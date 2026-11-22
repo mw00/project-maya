@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4::place {
+namespace maya::ds4::place {
 
 // DS4_RECENT_FIT's value: unset, empty, 0, negative or not a number -> 0 (off); 1; 2 and above -> 2
 inline int recent_fit_of(const char* v) {
@@ -200,4 +200,4 @@ inline bool layers_back(const std::vector<int>& grp, int n_groups, int& at, std:
     return true;
 }
 
-}  // namespace strata::ds4::place
+}  // namespace maya::ds4::place

@@ -4,9 +4,9 @@
 // requests with GlmExpertHelper (integrated mode) until the lead quits or ends.  Linux only.
 //   maya-glm-helper --ctl FD --region FD:BYTES:LEAD_ADDRESS [--region ...]
 // MAYA_GLM_HELPER_DEVICE: this program's GPU (default 0).
-#include "strata/core/glm_helper_link.hpp"
-#include "strata/core/remote_experts.hpp"
-#include "strata/prefill/moe_mmq.hpp"
+#include "maya/core/glm_helper_link.hpp"
+#include "maya/core/remote_experts.hpp"
+#include "maya/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -21,9 +21,9 @@
 #include <unistd.h>
 #endif
 
-namespace hl = strata::core::hlink;
+namespace hl = maya::core::hlink;
 
-#if defined(__linux__) && defined(STRATA_USE_HIP) && __has_include(<linux/udmabuf.h>) && __has_include(<linux/kfd_ioctl.h>)
+#if defined(__linux__) && defined(MAYA_USE_HIP) && __has_include(<linux/udmabuf.h>) && __has_include(<linux/kfd_ioctl.h>)
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
     hl::Ctl* c = (hl::Ctl*) cp;
     const char* dv = std::getenv("MAYA_GLM_HELPER_DEVICE");
     const int dev = dv != nullptr ? std::atoi(dv) : 0;
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
     // MAYA_GLM_HELPER_SPIN=1: spin in each call's stream wait instead of blocking - measured no faster (GLM-5.3-Flash
     // decode 34.8/32.5 tok/s blocking vs 34.7-34.8/31.2-32.6 spinning, a Radeon 8065S helper), and a spinning core
     // heats the APU the GPU shares, so it is off unless asked
@@ -297,7 +297,7 @@ int main(int argc, char** argv) {
     };
     const pid_t lead = getppid();
     __atomic_store_n(&c->ready, 1u, __ATOMIC_RELEASE);
-    strata::core::GlmExpertHelper h;
+    maya::core::GlmExpertHelper h;
     int n_embd = 0;
     uint32_t last = c->rep.load(std::memory_order_acquire);
     for (;;) {
@@ -328,7 +328,7 @@ int main(int argc, char** argv) {
             } else if (ok && xchg != nullptr) {
                 for (int t = 0; t < 64; ++t)
                     c->pf_types[t] = (uint8_t) h.pf_type_bits(t);
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
                 c->x3_pf = c->x3_on != 0 ? 1 : 0;   // (an EXL3 pack: its experts' prompt rows through pf_run_x3)
                 if (c->x3_on != 0 && !h.pf_x3_init(err)) {   // (its scratch now, not in the first prompt)
                     std::fprintf(stderr, "maya-glm-helper: %s (EXL3 prompt calls will fail)\n", err.c_str());
@@ -352,7 +352,7 @@ int main(int argc, char** argv) {
                 for (int j = 0; j < pn; ++j) blobs[(size_t) j] = mine(lp[j], 1);
             }
             if (c->op == hl::kPromptX3) {   // an EXL3 pack's experts: the layer's blob layout came with the call
-                strata::kernels::exl3::ExpertLayout lay;
+                maya::kernels::exl3::ExpertLayout lay;
                 for (int r = 0; r < 3; ++r) {
                     lay.suh[r] = (size_t) c->x3_suh[r];
                     lay.svh[r] = (size_t) c->x3_svh[r];
@@ -400,7 +400,7 @@ int main(int argc, char** argv) {
             break;
         }
         case hl::kComputeX3: {   // an EXL3 pack's experts: the layer's blob layout came with the call
-            strata::kernels::exl3::ExpertLayout lay;
+            maya::kernels::exl3::ExpertLayout lay;
             for (int r = 0; r < 3; ++r) {
                 lay.suh[r] = (size_t) c->x3_suh[r];
                 lay.svh[r] = (size_t) c->x3_svh[r];

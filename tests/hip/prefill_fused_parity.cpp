@@ -1,9 +1,9 @@
 // gfx1151 / gfx1100 GLM fused expert validation. Random valid IQ blocks, MMQ and independent
 // FP32 dequantized products; nonzero bounds, empty experts, partial/multiple tiles,
 // permuted source rows, clipping, all-zero input, and two-byte weight alignment.
-#include "strata/prefill/moe_fused_rdna4.hpp"
-#include "strata/prefill/moe_mmq.hpp"
-#include "strata/kernels/glm_batch.hpp"
+#include "maya/prefill/moe_fused_rdna4.hpp"
+#include "maya/prefill/moe_mmq.hpp"
+#include "maya/kernels/glm_batch.hpp"
 #include "ggml.h"
 #include <hip/hip_runtime.h>
 
@@ -16,8 +16,8 @@
 #include <stdexcept>
 #include <vector>
 
-namespace rf = strata::prefill::rdna4;
-namespace mq = strata::prefill::mmq;
+namespace rf = maya::prefill::rdna4;
+namespace mq = maya::prefill::mmq;
 int E = 4096, FF = 2048;   // GLM-5.3-Flash's experts; DeepSeek-V4.1's: 5120 / 2304
 constexpr int R = 83, A = 9;
 
@@ -97,7 +97,7 @@ double run(ggml_type gu_type, ggml_type d_type, float limit = 1.25f, double mmq_
     gp.n=4; gp.xq=xq.as<uint8_t>()-A*mq::q8_block_bytes(); gp.bounds=db.as<int>(); gp.ids=di.as<int>();
     gp.total_rows=R; gp.max_rows=65; gp.dst=gu.as<float>()-(size_t)A*2*FF; gp.ld_dst=2*FF;
     ctx.run(gp,nullptr);
-    strata::kernels::glmb::swiglu_rows(gu.as<float>(),gu.as<float>(),R,FF,geo.limit,nullptr,2*FF);
+    maya::kernels::glmb::swiglu_rows(gu.as<float>(),gu.as<float>(),R,FF,geo.limit,nullptr,2*FF);
     mq::quantize(gu.as<float>(),nullptr,hq.p,d_type,FF,2*FF,R,nullptr);
     auto dp=gp;
     dp.w=dw.as<uint8_t>()+2+geo.down_off; dp.type=d_type; dp.w_rows=E; dp.w_cols=FF;

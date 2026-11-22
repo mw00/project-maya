@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-using namespace strata::ds4;
+using namespace maya::ds4;
 
 namespace {
 template <class T>

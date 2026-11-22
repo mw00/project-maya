@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::ds4::gguf {
+namespace maya::ds4::gguf {
 
 constexpr int kMxCpuMaxN = 8;   // activations a call
 
@@ -17,7 +17,7 @@ constexpr int kMxCpuMaxN = 8;   // activations a call
 void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float* const* x, int n, float* const* y);
 
 /// A GGUF's low-bit experts (ds4_iq.cuh's types) on the CPU lane - ggml-cpu's arithmetic through the GLM CPU lane's
-/// native experts (strata::kernels::cpu::native_*: its AVX-512 / AVX2 multi-token rows where they are ggml's bit for bit,
+/// native experts (maya::kernels::cpu::native_*: its AVX-512 / AVX2 multi-token rows where they are ggml's bit for bit,
 /// ggml's dots otherwise; ds4_iq_cpu.cpp): an activation quantized once to the weight type's vec_dot_type (Q8_K: an F32
 /// scale per 256 values - the device takes one per 32, so the two sides agree to that rounding), each row one dot.
 struct IqCpu {
@@ -105,4 +105,4 @@ bool dense_requant(const uint8_t* q8, int n, int k, int type, std::vector<uint8_
 /// on the CPU lane as in VRAM (up to their order), whichever side the expert cache puts it on.
 void q8_round(const float* x, int k, float* out);
 
-}  // namespace strata::ds4::gguf
+}  // namespace maya::ds4::gguf

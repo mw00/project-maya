@@ -22,7 +22,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "strata/kernels/native_gdn_preprocess.hpp"
+#include "maya/kernels/native_gdn_preprocess.hpp"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstddef>
@@ -30,7 +30,7 @@
 #include <initializer_list>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 constexpr int S = 128;
 
@@ -196,4 +196,4 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
     out_norm<<<unsigned(heads), 256, 0, static_cast<cudaStream_t>(stream)>>>(output, z, gamma, destination, epsilon);
     check_launch();
 }
-} // namespace strata::kernels
+} // namespace maya::kernels

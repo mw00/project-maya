@@ -15,8 +15,8 @@
 #include <unistd.h>
 #endif
 
-using strata::ds4::IoQueue;
-using strata::ds4::Pool;
+using maya::ds4::IoQueue;
+using maya::ds4::Pool;
 
 namespace {
 
@@ -150,9 +150,9 @@ void many_device_copies() {   // (an item's three parts, many items, several thr
 // group's fewest slots a layer less one; every member's buffers then fit its own tail; a layer keeps the slots wholly
 // before a member's buffers, and the group the fewest of its members'
 void tp_borrow_arithmetic() {
-    using strata::ds4::tail_keep;
-    using strata::ds4::tp_tail_fits;
-    using strata::ds4::tp_tail_k;
+    using maya::ds4::tail_keep;
+    using maya::ds4::tp_tail_fits;
+    using maya::ds4::tp_tail_k;
     // (two members of an uneven group: 1280- and 1024-wide parts, so the wider one's step is larger)
     const std::vector<size_t> need = {100, 90}, step = {50, 40};
     EXPECT(tp_tail_k(need, step, 10) == 9);   // (356 / 50 -> 8, 346 / 40 -> 9)
@@ -226,7 +226,7 @@ bool compacts(size_t rows, size_t pitch, size_t off, size_t len) {
     for (size_t i = n; i < n + guard; ++i) buf[i] = 0xA5;
     for (size_t r = 0; r < rows; ++r)   // (the naive gather: row r's part, from the untouched input)
         for (size_t i = 0; i < len; ++i) want[r * len + i] = pat(r * pitch + off + i);
-    strata::ds4::compact_rows(buf.data(), rows, pitch, off, len);
+    maya::ds4::compact_rows(buf.data(), rows, pitch, off, len);
     bool ok = std::memcmp(buf.data(), want.data(), want.size()) == 0;
     for (size_t i = n; i < n + guard; ++i) ok = ok && buf[i] == 0xA5;
     return ok;
@@ -326,13 +326,13 @@ void compact_rows_jobs() {
         const int fd = mkstemp(path);
         EXPECT(fd >= 0);
         if (fd < 0) return;
-        const uint64_t at = 3 * 4096 + 100, lead = at % strata::ds4::os::kDirectAlign;
+        const uint64_t at = 3 * 4096 + 100, lead = at % maya::ds4::os::kDirectAlign;
         std::vector<uint8_t> file(at + n, 0x11);
         std::memcpy(file.data() + at, src.data(), n);
         EXPECT(::write(fd, file.data(), file.size()) == (ssize_t) file.size());
         ::close(fd);
-        const strata::ds4::os::fd_t f = strata::ds4::os::open_par(path);
-        EXPECT(f != strata::ds4::os::kBadFd);
+        const maya::ds4::os::fd_t f = maya::ds4::os::open_par(path);
+        EXPECT(f != maya::ds4::os::kBadFd);
         IoQueue q(1);
         std::vector<uint8_t> dst(lead + n, 0x5A), keep(n, 0);
         std::atomic<int> left{1};
@@ -349,7 +349,7 @@ void compact_rows_jobs() {
         bool lead_ok = true;
         for (uint64_t i = 0; i < lead; ++i) lead_ok = lead_ok && dst[i] == 0x5A;
         EXPECT(lead_ok && keep == src);
-        strata::ds4::os::close_fd(f);
+        maya::ds4::os::close_fd(f);
         std::remove(path);
     }
 #endif

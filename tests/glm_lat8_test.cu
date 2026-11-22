@@ -10,7 +10,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace strata::kernels::glmb;
+using namespace maya::kernels::glmb;
 
 namespace {
 
@@ -34,7 +34,7 @@ __global__ void check_kernel(const uint8_t* recs, int n_rec, unsigned long long*
     unsigned long long nbad = 0;
     for (int k = 0; k < 4; ++k) {
         const __half2 r = __floats2half2_rn((float) q[2 * k] * df, (float) q[2 * k + 1] * df);
-#if defined(STRATA_LAT8_UNSIGNED_ZEROS)
+#if defined(MAYA_LAT8_UNSIGNED_ZEROS)
         // (AMD: a zero has no sign in a record's read - the F32 product's own zero sign varies with the compiler)
         const unsigned ref = lat8_unsigned_zeros(*(const unsigned*) &r);
 #else

@@ -347,9 +347,9 @@ class HipSetupTests(unittest.TestCase):
                 patch.object(maya, "cmake_steps", return_value=None) as build:
             meta = maya.compile_engine_hip(pc, self.root / "llama", "source-sha")
         conf, _, env, _ = build.call_args.args
-        self.assertIn("-DSTRATA_ENABLE_HIP=ON", conf)
-        self.assertIn("-DSTRATA_ENABLE_CUDA=OFF", conf)
-        self.assertIn("-DSTRATA_PREFILL_MMQ=ON", conf)
+        self.assertIn("-DMAYA_ENABLE_HIP=ON", conf)
+        self.assertIn("-DMAYA_ENABLE_CUDA=OFF", conf)
+        self.assertIn("-DMAYA_PREFILL_MMQ=ON", conf)
         self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1100", conf)     # the chosen card's (#255)
         self.assertEqual(env["ROCM_PATH"], str(self.rocm))
         self.assertEqual(meta["backend"], "hip")
@@ -1032,8 +1032,8 @@ class WindowsHipSetupTests(unittest.TestCase):
                      f"-DCMAKE_C_COMPILER={root}/lib/llvm/bin/clang.exe",
                      f"-DCMAKE_HIP_COMPILER={root}/lib/llvm/bin/clang++.exe",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
-                     "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
-                     "-DSTRATA_PORTABLE=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx1151"):
+                     "-DMAYA_ENABLE_HIP=ON", "-DMAYA_ENABLE_CUDA=OFF", "-DMAYA_PREFILL_MMQ=ON",
+                     "-DMAYA_PORTABLE=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx1151"):
             self.assertIn(want, conf)
         if " " not in root:
             self.assertIn(f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={root}/lib/llvm/amdgcn/bitcode",

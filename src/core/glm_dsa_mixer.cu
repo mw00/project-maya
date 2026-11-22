@@ -11,7 +11,7 @@
 // MAYA_GLM_DSA_DENSE=1 (B14.3) a static iota of every cell.
 //
 // glm-dsa wave 5 (B10.1-B10.8 wiring): the projections and kernels are chosen by ONE dispatch policy
-// (include/strata/kernels/glmd_decode_policy.hpp): the WMMA scorer above 16K cells and the radix top-k above 32K
+// (include/maya/kernels/glmd_decode_policy.hpp): the WMMA scorer above 16K cells and the radix top-k above 32K
 // (MAYA_GLMD_IDX_WMMA / MAYA_GLMD_TOPK_MB: auto, 1 forces, 0 disables), the fused MLA with MAYA_GLMD_FUSED_MLA=1,
 // the index-key dtype of the state layout (B10.8), W_kb / W_vb BF16 or native Q8_0 as the binder picked them (B10.7).
 // Every position and count the kernels read is device-resident in a glmd::DevPos (B14.4), so with
@@ -23,7 +23,7 @@
 // carries the NextN block: token by token, and the block at every prompt position with the next prompt token (B11.1),
 // so its latent, k_pe and index-key caches cover the prompt as the batched path's mtp_fill fills them.  Any other
 // prompt it leaves to prefill() (false, err empty).
-#include "strata/core/glm_env.hpp"
+#include "maya/core/glm_env.hpp"
 #include "glm_dsa_fast.hpp"
 #include "glm_dsa_graphs.hpp"
 #include "glm_cb_dump.hpp"
@@ -31,13 +31,13 @@
 #include "glm_dsa_prefill_stream.hpp"
 #include "glm_fast_state.hpp"
 
-#include "strata/kernels/glmd_decode_policy.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_forward.hpp"
-#include "strata/kernels/glmd_graph.hpp"
-#include "strata/kernels/glmd_mixer.hpp"
-#include "strata/kernels/glmd_random_route.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_forward.hpp"
+#include "maya/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_mixer.hpp"
+#include "maya/kernels/glmd_random_route.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include "../kernels/cuda/glmd_rope.cuh"
 
@@ -51,9 +51,9 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace glmdsa {
 
@@ -220,7 +220,7 @@ bool mixer_setup(GlmDsaFast& X, const Glm5Geometry& g, int64_t max_ctx, std::str
     d.eps = g.norm_eps;
     d.idx_ln_eps = g.idx_ln_eps;
     d.kq_scale = glmd::attn_scale(g.qk_head());
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     d.pol = glmd::decode_policy_built(glmd::decode_policy_env());   // (no WMMA kernels in a HIP build)
 #else
     d.pol = glmd::decode_policy_env();
@@ -241,11 +241,11 @@ bool mixer_setup(GlmDsaFast& X, const Glm5Geometry& g, int64_t max_ctx, std::str
         }
     }
     if (const char* s = getenv("MAYA_GLMD_KQ_SCALE"); s != nullptr && s[0] != '\0') {   // mutation runs only (the reference reads it too)
-        d.kq_scale = (float) strata::glmenv::num_value("MAYA_GLMD_KQ_SCALE", s, d.kq_scale);
+        d.kq_scale = (float) maya::glmenv::num_value("MAYA_GLMD_KQ_SCALE", s, d.kq_scale);
         std::fprintf(stderr, "glm-dsa mixer: CUDA%d attention scale overridden to %g (MAYA_GLMD_KQ_SCALE)\n", X.dev,
                      (double) d.kq_scale);
     }
-    M->dense = strata::glmenv::env_flag("MAYA_GLM_DSA_DENSE", false);
+    M->dense = maya::glmenv::env_flag("MAYA_GLM_DSA_DENSE", false);
     if (max_ctx <= 0 || max_ctx >= INT_MAX || d.top_k <= 0 || d.qk_rope % 2 || d.idx_rope % 2 ||
         d.idx_rope > d.idx_key || (d.qk_rope != 0 && d.qk_rope != 64) || d.kv_lora > 512 || d.kv_lora % 32 ||
         d.q_lora > 2048 || d.q_lora % 32 || d.idx_key > 512 || d.v_head % 32) {
@@ -394,7 +394,7 @@ static void mixer_dump(cudaStream_t s, const std::string& name, const void* dev,
 // the missed latent rows), the same misses are copied from the k_pe host copy into the k_pe slots
 namespace {
 struct DsaKvCtx {
-    const strata::kernels::KvStreamMap* map = nullptr;
+    const maya::kernels::KvStreamMap* map = nullptr;
     const uint8_t* lat_host = nullptr;
     uint8_t* lat_slots = nullptr;
     const uint8_t* kpe_host = nullptr;
@@ -720,8 +720,8 @@ bool graph_prepare(GlmDsaFast& X, const GlmStateLayout& lay, int l0, int l1, int
     M.graph_off_last = nullptr;   // (the host side allows a graph again: the next reason met is logged)
     if (p < 0 || p >= M.d.max_ctx) return true;   // (the mixer refuses it with a message)
     M.graphs.set_per_part(seqs);   // a graph per sequence's state arena: switching sequences replays (GraphIndex)
-    static const bool mv_nw2 = strata::glmenv::env_flag("MAYA_GLMD_MV_NW2", false);     // (as glmd_mv_ext.cuh reads them)
-    static const bool mv_typed = strata::glmenv::env_flag("MAYA_GLMD_MV_TYPED", false);
+    static const bool mv_nw2 = maya::glmenv::env_flag("MAYA_GLMD_MV_NW2", false);     // (as glmd_mv_ext.cuh reads them)
+    static const bool mv_typed = maya::glmenv::env_flag("MAYA_GLMD_MV_TYPED", false);
     glmd::DecodePolicy pol = M.d.pol;
     pol.idx_fp16 = lay.ik_bytes == 2;
     pol.idx_had = lay.ik_had != 0;   // B14.11
@@ -812,4 +812,4 @@ bool Glm5Model::prefill_tokens_dsa(const std::vector<int32_t>& tokens, int32_t n
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

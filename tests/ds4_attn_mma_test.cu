@@ -11,7 +11,7 @@
 #include <random>
 #include <vector>
 
-using namespace strata::ds4;
+using namespace maya::ds4;
 
 #define CK(x)                                                                                                   \
     do {                                                                                                        \

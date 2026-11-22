@@ -2,7 +2,7 @@
 // direction's load onto every part of the split, and the per-conversation switch.
 #include "glm_ablate.hpp"
 
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include "ablate_capture.hpp"         // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
 #include "../mm3/mm3_ablate.hpp"   // (the control vector loader maya-mm3 uses: the same direction files)
@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace glmabl {
 
@@ -97,4 +97,4 @@ void Glm5Model::ablate_runs(float* y, const int* seqs, int n, cudaStream_t s) co
         glmabl::project_out(y + (size_t) ru.first * E, abl_r_, abl_scale_, E, ru.second - ru.first, s);
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

@@ -38,7 +38,7 @@ compilers and keeps its cache in Docker's build cache on the machine that builds
 
 ### A portable CPU build
 
-The Dockerfile passes `-DSTRATA_PORTABLE=ON`, which `maya.py` passes only for its HIP build. Without it the CMake sets
+The Dockerfile passes `-DMAYA_PORTABLE=ON`, which `maya.py` passes only for its HIP build. Without it the CMake sets
 `GGML_NATIVE=ON`, which compiles ggml's CPU code for the build machine's own CPU. That's right for a PC that compiles
 its own engine and wrong for an image: an image built on an AVX-512 machine stops with an illegal instruction on a CPU
 without AVX-512, a Ryzen 5000 for example. With it, ggml's CPU code targets an AVX2 baseline. Maya's own AVX-512
@@ -75,7 +75,7 @@ at the first failed check, before anything is pushed. None of the checks needs a
 |---|---|
 | `setup.py`'s llama.cpp pin (`LLAMA_CPP_COMMIT`) is the one `CMakeLists.txt` names | the two pins disagreeing (the image builds from `setup.py`'s, as `maya.py` does) |
 | `VERSION` is the release, when `--ref` is a `vX.Y.Z` tag | a tag on a tree whose `VERSION` wasn't bumped (v1.1.21 shipped an empty one) |
-| `CMakeCache.txt`: `STRATA_PORTABLE` on, `GGML_NATIVE` off, `GGML_AVX2` on, no AVX-512, VNNI or AMX | a native build slipping into the image |
+| `CMakeCache.txt`: `MAYA_PORTABLE` on, `GGML_NATIVE` off, `GGML_AVX2` on, no AVX-512, VNNI or AMX | a native build slipping into the image |
 | the architectures in `CMakeCache.txt` are the ones asked for | a build for the wrong cards |
 | `ldd` on each engine: everything resolves except the host driver's `libcuda` and `libnvidia-*` | a library missing from the runtime image |
 | `serve/server.py --help` and each pack builder's `--help` run | an import or a package the server needs missing |

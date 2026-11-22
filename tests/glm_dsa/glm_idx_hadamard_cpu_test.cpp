@@ -12,11 +12,11 @@
 //      fingerprint differs by kGlmFpIdxHad (a slot from one setting is refused by the other), an idx_key that is not
 //      a power of two is refused by name, Flash never rotates.
 #include "glm_dsa_mixer_fixture.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
-#include "strata/kernels/glmd_decode_policy.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_mixer.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_mixer.hpp"
 
 #include "../../src/kernels/cuda/glmd_had.cuh"
 
@@ -290,8 +290,8 @@ void test_mixer(const char* name, const mixfx::MixerDims& d, const std::vector<b
 }
 
 // ---------------------------------------------------------------- 5. the state layout
-strata::core::Glm5Geometry glm53(int idx_key = 128) {
-    using namespace strata::core;
+maya::core::Glm5Geometry glm53(int idx_key = 128) {
+    using namespace maya::core;
     Glm5Geometry g;
     g.arch = GlmArch::GlmDsa;
     g.n_embd = 6144;
@@ -320,7 +320,7 @@ strata::core::Glm5Geometry glm53(int idx_key = 128) {
 }
 
 void test_layout() {
-    using namespace strata::core;
+    using namespace maya::core;
     std::printf("[5. the state layout and the slot fingerprint]\n");
     unsetenv("MAYA_GLM_IDX_HADAMARD");
     unsetenv("MAYA_GLM_IDX_FP16");

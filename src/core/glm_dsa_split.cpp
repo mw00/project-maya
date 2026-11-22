@@ -1,14 +1,14 @@
 // src/core/glm_dsa_split.cpp - the glm-dsa port B6.1-B6.3: the glm-dsa layer split's pure host-side rules
-// (include/strata/core/glm_dsa_split.hpp).  No CUDA, no I/O: tests/glm_dsa/glm_dsa_split_test.cpp runs them on the CPU.
-#include "strata/core/glm_dsa_split.hpp"
-#include "strata/core/glm_state_layout.hpp"
+// (include/maya/core/glm_dsa_split.hpp).  No CUDA, no I/O: tests/glm_dsa/glm_dsa_split_test.cpp runs them on the CPU.
+#include "maya/core/glm_dsa_split.hpp"
+#include "maya/core/glm_state_layout.hpp"
 #include "glm_tier_plan.hpp"   // lane_pool_mode: the runtime's MAYA_GLM_CPU_SHARED rule
 
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -180,4 +180,4 @@ std::vector<int> glm_part_groups(const std::vector<int>& group_node, const std::
     return grp;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

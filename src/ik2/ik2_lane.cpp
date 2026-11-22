@@ -5,7 +5,7 @@
 #include "hy4_lane.hpp"
 #include "ik2_exact.h"
 #include "ik2_off.cuh"
-#include "strata/kernels/cpu/pool.hpp"
+#include "maya/kernels/cpu/pool.hpp"
 
 #include <immintrin.h>
 

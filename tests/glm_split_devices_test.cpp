@@ -2,13 +2,13 @@
 // default list, a named list (MAYA_GLM_DEVS) refused when it names the helper or repeats a device, pinned boundaries
 // taking the first n + 1 devices beside the helper, `auto` taking up to the part limit - and no helper: the lists as
 // before.  Host only, no GPU.
-#include "strata/core/glm_split_devices.hpp"
+#include "maya/core/glm_split_devices.hpp"
 
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using strata::core::glm_split_devices;
+using maya::core::glm_split_devices;
 
 static int fails = 0;
 

@@ -1,7 +1,7 @@
 // src/core/glm_dsa_graphs.hpp - glm-dsa B10.1: the per-part decode graph cache of the glm-dsa fast path.
 //
 // A captured graph per part (all of its layers) and per state arena - one per sequence with MAYA_GLM_SEQS /
-// --parallel, up to set_per_part() a part (glmd::GraphIndex) - keyed by glmd::GraphKey (include/strata/kernels/glmd_graph.hpp:
+// --parallel, up to set_per_part() a part (glmd::GraphIndex) - keyed by glmd::GraphKey (include/maya/kernels/glmd_graph.hpp:
 // the B14.4 rules every captured kernel follows).  The same request accounting as Maya's glmfast::LayerGraphs
 // (src/core/glm_layer_graphs.hpp): the body runs once at capture and does its own accounting (the MoE CPU-lane
 // requests it posts); a replay runs no host code, so enqueue() adds `requests` to `expected` itself, and the
@@ -15,8 +15,8 @@
 // where body() issues every layer of the part with p_dev / pos = &dev_pos->p, n_kv = k.n_cap, n_sel = top_k.
 #pragma once
 
-#include "strata/core/graph.hpp"
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/core/graph.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -24,7 +24,7 @@
 #include <string>
 #include <utility>
 
-namespace strata::core::glmdsa {
+namespace maya::core::glmdsa {
 
 class DsaGraphs {
 public:
@@ -87,4 +87,4 @@ private:
     std::map<int, CapturedGraph> graphs_;   // by slot
 };
 
-}  // namespace strata::core::glmdsa
+}  // namespace maya::core::glmdsa

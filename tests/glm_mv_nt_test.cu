@@ -5,7 +5,7 @@
 //   glm_mv_nt_test           the parity checks (ctest; with MAYA_GLM_MV_GENERIC=1 too: the generic kernel only)
 //   glm_mv_nt_test --bench   the time of one Q6_K 4096 x 12288 GEMV (the dense FFN's gate) for 1..8 activations
 //   glm_mv_nt_test --bench-cols <type>   one n-column mv() (the tiled kernels) at 6144 x 6144, 1..16 columns
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include "ggml.h"
 
@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace {
 void check(cudaError_t e, const char* what) {

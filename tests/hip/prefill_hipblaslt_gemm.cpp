@@ -5,7 +5,7 @@
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 
-#include "strata/prefill/gemm.hpp"
+#include "maya/prefill/gemm.hpp"
 #include "hipblaslt_tuning.hpp"
 
 #include <algorithm>
@@ -49,7 +49,7 @@ uint16_t encode(float value, bool bf16) {
     return bits;
 }
 
-bool run_case(strata::prefill::Gemm& gemm, hipblasHandle_t blas, hipStream_t stream, bool bf16, int t, int n,
+bool run_case(maya::prefill::Gemm& gemm, hipblasHandle_t blas, hipStream_t stream, bool bf16, int t, int n,
               int k, int ldy, int output_offset, float beta, uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
@@ -148,14 +148,14 @@ int main() {
     HIPBLAS_CHECK(hipblasLtGetVersion(lt, &version));
     HIPBLAS_CHECK(hipblasLtDestroy(lt));
 
-    strata::prefill::hipblaslt::TuningTable table;
+    maya::prefill::hipblaslt::TuningTable table;
     std::string error;
     if (!table.load(tuning_path, arch, version, error)) {
         std::fprintf(stderr, "tuning table rejected: %s\n", error.c_str());
         return 1;
     }
-    if (!table.closest(strata::prefill::hipblaslt::InputType::bf16, 48, 2560, 96, 4096) ||
-        !table.closest(strata::prefill::hipblaslt::InputType::f16, 512, 2560, 512, 4096)) {
+    if (!table.closest(maya::prefill::hipblaslt::InputType::bf16, 48, 2560, 96, 4096) ||
+        !table.closest(maya::prefill::hipblaslt::InputType::f16, 512, 2560, 512, 4096)) {
         std::fprintf(stderr, "tuning table lacks the focused BF16/F16 test rows\n");
         return 1;
     }
@@ -165,7 +165,7 @@ int main() {
     bool ok = true;
     {
         std::string init_error;
-        strata::prefill::Gemm gemm;
+        maya::prefill::Gemm gemm;
         if (!gemm.init((void*) stream, 0, init_error)) {
             std::fprintf(stderr, "Gemm init failed: %s\n", init_error.c_str());
             HIP_CHECK(hipStreamDestroy(stream));

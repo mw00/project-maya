@@ -36,7 +36,7 @@ Collection uses the routing bounds already synchronized and copied to the host;
 it adds no GPU readback or synchronization. It does add CPU counter work when
 enabled. No inference speedup is claimed.
 
-Build with `STRATA_BUILD_TESTS=ON`, then run
+Build with `MAYA_BUILD_TESTS=ON`, then run
 `ctest --test-dir <build> -R '^ds4_prefill_stats_test$' --output-on-failure`.
 The CPU test covers weighted versus unique hits, repeated chunks, borrowed
 resident slots, invalid bounds without partial updates, and 64-bit totals.

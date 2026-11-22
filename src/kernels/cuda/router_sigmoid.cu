@@ -14,14 +14,14 @@
 // which is "stable argsort of -sel, ties by ascending index" - what ref/glm.py's top_k_desc
 // produces with numpy's stable sort.  The bias is applied to sel ONLY; the gathered weights are
 // the unbiased p (router_sigmoid.hpp's trap).
-#include "strata/kernels/router_sigmoid.hpp"
+#include "maya/kernels/router_sigmoid.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int RS_MAX_THREADS = 512;
@@ -92,4 +92,4 @@ void router_sigmoid(const float* logits, const float* bias, int n_tokens, int n_
         logits, bias, n_tokens, n_expert, k, w_scale, norm_w ? 1 : 0, ids, weights);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

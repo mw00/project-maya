@@ -5,7 +5,7 @@
 // experts' GEMMs of the prompt path take FP16 rows (an NVFP4 weight is exact in FP16).  docs/INKLING2.md has the model.
 //
 // Layouts: rows of tokens; a token's heads back to back ([T][H][D]); the K / V caches by position, [ctx][Hkv][D] F32.
-// CUDA, and AMD (HIP, Linux) through include/strata/hip_compat.
+// CUDA, and AMD (HIP, Linux) through include/maya/hip_compat.
 #pragma once
 
 #include <cstddef>
@@ -116,7 +116,7 @@ bool attn_prompt_v70_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const
 /// can this build run attn_flash_* on the current GPU (CUDA: always; AMD: the RDNA matrix-core kernel's archs)
 bool attn_flash_available();
 
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
 /// AMD, RDNA 3 / 3.5 / 4 (ik2_rdna.inc): the prompt's routed experts of a layer in three launches from their blocks.
 /// Rows: a token's pick each, grouped by expert in expert order; tiles: int4 {expert, first row, rows <= 32, 0} over
 /// them; eptr [E]: an expert's blocks (gate, then up at off_up / down at off_down, as a cache slot holds them).

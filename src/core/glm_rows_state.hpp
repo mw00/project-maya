@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace glmrows {
 constexpr int kQ8 = 36;   // bytes per q8_1 block
@@ -73,4 +73,4 @@ struct Glm5Model::RowSeq {
     int kin_t = 0;          // ... the row's index in them
 };
 
-}  // namespace strata::core
+}  // namespace maya::core

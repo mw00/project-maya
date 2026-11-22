@@ -9,7 +9,7 @@
 // reference is (i * 37 + 11) % n_vocab).
 //
 // The interpreter is $MAYA_PYTHON, else python3; gguf-py must be importable (the ctest registration puts
-// ${STRATA_GGML_DIR}/gguf-py on PYTHONPATH).  Fixtures land in $MAYA_GLMD_FIXTURES, else <tmp>/glm_dsa_fixtures, and
+// ${MAYA_GGML_DIR}/gguf-py on PYTHONPATH).  Fixtures land in $MAYA_GLMD_FIXTURES, else <tmp>/glm_dsa_fixtures, and
 // are reused while their sha256 (synthetic GGUFs) or their marker file (packs) says they are current.
 #pragma once
 
@@ -29,15 +29,15 @@
 
 #include "glm_test_env.hpp"   // setenv / unsetenv (the pack switch below)
 
-#ifndef STRATA_SOURCE_DIR
-#define STRATA_SOURCE_DIR "."
+#ifndef MAYA_SOURCE_DIR
+#define MAYA_SOURCE_DIR "."
 #endif
 
 namespace glmfx {
 
 namespace fs = std::filesystem;
 
-inline fs::path src_dir() { return fs::path(STRATA_SOURCE_DIR); }
+inline fs::path src_dir() { return fs::path(MAYA_SOURCE_DIR); }
 inline fs::path data_dir() { return src_dir() / "data" / "glm-dsa"; }
 inline fs::path fixture_dir() {
     const char* fx = std::getenv("MAYA_GLMD_FIXTURES");

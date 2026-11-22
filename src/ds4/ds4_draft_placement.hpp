@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 // Device IDs are those printed at startup, not positions in a TP group's member list.
 // Return indices into the selected-device vector, so a filtered/noncontiguous selection works too.
@@ -43,4 +43,4 @@ inline bool draft_gpu_indices(std::string_view value, int blocks, const std::vec
     return true;
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

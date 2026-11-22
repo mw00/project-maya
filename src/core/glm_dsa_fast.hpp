@@ -8,9 +8,9 @@
 #pragma once
 
 #include "glm_dsa_fast_plan.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cuda_runtime.h>
 
@@ -20,14 +20,14 @@
 #include <string>
 #include <vector>
 
-namespace strata::core::glmdsa {
+namespace maya::core::glmdsa {
 
 /// One glm-dsa layer's attention weights, resolved at load (device pointers; never looked up per token).
 ///
 /// Every matrix is a WSlot: {q: the weight rows, type: its gf::mv type, n_in, n_out; f32 is set for type F32}.  type is
 /// a native ggml type (mv dots it against a q8_1 input), kTypeBF16 or kTypeF32 (mv reads the FLOAT input: pass xf, or
 /// call glmdsa::mv, which dequantizes the q8_1 input when only that is at hand).  Layouts are ggml's (first dimension
-/// contiguous, the same as include/strata/kernels/glmd_ref.hpp documents): a weight W[o * n_in + i].
+/// contiguous, the same as include/maya/kernels/glmd_ref.hpp documents): a weight W[o * n_in + i].
 struct GlmDsaLayerW {
     bool bound = false;       // this part holds the layer (l0_ <= il < lt_)
     bool mtp = false;         // the NextN block (il == n_layers)
@@ -103,7 +103,7 @@ inline bool float_type(int type) { return type == kTypeF32 || type == kTypeBF16;
 /// gets that input dequantized into ext->act first (one row per distinct input).  Jobs that need no fallback pass
 /// through unchanged, so on glm5-next (ext null) this IS gf::mv.  False when gf::mv refuses, or a fallback is needed
 /// and there is no ext.
-bool mv(GlmDsaFast* ext, const strata::kernels::glmf::MvJob* jobs, int n, cudaStream_t s);
+bool mv(GlmDsaFast* ext, const maya::kernels::glmf::MvJob* jobs, int n, cudaStream_t s);
 
 /// The shared expert's down when moe_gate_up's fused shared down cannot dot its type (!shexp_fused_ok: BF16 / F32, or a
 /// B10.7 type - F16, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL): the down runs here instead (glmdsa::mv into sh_out: BF16 / F32 on
@@ -165,4 +165,4 @@ bool win_rows_begin(GlmDsaFast& X, int64_t p0, int T, int cap, cudaStream_t s, s
 /// y[i] = q8_1 value i (n a multiple of 32): the device twin of q8_1_to_f32_host.
 void q8_1_to_f32(const void* xq, int n, float* y, cudaStream_t s);
 
-}  // namespace strata::core::glmdsa
+}  // namespace maya::core::glmdsa

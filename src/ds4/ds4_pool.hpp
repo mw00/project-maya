@@ -20,7 +20,7 @@
 #include <intrin.h>
 #endif
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 inline void cpu_relax() {
 #if defined(_MSC_VER)
@@ -256,4 +256,4 @@ private:
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0}, device_{0};
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

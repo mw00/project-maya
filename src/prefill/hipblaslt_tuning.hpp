@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::prefill::hipblaslt {
+namespace maya::prefill::hipblaslt {
 
 enum class InputType : uint8_t { f16, bf16 };
 
@@ -151,4 +151,4 @@ inline std::vector<std::string> split_table_list(const std::string& list) {
 #endif
 }
 
-}  // namespace strata::prefill::hipblaslt
+}  // namespace maya::prefill::hipblaslt

@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 
-namespace os = strata::ds4::os;
+namespace os = maya::ds4::os;
 
 namespace {
 

@@ -1,7 +1,7 @@
 // src/ik2/ik2_rdna.inc - maya-ik2's kernels for AMD's matrix cores (RDNA 3 / 3.5 gfx11, RDNA 4 gfx12, wave32), the
 // paths where the CUDA kernels' mma.sync has no AMD instruction to map to (ik2_kernels.cu includes this inside
 // ik2::k; the interface is in ik2_kernels.cuh).  The products: maya::kernels::wmma_f16 (16 x 16 x 16, F16 in, F32
-// sums; include/strata/kernels/rdna_wmma.hpp).  Every sum runs in a fixed order, so a GPU's answers repeat; they are
+// sums; include/maya/kernels/rdna_wmma.hpp).  Every sum runs in a fixed order, so a GPU's answers repeat; they are
 // not the CUDA kernels' bits (another order of the same sums).
 //
 // The prompt's routed experts: a layer's experts over a chunk in three launches, straight from their blocks (NVFP4 or
@@ -10,7 +10,7 @@
 // rows of one expert.  gate / up: a block 64 rows of gate and the same 64 of up against a tile's rows, SwiGLU in the
 // registers (a lane holds a row's gate and up); down: 128 rows of down.  Then each token's picks summed in expert
 // order (the order the CUDA path adds them in).
-// (AMD builds only: ik2_kernels.cu includes it under STRATA_USE_HIP, after rdna_wmma.hpp)
+// (AMD builds only: ik2_kernels.cu includes it under MAYA_USE_HIP, after rdna_wmma.hpp)
 
 namespace {
 

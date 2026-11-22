@@ -5,7 +5,7 @@
 // Random trellis words in memory bound to --node (-1: wherever the first touch puts them), --threads workers pinned to
 // that node's physical cores (CPU i is on node i % 2 here, CPUs 0..43 the physical cores), each call computing
 // --per-call experts' gate and up (all columns) from one activation: the time of a matrix pass and its GB/s.
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 #include "../src/ds4/ds4_pool.hpp"
 
 #include <sys/mman.h>
@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 static void* node_alloc(size_t bytes, int node) {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
     std::vector<int> cpus;
     for (int c = 0; c < 44; ++c)
         if (node < 0 || c % 2 == node) cpus.push_back(c);
-    strata::ds4::Pool pool(threads - 1, std::vector<int>(cpus.begin() + 1, cpus.end()));
+    maya::ds4::Pool pool(threads - 1, std::vector<int>(cpus.begin() + 1, cpus.end()));
     {
         cpu_set_t set;
         CPU_ZERO(&set);

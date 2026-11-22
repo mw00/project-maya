@@ -6,7 +6,7 @@
 
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
 
-namespace vl = strata::vramlate;
+namespace vl = maya::vramlate;
 static constexpr size_t MiB = (size_t) 1 << 20;
 
 int main() {

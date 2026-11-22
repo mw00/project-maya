@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::ds4::pcie {
+namespace maya::ds4::pcie {
 
 /// One format class's measured times on this PC (ms): the CPU lane's an expert and a call; the stream lane's an expert
 /// (its read into pinned memory and its copy to the GPU) and a request (the wait for the copies); the GPU's an expert
@@ -179,4 +179,4 @@ inline void cal_put(const std::string& file, const std::string& key, const std::
     }
 }
 
-}  // namespace strata::ds4::pcie
+}  // namespace maya::ds4::pcie

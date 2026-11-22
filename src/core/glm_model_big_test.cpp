@@ -16,7 +16,7 @@
 //
 // Fixtures: the GGUF is generated into the build tree by glm_model_big_gen; the expectation
 // (vocab, T) float32 dump is committed at data/glm5-big-dumps/.
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -70,16 +70,16 @@ int main(int argc, char** argv) {
     const char* dump_out = argc > 3 ? argv[3] : nullptr;   // optional: write the streamed logits
     constexpr size_t T = 512;
 
-    strata::core::Glm5Model model;
+    maya::core::Glm5Model model;
     std::string err;
     if (!model.load(gguf, 1024, err)) {
         // stage the failure: parse the GGUF and the geometry by hand before giving up
         try {
-            strata::GgufFile gg(gguf);
+            maya::GgufFile gg(gguf);
             std::fprintf(stderr, "gguf ok: %zu tensors, version %u\n", gg.tensors().size(), gg.version());
-            strata::core::Glm5Geometry geo;
+            maya::core::Glm5Geometry geo;
             std::string gerr;
-            const bool pok = strata::core::Glm5Geometry::from_gguf(gg, geo, gerr);
+            const bool pok = maya::core::Glm5Geometry::from_gguf(gg, geo, gerr);
             std::fprintf(stderr, "geometry: ok=%d err=[%s] layers=%d n_embd=%d kv_lora=%d kpool=%d topk=%d tail=%d\n",
                          (int) pok, gerr.c_str(), geo.n_layers, geo.n_embd, geo.kv_lora, geo.idx_kpool,
                          geo.idx_top_k, geo.idx_select_tail);

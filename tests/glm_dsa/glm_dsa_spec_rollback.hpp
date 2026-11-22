@@ -112,11 +112,11 @@ void suite(const char* name, const mixfx::MixerDims& dims, int T, int lat_q8) {
                 probe_accepted = probe_accepted && acc;
                 if (acc && std::memcmp(stale.data(), outA[4].data(), (size_t) E * 4) != 0) ++stale_wrong;
                 B.st = saved;
-                strata::core::glmdsa::sel_rollback(B.st);
+                maya::core::glmdsa::sel_rollback(B.st);
                 const bool ref = !B.step(4, p, stale, e2) && e2.find("not made at this position") != std::string::npos;
                 probe_refused = probe_refused && ref;
             }
-            strata::core::glmdsa::sel_rollback(B.st);   // glmdsa::mixer_rollback on the part
+            maya::core::glmdsa::sel_rollback(B.st);   // glmdsa::mixer_rollback on the part
         }
         for (int il = 0; il < NL; ++il) {
             if (!B.step(il, p, ob, err)) { check(false, "run B: " + err); return; }
@@ -219,7 +219,7 @@ OrderRun run_order(mixfx::Model& m, const mixfx::Model& draft, const std::vector
         if (o == Order::Today && s > 0 && !next_block(s - 1)) return r;
         if (rejected(s)) {   // the verdict: restore (glm-dsa: the selection state) and redo with the real inputs
             ++r.redone;
-            strata::core::glmdsa::sel_rollback(h0.st);
+            maya::core::glmdsa::sel_rollback(h0.st);
             if (!head(s, false)) return r;
         }
         if (!run(h1, kP1, kP2, s)) return r;

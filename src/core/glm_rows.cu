@@ -29,9 +29,9 @@
 // bit for bit (glm_rows_attn_test compares them).
 #include "glm_rows_state.hpp"
 
-#include "strata/core/mtp_rows.hpp"
-#include "strata/kernels/exl3.hpp"
-#include "strata/kernels/sampler.hpp"
+#include "maya/core/mtp_rows.hpp"
+#include "maya/kernels/exl3.hpp"
+#include "maya/kernels/sampler.hpp"
 
 #include "ggml.h"
 
@@ -41,7 +41,7 @@
 #include <cstdio>
 #include <cstring>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 using glmrows::kQ8;
@@ -693,7 +693,7 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
 // Its route is the same per row: the spares a row's fetch takes are resident for the rows after it, as they are for
 // the next row's route on the per-row path.  False with err empty: not here (the rows run one by one).
 bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
-    namespace x3 = strata::kernels::exl3;
+    namespace x3 = maya::kernels::exl3;
     FastState* F = fast_;
     RowsState* S = rows_;
     auto& W = F->win;
@@ -834,7 +834,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     return true;
 }
 
-bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err) {
+bool Glm5Model::rows_head(const RowSeq* rw, const maya::kernels::SamplerParams* sps, int n, std::string& err) {
     FastState* F = fast_;
     RowsState* S = rows_;
     const Glm5Geometry& g = g_;
@@ -858,7 +858,7 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     if (!mv(&o, 1, "output head")) return false;
     for (int i = 0; i < n; ++i) {
         const float* lg = rows(S->logits, g.n_vocab, i);
-        if (strata::core::rows_pick_argmax(sps[i]))
+        if (maya::core::rows_pick_argmax(sps[i]))
             gf::argmax(lg, g.n_vocab, S->tok + i, s);
         else
             pick_tokens(lg, 1, sps[i], nullptr, 0, S->tok + i, s);
@@ -866,7 +866,7 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     return true;
 }
 
-bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
+bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const maya::kernels::SamplerParams* sps, int n,
                            int* tokens_out, std::string& err) {
     if (!rows_ok() || n_parts_ != 1 || seq_.empty() || n < 1 || n > rows_max()) {
         err = "glm rows: not available here (one GPU, several sequences, 1.." + std::to_string(rows_max()) + " rows)";
@@ -927,7 +927,7 @@ bool Glm5Model::split_rows_ok() const {
 }
 
 bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
-                                 const strata::kernels::SamplerParams* sps, int n, std::string& err) {
+                                 const maya::kernels::SamplerParams* sps, int n, std::string& err) {
     if (!split_rows_ok() || n < 1 || n > rows_max()) {
         err = "glm rows: the split batch is not available here (every part's row arena, 1.." +
               std::to_string(rows_max()) + " rows)";
@@ -1007,4 +1007,4 @@ bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

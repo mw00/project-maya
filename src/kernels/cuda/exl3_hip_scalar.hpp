@@ -3,7 +3,7 @@
 #include <climits>
 #include <cstring>
 
-namespace strata::kernels::exl3::hip_scalar {
+namespace maya::kernels::exl3::hip_scalar {
 // 8 is the existing path; -1 chooses the configurable batch-row policy. Invalid values stay on 8.
 inline int mode(const char* value) {
     if (value == nullptr || std::strcmp(value, "0") == 0 || std::strcmp(value, "8") == 0) return 8;
@@ -26,4 +26,4 @@ inline int rows(int mode, bool gate_up, int max_rows, int gu_min, int down_min) 
     if (mode != -1) return mode;
     return gate_up ? (max_rows < gu_min ? 8 : 12) : (max_rows < down_min ? 12 : 24);
 }
-} // namespace strata::kernels::exl3::hip_scalar
+} // namespace maya::kernels::exl3::hip_scalar

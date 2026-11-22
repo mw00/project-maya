@@ -1,7 +1,7 @@
-// The stall report's watcher (include/strata/platform/stall_watch.hpp, #860): a step past the limit is reported once
+// The stall report's watcher (include/maya/platform/stall_watch.hpp, #860): a step past the limit is reported once
 // (then again only after again_s), with the phase it is in; steps that keep moving and an idle loop are never
 // reported; a limit of 0 starts no thread.  Host code only, no GPU.
-#include "strata/platform/stall_watch.hpp"
+#include "maya/platform/stall_watch.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -11,7 +11,7 @@
 #include <string>
 #include <thread>
 
-using strata::platform::StallWatch;
+using maya::platform::StallWatch;
 
 static int failures = 0;
 

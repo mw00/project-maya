@@ -1,11 +1,11 @@
-// src/kernels/cuda/glm_kv_stream.cu - see include/strata/kernels/glm_kv_stream.hpp.
-#include "strata/kernels/glm_kv_stream.hpp"
+// src/kernels/cuda/glm_kv_stream.cu - see include/maya/kernels/glm_kv_stream.hpp.
+#include "maya/kernels/glm_kv_stream.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 
-namespace strata::kernels::glmf {
+namespace maya::kernels::glmf {
 namespace {
 
 constexpr int RT = kKvResolveBlock;
@@ -205,4 +205,4 @@ void glm_kv_copy_misses(const KvStreamMap& m, const uint8_t* host, uint8_t* slot
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: copy: %s\n", cudaGetErrorString(e));
 }
-}  // namespace strata::kernels::glmf
+}  // namespace maya::kernels::glmf

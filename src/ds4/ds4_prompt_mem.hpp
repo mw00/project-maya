@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 // a 0 / 1 switch: -1 when it is not set (or empty), else whether it is non-zero
 inline int tri_of(const char* v) { return v == nullptr || *v == 0 ? -1 : std::atoi(v) != 0; }
@@ -109,4 +109,4 @@ inline bool pin_took_vram(long long pre, long long post, long long floor_mib) {
     return pre >= floor_mib && post < floor_mib;
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

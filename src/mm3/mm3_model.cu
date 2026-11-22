@@ -49,7 +49,7 @@
 #include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
 
 namespace mm3 {
-namespace x3 = strata::mm3::exl3;
+namespace x3 = maya::mm3::exl3;
 
 #define CK(call)                                                                       \
     do {                                                                               \
@@ -336,7 +336,7 @@ std::string tune_key_of(const std::vector<int>& gpus) {
     for (int id : gpus) {
         cudaDeviceProp pr{};
         if (cudaGetDeviceProperties(&pr, id) != cudaSuccess) continue;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         std::string arch = pr.gcnArchName;
         if (arch.find(':') != std::string::npos) arch.resize(arch.find(':'));
 #else
@@ -422,7 +422,7 @@ struct Model::Impl {
     // (#1026) the reserve held for the whole run: what each GPU's start and requests allocate after the residency,
     // read from the pack's vram-late.txt at the residency and kept free beside the reserve (src/core/vram_late.hpp;
     // MAYA_MM3_LATE_FILE / MAYA_MM3_LATE_MB or MAYA_VRAM_LATE_*)
-    strata::vramlate::Tracker late;
+    maya::vramlate::Tracker late;
     std::unique_ptr<Vision> vis;     // the vision tower (Options::vision)
     std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
@@ -449,7 +449,7 @@ struct Model::Impl {
         if (d.abl_r == nullptr || abl_on.empty()) return;
         if (rseq.empty() || (int) rseq.size() != T) {
             if (!abl_row(bound)) return;
-            if (strata::ablcap::on()) return strata::ablcap::put(y, T, g.dim, d.s);   // (a fitting run: read out)
+            if (maya::ablcap::on()) return maya::ablcap::put(y, T, g.dim, d.s);   // (a fitting run: read out)
             k::project_out(y, d.abl_r, abl_scale, T, g.dim, d.s);
             return;
         }
@@ -1192,7 +1192,7 @@ struct Model::Impl {
             CK(cudaSetDevice(id));
             CK(cudaStreamCreateWithFlags(&d.s, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.hop, cudaEventDisableTiming));
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
             if (const char* sv = ::mm3::env("MM3_SIDE"); sv == nullptr || std::atoi(sv) != 0) {
                 CK(cudaStreamCreateWithFlags(&d.s2, cudaStreamNonBlocking));
                 CK(cudaEventCreateWithFlags(&d.fev, cudaEventDisableTiming));
@@ -1842,7 +1842,7 @@ struct Model::Impl {
             graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
                        !o.verbose &&
                        ::mm3::env("MM3_DUMP_HS") == nullptr &&
-                       !strata::ablcap::on();   // (a fitting run's read-out waits on the host: not in a capture)
+                       !maya::ablcap::on();   // (a fitting run's read-out waits on the host: not in a capture)
             if (graph_on) info.push_back("decode: a token's and a verify window's forward replayed as a graph");
         }
         for (Dev& d : D) {
@@ -2415,7 +2415,7 @@ struct Model::Impl {
             return c;
         }
         for (int r = 0; r < 3; ++r) {
-            strata::kernels::cpu::Exl3Part& m = c.p[r];
+            maya::kernels::cpu::Exl3Part& m = c.p[r];
             if (blob) {
                 m.trellis = (const uint32_t*) (blob + l.lay.trellis[r]);
                 m.suh = (const uint16_t*) (blob + l.lay.suh[r]);
@@ -2909,7 +2909,7 @@ struct Model::Impl {
     // event, the host goes on enqueueing (CUDA; HIP - whose queued work Windows submits only at a host wait - and
     // MAYA_MM3_HOP_EVENTS=0: the host waits for a's stream first, as before)
     bool hop_events = [] {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         return false;
 #else
         const char* v = ::mm3::env("MM3_HOP_EVENTS");
@@ -3455,7 +3455,7 @@ bool Model::write_tune(const std::string& settings, std::string& err) const {
             return false;
         }
     }
-    if (!strata::ds4::os::replace_file(tmp, p->tfile)) {
+    if (!maya::ds4::os::replace_file(tmp, p->tfile)) {
         err = p->tfile + ": cannot replace";
         return false;
     }

@@ -11,9 +11,9 @@
 //   top-k     topk_mb == topk exactly (n 2049 / 40000 / 131072, ties, -inf, per-row positions), three calls
 //             in a row on the same scratch (it must be left zeroed).
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_ref.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 
@@ -32,7 +32,7 @@
 
 namespace {
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // HIP builds have neither nvcuda::wmma kernel (the fused MLA, the WMMA scorer): their cases are skipped, and the WMMA
 // scorer refuses every shape there (idx_score_wmma_supported is false); the rest (headwise, mla2 with BF16 / Q8_0
 // weights, the CUDA-core scorer, the radix top-k, the FP16 keys) runs as on CUDA

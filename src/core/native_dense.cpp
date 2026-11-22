@@ -1,7 +1,7 @@
-#include "strata/core/native_dense.hpp"
-#include "strata/core/weights.hpp"
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "maya/core/native_dense.hpp"
+#include "maya/core/weights.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -12,9 +12,9 @@
 #include <memory>
 #include <set>
 
-namespace strata::core {
+namespace maya::core {
 namespace {
-bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
+bool eligible(const maya::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS and IQ4_XS. Other keys retain the packed BF16 fallback.
@@ -28,12 +28,12 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
 }
 // the trunk's layers: a GGUF that ships its MTP block counts it into block_count (nextn_predict_layers more) - the
 // runner serves the trunk, so blk.<trunk>.* and above are not its (and have no canonical entry)
-int trunk_layers(const strata::GgufFile& gguf) {
+int trunk_layers(const maya::GgufFile& gguf) {
     const auto* bc = gguf.get("qwen4exp.block_count");
     const auto* nextn = gguf.get("qwen4exp.nextn_predict_layers");
     return bc ? (int) (bc->u - (nextn ? nextn->u : 0)) : INT_MAX;
 }
-bool in_mtp_block(const strata::TensorInfo& tensor, int trunk) {
+bool in_mtp_block(const maya::TensorInfo& tensor, int trunk) {
     const auto& name = tensor.name;
     if (trunk == INT_MAX || name.rfind("blk.", 0) != 0) return false;
     return std::atoi(name.c_str() + 4) >= trunk;
@@ -52,11 +52,11 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
                                std::set<std::string>& out, std::string& err) {
     try {
         for (const auto& path : shards) {
-            strata::GgufFile gguf(path);
+            maya::GgufFile gguf(path);
             const int trunk = trunk_layers(gguf);
             for (const auto& tensor : gguf.tensors())
                 if (eligible(tensor, include_ple_key) && !in_mtp_block(tensor, trunk) &&
-                    strata::kernels::native_mmvq_supported(tensor.type) &&
+                    maya::kernels::native_mmvq_supported(tensor.type) &&
                     tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
@@ -85,12 +85,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
         for (const auto& path : shards) {
-            strata::GgufFile gguf(path);
+            maya::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
             if (gguf.get("general.architecture")) {
-                err = strata::check_architecture(gguf);
+                err = maya::check_architecture(gguf);
                 if (!err.empty()) return false;
                 have_architecture = true;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {
@@ -118,7 +118,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             for (const auto& tensor : gguf.tensors()) {
                 int block_elements = 0, block_bytes = 0;
                 uint64_t elements = 1;
-                if (tensor.shape.empty() || !strata::block_geometry(tensor.type, block_elements, block_bytes) ||
+                if (tensor.shape.empty() || !maya::block_geometry(tensor.type, block_elements, block_bytes) ||
                     tensor.shape[0] % (uint64_t) block_elements != 0) {
                     err = "native dense: invalid block geometry " + tensor.name; return false;
                 }
@@ -153,13 +153,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
-                if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                if (!maya::kernels::native_mmvq_supported(tensor.type)) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
-                const auto bytes = strata::kernels::native_mmvq_weight_bytes(
+                const auto bytes = maya::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
@@ -176,7 +176,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
-        const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
+        const auto status = cudaMalloc(&allocation, maya::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
         if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
         // All checks and allocations finish before publishing any reference.
@@ -195,4 +195,4 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         return false;
     }
 }
-} // namespace strata::core
+} // namespace maya::core

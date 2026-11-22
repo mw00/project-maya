@@ -37,11 +37,11 @@
 // Exit 0 when every case is within exl3_test's tolerances (relative RMS 2e-3 for a product, 3e-3 for the experts' and
 // the GEMMs' chains), 1 otherwise, 77 without a GPU (unless only the cpu section runs).  A call a kernel refuses
 // fails, except the refusals listed as expected (printed at the end: they are what the engine has to cut around).
-#include "strata/kernels/cpu/exl3_cpu.hpp"
-#include "strata/kernels/cpu/exl3_ref.hpp"
-#include "strata/kernels/exl3.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/glm_batch.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_ref.hpp"
+#include "maya/kernels/exl3.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/glm_batch.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -68,11 +68,11 @@
 #define GLM_DSA_EXL3_X86 1
 #endif
 
-namespace ex = strata::kernels::exl3;
-namespace cpu = strata::kernels::cpu;
-namespace gb = strata::kernels::glmb;
-using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_f16;
+namespace ex = maya::kernels::exl3;
+namespace cpu = maya::kernels::cpu;
+namespace gb = maya::kernels::glmb;
+using maya::kernels::f16_from_f32;
+using maya::kernels::f32_from_f16;
 
 namespace {
 
@@ -1196,7 +1196,7 @@ void set_case(int gu, int dn, int cb, const std::vector<int>& counts, int row0, 
         dfree(p);
 }
 void sec_set() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const char* kind = ex::prompt_wmma() ? "the matrix-core kernels (EXL3_WMMA=0: the portable ones)" : "the portable kernels";
 #else
     const char* kind = ex::mma_supported() ? "the sm_80+ tensor-core kernels"
@@ -1221,7 +1221,7 @@ void sec_set() {
 
 // ================================================================ gemm_rows
 void sec_gemm() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const char* kind = "the portable kernels";
 #else
     const char* kind = ex::mma_supported() ? "the sm_80+ tensor-core kernels" : "the portable kernels";
@@ -1838,7 +1838,7 @@ int main(int argc, char** argv) {
         CK(cudaGetDevice(&dev));
         CK(cudaGetDeviceProperties(&p, dev));
         probe_family();
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         std::printf("glm_dsa_exl3_test on %s (%s, %d CUs, %.1f GB)\n", p.name, p.gcnArchName, p.multiProcessorCount,
                     (double) p.totalGlobalMem / 1e9);
 #else

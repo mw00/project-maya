@@ -21,7 +21,7 @@
 #define GLMPF_HD inline
 #endif
 
-namespace strata::core::glmpf {
+namespace maya::core::glmpf {
 
 /// Maya's dequant_f16 types beyond its dequant_bf16 geometry table: the i-quants it routes to iq_dequant_f16 (the
 /// batched prompt takes them on glm-dsa only: Flash keeps Maya v1.1.3's prefill_setup set).
@@ -121,4 +121,4 @@ inline std::string refusal(int t) {
            "runs token by token";
 }
 
-}  // namespace strata::core::glmpf
+}  // namespace maya::core::glmpf

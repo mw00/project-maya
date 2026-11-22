@@ -24,7 +24,7 @@
 // choice is time only.  No Q8_K activation holds -128 (ggml's quantizer: -127 .. 127), so negating by vpsignb or a
 // masked subtract never wraps differently from ggml's.
 
-#include "strata/kernels/cpu/iq3v_rows.hpp"
+#include "maya/kernels/cpu/iq3v_rows.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define GGML_COMMON_DECL_CPP
@@ -57,7 +57,7 @@
 #define IQ3V_FI inline __attribute__((always_inline))
 #endif
 
-namespace strata::kernels::cpu::iq3v {
+namespace maya::kernels::cpu::iq3v {
 namespace {
 inline float h2f(uint16_t h) {   // F16 -> F32, exactly
     const uint32_t s = (uint32_t) (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
@@ -406,13 +406,13 @@ bool vnni_form() {
 #endif
 }
 
-}  // namespace strata::kernels::cpu::iq3v
+}  // namespace maya::kernels::cpu::iq3v
 
 #else   // not x86-64: no forms (the caller never asks)
-namespace strata::kernels::cpu::iq3v {
+namespace maya::kernels::cpu::iq3v {
 void rows_iq3xxs(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 void rows_iq4xs(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 void rows_q4x(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 bool vnni_form() { return false; }
-}  // namespace strata::kernels::cpu::iq3v
+}  // namespace maya::kernels::cpu::iq3v
 #endif

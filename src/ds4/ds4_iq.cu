@@ -4,10 +4,10 @@
 #include "ds4_iq1_codes.hpp"
 #include "ds4_par_exp.h"
 #include "ds4_pdl.cuh"
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
-#include "strata/prefill/moe_mmq.hpp"
-#if defined(STRATA_USE_HIP)
-#include "strata/prefill/moe_fused_rdna4.hpp"
+#if defined(MAYA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
+#include "maya/prefill/moe_mmq.hpp"
+#if defined(MAYA_USE_HIP)
+#include "maya/prefill/moe_fused_rdna4.hpp"
 #endif
 #include <cstring>
 #include <map>
@@ -15,13 +15,13 @@
 #endif
 
 #include <cuda_fp16.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <mma.h>
 #endif
 // rocWMMA (the prompt sets on RDNA 3 / 4's matrix cores) as glm_batch.cu reads it: a device pass for gfx11 / gfx12
-// only, the host pass when the build targets such a card (STRATA_HAS_WMMA)
-#if defined(STRATA_USE_HIP) && \
-    ((!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && STRATA_HAS_WMMA) || \
+// only, the host pass when the build targets such a card (MAYA_HAS_WMMA)
+#if defined(MAYA_USE_HIP) && \
+    ((!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && MAYA_HAS_WMMA) || \
      ((defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
       defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))))
 #define DS4_ROCWMMA 1
@@ -55,7 +55,7 @@
 #include <mutex>
 #include <utility>
 
-namespace strata::ds4::gguf::iq {
+namespace maya::ds4::gguf::iq {
 namespace {
 
 constexpr int kWarps = 8, kThreads = kWarps * 32;
@@ -121,7 +121,7 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
 // there every rounding is explicit (no contraction, barriers the compiler cannot fold through) and IQ4_XS's rows load
 // in 16-bit halves.  Elsewhere - gfx11 and the other AMD GPUs, CUDA - the kernels compile as before (the same bits and
 // speed as v1.1.30: the barriers cost a Strix Halo ~7% of its decode).
-#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx906__))
+#if defined(MAYA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx906__))
 #define DS4_IQ_STRICT_FP 1
 #else
 #define DS4_IQ_STRICT_FP 0
@@ -487,7 +487,7 @@ __device__ __forceinline__ float fma_no_contract(float a, float b, float c) {
 // token kernels - the answers without drafts - had from ROCm 7's clang on gfx1151 (hy4_experts_test, HY4_EXPERTS_K:
 // the bits before and after), so those keep their bits and the windows now match them.  DS4_IQ_MF_G / _U / _DN / _MV:
 // a build's own choice.  The other builds of this file compile as before.
-#if defined(STRATA_USE_HIP) && !DS4_IQ_STRICT_FP && defined(DS4_IQ_MIN_FORMS)
+#if defined(MAYA_USE_HIP) && !DS4_IQ_STRICT_FP && defined(DS4_IQ_MIN_FORMS)
 #if !defined(DS4_IQ_MF_G)
 #define DS4_IQ_MF_G 4
 #endif
@@ -505,7 +505,7 @@ constexpr int kMinG = DS4_IQ_MF_G, kMinU = DS4_IQ_MF_U, kMinDN = DS4_IQ_MF_DN, k
 constexpr int kMinG = -1, kMinU = -1, kMinDN = -1, kMinMV = -1;
 #endif
 __device__ __forceinline__ float min_bar(float v) {   // (a value the compiler cannot fold a rounding through)
-#if defined(STRATA_USE_HIP) && defined(__clang__)
+#if defined(MAYA_USE_HIP) && defined(__clang__)
     asm volatile("" : "+v"(v));
 #endif
     return v;
@@ -696,7 +696,7 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
     }
 }
 
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
 __device__ __forceinline__ float hip_xor16(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
 }
@@ -715,7 +715,7 @@ __device__ __forceinline__ float hip_xor1(float v) {
 #endif
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
 #if DS4_IQ_STRICT_FP
     v = fadd_no_fma(v, hip_xor16(v));
     v = fadd_no_fma(v, hip_xor8(v));
@@ -763,7 +763,7 @@ template <int EPI>
 constexpr bool kBoth = EPI < 2;   // (gate and up in this pass)
 template <int EPI>
 __device__ __forceinline__ float act_out(float gv, float uv, float limit, int pexp = 0) {
-    if constexpr (EPI == 0) return pexp ? strata::ds4::par::swiglu_portable(gv, uv, limit) : swiglu(gv, uv, limit);
+    if constexpr (EPI == 0) return pexp ? maya::ds4::par::swiglu_portable(gv, uv, limit) : swiglu(gv, uv, limit);
     else return swigluoai(gv, uv, limit);
 }
 template <int EPI>
@@ -788,7 +788,7 @@ __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& bl
 // RW rows a warp, 32 / RW lanes a row (a lane a sub-block a step), their sums over those lanes
 template <int RW>
 __device__ __forceinline__ float lanes_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
 #if DS4_IQ_STRICT_FP
     if constexpr (RW <= 1) v = fadd_no_fma(v, hip_xor16(v));
     if constexpr (RW <= 2) v = fadd_no_fma(v, hip_xor8(v));
@@ -842,7 +842,7 @@ struct Ahead {
 // summed in the same order: every output keeps its bits, whatever the grid.  The smaller codebooks keep the full grid (a
 // block there loads little, and one of an empty group leaves at once).  CUDA's maya-ds4 only: HIP and maya-mm3's build
 // of this file (MAYA_DS4_IQ_ONLY) keep the full grids, and so do MiniMax's epilogues (EPI 1..3).
-#if defined(STRATA_USE_HIP) || defined(MAYA_DS4_IQ_ONLY)
+#if defined(MAYA_USE_HIP) || defined(MAYA_DS4_IQ_ONLY)
 #define DS4_IQ_PERSIST_BUILD 0
 #else
 #define DS4_IQ_PERSIST_BUILD 1
@@ -1128,7 +1128,7 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
     }
 }
 
-#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
+#if !defined(MAYA_USE_HIP) || MAYA_HAS_WMMA
 // the same on the tensor cores (sm_70+; AMD: RDNA 3 / 4's, rocWMMA): 8 warps each 16 rows x 32 outputs, the tiles
 // F16 in shared memory.  RM > 1: a block takes RM x 64 rows (each warp RM x 16), every weight tile decoded once for
 // all of them - an expert's weights decoded once per 64 * RM of its rows, not once per 64 (the decode is most of the
@@ -1138,10 +1138,10 @@ template <int T, bool GATE_UP, int EPI = 0, int RM = 1>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     pdl_wait();
     pdl_trigger();
-#if defined(STRATA_USE_HIP) && !DS4_ROCWMMA
+#if defined(MAYA_USE_HIP) && !DS4_ROCWMMA
     __builtin_trap();   // (a device pass for a card without WMMA: never launched there - tc_ok)
 #else
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     namespace wm = rocwmma;
     using wh = _Float16;
 #else
@@ -1369,7 +1369,7 @@ __global__ void __launch_bounds__(kThreads) mv_heads_kernel(const MvJob b0, size
         }
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // Q8_0 GEMVs with the activations in registers (mv_reg; MAYA_IQ_MV_REG=0: mv_kernel / mv_heads_kernel, as before).
 // mv_kernel gives a row a warp, and every row's lanes read the activations again - each column's 32 int8 values and
 // their scale for each of the lane's sub-blocks: as many load instructions as the weights take for one column, three
@@ -1526,7 +1526,7 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
     const size_t at = (size_t) b * 32 + lane, qr = (size_t) blockIdx.y;
     const float v = xf != nullptr ? xf[(size_t) idx[lr] * ldx + at] : __half2float(__ushort_as_half(xh[(size_t) lr * ldx + at]));
     float am = fabsf(v);
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     am = fmaxf(am, hip_xor16(am));
     am = fmaxf(am, hip_xor8(am));
     am = fmaxf(am, hip_xor4(am));
@@ -1649,7 +1649,7 @@ __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restr
 // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), MAYA_DS4_NO_TC=1 keeps the F32 kernel - per device (the GPUs
 // of a run need not be of one generation: one before sm_70 beside newer ones keeps its F32 kernel)
 bool tc_ok() {
-#if defined(STRATA_USE_HIP) && !STRATA_HAS_WMMA
+#if defined(MAYA_USE_HIP) && !MAYA_HAS_WMMA
     return false;
 #else
     static const bool off = [] {
@@ -1661,7 +1661,7 @@ bool tc_ok() {
     if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
     int k = known[dev].load(std::memory_order_relaxed);
     if (k == 0) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         cudaDeviceProp p{};
         const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
                         (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0);
@@ -1719,7 +1719,7 @@ struct Iq1Var {
 };
 // the early loads by default: IQ1_M on AMD (a Radeon 8065S, 6 experts' gate / up: 200 -> 150 us); IQ1_S there and both
 // on the V100 gain nothing from them
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 template <int T>
 constexpr bool kAhead = T == kIQ1_M;
 #else
@@ -1893,7 +1893,7 @@ static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_
         return n >= 4 ? 4 : n >= 2 ? 2 : 1;
     }();
     if (env > 0) return env;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static std::atomic<int> known[64];   // 0: not asked yet, else the answer
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 1;
@@ -1910,7 +1910,7 @@ static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_
 }
 template <int T, bool GU, int EPI = 0>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
+#if !defined(MAYA_USE_HIP) || MAYA_HAS_WMMA
     if (tc_ok()) {
         SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
         b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
@@ -2046,7 +2046,7 @@ static bool mv56() {
     static const bool on = !(std::getenv("MAYA_IQ_MV56") && std::getenv("MAYA_IQ_MV56")[0] == '0');
     return on;
 }
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 static bool mv_reg_on() {
     static const bool on = !(std::getenv("MAYA_IQ_MV_REG") && std::getenv("MAYA_IQ_MV_REG")[0] == '0');
     return on;
@@ -2145,7 +2145,7 @@ static bool mv_heads_reg_launch(const MvJob& b, int H, size_t ws, size_t xs, siz
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wide = false) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if constexpr (T == kQ8_0)
         if (wide && mv_reg_on() && max_c <= 8 && max_c >= mv_reg_min()) {
             int max_k = 0;
@@ -2175,7 +2175,7 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
 template <int T>
 void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s, bool wide = false) {
     const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if constexpr (T == kQ8_0)
         if (wide && mv_reg_on() && b.ncol <= 8 && b.ncol >= mv_reg_min()) {
             if (b.k <= 1024 && mv_heads_reg_launch<1>(b, H, ws, xs, ds, ys, s)) return;
@@ -2304,9 +2304,9 @@ bool persist_on() {
 }
 void set_persist(int on) { g_persist_set.store(on < 0 ? -1 : on != 0 ? 1 : 0, std::memory_order_relaxed); }
 
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+#if defined(MAYA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
 // Prompt expert sets through the existing GLM MMQ path (HIP, opt-in).
-// The same q8_1/MMA path the GLM prompt uses (strata::prefill::mmq): the packed expert is read once, activations are
+// The same q8_1/MMA path the GLM prompt uses (maya::prefill::mmq): the packed expert is read once, activations are
 // rounded to q8_1, and the products run on int8 tensor cores.  Opt-in (MAYA_DS4_EXPERT_MMQ=1), sets of at least 32 rows;
 // smaller sets, unsupported shapes/types and allocation failure keep the FP32 tiled kernel above.  MMQ launches a kernel a
 // matrix an expert, so an IQ1_S set's experts of few rows stay on the light kernels and the tiles (mmq_min_rows).
@@ -2371,7 +2371,7 @@ bool mmq_wanted(const SetArgs& a, bool gate_up) {
     const int type = gate_up ? a.tg : a.td;
     if (type != kIQ2_S && type != kIQ2_XXS && type != kIQ3_S && type != kIQ3_XXS && type != kIQ1_S) return false;
     if (a.max_rows < mmq_min_rows(type)) return false;   // (no expert of the set would take it)
-    if (!strata::prefill::mmq::built() || !strata::prefill::mmq::supported(gate_up ? a.tg : a.td)) return false;
+    if (!maya::prefill::mmq::built() || !maya::prefill::mmq::supported(gate_up ? a.tg : a.td)) return false;
     return true;
 }
 
@@ -2399,7 +2399,7 @@ struct MmqScratch {
     int device;
     cudaEvent_t ready = nullptr;
     bool recorded = false;
-    strata::prefill::mmq::Context* ctx = nullptr;
+    maya::prefill::mmq::Context* ctx = nullptr;
     explicit MmqScratch(int dev) : device(dev) {}
     ~MmqScratch() {
         int previous = 0;
@@ -2426,7 +2426,7 @@ struct MmqScratch {
         }
         if (rows >= nrows && b != nullptr) return true;   // grow only
         release();
-        const size_t q8 = strata::prefill::mmq::q8_bytes(nrows, 5120);
+        const size_t q8 = maya::prefill::mmq::q8_bytes(nrows, 5120);
         if (!mmq_alloc(&xq, q8) ||
             !mmq_alloc((void**) &gu, (size_t) nrows * 2 * 2304 * sizeof(float)) ||
             !mmq_alloc((void**) &hf, (size_t) nrows * 2304 * sizeof(float)) ||
@@ -2435,7 +2435,7 @@ struct MmqScratch {
             release();
             return false;
         }
-        if (!ctx) ctx = new strata::prefill::mmq::Context();
+        if (!ctx) ctx = new maya::prefill::mmq::Context();
         rows = nrows;
         return true;
     }
@@ -2503,8 +2503,8 @@ bool mmq_gate_up(const SetArgs& a, cudaStream_t s) {
     mmq_check(cudaGetLastError(), "launch");
     mmq_iota<<<(sc.rows + 256 + 255) / 256, 256, 0, s>>>(sc.ids, sc.rows + 256);
     mmq_check(cudaGetLastError(), "launch");
-    strata::prefill::mmq::quantize(a.xf, a.idx, sc.xq, a.tg, a.n_embd, a.ldx, total, (void*) s);
-    strata::prefill::mmq::Product p{};
+    maya::prefill::mmq::quantize(a.xf, a.idx, sc.xq, a.tg, a.n_embd, a.ldx, total, (void*) s);
+    maya::prefill::mmq::Product p{};
     p.w = (const uint8_t*) a.wbase + a.tr[0];
     p.type = a.tg;
     p.w_rows = a.n_ff;
@@ -2558,8 +2558,8 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
     mmq_check(cudaGetLastError(), "launch");
     mmq_half_float<<<(total * a.n_ff + 255) / 256, 256, 0, s>>>(a.xh, sc.hf, total, a.n_ff, a.ldx);
     mmq_check(cudaGetLastError(), "launch");
-    strata::prefill::mmq::quantize(sc.hf, nullptr, sc.xq, a.td, a.n_ff, a.n_ff, total, (void*) s);
-    strata::prefill::mmq::Product p{};
+    maya::prefill::mmq::quantize(sc.hf, nullptr, sc.xq, a.td, a.n_ff, a.n_ff, total, (void*) s);
+    maya::prefill::mmq::Product p{};
     p.w = (const uint8_t*) a.wbase + a.tr[2];
     p.type = a.td;
     p.w_rows = a.n_embd;
@@ -2595,8 +2595,8 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
 
 #endif
 
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
-// Prompt expert sets through the fused int8 experts the GLM prompt uses (strata::prefill::rdna4, gfx1151 / gfx1100 /
+#if defined(MAYA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+// Prompt expert sets through the fused int8 experts the GLM prompt uses (maya::prefill::rdna4, gfx1151 / gfx1100 /
 // RDNA4): the weights decoded to int8 in the WMMA tiles' shared memory, the activations and the SwiGLU's H rounded to
 // int8 per 32 values (as GLM's), the products on the int8 matrix cores.  On by default where it covers the set's formats
 // (MAYA_DS4_PREFILL_FUSED=0: the FP16 tiles above).  The set's rows are gathered into the scratch of the caller's
@@ -2643,11 +2643,11 @@ bool fused_wanted(const SetArgs& a) {
     if (mmq_host_bounds[0] != a.row0 || mmq_host_bounds[a.n_exp] - a.row0 != mmq_rows) return false;
     if (a.n_embd != 5120 || a.n_ff != 2304 || a.act != kActSwiglu || (a.tu != 0 && a.tu != a.tg) || a.skip_ge > 0)
         return false;
-    if (fused_scratch_bytes < strata::prefill::rdna4::act_bytes(mmq_rows, a.n_embd)) return false;
-    return strata::prefill::rdna4::supported(a.tg, a.td);
+    if (fused_scratch_bytes < maya::prefill::rdna4::act_bytes(mmq_rows, a.n_embd)) return false;
+    return maya::prefill::rdna4::supported(a.tg, a.td);
 }
-strata::prefill::rdna4::Geometry fused_geo(const SetArgs& a, size_t h_ld) {
-    strata::prefill::rdna4::Geometry g;
+maya::prefill::rdna4::Geometry fused_geo(const SetArgs& a, size_t h_ld) {
+    maya::prefill::rdna4::Geometry g;
     g.gu_type = a.tg;
     g.d_type = a.td;
     g.gu_row = (size_t) (a.n_embd / 256) * (size_t) block_bytes(a.tg);
@@ -2688,8 +2688,8 @@ bool fused_gate_up(const SetArgs& a, cudaStream_t s) {
     if (a.xf == nullptr || a.idx == nullptr || a.h == nullptr) return false;
     void* tiles = fused_tiles(mmq_rows, a.n_exp);
     if (tiles == nullptr) return false;
-    strata::prefill::rdna4::quantize_rows(a.xf, a.ldx, a.idx, mmq_rows, a.n_embd, fused_scratch, s);
-    strata::prefill::rdna4::experts_gate_up(a.wbase, a.stride, fused_geo(a, (size_t) a.ldo * 2), a.n_exp, a.bounds,
+    maya::prefill::rdna4::quantize_rows(a.xf, a.ldx, a.idx, mmq_rows, a.n_embd, fused_scratch, s);
+    maya::prefill::rdna4::experts_gate_up(a.wbase, a.stride, fused_geo(a, (size_t) a.ldo * 2), a.n_exp, a.bounds,
                                             mmq_host_bounds, tiles, fused_scratch, nullptr, a.h, s);
     return true;
 }
@@ -2697,7 +2697,7 @@ bool fused_down(const SetArgs& a, cudaStream_t s) {
     if (a.xh == nullptr || a.y == nullptr || a.ldo != a.n_embd) return false;
     void* tiles = fused_tiles(mmq_rows, a.n_exp);
     if (tiles == nullptr) return false;
-    strata::prefill::rdna4::experts_down(a.wbase, a.stride, fused_geo(a, (size_t) a.ldx * 2), a.n_exp, a.bounds,
+    maya::prefill::rdna4::experts_down(a.wbase, a.stride, fused_geo(a, (size_t) a.ldx * 2), a.n_exp, a.bounds,
                                          mmq_host_bounds, tiles, a.xh, a.y, s);
     return true;
 }
@@ -2705,7 +2705,7 @@ bool fused_down(const SetArgs& a, cudaStream_t s) {
 #endif
 
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+#if defined(MAYA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
     if (fused_wanted(a)) {
         if (fused_gate_up(a, s)) return true;
         std::fprintf(stderr, "ds4: the fused prompt experts could not run a set\n");
@@ -2752,7 +2752,7 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 }
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+#if defined(MAYA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
     if (fused_wanted(a)) {
         if (fused_down(a, s)) return true;
         std::fprintf(stderr, "ds4: the fused prompt experts could not run a set's down\n");
@@ -2901,4 +2901,4 @@ bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* 
     return true;
 }
 
-}  // namespace strata::ds4::gguf::iq
+}  // namespace maya::ds4::gguf::iq

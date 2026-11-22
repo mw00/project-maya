@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace place = strata::ds4::place;
+namespace place = maya::ds4::place;
 
 static int g_fail = 0;
 static long long g_checks = 0;

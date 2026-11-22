@@ -16,8 +16,8 @@
 //                                     activations; glmd_layer_parity uses the same bound)
 // In an ASan build (docs/strata/engine/asan.md) the same run checks the host side of the pool (class vectors, the
 // plan, the staging buffers) for out-of-bounds accesses.  Exits 77 without a device or without the fixture tools.
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_pool_classes.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_pool_classes.hpp"
 
 #include "glm_dsa_fixtures.hpp"
 #include "glm_test_env.hpp"   // setenv / unsetenv (<unistd.h> on POSIX; mapped on Windows)
@@ -65,13 +65,13 @@ bool run(const fs::path& pack, const Case& c, const std::vector<int32_t>& tokens
     setenv("MAYA_GLM_SPLIT", "0", 1);
     bool ok = false;
     {
-        strata::core::Glm5Model m;
+        maya::core::Glm5Model m;
         ok = m.load_pack(pack.string(), kCtx, err);
         if (ok && m.fast()) {
             err = "MAYA_GLM_SLOW=1 loaded the fast path";
             ok = false;
         }
-        classes = strata::core::glm_pool_classes_last();
+        classes = maya::core::glm_pool_classes_last();
         std::vector<float> lg;
         for (size_t t = 0; ok && t < tokens.size(); ++t) {
             ok = m.forward({tokens[t]}, lg, err);

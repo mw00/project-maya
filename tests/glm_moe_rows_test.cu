@@ -6,7 +6,7 @@
 //  - a group's routed experts each once (moe_win_experts over the rows' plans, the shared expert's down rows by mv_nt)
 //    against each row's moe_gate_up (with the fused shared down) + moe_down: bit for bit, with experts shared between
 //    rows, left-out entries and a row with a host part.
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -17,7 +17,7 @@
 #include <random>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace {
 

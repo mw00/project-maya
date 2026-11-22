@@ -2,7 +2,7 @@
 // Run with exactly two visible GPUs; needs about 800 MiB of spare VRAM on each, including calibration scratch.
 #include "../src/ds4/ds4_kernels.cuh"
 #include "../src/ds4/ds4_peer_cuda_compat.cuh"
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #include <hip/hip_runtime.h>
 #endif
 #include <algorithm>
@@ -13,7 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
-using namespace strata::ds4;
+using namespace maya::ds4;
 #define CK(x) do { const auto status_ = (x); if (status_ != hipSuccess) { \
     std::fprintf(stderr, "line %d %s: %s\n", __LINE__, #x, hipGetErrorString(status_)); std::exit(2); } } while (0)
 #define REQUIRE(x) do { if (!(x)) { \
@@ -100,7 +100,7 @@ int main() {
         CK(hipExtMallocWithFlags((void**) &r.peer.flags, flag_count * sizeof(unsigned), hipDeviceMallocUncached));
         r.peer.stride = kCapacity;
         r.peer.timeout_ticks = uint64_t(r.wall_clock_khz) * 2000;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         hipPointerAttribute_t attr{};
         CK(hipPointerGetAttributes(&attr, r.peer.recv));
         REQUIRE(attr.type == hipMemoryTypeDevice && attr.device == i && !attr.isManaged &&

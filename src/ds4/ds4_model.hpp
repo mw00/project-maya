@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 struct Options {
     std::string pack;                 // <model>/maya-ds4
@@ -429,4 +429,4 @@ private:
     std::unique_ptr<Impl> p_;
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

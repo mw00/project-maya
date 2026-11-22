@@ -27,14 +27,14 @@ namespace mm3::ablate {
 inline bool load(const std::string& path, int layer, int dim, float& scale, std::vector<float>& r, std::string& what,
                  std::string& err, const char* engine = "maya-mm3") {
     try {
-        strata::GgufFile g(path);
-        const strata::MetaValue* type = g.get("general.type");
+        maya::GgufFile g(path);
+        const maya::MetaValue* type = g.get("general.type");
         if (type != nullptr && type->s == "adapter") {
             err = path + ": an abliteration adapter (maya-ds4's: DeepSeek's tensors) - " + engine +
                   " takes a control vector (llama-cvector-generator's direction.N)";
             return false;
         }
-        const strata::MetaValue* arch = g.get("general.architecture");
+        const maya::MetaValue* arch = g.get("general.architecture");
         if (arch == nullptr || arch->s != "controlvector") {
             err = path + ": not a control vector (general.architecture " + (arch ? "\"" + arch->s + "\"" : "missing") +
                   ") - " + std::string(engine) + " takes llama-cvector-generator's direction.N";
@@ -42,14 +42,14 @@ inline bool load(const std::string& path, int layer, int dim, float& scale, std:
         }
         // (GgufFile takes general.alignment as given - 0 as its default, 32 - and one that is not a power of two -
         // UINT64_MAX - wraps the data section's start back into the header, whose bytes would then read as the direction)
-        if (const strata::MetaValue* a = g.get("general.alignment"))
+        if (const maya::MetaValue* a = g.get("general.alignment"))
             if (a->u != 0 && (a->u > (1ull << 20) || (a->u & (a->u - 1)) != 0)) {
                 err = path + ": general.alignment " + std::to_string(a->u) + " is not a power of two up to 2^20";
                 return false;
             }
         if (layer <= 0) {   // (a file of one direction: whichever direction.N it is)
             int only = 0, n = 0;
-            for (const strata::TensorInfo& t : g.tensors())
+            for (const maya::TensorInfo& t : g.tensors())
                 if (t.name.compare(0, 10, "direction.") == 0) {
                     ++n;
                     only = std::atoi(t.name.c_str() + 10);
@@ -59,7 +59,7 @@ inline bool load(const std::string& path, int layer, int dim, float& scale, std:
         }
         if (layer > 0) {
             const std::string tname = "direction." + std::to_string(layer);
-            const strata::TensorInfo* t = g.find(tname);
+            const maya::TensorInfo* t = g.find(tname);
             if (t != nullptr && (t->shape.size() != 1 || t->shape[0] != (uint64_t) dim)) {
                 std::string shape;
                 for (uint64_t d : t->shape) shape += (shape.empty() ? "" : ", ") + std::to_string(d);
@@ -73,7 +73,7 @@ inline bool load(const std::string& path, int layer, int dim, float& scale, std:
         return false;
     }
     std::string w;
-    if (!strata::ds4::ablate::load_direction(path, layer, 0, scale, r, w, err)) return false;
+    if (!maya::ds4::ablate::load_direction(path, layer, 0, scale, r, w, err)) return false;
     if ((int) r.size() != dim) {
         err = path + ": a direction of " + std::to_string(r.size()) + " values, the model's hidden size is " +
               std::to_string(dim);

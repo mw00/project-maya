@@ -12,7 +12,7 @@
 #include "glm_dsa_fast.hpp"
 #include "glm_fast_state.hpp"
 #include "glm_memory.hpp"
-#include "strata/core/glm_req_knobs.hpp"
+#include "maya/core/glm_req_knobs.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,9 +20,9 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace glmres {
 
@@ -303,4 +303,4 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

@@ -13,15 +13,15 @@ and stops every Windows NVIDIA build (glmd_mv_dots.cuh's h2f() used __builtin_me
      DEVICE_BUILTINS), __attribute__ (refused in device code too), the __atomic_* / __sync_* builtins, typeof,
      __int128, __PRETTY_FUNCTION__, and inline asm in host code (PTX asm in device code is fine).
      Not checked: preprocessor branches Windows NVIDIA builds never take (defined(__GNUC__) / __clang__ / __linux__ /
-     __APPLE__, the AMD build's STRATA_USE_HIP / __HIPCC__ / __HIP_DEVICE_COMPILE__, GCC's arch macros such as
+     __APPLE__, the AMD build's MAYA_USE_HIP / __HIPCC__ / __HIP_DEVICE_COMPILE__, GCC's arch macros such as
      __x86_64__ that MSVC never defines, !defined(_MSC_VER) / !defined(_WIN32), #if 0, and macros only ever defined
      inside such a branch), the AMD build's own folders (MSVC_SKIP_DIRS) and the sources CMake never builds on
      Windows (MSVC_SKIP_FILES).  A CUDA device branch (__CUDA_ARCH__) is NOT exempt: nvcc's MSVC-mode front end
      refuses __builtin_memcpy / __attribute__ there as well.
   2. The glm-dsa port's files (PORT_GLOBS / PORT_FILES): x86-only code inside an x86 guard, for aarch64 Linux and
      Apple silicon - <immintrin.h> and the other <*intrin.h> under #if defined(__x86_64__) || defined(_M_X64) ...
-     (or a macro only defined under one, such as STRATA_X86); in cmake/glm_dsa.d, -mavx* / -mf16c / -mfma /
-     -march= / /arch:AVX* under an x86 condition (STRATA_CPU_X86, CMAKE_SYSTEM_PROCESSOR MATCHES x86/AMD64, MSVC:
+     (or a macro only defined under one, such as MAYA_X86); in cmake/glm_dsa.d, -mavx* / -mf16c / -mfma /
+     -march= / /arch:AVX* under an x86 condition (MAYA_CPU_X86, CMAKE_SYSTEM_PROCESSOR MATCHES x86/AMD64, MSVC:
      Maya's Windows builds are x64).  X86_PENDING: files with known findings not fixed yet - the test fails once a
      listed file is clean, so the list only shrinks.
   3. The port's files: no POSIX-only C library call or header where Windows compiles (setenv, unsetenv, usleep,
@@ -44,7 +44,7 @@ SRC_DIRS = ("src", "include", "tests")
 SRC_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh", ".inl", ".ipp"}
 
 # --- check 1 --------------------------------------------------------------------------------------------------------
-MSVC_SKIP_DIRS = ("include/strata/hip_compat/", "tests/hip/")   # the AMD build's only (ROCm clang compiles them)
+MSVC_SKIP_DIRS = ("include/maya/hip_compat/", "tests/hip/")   # the AMD build's only (ROCm clang compiles them)
 MSVC_SKIP_FILES = {
     "tests/mm3_lane_test.cpp": "CMakeLists.txt builds it only if(NOT WIN32)",
 }
@@ -71,7 +71,7 @@ ANY_GNU = re.compile(r"__builtin_|__attribute__|__atomic_|__sync_|typeof|__u?int
 NON_MSVC = {
     "__GNUC__", "__clang__", "__linux__", "__linux", "__gnu_linux__", "__unix__", "__unix", "__APPLE__", "__MACH__",
     "__FreeBSD__", "__HIP_DEVICE_COMPILE__", "__HIP__", "__HIPCC__", "__HIP_PLATFORM_AMD__", "__HIP_PLATFORM_HCC__",
-    "STRATA_USE_HIP", "__x86_64__", "__x86_64", "__amd64__", "__amd64", "__i386__", "__i386", "__aarch64__",
+    "MAYA_USE_HIP", "__x86_64__", "__x86_64", "__amd64__", "__amd64", "__i386__", "__i386", "__aarch64__",
     "__arm__", "__powerpc64__", "__ppc64__", "__PPC64__",
 }
 AMD_GPU = re.compile(r"__(gfx|GFX)\w*__$|__AMDGCN\w*__$|__AMDGPU\w*__$")   # __gfx906__, __GFX11__: the AMD build's
@@ -84,7 +84,7 @@ X86_HEADER = re.compile(r"^\s*#\s*include\s*<\s*(immintrin|x86intrin|xmmintrin|e
                         r"fmaintrin|cpuid)\.h\s*>")
 X86 = {"__x86_64__", "__x86_64", "__amd64__", "__amd64", "_M_X64", "_M_AMD64", "__i386__", "__i386", "_M_IX86",
        "__AVX__", "__AVX2__", "__AVX512F__", "__F16C__", "__FMA__", "__SSE2__", "__SSE3__", "__SSSE3__", "__SSE4_1__",
-       "__SSE4_2__", "_MSC_VER", "_WIN64", "STRATA_X86"}
+       "__SSE4_2__", "_MSC_VER", "_WIN64", "MAYA_X86"}
 CMAKE_X86_FLAG = re.compile(r"(?<![\w-])(-mavx\w*|-mf16c|-mfma\b|-mbmi\w*|-march=[^\s;\")]+|/arch:AVX\w*)", re.I)
 
 # --- check 3 --------------------------------------------------------------------------------------------------------
@@ -104,18 +104,18 @@ SHIMMED = {"setenv", "unsetenv", "getpid"}
 
 # The glm-dsa port's files: every file the port added matches one of these.
 PORT_GLOBS = (
-    "src/kernels/cuda/glmd_*", "include/strata/kernels/glmd_*", "src/core/glm_dsa_*", "tests/glm_dsa/*",
+    "src/kernels/cuda/glmd_*", "include/maya/kernels/glmd_*", "src/core/glm_dsa_*", "tests/glm_dsa/*",
     "cmake/glm_dsa.d/*.cmake",
 )
 PORT_FILES = (
-    "include/strata/core/glm_arch.hpp", "include/strata/core/glm_cpu_affinity.hpp",
-    "include/strata/core/glm_draft_adaptive.hpp", "include/strata/core/glm_env.hpp",
-    "include/strata/core/glm_heat_evict.hpp", "include/strata/core/glm_maya_sync.hpp",
-    "include/strata/core/glm_mtp_state.hpp", "include/strata/core/glm_ngram_draft.hpp",
-    "include/strata/core/glm_pool_classes.hpp", "include/strata/core/glm_prompt_cache.hpp",
-    "include/strata/core/glm_req_knobs.hpp", "include/strata/core/glm_state_layout.hpp",
-    "include/strata/core/glm_warm_seq.hpp", "include/strata/kernels/cpu/glm_lane_row4.hpp",
-    "include/strata/prefill/moe_mmq_strata.hpp", "src/core/glm_cb_dump.hpp", "src/core/glm_geometry_check.cpp",
+    "include/maya/core/glm_arch.hpp", "include/maya/core/glm_cpu_affinity.hpp",
+    "include/maya/core/glm_draft_adaptive.hpp", "include/maya/core/glm_env.hpp",
+    "include/maya/core/glm_heat_evict.hpp", "include/maya/core/glm_maya_sync.hpp",
+    "include/maya/core/glm_mtp_state.hpp", "include/maya/core/glm_ngram_draft.hpp",
+    "include/maya/core/glm_pool_classes.hpp", "include/maya/core/glm_prompt_cache.hpp",
+    "include/maya/core/glm_req_knobs.hpp", "include/maya/core/glm_state_layout.hpp",
+    "include/maya/core/glm_warm_seq.hpp", "include/maya/kernels/cpu/glm_lane_row4.hpp",
+    "include/maya/prefill/moe_mmq_strata.hpp", "src/core/glm_cb_dump.hpp", "src/core/glm_geometry_check.cpp",
     "src/core/glm_guards_host.cpp", "src/core/glm_heat_evict.cpp", "src/core/glm_maya_sync.cpp",
     "src/core/glm_mtp_state.cpp", "src/core/glm_mtp_state_model.cu", "src/core/glm_ngram_draft.cpp",
     "src/core/glm_pool_classes.cpp", "src/core/glm_prefill_dsa.cu", "src/core/glm_prefill_dsa.hpp",
@@ -130,7 +130,7 @@ PORT_FILES = (
 )
 # port files with x86 findings known and not fixed yet (the test fails once one of them is clean: take it out then).
 # Empty since lane C item 2: glm_lane_row4.cpp / glm_lane_row4_avx2.cpp keep <immintrin.h> / <cpuid.h> under an x86-64
-# guard and 70-glm-lane-row4.cmake gives the AVX2 flags only under STRATA_CPU_X86.
+# guard and 70-glm-lane-row4.cmake gives the AVX2 flags only under MAYA_CPU_X86.
 X86_PENDING: dict = {}
 
 
@@ -283,7 +283,7 @@ def branch_flags(text: str, pos: set, neg: set = frozenset(), pos_re=None) -> li
 
 def derived(texts, pos: set, neg: set = frozenset(), pos_re=None) -> set:
     """Object-like macros #defined (to non-zero) only inside branches that give E - e.g. GLMD_MVQ_DEVICE (1 under
-    defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__), 0 otherwise) or STRATA_X86."""
+    defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__), 0 otherwise) or MAYA_X86."""
     inside, outside = set(), set()
     for text in texts:
         if "define" not in text:
@@ -448,7 +448,7 @@ def cmake_x86_findings(text: str):
         m = re.match(r"\s*(if|elseif|else|endif)\s*\((.*)\)\s*$", line, re.I)
         if m:
             kind, arg = m.group(1).lower(), m.group(2)
-            x86 = bool(re.search(r"(?<!NOT )\bSTRATA_CPU_X86\b", arg) or
+            x86 = bool(re.search(r"(?<!NOT )\bMAYA_CPU_X86\b", arg) or
                        re.search(r"(?<!NOT )CMAKE_SYSTEM_PROCESSOR\s+MATCHES\s+\S*(x86|AMD64|i686)", arg, re.I) or
                        re.fullmatch(r"\s*MSVC\s*", arg))
             if kind == "if":
@@ -519,7 +519,7 @@ class GnuOnlyWhereMsvcCompiles(unittest.TestCase):
         flagged = [(1, "GNU __atomic builtin (std::atomic works everywhere)")]
         self.assertEqual(flagged, scan_snippet(body, "src/x.cpp"))
         for guard in ("defined(__GNUC__) || defined(__clang__)", "!defined(_MSC_VER)", "defined(__linux__)",
-                      "defined(STRATA_USE_HIP)", "defined(__x86_64__) && !defined(_WIN32)", "0"):
+                      "defined(MAYA_USE_HIP)", "defined(__x86_64__) && !defined(_WIN32)", "0"):
             self.assertEqual([], scan_snippet("#if %s\n%s#endif\n" % (guard, body), "src/x.cpp"), guard)
         for guard in ("defined(__CUDA_ARCH__)", "!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700",
                       "defined(__GNUC__) || defined(_MSC_VER)", "__CUDA_ARCH__ < 610", "1"):
@@ -547,7 +547,7 @@ class X86Guards(unittest.TestCase):
         self.assertEqual([], x86_findings("#if defined(__x86_64__) || defined(_M_X64)\n#include <immintrin.h>\n"
                                           "#endif\n"))
         cm = ("if(MSVC)\n  set(F /arch:AVX2)\nelse()\n  set(F -mavx2)\nendif()\n"
-              "if(STRATA_CPU_X86)\n  set(G -mavx2;-mfma)\nendif()\n")
+              "if(MAYA_CPU_X86)\n  set(G -mavx2;-mfma)\nendif()\n")
         self.assertEqual([(4, "-mavx2")], cmake_x86_findings(cm))
 
 

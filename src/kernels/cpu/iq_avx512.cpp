@@ -11,7 +11,7 @@
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23), and the K-quants Q4_K (12)
 // and Q5_K (13) (with ggml's min terms from the activations' block sums).  IQ1_M stays on ggml-cpu (no shipped model
 // has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
-#include "strata/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -24,7 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
@@ -406,4 +406,4 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

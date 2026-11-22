@@ -13,7 +13,7 @@
 //   4. GREEDY CONTINUATION: argmax-stepping the runner (state persisting) must follow the oracle's
 //      greedy chain for the CURRENT dump - computed at run time from the dump's own columns,
 //      never a constant (a Phase-1 chain hardcoded here went stale when the oracle was repaired).
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <cuda_runtime.h>
 
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    strata::core::Glm5Model model;
+    maya::core::Glm5Model model;
     std::string err;
     require(model.load(gguf, 64, err), "load: " + err);
     const size_t V = (size_t) model.geometry().n_vocab;
@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
         require(std::fwrite(blob.data(), 1, blob.size(), dst) == blob.size(), "mutation: short write");
         std::fclose(dst);
 
-        strata::core::Glm5Model corrupt;
+        maya::core::Glm5Model corrupt;
         require(corrupt.load(corrupt_path, 64, err), "mutation load: " + err);
         std::vector<float> mutated;
         require(corrupt.forward(prompt, mutated, err), "mutation forward: " + err);

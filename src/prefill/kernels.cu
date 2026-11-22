@@ -1,8 +1,8 @@
-// src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
-#include "strata/prefill/kernels.hpp"
-#include "strata/kernels/mrope.hpp"
-#include "strata/kernels/router_top10.hpp"
-#include "strata/prefill/failure.hpp"
+// src/prefill/kernels.cu - see include/maya/prefill/kernels.hpp.
+#include "maya/prefill/kernels.hpp"
+#include "maya/kernels/mrope.hpp"
+#include "maya/kernels/router_top10.hpp"
+#include "maya/prefill/failure.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -12,14 +12,14 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::prefill {
+namespace maya::prefill {
 namespace {
 
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -33,7 +33,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
@@ -68,12 +68,12 @@ __device__ float block_sum(float v, float* sh) {
     return sh[0];
 }
 // A failed launch (an allocation, most of the time) ends this request, not the process: the reason is thrown and
-// the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
+// the caller turns it into an error for the request (include/maya/prefill/failure.hpp).
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e));
-        strata::prefill::fail(std::string("prefill ") + what + ": " + cudaGetErrorString(e));
+        maya::prefill::fail(std::string("prefill ") + what + ": " + cudaGetErrorString(e));
     }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
@@ -503,7 +503,7 @@ __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, i
     const int pair = threadIdx.x;               // 0..31
     const int64_t t = row / heads, h = row % heads;
     float* p = x + t * ld + h * dim;
-    const float theta = (float) strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
+    const float theta = (float) maya::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
     const float c = cosf(theta), s = sinf(theta);
     const float a = p[pair], b = p[pair + 32];
     p[pair] = a * c - b * s;
@@ -528,7 +528,7 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
 __global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
                                  uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-                                 strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage) {
+                                 maya::kernels::KvHostPools host, maya::kernels::KvHostPools stage) {
     const int64_t t = blockIdx.x;
     const int kvh = blockIdx.y, g = blockIdx.z >> 1;
     const bool is_v = (blockIdx.z & 1) != 0;
@@ -584,11 +584,11 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
+               void* stream, const maya::kernels::KvHostPools* host, const maya::kernels::KvHostPools* stage) {
     if (T <= 0) return;
     kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
         K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
-        host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
+        host ? *host : maya::kernels::KvHostPools{}, stage ? *stage : maya::kernels::KvHostPools{});
     check("kv_append");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
@@ -677,7 +677,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
     else if (n_expert == 256)
         route_kernel<8><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
     else
-        strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
+        maya::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
@@ -731,7 +731,7 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
 }
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream) {
     const float theta_scale = powf(freq_base, -2.0f / 64.0f);
-    rope_kernel<<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(x, heads, dim, ld, pos0, theta_scale, strata::kernels::mrope_table());
+    rope_kernel<<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(x, heads, dim, ld, pos0, theta_scale, maya::kernels::mrope_table());
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
@@ -743,4 +743,4 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
     check("gate_attn");
 }
 
-}  // namespace strata::prefill
+}  // namespace maya::prefill

@@ -57,7 +57,7 @@ Other backends and CUDA toolkits were not exercised in these hardware runs.
 
 ## Reproduce
 
-Configure a CUDA build with `STRATA_BUILD_TESTS=ON`. Stop the resident model before
+Configure a CUDA build with `MAYA_BUILD_TESTS=ON`. Stop the resident model before
 running the standalone GPU tests so they have enough free VRAM.
 
 ```sh

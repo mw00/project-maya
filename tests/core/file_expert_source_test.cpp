@@ -1,9 +1,9 @@
-#include "strata/core/expert_source.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "maya/core/expert_source.hpp"
+#include "maya/kernels/cpu/expert.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
 
-#if defined(STRATA_NATIVE_EXPERTS)
-#include "strata/kernels/cpu/native_expert.hpp"
+#if defined(MAYA_NATIVE_EXPERTS)
+#include "maya/kernels/cpu/native_expert.hpp"
 #include "ggml.h"
 #endif
 
@@ -64,7 +64,7 @@ void create_pack(const fs::path& dir, uint64_t bytes, const std::vector<std::pai
     }
 }
 
-void check_file_size_rejection(strata::core::FileExpertSource& source, const fs::path& dir, int64_t layers,
+void check_file_size_rejection(maya::core::FileExpertSource& source, const fs::path& dir, int64_t layers,
                                int64_t experts, uint64_t expected_bytes) {
     std::string err;
     source.close();
@@ -79,8 +79,8 @@ void check_file_size_rejection(strata::core::FileExpertSource& source, const fs:
 }
 
 void test_canonical_layout() {
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
+    using namespace maya::core;
+    using namespace maya::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
     const uint64_t layer_bytes = (uint64_t) experts * BLOB;
@@ -120,10 +120,10 @@ void test_canonical_layout() {
     source.close();
 }
 
-#if defined(STRATA_NATIVE_EXPERTS)
+#if defined(MAYA_NATIVE_EXPERTS)
 void test_native_variable_layout() {
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
+    using namespace maya::core;
+    using namespace maya::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
     constexpr int64_t embedding = 2560;
@@ -185,7 +185,7 @@ void test_native_variable_layout() {
 #endif
 
 void test_complement_plan() {
-    using namespace strata::core::detail;
+    using namespace maya::core::detail;
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     std::string error;
@@ -207,7 +207,7 @@ void test_complement_plan() {
 }
 
 void test_cgroup_memory_budget() {
-    using namespace strata::core::detail;
+    using namespace maya::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
     uint64_t bytes = 0;
 
@@ -242,7 +242,7 @@ void test_cgroup_memory_budget() {
 }
 
 void test_drive_reads_at_once() {
-    using namespace strata::core::detail;
+    using namespace maya::core::detail;
     const std::vector<int> counts = {2, 4, 8, 16};
     // an NVMe: more in flight is faster until ~8; 16 is within 3% of 8, so 8 (the fewest that close to the best)
     require(pick_reads_at_once(counts, {1690, 1970, 2100, 2110}) == 8, "NVMe-like rates did not pick 8");
@@ -261,8 +261,8 @@ void test_drive_reads_at_once() {
 }
 
 void test_begin_layer_prefetch() {
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
+    using namespace maya::core;
+    using namespace maya::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
     const uint64_t layer_bytes = (uint64_t) experts * BLOB;
@@ -314,7 +314,7 @@ int main() {
         test_drive_reads_at_once();
         test_canonical_layout();
         test_begin_layer_prefetch();
-#if defined(STRATA_NATIVE_EXPERTS)
+#if defined(MAYA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif
         std::cout << "file_expert_source_test: PASS\n";

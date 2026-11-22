@@ -11,8 +11,8 @@
 //      the 79 x 256 layout and the tool; the Flash hint is empty (Maya's message unchanged);
 //   5. with a path argument: that file (tools/strata/glm_dsa_profile.py's output, test_glm_dsa_profile.py passes it)
 //      is read at the layout given by the next two arguments - the Python writer and the engine's reader agree.
-#include "strata/core/expert_cache.hpp"
-#include "strata/core/glm_maya_sync.hpp"
+#include "maya/core/expert_cache.hpp"
+#include "maya/core/glm_maya_sync.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -29,12 +29,12 @@ void check(bool ok, const char* what) {
         ++fails;
     }
 }
-using strata::core::GlmArch;
+using maya::core::GlmArch;
 using Pair = std::pair<int32_t, int32_t>;
 }  // namespace
 
 int main(int argc, char** argv) {
-    namespace sc = strata::core;
+    namespace sc = maya::core;
     if (argc == 4) {   // 5. a profile written by tools/strata/glm_dsa_profile.py
         std::vector<Pair> ranked;
         int64_t slots = 0;
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
     check(r.size() > 4 && r[0] == Pair(3, 255) && r[1] == Pair(78, 17), "resident first, by heat (NextN included)");
     check(r.size() > 4 && r[2] == Pair(40, 9) && r[3] == Pair(77, 1) && r[4] == Pair(5, 2),
           "then the counted routes, then the prior");
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "strata_glm_maya_sync_test";
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "maya_glm_maya_sync_test";
     std::filesystem::create_directories(dir);
     const std::string path = (dir / "glm-dsa-profile.bin").string();
     check(sc::write_expert_profile(path, NL, NE, r, err), "written at 79 x 256");

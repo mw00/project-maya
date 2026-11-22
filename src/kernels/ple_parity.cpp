@@ -10,10 +10,10 @@
 //      `ple_layer_xcheck.cpp`.  That file records EVERY intermediate (key, value, gate, gated, normalized,
 //      conv_out, result), so a mismatch can be attributed to a stage instead of guessed at - and the weights
 //      in it were checked to be the artifact's real ones before this test was written.
-#include "strata/kernels/ple.hpp"
-#include "strata/kernels/ngram.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "maya/kernels/ple.hpp"
+#include "maya/kernels/ngram.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/native_mmvq.hpp"
 #include "ple_oracle_vectors.inc"
 
 #include <cuda_runtime.h>
@@ -27,8 +27,8 @@
 #include <stdexcept>
 #include <vector>
 
-namespace k = strata::kernels;
-namespace o = strata::kernels::ple_oracle;
+namespace k = maya::kernels;
+namespace o = maya::kernels::ple_oracle;
 
 namespace {
 
@@ -283,7 +283,7 @@ int main(int argc, char** argv) {
         for (const std::string& f : {gguf, pack + "/dense.bin", in_bin, out_bin}) {
             if (file_size(f.c_str()) < 0) {
                 std::fprintf(stderr, "ple_parity: SKIPPED, a required input is not on this PC: %s (give it with "
-                             "--gguf / $MAYA_PLE_GGUF, --pack, or STRATA_PLE_FIXTURE_DIR for ple_in.bin / ple_out.bin)\n",
+                             "--gguf / $MAYA_PLE_GGUF, --pack, or MAYA_PLE_FIXTURE_DIR for ple_in.bin / ple_out.bin)\n",
                              f.c_str());
                 return 77;
             }

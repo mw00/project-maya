@@ -1,5 +1,5 @@
 // src/mm3/mm3_cpu.hpp - maya-mm3's CPU lane: a token's routed experts that are not in VRAM, computed on the CPU from
-// host memory while the GPU computes the others (the shared CPU EXL3 kernels, include/strata/kernels/cpu/exl3_cpu.hpp,
+// host memory while the GPU computes the others (the shared CPU EXL3 kernels, include/maya/kernels/cpu/exl3_cpu.hpp,
 // with MiniMax-M3.1's swigluoai between gate / up and down).
 #pragma once
 
@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 
 namespace mm3 {
 
@@ -24,7 +24,7 @@ struct GgFmt {
 };
 
 struct CpuExpert {
-    strata::kernels::cpu::Exl3Part p[3];   // gate (w1), up (w3), down (w2)
+    maya::kernels::cpu::Exl3Part p[3];   // gate (w1), up (w3), down (w2)
     float w = 0.0f;                         // its weight in the sum (routed_scaling_factor included)
     // (a GGUF's expert instead: its layer's format, and its three matrices' rows in host memory - gg_run's)
     const GgFmt* gf = nullptr;
@@ -53,7 +53,7 @@ public:
     int max_entries() const;
     int threads() const;
     /// The workers a lane takes on this host: one a physical core the process may run on, but the first (the
-    /// caller's) - SMT siblings left out (strata::kernels::cpu::physical_cores).
+    /// caller's) - SMT siblings left out (maya::kernels::cpu::physical_cores).
     static int auto_workers();
     /// f(0 .. n - 1) on the lane's threads (the caller one of them), back when all are done.
     void parallel_for(int n, const std::function<void(int)>& f);

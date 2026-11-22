@@ -2,8 +2,8 @@
 // n_embd 6144 and at kMaxEmbd 8192 against an F64 reference (and glm5-next's 4096), the forced bad shapes that must
 // count an error instead of returning silently, and a 6144-wide route into the host-mapped ring that must leave the
 // next ring slot untouched (the canary: before B2.1 x[4096] spilled 8 KB into it).
-#include "strata/kernels/glm_batch.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_batch.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
 
@@ -15,8 +15,8 @@
 #include <random>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
-namespace gb = strata::kernels::glmb;
+namespace gf = maya::kernels::glmf;
+namespace gb = maya::kernels::glmb;
 
 #define CHECK(call) do { const cudaError_t e_ = (call); if (e_ != cudaSuccess) { \
     std::fprintf(stderr, "%s: %s\n", #call, cudaGetErrorString(e_)); return 2; } } while (0)

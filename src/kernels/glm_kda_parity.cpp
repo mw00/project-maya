@@ -19,7 +19,7 @@
 //
 // The positive comparison holds the f32 kernels to ref/glm.py's f64 loop at f32 tolerance, over two
 // geometries (the synthetic model's, and the real model's head_dim with fewer heads).
-#include "strata/kernels/glm_kda.hpp"
+#include "maya/kernels/glm_kda.hpp"
 
 #include <cuda_runtime.h>
 
@@ -246,7 +246,7 @@ void test_case(int n_head, int head_dim, int T, float lower_bound, uint32_t seed
     float* d_gated = a.d + off; off += seq;
 
     // ---- conv (reads the history; the slide moves it forward for the next call)
-    strata::kernels::glm_kda_conv(d_x, d_w, d_conv_state, (int) di, f.d_conv, T, d_conv_out, nullptr);
+    maya::kernels::glm_kda_conv(d_x, d_w, d_conv_state, (int) di, f.d_conv, T, d_conv_out, nullptr);
     check(cudaGetLastError(), "conv launch");
     std::vector<float> r_conv, r_state;
     ref_conv(f, r_conv, r_state, false);
@@ -261,7 +261,7 @@ void test_case(int n_head, int head_dim, int T, float lower_bound, uint32_t seed
     require(max_abs(r_conv, w_conv) > 1e-2, "the conv tap order is indistinguishable - enlarge conv_w");
 
     // ---- gate
-    strata::kernels::glm_kda_gate(d_g, d_a, f.lower_bound, head_dim, n_head, T, d_g1, nullptr);
+    maya::kernels::glm_kda_gate(d_g, d_a, f.lower_bound, head_dim, n_head, T, d_g1, nullptr);
     check(cudaGetLastError(), "gate launch");
     std::vector<float> k_g1(seq);
     check(cudaMemcpy(k_g1.data(), d_g1, k_g1.size() * sizeof(float), cudaMemcpyDeviceToHost), "g1 D2H");
@@ -273,7 +273,7 @@ void test_case(int n_head, int head_dim, int T, float lower_bound, uint32_t seed
     require(max_abs(r_g1, w_g1) > 1e-2, "the lower-bound and softplus forms are indistinguishable");
 
     // ---- recurrence (the gate kernel's own output feeds it, like the engine's graph)
-    strata::kernels::glm_kda_recurrence(d_q, d_k, d_v, d_g1, d_beta, d_rec_state, n_head, head_dim, T, d_rec,
+    maya::kernels::glm_kda_recurrence(d_q, d_k, d_v, d_g1, d_beta, d_rec_state, n_head, head_dim, T, d_rec,
                                         nullptr);
     check(cudaGetLastError(), "recurrence launch");
     std::vector<float> k_rec(seq);
@@ -302,7 +302,7 @@ void test_case(int n_head, int head_dim, int T, float lower_bound, uint32_t seed
     require(max_abs(r_rec, w_rec) > 1e-2, "the 1/sqrt(dv) output scale is invisible");
 
     // ---- out gate
-    strata::kernels::glm_kda_out_gate(d_rec, d_nw, d_g2, head_dim, n_head, T, f.norm_eps, d_gated, nullptr);
+    maya::kernels::glm_kda_out_gate(d_rec, d_nw, d_g2, head_dim, n_head, T, f.norm_eps, d_gated, nullptr);
     check(cudaGetLastError(), "out_gate launch");
     std::vector<float> k_gated(seq);
     check(cudaMemcpy(k_gated.data(), d_gated, k_gated.size() * sizeof(float), cudaMemcpyDeviceToHost), "gated D2H");

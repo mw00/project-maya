@@ -15,7 +15,7 @@
 //        swiglu and the down input; per expert and band the down rows) - an expert's time on the lane, the number the
 //        engine's start-up timing compares with a copy over PCIe, and the trellis GB/s.
 // --pin: thread t on CPU t (one a physical core while T <= the core count on Linux's usual numbering).
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -34,7 +34,7 @@
 #include <sched.h>
 #endif
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 using clk = std::chrono::steady_clock;
 
 namespace {

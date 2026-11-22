@@ -4,8 +4,8 @@
 //
 // Dequant must match gguf-py's values to fp32 rounding; the MMVQ dot (q8_1 activations) must match the float
 // matrix-vector product within the activation rounding (a few 1e-3 relative).
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "maya/kernels/iq_kernels.hpp"
+#include "maya/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -40,8 +40,8 @@ int main(int argc, char** argv) {
         cudaMalloc(&dq, ref.size() * 4);
         cudaMemcpy(dw, raw.data(), raw.size(), cudaMemcpyHostToDevice);
         double dq_err = 0.0;
-        if (strata::kernels::iq_supported(type) && ((size_t) rows * cols) % 256 == 0) {
-            strata::kernels::iq_dequant_f32(type, dw, (int64_t) rows * cols, dq, s);
+        if (maya::kernels::iq_supported(type) && ((size_t) rows * cols) % 256 == 0) {
+            maya::kernels::iq_dequant_f32(type, dw, (int64_t) rows * cols, dq, s);
             std::vector<float> got(ref.size());
             cudaMemcpy(got.data(), dq, got.size() * 4, cudaMemcpyDeviceToHost);
             double num = 0, den = 0;
@@ -60,9 +60,9 @@ int main(int argc, char** argv) {
         cudaMalloc(&xq, (size_t) 2 * cols / 32 * 36);
         cudaMalloc(&dy, (size_t) 2 * rows * 4);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
-        strata::kernels::quantize_q8_1_rows(dx, 2, cols, xq, s);
+        maya::kernels::quantize_q8_1_rows(dx, 2, cols, xq, s);
         try {
-            strata::kernels::native_mmvq(type, dw, xq, dy, cols, rows, 2, s);
+            maya::kernels::native_mmvq(type, dw, xq, dy, cols, rows, 2, s);
         } catch (const std::exception& e) { std::printf("%-8s mmvq: %s\n", nm, e.what()); ++failures; continue; }
         std::vector<float> y((size_t) 2 * rows);
         cudaStreamSynchronize(s);

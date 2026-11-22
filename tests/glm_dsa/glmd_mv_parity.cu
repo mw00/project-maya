@@ -12,7 +12,7 @@
 #include <cuda_fp16.h>
 
 #include "../../src/kernels/cuda/glmd_mv_dots.cuh"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include "ggml.h"
 
@@ -25,7 +25,7 @@
 #include <random>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace {
 

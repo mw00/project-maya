@@ -9,7 +9,7 @@
 // Every supported IQ format is covered.  The weight blocks and the q8_1 activations are random bytes: the
 // dequantisers are total functions of the bytes, and a NaN propagates identically through both paths, so
 // the bit comparison is still the right check.
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -32,7 +32,7 @@ int main() {
         const int qk = block_elems(t);
         const int n_in = qk * 4;            // 4 blocks per row keeps every format's block loop exercised
         const int n_out = 8;
-        const size_t rb = strata::kernels::iq_row_bytes(t, n_in);
+        const size_t rb = maya::kernels::iq_row_bytes(t, n_in);
         if (rb == 0) { std::printf("  type %d: no row size, skipped\n", t); ++fails; continue; }
         const size_t w_bytes = rb * (size_t) n_out;
         std::vector<uint8_t> hw(w_bytes);
@@ -69,11 +69,11 @@ int main() {
             // reference: the scalar entry point, one column at a time
             cudaMemset(dy_ref, 0, (size_t) max_cols * (size_t) n_out * sizeof(float));
             for (int c = 0; c < ncols; ++c)
-                strata::kernels::iq_mmvq(t, dw, dx + (size_t) c * xb, dy_ref + (size_t) c * n_out,
+                maya::kernels::iq_mmvq(t, dw, dx + (size_t) c * xb, dy_ref + (size_t) c * n_out,
                                          n_in, n_out, 1, nullptr);
             // batched
             cudaMemset(dy_bat, 0, (size_t) max_cols * (size_t) n_out * sizeof(float));
-            strata::kernels::iq_mmvq(t, dw, dx, dy_bat, n_in, n_out, ncols, nullptr);
+            maya::kernels::iq_mmvq(t, dw, dx, dy_bat, n_in, n_out, ncols, nullptr);
             cudaDeviceSynchronize();
 
             std::vector<float> a((size_t) ncols * (size_t) n_out), b((size_t) ncols * (size_t) n_out);

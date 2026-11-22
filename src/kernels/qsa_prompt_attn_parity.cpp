@@ -8,9 +8,9 @@
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale;
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "maya/kernels/qsa.hpp"
+#include "maya/kernels/qsa_decode_attn.hpp"
+#include "maya/kernels/qsa_prompt_attn.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -22,7 +22,7 @@
 #include <random>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = maya::kernels;
 
 namespace {
 void ck(cudaError_t e, const char* w) {

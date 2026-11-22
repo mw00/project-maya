@@ -1,6 +1,6 @@
 // src/kernels/cpu/glm_lane_row4.cpp - the glm-dsa port B14.9: the CPU expert lane's lockstep 4-row decode GEMV - its
 // switch, its CPU check and the two hooks native_expert.cpp calls at nt = 1.  See
-// include/strata/kernels/cpu/glm_lane_row4.hpp for the contract; the kernels are in glm_lane_row4_avx2.cpp.
+// include/maya/kernels/cpu/glm_lane_row4.hpp for the contract; the kernels are in glm_lane_row4_avx2.cpp.
 //
 // Two files, because native_expert.cpp calls the hooks on every one-token step of every model whose rows its own
 // kernels do not take, with the lane on or off - on a CPU without AVX, every such step.  This file is compiled like
@@ -10,17 +10,17 @@
 // row4x86::kernel(), and only after cpu_ok() below has said yes.
 //
 // Builds (cmake/glm_dsa.d/70-glm-lane-row4.cmake): every native-experts build compiles this file.  x86-64 builds also
-// get the kernels, with STRATA_GLM_LANE_ROW4_KERNELS defined on both files (a CMake option, ON by default).  Every other
-// build - aarch64 (DGX Spark / Grace), ppc64le (IBM AC922), or x86-64 with -DSTRATA_GLM_LANE_ROW4_KERNELS=OFF - compiles
+// get the kernels, with MAYA_GLM_LANE_ROW4_KERNELS defined on both files (a CMake option, ON by default).  Every other
+// build - aarch64 (DGX Spark / Grace), ppc64le (IBM AC922), or x86-64 with -DMAYA_GLM_LANE_ROW4_KERNELS=OFF - compiles
 // the no-lane branch at the end: no type has a 4-row kernel, the lane is never on and both hooks return false, so
 // native_expert.cpp's nt = 1 loops run ggml's vec_dot as they did before the port.
-#include "strata/kernels/cpu/glm_lane_row4.hpp"
+#include "maya/kernels/cpu/glm_lane_row4.hpp"
 
-#if defined(STRATA_GLM_LANE_ROW4_KERNELS) && (defined(__x86_64__) || defined(_M_X64))
+#if defined(MAYA_GLM_LANE_ROW4_KERNELS) && (defined(__x86_64__) || defined(_M_X64))
 
 #include "glm_lane_row4_x86.hpp"
-#include "strata/core/glm_env.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -37,7 +37,7 @@
 #include <limits>
 #include <vector>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 using row4x86::Kernel;
@@ -165,7 +165,7 @@ bool lane_row4_on() {
     const int o = g_override.load(std::memory_order_relaxed);
     if (o >= 0) return o != 0;
     static const bool env = [] {
-        return strata::glmenv::env_flag("MAYA_GLM_LANE_ROW4", true);   // (default on: bit-identical, faster)
+        return maya::glmenv::env_flag("MAYA_GLM_LANE_ROW4", true);   // (default on: bit-identical, faster)
     }();
     return env;
 }
@@ -220,13 +220,13 @@ bool lane_row4_down(const NativeFmt& f, const uint8_t* down_base, const void* hq
     return true;
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu
 
-#else  // no 4-row lane in this build (not x86-64, or STRATA_GLM_LANE_ROW4_KERNELS=OFF): see the top
+#else  // no 4-row lane in this build (not x86-64, or MAYA_GLM_LANE_ROW4_KERNELS=OFF): see the top
 
 #include <cstdlib>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 
 bool row4_supported(int) { return false; }
 
@@ -250,6 +250,6 @@ bool lane_row4_gu(const NativeFmt&, const uint8_t*, const uint8_t*, const void*,
 
 bool lane_row4_down(const NativeFmt&, const uint8_t*, const void*, float*, int, int) { return false; }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu
 
 #endif

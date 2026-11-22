@@ -15,13 +15,13 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels::glmb {
+namespace maya::kernels::glmb {
 
 __device__ __forceinline__ const uint8_t* lat8_rec(const uint16_t* lat, int kv, int cell) {
     return (const uint8_t*) lat + (size_t) (kv + kv / 16) * cell;
 }
-#if defined(STRATA_USE_HIP) && !defined(__gfx942__) && !defined(__gfx950__)
-#define STRATA_LAT8_UNSIGNED_ZEROS 1
+#if defined(MAYA_USE_HIP) && !defined(__gfx942__) && !defined(__gfx950__)
+#define MAYA_LAT8_UNSIGNED_ZEROS 1
 // two FP16 values, a zero without its sign
 __device__ __forceinline__ unsigned lat8_unsigned_zeros(unsigned x) {
     return x & (0x7FFF7FFFu | (((x & 0x7FFF7FFFu) + 0x7FFF7FFFu) & 0x80008000u));
@@ -34,7 +34,7 @@ __device__ __forceinline__ uint2 lat8_q4(uint32_t w, __half2 d) {
     const __half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));   // 1152
     const __half2 a = __hmul2(__hsub2(*(const __half2*) &lo, bias), d);
     const __half2 b = __hmul2(__hsub2(*(const __half2*) &hi, bias), d);
-#if defined(STRATA_LAT8_UNSIGNED_ZEROS)
+#if defined(MAYA_LAT8_UNSIGNED_ZEROS)
     // a code 0 times a negative scale is -0 in FP16 and +0 through AMD's F32 product: a zero half loses its sign
     // (only a code 0 makes a zero here - a normal scale times any other code is a normal number).  CDNA3 and CDNA4 (gfx942, gfx950)
     // keeps the sign through the F32 product as NVIDIA does, so its FP16 product is already the same bits
@@ -52,7 +52,7 @@ __device__ __forceinline__ uint2 lat8_q4(uint32_t w, __half2 d) {
 __device__ __forceinline__ uint2 lat8_q4_f32(uint32_t w, float d) {
     const __half2 a = __floats2half2_rn((float) (int8_t) w * d, (float) (int8_t) (w >> 8) * d);
     const __half2 b = __floats2half2_rn((float) (int8_t) (w >> 16) * d, (float) (int8_t) (w >> 24) * d);
-#if defined(STRATA_LAT8_UNSIGNED_ZEROS)
+#if defined(MAYA_LAT8_UNSIGNED_ZEROS)
     return make_uint2(lat8_unsigned_zeros(*(const unsigned*) &a), lat8_unsigned_zeros(*(const unsigned*) &b));
 #else
     return make_uint2(*(const unsigned*) &a, *(const unsigned*) &b);
@@ -65,7 +65,7 @@ __device__ __forceinline__ bool lat8_normal(__half d) { return (__half_as_ushort
 __device__ __forceinline__ uint2 lat8_h4(const uint8_t* rec, int kv, int c4) {
     const uint32_t w = ((const uint32_t*) rec)[c4];
     const __half d = ((const __half*) (rec + kv))[(4 * c4) >> 5];
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (!lat8_normal(d)) return lat8_q4_f32(w, __half2float(d));
 #endif
     return lat8_q4(w, __half2half2(d));
@@ -74,7 +74,7 @@ __device__ __forceinline__ uint2 lat8_h4(const uint8_t* rec, int kv, int c4) {
 __device__ __forceinline__ uint4 lat8_h8(const uint8_t* rec, int kv, int c8) {
     const uint2 w = ((const uint2*) rec)[c8];
     const __half d = ((const __half*) (rec + kv))[c8 >> 2];
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (!lat8_normal(d)) {
         const uint2 lo = lat8_q4_f32(w.x, __half2float(d)), hi = lat8_q4_f32(w.y, __half2float(d));
         return make_uint4(lo.x, lo.y, hi.x, hi.y);
@@ -84,4 +84,4 @@ __device__ __forceinline__ uint4 lat8_h8(const uint8_t* rec, int kv, int c8) {
     return make_uint4(lo.x, lo.y, hi.x, hi.y);
 }
 
-}  // namespace strata::kernels::glmb
+}  // namespace maya::kernels::glmb

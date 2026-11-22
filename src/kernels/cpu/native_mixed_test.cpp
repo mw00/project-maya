@@ -5,9 +5,9 @@
 //   2. native_gu_rows on the mixed layer, one and three tokens, against ggml-cpu's own vec_dot per type (the
 //      products llama.cpp computes): equal bit for bit
 //   3. expert_layout_load reads a "gate:up" type column (and still the plain one); a malformed column is refused
-#include "strata/kernels/cpu/native_expert.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/expert.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-namespace cpu = strata::kernels::cpu;
+namespace cpu = maya::kernels::cpu;
 
 static int failures = 0;
 static void check(bool ok, const std::string& what) {

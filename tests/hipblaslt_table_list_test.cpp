@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-using strata::prefill::hipblaslt::split_table_list;
+using maya::prefill::hipblaslt::split_table_list;
 
 static int failures = 0;
 

@@ -70,8 +70,8 @@ def why_not(cfg: dict, cards: list[int] | None = None) -> str | None:
     if not (cards if cards is not None else nvidia_cards()):
         return "no NVIDIA card answers nvidia-smi"
     if not cuda_exe(cfg).is_file():
-        return f"no CUDA build of maya at {cuda_exe(cfg)} (cmake -S . -B build-cuda -DSTRATA_ENABLE_CUDA=ON " \
-               "-DSTRATA_ENABLE_HIP=OFF; cmake --build build-cuda --target maya)"
+        return f"no CUDA build of maya at {cuda_exe(cfg)} (cmake -S . -B build-cuda -DMAYA_ENABLE_CUDA=ON " \
+               "-DMAYA_ENABLE_HIP=OFF; cmake --build build-cuda --target maya)"
     if not helper_exe(cfg).is_file():
         return f"no helper program at {helper_exe(cfg)} (cmake --build build-hip --target maya-glm-helper)"
     return None

@@ -1,5 +1,5 @@
 // src/core/glm_mtp_state_model.cu - glm-dsa B15.3: the model side of the NextN (MTP) sequence state
-// (include/strata/core/glm_mtp_state.hpp).
+// (include/maya/core/glm_mtp_state.hpp).
 //
 // Each (model part, sequence) that carries the NextN block owns a device carrier row and its snapshot copy (n_embd
 // floats each, allocated on first use on the part's device) plus a glmmtp::CarrierState.  Glm5Model members:
@@ -15,9 +15,9 @@
 //   mtp_carrier_stats()            counters over the chain's carriers.
 // Everything is a no-op on Flash (glm5-next) and on parts without the NextN block: mtp_carry_row returns the
 // fallback (FastState::head_x, Maya's behaviour), so Flash stays bit-identical.
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_mtp_state.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_mtp_state.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include "glm_fast_state.hpp"
 
@@ -32,7 +32,7 @@
 #include <ostream>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -281,4 +281,4 @@ void Glm5Model::mtp_slot_get(std::istream& f, int64_t n, bool whole) {
     cudaSetDevice(dev_);
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

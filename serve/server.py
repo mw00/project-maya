@@ -2353,7 +2353,7 @@ def engine_args(cfg: dict) -> list[str]:
     # (measured on a 20 GB RTX 4000 Ada: 2 conversations 24.5 tok/s aggregate, 3 unusable).
     # MAYA_PAR_MAX caps the conversations asked of the engine before it starts; the requests beyond it wait in
     # this server's own queue instead of starving the others.  MAYA_PAR_MAX=2 on that card, for example.
-    # (the config's own env keys are renamed to their older STRATA_ names by env_in on load: both are read)
+    # (the config's own env keys are renamed to their older MAYA_ names by env_in on load: both are read)
     _env = cfg.get("env") or {}
     cap = (_env.get("MAYA_PAR_MAX") or _env.get(maya_names.read_as("MAYA_PAR_MAX")) or
            os.environ.get("MAYA_PAR_MAX"))
@@ -2462,7 +2462,7 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     # engine settings the config carries (AMD: the GEMM tuning table), under BOTH names: env_in left the config with the
-    # older STRATA_ one, and some of the engines' settings are read by their MAYA_ name alone (issue #686)
+    # older MAYA_ one, and some of the engines' settings are read by their MAYA_ name alone (issue #686)
     maya_names.export_env(env, cfg.get("env"))
     # DeepSeek's fast prompt reading (the config's "fast_prefill", the Models page's switch, --fast-prefill on|off):
     # the long prompt's skip as a per-layer cone in maya-ds4 (DS4_YOCO_CONE).  Opt-in - the same sums, but a kernel's

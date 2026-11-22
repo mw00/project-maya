@@ -18,7 +18,7 @@
 // It prints the tier it ran on.  ctest runs it twice, the second time with MAYA_FORCE_AVX2=1, so an AVX-512 host's
 // rows and GEMM take the AVX2 tier too (the band entries reach tier 4 on any AVX2 host).  On a CPU without AVX2 the
 // switch must report itself off and change nothing, and tier 4 must be refused.
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-namespace cpu = strata::kernels::cpu;
+namespace cpu = maya::kernels::cpu;
 
 namespace {
 

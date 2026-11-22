@@ -7,7 +7,7 @@
 #include "ds4_par_exp.h"   // (DS4_LANE_PARITY: the CPU lane's MXFP4 rows reproduce this SwiGLU bit for bit)
 
 #include <cuda_fp16.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <mma.h>
 #endif
 
@@ -24,7 +24,7 @@
 #include <string>
 #include <chrono>
 
-namespace strata::ds4::gguf {
+namespace maya::ds4::gguf {
 namespace {
 
 std::atomic<int> g_errors{0};
@@ -45,7 +45,7 @@ constexpr int kWarps = 8, kThreads = kWarps * 32;
 constexpr int kMaxEnt = 16;   // a group's entries in one pass (a window's tokens at most)
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -140,7 +140,7 @@ __global__ void q8_rows_kernel(const uint8_t* __restrict__ w, size_t ld, int k, 
         const size_t r = i / (size_t) k, c = i - r * (size_t) k;
         const uint8_t* p = w + r * ld + (c / 32) * kQ8Bytes;
         const float v = __half2float(__ushort_as_half(*(const uint16_t*) p)) * (float) (int8_t) p[2 + c % 32];
-        dst[i] = bf16 ? strata::ds4::bf16_rn(v) : __half_as_ushort(__float2half_rn(v));
+        dst[i] = bf16 ? maya::ds4::bf16_rn(v) : __half_as_ushort(__float2half_rn(v));
     }
 }
 
@@ -346,7 +346,7 @@ bool iq_q8k() {
 // DS4_LANE_PARITY (MAYA_DS4_LANE_PARITY=1; off by default): see lane_parity in ds4_gguf.cuh
 std::atomic<int> g_lane_par{-1};   // (tests: lane_parity_mode)
 bool lane_parity_on() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;   // (an AMD build keeps its own sums: the parity rows are the CUDA kernels', not run on AMD yet)
 #else
     static const bool env = [] {
@@ -535,19 +535,19 @@ template <int CH>
 __host__ __device__ constexpr int tc_str() { return CH == 32 ? 1104 : 560; }
 // (cp.async and mma.sync's int8 m16n8k32: sm_80+, CUDA; elsewhere the kernel is empty and never launched - q8_tc_dev)
 __device__ __forceinline__ void tc_cp16(void* s, const void* g) {
-#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#if !defined(MAYA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     const unsigned sa = (unsigned) __cvta_generic_to_shared(s);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(g));
 #endif
 }
 __device__ __forceinline__ void tc_commit() {
-#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#if !defined(MAYA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
 template <int N>
 __device__ __forceinline__ void tc_wait() {
-#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#if !defined(MAYA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 #endif
 }
@@ -562,7 +562,7 @@ template <int NC, int MT, int STG, int CH>
 __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
     pdl_wait();
     pdl_trigger();
-#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#if !defined(MAYA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     extern __shared__ __align__(16) uint8_t tc_sm[];
     constexpr int R = 16 * MT, NT = NC > 8 ? 2 : 1;   // (NT: 8-column tiles, 9..16 columns two)
     const BfJob& b = J.j[blockIdx.y];
@@ -857,7 +857,7 @@ __global__ void __launch_bounds__(kThreads) mx_gate_up_kernel(const MxArgs a) {
                 const float gv = warp_sum(ag[i]), uv = warp_sum(au[i]);
                 if (lane == 0)
                     a.h[(size_t) es[i] * a.n_ff + row] =
-                        a.pexp ? strata::ds4::par::swiglu_portable(gv, uv, a.limit) : swiglu(gv, uv, a.limit);
+                        a.pexp ? maya::ds4::par::swiglu_portable(gv, uv, a.limit) : swiglu(gv, uv, a.limit);
             }
     }
 }
@@ -1088,7 +1088,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_kernel(const SetK a) {
 
 // the same on the tensor cores: a block BM rows x BN outputs, 8 warps each 16 rows x 32 outputs (2 fragments, gate and
 // up: 4), a 32-value MXFP4 block of K a step (2 WMMA k-steps), the tiles in shared memory as F16
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 namespace wm = nvcuda::wmma;
 constexpr int kLdT = 40;   // halves a tile row (32 + 8: WMMA wants a multiple of 8; the pad spreads the banks)
 template <bool GATE_UP>
@@ -1183,7 +1183,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_tc_kernel(const SetK a) {
     }
 }
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // the same on an AMD wave32 GPU's WMMA (RDNA3 / RDNA3.5 gfx11, RDNA4 gfx12): 8 waves each 16 rows x 32 outputs, the
 // tiles in shared memory as F16, F32 accumulation - each lane gives its row / column's 16 values of a k-step (gfx12:
 // its half of them), and holds 8 of the 16 x 16 results (rows 2 i + hi on gfx11, 8 hi + i on gfx12; column lane % 16)
@@ -1323,7 +1323,7 @@ bool tc_ok() {
     int k = known[dev].load(std::memory_order_relaxed);
     if (k == 0) {
         bool ok = false;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
             for (const char* p : {"gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201"})
@@ -1683,7 +1683,7 @@ bool q8_tc_ok(const BfJobs& J, int nj) {
 }
 // the tensor-core q8_mv's device: compute capability 8.0+ (cp.async, mma.sync's int8 m16n8k32), CUDA; asked once a device
 bool q8_tc_dev() {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
@@ -2109,7 +2109,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     k.ldo = ldh;
     k.xh_vec = x16 != nullptr && ((uintptr_t) x16 & 15) == 0 && (ldx & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_ff / BN), (unsigned) sa.n_exp);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (tc_ok()) pdl_launch(mx_set_tc_kernel<true>, grid, kThreads, 0, s, k);
 #else
     if (tc_ok()) pdl_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
@@ -2167,7 +2167,7 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     k.ldo = ldy;
     k.xh_vec = ((uintptr_t) h16 & 15) == 0 && (ldh & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_embd / BN), (unsigned) sa.n_exp);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (tc_ok()) pdl_launch(mx_set_tc_kernel<false>, grid, kThreads, 0, s, k);
 #else
     if (tc_ok()) pdl_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
@@ -2177,4 +2177,4 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     check("set_down");
 }
 
-}  // namespace strata::ds4::gguf
+}  // namespace maya::ds4::gguf

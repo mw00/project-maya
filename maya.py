@@ -2807,9 +2807,9 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
     cuda_archs = arch_setting(archs)
     conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
-             "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-             "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
-             f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}"]
+             "-DMAYA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
+             "-DMAYA_NATIVE_EXPERTS=ON", "-DMAYA_BUILD_TESTS=OFF",
+             f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DMAYA_GGML_DIR={llama}"]
     if S.ARM and S.arm_cpu_arch():
         conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     if host_compiler:
@@ -3025,15 +3025,15 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
                  f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
                  f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}",
-                 "-DSTRATA_PORTABLE=ON"]
+                 "-DMAYA_PORTABLE=ON"]
         if " " not in str(root) + str(bitcode):        # (with a space in them, clang takes HIP_PATH and the above)
             conf.append(f"-DCMAKE_HIP_FLAGS=--rocm-path={root.as_posix()} --rocm-device-lib-path={bitcode.as_posix()}")
     conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
-             "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
-             "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
+             "-DMAYA_ENABLE_HIP=ON", "-DMAYA_ENABLE_CUDA=OFF", "-DMAYA_PREFILL_MMQ=ON",
+             "-DMAYA_NATIVE_EXPERTS=ON", "-DMAYA_BUILD_TESTS=OFF",
              f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
              f"-DCMAKE_HIP_COMPILER={clang.as_posix()}", f"-DCMAKE_PREFIX_PATH={root.as_posix()}",
-             f"-DSTRATA_GGML_DIR={llama.as_posix()}"]
+             f"-DMAYA_GGML_DIR={llama.as_posix()}"]
     if not WIN and root == Path("/usr"):   # a distribution's ROCm: CMake's HIP check looks for hip-lang under this root
         conf.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}")
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
@@ -4429,8 +4429,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     hip = pc.get("backend") == "hip"
     env = vcvars = bindir = None
     if hip:
-        conf += ["-DSTRATA_VISION_HIP=ON",
-                 "-DSTRATA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
+        conf += ["-DMAYA_VISION_HIP=ON",
+                 "-DMAYA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs)]
         if WIN:
@@ -4445,7 +4445,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         if S.ARM and S.arm_cpu_arch():
             conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     elif not metal:                                    # (macOS: ggml builds its Metal backend by default, no CUDA)
-        conf += ["-DSTRATA_VISION_CUDA=ON",
+        conf += ["-DMAYA_VISION_CUDA=ON",
                  "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
                  f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
                  *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]

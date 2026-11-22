@@ -20,8 +20,8 @@
 // `glm_lane_row4_test --bench [seconds]` adds a single-thread microbenchmark: GB/s of weight rows streamed by ggml's
 // vec_dot loop vs row4_rows, for an L2-resident (~1 MB) and a DRAM-sized (~192 MB) matrix: 6144-wide rows (GLM-5.3's
 // gate/up rows, IQ1_S among them) and IQ4_XS at 2048 (its down rows).
-#include "strata/kernels/cpu/glm_lane_row4.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/glm_lane_row4.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -38,7 +38,7 @@
 #include <utility>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 namespace {
 

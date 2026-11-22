@@ -7,7 +7,7 @@ ggml type, which engine path serves it:
   routed experts (blk.N.ffn_{gate,up,down}_exps)
     decode GPU   the MoE kernels' instantiations (glm_fast.cu moe_supported)
     CPU lane     ggml-cpu's vec_dot for the type (the native lane computes with ggml's dot products; native_fmt)
-    prefill      the MMQ instances (strata_mmq: CMakeLists.txt mmq-instance-<t>.cu)
+    prefill      the MMQ instances (maya_mmq: CMakeLists.txt mmq-instance-<t>.cu)
   non-routed tensors
     pack         tools/strata/glm_dsa_pack.py plan_tensor: served natively, copied, dequantized to BF16/F32, or
                  refused (with MAYA_PACK_NATIVE32 or --native32: the B10.7 types stay native)
@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+import sys as _sys   # (an older MAYA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
 _sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 import maya_names  # noqa: E402,F401
 import pathlib
@@ -309,7 +309,7 @@ def markdown(cov: dict, tab: dict, source: str, native32: bool) -> str:
             "## Runtime check (on the test PC)", "",
             "Every routed type: float reference vs ggml-cpu vs GPU, max rel err < 1e-3 (BUILD-PLAN B5.3):", "",
             "```sh",
-            "cmake -S . -B build -DSTRATA_REAL_SHARD=\"<the shards holding layers 3, 26, 54, 77, 78>\"",
+            "cmake -S . -B build -DMAYA_REAL_SHARD=\"<the shards holding layers 3, 26, 54, 77, 78>\"",
             "ctest --test-dir build -R native_expert_parity_real --output-on-failure",
             "# or directly: build/native_expert_parity <shard> 3 26 54 77 78",
             "```", "", "| Layer | gate/up type | down type | max rel err | Result |", "|---|---|---|---|---|",

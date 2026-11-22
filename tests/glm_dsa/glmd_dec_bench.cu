@@ -7,10 +7,10 @@
 // AMD arch it is off on).
 //
 //   glmd_dec_bench [reps]      (default 40; exits 77 without a GPU)
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glmd_dec.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glmd_dec.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include "ggml.h"
 
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace {
 
@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
     const int reps = argc > 1 ? std::max(4, std::atoi(argv[1])) : 40;
     cudaDeviceProp prop{};
     CK(cudaGetDeviceProperties(&prop, 0));
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     std::printf("%s (%s), %d reps a timing, weights rotated over copies\n", prop.name, prop.gcnArchName, reps);
 #else
     std::printf("%s (sm_%d%d), %d reps a timing, weights rotated over copies\n", prop.name, prop.major, prop.minor, reps);
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
             gf::mv_dsa(j, (int) st.idx.size(), s, cfg);
             CK(cudaMemcpy(got.data(), y, got.size() * 4, cudaMemcpyDeviceToHost));
             const bool same = std::memcmp(ref.data(), got.data(), ref.size() * 4) == 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
             const bool gated = cfg == gf::kMvDsaAuto;   // (off by default on HIP: the forced shapes only inform)
 #else
             const bool gated = true;
@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
         CK(cudaFree(out2));
         CK(cudaFree(n_dev));
         CK(cudaFree(lat8));
-#if !defined(STRATA_USE_HIP)   // the fused attention (MAYA_GLMD_FUSED_MLA, off by default; nvcuda::wmma) for comparison
+#if !defined(MAYA_USE_HIP)   // the fused attention (MAYA_GLMD_FUSED_MLA, off by default; nvcuda::wmma) for comparison
         {
             const size_t fwb = glmd::mla_fused_work_bytes(NH, KVL, 64, max_ctx);
             void* fwork = nullptr;

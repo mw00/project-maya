@@ -1,6 +1,6 @@
 #pragma once
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 // A spare is publishable only after the source read and every member's transfer (including its wait) succeeded.
 // Callers own all buffers until this returns; failure never means that the spare contains a complete expert.
@@ -38,4 +38,4 @@ inline bool discard_failed_cache_swap(bool ready, bool& pending, int& incoming, 
     return true;
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

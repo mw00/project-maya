@@ -28,7 +28,7 @@
 #pragma once
 
 #include "glm_tier_plan.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -37,17 +37,17 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 struct Glm5Geometry;
 }
 
-namespace strata::core::glmtier {
+namespace maya::core::glmtier {
 struct TierState;
 }
 
-namespace strata::core::glmpfs {
+namespace maya::core::glmpfs {
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 // ---------------------------------------------------------------- the schedule (pure)
 
@@ -146,4 +146,4 @@ bool share_ok(const glmtier::TierState* T, int il);
 bool split_share(glmtier::TierState* T, const kc::NativeFmt& nf, const Glm5Geometry& g, int il, int n_exp,
                  const std::function<ShareX(int)>& ex, const float* x_h, const int* rt_h, int rows, float* out_h);
 
-}  // namespace strata::core::glmpfs
+}  // namespace maya::core::glmpfs

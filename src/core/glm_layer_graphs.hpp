@@ -1,14 +1,14 @@
 // Opt-in GLM layer capture: no per-layer wait, explicit host request accounting.
 #pragma once
 
-#include "strata/core/graph.hpp"
+#include "maya/core/graph.hpp"
 
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
 
-namespace strata::core::glmfast {
+namespace maya::core::glmfast {
 
 class LayerGraphs {
 public:
@@ -96,4 +96,4 @@ private:
     std::map<GraphId, Entry> entries_;
 };
 
-}  // namespace strata::core::glmfast
+}  // namespace maya::core::glmfast

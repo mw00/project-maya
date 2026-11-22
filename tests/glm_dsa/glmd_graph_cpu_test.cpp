@@ -4,7 +4,7 @@
 //   n_cap     4096 up to position 4095, then powers of two, capped at max_ctx; a 64K session re-captures 5 times;
 //   bits      every switch has its own bit;
 //   key       any field change (part, range, plan, addresses, bits, regime, n_cap) makes a different key.
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cstdio>
 #include <set>

@@ -1,6 +1,6 @@
 // The HIP runtime names the peer all-reduce uses (init_peer_ar, calibrate_peer, its test), on CUDA (DS4_CUDA_PEER_AR)
 #pragma once
-#if defined(DS4_CUDA_PEER_AR) && !defined(STRATA_USE_HIP)
+#if defined(DS4_CUDA_PEER_AR) && !defined(MAYA_USE_HIP)
 #include <cuda_runtime.h>
 #define hipSuccess cudaSuccess
 #define hipError_t cudaError_t

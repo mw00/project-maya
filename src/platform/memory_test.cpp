@@ -1,5 +1,5 @@
 // src/platform/memory_test.cpp - plan v0.3 P0.1: lock_resident on a 256 MiB region (CPU only, no GPU, no model).
-#include "strata/platform/memory.hpp"
+#include "maya/platform/memory.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +29,7 @@ int main() {
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);
-    const strata::platform::LockResult r = strata::platform::lock_resident(p, bytes);
+    const maya::platform::LockResult r = maya::platform::lock_resident(p, bytes);
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
     int fail = !(r.ok && r.locked_bytes == bytes);
@@ -39,7 +39,7 @@ int main() {
     std::printf("working set %llu MiB\n", (unsigned long long) (pmc.WorkingSetSize >> 20));
     fail |= pmc.WorkingSetSize < bytes;
 #endif
-    strata::platform::unlock_resident(p, bytes);
+    maya::platform::unlock_resident(p, bytes);
     std::free(p);
     std::printf("platform_memory_test: %s\n", fail ? "FAILED" : "OK");
     return fail;

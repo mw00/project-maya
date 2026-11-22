@@ -16,7 +16,7 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using strata::ds4::KernelTypes;
+using maya::ds4::KernelTypes;
 
 namespace {
 int fails = 0;
@@ -142,7 +142,7 @@ struct Pack {
 // pack_info's code and its report
 int run(const Pack& p, std::string& text) {
     std::FILE* f = std::tmpfile();
-    const int rc = strata::ds4::pack_info((p.root / "pack").string(), "", kernels(), f);
+    const int rc = maya::ds4::pack_info((p.root / "pack").string(), "", kernels(), f);
     std::rewind(f);
     text.clear();
     char buf[4096];

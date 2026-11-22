@@ -17,8 +17,8 @@
 #include <random>
 #include <vector>
 
-using namespace strata::core;
-namespace gf = strata::kernels::glmf;
+using namespace maya::core;
+namespace gf = maya::kernels::glmf;
 
 static int g_fail = 0;
 static int g_expected_launch_errors = 0;   // refusals a test provokes on purpose

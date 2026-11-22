@@ -3,8 +3,8 @@
 // This is P2.S1's "startup prints the memory plan vs actual cudaMemGetInfo" bullet, on its own so it can run
 // without the model.  It is also the run-time half of the architecture policy: CMake refuses to COMPILE below
 // compute capability 6.0, and this refuses to RUN on such a card.
-#include "strata/core/device.hpp"
-#include "strata/plan/plan.hpp"
+#include "maya/core/device.hpp"
+#include "maya/plan/plan.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -31,10 +31,10 @@ int main(int argc, char** argv) {
     }
 
     try {
-        const strata::core::DeviceInfo d = strata::core::device_info(0);
+        const maya::core::DeviceInfo d = maya::core::device_info(0);
         std::printf("device %d: %s\n", d.ordinal, d.name.c_str());
-#if defined(STRATA_USE_HIP)
-        std::printf("  HIP device / build  %s wave32 / %s\n", d.arch.c_str(), strata::core::compiled_gpu_archs());
+#if defined(MAYA_USE_HIP)
+        std::printf("  HIP device / build  %s wave32 / %s\n", d.arch.c_str(), maya::core::compiled_gpu_archs());
 #else
         std::printf("  compute capability  %d.%d   (sm_%d%d)\n", d.cc_major, d.cc_minor, d.cc_major, d.cc_minor);
 #endif
@@ -44,8 +44,8 @@ int main(int argc, char** argv) {
 
         // The planner's view against the card's.  A plan that does not fit in what is actually FREE is the
         // failure this print exists to make visible at startup rather than at token 4000.
-        const auto plan = strata::plan::make_plan(20480, strata::plan::Geometry{}, strata::plan::Costs{});
-        std::printf("\n%s", strata::plan::to_string(plan).c_str());
+        const auto plan = maya::plan::make_plan(20480, maya::plan::Geometry{}, maya::plan::Costs{});
+        std::printf("\n%s", maya::plan::to_string(plan).c_str());
         std::printf("  card free           %s\n", human(d.free_bytes).c_str());
         std::printf("  plan + KV vs free   %s\n",
                     plan.vram_budget <= d.free_bytes ? "FITS" : "*** DOES NOT FIT ***");
@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
             // path leaves NaNs rather than zeros.  A GPU test that only asks the driver for its name does not
             // test the runtime this file exists to provide.
             const uint64_t bytes = 64ull << 20;      // 64 MiB, small enough to be safe on any card
-            strata::core::DeviceArena arena(bytes, 0, /*poison=*/true);
+            maya::core::DeviceArena arena(bytes, 0, /*poison=*/true);
             void* a = arena.alloc(1 << 20, 256);
             void* b = arena.alloc(1 << 20, 4096);
             if (((uintptr_t) a % 256) || ((uintptr_t) b % 4096)) {
@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
                 arena.alloc(bytes * 2);
                 std::fprintf(stderr, "selftest: over-allocation did NOT throw\n");
                 return 1;
-            } catch (const strata::core::CudaError&) {
+            } catch (const maya::core::CudaError&) {
                 std::printf("selftest: over-allocation refused as required\n");
             }
             std::printf("strata-device selftest OK\n");

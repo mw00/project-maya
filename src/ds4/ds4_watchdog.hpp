@@ -7,7 +7,7 @@
 #include <atomic>
 #include <cstdint>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 struct StallRule {
     double limit_s = 600;   // (<= 0: off)
@@ -27,4 +27,4 @@ struct StallRule {
     }
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

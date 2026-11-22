@@ -11,7 +11,7 @@
 #include "glm_metal.hpp"
 #include "sampler.hpp"
 #include "spec.hpp"
-#include "../../include/strata/platform/env_switch.hpp"   // (header only; maya-metal's include path is src/metal)
+#include "../../include/maya/platform/env_switch.hpp"   // (header only; maya-metal's include path is src/metal)
 
 #include <algorithm>
 #include <atomic>
@@ -545,7 +545,7 @@ int serve(GlmMetal& model, const std::vector<std::string>& args) {
     const char* md = std::getenv("MAYA_GLM_MTP_DECODE");
     const bool mtp_wanted = md && *md ? std::atoi(md) != 0 : model.stats().experts_all_resident;
     const bool no_mtp =
-        strata::platform::env_switch("MAYA_GLM_NO_MTP") || strata::platform::env_switch("MAYA_GLM_NO_SPEC");
+        maya::platform::env_switch("MAYA_GLM_NO_MTP") || maya::platform::env_switch("MAYA_GLM_NO_SPEC");
     s.mtp = mtp_wanted && model.has_mtp() && !no_mtp;
     s.mtp_auto = !(md && *md) && model.has_mtp() && !no_mtp;
     if (model.has_mtp() && !s.mtp)

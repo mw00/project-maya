@@ -19,7 +19,7 @@
 // --env: run with MAYA_EXL3_AVX2_SHUF=1 - the switch must be on at the start (the kernels' own start check
 // passed), the ctest entry exl3_cpu_shuf_test_env. Without --env and without that variable it must be off (the
 // default).
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 namespace {
 

@@ -17,22 +17,22 @@
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "glm_fast_state.hpp"
-#include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.1 / B6.2
-#include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2
-#include "strata/core/glm_pool_classes.hpp"   // glm-dsa B3.7
-#include "strata/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
+#include "maya/core/glm_dsa_split.hpp"   // glm-dsa B6.1 / B6.2
+#include "maya/core/glm_dsa_spec.hpp"   // glm-dsa B11.2
+#include "maya/core/glm_pool_classes.hpp"   // glm-dsa B3.7
+#include "maya/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
 
-#include "strata/kernels/glm_dsa.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glm_ffn.hpp"
-#include "strata/kernels/glm_hc.hpp"
-#include "strata/kernels/glm_kda.hpp"
-#include "strata/kernels/router_sigmoid.hpp"
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/kernels/glm_dsa.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_ffn.hpp"
+#include "maya/kernels/glm_hc.hpp"
+#include "maya/kernels/glm_kda.hpp"
+#include "maya/kernels/router_sigmoid.hpp"
+#include "maya/kernels/native_mmvq.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
-#include "strata/core/glm_split_devices.hpp"
-#include "strata/platform/env_switch.hpp"
+#include "maya/core/glm_split_devices.hpp"
+#include "maya/platform/env_switch.hpp"
 
 #include "ggml.h"
 
@@ -68,7 +68,7 @@
 #include <cstring>
 #include <numeric>
 
-#include "strata/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2: mmq_pad_enable
+#include "maya/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2: mmq_pad_enable
 
 // the GGUF shards a pack serves from, in order: native_experts.txt's header names shard 1 (they sit NEXT TO the pack;
 // the siblings follow its -NNNNN-of-MMMMM pattern)
@@ -112,7 +112,7 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
 // tools/exl3_pack.py's exl3.txt (an EXL3 pack; absent for a GGUF pack): the safetensors files, the EXL3 matrices
 // (index rows of kind x) and every routed expert's nine pieces.  false + empty err: no such file.  Each matrix's and
 // part's bitrate is K bits a weight, written "3", or "3.5" for exllamav3 1.6's half-integer K (1.5 / 2.5 / 3.5, mul1);
-// carried as k2 = 2 K (strata::kernels::exl3::Mat::k2).  An engine from before half-integer K refuses such a line.
+// carried as k2 = 2 K (maya::kernels::exl3::Mat::k2).  An engine from before half-integer K refuses such a line.
 namespace {
 struct Exl3Table {
     std::vector<std::string> files;
@@ -183,7 +183,7 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
                 err = "exl3.txt: bad mat line: " + line;
                 return false;
             }
-            if (!strata::kernels::exl3::k2_supported(m.k2, m.cb)) {
+            if (!maya::kernels::exl3::k2_supported(m.k2, m.cb)) {
                 err = "exl3.txt: " + nm + ": K " + kt + " with codebook " + std::to_string(m.cb) +
                       " - the kernels take K 1..8 with any codebook and 1.5 / 2.5 / 3.5 with mul1 (2)";
                 return false;
@@ -204,7 +204,7 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
                 return false;
             }
             for (int r = 0; r < 3; ++r)
-                if (!strata::kernels::exl3::k2_supported(L.k2[r], L.cb)) {
+                if (!maya::kernels::exl3::k2_supported(L.k2[r], L.cb)) {
                     err = "exl3.txt: layer " + std::to_string(il) + " " + (r == 0 ? "gate" : r == 1 ? "up" : "down") +
                           ": K " + kt[r] + " with codebook " + std::to_string(L.cb) +
                           " - the kernels take K 1..8 with any codebook and 1.5 / 2.5 / 3.5 with mul1 (2)";
@@ -254,7 +254,7 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
 // token_embd on the host (the embedding row is dequantized there from the shard mapping)
-static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
+static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const maya::TensorInfo* t, bool fast,
                               std::string* how = nullptr, bool keep_bf16 = false) {
     if (fast && name == "token_embd.weight") return 0;
     if ((fast || keep_bf16) && kind == "4" && t->elements() >= 65536) {   // glm-dsa B3.5: keep_bf16 (glm-dsa slow)
@@ -266,7 +266,7 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind, 
         return ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
     }
     if (how) *how = " q" + std::to_string((int) t->type);
-    return (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) (t->elements() / t->shape[0])) + 255u) &   // glm-dsa B10.7: every row of a 3-D tensor
+    return (maya::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) (t->elements() / t->shape[0])) + 255u) &   // glm-dsa B10.7: every row of a 3-D tensor
            ~(uint64_t) 255u;
 }
 
@@ -283,36 +283,36 @@ static const char* const kMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "at
                                       "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
 
 // ... and the VRAM they take
-static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
+static bool mtp_dense_vram(const std::function<const maya::TensorInfo*(const std::string&)>& find, int il,
                            uint64_t& bytes, std::string& err,
-                           strata::core::GlmArch arch = strata::core::GlmArch::Glm5Next) {
+                           maya::core::GlmArch arch = maya::core::GlmArch::Glm5Next) {
     const std::string P = "blk." + std::to_string(il) + ".";
     bytes = 0;
     std::vector<std::string> kRaw(std::begin(kMtpRaw), std::end(kMtpRaw)), kB16(std::begin(kMtpB16), std::end(kMtpB16)),
         kF32(std::begin(kMtpF32), std::end(kMtpF32));
-    strata::core::glm_mtp_lists(arch, kRaw, kB16, kF32);   // glm-dsa B1.8: glm-dsa's own lists
+    maya::core::glm_mtp_lists(arch, kRaw, kB16, kF32);   // glm-dsa B1.8: glm-dsa's own lists
     for (const auto& n : kRaw) {
-        const strata::TensorInfo* t = find(P + n);
+        const maya::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
-        bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
+        bytes += (maya::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
                  ~(uint64_t) 255u;
     }
     for (const auto& n : kB16) {
-        const strata::TensorInfo* t = find(P + n);
+        const maya::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
     for (const auto& n : kF32) {
-        const strata::TensorInfo* t = find(P + n);
+        const maya::TensorInfo* t = find(P + n);
         if (t == nullptr)
-            if (const char* fb = strata::core::glm_mtp_fallback(arch, n)) t = find(fb);   // glm-dsa B1.8
+            if (const char* fb = maya::core::glm_mtp_fallback(arch, n)) t = find(fb);   // glm-dsa B1.8
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
     }
     return true;
 }
 
-namespace strata::core {
+namespace maya::core {
 namespace {
 
 constexpr int GM_THREADS = 256;
@@ -479,7 +479,7 @@ float* q8_scratch(size_t bytes) {
     return buf[dev];
 }
 
-cudaError_t gm_gemv(const strata::core::WSlot& w, const float* x, const float* bias, float alpha, float* y,
+cudaError_t gm_gemv(const maya::core::WSlot& w, const float* x, const float* bias, float alpha, float* y,
                     int out, int in) {
     if (w.type == 0) {
         // warp-per-row: `out` warps of work, not `out` threads
@@ -489,14 +489,14 @@ cudaError_t gm_gemv(const strata::core::WSlot& w, const float* x, const float* b
     if (in % 32) return cudaErrorInvalidConfiguration;
     float* scratch = q8_scratch((size_t)(in / 32) * 64);
     if (!scratch) return cudaErrorMemoryAllocation;
-    strata::kernels::quantize_q8_1_rows(x, 1, in, scratch, 0);
-    strata::kernels::native_mmvq(w.type, w.q, scratch, y, in, out, 1, cudaStreamLegacy);
+    maya::kernels::quantize_q8_1_rows(x, 1, in, scratch, 0);
+    maya::kernels::native_mmvq(w.type, w.q, scratch, y, in, out, 1, cudaStreamLegacy);
     bias_apply_kernel<<<blocks(out), GM_THREADS>>>(y, bias, alpha, out);
     return cudaGetLastError();
 }
 
 // dequantize one quantized row tensor to F32 using ggml's trait table
-static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src, std::vector<float>& dst,
+static bool pack_dequant_tensor(const maya::TensorInfo& t, const uint8_t* src, std::vector<float>& dst,
                                 std::string& err) {
     const ggml_type ty = (ggml_type) t.type;
     const ggml_type_traits* tt = ggml_get_type_traits(ty);
@@ -517,7 +517,7 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
 
 // ================================ geometry ================================
 
-bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+bool Glm5Geometry::from_gguf(const maya::GgufFile& g, Glm5Geometry& out, std::string& err) {
     if (const int r = glm_arch_route(g, out, err); r != 0) return r > 0;   // glm-dsa B1.2: glm-dsa, refusals
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
@@ -525,7 +525,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     const auto num = [&](const std::string& key, double def, bool& ok) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
-        if (v->type == strata::MetaType::ARRAY) {
+        if (v->type == maya::MetaType::ARRAY) {
             if (v->items.empty() || !v->items[0].is_num()) return def;
             return v->items[0].num();
         }
@@ -535,7 +535,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     };
     const auto arr_i = [&](const std::string& key, std::vector<int>& dst, int n_layers) {
         const auto* v = g.get(p + key);
-        if (v && v->type == strata::MetaType::ARRAY && v->items.size() >= (size_t) n_layers)
+        if (v && v->type == maya::MetaType::ARRAY && v->items.size() >= (size_t) n_layers)
             // the per-layer arrays count ALL blocks (the NextN layer included); the trunk uses
             // the first n_layers entries
             for (int i = 0; i < n_layers; ++i) dst[(size_t) i] = (int) v->items[(size_t) i].u;
@@ -729,7 +729,7 @@ Glm5Model::~Glm5Model() {
 }
 
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
-    strata::GgufFile gguf(gguf_path);
+    maya::GgufFile gguf(gguf_path);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
     if (!glm_geometry_check(g_, [&](const std::string& n) { return gguf.find(n); }, 0, 0, err) ||
         !glm_forward_available(g_, err)) return false;   // glm-dsa B1.4: tensor shapes; glm-dsa forward gate
@@ -762,7 +762,7 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
         const uint64_t n = (uint64_t) t.elements() * sizeof(float);
         GM_CHECK(cudaMemcpy((uint8_t*) w_arena_ + at, gguf.tensor_data(t), n, cudaMemcpyHostToDevice), err);
         w_[t.name] = (const float*) ((uint8_t*) w_arena_ + at);
-        ws_map_[t.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
+        ws_map_[t.name] = maya::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
         at += (n + 255u) & ~(uint64_t) 255u;
     }
 
@@ -855,7 +855,7 @@ void Glm5Model::reset() {
     }
 }
 
-// ---- KV streaming (strata/kernels/glm_kv_stream.hpp)
+// ---- KV streaming (maya/kernels/glm_kv_stream.hpp)
 // OWNER-DECISIONS 36: `--kv-streaming on` (the setup's, no window of the user's: MAYA_GLM_KV_AUTO=1) streams a
 // glm-dsa model's caches only when the whole cache does not fit; load_pack_place decides at the start from the
 // split planner's measured budget (glm_dsa_kv_auto / glm_search_bounds) and sets this for the load: 1 = keep every
@@ -870,7 +870,7 @@ int64_t Glm5Model::kv_resident_cells(int kpool, int64_t max_ctx) {
     // MAYA_GLM_KV_RESIDENT_TEST_MIN=<n>: a lower floor, for tests that make a short context evict (L1-6; the resolve
     // still needs kKvResolveBlock pages and room for a whole selection)
     const char* tm = getenv("MAYA_GLM_KV_RESIDENT_TEST_MIN");
-    const int64_t floor = tm != nullptr && std::atoll(tm) > 0 ? std::atoll(tm) : strata::kernels::glmf::kKvResidentMin;
+    const int64_t floor = tm != nullptr && std::atoll(tm) > 0 ? std::atoll(tm) : maya::kernels::glmf::kKvResidentMin;
     int64_t cells = std::max<int64_t>(want, floor);
     cells = (cells + kpool - 1) / kpool * kpool;
     return cells < max_ctx ? cells : 0;   // a context of N positions or fewer is not streamed
@@ -888,7 +888,7 @@ int64_t Glm5Model::kv_resident() const {
 // resident.  ctx: that sequence's context.  Under WSL the driver pins only about 1 GB in all, which the start reports as
 // an error.  Null with err empty: no DSA layer on this part.
 Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::string& err) {
-    namespace k = strata::kernels;
+    namespace k = maya::kernels;
     const std::vector<int> ls = dsa_layers();
     if (ls.empty()) return nullptr;
     auto* K = new KvStream();
@@ -982,7 +982,7 @@ void Glm5Model::kv_stream_reset_maps() {
     if (kv_ == nullptr) return;
     cudaSetDevice(dev_);
     for (const auto& m : kv_->map)
-        if (m.page_table != nullptr) strata::kernels::kv_stream_reset(m, fast_ != nullptr ? (void*) fast_->cs : nullptr);
+        if (m.page_table != nullptr) maya::kernels::kv_stream_reset(m, fast_ != nullptr ? (void*) fast_->cs : nullptr);
 }
 
 Glm5Model::KvStreamStats Glm5Model::kv_stream_stats() const {
@@ -998,7 +998,7 @@ Glm5Model::KvStreamStats Glm5Model::kv_stream_stats() const {
             if (K == nullptr) continue;
             for (const auto& mp : K->map) {
                 if (mp.page_table == nullptr) continue;
-                const strata::kernels::KvStreamCounters c = strata::kernels::kv_stream_counters(mp);
+                const maya::kernels::KvStreamCounters c = maya::kernels::kv_stream_counters(mp);
                 r.lookups += c.lookups;
                 r.misses += c.misses;
                 r.overflow = r.overflow || c.overflow;
@@ -1080,7 +1080,7 @@ const float* Glm5Model::logit_bias_table(int slot, const std::vector<std::pair<i
     return tab;
 }
 
-int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
+int Glm5Model::sample_token(maya::kernels::SamplerParams& sp, std::string& err) {
     // the fast path already ran the greedy argmax on the device at the end of the forward (an unbiased one)
     if (fast_ != nullptr && sp.greedy && sp.logit_bias == nullptr && sp.penalty_last_n <= 0 && last_tok_ >= 0)
         return last_tok_;
@@ -1146,11 +1146,11 @@ void Glm5Model::pen_free() {   // (on this part's device)
     pen_w_ = 0;
 }
 
-void Glm5Model::pick_tokens(const float* logits, int T, const strata::kernels::SamplerParams& sp, const int32_t* win,
+void Glm5Model::pick_tokens(const float* logits, int T, const maya::kernels::SamplerParams& sp, const int32_t* win,
                             int n0, int* out, cudaStream_t s) {
     const int V = (int) g_.n_vocab;
     if (sp.penalty_last_n <= 0) {   // no penalties: the call every site made before, nothing else
-        strata::kernels::sample_tokens(logits, T, V, nullptr, 0, sp, out, s);
+        maya::kernels::sample_tokens(logits, T, V, nullptr, 0, sp, out, s);
         return;
     }
     const std::vector<int32_t>* H = sp.host_history;
@@ -1166,9 +1166,9 @@ void Glm5Model::pick_tokens(const float* logits, int T, const strata::kernels::S
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
             std::fprintf(stderr, "glm penalties: %s - picks without the penalties (said once)\n", why.c_str());
-        strata::kernels::SamplerParams q = sp;
+        maya::kernels::SamplerParams q = sp;
         q.penalty_last_n = 0;
-        strata::kernels::sample_tokens(logits, T, V, nullptr, 0, q, out, s);
+        maya::kernels::sample_tokens(logits, T, V, nullptr, 0, q, out, s);
         return;
     }
     // a window's first token is the history's last (what the state was fed last): a caller that lets them part would
@@ -1198,16 +1198,16 @@ void Glm5Model::pick_tokens(const float* logits, int T, const strata::kernels::S
     }
     int32_t* dev = pen_d_ + (size_t) r * (size_t) pen_w_;
     cudaMemcpyAsync(dev, host, (size_t) T * (size_t) h * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    strata::kernels::SamplerParams q = sp;
+    maya::kernels::SamplerParams q = sp;
     q.penalty_last_n = h;
-    strata::kernels::sample_tokens(logits, T, V, dev, h, q, out, s);
+    maya::kernels::sample_tokens(logits, T, V, dev, h, q, out, s);
     for (int i = r; i < r + T; ++i) cudaEventRecord(pen_ev_[i], s);
 }
 
 // the last part's side of the head split: the helper and the pinned rows a pick crosses with
 bool Glm5Model::head_split_link(Glm5Model* helper, std::string& err) {
     if (helper == nullptr || !helper->head_half_ || helper->hh_s_ == nullptr || !exl3_) return true;
-    namespace x3 = strata::kernels::exl3;
+    namespace x3 = maya::kernels::exl3;
     cudaSetDevice(dev_);
     const size_t E = (size_t) g_.n_embd, nc = (size_t) (g_.n_vocab - helper->head_c0_);
     if (cudaHostAlloc((void**) &ht_x_h_, kPipeSlots * E * sizeof(float), cudaHostAllocPortable) != cudaSuccess ||
@@ -1234,7 +1234,7 @@ bool Glm5Model::head_split_link(Glm5Model* helper, std::string& err) {
         return true;
     }
     const x3::Mat& slot = exl3_mats_["output.weight.lo"] = lo;
-    ws_map_["output.weight.lo"] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, lo.k, lo.n};
+    ws_map_["output.weight.lo"] = maya::core::WSlot{nullptr, x3::kTypeEXL3, &slot, lo.k, lo.n};
     head_helper_ = helper;
     head_c0_ = helper->head_c0_;
     std::fprintf(stderr, "glm split: the head's columns [0, %d) on CUDA%d, [%d, %d) on CUDA%d at once (a pipelined "
@@ -1506,10 +1506,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     std::string err;
     std::vector<std::string> names;
     if (!pack_shard_names(pack_dir, names, err)) return {};
-    std::vector<std::unique_ptr<strata::GgufFile>> gfs;
+    std::vector<std::unique_ptr<maya::GgufFile>> gfs;
     Glm5Geometry g;
     try {
-        for (const auto& nm : names) gfs.emplace_back(new strata::GgufFile(pack_dir + "/../" + nm));
+        for (const auto& nm : names) gfs.emplace_back(new maya::GgufFile(pack_dir + "/../" + nm));
         if (!Glm5Geometry::from_gguf(*gfs[0], g, err)) return {};
     } catch (const std::exception& e) {
         std::fprintf(stderr, "glm split auto: %s - the split by free VRAM instead\n", e.what());
@@ -1518,12 +1518,12 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const int L = g.n_layers, n = (int) devs.size();
     if ((only == nullptr && n < 2) || n < 1 || L < n) return {};
     const bool fast = getenv("MAYA_GLM_SLOW") == nullptr;
-    const auto find = [&](const std::string& nm) -> const strata::TensorInfo* {
+    const auto find = [&](const std::string& nm) -> const maya::TensorInfo* {
         for (const auto& gf : gfs)
-            if (const strata::TensorInfo* t = gf->find(nm)) return t;
+            if (const maya::TensorInfo* t = gf->find(nm)) return t;
         return nullptr;
     };
-    const auto tensor_bytes = [](const strata::TensorInfo* t) {
+    const auto tensor_bytes = [](const maya::TensorInfo* t) {
         return (double) ggml_row_size((ggml_type) t->type, t->shape[0]) * (double) (t->elements() / t->shape[0]);
     };
     Exl3Table xtab;   // an EXL3 pack: its matrices (index kind x) and experts
@@ -1543,11 +1543,11 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             std::istringstream ss(line);
             std::string nm, served, kind;
             ss >> nm >> served >> kind;
-            const strata::TensorInfo* t = find(nm);
+            const maya::TensorInfo* t = find(nm);
             const auto xm = xtab.mats.find(nm);
             if (t == nullptr && (kind != "x" || xm == xtab.mats.end())) continue;
             const double b = kind == "x" ? (double) xm->second.vram()
-                                         : (double) pack_row_vram(nm, kind, t, fast, nullptr, g.arch == strata::core::GlmArch::GlmDsa);
+                                         : (double) pack_row_vram(nm, kind, t, fast, nullptr, g.arch == maya::core::GlmArch::GlmDsa);
             if (nm.rfind("blk.", 0) == 0) {
                 const int il = std::atoi(nm.c_str() + 4);
                 if (il >= 0 && il < L) dense[(size_t) il] += b;
@@ -1623,31 +1623,31 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             if (kv.first >= 0 && kv.first < L) {
                 blob[(size_t) kv.first] = (double) kv.second.blob();
                 stride[(size_t) kv.first] = (double) glmfast::expert_stride(
-                    (size_t) kv.second.blob(), strata::kernels::exl3::kTypeEXL3, strata::kernels::exl3::kTypeEXL3);
+                    (size_t) kv.second.blob(), maya::kernels::exl3::kTypeEXL3, maya::kernels::exl3::kTypeEXL3);
             }
     }
     // the NextN draft block: the last part of a two-part split carries it (load_pack), from the model's GGUF or
     // MAYA_GLM_MTP_GGUF's; the pipelined decode drafts with it once a token
     bool mtp = false;
     double mtp_dense = 0;
-    std::unique_ptr<strata::GgufFile> extra;
-    if (fast && glm_split_prices_mtp(g, n) && !strata::platform::env_switch("MAYA_GLM_NO_MTP")) {   // glm-dsa B6.2: n >= 2
+    std::unique_ptr<maya::GgufFile> extra;
+    if (fast && glm_split_prices_mtp(g, n) && !maya::platform::env_switch("MAYA_GLM_NO_MTP")) {   // glm-dsa B6.2: n >= 2
         const std::string P = "blk." + std::to_string(L) + ".";
         const char* mg = getenv("MAYA_GLM_MTP_GGUF");
         if (find(P + "nextn.eh_proj.weight") == nullptr && mg != nullptr && mg[0] != '\0') try {
-                extra.reset(new strata::GgufFile(mg));
+                extra.reset(new maya::GgufFile(mg));
             } catch (const std::exception&) {
                 extra.reset();
             }
-        const auto findm = [&](const std::string& nm) -> const strata::TensorInfo* {
-            if (const strata::TensorInfo* t = find(nm)) return t;
+        const auto findm = [&](const std::string& nm) -> const maya::TensorInfo* {
+            if (const maya::TensorInfo* t = find(nm)) return t;
             return extra ? extra->find(nm) : nullptr;
         };
         uint64_t b = 0;
         std::string e2;
-        const strata::TensorInfo* tg = findm(P + "ffn_gate_exps.weight");
-        const strata::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
-        const strata::TensorInfo* td = findm(P + "ffn_down_exps.weight");
+        const maya::TensorInfo* tg = findm(P + "ffn_gate_exps.weight");
+        const maya::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
+        const maya::TensorInfo* td = findm(P + "ffn_down_exps.weight");
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
             mtp_dense_vram(findm, L, b, e2, g.arch)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
@@ -1661,19 +1661,19 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                 if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
             for (const char* nm : kMtpB16) {
                 if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
-                else if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 2;
+                else if (const maya::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 2;
             }
             for (const char* nm : kMtpF32)
-                if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 4;
+                if (const maya::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 4;
             blob[(size_t) L] = (double) xtab.layers.at(L).blob();
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) xtab.layers.at(L).blob(),
-                                                                 strata::kernels::exl3::kTypeEXL3,
-                                                                 strata::kernels::exl3::kTypeEXL3);
+                                                                 maya::kernels::exl3::kTypeEXL3,
+                                                                 maya::kernels::exl3::kTypeEXL3);
             mtp_dense = d;
             mtp = true;
         }
     }
-    const bool pipelined = n == 2 && mtp && !strata::platform::env_switch("MAYA_GLM_NO_SPEC");
+    const bool pipelined = n == 2 && mtp && !maya::platform::env_switch("MAYA_GLM_NO_SPEC");
     // a DFlash drafter's pipelined window (dflash_pipelined): the anchor crosses every part, and each draft kept behind
     // it costs about the slowest part, so a round of a kept drafts costs sum + a * slowest for a + 1 tokens (a ~1.5 at
     // the pipelined window's default cut); the batched one crosses the parts in turn (the parts added)
@@ -1871,7 +1871,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         for (int l = lb; l < le; ++l) ev.ms += layer_ms(l, dense[(size_t) l]);
         if (last) {
             ev.ms += 1e3 * head / c.bw;
-            if (pipelined || (mtp && n >= 3 && !strata::platform::env_switch("MAYA_GLM_NO_SPEC")))   // glm-dsa B6.2: 3+ parts
+            if (pipelined || (mtp && n >= 3 && !maya::platform::env_switch("MAYA_GLM_NO_SPEC")))   // glm-dsa B6.2: 3+ parts
                 ev.ms += layer_ms(L, mtp_dense);   // the draft, once a token
         }
         memo[key] = ev;
@@ -2010,7 +2010,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     }
     std::fprintf(stderr, "glm split auto: layers %s - a token %.1f ms predicted (%s), %.0f%% of the routed experts in "
                          "VRAM\n", where.c_str(), obj, parts.c_str(), routes > 0 ? 100.0 * hits / routes : 0.0);
-    if (g.arch == GlmArch::GlmDsa && mtp && n >= 3 && !strata::platform::env_switch("MAYA_GLM_NO_SPEC")) { std::vector<glmspec::PartCost> pc; const std::vector<int> pools = glm_split_pool_ids(g, devs); for (int i = 0; i < n; ++i) pc.push_back({cards[(size_t) i].dev, ev[(size_t) i].ms, ev[(size_t) i].ms * glmspec::lane_share(ev[(size_t) i].hits, ev[(size_t) i].routes, cards[(size_t) i].bw, miss_bps), pools[(size_t) i]}); glmspec::spec_record_prices(pc); }   // glm-dsa B11.2
+    if (g.arch == GlmArch::GlmDsa && mtp && n >= 3 && !maya::platform::env_switch("MAYA_GLM_NO_SPEC")) { std::vector<glmspec::PartCost> pc; const std::vector<int> pools = glm_split_pool_ids(g, devs); for (int i = 0; i < n; ++i) pc.push_back({cards[(size_t) i].dev, ev[(size_t) i].ms, ev[(size_t) i].ms * glmspec::lane_share(ev[(size_t) i].hits, ev[(size_t) i].routes, cards[(size_t) i].bw, miss_bps), pools[(size_t) i]}); glmspec::spec_record_prices(pc); }   // glm-dsa B11.2
     return best;
 }
 
@@ -2018,7 +2018,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
 // window (--parallel's sequences, the reference path and the expert helper stream as before)
 static bool glm_dsa_kv_auto(const Glm5Geometry& g, int64_t max_ctx) {
     s_kv_auto_resident = 0;
-    if (g.arch != GlmArch::GlmDsa || !strata::platform::env_switch("MAYA_GLM_KV_AUTO")) return false;
+    if (g.arch != GlmArch::GlmDsa || !maya::platform::env_switch("MAYA_GLM_KV_AUTO")) return false;
     if (getenv("MAYA_GLM_SLOW") != nullptr || getenv("MAYA_GLM_EXPERT_HELPER") != nullptr) return false;
     if (const char* sq = getenv("MAYA_GLM_SEQS"); sq != nullptr && std::atoi(sq) > 1) return false;
     return Glm5Model::kv_resident_cells(g.idx_kpool, max_ctx) > 0;
@@ -2052,7 +2052,7 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
                               const std::string& layer_split) {
     if (const char* df = getenv("MAYA_GLM_DFLASH"); df != nullptr && df[0] != '\0') {
         dflash_path_ = df;
-        if (!strata::platform::env_switch("MAYA_GLM_NO_MTP")) {   // (unset, or 0 / off: it is set to 1)
+        if (!maya::platform::env_switch("MAYA_GLM_NO_MTP")) {   // (unset, or 0 / off: it is set to 1)
 #if defined(_WIN32)
             _putenv_s("MAYA_GLM_NO_MTP", "1");
 #else
@@ -2082,7 +2082,7 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     int helper = -1;
     if (const char* h = getenv("MAYA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
         // =link: the helper is a program of its own (glm_helper_link.hpp), beside one trunk GPU
-        if (strata::core::hlink::wanted()) {
+        if (maya::core::hlink::wanted()) {
             if (spec.empty() || spec == "0") return load_pack(pack_dir, max_ctx, err);
             err = "GLM expert helper link: one trunk GPU only (MAYA_GLM_SPLIT=0)";
             return false;
@@ -2154,8 +2154,8 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
         }
         if (bounds.empty() && devs.size() == 2)
             bounds = {g_.n_layers / 2 +
-                      (!strata::platform::env_switch("MAYA_GLM_NO_MTP") &&
-                               !strata::platform::env_switch("MAYA_GLM_NO_SPEC") ? 2 : 0)};
+                      (!maya::platform::env_switch("MAYA_GLM_NO_MTP") &&
+                               !maya::platform::env_switch("MAYA_GLM_NO_SPEC") ? 2 : 0)};
         if (bounds.empty()) bounds = glm_auto_bounds(pack_dir, g_.n_layers, devs, &g_);
         bounds = glm_snap_bounds(g_, bounds);   // glm-dsa B6.1: glm-dsa default bounds on full-indexer layers
     }
@@ -2357,12 +2357,12 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
     float* const S = state_;
     float* const A = sc_;
     float* R = S;   // the residual stack lives at the state arena's head
-    strata::kernels::GlmHcShapes hcs;
+    maya::kernels::GlmHcShapes hcs;
     hcs.n_embd = g.n_embd;
     hcs.hc = g.hc;
     hcs.sinkhorn_iters = g.sinkhorn_iters;
-    strata::kernels::GlmHcWorkspace hcws;
-    strata::kernels::glm_hc_workspace_init(hcs, A + sc_inv, hcws);
+    maya::kernels::GlmHcWorkspace hcws;
+    maya::kernels::glm_hc_workspace_init(hcs, A + sc_inv, hcws);
     const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
 
     for (int il = l0_; il < l1_; ++il) {
@@ -2372,7 +2372,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
         const auto ws_ = [&](const std::string& suffix) -> WSlot& { return ws_map_.at("blk." + L + "." + suffix); };
 
         // ---- hc read + norm
-        strata::kernels::glm_hc_pre(R, W("hc_attn_fn.weight"), W("hc_attn_scale.weight"),
+        maya::kernels::glm_hc_pre(R, W("hc_attn_fn.weight"), W("hc_attn_scale.weight"),
                                     W("hc_attn_base.weight"), g.norm_eps, g.hc_eps, hcs, hcws, A + sc_mixed,
                                     A + sc_pre, A + sc_post, A + sc_comb, nullptr);
         cb_dump("hc_pre-" + L, A + sc_pre, g.hc);
@@ -2391,7 +2391,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                 const std::string conv = std::string("ssm_conv1d_") + streams[si] + ".weight";
                 GM_CHECK(gm_gemv(ws_(attn), A + sc_x, nullptr, 1.0f,
                                  A + sc_proj, g.d_inner(), g.n_embd), err);
-                strata::kernels::glm_kda_conv(A + sc_proj, W(conv.c_str()),
+                maya::kernels::glm_kda_conv(A + sc_proj, W(conv.c_str()),
                                               S + kda_conv_[(size_t) il] + (int64_t) si * g.d_inner() * (g.d_conv - 1),
                                               g.d_inner(), g.d_conv, 1, A + sc_conv[si], nullptr);
             }
@@ -2404,19 +2404,19 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             GM_CHECK(gm_gemv(ws_("ssm_f_b.weight"), A + sc_tmp, nullptr, 1.0f,
                                                                  A + sc_g, g.d_inner(), g.kda_head_dim), err);
             axpy_kernel<<<blocks(g.d_inner()), GM_THREADS>>>(A + sc_g, 1.0f, W("ssm_dt.bias"), g.d_inner());
-            strata::kernels::glm_kda_gate(A + sc_g, W("ssm_a"), g.kda_lb, g.kda_head_dim, g.n_head, 1,
+            maya::kernels::glm_kda_gate(A + sc_g, W("ssm_a"), g.kda_lb, g.kda_head_dim, g.n_head, 1,
                                           A + sc_g1, nullptr);
             GM_CHECK(gm_gemv(ws_("ssm_beta.weight"), A + sc_x, nullptr, 1.0f,
                                                                A + sc_beta, g.n_head, g.n_embd), err);
             sigmoid_kernel<<<blocks(g.n_head), GM_THREADS>>>(A + sc_beta, g.n_head);
-            strata::kernels::glm_kda_recurrence(A + sc_conv[0], A + sc_conv[1], A + sc_conv[2], A + sc_g1,
+            maya::kernels::glm_kda_recurrence(A + sc_conv[0], A + sc_conv[1], A + sc_conv[2], A + sc_g1,
                                                 A + sc_beta, S + kda_S_[(size_t) il], g.n_head, g.kda_head_dim, 1,
                                                 A + sc_scan, nullptr);
             GM_CHECK(gm_gemv(ws_("ssm_g_a.weight"), A + sc_x, nullptr, 1.0f,
                                                                      A + sc_tmp, g.kda_head_dim, g.n_embd), err);
             GM_CHECK(gm_gemv(ws_("ssm_g_b.weight"), A + sc_tmp, nullptr, 1.0f,
                                                                  A + sc_g2, g.d_inner(), g.kda_head_dim), err);
-            strata::kernels::glm_kda_out_gate(A + sc_scan, W("ssm_norm.weight"), A + sc_g2, g.kda_head_dim,
+            maya::kernels::glm_kda_out_gate(A + sc_scan, W("ssm_norm.weight"), A + sc_g2, g.kda_head_dim,
                                               g.n_head, 1, g.norm_eps, A + sc_gated, nullptr);
             GM_CHECK(gm_gemv(ws_("attn_output.weight"), A + sc_gated, nullptr, 1.0f,
                                                                A + sc_mixer, g.n_embd, g.d_inner()), err);
@@ -2452,7 +2452,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             const int64_t pool_done = (p + 1) / g.idx_kpool;   // pools whose last member is <= p
             if ((p + 1) % g.idx_kpool == 0) {
                 const int64_t pi = pool_done - 1;
-                strata::kernels::glm_dsa_pool(S + dsa_ik_[(size_t) il] + (int64_t) g.idx_key * pi * g.idx_kpool,
+                maya::kernels::glm_dsa_pool(S + dsa_ik_[(size_t) il] + (int64_t) g.idx_key * pi * g.idx_kpool,
                                               S + dsa_ig_[(size_t) il] + (int64_t) g.idx_key * pi * g.idx_kpool,
                                               W("indexer_compressor_ape.weight"), g.idx_key, g.idx_kpool, 1,
                                               S + dsa_pool_[(size_t) il] + (int64_t) g.idx_key * pi, nullptr);
@@ -2467,16 +2467,16 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             // has nothing to attend to
             if (pool_done > 0 || g.idx_select_tail) {
                 if (pool_done > 0)
-                    strata::kernels::glm_dsa_score(A + sc_iq, S + dsa_pool_[(size_t) il], A + sc_iw, g.idx_key,
+                    maya::kernels::glm_dsa_score(A + sc_iq, S + dsa_pool_[(size_t) il], A + sc_iw, g.idx_key,
                                                    g.idx_heads, 1, (int) pool_done, A + sc_score, nullptr);
                 const int top_pools = (int) std::min<int64_t>(g.top_pools_max(), pool_done);
                 const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
                 const int p32 = (int) p;
                 GM_CHECK(cudaMemcpy(d_pos_, &p32, sizeof(int), cudaMemcpyHostToDevice), err);
-                strata::kernels::glm_dsa_select(A + sc_score, (int) pool_done, g.idx_kpool, top_pools,
+                maya::kernels::glm_dsa_select(A + sc_score, (int) pool_done, g.idx_kpool, top_pools,
                                                 g.idx_select_tail, 1, n_sel, d_pos_, (int*) (A + sc_cells),
                                                 nullptr);
-                strata::kernels::glm_mla_attention(A + sc_qabs, lat, (const int*) (A + sc_cells),
+                maya::kernels::glm_mla_attention(A + sc_qabs, lat, (const int*) (A + sc_cells),
                                                    W("attn_v_b.weight"), g.kv_lora, g.n_head, g.v_head,
                                                    g.qk_nope, 1, n_sel, A + sc_attn, nullptr);
             } else {
@@ -2488,10 +2488,10 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
 
         // ---- hc write (ping-pong), then the FFN half
         ablate(A + sc_mixer, 1, nullptr);   // (--ablate: the mixer's write loses the direction)
-        strata::kernels::glm_hc_post(A + sc_mixer, R, A + sc_post, A + sc_comb, hcs, S + g.hc * g.n_embd, nullptr);
+        maya::kernels::glm_hc_post(A + sc_mixer, R, A + sc_post, A + sc_comb, hcs, S + g.hc * g.n_embd, nullptr);
         R = S + g.hc * g.n_embd;
         cb_dump("hc_attn_post-" + L, R, g.hc * g.n_embd);
-        strata::kernels::glm_hc_pre(R, W("hc_ffn_fn.weight"), W("hc_ffn_scale.weight"), W("hc_ffn_base.weight"),
+        maya::kernels::glm_hc_pre(R, W("hc_ffn_fn.weight"), W("hc_ffn_scale.weight"), W("hc_ffn_base.weight"),
                                     g.norm_eps, g.hc_eps, hcs, hcws, A + sc_mixed, A + sc_pre, A + sc_post,
                                     A + sc_comb, nullptr);
         cb_dump("hc_ffn_pre-" + L, A + sc_mixed, g.n_embd);
@@ -2503,7 +2503,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                                                                    A + sc_gate, g.n_ff_dense, g.n_embd), err);
             GM_CHECK(gm_gemv(ws_("ffn_up.weight"), A + sc_x, nullptr, 1.0f,
                                                                    A + sc_up, g.n_ff_dense, g.n_embd), err);
-            strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_shexp, g.n_ff_dense, A + sc_h,
+            maya::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_shexp, g.n_ff_dense, A + sc_h,
                                               nullptr);
             GM_CHECK(gm_gemv(ws_("ffn_down.weight"), A + sc_h, nullptr, 1.0f,
                                                                A + sc_ffn, g.n_embd, g.n_ff_dense), err);
@@ -2511,7 +2511,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             GM_CHECK(gm_gemv(ws_("ffn_gate_inp.weight"), A + sc_x, nullptr, 1.0f,
                                                                  A + sc_tmp, g.n_expert, g.n_embd), err);
             cb_dump("glm_moe_logits-" + L, A + sc_tmp, g.n_expert);
-            strata::kernels::router_sigmoid(A + sc_tmp, W("exp_probs_b.bias"), 1, g.n_expert, g.n_exp_used,
+            maya::kernels::router_sigmoid(A + sc_tmp, W("exp_probs_b.bias"), 1, g.n_expert, g.n_exp_used,
                                             g.w_scale, g.norm_w != 0, (int*) (A + sc_ids), A + sc_rw, nullptr);
             cb_dump("glm_moe_topk-" + L, A + sc_ids, g.n_exp_used);
             cb_dump("glm_moe_rw-" + L, A + sc_rw, g.n_exp_used);
@@ -2540,7 +2540,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                     gemv_bias_kernel<<<gm_blocks(g.n_ff_exp), GM_THREADS>>>(W("ffn_up_exps.weight") + slab * e,
                                                                          A + sc_x, nullptr, 1.0f, A + sc_up,
                                                                          g.n_ff_exp, g.n_embd, 1);
-                    strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_exp, g.n_ff_exp, A + sc_h,
+                    maya::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_exp, g.n_ff_exp, A + sc_h,
                                                       nullptr);
                     gemv_bias_kernel<<<gm_blocks(g.n_embd), GM_THREADS>>>(W("ffn_down_exps.weight") + slab * e,
                                                                        A + sc_h, nullptr, 1.0f, A + sc_dn, g.n_embd,
@@ -2552,7 +2552,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             GM_CHECK(gm_gemv(ws_("ffn_gate_shexp.weight"), A + sc_x, nullptr, 1.0f, A + sc_gate, g.n_ff_exp * g.n_shared,
                 g.n_embd), err);
             GM_CHECK(gm_gemv(ws_("ffn_up_shexp.weight"), A + sc_x, nullptr, 1.0f, A + sc_up, g.n_ff_exp * g.n_shared, g.n_embd), err);
-            strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_shexp, g.n_ff_exp * g.n_shared,
+            maya::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_shexp, g.n_ff_exp * g.n_shared,
                                               A + sc_h, nullptr);
             GM_CHECK(gm_gemv(ws_("ffn_down_shexp.weight"), A + sc_h, nullptr,
                                                                1.0f, A + sc_sh, g.n_embd,
@@ -2564,7 +2564,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
         cb_dump("ffn_out-" + L, A + sc_ffn, g.n_embd);
 
         ablate(A + sc_ffn, 1, nullptr);   // (... and the FFN's)
-        strata::kernels::glm_hc_post(A + sc_ffn, R, A + sc_post, A + sc_comb, hcs, S, nullptr);
+        maya::kernels::glm_hc_post(A + sc_ffn, R, A + sc_post, A + sc_comb, hcs, S, nullptr);
         R = S;
         cb_dump("l_out-" + L, R, g.hc * g.n_embd);
         if (timing_) {
@@ -2603,13 +2603,13 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core
 
 // ================================ the pack (docs/GLM5-FLASH.md §9) ================================
 
 // the routed half of one MoE layer, on the CPU: x (device) -> host, the selected experts'
 // quantized blobs dotted by native_expert, weighted sum uploaded into A + sc_moe
-cudaError_t strata::core::Glm5Model::pack_moe_tail(std::string& err, const std::vector<int>& ids, const std::vector<float>& rw,
+cudaError_t maya::core::Glm5Model::pack_moe_tail(std::string& err, const std::vector<int>& ids, const std::vector<float>& rw,
                               float* A, int layer) {
     const auto& g = g_;
     const auto& nl = pack_layers_[(size_t) layer];
@@ -2634,11 +2634,11 @@ cudaError_t strata::core::Glm5Model::pack_moe_tail(std::string& err, const std::
         const uint8_t* gb = gs.base + nl.gate_off + (uint64_t) e * nl.fmt.gu_row * (uint64_t) g.n_ff_exp;
         const uint8_t* ub = us.base + nl.up_off + (uint64_t) e * nl.fmt.gu_row * (uint64_t) g.n_ff_exp;
         const uint8_t* db = ds.base + nl.down_off + (uint64_t) e * nl.fmt.d_row * (uint64_t) g.n_embd;
-        strata::kernels::cpu::native_quant_act(nl.fmt, host_x_.data(), host_act_.data());
-        strata::kernels::cpu::native_gu_rows_split(nl.fmt, gb, ub, act, 1, ff1, 0, (int) g.n_ff_exp, g.swiglu_exp);
+        maya::kernels::cpu::native_quant_act(nl.fmt, host_x_.data(), host_act_.data());
+        maya::kernels::cpu::native_gu_rows_split(nl.fmt, gb, ub, act, 1, ff1, 0, (int) g.n_ff_exp, g.swiglu_exp);
         cb_dump_h("glm_exp" + std::to_string(e) + "-h-" + std::to_string(layer), host_ff_.data(), g.n_ff_exp);
-        strata::kernels::cpu::native_quant_h(nl.fmt, host_ff_.data(), host_hq_.data());
-        strata::kernels::cpu::native_down_rows_split(nl.fmt, db, hq, 1, dn1, 0, (int) g.n_embd);
+        maya::kernels::cpu::native_quant_h(nl.fmt, host_ff_.data(), host_hq_.data());
+        maya::kernels::cpu::native_down_rows_split(nl.fmt, db, hq, 1, dn1, 0, (int) g.n_embd);
         cb_dump_h("glm_exp" + std::to_string(e) + "-dn-" + std::to_string(layer), host_dn_.data(), g.n_embd);
         const float w = rw[i];
         for (int j = 0; j < g.n_embd; ++j) host_moe_[(size_t) j] += w * host_dn_[(size_t) j];
@@ -2650,7 +2650,7 @@ cudaError_t strata::core::Glm5Model::pack_moe_tail(std::string& err, const std::
 
 // ---- M2b: the device expert pool -----------------------------------------------
 
-void strata::core::Glm5Model::stage_worker() {
+void maya::core::Glm5Model::stage_worker() {
     for (;;) {
         StageJob job;
         {
@@ -2672,12 +2672,12 @@ void strata::core::Glm5Model::stage_worker() {
     }
 }
 
-void strata::core::Glm5Model::stage_join() {
+void maya::core::Glm5Model::stage_join() {
     std::unique_lock<std::mutex> lk(stage_mu_);
     stage_done_cv_.wait(lk, [&] { return stage_pending_ == 0; });
 }
 
-int32_t strata::core::Glm5Model::pool_evict(int cls) {
+int32_t maya::core::Glm5Model::pool_evict(int cls) {
     // LFU with aging, not plain LRU: the routing traces show a heavy hitter set that recency
     // churns.  The least-used slot goes first, recency breaks ties; every 4096 evictions all
     // counts halve, so the pool tracks a phase change instead of fossilising the warmup.
@@ -2702,7 +2702,7 @@ int32_t strata::core::Glm5Model::pool_evict(int cls) {
     return best;
 }
 
-void strata::core::Glm5Model::pool_ensure(int layer, const int* ids, int k) {
+void maya::core::Glm5Model::pool_ensure(int layer, const int* ids, int k) {
     const auto& nl = pack_layers_[(size_t) layer];
     const uint64_t gu_bytes = (uint64_t) nl.fmt.gu_row * (uint64_t) g_.n_ff_exp;   // one role
     const uint64_t dn_bytes = (uint64_t) nl.fmt.d_row * (uint64_t) g_.n_embd;
@@ -2803,7 +2803,7 @@ void strata::core::Glm5Model::pool_ensure(int layer, const int* ids, int k) {
     }
 }
 
-bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::vector<int>& ids,
+bool maya::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::vector<int>& ids,
                                                    const std::vector<float>& rw, float* A, int layer) {
     const auto& g = g_;
     const auto& nl = pack_layers_[(size_t) layer];
@@ -2861,10 +2861,10 @@ bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::
         }
     }
 #endif
-    strata::kernels::quantize_q8_1_rows(A + sc_x, 1, g.n_embd, dev_xq_, nullptr);
-    const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(
+    maya::kernels::quantize_q8_1_rows(A + sc_x, 1, g.n_embd, dev_xq_, nullptr);
+    const maya::kernels::NativeExpertLayout L = maya::kernels::native_expert_layout(
         nl.fmt.gu_type, nl.fmt.d_type, g.n_embd, g.n_ff_exp);
-    if (!strata::kernels::native_expert_grouped(L, (const unsigned long long*) (plan_dev_ + offsetof(DevPlan, ptr)),
+    if (!maya::kernels::native_expert_grouped(L, (const unsigned long long*) (plan_dev_ + offsetof(DevPlan, ptr)),
                                                 (const int32_t*) (plan_dev_ + offsetof(DevPlan, start)),
                                                 (const int32_t*) (plan_dev_ + offsetof(DevPlan, n_groups)),
                                                 (const int32_t*) (plan_dev_ + offsetof(DevPlan, dst)),
@@ -2887,7 +2887,7 @@ bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::
 
 // ================================ the pack (docs/GLM5-FLASH.md §9) ================================
 
-static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Shard& s, uint64_t data_start,
+static bool pack_shard_mmap(const std::string& path, maya::core::Glm5Model::Shard& s, uint64_t data_start,
                             std::string& err) {
 #ifdef _WIN32
     // the same as below with Windows' calls: a read-only view of the whole shard, and a second, unbuffered handle
@@ -2957,7 +2957,7 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
 // reads the shards through h_direct only, and token_embd through pack_emb_src_: the table moves to the heap
 // (~0.7 GB for GLM-5.3-Flash's Q8_0 rows) and the views go.  Kept when a shard has no unbuffered handle (its reads
 // fall back to the view) or with MAYA_GLM_KEEP_MAP=1.
-void strata::core::Glm5Model::pack_release_views() {
+void maya::core::Glm5Model::pack_release_views() {
 #ifdef _WIN32
     const char* km = getenv("MAYA_GLM_KEEP_MAP");
     if (km != nullptr && std::atoi(km) != 0) return;
@@ -2978,7 +2978,7 @@ void strata::core::Glm5Model::pack_release_views() {
 #endif
 }
 
-bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_ctx, std::string& err, int dev,
+bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_ctx, std::string& err, int dev,
                                         int l0, int l1) {
     dev_ = dev;
     pack_dir_ = pack_dir;
@@ -2987,7 +2987,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     std::vector<std::string> shard_names;
     if (!pack_shard_names(pack_dir, shard_names, err)) return false;
     const std::string dir2 = pack_dir + "/..";   // the shards live beside the pack directory
-    strata::GgufFile gguf(dir2 + "/" + shard_names[0]);
+    maya::GgufFile gguf(dir2 + "/" + shard_names[0]);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
     max_ctx_ = max_ctx;
     l0_ = l0;
@@ -3011,16 +3011,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
 
     // 2. mmap the shards AND keep their GGUF directories alive: unsloth's shard 1 carries only
     //    metadata - the tensor directories live in shards 2/3, so lookups must scan them all
-    std::vector<std::unique_ptr<strata::GgufFile>> gfs;
+    std::vector<std::unique_ptr<maya::GgufFile>> gfs;
     for (const auto& n : shard_names) {
-        gfs.emplace_back(new strata::GgufFile(dir2 + "/" + n));
+        gfs.emplace_back(new maya::GgufFile(dir2 + "/" + n));
         Shard s;
         if (!pack_shard_mmap(dir2 + "/" + n, s, gfs.back()->data_start(), err)) return false;
         pack_shards_.push_back(s);
     }
-    const auto find_tensor = [&](const std::string& name) -> const strata::TensorInfo* {
+    const auto find_tensor = [&](const std::string& name) -> const maya::TensorInfo* {
         for (const auto& gf : gfs) {
-            const strata::TensorInfo* t = gf->find(name);
+            const maya::TensorInfo* t = gf->find(name);
             if (t) return t;
         }
         return nullptr;
@@ -3055,7 +3055,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             if (layer < 0 || layer >= g_.n_layers) continue;
             NativeLayer nl;
             nl.layer = layer;
-            if (!strata::kernels::cpu::native_fmt(gu, dty, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
+            if (!maya::kernels::cpu::native_fmt(gu, dty, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
             nl.gate_off = go;
             nl.up_off = uo;
             nl.down_off = dof;
@@ -3090,7 +3090,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const int role_ty[3] = {gu, gu, dty};   // gate and up share one type; down is its own
             for (int ri = 0; ri < 3; ++ri) {
                 const std::string rn = "blk." + std::to_string(layer) + "." + role_tn[ri];
-                const strata::TensorInfo* ti = gfs[(size_t) role_sh[ri]]->find(rn);
+                const maya::TensorInfo* ti = gfs[(size_t) role_sh[ri]]->find(rn);
                 if (ti == nullptr || (int) ti->type != role_ty[ri] ||
                     (uint64_t) gfs[(size_t) role_sh[ri]]->data_start() + ti->offset != role_of[ri]) {
                     err = "pack: native_experts row " + std::to_string(layer) +
@@ -3110,7 +3110,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // 3b. an EXL3 pack (tools/exl3_pack.py's exl3.txt): the model's safetensors join the shards after the GGUF; each
     //     routed expert is nine pieces in them (gate, up, down x trellis, suh, svh), assembled into the usual
     //     [gate | up | down] blob as it is read; the matrices are index rows of kind x, uploaded below
-    namespace x3 = strata::kernels::exl3;
+    namespace x3 = maya::kernels::exl3;
     Exl3Table xt;
     {
         std::string xe;
@@ -3198,7 +3198,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         err = "pack: an EXL3 model runs on the fast path only (unset MAYA_GLM_SLOW)";
         return false;
     }
-    const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
+    const auto keep16 = [&](const Row& r, const maya::TensorInfo* t) {
         return (fast_mode_ || g_.arch == GlmArch::GlmDsa) && r.kind == "4" && t->elements() >= 65536;   // glm-dsa B3.5
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
@@ -3233,7 +3233,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + " exl3"] += xm->second.vram();
             continue;
         }
-        const strata::TensorInfo* t = find_tensor(r.name);
+        const maya::TensorInfo* t = find_tensor(r.name);
         if (!t) {
             err = "pack: tensor " + r.name + " is in index.txt but in no shard";
             return false;
@@ -3306,7 +3306,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 return false;
             }
             const x3::Mat& slot = exl3_mats_[r.name] = M;
-            ws_map_[r.name] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, m.n};
+            ws_map_[r.name] = maya::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, m.n};
             // the fused KDA projection: q, k and v are its column thirds (tools/exl3_pack.py keeps llama.cpp's order)
             const std::string fused = "attn_qkv.weight";
             if (r.name.size() > fused.size() && r.name.compare(r.name.size() - fused.size(), fused.size(), fused) == 0) {
@@ -3315,15 +3315,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 const char* part[3] = {"attn_q.weight", "attn_k.weight", "attn_v.weight"};
                 for (int i = 0; i < 3; ++i) {
                     const x3::Mat& v = exl3_mats_[P + part[i]] = x3::view(M, i * third, third);
-                    ws_map_[P + part[i]] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &v, m.k, third};
+                    ws_map_[P + part[i]] = maya::core::WSlot{nullptr, x3::kTypeEXL3, &v, m.k, third};
                 }
             }
             continue;
         }
-        const strata::TensorInfo* t = find_tensor(r.name);
+        const maya::TensorInfo* t = find_tensor(r.name);
         if (skip_upload(r)) {
             const int si = find_shard_of(r.name);
-            const strata::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;
+            const maya::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;
             if (ti == nullptr) {
                 err = "pack: token_embd not found in any shard";
                 return false;
@@ -3356,12 +3356,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 err = "pack: native tensor " + r.name + " not found in any shard";
                 return false;
             }
-            const strata::TensorInfo* ti = gfs[(size_t) si]->find(r.name);
-            const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0],
+            const maya::TensorInfo* ti = gfs[(size_t) si]->find(r.name);
+            const size_t nbytes = maya::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0],
                                                                             (int) (ti->elements() / ti->shape[0]));   // glm-dsa B10.7: 3-D native rows
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
-            ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) ((uint8_t*) w_arena_ + at),
+            ws_map_[r.name] = maya::core::WSlot{nullptr, (int) ti->type, (const void*) ((uint8_t*) w_arena_ + at),
                                     (int64_t) ti->shape[0], (int64_t) ti->shape[1]};
             if (r.name == "token_embd.weight") {
                 pack_emb_src_ = src;
@@ -3380,7 +3380,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 err = "pack: native tensor " + r.name + " not found in any shard";
                 return false;
             }
-            const strata::TensorInfo* ti = gfs[(size_t) si]->find(r.name);
+            const maya::TensorInfo* ti = gfs[(size_t) si]->find(r.name);
             if (!ti) {
                 err = "pack: tensor " + r.name + " missing from shard " + std::to_string(si);
                 return false;
@@ -3420,7 +3420,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, host.data(), (size_t) n_f32 * 4,
                             cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
-        ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
+        ws_map_[r.name] = maya::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
         at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;
     }
     if (head_half_) {
@@ -3472,7 +3472,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         M.k2 = m.k2;
         M.cb = m.cb;
         const x3::Mat& slot = exl3_mats_["output.weight.hi"] = M;
-        ws_map_["output.weight.hi"] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, nc};
+        ws_map_["output.weight.hi"] = maya::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, nc};
         int lo = 0, hi = 0;
         cudaDeviceGetStreamPriorityRange(&lo, &hi);
         if (cudaStreamCreateWithPriority(&hh_s_, cudaStreamNonBlocking, hi) != cudaSuccess ||
@@ -3497,7 +3497,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const char* mtp_gguf = getenv("MAYA_GLM_MTP_GGUF");
     if (fast_mode_ && l1_ == g_.n_layers && mtp_gguf != nullptr && mtp_gguf[0] != '\0') {
         const bool own = find_tensor("blk." + std::to_string(g_.n_layers) + ".nextn.eh_proj.weight") != nullptr;
-        auto extra = std::make_unique<strata::GgufFile>(mtp_gguf);
+        auto extra = std::make_unique<maya::GgufFile>(mtp_gguf);
         if (extra->find("blk." + std::to_string(g_.n_layers) + ".nextn.eh_proj.weight") == nullptr) {
             err = std::string("MAYA_GLM_MTP_GGUF: ") + mtp_gguf + " has no blk." + std::to_string(g_.n_layers) +
                   " draft block";
@@ -3517,7 +3517,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // (glm-dsa too since L1-4: its NextN cache rows and the verify window run glm-dsa's own caches)
     const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_, g_.arch == GlmArch::GlmDsa);
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) &&
-        !strata::platform::env_switch("MAYA_GLM_NO_MTP") &&
+        !maya::platform::env_switch("MAYA_GLM_NO_MTP") &&
         (l0_ > 0 || getenv("MAYA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
@@ -3546,11 +3546,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
-    const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
+    const int64_t lat_floats = lat_q8_      ? (int64_t) maya::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
                                : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
                                             : (int64_t) g_.kv_lora * lat_rows;
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
-                              strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
+                              maya::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it, placed first)
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position).  glm-dsa B4.1: the
@@ -3712,7 +3712,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         if (cudaHostAlloc(&plan_host_, sizeof(DevPlan), cudaHostAllocMapped) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &plan_dev_, plan_host_, 0) != cudaSuccess ||
             cudaMalloc(&dev_xq_, (size_t) g_.n_embd / 32 * 36) != cudaSuccess ||
-            cudaMalloc(&dev_scratch_, strata::kernels::native_expert_scratch_bytes(g_.n_exp_used, g_.n_ff_exp)) !=
+            cudaMalloc(&dev_scratch_, maya::kernels::native_expert_scratch_bytes(g_.n_exp_used, g_.n_ff_exp)) !=
                 cudaSuccess ||
             cudaMalloc(&dev_hit_out_, (size_t) g_.n_exp_used * (size_t) g_.n_embd * sizeof(float)) != cudaSuccess) {
             err = "pack: the device expert pool could not allocate its scratch";
@@ -3754,8 +3754,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     host_moe_.resize((size_t) g_.n_embd);
     host_ff_.resize((size_t) g_.n_ff_exp);
     host_dn_.resize((size_t) g_.n_embd);
-    host_act_.resize(strata::kernels::cpu::kNativeActBytes);
-    host_hq_.resize(strata::kernels::cpu::kNativeHBytes);
+    host_act_.resize(maya::kernels::cpu::kNativeActBytes);
+    host_hq_.resize(maya::kernels::cpu::kNativeHBytes);
     pack_ = true;
     loaded_ = true;
     if (fast_mode_) pack_release_views();   // before fast_setup: its RAM tier sees the embedding's heap copy
@@ -3779,17 +3779,17 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
 // state)].  The pack never carried it, so its tensors come straight from the shards: the quantized projections stay
 // quantized, the small rows the trunk's kernels expect as BF16 (indexer, router, absorbed k/v) are widened at load,
 // and its routed experts join the expert tiers as one more MoE layer (pack_layers_[n_layers]).
-bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err) {
+bool maya::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<maya::GgufFile>>& gfs, std::string& err) {
     const int il = g_.n_layers;
     const std::string P = "blk." + std::to_string(il) + ".";
-    const auto find = [&](const std::string& n, int& si) -> const strata::TensorInfo* {
+    const auto find = [&](const std::string& n, int& si) -> const maya::TensorInfo* {
         if (mtp_src_ >= 0 && n.compare(0, P.size(), P) == 0)   // the block from MAYA_GLM_MTP_GGUF wins
-            if (const strata::TensorInfo* t = gfs[(size_t) mtp_src_]->find(n)) {
+            if (const maya::TensorInfo* t = gfs[(size_t) mtp_src_]->find(n)) {
                 si = mtp_src_;
                 return t;
             }
         for (size_t i = 0; i < gfs.size(); ++i)
-            if (const strata::TensorInfo* t = gfs[i]->find(n)) {
+            if (const maya::TensorInfo* t = gfs[i]->find(n)) {
                 si = (int) i;
                 return t;
             }
@@ -3821,12 +3821,12 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         }
         for (const auto& n : b16_names) {
             if (x3(P + n)) { bytes += xt.mats.at(P + n).vram(); continue; }
-            const strata::TensorInfo* t = find(P + n, si);
+            const maya::TensorInfo* t = find(P + n, si);
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
         }
         for (const auto& n : f32_names) {
-            const strata::TensorInfo* t = find(P + n, si);
+            const maya::TensorInfo* t = find(P + n, si);
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
         }
@@ -3842,10 +3842,10 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     uint64_t at = 0;
     uint8_t* base = (uint8_t*) mtp_arena_;
     std::vector<float> host;
-    const auto src_of = [&](const strata::TensorInfo* t, int s) {
+    const auto src_of = [&](const maya::TensorInfo* t, int s) {
         return pack_shards_[(size_t) s].base + gfs[(size_t) s]->data_start() + t->offset;
     };
-    const auto to_host = [&](const strata::TensorInfo* t, int s) -> bool {
+    const auto to_host = [&](const maya::TensorInfo* t, int s) -> bool {
         if (t->type == 0) {   // F32
             host.resize((size_t) t->elements());
             std::memcpy(host.data(), src_of(t, s), (size_t) t->elements() * 4);
@@ -3869,7 +3869,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             }
             at += (nb[j] + 255u) & ~(uint64_t) 255u;
         }
-        strata::kernels::exl3::Mat M;
+        maya::kernels::exl3::Mat M;
         M.trellis = (const uint32_t*) dst[0];
         M.suh = (const uint16_t*) dst[1];
         M.svh = (const uint16_t*) dst[2];
@@ -3877,9 +3877,9 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         M.n = m.n;
         M.k2 = m.k2;
         M.cb = m.cb;
-        if (!strata::kernels::exl3::supported(M)) { err = "mtp: EXL3 " + n + " is not covered by the kernels"; return false; }
-        const strata::kernels::exl3::Mat& slot = exl3_mats_[n] = M;
-        ws_map_[n] = strata::core::WSlot{nullptr, strata::kernels::exl3::kTypeEXL3, &slot, m.k, m.n};
+        if (!maya::kernels::exl3::supported(M)) { err = "mtp: EXL3 " + n + " is not covered by the kernels"; return false; }
+        const maya::kernels::exl3::Mat& slot = exl3_mats_[n] = M;
+        ws_map_[n] = maya::core::WSlot{nullptr, maya::kernels::exl3::kTypeEXL3, &slot, m.k, m.n};
         return true;
     };
     for (const auto& n : raw_names) {
@@ -3887,10 +3887,10 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             if (!up_x3(P + n)) return false;
             continue;
         }
-        const strata::TensorInfo* t = find(P + n, si);
-        const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
+        const maya::TensorInfo* t = find(P + n, si);
+        const size_t nb = maya::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
         if (cudaMemcpy(base + at, src_of(t, si), nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
-        ws_map_[P + n] = strata::core::WSlot{nullptr, (int) t->type, (const void*) (base + at), (int64_t) t->shape[0],
+        ws_map_[P + n] = maya::core::WSlot{nullptr, (int) t->type, (const void*) (base + at), (int64_t) t->shape[0],
                                              (int64_t) t->shape[1]};
         at += (nb + 255u) & ~(uint64_t) 255u;
     }
@@ -3900,7 +3900,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             if (!up_x3(P + n)) return false;
             continue;
         }
-        const strata::TensorInfo* t = find(P + n, si);
+        const maya::TensorInfo* t = find(P + n, si);
         if (!to_host(t, si)) return false;
         b16.resize(host.size());
         for (size_t i = 0; i < host.size(); ++i) {   // round to nearest even
@@ -3914,13 +3914,13 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         at += ((uint64_t) b16.size() * 2 + 255u) & ~(uint64_t) 255u;
     }
     for (const auto& n : f32_names) {
-        const strata::TensorInfo* t = find(P + n, si);
+        const maya::TensorInfo* t = find(P + n, si);
         if (t == nullptr)
             if (const char* fb = glm_mtp_fallback(g_.arch, n)) t = find(fb, si);   // glm-dsa B1.8: shared_head_norm
         if (!to_host(t, si)) return false;
         if (cudaMemcpy(base + at, host.data(), host.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
         w_[P + n] = (const float*) (base + at);
-        ws_map_[P + n] = strata::core::WSlot{(const float*) (base + at), 0, nullptr, 0, 0};
+        ws_map_[P + n] = maya::core::WSlot{(const float*) (base + at), 0, nullptr, 0, 0};
         at += ((uint64_t) host.size() * 4 + 255u) & ~(uint64_t) 255u;
     }
     // the routed experts: gate/up/down by absolute offset, like native_experts.txt rows
@@ -3937,7 +3937,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             err = "mtp: the draft block's expert shapes disagree with the geometry";
             return false;
         }
-        nl.fmt.gu_type = nl.fmt.d_type = strata::kernels::exl3::kTypeEXL3;
+        nl.fmt.gu_type = nl.fmt.d_type = maya::kernels::exl3::kTypeEXL3;
         nl.x_cb = X.cb;
         for (int r = 0; r < 3; ++r) {
             nl.x_k2[r] = X.k2[r];
@@ -3957,7 +3957,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         pack_layers_[(size_t) il] = std::move(nl);
         if (pack_emb_src_ == nullptr) {
             int se = -1;
-            const strata::TensorInfo* te = find("token_embd.weight", se);
+            const maya::TensorInfo* te = find("token_embd.weight", se);
             if (te == nullptr) { err = "mtp: token_embd not found"; return false; }
             pack_emb_src_ = src_of(te, se);
             pack_emb_type_ = (int) te->type;
@@ -3969,14 +3969,14 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;
     }
     int sg = -1, su = -1, sd = -1;
-    const strata::TensorInfo* tg = find(P + "ffn_gate_exps.weight", sg);
-    const strata::TensorInfo* tu = find(P + "ffn_up_exps.weight", su);
-    const strata::TensorInfo* td = find(P + "ffn_down_exps.weight", sd);
+    const maya::TensorInfo* tg = find(P + "ffn_gate_exps.weight", sg);
+    const maya::TensorInfo* tu = find(P + "ffn_up_exps.weight", su);
+    const maya::TensorInfo* td = find(P + "ffn_down_exps.weight", sd);
     if (tg == nullptr || tu == nullptr || td == nullptr || tg->type != tu->type) {
         err = "mtp: the draft block's routed experts are missing or mixed";
         return false;
     }
-    if (!strata::kernels::cpu::native_fmt((int) tg->type, (int) td->type, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
+    if (!maya::kernels::cpu::native_fmt((int) tg->type, (int) td->type, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
     nl.gate_shard = sg;
     nl.up_shard = su;
     nl.down_shard = sd;
@@ -3988,7 +3988,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     // the draft block embeds the next token: the embedding rows come from the shard mapping on this half too
     if (pack_emb_src_ == nullptr) {
         int se = -1;
-        const strata::TensorInfo* te = find("token_embd.weight", se);
+        const maya::TensorInfo* te = find("token_embd.weight", se);
         if (te == nullptr) { err = "mtp: token_embd not found"; return false; }
         pack_emb_src_ = src_of(te, se);
         pack_emb_type_ = (int) te->type;

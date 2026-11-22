@@ -19,7 +19,7 @@
 #include <cstring>
 #endif
 
-namespace strata::ds4::par {
+namespace maya::ds4::par {
 
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
 DS4_PAR_HD float p_fma(float a, float b, float c) { return __fmaf_rn(a, b, c); }
@@ -82,4 +82,4 @@ DS4_PAR_HD float swiglu_portable(float gv, float uv, float limit) {
     return p_mul(p_div(gv, p_add(1.0f, exp_portable(-gv))), uv);
 }
 
-}  // namespace strata::ds4::par
+}  // namespace maya::ds4::par

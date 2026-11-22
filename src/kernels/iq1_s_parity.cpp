@@ -7,8 +7,8 @@
 // agree to fp32 rounding; the device MMVQ dot through the production dispatcher (native_mmvq,
 // type 19, q8_1 activations) must track an f32 matvec of the dequanted weights within the
 // activation rounding.  Byte accounting (native_mmvq_weight_bytes) is asserted too.
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "maya/kernels/iq_kernels.hpp"
+#include "maya/kernels/native_mmvq.hpp"
 #include "ggml.h"
 
 #include <cuda_runtime.h>
@@ -27,9 +27,9 @@ int main() {
 
     // 1. the byte accounting
     const std::size_t expect_bytes = (std::size_t) kRows * kBlocks * kBlockBytes;
-    if (strata::kernels::native_mmvq_weight_bytes(19, kCols, kRows) != expect_bytes) {
+    if (maya::kernels::native_mmvq_weight_bytes(19, kCols, kRows) != expect_bytes) {
         std::printf("FAIL weight_bytes(19, %d, %d) = %zu, expected %zu\n", kCols, kRows,
-                    strata::kernels::native_mmvq_weight_bytes(19, kCols, kRows), expect_bytes);
+                    maya::kernels::native_mmvq_weight_bytes(19, kCols, kRows), expect_bytes);
         ++failures;
     }
 
@@ -66,7 +66,7 @@ int main() {
         std::printf("FAIL cuda alloc\n");
         return 1;
     }
-    strata::kernels::iq_dequant_f32(19, dw, (int64_t) kRows * kCols, dq, s);
+    maya::kernels::iq_dequant_f32(19, dw, (int64_t) kRows * kCols, dq, s);
     std::vector<float> got(ref.size());
     cudaMemcpy(got.data(), dq, got.size() * 4, cudaMemcpyDeviceToHost);
     double num = 0, den = 0;
@@ -87,8 +87,8 @@ int main() {
     cudaMalloc(&xq, (size_t) 2 * (kCols / 32) * 36);
     cudaMalloc(&dy, (size_t) 2 * kRows * 4);
     cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
-    strata::kernels::quantize_q8_1_rows(dx, 2, kCols, xq, s);
-    strata::kernels::native_mmvq(19, dw, xq, dy, kCols, kRows, 2, s);
+    maya::kernels::quantize_q8_1_rows(dx, 2, kCols, xq, s);
+    maya::kernels::native_mmvq(19, dw, xq, dy, kCols, kRows, 2, s);
     cudaStreamSynchronize(s);
     std::vector<float> y((size_t) 2 * kRows);
     cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);

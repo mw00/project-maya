@@ -1,7 +1,7 @@
-// The host-side rules of several conversations drafting at once (MAYA_GLM_MULTI_MTP, strata/core/mtp_rows.hpp): a
+// The host-side rules of several conversations drafting at once (MAYA_GLM_MULTI_MTP, maya/core/mtp_rows.hpp): a
 // window's rows from its drafts, budget and room; a group cut to its row cap; the kept rows of a window, with stops,
 // forced tokens and the last row; the head's argmax-or-sampler rule.  CPU only.
-#include "strata/core/mtp_rows.hpp"
+#include "maya/core/mtp_rows.hpp"
 
 #include <cstdio>
 #include <vector>
@@ -25,7 +25,7 @@ void check_v(const std::vector<int>& got, const std::vector<int>& want, const ch
 }  // namespace
 
 int main() {
-    using namespace strata::core;
+    using namespace maya::core;
     // ---- a window's rows
     check(mtp_rows_count(3, 100, 100) == 4, "3 drafts: 4 rows");
     check(mtp_rows_count(0, 100, 100) == 1, "no drafts: 1 row");
@@ -111,17 +111,17 @@ int main() {
 
     // ---- the head's rule (rows_head and the windows' head alike): argmax only for greedy without penalties
     {
-        strata::kernels::SamplerParams sp;
+        maya::kernels::SamplerParams sp;
         sp.greedy = true;
         check(rows_pick_argmax(sp), "greedy: argmax");
         sp.penalty_last_n = 64;
         check(!rows_pick_argmax(sp), "greedy with penalties: the sampler (penalized greedy)");
-        sp = strata::kernels::SamplerParams();
+        sp = maya::kernels::SamplerParams();
         sp.temperature = 0.0f;
         check(rows_pick_argmax(sp), "temperature 0: argmax");
         sp.penalty_last_n = 1;
         check(!rows_pick_argmax(sp), "temperature 0 with penalties: the sampler");
-        sp = strata::kernels::SamplerParams();
+        sp = maya::kernels::SamplerParams();
         sp.temperature = 0.7f;
         check(!rows_pick_argmax(sp), "sampled: the sampler");
     }

@@ -26,7 +26,7 @@ static size_t resident_pages(const uint8_t* base, size_t pages) {
 }
 
 int main() {
-    using namespace strata::ds4::os;
+    using namespace maya::ds4::os;
     const std::string path = "ds4-copy-cache-windows-test.bin";
     constexpr size_t page = 4096, pages = 4096, bytes = page * pages;
     std::vector<uint8_t> original(bytes), copy(bytes);
