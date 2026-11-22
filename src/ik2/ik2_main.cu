@@ -4147,7 +4147,7 @@ int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& r
 // tokens (1 - a^B) / (1 - a) - a the drafts' acceptance, each accepted given the one before it, from the recent
 // steps - over its measured time, against a plain token's; a plain run drafts once in a while to look again.
 struct SpecCtl {
-    int wmax = 5;
+    int wmax = kBlockMax;
     bool adapt = true;
     double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
     double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
@@ -4157,9 +4157,23 @@ struct SpecCtl {
     double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
     uint64_t hist[kBlockMax] = {};
+    // (a step's seconds by width before any is measured: an RTX 3090's at a 262,144 context - the drafter and the
+    //  exact window.  A width's first step is not counted (it records the width's CUDA graph: 38 ms once put a width
+    //  aside for good), and the widths not measured yet follow the measured ones' ratio to these)
+    double prior[kBlockMax + 1] = {0, 7.8e-3, 13.2e-3, 14.9e-3, 17.0e-3, 19.1e-3, 21.0e-3, 23.2e-3, 25.3e-3};
+    int seen[kBlockMax + 1] = {};
     SpecCtl() {
-        const double prior[kBlockMax + 1] = {0, 7.8e-3, 13.3e-3, 15.1e-3, 16.7e-3, 18.2e-3, 19.8e-3, 21.3e-3, 22.8e-3};
         for (int b = 0; b <= kBlockMax; ++b) c[b] = prior[b];
+    }
+    void took_width(int B, double t) {
+        if (seen[B]++ == 0) return;
+        c[B] = seen[B] == 2 ? t : 0.8 * c[B] + 0.2 * t;
+        double r = 0;
+        int n = 0;
+        for (int b = 2; b <= kBlockMax; ++b)
+            if (seen[b] >= 2) r += c[b] / prior[b], ++n;
+        for (int b = 2; b <= kBlockMax && n; ++b)
+            if (seen[b] < 2) c[b] = prior[b] * r / n;
     }
     int choose(int room) {   // room: the widest a step may be (1: plain)
         const int bmax = std::min(wmax, room);
@@ -4180,7 +4194,7 @@ struct SpecCtl {
         ++plain, ++plain_run;
     }
     void took_spec(int B, int acc, double t) {
-        c[B] = 0.8 * c[B] + 0.2 * t;
+        took_width(B, t);
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
         plain_run = 0;
@@ -4215,7 +4229,7 @@ struct SpecCtl {
         return src;
     }
     void took_lookup(int B, int acc, double t) {
-        c[B] = 0.8 * c[B] + 0.2 * t;
+        took_width(B, t);
         SL = decay * SL + acc, FL = decay * FL + (acc < B - 1 ? 1 : 0);
         ++l_steps, l_drafted += B - 1, l_accepted += acc;
         plain_run = 0;
@@ -7269,7 +7283,7 @@ int main(int argc, char** argv) {
                         }
                         CU(cudaStreamSynchronize(g_s));
                         SpecCtl ctl;
-                        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+                        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
                         ctl.use_lookup = mode == 1 || mode == 3, ctl.use_model = mode >= 2;
                         if (mode == 0) ctl.wmax = 1;   // (plain tokens only)
                         strata::spec::SuffixDrafter lk1;
@@ -7777,7 +7791,7 @@ int main(int argc, char** argv) {
         // widest window, IK2_DRAFT_ADAPT=0 always that wide
         SpecCtl sctl;
         const bool spec_on = (drafter || g_lookup) && g_fast && g_block;
-        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         sctl.use_model = drafter != nullptr, sctl.use_lookup = g_lookup;
         static strata::spec::SuffixDrafter lk;   // (the prompt lookup: a request's tokens so far)
@@ -8232,6 +8246,22 @@ int main(int argc, char** argv) {
         first_best = (int) (std::max_element(r_last, r_last + c.n_vocab) - r_last);
         logits.clear();
     }
+    // (IK2_BLOCK_WARM=1: the windows' CUDA graphs recorded before the generation is timed - a width's first window
+    //  records its graph, tens of ms once a process)
+    if (getenv("IK2_BLOCK_WARM") && std::atoi(getenv("IK2_BLOCK_WARM")) && (drafter || g_lookup) && g_fast && g_block &&
+        (int) prompt.size() + kBlockMax <= ctx) {
+        const double tw = now();
+        int tk[kBlockMax];
+        for (int j = 0; j < kBlockMax; ++j) tk[j] = first_best;
+        for (int T = 2; T <= kBlockMax; ++T) {
+            std::vector<float> lo;
+            std::vector<int> g;
+            fast_block(M, tk, T, (int) prompt.size(), OutMode::kArgmax, lo, &g);
+            block_rollback(0);
+        }
+        CU(cudaStreamSynchronize(g_s));
+        std::printf("windows of 2 .. %d tokens recorded in %.2f s\n", kBlockMax, now() - tw);
+    }
     // greedy generation
     g_pf = Prof{};
     std::vector<int> out;
@@ -8287,7 +8317,7 @@ int main(int argc, char** argv) {
     if ((drafter || g_lookup) && g_fast && g_block) {
         // (the resident path: the controller picks plain tokens or a window of the drafter's or the prompt lookup's
         //  drafts; greedy, as the CLI's generation is)
-        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
         ctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         ctl.use_model = drafter != nullptr, ctl.use_lookup = g_lookup;
         strata::spec::SuffixDrafter lk;
