@@ -3860,7 +3860,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (tp_on()) {   // tensor parallel (this version): every expert slice in VRAM, no CPU lane
-        F->cpu_fmt.assign(F->L.size(), strata::kernels::cpu::NativeFmt{});
+        F->cpu_fmt.assign(F->L.size(), maya::kernels::cpu::NativeFmt{});
         return true;
     }
     const char* lv = getenv(("MAYA_GLM_CPU_LANE" + std::to_string(dev_)).c_str());
@@ -7147,7 +7147,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
 static bool kda_graph_wanted() {
     const char* e = getenv("MAYA_GLM_KDA_GRAPH");
     if (e != nullptr && e[0] != '\0') return std::atoi(e) != 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static const bool defer = [] {
@@ -8102,7 +8102,7 @@ bool Glm5Model::spec_ready() const {
 int Glm5Model::spec_win_mode() const {
     const char* e = getenv("MAYA_GLM_SPEC_WIN");
     if (e != nullptr && e[0] != '\0') return std::atoi(e) != 0 ? 1 : 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return 0;
 #else
     // (#235) a split of three or more parts decodes as two groups that take turns; the pipelined window keeps every

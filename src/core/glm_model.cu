@@ -3219,7 +3219,7 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
     // tensor parallel (glm_tp.cu): a tensor's shape on this member - its rows are its last dimension (a 1-D tensor is
     // one row), and the cut keeps rows [a0, a1) or columns [a0, a1) of every row
-    const auto tp_shape = [&](const std::string& name, const strata::TensorInfo* t, strata::TensorInfo& out) -> TpCut {
+    const auto tp_shape = [&](const std::string& name, const maya::TensorInfo* t, maya::TensorInfo& out) -> TpCut {
         const TpCut c = tp_cut(name);
         out = *t;
         if (c.mode == 1 || c.mode == 2) {
@@ -3230,7 +3230,7 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
     };
     // ... and the copy of that share: src holds the whole tensor (rows of ne0 elements in blocks of bw elements of bb
     // bytes), dst gets the member's rows, or every row's columns, back to back
-    const auto tp_copy = [](const TpCut& c, const uint8_t* src, const strata::TensorInfo* t, int64_t bw, size_t bb,
+    const auto tp_copy = [](const TpCut& c, const uint8_t* src, const maya::TensorInfo* t, int64_t bw, size_t bb,
                             uint8_t* dst) {
         const uint64_t rows = t->shape.size() >= 2 ? t->shape.back() : 1, ne0 = t->elements() / rows;
         const size_t row_b = (size_t) (ne0 / (uint64_t) bw) * bb;
@@ -3279,7 +3279,7 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
         }
         if (skip_upload(r)) continue;
         std::string how;
-        strata::TensorInfo tcut;   // tensor parallel: this member's share of it (the whole tensor otherwise)
+        maya::TensorInfo tcut;   // tensor parallel: this member's share of it (the whole tensor otherwise)
         (void) tp_shape(r.name, t, tcut);
         const uint64_t b = pack_row_vram(r.name, r.kind, &tcut, fast_mode_, &how, g_.arch == GlmArch::GlmDsa);
         bytes += b;
@@ -3385,7 +3385,7 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
                 err = "pack: short read on dense.bin for " + r.name;
                 return false;
             }
-            strata::TensorInfo tc;
+            maya::TensorInfo tc;
             if (const TpCut c = tp_shape(r.name, t, tc); c.mode == 1 || c.mode == 2) {   // tensor parallel: the share
                 std::vector<uint8_t> cut((size_t) tc.elements() * 2);
                 tp_copy(c, raw.data(), t, 1, 2, cut.data());
@@ -3477,7 +3477,7 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
         }
         uint64_t n_up = n_f32;   // tensor parallel: this member's share of the floats
         {
-            strata::TensorInfo tc;
+            maya::TensorInfo tc;
             if (const TpCut c = tp_shape(r.name, t, tc); c.mode == 1 || c.mode == 2) {
                 std::vector<float> cut((size_t) tc.elements());
                 tp_copy(c, (const uint8_t*) host.data(), t, 1, 4, (uint8_t*) cut.data());
