@@ -366,6 +366,10 @@ struct Drafter {
     std::vector<uint16_t> hout_w;   // host BF16, for the fold
     std::vector<float> hout_b;      // host, for the fold (the original's BF16 values)
     uint16_t *fold_w = nullptr, *fold_b = nullptr;   // FP16 [R][n_rows], [n_rows]
+    // the fold as int8 [R][n_rows], a row's scale apart (fold_sc [R]; xs = latent * fold_sc a draft): half the bytes
+    // a draft reads - fold_w is then gone after the load.  IK2_DRAFT_FOLD=f16: the FP16 table
+    int8_t* fold_q = nullptr;
+    float *fold_sc = nullptr, *fold_xs = nullptr;
     int n_rows = 0;
     const int8_t* head_q8 = nullptr;      // the target's head as planar Q8_0 (set_head_q8): the base logits through it
     const uint16_t* head_q8d = nullptr;
@@ -457,6 +461,10 @@ __global__ void shortlist_gemv(const int* ids, int n, const uint16_t* W, const f
     if (lane == 0) scores[i] = dot + base[token] + __half2float(__ushort_as_half(bias[token]));
 }
 __global__ void shortlist_pick(int* out, const int* ids) { *out = ids[*out]; }
+__global__ void scale_rows_kernel(const float* x, const float* sc, int n, float* y) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = x[i] * sc[i];
+}
 
 uint16_t* up16(Drafter* d, const std::vector<uint16_t>& v) {
     uint16_t* p = dalloc<uint16_t>(v.size());
@@ -792,6 +800,39 @@ void fold_impl(Drafter* d, const uint16_t* lm_f16, const int8_t* q8, const uint1
     cu(cudaStreamSynchronize(d->s), "fold");
     cudaFree(dht), cudaFree(dhb), cudaFree(dlm), cudaFree(dfw), cudaFree(dfb);
     d->vram += ((size_t) R + 1) * n_rows * 2 + (size_t) (kBlock - 1) * n_rows * 4;
+    const bool want_i8 = !(getenv("IK2_DRAFT_FOLD") && std::string(getenv("IK2_DRAFT_FOLD")) == "f16");
+    if (want_i8 && !d->shortlist && n_rows % 8 == 0) {
+        // (each row over the vocabulary rounded to int8 of its largest value: the drafts only)
+        std::vector<uint16_t> hw((size_t) R * n_rows);
+        cu(cudaMemcpy(hw.data(), d->fold_w, hw.size() * 2, cudaMemcpyDeviceToHost), "fold (int8)");
+        std::vector<int8_t> hq(hw.size());
+        std::vector<float> sc(R);
+        for (int r = 0; r < R; ++r) {
+            const uint16_t* row = hw.data() + (size_t) r * n_rows;
+            float mx = 0.0f;
+            for (int v = 0; v < n_rows; ++v) mx = std::max(mx, std::fabs(h2f_host(row[v])));
+            const float scale = mx > 0.0f ? mx / 127.0f : 1.0f;
+            sc[r] = scale;
+            int8_t* q = hq.data() + (size_t) r * n_rows;
+            for (int v = 0; v < n_rows; ++v)
+                q[v] = (int8_t) std::lrintf(std::max(-127.0f, std::min(127.0f, h2f_host(row[v]) / scale)));
+        }
+        {
+            Track kept(&d->mem);
+            d->fold_q = dalloc<int8_t>(hq.size());
+            d->fold_sc = dalloc<float>(R), d->fold_xs = dalloc<float>(R);
+        }
+        cu(cudaMemcpy(d->fold_q, hq.data(), hq.size(), cudaMemcpyHostToDevice), "fold (int8)");
+        cu(cudaMemcpy(d->fold_sc, sc.data(), (size_t) R * 4, cudaMemcpyHostToDevice), "fold (int8)");
+        for (auto it = d->mem.begin(); it != d->mem.end(); ++it)
+            if (*it == d->fold_w) {
+                d->mem.erase(it);
+                break;
+            }
+        cudaFree(d->fold_w);
+        d->fold_w = nullptr;
+        d->vram -= (size_t) R * n_rows;
+    }
 }
 }  // namespace
 
@@ -896,6 +937,10 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
                 d->base + (size_t)t * n_rows, d->fold_b, d->R, d->shortlist_scores);
             k::argmax_sum(d->shortlist_scores, nullptr, nullptr, shortlist_n, d->toks + t + 1, d->s);
             shortlist_pick<<<1, 1, 0, d->s>>>(d->toks + t + 1, ids);
+        } else if (d->fold_q) {
+            scale_rows_kernel<<<1, 256, 0, d->s>>>(d->latent, d->fold_sc, d->R, d->fold_xs);
+            k::argmax_gemv_i8(d->fold_q, n_rows, d->fold_xs, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
+                              d->toks + t + 1, d->s);
         } else {
             k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
                            d->toks + t + 1, d->s);

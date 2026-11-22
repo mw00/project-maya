@@ -474,6 +474,10 @@ void rnn_gates(const float* proj, const float* bias, int R, float* state, float*
 void argmax_sum(const float* a, const float* b, const float* c, int n, int* out, cudaStream_t s);
 /// out[r] = argmax over c < n_cols of x[r * ld + c] for 0 <= r < n_rows (ties: the lower index), written on the device.
 void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaStream_t s);
+/// argmax_gemv_f16 over a table kept as int8 [R][ld] with each row's scale folded into xs (xs[r] = x[r] * scale[r]):
+/// *out = argmax over v < n of base[v] + bias_f16[v] + sum_r W[r * ld + v] * xs[r].  ld a multiple of 8.
+void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base, const uint16_t* bias_f16, int R, int n,
+                    int* out, cudaStream_t s);
 /// *out = argmax over v < n of (base[v] + bias_f16[v] + sum_{r<R} W[r * ld + v] * x[r]), where W is [R][ld] FP16,
 /// x is [R] F32, base (optional) is [n] F32, bias_f16 (optional) is [n] FP16.  Ties: the lower index.
 void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* base, const uint16_t* bias_f16,

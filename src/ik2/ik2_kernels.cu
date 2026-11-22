@@ -4912,6 +4912,54 @@ __global__ void argmax_gemv_f16_part_kernel(const uint16_t* W, int ld, const flo
     }
 }
 
+// argmax_gemv_f16 over a table kept as int8 [R][ld] (each row's scale already in xs: xs[r] = x[r] * scale[r]) - half
+// the bytes a draft of the drafter's Markov head reads (51 MB where the FP16 table is 103).  A thread 8 columns.
+__global__ void argmax_gemv_i8_part_kernel(const int8_t* __restrict__ W, int ld, const float* __restrict__ xs,
+                                           const float* __restrict__ base, const uint16_t* __restrict__ bias_f16, int R,
+                                           int n) {
+    extern __shared__ float sx[];
+    for (int r = threadIdx.x; r < R; r += blockDim.x) sx[r] = xs[r];
+    __syncthreads();
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gstride = gridDim.x * blockDim.x;
+    float best = -INFINITY;
+    int idx = 0x7fffffff;
+    const int n8 = n >> 3;
+    for (int v8 = gtid; v8 < n8; v8 += gstride) {
+        const int v = v8 << 3;
+        float d[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        const int8_t* wr = W + v;
+        for (int r = 0; r < R; ++r, wr += ld) {
+            const float xr = sx[r];
+            const uint2 w = __ldg((const uint2*) wr);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                d[j] = fmaf((float) (int8_t) ((w.x >> (8 * j)) & 0xFFu), xr, d[j]);
+                d[4 + j] = fmaf((float) (int8_t) ((w.y >> (8 * j)) & 0xFFu), xr, d[4 + j]);
+            }
+        }
+        const float4 b0 = __ldg((const float4*) (base + v)), b1 = __ldg((const float4*) (base + v + 4));
+        const uint4 bb = __ldg((const uint4*) (bias_f16 + v));
+        const float2 f0 = u32_to_f2(bb.x), f1 = u32_to_f2(bb.y), f2 = u32_to_f2(bb.z), f3 = u32_to_f2(bb.w);
+        argmax_better(d[0] + b0.x + f0.x, v + 0, best, idx);
+        argmax_better(d[1] + b0.y + f0.y, v + 1, best, idx);
+        argmax_better(d[2] + b0.z + f1.x, v + 2, best, idx);
+        argmax_better(d[3] + b0.w + f1.y, v + 3, best, idx);
+        argmax_better(d[4] + b1.x + f2.x, v + 4, best, idx);
+        argmax_better(d[5] + b1.y + f2.y, v + 5, best, idx);
+        argmax_better(d[6] + b1.z + f3.x, v + 6, best, idx);
+        argmax_better(d[7] + b1.w + f3.y, v + 7, best, idx);
+    }
+    for (int v = (n8 << 3) + gtid; v < n; v += gstride) {
+        float d = 0.0f;
+        const int8_t* wr = W + v;
+        for (int r = 0; r < R; ++r, wr += ld) d = fmaf((float) __ldg(wr), sx[r], d);
+        argmax_better(d + __ldg(base + v) + h2f(__ldg(bias_f16 + v)), v, best, idx);
+    }
+    argmax_block_reduce(best, idx);
+    if (threadIdx.x == 0) g_argmax_v[blockIdx.x] = best, g_argmax_i[blockIdx.x] = idx;
+}
+
 __global__ void argmax_final_kernel(int n_partials, int stride_partials, int* out) {
     const int r = blockIdx.x;
     float best = -INFINITY;
@@ -6771,6 +6819,20 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
     check("argmax_gemv_f16_part");
     argmax_final_kernel<<<1, 256, 0, s>>>(B, 1, out);
     check("argmax_gemv_f16_final");
+}
+
+void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base, const uint16_t* bias_f16, int R, int n,
+                    int* out, cudaStream_t s) {
+    if (n <= 0) return;
+    if ((ld & 7) || ((uintptr_t) W & 7) || ((uintptr_t) base & 15) || ((uintptr_t) bias_f16 & 15) || R > 4096) {
+        std::fprintf(stderr, "ik2::k::argmax_gemv_i8: a table, base or bias not aligned, or rank %d\n", R);
+        std::abort();
+    }
+    const int B = std::min(512, std::max(2, ((n >> 3) + 127) / 128));
+    argmax_gemv_i8_part_kernel<<<B, 128, (size_t) R * sizeof(float), s>>>(W, ld, xs, base, bias_f16, R, n);
+    check("argmax_gemv_i8_part");
+    argmax_final_kernel<<<1, 256, 0, s>>>(B, 1, out);
+    check("argmax_gemv_i8_final");
 }
 
 int block_values(int type) {
