@@ -2782,6 +2782,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_PROF` | off | debugging: each forward's GPU time by part |
 | `HY4_DUMP` | off | debugging: each layer's sums |
 | `HY4_INJECT`, `HY4_INJECT_FROM`, `HY4_SAVE` | off | debugging: a layer's inputs taken from a reference dump to compare one layer at a time |
+| `HY4_VISION_FP16` | on on `gfx906`/`gfx10` and CUDA `< sm_80`, else off | `1`: run `maya-hy4` vision tower GEMMs in IEEE FP16 (`CUDA_R_16F` with NaN-preserving `[-65504, 65504]` clamp and GPU-side BF16->FP16 stage conversion) where hardware BF16 BLAS is unavailable; `0`: keep BF16 (`CUDA_R_16BF`) |
 
 ## Inkling-2-Small
 
