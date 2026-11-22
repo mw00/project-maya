@@ -514,6 +514,82 @@ void mv_columns(int type, std::mt19937& rng) {
     cudaFree(dd);
 }
 
+// mv_heads's short-row form (MAYA_IQ_MV_RW: heads of at most 16 sub-blocks a row, 2 or 4 rows a warp) against its
+// one-row-a-warp form: the same bits, in the types and row lengths Hy4's attention heads take (and a row count that
+// leaves the one-row form)
+void mv_heads_rows(int type, std::mt19937& rng) {
+    const int H = 4;
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int k : {192, 256, 512}) {
+        if (k % iq::block_values(type)) continue;
+        for (int n : {64, 66, 65}) {
+            const size_t rb = iq::row_bytes(type, k);
+            std::vector<uint8_t> w(rb * n * H);
+            for (auto& b : w) b = (uint8_t) byte(rng);
+            const int bb = iq::block_bytes(type), bv = iq::block_values(type);
+            for (size_t r = 0; r < (size_t) n * H; ++r)
+                for (int b = 0; b < k / bv; ++b) {   // (sane scales: each block's half-precision scale small)
+                    uint8_t* p = w.data() + r * rb + (size_t) b * bb;
+                    if (type == iq::kQ6_K) {
+                        p[bb - 2] = 0x00;
+                        p[bb - 1] = 0x20;
+                    } else {
+                        p[0] = 0x00;
+                        p[1] = 0x20;
+                    }
+                }
+            std::vector<float> x((size_t) H * 16 * k);
+            for (auto& v : x) v = nd(rng);
+            uint8_t* dw;
+            float *dx, *dy, *dd;
+            int8_t* dq;
+            CU(cudaMalloc(&dw, w.size()));
+            CU(cudaMalloc(&dx, x.size() * 4));
+            CU(cudaMalloc(&dy, (size_t) H * 16 * n * 4));
+            CU(cudaMalloc(&dq, x.size()));
+            CU(cudaMalloc(&dd, x.size() / 32 * 4));
+            CU(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+            cudaStream_t s = nullptr;
+            for (int nc : {1, 4, 16}) {
+                hy4::k::q8_rows(dx, k, nc * H, k, dq, dd, s);
+                iq::MvJob j;
+                j.w = dw;
+                j.ld = rb;
+                j.type = type;
+                j.k = k;
+                j.n = n;
+                j.ncol = nc;
+                j.xq = dq;
+                j.xd = dd;
+                j.y = dy;
+                j.ycs = n;
+                std::vector<float> y[2];
+                for (int on = 0; on < 2; ++on) {
+                    iq::set_mv_rows(on);
+                    CU(cudaMemset(dy, 0xff, (size_t) H * nc * n * 4));
+                    CHECK(iq::mv_heads(j, H, (size_t) n * rb, (size_t) nc * k, (size_t) nc * k / 32, (size_t) nc * n,
+                                       s));
+                    y[on].resize((size_t) H * nc * n);
+                    CU(cudaMemcpy(y[on].data(), dy, y[on].size() * 4, cudaMemcpyDeviceToHost));
+                }
+                iq::set_mv_rows(-1);
+                int diff = 0;
+                for (size_t i = 0; i < y[0].size(); ++i) diff += std::memcmp(&y[0][i], &y[1][i], 4) != 0;
+                std::printf("  mv_heads %s k %d n %d, %2d columns: rows packed vs one a warp: %d of %zu values differ\n",
+                            iq::name(type), k, n, nc, diff, y[0].size());
+                CHECK(diff == 0);
+            }
+            cudaFree(dw);
+            cudaFree(dx);
+            cudaFree(dy);
+            cudaFree(dq);
+            cudaFree(dd);
+        }
+    }
+}
+
 // The CPU lane's waits by system and environment (no GPU needed): the measured set on every system, HY4_LANE_WAITS=0
 // for the plain one, each variable alone for its own.
 void lane_waits_cases() {
@@ -578,6 +654,11 @@ int main() {
         for (int F : {256, 512})
             if (F % iq::block_values(tt[1]) == 0)
                 for (int T : {1, 5}) run_case(tt[0], tt[1], 24, T, rng, F);
+    }
+    // attention heads' short rows (Q8_0, Q6_K): packed a few a warp or one a warp, the same bits
+    for (int ty : {iq::kQ8_0, iq::kQ6_K}) {
+        std::mt19937 rng2(7);
+        mv_heads_rows(ty, rng2);
     }
     // the lower-bit types (gate = up = down a layer): the same three forms
     for (int ty : {iq::kIQ2_XXS, iq::kIQ2_S, iq::kIQ3_XXS, iq::kIQ4_XS, iq::kQ5_K}) {

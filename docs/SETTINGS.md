@@ -2748,6 +2748,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_CREW_SPIN_MS` | 25 | tensor parallel: how long a member's host thread watches for the next token window before it sleeps, in ms |
 | `HY4_SUM_PER` | 2048 | tensor parallel: the fewest values of a sum a host thread takes (fewer threads join a smaller sum) |
 | `MAYA_IQ_MV8` | on | the quantized GEMV kernel's own form for windows of 5 to 8 tokens (the same sums); `0`: the 16-token form, as before |
+| `MAYA_IQ_MV_RW` | on with AMD, off with NVIDIA | the attention heads' short Q8_0 / Q6_K rows (16 sub-blocks or fewer, as Hy4-Flash's `k_b` and `v_b`) packed 2 or 4 to a warp instead of one, so a warp's lanes all work (the same sums); `0`: one row a warp, as before; `1`: on with NVIDIA too |
 | `HY4_TP_PROF` | off | debugging: the host's waits and sums a token window |
 | `HY4_TP_LATENT_SUM` | off | tensor parallel: the FFN's partials summed in the latent space, projected up after the sum (a third more to send) |
 | `HY4_TP_EV`, `HY4_TP_EV_M` | off | debugging: a member's GPU time by part of each layer (events), member 0 or the one named; `HY4_TP_EV=all`: every member's, by window size |
