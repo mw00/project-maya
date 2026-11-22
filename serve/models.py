@@ -90,9 +90,9 @@ HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a 
 # Inkling-2-Mini (maya-ik2, an experimental preview): its settings, and what its engine does not have yet - said in
 # plain words when a client asks for it (each one's "off": IK2_OFF)
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on its card: the setup's own figures
-IK2_KEYS = ("context", "images", "gpus", "env", "kv", "draft")
-IK2_OFF = {"parallel": 1}
-IK2_NOT_YET = {"parallel": "Answers at once: Inkling 2 Mini answers one request at a time for now"}
+IK2_KEYS = ("context", "images", "gpus", "env", "kv", "draft", "parallel")
+IK2_OFF: dict = {}
+IK2_NOT_YET: dict = {}   # (v1.1.74: --parallel, Answers at once, is in - the engine's resident path on one GPU)
 
 
 def ik2_draft_of(args: list) -> str:
@@ -478,7 +478,7 @@ def settings_of(cfg: dict) -> dict:
         return out
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
         kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
-        out.update(images=bool(cfg.get("vision")), draft=ik2_draft_of(args),
+        out.update(images=bool(cfg.get("vision")), draft=ik2_draft_of(args), parallel=_int(flag(args, "--parallel"), 1),
                    kv="f16" if kv in ("f16", "fp16") else "fp8" if kv in ("fp8", "e4m3") else kv)
         return out
     if family(cfg) == "qwen":
@@ -753,6 +753,11 @@ def apply(cfg: dict, settings: dict) -> dict:
                              else "Drafting: auto, the drafter (DSpark) or none")
         if s["draft"] != ik2_draft_of(args):   # (written where it changes: a config from before keeps its flags)
             args = set_flag(args, "--drafting", {"auto": "auto", "dspark": "on"}.get(s["draft"], "off"))
+        # (--parallel: n conversations at once where every expert stays in VRAM on one GPU - the engine's resident
+        #  path, a cache each; drafting is off while it is above 1, elsewhere the engine says so and answers one at a
+        #  time; written where it changes)
+        par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+        args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
     elif fam == "minimax":
         # (maya-mm3 --parallel: n conversations at once - each its own KV cache in VRAM, so no KV streaming and no DSpark
         #  while it is above 1; those two settings stay as chosen for the day it is 1 again; written where it changes)

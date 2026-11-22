@@ -345,7 +345,7 @@ class Settings(unittest.TestCase):
         cfg = M.read(path)
         self.assertEqual(M.family(cfg), "ik2")
         self.assertEqual(M.settings_of(cfg), {"context": 262144, "gpus": [0], "env": {}, "ablate": False,
-                                              "images": False, "kv": "fp8", "draft": "none"})
+                                              "images": False, "kv": "fp8", "draft": "none", "parallel": 1})
         self.assertEqual(M.choices(cfg)["draft"], ["auto", "none"])   # (no drafter downloaded: the prompt lookup)
         self.assertFalse(M.choices(cfg)["images"])
         self.assertEqual(M.quant_label(cfg, path), "unsloth UD-Q4_K_XL")
@@ -364,7 +364,10 @@ class Settings(unittest.TestCase):
         two = M.apply(cfg, {"gpus": [0, 1]})
         self.assertEqual(M.flag(two["args"], "--gpus"), "2")
         self.assertIsNone(M.flag(M.apply(two, {"gpus": [0]})["args"], "--gpus"))
-        for bad, why in (({"gpus": [0, 1, 2]}, "one or two GPUs"), ({"parallel": 2}, "one request at a time"),
+        # (Answers at once: --parallel, written where it changes, 1-8)
+        self.assertEqual(M.flag(M.apply(cfg, {"parallel": 2})["args"], "--parallel"), "2")
+        self.assertIsNone(M.flag(M.apply(cfg, {"parallel": 1})["args"], "--parallel"))
+        for bad, why in (({"gpus": [0, 1, 2]}, "one or two GPUs"), ({"parallel": 9}, "Answers at once"),
                          ({"draft": "dspark"}, "this setup has no drafter"), ({"draft": "mtp"}, "auto, the drafter"),
                          ({"kv": "int8"}, "FP8 or F16"), ({"images": True}, "set up without its image encoder"),
                          ({"reserve_mib": 512}, "not a setting")):
