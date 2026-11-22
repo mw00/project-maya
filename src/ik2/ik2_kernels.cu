@@ -5630,6 +5630,9 @@ experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __re
         }
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
+            // (a tile none of the group's members is in - members <= 4 j: its sums are not read; most groups of a
+            //  window of 5 .. 8 tokens have four members or fewer)
+            if (j && n <= 4 * j) continue;
             uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
             if (x_ok[j]) x0 = __ldg(xp[j] + k * 8), x1 = __ldg(xp[j] + k * 8 + 1);
             const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
