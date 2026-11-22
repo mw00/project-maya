@@ -3435,6 +3435,9 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
 // one-token path's to the bit - its products with mv1's sums (the weights read once), its attention through the
 // token's own kernels, its experts' rows with the token kernels' sums (an expert read once for its tokens).
 bool g_block_exact = true;
+// (IK2_BLOCK_FUSE=0: the window's small kernels a launch each - k's and v's convs and the looped inputs' three norms
+//  share launches otherwise: 96 launches of ~3.5 us less a window)
+const bool g_blk_fuse = !(getenv("IK2_BLOCK_FUSE") && !std::atoi(getenv("IK2_BLOCK_FUSE")));
 // rows [r0, r0 + n) of a dense matrix times x [T][K] (F32, rows x_ld apart): y [T][ldy], each token's mv1's
 void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, float* y, int ldy) {
     if (m.q8) {
@@ -3500,7 +3503,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                     gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
                              Ly.lp_forget[j], Ly.lp_gain[j], x3[j]};
                 k::loop_gates(gt, 3, T, C, c.rank, 1e-6f, W.lp_g, g_s);
-                for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], T, C, c.eps, y16[j], x3[j], g_s);
+                if (g_blk_fuse) k::rms_f16_jobs(x3, nw, y16, x3, 3, T, C, c.eps, g_s);   // (one launch, not three)
+                else for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], T, C, c.eps, y16[j], x3[j], g_s);
                 sep = true;
             } else if (l > 0) {
                 k::RmsOuts outs{};
@@ -3519,7 +3523,11 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             const int N = m.N;
             if (ex && !sep) {
                 exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
-            } else if (ex) {   // (q, k and v each with its input, as mv_q8p_conv's alternative inputs)
+            } else if (ex && m.q8 && k::mv_q8p_cols_alts(m.K, T, k::MvAlt{W.xk, HD, KD}, k::MvAlt{W.xv, HD + KD, KD})) {
+                // (q, k and v each with its input, as mv_q8p_conv's alternative inputs: one launch, not four)
+                k::mv_q8p_cols(m.q8, m.q8d, N, m.K, W.xq, C, T, W.qkv, N, g_s, k::MvAlt{W.xk, HD, KD},
+                               k::MvAlt{W.xv, HD + KD, KD});
+            } else if (ex) {
                 exact_rows(m, 0, HD, W.xq, C, T, W.qkv, N);
                 exact_rows(m, HD, KD, W.xk, C, T, W.qkv + HD, N);
                 exact_rows(m, HD + KD, KD, W.xv, C, T, W.qkv + HD + KD, N);
@@ -3534,10 +3542,16 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             }
             q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
             q_ld = r_ld = gate_ld = N;
-            k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                          Ly.rec_x[0], g_s);
-            k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
-                          Ly.rec_old[1], Ly.rec_x[1], g_s);
+            if (g_blk_fuse) {   // (k's and v's convs: one launch)
+                k::conv_block2(W.qkv + HD, Ly.h_k, Ly.sc_k, nullptr, W.kconv, Ly.rec_old[0], Ly.rec_x[0],
+                               W.qkv + HD + KD, Ly.h_v, Ly.sc_v, nullptr, W.vconv, Ly.rec_old[1], Ly.rec_x[1], N, 0, 0, T,
+                               KD, KD, g_s);
+            } else {
+                k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD,
+                              Ly.rec_old[0], Ly.rec_x[0], g_s);
+                k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
+                              Ly.rec_old[1], Ly.rec_x[1], g_s);
+            }
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
             const int N = m.N;
@@ -3556,10 +3570,15 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                 tile_rows(Ly.wk, 0, KD, W.xk16, T, W.kk, KD);
                 tile_rows(Ly.wv, 0, KD, W.xv16, T, W.vv, KD);
             }
-            k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                          Ly.rec_x[0], g_s);
-            k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
-                          Ly.rec_x[1], g_s);
+            if (g_blk_fuse) {
+                k::conv_block2(W.kk, Ly.h_k, Ly.sc_k, kd, W.kconv, Ly.rec_old[0], Ly.rec_x[0], W.vv, Ly.h_v, Ly.sc_v, vd,
+                               W.vconv, Ly.rec_old[1], Ly.rec_x[1], KD, DL, c.KV, T, KD, KD, g_s);
+            } else {
+                k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
+                              Ly.rec_x[0], g_s);
+                k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
+                              Ly.rec_x[1], g_s);
+            }
         }
         // the clips, the window's K and V into the cache at its positions, the attention of its queries
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
@@ -3570,7 +3589,32 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (ex) {   // (each token through fast_token_launches' own clips and attention, its position from W.pos + t)
             const bool mma = g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding);
             const int P = Ly.sliding ? std::min(128, std::max(1, (c.window + 63) / 64)) : 128;
-            for (int t = 0; t < T; ++t) {
+            // (the tensor cores' kernels: every token's clips in one launch, then its attention's blocks and its
+            //  combine as one launch each - a grid z a token, each block the one-token launch's, the tokens' K and V
+            //  all in the cache first (a token's kernel reads no key past its own).  240 launches of 3 .. 5 us a
+            //  window of 5 were 3.1 ms.  IK2_ATTN_TOKS=0: a token at a time)
+            static const bool toks_on = !(getenv("IK2_ATTN_TOKS") && !std::atoi(getenv("IK2_ATTN_TOKS")));
+            bool toks = false;
+            if (mma && toks_on && k::arch_class() != 70 && (size_t) T * k::attn_decode_mma_scratch(c.H, ns) <= W.lg_cap) {
+                if (g_kv_fp8) {
+                    k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip,
+                                            T, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding,
+                                            c.alpha, c.n_floor, Ly.kv_cap, k_scale, v_scale, W.x16, g_s, Ly.sink16, W.xq,
+                                            C, W.sink);
+                    toks = k::attn_decode_mma_toks_fp8(W.x16, HD, r_p, r_ld, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV,
+                                                       W.pos, T, ns, qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj,
+                                                       c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s);
+                } else {
+                    k::prep_qkv_r_f16_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, r_ld, Ly.r_clip, T,
+                                            c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding,
+                                            c.alpha, c.n_floor, Ly.kv_cap, W.x16, g_s, Ly.sink16, W.xq, C, W.sink);
+                    toks = k::attn_decode_mma_toks_f16(W.x16, HD, r_p, r_ld, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos,
+                                                       T, ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o,
+                                                       gate_p, gate_ld, W.x16, g_s);
+                }
+                if (!toks) die("the block path: the tokens' attention was not launched");
+            }
+            for (int t = 0; t < T && !toks; ++t) {
                 float *qt = q_p + (size_t) t * q_ld, *rt = r_p + (size_t) t * r_ld, *ot = W.o + (size_t) t * HD;
                 const float* gt = gate_p + (size_t) t * gate_ld;
                 const int* pt = W.pos + t;
@@ -3677,6 +3721,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
+        // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
+        //  tokens' picks - it took 9.4 us where the two take 7)
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
         k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
                       g_s);
@@ -4149,6 +4195,7 @@ struct SampleCfg {   // temp <= 0: greedy
     double temp = 0, top_p = 1;
     int top_k = 0;
     std::mt19937_64* rng = nullptr;
+    uint64_t salt = 0;   // the request's: a window's tokens are drawn with k::gumbel_noise(salt, position, token)
 };
 // the serve loop's sampling distribution over candidates cd (logit, token): softmax(logit / temp) over the top_p
 // mass of the min(top_k, kCandK) largest (ties: the lower token first) - pick_top's - as (token, probability)
@@ -4196,29 +4243,59 @@ int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& r
 // tokens (1 - a^B) / (1 - a) - a the drafts' acceptance, each accepted given the one before it, from the recent
 // steps - over its measured time, against a plain token's; a plain run drafts once in a while to look again.
 struct SpecCtl {
-    int wmax = 5;
+    int wmax = kBlockMax;
     bool adapt = true;
     double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
     double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
     int plain_run = 0;
-    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 8;   // plain tokens before a look
-    int probe_w = 4;
+    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 4;   // plain tokens before a look
+    int probe_w = getenv("IK2_DRAFT_PROBE_W") ? std::clamp(atoi(getenv("IK2_DRAFT_PROBE_W")), 2, kBlockMax) : 4;   // the look's width
     double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
     uint64_t hist[kBlockMax] = {};
+    // (a step's seconds by width before any is measured: an RTX 3090's at a 262,144 context - the drafter and the
+    //  exact window.  A width's first step is not counted (it records the width's CUDA graph: 38 ms once put a width
+    //  aside for good), and the widths not measured yet follow the measured ones' ratio to these)
+    double prior[kBlockMax + 1] = {0, 7.8e-3, 13.2e-3, 14.9e-3, 17.0e-3, 19.1e-3, 21.0e-3, 23.2e-3, 25.3e-3};
+    int seen[kBlockMax + 1] = {};
     SpecCtl() {
-        const double prior[kBlockMax + 1] = {0, 7.8e-3, 13.3e-3, 15.1e-3, 16.7e-3, 18.2e-3, 19.8e-3, 21.3e-3, 22.8e-3};
         for (int b = 0; b <= kBlockMax; ++b) c[b] = prior[b];
+    }
+    void took_width(int B, double t) {
+        if (seen[B]++ == 0) return;
+        c[B] = seen[B] == 2 ? t : 0.8 * c[B] + 0.2 * t;
+        double r = 0;
+        int n = 0;
+        for (int b = 2; b <= kBlockMax; ++b)
+            if (seen[b] >= 2) r += c[b] / prior[b], ++n;
+        for (int b = 2; b <= kBlockMax && n; ++b)
+            if (seen[b] < 2) c[b] = prior[b] * r / n;
+    }
+    // The drafter's drafts are kept in runs: a draft whose predecessors were kept is kept far more often than the
+    // first one (code: 0.78 the first, 0.8 .. 0.9 each one after), which one acceptance for every position (a
+    // geometric window) undervalues - it chose windows of 3 where 5 gave 5% more.  So: the kept share by position
+    // (pa / pn: of the drafts reached - every one before them kept - the ones kept; decayed counts over priors).
+    // IK2_DRAFT_POLICY=geo: one acceptance for all positions, as before.
+    bool by_pos = !(getenv("IK2_DRAFT_POLICY") && std::string(getenv("IK2_DRAFT_POLICY")) == "geo");
+    double pn[kBlockMax] = {3, 3, 3, 3, 3, 3, 3, 3}, pa[kBlockMax] = {2.1, 2.25, 2.4, 2.4, 2.4, 2.55, 2.55, 2.55};
+    double pos_decay = getenv("IK2_DRAFT_POS_DECAY") ? atof(getenv("IK2_DRAFT_POS_DECAY")) : 0.9;
+    double expect(int b) const {   // the tokens a window of b gives: the anchor's next and the drafts kept before a miss
+        if (!by_pos) {
+            const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
+            return (1.0 - std::pow(a, b)) / (1.0 - a);
+        }
+        double e = 1.0, reach = 1.0;
+        for (int j = 0; j + 1 < b; ++j) reach *= std::min(0.98, pa[j] / pn[j]), e += reach;
+        return e;
     }
     int choose(int room) {   // room: the widest a step may be (1: plain)
         const int bmax = std::min(wmax, room);
         if (bmax < 2) return 1;
         if (!adapt) return bmax;
-        const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
         int best = 1;
         double vb = 1.0 / c_plain;
         for (int b = 2; b <= bmax; ++b) {
-            const double e = (1.0 - std::pow(a, b)) / (1.0 - a), v = e / c[b];
+            const double v = expect(b) / c[b];
             if (v > vb) vb = v, best = b;
         }
         if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
@@ -4229,8 +4306,10 @@ struct SpecCtl {
         ++plain, ++plain_run;
     }
     void took_spec(int B, int acc, double t) {
-        c[B] = 0.8 * c[B] + 0.2 * t;
+        took_width(B, t);
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
+        for (int j = 0; j + 1 < B && j <= acc; ++j)   // (draft j was reached: the j before it were kept)
+            pn[j] = pos_decay * pn[j] + 1.0, pa[j] = pos_decay * pa[j] + (j < acc ? 1.0 : 0.0);
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
         plain_run = 0;
     }
@@ -4256,15 +4335,14 @@ struct SpecCtl {
         if (use_model) {
             const int bm = choose(room);
             if (bm >= 2) {
-                const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
-                const double v = (1.0 - std::pow(a, bm)) / (1.0 - a) / c[bm];
+                const double v = expect(bm) / c[bm];
                 if (src == 0 || v > vb || plain_run >= probe) vb = v, B = bm, src = 1;
             }
         }
         return src;
     }
     void took_lookup(int B, int acc, double t) {
-        c[B] = 0.8 * c[B] + 0.2 * t;
+        took_width(B, t);
         SL = decay * SL + acc, FL = decay * FL + (acc < B - 1 ? 1 : 0);
         ++l_steps, l_drafted += B - 1, l_accepted += acc;
         plain_run = 0;
@@ -4277,22 +4355,41 @@ bool g_lookup = false;   // the prompt lookup (src/spec/suffix_drafter): drafts 
 
 // VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
 // visit's four convs, for rollback_block) and buffers, whichever drafts; with the drafter (path) its weights (the
-// file's BF16), its fold through the head (FP16 [256][n_rows] and a bias), its layer without a window's context
-// (FP16 K and V, 8 heads of 128: 4 KiB a position) and its attention's scratch (24 heads: 768 B a position), the 4
-// windowed layers' rings (F32, 2048 positions) and the target's taps (4 rows of a chunk, F32).  (The head's FP16 copy
-// its fold is made from is gone again before the work buffers take the plan's reserve.)  tools/ik2_fit.py's
-// draft_gib has the same figures.
-size_t draft_room(const std::string& path, int ctx, int chunk, const Config& c, int n_rows) {
+// file's: BF16 in mtp.safetensors, the layers' matrices Q8_0 in a GGUF), its fold through the head (FP16 [256][n_rows]
+// and a bias), its layer without a window's context (FP16 K and V, 8 heads of 128: 4 KiB a position, IK2_DRAFT_CTX's
+// positions), its windowed layers' rings (F32, 2048 positions: Inkling-2-Mini's drafter 2, Small's 4), its
+// attention's partials (not a context's size: its logits stay in shared memory) and the target's taps (4 rows of a
+// chunk, F32).  (The fold reads a Q8_0 head a chunk at a time - no FP16 copy of it; an FP16 head is the model's
+// own.)  tools/ik2_fit.py's draft_gib has the same figures.
+size_t draft_room(const std::string& path, int ctx, int chunk, const Config& c, int n_rows, bool kv8 = false) {
     const size_t C = c.C, KD = (size_t) c.KV * c.D;
     size_t b = (size_t) c.n_visit * (2 * KD + 2 * C) * (3 + 8) * 4 + ((size_t) 16 << 20);
     if (path.empty()) return b;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     const size_t file = f ? (size_t) f.tellg() : ((size_t) 640 << 20);
-    b += file + (size_t) n_rows * 258 * 2 + (size_t) ctx * (4096 + 768) + (size_t) 4 * 2048 * 8 * 128 * 8 +
+    const size_t rings = c.C == 2304 ? 2 : 4, heads = c.C == 2304 ? 24 : 48;
+    b += file + (size_t) n_rows * 258 * 2 + (size_t) ik2::draft::context_rows(ctx) * (kv8 ? 2048 : 4096) +
+         rings * 2048 * 8 * 128 * 8 + k::draft_attn_scratch((int) heads) * 4 +
          (size_t) 4 * std::max(chunk, 8) * C * 4 + ((size_t) 32 << 20);
     return b;
 }
 
+// A window's sampled token of a position: the token of the most log-probability plus its noise (k::gumbel_noise of
+// the request's salt, the position and the token) - a sample of dist exactly (the Gumbel-max trick; the lower token
+// of equal sums).  The drafter draws its draft of the position with the same noise over its own logits, so the two
+// agree wherever the drafter's distribution is close to the model's - not only where the model's best token has the
+// probability to be taken (a draft that was the drafter's best token was kept with the model's probability of it:
+// 60% of the drafts of a code answer at temperature 1, where a greedy one keeps 65%).
+int gumbel_pick(const std::vector<std::pair<int, double>>& dist, uint64_t salt, int pos) {
+    float best = -INFINITY;
+    int tok = dist.empty() ? 0 : dist[0].first;
+    for (const auto& e : dist) {
+        if (e.second <= 0) continue;
+        const float v = std::log((float) e.second) + k::gumbel_noise(salt, pos, e.first);
+        if (v > best || (v == best && e.first < tok)) best = v, tok = e.first;
+    }
+    return tok;
+}
 // a sampled step's pick at a drafted position: the draft with the target's probability of it, else the target's
 // distribution without it - the target's own distribution, whatever drafted (speculative sampling with a point-mass
 // draft).  accepted: the draft was kept.
@@ -4304,6 +4401,11 @@ int spec_pick(const std::vector<std::pair<int, double>>& dist, int draft, std::m
     return accepted ? draft : sample_from(dist, rng, draft);
 }
 
+double g_sp_draft = 0, g_sp_block = 0, g_sp_tail = 0;   // IK2_SPEC_PROF: a step's drafting, window and the rest, s
+uint64_t g_sp_n = 0;
+std::string g_sp_seq;   // (a step's width and kept drafts, "5:4 5:0 ...")
+// (IK2_DRAFT_COUPLE=0: a sampled window's drafts the drafter's best tokens, kept with the model's probability of them)
+const bool g_draft_couple = !(getenv("IK2_DRAFT_COUPLE") && !std::atoi(getenv("IK2_DRAFT_COUPLE")));
 int g_window_check = 0;                       // IK2_WINDOW_CHECK: windows still to check against fast_token
 uint64_t g_window_rows = 0, g_window_same = 0;   // (rows checked, rows the same to the bit)
 
@@ -4324,9 +4426,18 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         static float *raw = nullptr, *anchor_h = nullptr;
         if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
         embed_row(M, anchor, raw, anchor_h);
-        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+        ik2::draft::Noise nz;
+        // (the drafter is less sure than the model where the model is sure: its logits over a share of the temperature,
+        //  IK2_DRAFT_COUPLE_T, so that its draws stay on the model's token there - any draft leaves the model's draw exact)
+        static const double couple_t = getenv("IK2_DRAFT_COUPLE_T") ? std::atof(getenv("IK2_DRAFT_COUPLE_T")) : 1.0;
+        nz.salt = sc.salt, nz.inv_temp = sc.temp > 0 ? (float) (1.0 / (sc.temp * couple_t)) : 0.0f, nz.cap = c.logit_cap;
+        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1,
+                            sc.temp > 0 && g_draft_couple ? &nz : nullptr);
         if (t_draft) *t_draft += now() - t0;
+        g_sp_draft += now() - t0;
     }
+    const double t_sp0 = now();
+    double t_sp1 = t_sp0;
     int tk[kBlockMax];
     tk[0] = anchor;
     for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
@@ -4353,6 +4464,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     if (sc.temp <= 0) {
         std::vector<int> g;
         fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g);
+        t_sp1 = now();
         int n = 0;
         while (n < B - 1 && dr[n] == g[n]) ++n;
         for (int j = 0; j < n; ++j) next.push_back(dr[j]);
@@ -4371,6 +4483,12 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
                 for (int v = 0; v < c.n_vocab; ++v) cd[v] = {row[v], v};
             }
             const auto dist = sample_dist(cd, sc);
+            if (g_draft_couple) {   // (the position's token, drawn with its noise; a draft is kept where it is that token)
+                const int tok = gumbel_pick(dist, sc.salt, P + j + 1);
+                next.push_back(tok);
+                if (j == B - 1 || tok != dr[j]) break;
+                continue;
+            }
             if (j == B - 1) {
                 next.push_back(sample_from(dist, *sc.rng));
                 break;
@@ -4390,6 +4508,12 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     if (drafter) {   // (its context for the kept positions, whichever drafted)
         ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
         ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
+    }
+    static const bool sp_prof = getenv("IK2_SPEC_PROF") && std::atoi(getenv("IK2_SPEC_PROF"));
+    if (sp_prof) {   // (the tail waited for: the rollback and the drafter's context)
+        CU(cudaStreamSynchronize(g_s));
+        g_sp_block += t_sp1 - t_sp0, g_sp_tail += now() - t_sp1, ++g_sp_n;
+        g_sp_seq += std::to_string(B) + ":" + std::to_string(m - 1) + (given ? "L " : " ");
     }
 }
 
@@ -5418,13 +5542,34 @@ int check_sampling() {
         sc.temp = temps[cs], sc.top_p = tops[cs], sc.top_k = topks[cs];
         const auto dist = sample_dist(cd, sc);
         const int drafts[3] = {dist[0].first, dist[std::min<size_t>(3, dist.size() - 1)].first, 99999};
-        for (int dk = 0; dk < 4; ++dk) {   // (dk 3: the plain pick)
+        // (the drafter's distribution for the noise-coupled draws: the model's logits moved a little, at the same
+        //  temperature - a drafter that is close but not the model)
+        std::vector<std::pair<float, int>> cq = cd;
+        for (auto& e : cq) e.first += (float) std::normal_distribution<double>(0, 0.5)(rng);
+        const uint64_t salt = rng();
+        for (int dk = 0; dk < 6; ++dk) {   // (dk 3: the plain pick; 4, 5: the noise-coupled draws)
             std::map<int, int> n;
             const int N = 400000;
             int kept = 0;
             for (int i = 0; i < N; ++i) {
                 bool acc = false;
-                const int t = dk == 3 ? sample_from(dist, rng) : spec_pick(dist, drafts[dk], rng, acc);
+                int t;
+                if (dk >= 4) {
+                    // the window's token of position i; dk 5: against a draft drawn with the same noise from cq -
+                    // kept where the two agree (the token is the model's draw either way)
+                    t = gumbel_pick(dist, salt, i);
+                    if (dk == 5) {
+                        float bq = -INFINITY;
+                        int dq = -1;
+                        for (const auto& e : cq) {
+                            const float v = e.first / (float) sc.temp + k::gumbel_noise(salt, i, e.second);
+                            if (v > bq) bq = v, dq = e.second;
+                        }
+                        acc = dq == t;
+                    }
+                } else {
+                    t = dk == 3 ? sample_from(dist, rng) : spec_pick(dist, drafts[dk], rng, acc);
+                }
                 ++n[t], kept += acc;
             }
             double chi = 0;
@@ -5444,7 +5589,7 @@ int check_sampling() {
             std::printf("check sampling: temperature %.1f top_p %.2f top_k %d, %s: chi-square %.1f (%d df), p %.3g, "
                         "drafts kept %.1f%%%s - %s\n", sc.temp, sc.top_p, sc.top_k,
                         dk == 3 ? "plain pick" : dk == 0 ? "the likeliest draft" : dk == 1 ? "a less likely draft"
-                                                                                    : "an impossible draft",
+                        : dk == 2 ? "an impossible draft" : dk == 4 ? "the noise's draw" : "a draft drawn with the same noise",
                         chi, df, p, 100.0 * kept / N, outside ? " (tokens outside the distribution)" : "",
                         ok ? "ok" : "FAIL");
         }
@@ -6067,8 +6212,15 @@ int main(int argc, char** argv) {
             if (model_drafter ? draft_path.empty() : !g_lookup) continue;
             const auto* head = S.info("output.weight");
             const int head_rows = head ? (int) (head->elements() / c.C) : 201024;
-            const size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows);
+            // (the drafter: its context rows in FP16, else in FP8 - IK2_DRAFT_KV takes one; the load below measures)
+            const char* kv_env = getenv("IK2_DRAFT_KV");
+            const bool only16 = kv_env && std::string(kv_env) == "f16", only8 = kv_env && std::string(kv_env) == "fp8";
+            size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8);
             std::string why;
+            if (model_drafter && !only8 && !only16 && !room_ok(need, why)) {
+                why.clear();
+                need = draft_room(draft_path, ctx, chunk, c, head_rows, true);
+            }
             if (room_ok(need, why)) {
                 std::printf("drafting: %s, %.2f GiB of VRAM beside the model (the plan as without it)\n",
                             model_drafter ? (g_lookup ? "the drafter and the prompt lookup" : "the drafter")
@@ -6607,37 +6759,18 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
     }
 
-    // the drafter (before the expert cache takes what VRAM is left)
+    // the drafter: loaded on GPU 0 below, after the work buffers and before the expert cache (draft_path: planned)
     ik2::draft::Drafter* drafter = nullptr;
     uint16_t* draft_head = M.out_w.f16;
     if (!draft_path.empty()) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
-        if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
-            const size_t n = (size_t) c.n_rows * c.C;
-            draft_head = dalloc<uint16_t>(n);
-            k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
-        }
-        if (!draft_head) die("--draft: the output head is neither FP16 nor planar Q8_0");
+        // (a Q8_0 head: the fold reads its blocks a chunk at a time and the base logits are products with them - no
+        //  FP16 copy of it, 0.9 GiB for Inkling 2's, which at a long context's start had no room beside the cache)
+        if (!draft_head && !M.out_w.q8) die("--draft: the output head is neither FP16 nor planar Q8_0");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
-        const double t0 = now();
-        try {
-            drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
-            ik2::draft::fold(drafter, draft_head, c.n_rows);
-        } catch (const std::exception& e) {
-            die(e.what());
-        }
-        if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
-            ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
-            CU(cudaStreamSynchronize(g_s));
-            CU(cudaFree(draft_head));
-            draft_head = nullptr;
-        }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
-        g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
-        std::printf("drafter: %s, %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
-                    ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
-    if (drafter || g_lookup) {   // (the verify window's records of every conv: rollback_block)
+    if (!draft_path.empty() || g_lookup) {   // (the verify window's records of every conv: rollback_block)
         for (auto& Vi : M.V) {
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
@@ -6811,6 +6944,64 @@ int main(int argc, char** argv) {
         int sms = 0;
         CU(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
         g_offs.blocks = std::max(8, 2 * sms);
+    }
+    // The drafter, now that the work buffers have their VRAM: it takes room only where the cache still holds every
+    // expert beside it (the resident path, the plan's - drafting never changes it) - its context rows in FP16, else
+    // in FP8 (2 KiB a position instead of 4: the drafts only, the target checks every token; IK2_DRAFT_KV=f16 / fp8
+    // takes one), else it is left out with a NOTE.  Measured here, not estimated: the plan reserves a fixed 1.5 GiB
+    // for the work buffers, and at 262,144 tokens they take more - a drafter loaded before them took the experts'
+    // last 135 MiB, and the model ran on the cache path at two thirds of its speed.
+    if (d == 0 && !draft_path.empty()) {
+        size_t cache_need = 0;   // (every expert in slots, as ExpertCache::init sizes them)
+        for (int l = 0; l < c.n_layer; ++l)
+            cache_need += (size_t) c.E * ((M.L[l].eb[0] + M.L[l].eb[1] + M.L[l].eb[2] + 255) / 256 * 256);
+        const size_t keep = cache_need + ((size_t) 256 << 20) + ((size_t) 32 << 20);   // (+ the cache's room, slack)
+        const char* kv_env = getenv("IK2_DRAFT_KV");
+        const std::string kv_want = kv_env && *kv_env ? kv_env : "auto";
+        if (kv_want != "auto" && kv_want != "f16" && kv_want != "fp8")
+            die("unknown IK2_DRAFT_KV=" + kv_want + " (expected f16 or fp8)");
+        const double t0 = now();
+        size_t short_b = 0;
+        for (int kv8 = kv_want == "fp8" ? 1 : 0; kv8 <= (kv_want == "f16" ? 0 : 1) && !drafter; ++kv8) {
+            ik2::draft::Drafter* dr = nullptr;
+            try {
+                dr = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, kv8 != 0);
+                if (draft_head) {
+                    ik2::draft::fold(dr, draft_head, c.n_rows);
+                } else {
+                    ik2::draft::fold_q8(dr, M.out_w.q8, M.out_w.q8d, c.n_rows);
+                    ik2::draft::set_head_q8(dr, M.out_w.q8, M.out_w.q8d);
+                }
+            } catch (const std::exception& e) {
+                die(e.what());
+            }
+            g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
+            CU(cudaStreamSynchronize(g_s));
+            size_t fr_now = 0, tot_now = 0;
+            CU(mem_info(&fr_now, &tot_now));
+            if (!g_fast_want || fr_now >= keep) {
+                drafter = dr;
+                break;
+            }
+            short_b = keep - fr_now;
+            ik2::draft::destroy(dr);
+            CU(cudaFree(g_taps));
+            g_taps = nullptr;
+        }
+        if (drafter) {
+            std::printf("drafter: %s, %s matrices, its context rows %s%s, %.2f GiB of VRAM, %.1f s\n",
+                        draft_path.c_str(), ik2::draft::matrices_q8(drafter) ? "Q8_0" : "BF16",
+                        ik2::draft::context_fp8(drafter) ? "FP8" : "FP16",
+                        ik2::draft::context_fp8(drafter) && kv_want == "auto" ? " (FP16's do not fit beside every expert)"
+                                                                               : "",
+                        ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
+        } else {
+            std::printf("NOTE maya-ik2: the drafter left out: beside it the cache would not hold every expert (%.2f "
+                        "GiB short%s) - a smaller --max-context leaves it room\n", short_b / 1073741824.0,
+                        kv_want == "f16" ? " with FP16 context rows" : "");
+            draft_path.clear();
+        }
+        std::fflush(stdout);
     }
     CU(mem_info(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
@@ -7288,7 +7479,7 @@ int main(int argc, char** argv) {
                         }
                         CU(cudaStreamSynchronize(g_s));
                         SpecCtl ctl;
-                        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+                        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
                         ctl.use_lookup = mode == 1 || mode == 3, ctl.use_model = mode >= 2;
                         if (mode == 0) ctl.wmax = 1;   // (plain tokens only)
                         maya::spec::SuffixDrafter lk1;
@@ -7796,7 +7987,7 @@ int main(int argc, char** argv) {
         // widest window, IK2_DRAFT_ADAPT=0 always that wide
         SpecCtl sctl;
         const bool spec_on = (drafter || g_lookup) && g_fast && g_block;
-        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         sctl.use_model = drafter != nullptr, sctl.use_lookup = g_lookup;
         static maya::spec::SuffixDrafter lk;   // (the prompt lookup: a request's tokens so far)
@@ -7873,6 +8064,7 @@ int main(int argc, char** argv) {
             g_wd_busy = true;
             beat("the request's start (its kept state)");
             if (seed >= 0) rng.seed((uint64_t) seed);
+            const uint64_t req_salt = rng();   // (the request's noise for its windows' tokens: its seed's, or a new one)
             g_cancel = 0;
             // (drafting for this request: spec=1 asks for none; the prompt lookup's history its tokens; the Monitor's
             //  figures - STAT draft_acc / draft_off, DONE's kept and offered - this request's drafts)
@@ -8095,7 +8287,7 @@ int main(int argc, char** argv) {
                 }
                 if (B >= 2) {
                     SampleCfg sc;
-                    sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng;
+                    sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng, sc.salt = req_salt;
                     std::vector<int> next;
                     const double ts = now();
                     int given[kBlockMax];
@@ -8251,6 +8443,22 @@ int main(int argc, char** argv) {
         first_best = (int) (std::max_element(r_last, r_last + c.n_vocab) - r_last);
         logits.clear();
     }
+    // (IK2_BLOCK_WARM=1: the windows' CUDA graphs recorded before the generation is timed - a width's first window
+    //  records its graph, tens of ms once a process)
+    if (getenv("IK2_BLOCK_WARM") && std::atoi(getenv("IK2_BLOCK_WARM")) && (drafter || g_lookup) && g_fast && g_block &&
+        (int) prompt.size() + kBlockMax <= ctx) {
+        const double tw = now();
+        int tk[kBlockMax];
+        for (int j = 0; j < kBlockMax; ++j) tk[j] = first_best;
+        for (int T = 2; T <= kBlockMax; ++T) {
+            std::vector<float> lo;
+            std::vector<int> g;
+            fast_block(M, tk, T, (int) prompt.size(), OutMode::kArgmax, lo, &g);
+            block_rollback(0);
+        }
+        CU(cudaStreamSynchronize(g_s));
+        std::printf("windows of 2 .. %d tokens recorded in %.2f s\n", kBlockMax, now() - tw);
+    }
     // greedy generation
     g_pf = Prof{};
     std::vector<int> out;
@@ -8306,7 +8514,7 @@ int main(int argc, char** argv) {
     if ((drafter || g_lookup) && g_fast && g_block) {
         // (the resident path: the controller picks plain tokens or a window of the drafter's or the prompt lookup's
         //  drafts; greedy, as the CLI's generation is)
-        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
         ctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         ctl.use_model = drafter != nullptr, ctl.use_lookup = g_lookup;
         maya::spec::SuffixDrafter lk;
@@ -8486,6 +8694,16 @@ int main(int argc, char** argv) {
                     ctl.c[std::min(ctl.wmax, kBlockMax)] * 1e3);
         for (int b = 2; b <= 6; ++b) std::printf(" %.1f", ctl.c[b] * 1e3);
         std::printf("), a plain token %.1f ms\n", ctl.c_plain * 1e3);
+    }
+    if (g_sp_n)
+        std::printf("steps: %llu, a step's drafting %.2f ms, its window %.2f ms, the rest %.2f ms\n",
+                    (unsigned long long) g_sp_n, g_sp_draft * 1e3 / g_sp_n, g_sp_block * 1e3 / g_sp_n,
+                    g_sp_tail * 1e3 / g_sp_n);
+    if (g_sp_n) std::printf("step widths and kept drafts: %s\n", g_sp_seq.c_str());
+    if (g_sp_n && drafter) {
+        double sub = 0, wait = 0;
+        ik2::draft::propose_times(&sub, &wait);
+        std::printf("the drafter's step: %.2f ms queueing its launches, %.2f ms waiting for them after\n", sub, wait);
     }
     if (g_window_rows)
         std::printf("window check: %llu of %llu rows the one-token path's to the bit\n",

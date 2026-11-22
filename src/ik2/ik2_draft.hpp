@@ -1,5 +1,5 @@
 // src/ik2/ik2_draft.hpp - maya-ik2's drafter: Inkling 2's DSpark draft model (the official checkpoint's
-// mtp.safetensors, BF16) for speculative decoding.
+// mtp.safetensors, BF16, or a GGUF of it: unsloth's dspark-Inkling-2-Mini-Q8_0.gguf) for speculative decoding.
 //
 //   * The target leaves 8 hidden states a position: its stream at the start of layers 5, 11, .., 41 and the final
 //     normed hidden (taps).  For each committed position, each draft layer mixes them (softmax(fuse_weight[layer])),
@@ -29,22 +29,44 @@ struct Drafter;
 const std::vector<int>& tap_layers();
 constexpr int kTaps = 8, kBlock = 8;
 
-/// Loads mtp.safetensors (path) onto the current device; ctx: positions the context caches hold.  C: the target's
-/// width (4608).  Throws (std::runtime_error) on a file it does not understand.
-Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s);
+/// Loads the drafter (path) onto the current device: mtp.safetensors (BF16), or a GGUF of it (llama.cpp's dflash
+/// arch, e.g. unsloth's dspark-Inkling-2-Mini-Q8_0.gguf - its layers' matrices Q8_0, read on the tensor cores from
+/// their blocks; its metadata checked against this drafter).  ctx: positions the context caches hold.  C: the
+/// target's width (2304, 4608).  kv8: the layer without a window's context rows in FP8 (2 KiB a position instead of
+/// FP16's 4 - the drafts only, the target checks every token).  Throws (std::runtime_error) on a file it does not
+/// understand.
+Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s, bool kv8 = false);
+/// Frees everything load() and fold() took on the device (a drafter that does not fit after all).
+void destroy(Drafter* d);
+bool matrices_q8(const Drafter* d);
+bool context_fp8(const Drafter* d);
+/// The rows of the context cache of the layer without a window (IK2_DRAFT_CTX, default ctx).
+int context_rows(int ctx);
 /// The Markov head's bias folded through the target's output head (FP16 [n_rows][C], on the device).
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);
+/// ... through the head kept as planar Q8_0 (set_head_q8's form), read a chunk at a time: the same fold as through
+/// its FP16 copy, without the copy.
+void fold_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d, int n_rows);
 /// The context caches for positions pos0 .. pos0 + m - 1 from tap rows r0 .. r0 + m - 1 (taps [8][ld][C] F32).
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0);
 /// f_rnn from tap row `row`.
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row);
 /// Drafts 7 tokens (out, host) after the anchor at position P; anchor_h: its embedding, normed (device [C] F32).
 /// lm_f16: the target's output head; n_vocab: the real rows (the argmax's range).
+/// noise (a sampled request, or null): the drafts are then drawn - draft j the argmax of its softcapped logits over
+/// the temperature plus k::gumbel_noise(salt, P + 1 + j, token), the noise the model's own token of that position
+/// is drawn with - instead of the drafter's best tokens (a GGUF drafter's int8 fold; else its best tokens).
+struct Noise {
+    uint64_t salt = 0;
+    float inv_temp = 0.0f, cap = 30.0f;
+};
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out, int proposals = kBlock - 1);
+             int* out, int proposals = kBlock - 1, const Noise* noise = nullptr);
 /// The base logits through the target's head kept as planar Q8_0 (int8 [n_rows][C], FP16 scales [n_rows][C / 32]):
 /// propose's lm_f16 is not read then (the FP16 copy is fold()'s only).
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
+/// propose's mean host time to queue its launches and its wait for them after, ms (a profile).
+void propose_times(double* submit_ms, double* wait_ms);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
 

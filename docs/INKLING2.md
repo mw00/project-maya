@@ -323,18 +323,29 @@ CPU) and ends after the request's pictures, so it keeps no VRAM. The server send
 640 x 448 is 192 tokens and 22 ms.
 
 **The drafter** (`--draft mtp.safetensors`, the official DSpark checkpoint: 5 layers; its taps the stream at
-visits 5, 23 and 41 and the final hidden, `mtp_config.target_layer_ids`) drafts after the last chosen token, and the
+visits 5, 23 and 41 and the final hidden, `mtp_config.target_layer_ids`; or a GGUF of it - llama.cpp's `dflash`
+architecture, e.g. unsloth's `dspark-Inkling-2-Mini-Q8_0.gguf`, whose metadata is checked against this drafter and
+whose Q8_0 matrices are read on the tensor cores straight from their blocks) drafts after the last chosen token, and the
 model checks the window - the anchor and the drafts - in one go on the **block path** (`fast_block`): the resident
 token path for 2 .. 8 tokens, every position read from the device, the picks grouped by expert on the device (an
 expert's blocks read once for the tokens that picked it: 5 tokens need 2.7 times one token's experts, not 5), the
 convs' histories and inputs recorded and taken back in one launch for the rejected tokens - one CUDA graph a window
-size. Greedy keeps the agreeing drafts and the model's next token; sampling accepts a draft with the model's
-probability of it and otherwise samples the model's distribution without it, which is the model's distribution
-exactly.
+size. Greedy keeps the agreeing drafts and the model's next token. A sampled request draws each position's token
+from the model's distribution with noise that depends on the request, the position and the token only (the
+Gumbel-max draw: the token with the largest log probability plus its noise, `k::gumbel_noise`) - the model's
+distribution exactly, whatever was drafted - and a draft is kept where it is that token; the drafter draws its drafts
+with the same noise, so the two agree far more often than a draft's probability (new code at temperature 1: 58 ->
+68% of the drafts kept). `--check-sampling` tests the draw. `IK2_DRAFT_COUPLE=0`: the drafter's best tokens, each
+kept with the model's probability of it (also the model's distribution exactly).
 
 **Drafting on = drafting off.** The window gives every token the one-token path's values to the bit (the **exact
 window**, the default): its dense products are `mv_q8p`'s sums for each token with the weights read once
-(`k::mv_q8p_cols`), its attention the token's own kernels a token at a time, its experts the token kernels' sums (the
+(`k::mv_q8p_cols`: the tokens a template parameter, an input asked for a step ahead and the weights four, the
+one-token expression's own order of multiply-adds; a visit's q, k, v, r and gate rows one launch), its attention
+each token's own blocks of the one-token kernel in one launch - and on a layer without a sliding window the tokens'
+queries side by side on a key's rows, read once (`attn_decode_mma_win`: a column's steps, warps and sums are the
+one-token kernel's wherever the window's tokens have the same steps a warp, which the kernel decides on the device;
+the other windows, one in 16 x the warps positions, take the tokens' own blocks) - its experts the token kernels' sums (the
 tensor cores' NVFP4 blocks with the same warp split and order; the row dots - the Q8_0 layers, and every layer
 where the tensor-core kernels are off - a member at a time, an expert read once for its tokens). So greedy answers
 are the same with drafting and without it, and sampled ones follow the same distribution. `IK2_WINDOW_CHECK=n`
@@ -350,17 +361,31 @@ drafter and both answers fastest (a chat, a code and a tool-call request, `IK2_D
 **on** drafts with the drafter and the prompt lookup, the controller choosing each step; **off** loads neither. A
 request's `spec=1` asks for no drafting. The drafter takes room only where the start plan stays as it is without it
 (every expert in VRAM, the same context and cache, and not the free VRAM the pictures' encoder would start in on the
-GPU - `IK2_VISION_GIB`, the server's), else it is left out with a NOTE: on a 24 GB card that is above about 200K tokens of
-context with the FP8 cache (`tools/ik2_fit.py` `draft_gib`: 0.88 GiB + 4.75 KiB a token). The Monitor's Speculation
-shows the drafts kept (STAT `draft_acc` / `draft_off`, `draft_ms`, `verify_ms`).
+GPU - `IK2_VISION_GIB`, the server's), else it is left out with a NOTE. It is loaded last before the expert cache and
+what is left is measured: where the context rows of its layer without a window do not fit in FP16 (4 KiB a
+position) they are kept in FP8 (2 KiB; `IK2_DRAFT_KV=f16|fp8` decides instead), so a 24 GB card keeps the drafter at
+262,144 tokens with the FP8 cache (1.0 GiB; `tools/ik2_fit.py` `draft_gib`: 0.86 GiB + 4 KiB a token for FP16
+rows). The Monitor's Speculation shows the drafts kept (STAT `draft_acc` / `draft_off`, `draft_ms`, `verify_ms`).
 
 Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
-document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens, (1 - a^B) / (1 - a)
-with a the recent acceptance, over its measured time, against a plain token's; after 8 plain tokens it drafts once
-to look again. One RTX 3090, greedy, against plain decode: prose 131 / 127 tok/s, new code 162 / 126, an edit 213 /
-124; through the server new code 207 tok/s, at temperature 0.7 209. The drafter's context: its windowed layers a
-ring of 2048 rows, the layer without a window the whole context in FP16 (`IK2_DRAFT_CTX` caps it: a 64K document
-continues at 3.07 tokens a step with the whole context, 2.24 with the last 16K).
+document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens - the recent share of
+the drafts kept at each draft position, each given the one before it (`IK2_DRAFT_POLICY=geo`: one acceptance a,
+(1 - a^B) / (1 - a)) - over that width's measured time, against a plain token's, up to 8 wide; after 4 plain tokens
+it drafts once to look again. One RTX 3090, greedy, against plain decode: prose 131 / 127 tok/s, new code 162 / 126,
+an edit 213 / 124; through the server new code 207 tok/s, at temperature 0.7 209. The drafter's context: its
+windowed layers a ring of 2048 rows, the layer without a window the whole context in FP16 or FP8 (`IK2_DRAFT_CTX`
+caps it: a 64K document continues at 3.07 tokens a step with the whole context, 2.24 with the last 16K).
+
+**A step's time** (one RTX 3090 held at 300 W, Inkling-2-Mini UD-Q4_K_XL, 262,144 context, FP8 cache, the Q8_0
+GGUF drafter, a window of 5): 25.5 ms (the drafts 2.5, the window 22.2, the rest 0.8) became 17.6 ms (1.7, 15.7,
+0.15), every token's logits still the one-token path's to the bit. The drafter is one recorded CUDA graph (its
+position and a sampled request's noise read on the device, `IK2_DRAFT_GRAPH=0`: launch by launch), its Markov
+head's fold through the output head kept as int8 rows (`IK2_DRAFT_FOLD=f16`), its attention on the tensor cores over
+FP8 or FP16 context rows (`IK2_DRAFT_ATTN=scalar`: the F32 kernels). Greedy, with drafting / without, tok/s, the
+same tokens: new code 201 / 124, a tool call 201 / 124, an edit 210 / 124, a 900-token tool call 237 / 124, prose
+135 / 124. After a 65K-token document the window's attention and the drafter's own were most of a step: new code
+there 114 -> 154 tok/s (plain 102) with the tokens' queries on a key's rows read once and the drafter's attention on
+the tensor cores (a draft there 6.1 -> 2.0 ms, a window of 5 23.2 -> 17.4 ms).
 
 To run it (one GPU):
 

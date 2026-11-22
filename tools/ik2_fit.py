@@ -132,9 +132,10 @@ def verdict_two(vram0_gb: float, vram1_gb: float, ram_gb: float, ctx: int, kv: s
     return word, line
 
 
-DRAFT_BASE_GIB = 0.88                               # the drafter (mtp.safetensors 0.59 GiB, its fold through the head,
-DRAFT_TOKEN_BYTES = 4864                            # its rings, the taps): maya-ik2's draft_room; its layer without a
-                                                    # window's context 4 KiB a token + its scratch's 768 B
+DRAFT_BASE_GIB = 0.86                               # the drafter (mtp.safetensors 0.59 GiB, its fold through the head,
+DRAFT_TOKEN_BYTES = 4096                            # its 2 rings, its attention's partials, the taps): maya-ik2's
+                                                    # draft_room; its layer without a window's context 4 KiB a token
+                                                    # (its attention's logits in shared memory: no scratch a token)
 
 
 def draft_gib(ctx: int) -> float:
