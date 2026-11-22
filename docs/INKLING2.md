@@ -167,8 +167,13 @@ Without it the layers are split between the GPUs.
 - The model writes typed segments rather than tags - `<|content_thinking|>`, `<|content_text|>`, a call as
   `<|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}<|end_message|>`.
   `InklingRewriter` turns them, as they stream, into what `OutputParser` reads (DeepSeek's and MiniMax's path).
-- A required tool call (`tool_choice`) opens in its own form; a picture is refused in plain words when the config
-  has no image encoder (section 8: pictures).
+- A required tool call (`tool_choice`) opens in its own form: a named one as
+  `<|message_model|>NAME<|content_invoke_tool_json|>`. `required` (any tool) can open only `<|message_model|>`, since
+  the name comes first, and the model may go on from there in words; `maya-ik2` reads `GEN ... starts=<ids>;<ids>`
+  (and says so in its `INFO` line), each tool's name and the call's segment, and opens the answer with one of them:
+  a token among the ones the matching names go on with, the model's pick from its logits, no drafts until one is
+  whole. A later engine call of the same answer (a fair slice) goes on after it. A picture is refused in plain words
+  when the config has no image encoder (section 8: pictures).
 - `tools/strata_tokenizer.py` reads the tokenizer under both names unsloth's files give its pre-tokenizer (`gpt-4o`,
   `inkling`): 442 strings against the model's own `tokenizer.json`, all equal, with both files.
 

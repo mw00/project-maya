@@ -16,12 +16,14 @@ import hashlib
 import json
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from serve import server
 from serve.frontend import ChatTemplate, InklingRewriter, OutputParser, effort_kwargs, inkling_messages, \
     openai_to_messages
-from serve.server import ByteTokenizer, Service
+from serve.server import ByteTokenizer, Service, StrataEngine
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC = ROOT / "tools" / "ik2" / "chat_template.jinja"
@@ -226,6 +228,49 @@ class Serving(unittest.TestCase):
         self.assertIn(EFFORT + "0" + END, tok.decode(eng.prompts[0]))   # (thinking off for a required call)
         self.assertEqual(got["calls"], [("get_weather", {"city": "Rome"})])
 
+    def test_any_required_call_opens_with_a_tools_name(self):
+        # tool_choice "required" names no tool, and Inkling's call opens with the tool's name: the prompt can open the
+        # model's message only.  Where the engine reads starts=, the message must go on with one of the tools' names and
+        # the call's segment (the model's pick among them), not with words
+        svc, eng, tok = service("get_weather" + CALL + '{"name":"get_weather","args":{"city":"Rome"}}' + END)
+        eng.info["starts"] = 1
+        tools = TOOLS + [{"type": "function", "function": {"name": "get_time", "parameters": {"type": "object"}}}]
+        msgs, tools, kw = openai_to_messages({"messages": ASK, "tools": tools, "tool_choice": "required"})
+        ids, _, _ = svc.prepare(msgs, tools, kw, 500)
+        self.assertEqual(tok.decode(ids[-1:]), MODEL)
+        seg = tok.special_tokens[CALL]
+        self.assertEqual(sorted(kw["_starts"]),
+                         sorted([tok.encode("get_weather") + [seg], tok.encode("get_time") + [seg]]))
+        self.assertIn(EFFORT + "0" + END, tok.decode(ids))   # (thinking off, as for a named call)
+
+    def test_openings_only_where_needed_and_read(self):
+        for choice, info in (("required", {}),                                       # (an engine without it)
+                             ({"type": "function", "function": {"name": "get_weather"}}, {"starts": 1}),
+                             ("auto", {"starts": 1})):
+            svc, eng, _ = service("x")
+            eng.info.update(info)
+            msgs, tools, kw = openai_to_messages({"messages": ASK, "tools": TOOLS, "tool_choice": choice})
+            svc.prepare(msgs, tools, kw, 500)
+            self.assertIsNone(kw["_starts"], choice)
+
+    def test_openings_go_to_the_engine_for_the_answers_start(self):
+        self.assertIn("starts=3,7;9", StrataEngine.sampling_keys({"_starts": [[3, 7], [9]]}).split())
+        self.assertIn("starts=3", StrataEngine.sampling_keys({"_starts": [[3]], "temperature": 0}).split())
+        self.assertNotIn("starts", StrataEngine.sampling_keys({"_starts": None, "temperature": 0.7}))
+        # a later call for the same answer goes on after what was written: cut inside the opening, with what the
+        # sequences it matches have left; once one is whole (or none matches), freely
+        self.assertEqual(server.openings_left([[1, 2, 3], [1, 4], [5]], [1]), [[2, 3], [4]])
+        self.assertEqual(server.openings_left([[1, 2, 3], [1, 4], [5]], [1, 2]), [[3]])
+        self.assertIsNone(server.openings_left([[1, 2, 3], [1, 4]], [1, 4, 9]))
+        self.assertIsNone(server.openings_left([[1, 2, 3]], [7]))
+        # (through _sliced: the thinking budget's close at a sentence's end stops the first call after "Hi.", the
+        # next goes on - the opening was written whole)
+        svc, eng, tok = service("Hi. There.")
+        hi = tok.encode("Hi.")
+        smp = {"_starts": [hi, [2]], "_think_soft": 1, "_think_end": tok.special_tokens[END]}
+        list(svc._sliced(tok.encode("Q"), 50, smp, threading.Event(), None, [True, True], {}))
+        self.assertEqual([x.get("_starts") for x in eng.sampling], [[hi, [2]], None])
+
     def test_pictures_are_refused_in_plain_words(self):
         svc, eng, _ = service("x")
         msgs, tools, kw = openai_to_messages({"messages": [PICTURE]})
@@ -255,6 +300,54 @@ class Defaults(unittest.TestCase):
         cfg = server.checked_config_effort(dict(self.CFG), public(), True)
         self.assertEqual(cfg["reasoning_effort"], "auto")
 
+
+
+class Http(unittest.TestCase):
+    """A required call through each API: the openings reach the engine with the request (OpenAI's chat, Anthropic's
+    messages, Responses)."""
+
+    def setUp(self):
+        self.svc, self.eng, self.tok = service("get_weather" + CALL + '{"name":"get_weather","args":{"city":"Rome"}}'
+                                               + END)
+        self.eng.info["starts"] = 1
+        self.httpd = server.serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    def check(self, path, body):
+        code, out = self.post(path, body)
+        self.assertEqual(code, 200, out)
+        self.assertEqual(self.eng.sampling[0].get("_starts"),
+                         [self.tok.encode("get_weather") + [self.tok.special_tokens[CALL]]])
+        return out
+
+    def test_chat(self):
+        out = self.check("/v1/chat/completions", {"model": "x", "messages": ASK, "tools": TOOLS,
+                                                  "tool_choice": "required"})
+        self.assertEqual(out["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather")
+
+    def test_messages(self):
+        tools = [{"name": "get_weather", "description": "Weather.", "input_schema": TOOLS[0]["function"]["parameters"]}]
+        out = self.check("/v1/messages", {"model": "x", "max_tokens": 100, "messages": ASK, "tools": tools,
+                                          "tool_choice": {"type": "any"}})
+        self.assertEqual([b["name"] for b in out["content"] if b["type"] == "tool_use"], ["get_weather"])
+
+    def test_responses(self):
+        out = self.check("/v1/responses", {"model": "x", "input": "Weather in Paris?", "tool_choice": "required",
+                                           "tools": [{"type": "function", **TOOLS[0]["function"]}]})
+        self.assertEqual([o["name"] for o in out["output"] if o["type"] == "function_call"], ["get_weather"])
 
 if __name__ == "__main__":
     unittest.main()

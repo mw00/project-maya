@@ -4286,6 +4286,72 @@ bool par_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) {
 
 void embed_row(Model& M, int t, float* raw, float* out);
 
+// GEN's starts=<ids>;<ids>;..: the answer opens with one of these token sequences - the server's required tool call
+// on Inkling's form (serve/server.py's Service.prepare), a call to any tool: its name comes first, so the prompt can
+// open only the model's message and the sequences are each tool's name and the call's segment.  While more than one
+// still matches, a token is the model's pick among the ones they go on with; with one left, its tokens follow
+// (`alive`: the sequences still matching, `sd`: the tokens of them written)
+struct Starts {
+    std::vector<std::vector<int>> seqs;
+    std::vector<int> alive;
+    int sd = 0;
+    void parse(const std::string& v, int vocab) {   // "1,2,3;4,5" (a sequence with a token outside 0..vocab-1 is dropped)
+        seqs.clear();
+        for (size_t a = 0; a <= v.size();) {
+            size_t b = v.find(';', a);
+            if (b == std::string::npos) b = v.size();
+            std::vector<int> q;
+            bool ok = true;
+            for (size_t x = a; x < b;) {
+                const long tk = std::strtol(v.c_str() + x, nullptr, 10);
+                if (tk < 0 || tk >= vocab) ok = false;
+                q.push_back((int) tk);
+                while (x < b && v[x] != ',') ++x;
+                ++x;
+            }
+            if (ok && !q.empty()) seqs.push_back(q);
+            a = b + 1;
+        }
+        alive.clear(), sd = 0;
+        for (int j = 0; j < (int) seqs.size(); ++j) alive.push_back(j);
+    }
+    bool on() const { return !alive.empty(); }
+    std::vector<int> opts() const {   // the tokens the matching sequences go on with
+        std::vector<int> o;
+        for (int j : alive)
+            if (std::find(o.begin(), o.end(), seqs[j][sd]) == o.end()) o.push_back(seqs[j][sd]);
+        return o;
+    }
+    void took(int t) {   // a token written: the sequences it matches; once one is whole, the answer goes on freely
+        if (alive.empty()) return;
+        std::vector<int> keep;
+        for (int j : alive)
+            if (seqs[j][sd] == t) keep.push_back(j);
+        alive.swap(keep), ++sd;
+        for (int j : alive)
+            if ((int) seqs[j].size() == sd) {
+                alive.clear();
+                break;
+            }
+    }
+};
+// the pick among opts o from (logit, token) candidates: greedy the largest (ties: the lower token), else `sample` of
+// them; a token missing from cd (outside the candidates a step keeps) is none of it, and with none there, o's first
+template <class F>
+int pick_among(const std::vector<int>& o, const std::vector<std::pair<float, int>>& cd, double temp, F sample) {
+    if (o.size() == 1) return o[0];
+    std::vector<std::pair<float, int>> in;
+    for (const auto& e : cd)
+        if (std::find(o.begin(), o.end(), e.second) != o.end()) in.push_back(e);
+    if (in.empty()) return o[0];
+    if (temp <= 0)
+        return std::min_element(in.begin(), in.end(),
+                                [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                                })->second;
+    return sample(in);
+}
+
 struct SampleCfg {   // temp <= 0: greedy
     double temp = 0, top_p = 1;
     int top_k = 0;
@@ -8019,8 +8085,10 @@ int main(int argc, char** argv) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
             const bool sp = (drafter || g_lookup) && spec_path();
             const char* wd = getenv("IK2_WATCHDOG_S");
+            // (starts=1: GEN's starts= is read - the server's required tool call, Service.prepare)
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
-                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx,
+                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s starts=1\n",
+                        g_kv_fp8 ? "fp8" : "f16", ctx,
                         g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0, drafting.c_str(),
                         c.n_layer * c.E, g_par, wd && *wd ? std::max(0, std::atoi(wd)) : 600,
                         g_fast ? "resident" : g_off ? "offload" : "cache");
@@ -8152,6 +8220,7 @@ int main(int argc, char** argv) {
                 int cached = 0, n_out = 0, tok = -1;
                 double t0 = 0, t1 = 0;
                 bool cancel = false;
+                Starts starts;   // (GEN's starts=: the answer's opening)
             };
             struct SlotH {
                 std::vector<int> hist;
@@ -8233,7 +8302,17 @@ int main(int argc, char** argv) {
                 }
                 r.t1 = now();
                 r.phase = 2;
-                r.tok = pick_last(r, S.last);
+                if (r.starts.on()) {   // (an opening: the first token among its sequences')
+                    const std::vector<int> o = r.starts.opts();
+                    std::vector<std::pair<float, int>> cd;
+                    if (o.size() > 1)
+                        for (int t : o) cd.push_back({S.last[t], t});
+                    r.tok = pick_among(o, cd, r.temp,
+                                       [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
+                } else {
+                    r.tok = pick_last(r, S.last);
+                }
+                r.starts.took(r.tok);
             };
             auto admit = [&](Req&& rq) {
                 int s = -1;
@@ -8322,6 +8401,7 @@ int main(int argc, char** argv) {
                     else if (k == "top_k") r.top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "rid") r.rid = std::atoi(v.c_str());
+                    else if (k == "starts") r.starts.parse(v, c.n_vocab);
                 }
                 r.ids = parse_ints(ids_s);
                 r.rng.seed(seed >= 0 ? (uint64_t) seed : rng_g());
@@ -8434,20 +8514,27 @@ int main(int argc, char** argv) {
                     bool cand = false;
                     for (int t = 0; t < T; ++t) {
                         tk[t] = go[t]->tok, ps[t] = (int) sh[go[t]->slot].hist.size(), sl[t] = go[t]->slot;
-                        cand = cand || go[t]->temp > 0;
+                        cand = cand || go[t]->temp > 0 || (go[t]->starts.on() && go[t]->starts.opts().size() > 1);
                     }
                     beat("a decode step (--parallel, the conversations' tokens together)");
                     par_step(M, T, tk, ps, sl, cand, am);
                     for (int t = 0; t < T; ++t) {
                         Req& r = *go[t];
                         sh[r.slot].hist.push_back(r.tok);
-                        if (r.temp <= 0) {
+                        if (r.starts.on()) {   // (an opening: among its tokens, from this step's candidates)
+                            const std::vector<int> o = r.starts.opts();
+                            std::vector<std::pair<float, int>> cd;
+                            if (o.size() > 1) par_cands(M, t, cd);
+                            r.tok = pick_among(o, cd, r.temp,
+                                               [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
+                        } else if (r.temp <= 0) {
                             r.tok = am[t];
                         } else {
                             std::vector<std::pair<float, int>> cd;
                             par_cands(M, t, cd);
                             r.tok = sample(r, cd);
                         }
+                        r.starts.took(r.tok);
                     }
                     stat_tok += T;
                     if (++steps % 16 == 0) {
@@ -8500,6 +8587,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::vector<int> stops;
+            Starts starts;   // (GEN's starts=: the answer's opening, one of these sequences)
             if (serve_maya) {
                 in >> max_new;
                 std::string w;
@@ -8518,6 +8606,7 @@ int main(int argc, char** argv) {
                     else if (k == "top_k") top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "spec") spec_key = std::atoi(v.c_str());   // (1: no drafting; 2 .. 8: the widest window)
+                    else if (k == "starts") starts.parse(v, c.n_vocab);
                 }
                 stops = eos_ids;
             } else {
@@ -8739,7 +8828,16 @@ int main(int argc, char** argv) {
             int pending_sample = -1;   // (a speculative window's last token, sampled already)
             const char* reason = "length";
             int n_out = 0;
-            int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
+            // (starts=: a token among the opening's - from the logits of the step before it, asked for below - and
+            //  no drafts until the opening is written)
+            auto among = [&](const float* r) -> int {
+                const std::vector<int> o = starts.opts();
+                std::vector<std::pair<float, int>> cd;
+                if (o.size() > 1)
+                    for (int t : o) cd.push_back({r[t], t});
+                return pick_among(o, cd, temp, [&](std::vector<std::pair<float, int>>& x) { return pick_top(x); });
+            };
+            int greedy_tok = temp <= 0 && !last.empty() ? (starts.on() ? among(last.data()) : pick(last.data())) : -1;
             stat_t = t1;
             unsigned long long ph0 = 0, pn0 = 0;
             pick_counts(0, ph0, pn0);
@@ -8752,9 +8850,13 @@ int main(int argc, char** argv) {
                 if (serve_maya && !req_spec && n_out && n_out % 32 == 0) stat_line(n_out, now());
                 const int tok = temp <= 0             ? greedy_tok
                                 : pending_sample >= 0 ? pending_sample
+                                : starts.on()         ? among(last.data())
                                 : cand                ? pick_cand()
                                                       : pick(last.data());
                 pending_sample = -1;
+                starts.took(tok);
+                // the next token is a choice among the opening's: this step gives the whole logits
+                const bool choice = starts.on() && starts.opts().size() > 1;
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
@@ -8767,7 +8869,7 @@ int main(int argc, char** argv) {
                 // (the step: a plain token, or a window of the drafter's or the prompt lookup's drafts)
                 int B = 1, src = 0;
                 int32_t ld[kBlockMax];
-                if (req_spec) {
+                if (req_spec && !starts.on()) {
                     const int room = std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax});
                     const int k = g_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
                     src = sctl.pick(room, k, B);
@@ -8808,11 +8910,17 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const double tp0 = now();
-                if (temp <= 0) {
+                if (choice) {
+                    std::vector<float> lo;
+                    forward(M, &tok, 1, (int) hist.size(), false, OutMode::kLogits, std::string(), lo, nullptr, t_exp);
+                    last = std::move(lo);
+                    cand = false;
+                    if (temp <= 0) greedy_tok = among(last.data());
+                } else if (temp <= 0) {
                     std::vector<float> lo;
                     std::vector<int> ag;
                     forward(M, &tok, 1, (int) hist.size(), false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
-                    greedy_tok = ag[0];
+                    greedy_tok = starts.on() ? starts.opts()[0] : ag[0];   // (one way on: its token)
                     last.clear();
                 } else {
                     std::vector<float> lo;
