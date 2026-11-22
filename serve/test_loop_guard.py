@@ -1329,5 +1329,237 @@ class Hy4(unittest.TestCase):
         self.assertEqual(svc.loop_guard_counts["thinking_closed"], 1)
 
 
+class Memo(unittest.TestCase):
+    """MAYA_LOOP_GUARD_MEMO: the scans of a whole conversation give what they give without it - for random
+    conversations that repeat themselves in every way the guard looks for, as a client sends them (new objects every
+    request), grown, edited, cut, rolled back and taken up again, with other conversations in between; with a memo
+    so small that it turns over all the time, too.  (The rest of this file passes with MAYA_LOOP_GUARD_MEMO=1 set.)"""
+
+    WORDS = ("alpha beta gamma delta build test link error line file make run check value result path node "
+             "kernel token stream").split()
+
+    def setUp(self):
+        self.was = LG.MEMO
+        self.caps = [(m, m.cap) for m in (LG._ARGS, LG._RESULT, LG._SAID)]
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        LG.MEMO = self.was
+        for m, cap in self.caps:
+            m.cap = cap
+            m.clear()
+
+    def text(self, rng, big=False):
+        """Prose from a few stock sentences (so pieces come back), now and then a code block, numbers, the model's
+        talk about its loop, odd spacing, non-ASCII."""
+        stock = ["Hmm - hold on: I realize something important.", "Now let me check the build.", "OK.", "Done.",
+                 "I keep repeating myself, I am in a loop.", "The loop guard is right.", "Result: 12 bytes received.",
+                 "Result: 15 bytes received.", "```\nmake -j8\nexit 0\n```", "Größe: 3 – fertig.", "}", ""]
+        out = []
+        for _ in range(rng.randrange(0, 6 if not big else 60)):
+            if rng.random() < 0.6:
+                out.append(rng.choice(stock))
+            else:
+                out.append(" ".join(rng.choice(self.WORDS) for _ in range(rng.randrange(1, 12))) +
+                           rng.choice([".", "!", "?", "", " %d" % rng.randrange(100)]))
+            out.append(rng.choice([" ", "\n", "\n\n", "", "  \n "]))
+        return "".join(out)
+
+    def call(self, rng):
+        name = rng.choice(["bash", "read", "grep"])
+        args = rng.choice([{"cmd": "make"}, {"cmd": "sleep 5; make"}, {"path": "a.c", "n": rng.randrange(3)},
+                           {"pattern": rng.choice(self.WORDS)}, "not json", "", None])
+        if isinstance(args, dict) and rng.random() < 0.7:
+            args = json.dumps(args) if rng.random() < 0.8 else json.dumps(args, indent=1)   # (a client's string)
+        fn = {"name": name, "arguments": args}
+        return {"id": "c%d" % rng.randrange(10 ** 6), "type": "function", "function": fn} if rng.random() < 0.9 else fn
+
+    def result(self, rng, big=False):
+        r = rng.random()
+        if r < 0.5:
+            return rng.choice(["ok", "error: 1 failed", "bytes received: 12", "bytes received: 15", "", "\x00\ufffd x"])
+        if r < 0.6:
+            return [{"type": "text", "text": "ok"}, {"type": "image_url"}]           # (content parts: not a string)
+        if r < 0.65:
+            return None
+        return self.text(rng, big)
+
+    def turn(self, rng, big=False):
+        """The messages a step of a conversation adds."""
+        r = rng.random()
+        if r < 0.15:
+            return [{"role": "user", "content": rng.choice(["continue", "ok", "Please go on.", "what now?", "fix it",
+                                                            [{"type": "text", "text": "continue"}]])}]
+        if r < 0.2:
+            return [{"role": "system", "content": "note"}]
+        m = {"role": "assistant"}
+        if rng.random() < 0.8:
+            m["content"] = rng.choice([self.text(rng, big), "", None, [{"type": "text", "text": "Done."}]])
+        if rng.random() < 0.6:
+            m["reasoning_content"] = rng.choice([self.text(rng, big), self.text(rng, big), "", None])
+        out = [m]
+        if rng.random() < 0.75:
+            calls = [self.call(rng) for _ in range(rng.choice([1, 1, 1, 2, 3]))]
+            m["tool_calls"] = calls
+            n = len(calls) if rng.random() < 0.85 else rng.randrange(0, len(calls) + 2)   # (results missing, one more)
+            out += [{"role": "tool", "tool_call_id": "x", "content": self.result(rng, big)} for _ in range(n)]
+        return out
+
+    def scans(self, messages):
+        fresh = json.loads(json.dumps(messages))            # a request's own objects, as the server parses them
+        before = json.dumps(fresh)
+        c = LG.collapse(fresh)
+        out = (LG.tool_blocked(fresh), LG.echoes(fresh), LG.tool_repeat(fresh), c, LG.said_before(fresh),
+               LG.conv_chars(fresh), LG._tool_calls(fresh))
+        self.assertEqual(json.dumps(fresh), before)         # (the request's messages are left as they came)
+        return out
+
+    def both(self, messages):
+        LG.MEMO = False
+        plain = self.scans(messages)
+        LG.MEMO = True
+        memo = self.scans(messages)
+        self.assertEqual(plain, memo)
+        self.assertIs(type(plain[4]), set)                  # (said_before: a set, used for `in` only - no order)
+        self.assertIs(type(memo[4]), set)
+        self.assertEqual(repr(plain[:4] + plain[5:]), repr(memo[:4] + memo[5:]))   # (the same types and order too)
+        return plain
+
+    def run_conversations(self, seed, rounds, big=False):
+        rng = random.Random(seed)
+        seen = {"blocked": 0, "echoes": 0, "repeat": 0, "collapse": 0}
+        for _ in range(rounds):
+            convs = [[{"role": "user", "content": "start %d" % k}] for k in range(3)]
+            kept = []                                       # earlier states, to roll back to
+            for _ in range(rng.randrange(8, 30)):
+                k = rng.randrange(3)
+                conv, op = convs[k], rng.random()
+                if op < 0.62:
+                    step = self.turn(rng, big)
+                    if rng.random() < 0.45 and len(conv) > 2:      # the same step again: what a loop is made of
+                        step = json.loads(json.dumps(rng.choice(kept)[1][-3:] if kept and rng.random() < 0.3
+                                                     else self.last_round(conv) or step))
+                        step = step * rng.choice([1, 1, 2, 6])     # (... and again: until a call is blocked)
+                    conv = conv + step
+                elif op < 0.72 and len(conv) > 1:                  # cut
+                    conv = conv[:rng.randrange(1, len(conv))]
+                elif op < 0.84 and len(conv) > 1:                  # an edit somewhere: a text, a result, a role, a call
+                    conv = json.loads(json.dumps(conv))
+                    m = conv[rng.randrange(len(conv))]
+                    what = rng.random()
+                    if what < 0.5:
+                        m["content"] = self.text(rng) if rng.random() < 0.7 else LG._text(m.get("content")) + " 7"
+                    elif what < 0.7 and m.get("tool_calls"):
+                        m["tool_calls"] = m["tool_calls"][:-1] + [self.call(rng)]
+                    elif what < 0.85:
+                        m["reasoning_content"] = self.text(rng)
+                    else:
+                        m["role"] = rng.choice(["user", "assistant", "tool"])
+                elif op < 0.9 and kept:                            # back to an earlier state of any of them
+                    conv = rng.choice(kept)[1]
+                elif op < 0.95 and len(conv) > 3:                  # a message taken out of the middle
+                    at = rng.randrange(1, len(conv) - 1)
+                    conv = conv[:at] + conv[at + 1:]
+                else:                                              # the other conversation's tail on this one
+                    conv = conv + json.loads(json.dumps(convs[(k + 1) % 3][-4:]))
+                convs[k] = conv
+                kept.append((k, conv))
+                r = self.both(conv)
+                seen["blocked"] += bool(r[0])
+                seen["echoes"] += bool(r[1])
+                seen["repeat"] += r[2] is not None
+                seen["collapse"] += r[3] is not None
+        return seen
+
+    @staticmethod
+    def last_round(conv):
+        """The last assistant message with its results (to say and do again)."""
+        for i in range(len(conv) - 1, -1, -1):
+            if conv[i].get("role") == "assistant":
+                return conv[i:i + 4]
+        return None
+
+    def test_random_conversations(self):
+        seen = self.run_conversations(1121, 150)
+        for k, n in seen.items():                           # (the conversations do reach what the guard looks for)
+            self.assertGreater(n, 20, k)
+
+    def test_a_memo_that_turns_over(self):
+        for m in (LG._ARGS, LG._RESULT, LG._SAID):
+            m.clear()
+            m.cap = 2000                                    # (a few entries a generation; some texts never kept)
+        self.run_conversations(7, 60)
+        for m in (LG._ARGS, LG._RESULT, LG._SAID):
+            self.assertLessEqual(m.size, m.cap // 2 + m.cap // 8)
+            self.assertLessEqual(sum(m.cost(k, v) for k, v in m.new.items()), m.cap // 2 + m.cap // 8)
+
+    def test_long_conversations(self):
+        os.environ["MAYA_LOOP_GUARD_COLLAPSE_MAX"] = "4000"         # (both sides of the limit come up)
+        self.addCleanup(os.environ.pop, "MAYA_LOOP_GUARD_COLLAPSE_MAX", None)
+        self.run_conversations(3, 25, big=True)
+
+    def test_over_the_limit(self):
+        """_conv_over is conv_chars(..) > limit, at the limit itself and around it."""
+        rng = random.Random(11)
+        for _ in range(200):
+            conv = [{"role": "user", "content": "start"}]
+            for _ in range(rng.randrange(0, 12)):
+                conv += self.turn(rng)
+            n = LG.conv_chars(conv)
+            for limit in (n - 1, n, n + 1, 1, rng.randrange(1, n + 2), -3):
+                self.assertEqual(LG._conv_over(conv, limit), n > limit, (n, limit))
+        self.assertEqual(LG._conv_over([], -1), LG.conv_chars([]) > -1)
+
+    def test_strings_only(self):
+        """A key that is not a str itself goes the plain way; equal strings give one entry."""
+        LG.MEMO = True
+        for m in (LG._ARGS, LG._RESULT, LG._SAID):
+            m.clear()
+
+        class S(str):
+            pass
+        self.assertEqual(LG._akey(S('{"a": 1}')), LG.args_key('{"a": 1}'))
+        self.assertEqual(LG._akey({"a": 1}), LG.args_key({"a": 1}))
+        self.assertEqual(LG._res(["x"]), LG._same(["x"]))
+        self.assertEqual(LG._res(1), LG._same(1))
+        self.assertEqual((len(LG._ARGS.new), len(LG._RESULT.new)), (0, 0))
+        self.assertEqual(LG._akey('{"b": 1, "a": 2}'), LG._akey("".join(['{"b": 1,', ' "a": 2}'])))
+        self.assertEqual(LG._res("1"), '"1"')
+        self.assertEqual((len(LG._ARGS.new), len(LG._RESULT.new)), (1, 1))
+        self.assertIsNone(LG._said({"role": "assistant", "content": [{"type": "text", "text": "x"}]}))
+        self.assertIsNone(LG._said({"role": "assistant", "content": "x", "reasoning_content": 5}))
+
+    def test_threads(self):
+        """Requests prepared at once (the handler threads): the same results, the memo within its size."""
+        LG.MEMO = False
+        rng = random.Random(5)
+        convs = []
+        for k in range(8):
+            conv = [{"role": "user", "content": "start"}]
+            for _ in range(40):
+                conv += self.turn(rng)
+            convs.append(conv)
+        want = [self.scans(c) for c in convs]
+        LG.MEMO = True
+        for m in (LG._ARGS, LG._RESULT, LG._SAID):
+            m.clear()
+            m.cap = 20000
+        bad = []
+
+        def work(k):
+            for _ in range(30):
+                fresh = json.loads(json.dumps(convs[k]))
+                got = (LG.tool_blocked(fresh), LG.echoes(fresh), LG.tool_repeat(fresh), LG.collapse(fresh),
+                       LG.said_before(fresh), LG.conv_chars(fresh), LG._tool_calls(fresh))
+                if got != want[k]:
+                    bad.append(k)
+        ts = [threading.Thread(target=work, args=(k,)) for k in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(bad, [])
+
+
 if __name__ == "__main__":
     unittest.main()

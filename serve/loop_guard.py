@@ -46,6 +46,7 @@ import functools
 import json
 import os
 import re
+import threading
 from collections import Counter
 from typing import Callable, NamedTuple
 
@@ -315,6 +316,74 @@ def _same(v) -> str:
     return json.dumps(v, sort_keys=True, ensure_ascii=False, default=str)
 
 
+# MAYA_LOOP_GUARD_MEMO=1 (off unless set; read once): the scans below over a whole conversation (tool_blocked, echoes,
+# tool_repeat, collapse, said_before - every request, every message: 32 ms at 1,700 messages) keep what they work out
+# of one message's own text.  Only that is kept, by the text itself: a call's arguments in one form (args_key), a tool
+# result in one form (_same), the pieces of a message of the model's (its reasoning and text: _units, _key) - each a
+# function of its string alone, whatever the conversation around it.  Everything that looks at other messages (the
+# counts across turns, the runs in a row, the window since the user's last message, what was said or made before) is
+# worked out again every request from those, as before - so a conversation that was edited, cut, or that comes between
+# another one's requests gets what it would get without the memo: there is nothing of a conversation in it.  Strings
+# only (str itself); anything else (content parts, arguments already a dict) goes the plain way.
+MEMO = os.environ.get("MAYA_LOOP_GUARD_MEMO", "") not in ("", "0")
+MEMO_CHARS = 32 << 20   # each memo holds at most about this many characters, keys and results (two halves: below)
+
+
+class _Memo:
+    """fn(key) remembered, bounded by size: two generations - `new` takes every result; when it holds more than half
+    the cap it becomes `old` and the old one is dropped; a result found in `old` moves to `new`.  So what the requests
+    of now use stays, and the rest is gone after two turns of the cap.  A hit takes no lock (one dict read); results
+    are functions of their keys, so a lost or doubled entry between threads changes nothing but the count.  A result
+    that alone would take an eighth of the cap is not kept."""
+
+    def __init__(self, fn, cost, cap: int = MEMO_CHARS):
+        self.fn, self.cost, self.cap = fn, cost, cap
+        self.new, self.old, self.size, self.lock = {}, {}, 0, threading.Lock()
+
+    def __call__(self, key):
+        v = self.new.get(key)
+        if v is not None:
+            return v
+        v = self.old.get(key)
+        if v is None:
+            v = self.fn(key)
+        c = self.cost(key, v)
+        if c > self.cap // 8:                   # (one huge text: worked out each time, the rest stays remembered)
+            return v
+        with self.lock:
+            if self.size + c > self.cap // 2 and self.new:
+                self.old, self.new, self.size = self.new, {}, 0
+            self.new[key] = v
+            self.size += c
+        return v
+
+    def clear(self) -> None:
+        with self.lock:
+            self.new, self.old, self.size = {}, {}, 0
+
+
+def _args_plain(v: str) -> tuple:
+    return (args_key(v),)
+
+
+def _result_plain(v: str) -> tuple:
+    return (_same(v),)
+
+
+_ARGS = _Memo(_args_plain, lambda k, v: 2 * len(k) + 64)       # a call's arguments (a JSON string) -> (args_key,)
+_RESULT = _Memo(_result_plain, lambda k, v: 2 * len(k) + 64)   # a tool result's text -> (_same,)
+
+
+def _akey(v) -> str:
+    """args_key(v) (MAYA_LOOP_GUARD_MEMO: a string's remembered)."""
+    return _ARGS(v)[0] if MEMO and type(v) is str else args_key(v)
+
+
+def _res(v) -> str:
+    """_same(v) (MAYA_LOOP_GUARD_MEMO: a string's remembered)."""
+    return _RESULT(v)[0] if MEMO and type(v) is str else _same(v)
+
+
 def args_key(v) -> str:
     """A call's arguments in one form: a client's JSON string and the parser's dict compare equal."""
     if isinstance(v, str):
@@ -348,7 +417,7 @@ def go_on(m: dict) -> bool:
 def _gist(result: str) -> str:
     """A result without its numbers, white space and anything outside printable ASCII: "bytes received: 12 ..."
     and "bytes received: 15 ..." the same."""
-    if os.environ.get("MAYA_PROMPT_MEMO", "1") != "0":   # (a re-sent history's results: by text, the same)
+    if MEMO or os.environ.get("MAYA_PROMPT_MEMO", "1") != "0":   # (a re-sent history's results: by text, the same)
         return _gist_memo(result)
     return re.sub(r"\d+|[^\x21-\x7e]+", "", result)
 
@@ -367,11 +436,11 @@ def _tool_calls(messages: list[dict]) -> list[tuple]:
         if role == "user" and not go_on(m):    # the user spoke: what came before is not this loop
             calls, pending = [], []
         elif role == "assistant":
-            pending = [((c.get("function") or c).get("name"), args_key((c.get("function") or c).get("arguments")))
+            pending = [((c.get("function") or c).get("name"), _akey((c.get("function") or c).get("arguments")))
                        for c in m.get("tool_calls") or []]
         elif role == "tool" and pending:        # results answer the calls in their order
             name, args = pending.pop(0)
-            result = _same(m.get("content"))
+            result = _res(m.get("content"))
             calls.append((name, args, result, _gist(result)))
     return calls
 
@@ -525,13 +594,32 @@ def _key(paragraph: str) -> str:
     return " ".join(paragraph.split())
 
 
+def _said_plain(rc: tuple) -> tuple:
+    """Of one message of the model's - (its reasoning, its text), each a string or None - the keys of its pieces:
+    (the ones echoes() counts: ECHO_MIN long or longer, all of them: said_before's), as those two write them."""
+    said = [(f, _key(p)) for f, text in zip(("reasoning_content", "content"), rc) for p, _ in _units(text, f)]
+    return (frozenset(k for f, k in said if len(k) >= ECHO_MIN[f]), frozenset(k for _, k in said))
+
+
+_SAID = _Memo(_said_plain, lambda k, v: 2 * (len(k[0] or "") + len(k[1] or "")) + 128)
+
+
+def _said(m: dict) -> tuple | None:
+    """_said_plain of an assistant message whose reasoning and text are strings or absent (remembered by them); None:
+    another form (content parts, ...) - the caller goes the plain way."""
+    r, c = m.get("reasoning_content"), m.get("content")
+    if (r is None or type(r) is str) and (c is None or type(c) is str):
+        return _SAID((r, c))
+    return None
+
+
 def _round_keys(messages: list[dict], i: int) -> tuple[list[tuple], int]:
     """The (name, arguments, result) of messages[i]'s calls and the index after its results."""
-    calls = [((c.get("function") or c).get("name"), args_key((c.get("function") or c).get("arguments")))
+    calls = [((c.get("function") or c).get("name"), _akey((c.get("function") or c).get("arguments")))
              for c in messages[i].get("tool_calls") or []]
     j, keys = i + 1, []
     while j < len(messages) and messages[j].get("role") == "tool" and len(keys) < len(calls):
-        keys.append(calls[len(keys)] + (_same(messages[j].get("content")),))
+        keys.append(calls[len(keys)] + (_res(messages[j].get("content")),))
         j += 1
     return keys, j
 
@@ -544,7 +632,9 @@ def echoes(messages: list[dict]) -> bool:
     for i, m in enumerate(messages):
         if m.get("role") != "assistant":
             continue
-        para.update({_key(p) for f in ("reasoning_content", "content") for p, _ in _units(m.get(f), f)
+        said = _said(m) if MEMO else None
+        para.update(said[0] if said is not None else
+                    {_key(p) for f in ("reasoning_content", "content") for p, _ in _units(m.get(f), f)
                      if len(_key(p)) >= ECHO_MIN[f]})
         keys = _round_keys(messages, i)[0]
         calls.update(keys)
@@ -579,6 +669,24 @@ def conv_chars(messages: list[dict]) -> int:
     return n
 
 
+def _conv_over(messages: list[dict], limit: int) -> bool:
+    """conv_chars(messages) > limit, counted only until it is (MAYA_LOOP_GUARD_MEMO: every part adds, none takes away,
+    so a long conversation is over the limit after its first messages)."""
+    n = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            n += len(c)
+        r = m.get("reasoning_content")
+        if isinstance(r, str):
+            n += len(r)
+        for tc in m.get("tool_calls") or []:
+            n += len(json.dumps(tc, ensure_ascii=False))
+        if n > limit:
+            return True
+    return n > limit
+
+
 def collapse(messages: list[dict]) -> Collapse | None:
     """The prompt of a conversation that carries a loop (echoes()) without what the model already wrote: a paragraph
     of its reasoning or text that it wrote before (an earlier message, or earlier in the same one) is left out, and
@@ -594,7 +702,7 @@ def collapse(messages: list[dict]) -> Collapse | None:
         limit = int(os.environ.get("MAYA_LOOP_GUARD_COLLAPSE_MAX") or COLLAPSE_MAX_CHARS)
     except ValueError:          # (a setting that is not a number: the default, not a failed request)
         limit = COLLAPSE_MAX_CHARS
-    if limit and conv_chars(messages) > limit:
+    if limit and (_conv_over(messages, limit) if MEMO else conv_chars(messages) > limit):
         return None          # a long conversation keeps its prompt whole: the engine's cache stays valid (#702)
     out, seen, made, paras, rounds, i, last = [], set(), set(), 0, 0, 0, None
     while i < len(messages):
@@ -652,6 +760,14 @@ def talk(text: str) -> bool:
 
 def said_before(messages: list[dict]) -> set[str]:
     """Every piece of the model's reasoning and text in the conversation (stops_short's `seen`)."""
+    if MEMO:
+        out = set()
+        for m in messages:
+            if m.get("role") == "assistant":
+                said = _said(m)
+                out.update(said[1] if said is not None else
+                           {_key(u) for f in ("reasoning_content", "content") for u, _ in _units(m.get(f), f)})
+        return out
     return {_key(u) for m in messages if m.get("role") == "assistant"
             for f in ("reasoning_content", "content") for u, _ in _units(m.get(f), f)}
 
