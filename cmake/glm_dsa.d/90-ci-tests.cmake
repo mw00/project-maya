@@ -128,7 +128,7 @@ if(TARGET native_expert_parity AND MAYA_REAL_SHARD AND MAYA_PYTHON3)
     if(EXISTS "${_shard}")
       list(APPEND _shards "${_shard}")
     else()
-      message(STATUS "strata: MAYA_REAL_SHARD ${_shard} does not exist - left out")
+      message(STATUS "maya: MAYA_REAL_SHARD ${_shard} does not exist - left out")
     endif()
   endforeach()
   if(_shards)
@@ -137,7 +137,7 @@ if(TARGET native_expert_parity AND MAYA_REAL_SHARD AND MAYA_PYTHON3)
              COMMAND ${MAYA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/strata/expert_parity_shards.py
                      --bin $<TARGET_FILE:native_expert_parity> --layers "${_layers}" ${_shards})
     set_tests_properties(native_expert_parity_real PROPERTIES LABELS "gpu;realpack" TIMEOUT 3600 SKIP_RETURN_CODE 77)
-    message(STATUS "strata: native_expert_parity_real on ${_shards} (layers ${_layers})")
+    message(STATUS "maya: native_expert_parity_real on ${_shards} (layers ${_layers})")
   endif()
 endif()
 
@@ -152,16 +152,16 @@ if(TARGET glm_pack_test AND MAYA_REAL_PACK AND MAYA_PYTHON3)
                COMMAND ${_gate} --logits ${CMAKE_CURRENT_BINARY_DIR}/glm_pack_test_real.logits.f32
                        --ids ${MAYA_REAL_IDS} --ref-logits ${MAYA_REAL_REF})
       set_tests_properties(glm_pack_test_real PROPERTIES LABELS "gpu;realpack" TIMEOUT 3600 SKIP_RETURN_CODE 77)
-      message(STATUS "strata: glm_pack_test_real on ${MAYA_REAL_PACK} (gated against ${MAYA_REAL_REF})")
+      message(STATUS "maya: glm_pack_test_real on ${MAYA_REAL_PACK} (gated against ${MAYA_REAL_REF})")
     else()
       add_test(NAME glm_pack_smoke_real
                COMMAND ${_gate} --logits ${CMAKE_CURRENT_BINARY_DIR}/glm_pack_smoke_real.logits.f32 --informational)
       set_tests_properties(glm_pack_smoke_real PROPERTIES LABELS "gpu;realpack;informational" TIMEOUT 3600
                                                           SKIP_RETURN_CODE 77)
-      message(STATUS "strata: glm_pack_smoke_real on ${MAYA_REAL_PACK} (informational: set MAYA_REAL_IDS and "
+      message(STATUS "maya: glm_pack_smoke_real on ${MAYA_REAL_PACK} (informational: set MAYA_REAL_IDS and "
                      "MAYA_REAL_REF for the gated glm_pack_test_real)")
     endif()
   else()
-    message(STATUS "strata: MAYA_REAL_PACK ${MAYA_REAL_PACK} has no index.txt - glm_pack_test_real not registered")
+    message(STATUS "maya: MAYA_REAL_PACK ${MAYA_REAL_PACK} has no index.txt - glm_pack_test_real not registered")
   endif()
 endif()

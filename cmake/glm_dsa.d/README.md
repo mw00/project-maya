@@ -1,7 +1,7 @@
-# cmake/strata.d
+# cmake/glm_dsa.d
 
 One CMake fragment per glm-dsa feature (for example `20-glm-dsa-attention.cmake`), included in sorted order by
-`cmake/strata.cmake` after the base lists. A fragment registers its engine sources with
+`cmake/glm_dsa.cmake` after the base lists. A fragment registers its engine sources with
 `target_sources(maya_engine PRIVATE ...)` (guard with `if(TARGET maya_engine)` and, for `.cu` files,
 `MAYA_ENABLE_CUDA`) and its tests inside `if(MAYA_BUILD_TESTS)`, labelling GPU tests `LABELS gpu`.
 Labels: `gpu` (needs a device; exit 77 without one), `realpack` (needs a real model file; register it only when the

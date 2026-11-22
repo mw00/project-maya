@@ -148,4 +148,4 @@ foreach(_source IN ITEMS tests/hip/intrinsics.cpp tests/hip/native_qsa_score.cpp
   endif()
 endforeach()
 
-message(STATUS "Strata: HIP enabled, arch ${MAYA_HIP_ARCHS}")
+message(STATUS "Maya: HIP enabled, arch ${MAYA_HIP_ARCHS}")
