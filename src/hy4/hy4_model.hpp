@@ -166,6 +166,9 @@ public:
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
+    /// The web app's map of the GPUs: a "VRAM dev=.. total=.. free=.. weights=.. kv=.. pool=.. slots=.. layers=a-b"
+    /// line a GPU (serve/gpu_map.py), measured now
+    std::vector<std::string> vram_lines() const;
     /// --room-report's measurement, the server's INFO keys (empty: not asked, or the start did not fit):
     /// "room_rows=f16|q8 room_drafter=0|1 room_streamed=0|1 room_gpus=<PCI bus id>,<free>,<slack>;..." - each GPU's
     /// free VRAM as the plan read it at the start (bytes) and how much less of it the start's choices hold with: the
