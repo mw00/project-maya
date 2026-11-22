@@ -1471,7 +1471,17 @@ bool Glm5Model::fast_setup(std::string& err) {
         size_t blob_sum = 0;
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) blob_sum += F->L[(size_t) il].blob;
-        int per = (int) std::min<size_t>((size_t) g.n_expert, avail / std::max<size_t>(1, blob_sum));
+        // MAYA_GLM_POOL_FILL=1 (off unless set): a pool that cannot be complete still takes what its budget holds past
+        // n_expert slots (up to the spares and a 64-slot tail more) - those slots are free, laid out where a prompt
+        // borrows first (the interleaved tail, layout_tail), so a prompt lends them before any expert's slot.  Before,
+        // the pool stopped at n_expert slots and the rest of the budget stayed unused (8x3090, SC pack: ~0.6 GB on
+        // each 6-MoE-layer part, every prompt evicting ~30 experts a layer there and streaming them back each chunk)
+        static const bool pool_fill = [] {
+            const char* v = getenv("MAYA_GLM_POOL_FILL");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const int per_cap = pool_fill && !F->unified_memory ? g.n_expert + gf::kSpares + 64 : g.n_expert;
+        int per = (int) std::min<size_t>((size_t) per_cap, avail / std::max<size_t>(1, blob_sum));
         // keep a whole number of 256-byte-aligned blobs
         while (per > 0) {
             size_t tot = 0;
@@ -1703,7 +1713,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe && share[(size_t) il].empty()) all = false;
             if (all) {
-                const int cap = g.n_expert + gf::kSpares;
+                const int cap = g.n_expert + gf::kSpares + (pool_fill && !F->unified_memory && !F->complete ? k_extra : 0);
                 // the floor: a route's experts, the spares and the lendable tail, +16 when the budget has room for
                 // it (a 24 GB card running the whole model has ~30 slots a layer: the +16 floor alone overran it)
                 const int need = g.n_exp_used + gf::kSpares + k_extra;
@@ -1822,13 +1832,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->pool_slots += nl;
         }
         uint8_t* xregion = F->xpool;
-        b = xregion;
-        for (int il = l0_; il < lt_; ++il) {
-            if (!F->L[(size_t) il].moe) continue;
-            auto& P = F->lp[(size_t) il];
-            P.xbase = b;
-            b += (size_t) k_extra * P.stride;
-        }
+        F->tail_interleaved = pool_fill && !F->complete && nmax > g.n_expert && nmin == nmax;
+        F->layout_tail(xregion, l0_, lt_);
+        if (F->tail_interleaved)
+            std::fprintf(stderr, "glm fast: CUDA%d %d slots a layer past the experts, at the front of the interleaved "
+                                 "tail (a prompt lends them first)\n", dev_, nmin - g.n_expert);
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
         if (vis_lend_ok_)
             std::fprintf(stderr, "glm fast: CUDA%d the vision encoder borrows the pool's tail (%.2f GB) while it "
