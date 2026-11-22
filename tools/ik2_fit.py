@@ -29,7 +29,9 @@ CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # the setup's choic
 RECOMMEND_MAX = 262144                              # the largest context the setup recommends by itself
 FULL_VISITS = 8                                     # the visits of the layers without a window: KV_BYTES / 8 each
 SCRATCH_TOKEN_BYTES = 1152                          # the attention's scratch a context token past 262,144 (48 x 24 heads)
-STREAM_HOST_GIB = 4.0                               # the RAM the engine leaves the system beside the streamed rows
+RING_OF_VISIT = 0.1                                 # the tokens' copy ring beside a full visit (V100: 2 x 2 slots of a
+                                                    # twentieth of a visit's rows; more SMs, smaller slots)
+STREAM_HOST_GIB = 4.0                              # the RAM the engine leaves the system beside the streamed rows
 OFF_TIER_MIN_GIB = 0.5                              # an offload layout streams only where its cache leaves the tier less
                                                     # (the engine: else its cache in VRAM, as in v1.1.73)
 DEFAULT_KV = "fp8"
@@ -64,11 +66,13 @@ def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
     kv_gib = ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB
     vis = kv_gib / FULL_VISITS
     base = BASE_GIB + max(0, ctx - 262144) * SCRATCH_TOKEN_BYTES / GIB   # (beside the full visits' cache)
-    # KV streaming with every expert in VRAM: as many full visits in VRAM as fit beside one staging pair
-    n_res = min(FULL_VISITS, int((room - base - vis) // vis)) if room >= base + vis else -1
-    if n_res >= 0:
-        kv_ram = round((FULL_VISITS - n_res) * vis, 1)
-        return {"resident": True, "need_gib": round(base + (n_res + 1) * vis, 1), "layout": "resident",
+    # KV streaming with every expert in VRAM: as many full visits in VRAM as fit beside the tokens' ring, one of
+    # them (the swing visit) the prompts' staging pair - its rows in RAM too
+    ring = vis * RING_OF_VISIT
+    n_res = min(FULL_VISITS, int((room - base - ring) // vis)) if room >= base + ring + vis else -1
+    if n_res >= 1:
+        kv_ram = round((FULL_VISITS - n_res + 1) * vis, 1)
+        return {"resident": True, "need_gib": round(base + n_res * vis + ring, 1), "layout": "resident",
                 "tier_gib": EXPERTS_GIB, "ram_gib": round(HOST_GIB + kv_ram + STREAM_HOST_GIB, 1),
                 "kv_streamed": True, "kv_ram_gib": kv_ram}
     # the offload path: its cache in VRAM where that leaves the tier OFF_TIER_MIN_GIB, else streamed
@@ -76,9 +80,9 @@ def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
     tier = room - dense - kv_gib - OFF_ROOM_GIB
     kv_ram = 0.0
     if tier < OFF_TIER_MIN_GIB:
-        n_res = max(0, min(FULL_VISITS, int((room - dense - OFF_ROOM_GIB - OFF_TIER_MIN_GIB - vis) // vis)))
-        kv_ram = (FULL_VISITS - n_res) * vis
-        tier = room - dense - (n_res + 1) * vis - OFF_ROOM_GIB
+        n_res = max(1, min(FULL_VISITS, int((room - dense - OFF_ROOM_GIB - OFF_TIER_MIN_GIB - ring) // vis)))
+        kv_ram = (FULL_VISITS - n_res + 1) * vis
+        tier = room - dense - n_res * vis - ring - OFF_ROOM_GIB
     tier = round(max(0.0, min(EXPERTS_GIB, tier)), 1)
     return {"resident": False, "need_gib": need, "layout": "offload", "tier_gib": tier,
             "ram_gib": round(EXPERTS_GIB - tier + OFF_HOST_GIB + (kv_ram + STREAM_HOST_GIB if kv_ram else 0.0), 1),
