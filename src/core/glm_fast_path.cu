@@ -746,6 +746,34 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 #else
     // Windows: the unbuffered handle the same way (sector-aligned offset, size and buffer), the mapping otherwise.
     // The handle is overlapped (reads from many threads run at once): each read waits on this thread's own event
+    if (sh.h_direct != nullptr && (off & 4095ull) == 0 && ((uintptr_t) dst & 4095u) == 0 && len >= 4096) {
+        // aligned already (MAYA_GLM_EXPERTS_BIN's experts into their 4096-aligned slots): the whole sectors straight
+        // into dst - no bounce buffer, no copy; a tail below a sector takes the bounce path below
+        struct Ev {
+            HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+            ~Ev() { if (ev != nullptr) CloseHandle(ev); }
+        };
+        static thread_local Ev de;
+        const size_t whole = len & ~(size_t) 4095;
+        size_t got = 0;
+        bool ok = de.ev != nullptr;
+        while (ok && got < whole) {
+            OVERLAPPED ov{};
+            const uint64_t at = off + got;
+            ov.Offset = (DWORD) at;
+            ov.OffsetHigh = (DWORD) (at >> 32);
+            ov.hEvent = de.ev;
+            const DWORD want = (DWORD) std::min<size_t>(whole - got, (size_t) 1 << 30);
+            DWORD r = 0;
+            if (!ReadFile((HANDLE) sh.h_direct, dst + got, want, nullptr, &ov) && GetLastError() != ERROR_IO_PENDING) ok = false;
+            else if (!GetOverlappedResult((HANDLE) sh.h_direct, &ov, &r, TRUE) || r == 0) ok = false;
+            else got += (size_t) r;
+        }
+        if (ok) {
+            if (len > whole) read_slice(sh, off + whole, len - whole, dst + whole);
+            return;
+        }
+    }
     if (sh.h_direct != nullptr) {
         // freed and closed when its thread ends
         struct Bounce {
@@ -801,6 +829,11 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 }  // namespace glmfast
 
 using glmfast::read_slice;
+
+namespace {   // MAYA_GLM_EXPERTS_BIN's layout, defined with the experts file below
+void xbin_layout(const std::vector<size_t>& blob, std::vector<uint64_t>& base, std::vector<uint64_t>& stride, uint64_t& total,
+                 int n_expert);
+}
 
 static float* fa_take(uint8_t*& at, size_t floats) {
     float* p = (float*) at;
@@ -4767,6 +4800,40 @@ bool Glm5Model::fast_warm(std::string& err) {
         return false;
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // MAYA_GLM_EXPERTS_BIN_WRITE=<file>: every EXL3 expert's blob, as the engine lays it out, at a 4096-byte boundary in
+    // one file (layer by layer, expert by expert; MAYA_GLM_EXPERTS_BIN reads it); then the engine exits
+    if (const char* xw = getenv("MAYA_GLM_EXPERTS_BIN_WRITE"); xw != nullptr && xw[0] != 0 && getenv("MAYA_GLM_EXPERTS_BIN") == nullptr) {
+        std::vector<size_t> xb(F->L.size(), 0);
+        for (size_t xi = 0; xi < xb.size() && xi < pack_layers_.size(); ++xi)
+            if (F->L[xi].moe && pack_layers_[xi].x_cb >= 0) xb[xi] = F->L[xi].blob;
+        std::vector<uint64_t> xbase, xstride;
+        uint64_t xtotal = 0;
+        xbin_layout(xb, xbase, xstride, xtotal, g.n_expert);
+        const std::string tmp = std::string(xw) + ".tmp";
+        std::FILE* xf = std::fopen(tmp.c_str(), "wb");
+        bool xok = xf != nullptr && xtotal > 0;
+        if (xok) std::setvbuf(xf, nullptr, _IOFBF, (size_t) 64 << 20);
+        const auto xt0 = std::chrono::steady_clock::now();
+        std::vector<uint8_t> xbuf;
+        for (size_t xi = 0; xi < xb.size() && xok; ++xi) {
+            if (xstride[xi] == 0) continue;
+            xbuf.assign((size_t) xstride[xi], 0);
+            for (int e = 0; e < g.n_expert && xok; ++e) {
+                std::fill(xbuf.begin() + (long long) xb[xi], xbuf.end(), (uint8_t) 0);
+                fast_read_expert_x3((int) xi, e, xbuf.data());
+                xok = std::fwrite(xbuf.data(), 1, xbuf.size(), xf) == xbuf.size();
+            }
+            std::fprintf(stderr, "glm experts file: layer %zu written (%.0f s)\n", xi,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - xt0).count());
+        }
+        if (xf != nullptr) xok = std::fclose(xf) == 0 && xok;
+        std::error_code xec;
+        if (xok) std::filesystem::rename(tmp, xw, xec);
+        std::fprintf(stderr, "glm experts file: %s - %s (%.1f GB)\n", xw, xok && !xec ? "written" : "FAILED",
+                     (double) xtotal / 1073741824.0);
+        std::fflush(stderr);
+        std::_Exit(xok && !xec ? 0 : 3);
+    }
     // glm-dsa B8.1 (warm): the rate in MB/s (each part's ~13 MB/s printed as 0.01 GB/s) and the reads' order
     std::string how = "slot order, parallel reads";
     if (seq) {
@@ -5913,12 +5980,78 @@ void Glm5Model::fast_service() {
                              m_pa[w] / (double) m_pn[w]);
 }
 
+// MAYA_GLM_EXPERTS_BIN: every EXL3 expert's blob in one file, each at a 4096-byte boundary (MAYA_GLM_EXPERTS_BIN_WRITE
+// writes it).  An expert's nine pieces lie unaligned in the safetensors and in another order than its blob, so every
+// read from them goes through a bounce buffer and a copy; from this file it is one unbuffered read into its slot.
+namespace {
+struct XBin {
+    Glm5Model::Shard sh;
+    std::vector<uint64_t> base;     // per layer (0 with stride 0: none)
+    std::vector<uint64_t> stride;
+    uint64_t total = 0;
+    bool on = false;
+} g_xbin;
+std::once_flag g_xbin_once;
+
+// the layout for the layers' blob sizes (0: not an EXL3 MoE layer)
+void xbin_layout(const std::vector<size_t>& blob, std::vector<uint64_t>& base, std::vector<uint64_t>& stride, uint64_t& total,
+                 int n_expert) {
+    base.assign(blob.size(), 0);
+    stride.assign(blob.size(), 0);
+    total = 0;
+    for (size_t il = 0; il < blob.size(); ++il) {
+        if (blob[il] == 0) continue;
+        stride[il] = ((uint64_t) blob[il] + 4095ull) & ~4095ull;
+        base[il] = total;
+        total += stride[il] * (uint64_t) n_expert;
+    }
+}
+
+void xbin_open(const std::vector<size_t>& blob, int n_expert) {
+    const char* path = std::getenv("MAYA_GLM_EXPERTS_BIN");
+    if (path == nullptr || path[0] == 0) return;
+    xbin_layout(blob, g_xbin.base, g_xbin.stride, g_xbin.total, n_expert);
+#ifdef _WIN32
+    HANDLE hd = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    LARGE_INTEGER sz{};
+    if (hd == INVALID_HANDLE_VALUE || !GetFileSizeEx(hd, &sz) || (uint64_t) sz.QuadPart != g_xbin.total) {
+        std::fprintf(stderr, "glm fast: MAYA_GLM_EXPERTS_BIN: %s is not this model's experts file (%llu bytes wanted) - "
+                             "not used\n", path, (unsigned long long) g_xbin.total);
+        if (hd != INVALID_HANDLE_VALUE) CloseHandle(hd);
+        return;
+    }
+    g_xbin.sh.path = path;
+    g_xbin.sh.size = g_xbin.total;
+    g_xbin.sh.h_direct = (void*) hd;
+    g_xbin.on = true;
+    std::fprintf(stderr, "glm fast: EXL3 experts from %s (%.1f GB, one aligned read an expert)\n", path,
+                 (double) g_xbin.total / 1073741824.0);
+#else
+    std::fprintf(stderr, "glm fast: MAYA_GLM_EXPERTS_BIN is Windows only so far - not used\n");
+#endif
+}
+}  // namespace
+
+#define XBIN_ONCE()                                                                                          \
+    std::call_once(g_xbin_once, [&] {                                                                        \
+        std::vector<size_t> xb(fast_->L.size(), 0);                                                          \
+        for (size_t xi = 0; xi < xb.size() && xi < pack_layers_.size(); ++xi)                                \
+            if (fast_->L[xi].moe && pack_layers_[xi].x_cb >= 0) xb[xi] = fast_->L[xi].blob;                  \
+        xbin_open(xb, g_.n_expert);                                                                          \
+    })
+
 // a whole EXL3 expert into its blob: the nine pieces sorted by file offset, those less than 64 KB apart read as one
 // range through a bounce buffer (the 3.05 bpw files keep an expert's three trellises together and its scales elsewhere:
 // two reads instead of nine; files that keep the whole expert together: one)
 void Glm5Model::fast_read_expert_x3(int il, int e, uint8_t* blob) {
     const auto& Ly = fast_->L[(size_t) il];
     const auto& nl = pack_layers_[(size_t) il];
+    XBIN_ONCE();
+    if (g_xbin.on && g_xbin.stride[(size_t) il] != 0) {   // MAYA_GLM_EXPERTS_BIN: one read, straight into an aligned slot
+        read_slice(g_xbin.sh, g_xbin.base[(size_t) il] + (uint64_t) e * g_xbin.stride[(size_t) il], Ly.blob, blob);
+        return;
+    }
     struct Piece {
         int sh;
         uint64_t off;
@@ -5960,6 +6093,19 @@ void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk
     const auto& Ly = fast_->L[(size_t) il];
     const auto& nl = pack_layers_[(size_t) il];
     if (nl.x_cb >= 0) {
+        XBIN_ONCE();
+        if (g_xbin.on && g_xbin.stride[(size_t) il] != 0) {
+            // MAYA_GLM_EXPERTS_BIN: the whole expert is one aligned run.  Every caller reads an expert's three roles, each
+            // in n_chunks pieces: the 3 x n_chunks calls share the run evenly (4096-multiple pieces straight into the
+            // blob), so as many readers work on it as before
+            const size_t xlen = Ly.blob, xn = (size_t) 3 * (size_t) n_chunks, xi = (size_t) role * (size_t) n_chunks + (size_t) chunk;
+            const size_t xpiece = ((xlen + xn - 1) / xn + 4095) & ~(size_t) 4095;
+            const size_t x0 = std::min(xlen, xi * xpiece), x1 = std::min(xlen, x0 + xpiece);
+            if (x1 > x0)
+                read_slice(g_xbin.sh, g_xbin.base[(size_t) il] + (uint64_t) e * g_xbin.stride[(size_t) il] + x0, x1 - x0,
+                           blob + x0);
+            return;
+        }
         // EXL3: the part's three pieces (trellis, suh, svh) from wherever the safetensors keep them; the chunks split
         // the trellis, the scales come with the first
         size_t at = role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off;
