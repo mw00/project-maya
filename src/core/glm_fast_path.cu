@@ -9318,7 +9318,11 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
                 }
             }
         }
-        m->kv_stream_reset_maps();   // KV streaming: the slots held the other conversation's blocks
+        // KV streaming: the slots held the other conversation's blocks (glm-dsa: this one's go into the identity window)
+        if (!m->kv_stream_prime(n, err)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
         m->snap_pos_ = n;
     }
     if (v3) mtp_slot_get(f, n, true);   // glm-dsa B15.3: the carrier row of the NextN block
@@ -9521,7 +9525,11 @@ bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::
                 pos += (size_t) c * sizeof(float);
             }
         }
-        m->kv_stream_reset_maps();   // KV streaming: the slots held the other conversation's blocks
+        // KV streaming: the slots held the other conversation's blocks (glm-dsa: this one's go into the identity window)
+        if (!m->kv_stream_prime(n, err)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
         m->snap_pos_ = n;
     }
     if (lay_.glm_dsa() && pos < data.size()) {   // glm-dsa B15.3: the carrier trailer (slot_save below wrote it)
