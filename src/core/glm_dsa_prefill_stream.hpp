@@ -132,10 +132,10 @@ void share_add(const float* p0, const float* p1, float* out, size_t n, const Run
 
 // ---------------------------------------------------------------- run time (glm_dsa_prefill_stream.cpp)
 
-/// cudaHostAlloc for the prompt's disk landing ring; on glm-dsa bound to dev's NUMA node (staging_node) through
-/// mmap + mbind + cudaHostRegister.  Returns a cudaError_t value (0 = cudaSuccess), so Maya's halving loop stays.
+/// Pinned memory for the prompt's disk landing ring (MAYA_GLM_PIN_HUGETLB on the plain path); on glm-dsa bound to
+/// dev's NUMA node through mmap + mbind + cudaHostRegister. Returns a cudaError_t value, so Maya's halving loop stays.
 int host_alloc_node(void** p, size_t bytes, int dev, bool dsa);
-/// The matching free (cudaFreeHost for a cudaHostAlloc-ed block).
+/// The matching free for ordinary pinned, explicit huge-page and NUMA-bound blocks.
 void host_free_node(void* p);
 /// Whether layer il may give experts to the host share: not node-split, or split with both node lanes and the half
 /// format ready (MAYA_GLM_PREFILL_SPLIT_SHARE != 0).
