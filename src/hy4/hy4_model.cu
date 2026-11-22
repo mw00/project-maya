@@ -244,6 +244,32 @@ void bf16_to_q8_0(const uint16_t* src, size_t rows, int k, uint8_t* dst, int thr
     }
     for (auto& x : th) x.join();
 }
+// ggml's quantize_row_q4_K_ref over rows of k BF16 values (k % 256 == 0): the MTP block's routed experts in the type
+// the model's own are.  HY4_MTP_Q4K=1 (off by default: the rounding is slow - 512 experts some 10 to 18 s more of a
+// start): a draft step reads half the experts' bytes; the answers do not move - a draft the model does not agree
+// with is not kept - and the drafts kept stayed as many where measured
+void bf16_to_q4_k(const uint16_t* src, size_t rows, int k, uint8_t* dst, size_t rb, int threads) {
+    std::vector<std::thread> th;
+    for (int t = 0; t < threads; ++t)
+        th.emplace_back([&, t] {
+            std::vector<float> x((size_t) k);
+            for (size_t r = (size_t) t; r < rows; r += (size_t) threads) {
+                for (int i = 0; i < k; ++i) {
+                    const uint32_t u = (uint32_t) src[r * (size_t) k + (size_t) i] << 16;
+                    std::memcpy(&x[(size_t) i], &u, 4);
+                }
+                quantize_row_q4_K_ref(x.data(), dst + r * rb, k);
+            }
+        });
+    for (auto& x : th) x.join();
+}
+bool mtp_q4k_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("HY4_MTP_Q4K");
+        return e && std::atoi(e) != 0;
+    }();
+    return on;
+}
 // (load_layer on the MTP block's thread: its BF16 matrices rounded to Q8_0 by mat())
 thread_local bool t_round_bf16 = false;
 
@@ -3162,7 +3188,8 @@ struct Model::Impl {
             l.tg = type_id(tg->type);
             l.td = type_id(td->type);
             const bool round = t_round_bf16 && l.tg == kBF16 && l.td == kBF16 && type_id(tu->type) == kBF16;
-            if (round) l.tg = l.td = 8;   // (the MTP block's BF16 experts, rounded to Q8_0 below)
+            const bool q4 = round && mtp_q4k_on() && lat % 256 == 0 && ff % 256 == 0;
+            if (round) l.tg = l.td = q4 ? iq::kQ4_K : 8;   // (the MTP block's BF16 experts, rounded below)
             if (!iq::expert_supported(l.tg) || (!round && type_id(tu->type) != l.tg) || !iq::expert_supported(l.td) ||
                 tg->n(0) != lat || tg->n(1) != ff || tg->n(2) != g.n_expert || td->n(0) != ff || td->n(1) != lat ||
                 td->n(2) != g.n_expert) {
@@ -3220,6 +3247,13 @@ struct Model::Impl {
                 for (int i = 0; i < ne; ++i) {
                     uint8_t* b = host.data() + (size_t) i * l.blob;
                     const size_t e = (size_t) res[(size_t) (s0 + i)];
+                    if (q4) {
+                        const int nt = (int) std::max(1u, std::min(64u, std::thread::hardware_concurrency()));
+                        bf16_to_q4_k((const uint16_t*) (sg + e * sgb), (size_t) ff, lat, b + l.tr[0], gb / (size_t) ff, nt);
+                        bf16_to_q4_k((const uint16_t*) (su + e * sgb), (size_t) ff, lat, b + l.tr[1], gb / (size_t) ff, nt);
+                        bf16_to_q4_k((const uint16_t*) (sd + e * sdb), (size_t) lat, ff, b + l.tr[2], db / (size_t) lat, nt);
+                        continue;
+                    }
                     if (round) {
                         bf16_to_q8_0((const uint16_t*) (sg + e * sgb), (size_t) ff, lat, b + l.tr[0]);
                         bf16_to_q8_0((const uint16_t*) (su + e * sgb), (size_t) ff, lat, b + l.tr[1]);
@@ -4087,9 +4121,9 @@ struct Model::Impl {
                     hm.blas = nullptr;
                 }
             }
-            char buf[160];
-            std::snprintf(buf, sizeof buf, "INFO the MTP block (drafts): its BF16 matrices rounded to Q8_0 in %.1f s",
-                          now_s() - tm);
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "INFO the MTP block (drafts): its BF16 matrices rounded to Q8_0%s in %.1f s",
+                          mtp_q4k_on() ? ", its routed experts to Q4_K (HY4_MTP_Q4K)" : "", now_s() - tm);
             info.push_back(buf);
         }
         if (o.dfly2 && !dfly_load(err)) return false;
