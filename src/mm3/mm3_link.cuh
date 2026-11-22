@@ -4,7 +4,7 @@
 // over the very call arrives intact (a PHB pair took peer copies and delivered 99.6% of the bytes wrong); a pair
 // without peer access takes the driver's copy, tested the same way; every other pair goes through pinned host memory -
 // the same bytes, in pieces of two pinned halves (the source's stream copying a piece out once its half's last piece
-// is in, the destination's copying it in once it is out).  Header only; CUDA, and HIP through include/strata/hip_compat.
+// is in, the destination's copying it in once it is out).  Header only; CUDA, and HIP through the hip_compat headers.
 #pragma once
 
 #include <cuda_runtime.h>
