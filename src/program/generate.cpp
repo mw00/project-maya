@@ -7425,6 +7425,7 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        uint64_t completed_promotions = 0; // advanced only after pending swaps complete
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
             if (d_res != nullptr)
@@ -7445,6 +7446,7 @@ int main(int argc, char** argv) {
                 }
             for (auto& st : stages) st->adapt_live = false;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            completed_promotions += pending.size();
             pending.clear();
             res_upload();
         };
@@ -8411,6 +8413,7 @@ int main(int argc, char** argv) {
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
+            const uint64_t promotions0 = completed_promotions;
             const int64_t decode_hits0 = drive.d.cache_hits;
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t staged0 = from_gguf ? gguf_src.staged() : 0;
@@ -8541,11 +8544,12 @@ int main(int argc, char** argv) {
                     const int64_t h = drive.d.cache_hits - decode_hits0;
                     const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
                     const int64_t staged = from_gguf ? gguf_src.staged() - staged0 : 0;
-                    std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=0 "
+                    std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
                                 "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f "
                                 "disk_gb=%.1f draft_acc=%lld draft_off=%lld\n",
                                 nt / std::max(1e-9, el), 1000.0 * el / nt, (double) h / (double) std::max<int64_t>(1, look),
                                 (double) std::max<int64_t>(0, look - h - staged) / nt, (double) staged / nt,
+                                (double) (completed_promotions - promotions0) / nt,
                                 (long long) xcache.resident(), (long long) xcache.slots(),
                                 (long long) (from_gguf ? gguf_src.resident_blobs()
                                                        : (int64_t) g.n_layers * g.n_expert - xcache.resident()),
