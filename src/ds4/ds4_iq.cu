@@ -1401,10 +1401,10 @@ __device__ __forceinline__ void warp_sum_cols(float (&v)[NC]) {
 // (bx of nbx: this block among the job's)
 template <int NC, int NS>
 __device__ __forceinline__ void mv_reg_body(const MvJob& b, int bx, int nbx) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = (int) blockDim.x >> 5;
     const int nsb = b.k / 32;
-    const int R = (b.n + kWarps * nbx - 1) / (kWarps * nbx);
-    int row = bx * kWarps * R + warp;
+    const int R = (b.n + nw * nbx - 1) / (nw * nbx);
+    int row = bx * nw * R + warp;
     if (row >= b.n) return;   // (a whole warp)
     int4 xa[NS][NC], xb[NS][NC];
     float xs[NS][NC];
@@ -1419,7 +1419,7 @@ __device__ __forceinline__ void mv_reg_body(const MvJob& b, int bx, int nbx) {
             xb[q][c] = in ? xp[1] : make_int4(0, 0, 0, 0);
             xs[q][c] = in ? b.xd[(size_t) c * nsb + kb] : 0.0f;
         }
-    for (int i = 0; i < R && row < b.n; ++i, row += kWarps) {
+    for (int i = 0; i < R && row < b.n; ++i, row += nw) {
         const uint8_t* w = b.w + (size_t) row * b.ld;
         uint32_t wr[NS][9], od[NS];
 #pragma unroll
@@ -2060,6 +2060,17 @@ static int mv_reg_min() {
 }
 // the blocks the device runs at once of an mv_reg instance: its SMs times the blocks of the instance one holds (the
 // kernel's registers the limit) - by instance (NC, NS; HEADS: the heads' kernel) and device
+// (a block of 128 threads: the kernel's registers let an SM run few of its threads at once - 8 warps of an instance
+//  of 3072-value rows and 4 columns in blocks of 256, 12 in blocks of 128 - and the smaller blocks fit beside another
+//  kernel's.  MAYA_IQ_MV_REG_THREADS: another size, a multiple of 32 up to 256)
+static int mv_reg_threads() {
+    static const int v = [] {
+        const char* e = std::getenv("MAYA_IQ_MV_REG_THREADS");
+        const int t = e ? std::atoi(e) : 128;
+        return t >= 32 && t <= kThreads && t % 32 == 0 ? t : 128;
+    }();
+    return v;
+}
 template <int NC, int NS, bool HEADS>
 static int mv_reg_fit() {
     constexpr int kDev = 64;
@@ -2072,8 +2083,9 @@ static int mv_reg_fit() {
     const int sms = cudaGetDeviceProperties(&p, dev) == cudaSuccess && p.multiProcessorCount > 0 ? p.multiProcessorCount : 32;
     int nb = 1;
     cudaError_t e;
-    if constexpr (HEADS) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mv_heads_reg_kernel<NC, NS>, kThreads, 0);
-    else e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mv_reg_kernel<NC, NS>, kThreads, 0);
+    if constexpr (HEADS)
+        e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mv_heads_reg_kernel<NC, NS>, mv_reg_threads(), 0);
+    else e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mv_reg_kernel<NC, NS>, mv_reg_threads(), 0);
     if (e != cudaSuccess) (void) cudaGetLastError();
     f = sms * std::max(1, nb);
     fit[dev].store(f, std::memory_order_relaxed);
@@ -2081,8 +2093,8 @@ static int mv_reg_fit() {
 }
 template <int NC, int NS>
 static void mv_reg_go(const Jobs& J, int nj, cudaStream_t s) {
-    // a job's blocks: its share of what fits, by its rows - one at least, and no more than a block 8 rows
-    const int fit = mv_reg_fit<NC, NS, false>();
+    // a job's blocks: its share of what fits, by its rows - one at least, and no more than a block a row a warp
+    const int fit = mv_reg_fit<NC, NS, false>(), nw = mv_reg_threads() / 32;
     long long rows = 0;
     for (int i = 0; i < nj; ++i) rows += J.j[i].n;
     MvRegSplit S{};
@@ -2090,13 +2102,13 @@ static void mv_reg_go(const Jobs& J, int nj, cudaStream_t s) {
     for (int i = 0; i < kMaxJobs; ++i) {
         S.b[i] = at;
         if (i < nj) {
-            const int r8 = (J.j[i].n + kWarps - 1) / kWarps;
+            const int r8 = (J.j[i].n + nw - 1) / nw;
             at += std::max(1, std::min(r8, (int) ((long long) fit * J.j[i].n / std::max(1LL, rows))));
         }
     }
     S.b[kMaxJobs] = at;
     for (int i = nj; i <= kMaxJobs; ++i) S.b[i] = at;   // (no block past the last job's)
-    pdl_launch(mv_reg_kernel<NC, NS>, dim3((unsigned) at), kThreads, 0, s, J, S);
+    pdl_launch(mv_reg_kernel<NC, NS>, dim3((unsigned) at), mv_reg_threads(), 0, s, J, S);
 }
 // (NS: 1..3; false: no instance for these counts)
 template <int NS>
@@ -2114,9 +2126,10 @@ static bool mv_reg_launch(const Jobs& J, int nj, int max_c, cudaStream_t s) {
 }
 template <int NS>
 static bool mv_heads_reg_launch(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s) {
-#define MR_(NC) { const int r8 = (b.n + kWarps - 1) / kWarps;                                                         \
+#define MR_(NC) { const int nw = mv_reg_threads() / 32, r8 = (b.n + nw - 1) / nw;                                     \
                   const unsigned gx = (unsigned) std::max(1, std::min(r8, mv_reg_fit<NC, NS, true>() / std::max(1, H))); \
-                  pdl_launch(mv_heads_reg_kernel<NC, NS>, dim3(gx, (unsigned) H), kThreads, 0, s, b, ws, xs, ds, ys);  \
+                  pdl_launch(mv_heads_reg_kernel<NC, NS>, dim3(gx, (unsigned) H), mv_reg_threads(), 0, s, b, ws, xs, ds, \
+                             ys);                                                                                      \
                   return true; }
     if (b.ncol <= 1) MR_(1)
     if (b.ncol <= 2) MR_(2)
