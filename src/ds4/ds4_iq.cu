@@ -1369,6 +1369,137 @@ __global__ void __launch_bounds__(kThreads) mv_heads_kernel(const MvJob b0, size
         }
 }
 
+#if !defined(STRATA_USE_HIP)
+// Q8_0 GEMVs with the activations in registers (mv_reg; MAYA_IQ_MV_REG=0: mv_kernel / mv_heads_kernel, as before).
+// mv_kernel gives a row a warp, and every row's lanes read the activations again - each column's 32 int8 values and
+// their scale for each of the lane's sub-blocks: as many load instructions as the weights take for one column, three
+// more for every further one.  With the weights in the GPU's cache (hy4's dense matrices, read ahead behind its sums)
+// those loads are what the kernel waits for: a window of four columns took twice a single column's time.  Here a lane
+// reads its sub-blocks' activations once - every column's, kept in registers - and its warp takes R rows in turn (the
+// job's rows over the grid's blocks, which the launch sizes to what the device runs at once).  A warp then waits on a
+// row's own chain, so a sub-block's eight integer products are made side by side and added as a tree (the same
+// integer), and the columns' sums over the lanes go level by level together (each column's own additions, in
+// warp_sum's order).  A row's arithmetic is mv_kernel's otherwise - the same scales, products and order: the same bits.
+// NS: sub-blocks a lane at most (rows of up to 1024 NS values)
+template <int NC>
+__device__ __forceinline__ void warp_sum_cols(float (&v)[NC]) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        float t[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) t[c] = __shfl_xor_sync(0xffffffffu, v[c], o);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+#if DS4_IQ_STRICT_FP
+            v[c] = fadd_no_fma(v[c], t[c]);
+#else
+            v[c] += t[c];
+#endif
+        }
+    }
+}
+// (bx of nbx: this block among the job's)
+template <int NC, int NS>
+__device__ __forceinline__ void mv_reg_body(const MvJob& b, int bx, int nbx) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nsb = b.k / 32;
+    const int R = (b.n + kWarps * nbx - 1) / (kWarps * nbx);
+    int row = bx * kWarps * R + warp;
+    if (row >= b.n) return;   // (a whole warp)
+    int4 xa[NS][NC], xb[NS][NC];
+    float xs[NS][NC];
+#pragma unroll
+    for (int q = 0; q < NS; ++q)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int kb = lane + 32 * q;
+            const bool in = kb < nsb && c < b.ncol;
+            const int4* xp = (const int4*) (b.xq + (size_t) (in ? c : 0) * b.k + (size_t) (in ? kb : 0) * 32);
+            xa[q][c] = in ? xp[0] : make_int4(0, 0, 0, 0);
+            xb[q][c] = in ? xp[1] : make_int4(0, 0, 0, 0);
+            xs[q][c] = in ? b.xd[(size_t) c * nsb + kb] : 0.0f;
+        }
+    for (int i = 0; i < R && row < b.n; ++i, row += kWarps) {
+        const uint8_t* w = b.w + (size_t) row * b.ld;
+        uint32_t wr[NS][9], od[NS];
+#pragma unroll
+        for (int q = 0; q < NS; ++q) {   // (decode_q8_wide's 9 words a sub-block, the row's asked for together)
+            const int kb = lane + 32 * q;
+            const uint8_t* bp = w + (size_t) (kb < nsb ? kb : 0) * 34;
+            od[q] = (uint32_t) ((uintptr_t) bp & 2u);
+            const uint32_t* m = (const uint32_t*) (bp - od[q]);
+#pragma unroll
+            for (int t = 0; t < 9; ++t) wr[q][t] = kb < nsb ? m[t] : 0u;
+        }
+        float acc[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < NS; ++q) {
+            if (lane + 32 * q < nsb) {
+                const float d = __half2float(__ushort_as_half((uint16_t) (od[q] ? wr[q][0] >> 16 : wr[q][0] & 0xffffu)));
+                int qv[8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) qv[t] = (int) (od[q] ? wr[q][t + 1] : (wr[q][t] >> 16) | (wr[q][t + 1] << 16));
+                float dt[NC];
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {   // (sub_dot<kQ8_0>'s integer - its two chains' sum - and its scale)
+                    const int4 a4 = xa[q][c], b4 = xb[q][c];
+                    const int p0 = __dp4a(qv[0], a4.x, 0), p1 = __dp4a(qv[1], a4.y, 0), p2 = __dp4a(qv[2], a4.z, 0),
+                              p3 = __dp4a(qv[3], a4.w, 0), p4 = __dp4a(qv[4], b4.x, 0), p5 = __dp4a(qv[5], b4.y, 0),
+                              p6 = __dp4a(qv[6], b4.z, 0), p7 = __dp4a(qv[7], b4.w, 0);
+                    dt[c] = fmul_no_fma(d, (float) (((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7))));
+                }
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < b.ncol) acc[c] = fmaf(xs[q][c], dt[c], acc[c]);
+            }
+        }
+        warp_sum_cols<NC>(acc);
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c < b.ncol) b.y[c * b.ycs + row] = b.alpha * acc[c] + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+    }
+}
+// (the jobs' blocks one after another along x - job j's are [S.b[j], S.b[j + 1]): a job's share by its rows, where a
+//  grid row a job gave a matrix of 1536 rows and one of 192 the same blocks)
+struct MvRegSplit {
+    int b[kMaxJobs + 1];
+};
+template <int NC, int NS>
+__global__ void __launch_bounds__(kThreads) mv_reg_kernel(const Jobs J, const MvRegSplit S) {
+    pdl_wait();
+    pdl_trigger();
+    int j = 0;
+#pragma unroll
+    for (int i = 1; i < kMaxJobs; ++i) j += (int) blockIdx.x >= S.b[i] ? 1 : 0;
+    MvJob b = J.j[0];
+    int b0 = S.b[0], b1 = S.b[1];
+#pragma unroll
+    for (int i = 1; i < kMaxJobs; ++i)
+        if (j == i) {
+            b = J.j[i];
+            b0 = S.b[i];
+            b1 = S.b[i + 1];
+        }
+    mv_reg_body<NC, NS>(b, (int) blockIdx.x - b0, b1 - b0);
+}
+template <int NC, int NS>
+__global__ void __launch_bounds__(kThreads) mv_heads_reg_kernel(const MvJob b0, size_t w_st, size_t xq_st, size_t xd_st,
+                                                                size_t y_st) {
+    pdl_wait();
+    pdl_trigger();
+    MvJob b = b0;
+    b.w += (size_t) blockIdx.y * w_st;
+    b.xq += (size_t) blockIdx.y * xq_st;
+    b.xd += (size_t) blockIdx.y * xd_st;
+    b.y += (size_t) blockIdx.y * y_st;
+    mv_reg_body<NC, NS>(b, (int) blockIdx.x, (int) gridDim.x);
+}
+#endif
+
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
 // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
@@ -1915,9 +2046,102 @@ static bool mv56() {
     static const bool on = !(std::getenv("MAYA_IQ_MV56") && std::getenv("MAYA_IQ_MV56")[0] == '0');
     return on;
 }
+#if !defined(STRATA_USE_HIP)
+static bool mv_reg_on() {
+    static const bool on = !(std::getenv("MAYA_IQ_MV_REG") && std::getenv("MAYA_IQ_MV_REG")[0] == '0');
+    return on;
+}
+// (the columns from which mv_reg is taken: a single column's GEMV waits on its weights, not on its activations - a
+//  row a warp reads them at the cache's pace: a window of one token was slower on mv_reg, of two and of three 3% and
+//  7% faster.  MAYA_IQ_MV_REG_MIN: another count)
+static int mv_reg_min() {
+    static const int v = std::getenv("MAYA_IQ_MV_REG_MIN") ? std::max(1, std::atoi(std::getenv("MAYA_IQ_MV_REG_MIN"))) : 2;
+    return v;
+}
+// the blocks the device runs at once of an mv_reg instance: its SMs times the blocks of the instance one holds (the
+// kernel's registers the limit) - by instance (NC, NS; HEADS: the heads' kernel) and device
+template <int NC, int NS, bool HEADS>
+static int mv_reg_fit() {
+    constexpr int kDev = 64;
+    static std::atomic<int> fit[kDev];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kDev) dev = 0;
+    int f = fit[dev].load(std::memory_order_relaxed);
+    if (f > 0) return f;
+    cudaDeviceProp p{};
+    const int sms = cudaGetDeviceProperties(&p, dev) == cudaSuccess && p.multiProcessorCount > 0 ? p.multiProcessorCount : 32;
+    int nb = 1;
+    cudaError_t e;
+    if constexpr (HEADS) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mv_heads_reg_kernel<NC, NS>, kThreads, 0);
+    else e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mv_reg_kernel<NC, NS>, kThreads, 0);
+    if (e != cudaSuccess) (void) cudaGetLastError();
+    f = sms * std::max(1, nb);
+    fit[dev].store(f, std::memory_order_relaxed);
+    return f;
+}
+template <int NC, int NS>
+static void mv_reg_go(const Jobs& J, int nj, cudaStream_t s) {
+    // a job's blocks: its share of what fits, by its rows - one at least, and no more than a block 8 rows
+    const int fit = mv_reg_fit<NC, NS, false>();
+    long long rows = 0;
+    for (int i = 0; i < nj; ++i) rows += J.j[i].n;
+    MvRegSplit S{};
+    int at = 0;
+    for (int i = 0; i < kMaxJobs; ++i) {
+        S.b[i] = at;
+        if (i < nj) {
+            const int r8 = (J.j[i].n + kWarps - 1) / kWarps;
+            at += std::max(1, std::min(r8, (int) ((long long) fit * J.j[i].n / std::max(1LL, rows))));
+        }
+    }
+    S.b[kMaxJobs] = at;
+    for (int i = nj; i <= kMaxJobs; ++i) S.b[i] = at;   // (no block past the last job's)
+    pdl_launch(mv_reg_kernel<NC, NS>, dim3((unsigned) at), kThreads, 0, s, J, S);
+}
+// (NS: 1..3; false: no instance for these counts)
+template <int NS>
+static bool mv_reg_launch(const Jobs& J, int nj, int max_c, cudaStream_t s) {
+#define MR_(NC) { mv_reg_go<NC, NS>(J, nj, s); return true; }
+    if (max_c <= 1) MR_(1)
+    if (max_c <= 2) MR_(2)
+    if (max_c <= 3) MR_(3)
+    if (max_c <= 4) MR_(4)
+    if (max_c <= 5) MR_(5)
+    if (max_c <= 6) MR_(6)
+    if (max_c <= 8) MR_(8)
+#undef MR_
+    return false;
+}
+template <int NS>
+static bool mv_heads_reg_launch(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s) {
+#define MR_(NC) { const int r8 = (b.n + kWarps - 1) / kWarps;                                                         \
+                  const unsigned gx = (unsigned) std::max(1, std::min(r8, mv_reg_fit<NC, NS, true>() / std::max(1, H))); \
+                  pdl_launch(mv_heads_reg_kernel<NC, NS>, dim3(gx, (unsigned) H), kThreads, 0, s, b, ws, xs, ds, ys);  \
+                  return true; }
+    if (b.ncol <= 1) MR_(1)
+    if (b.ncol <= 2) MR_(2)
+    if (b.ncol <= 3) MR_(3)
+    if (b.ncol <= 4) MR_(4)
+    if (b.ncol <= 5) MR_(5)
+    if (b.ncol <= 6) MR_(6)
+    if (b.ncol <= 8) MR_(8)
+#undef MR_
+    return false;
+}
+#endif
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wide = false) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+#if !defined(STRATA_USE_HIP)
+    if constexpr (T == kQ8_0)
+        if (wide && mv_reg_on() && max_c <= 8 && max_c >= mv_reg_min()) {
+            int max_k = 0;
+            for (int i = 0; i < nj; ++i) max_k = std::max(max_k, J.j[i].k);
+            if (max_k <= 1024 && mv_reg_launch<1>(J, nj, max_c, s)) return;
+            if (max_k > 1024 && max_k <= 2048 && mv_reg_launch<2>(J, nj, max_c, s)) return;
+            if (max_k > 2048 && max_k <= 3072 && mv_reg_launch<3>(J, nj, max_c, s)) return;
+        }
+#endif
     if constexpr (T == kQ8_0)
         if (wide && mv56() && mv8()) {   // (every job's blocks readable in aligned words: mv's check)
             if (max_c <= 1) pdl_launch(mv_kernel<T, 1, true>, grid, kThreads, 0, s, J);
@@ -1938,6 +2162,14 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
 template <int T>
 void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s, bool wide = false) {
     const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
+#if !defined(STRATA_USE_HIP)
+    if constexpr (T == kQ8_0)
+        if (wide && mv_reg_on() && b.ncol <= 8 && b.ncol >= mv_reg_min()) {
+            if (b.k <= 1024 && mv_heads_reg_launch<1>(b, H, ws, xs, ds, ys, s)) return;
+            if (b.k > 1024 && b.k <= 2048 && mv_heads_reg_launch<2>(b, H, ws, xs, ds, ys, s)) return;
+            if (b.k > 2048 && b.k <= 3072 && mv_heads_reg_launch<3>(b, H, ws, xs, ds, ys, s)) return;
+        }
+#endif
     if constexpr (T == kQ8_0)
         if (wide && mv56()) {
             if (b.ncol <= 1) pdl_launch(mv_heads_kernel<T, 1, true>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
