@@ -338,10 +338,39 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
 }
 
 // ---------------------------------------------------------------- norms
+// (a thread's values and their weights read first - their loads in flight together - then summed and scaled in the
+//  order they were: a thread's 12 values of 3072 were 12 memory trips one after another, and its 12 weights - cold, a
+//  layer's are read once a window - 12 more.  Up to kRmsPer values a thread; wider rows as before)
+constexpr int kRmsPer = 16;
 __global__ void rms_kernel(const float* __restrict__ x, size_t ldx, int n, const float* __restrict__ w, float eps,
-                           float* __restrict__ y, size_t ldy, const Q8Out q8) {
+                           float* __restrict__ y, size_t ldy, const Q8Out q8, const int ahead) {
     const float* xr = x + (size_t) blockIdx.x * ldx;
     float ss = 0.0f;
+    if (ahead && n <= kRmsPer * (int) blockDim.x) {
+        float* yo = y + (size_t) blockIdx.x * ldy;
+        float v[kRmsPer], wv[kRmsPer];
+#pragma unroll
+        for (int j = 0; j < kRmsPer; ++j) {
+            const int i = (int) threadIdx.x + j * (int) blockDim.x;
+            v[j] = i < n ? xr[i] : 0.0f;
+            wv[j] = i < n && w ? w[i] : 1.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < kRmsPer; ++j)
+            if ((int) threadIdx.x + j * (int) blockDim.x < n) ss += v[j] * v[j];
+        ss = block_sum(ss);
+        const float r = 1.0f / sqrtf(ss / (float) n + eps);
+#pragma unroll
+        for (int j = 0; j < kRmsPer; ++j) {
+            const int i = (int) threadIdx.x + j * (int) blockDim.x;
+            if (i < n) {
+                const float o = v[j] * r * wv[j];
+                yo[i] = o;
+                if (q8.q != nullptr) q8_put(o, (size_t) blockIdx.x * n + i, q8);
+            }
+        }
+        return;
+    }
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     ss = block_sum(ss);
     const float r = 1.0f / sqrtf(ss / (float) n + eps);
@@ -370,7 +399,40 @@ __device__ __forceinline__ void hc_part_body(int t, int b, const float* __restri
     float acc[kMaxM + 1];
 #pragma unroll
     for (int j = 0; j <= kMaxM; ++j) acc[j] = 0.0f;
-    for (int i = i0 + (int) threadIdx.x; i < i1; i += blockDim.x) {
+    // (BYEL, a thread's values two at most - a token's 12288 over 24 blocks of 256: both values and their weights
+    //  read first, the loads in flight together - the weights are cold, a layer's read once a window - then the same
+    //  products summed in the same order)
+    constexpr int kIt = 2;
+    bool ahead = false;
+    if constexpr (BYEL) ahead = i1 - i0 <= kIt * (int) blockDim.x;
+    if (ahead) {
+        float v[kIt];
+        float4 wv[kIt][kMaxM / 4];
+#pragma unroll
+        for (int q = 0; q < kIt; ++q) {
+            const int i = i0 + (int) threadIdx.x + q * (int) blockDim.x;
+            const bool in = i < i1;
+            v[q] = in ? xt[i] : 0.0f;
+            const float4* f4 = (const float4*) (fn + (size_t) (in ? i : i0) * nm);
+#pragma unroll
+            for (int j = 0; j < kMaxM; j += 4)
+                wv[q][j / 4] = in && j < nm ? f4[j / 4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+#pragma unroll
+        for (int q = 0; q < kIt; ++q)
+            if (i0 + (int) threadIdx.x + q * (int) blockDim.x < i1) {
+                acc[kMaxM] = fmaf(v[q], v[q], acc[kMaxM]);
+#pragma unroll
+                for (int j = 0; j < kMaxM; j += 4)
+                    if (j < nm) {
+                        acc[j] = fmaf(wv[q][j / 4].x, v[q], acc[j]);
+                        acc[j + 1] = fmaf(wv[q][j / 4].y, v[q], acc[j + 1]);
+                        acc[j + 2] = fmaf(wv[q][j / 4].z, v[q], acc[j + 2]);
+                        acc[j + 3] = fmaf(wv[q][j / 4].w, v[q], acc[j + 3]);
+                    }
+            }
+    }
+    for (int i = i0 + (int) threadIdx.x; i < i1 && !ahead; i += blockDim.x) {
         const float v = xt[i];
         acc[kMaxM] = fmaf(v, v, acc[kMaxM]);
         if constexpr (BYEL) {
@@ -420,6 +482,19 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
     __shared__ float s_mix[kMaxM + 1], s_pre[8];
     __shared__ float s_part[kHcBlocks * (kMaxM + 1)];
     const int nm = HEAD ? hc : 2 * hc, HE = hc * E;
+    // (the streams' values and the norm's weights - cold, a layer's read once a window - asked for at the start: a
+    //  thread's loads in flight together while the mixes are made, not each behind the sum before it, the weights' six
+    //  one after another at the end; the same sums in the same order)
+    const float* xt = x + (size_t) t * HE;
+    constexpr int kPer = KPER;   // (E <= blockDim kPer: a thread's values kept for the norm)
+    float xa[kPer][8], nwv[kPer];
+#pragma unroll
+    for (int q = 0; q < kPer; ++q) {
+        const int d = threadIdx.x + q * blockDim.x;
+        nwv[q] = nw && d < E ? nw[d] : 1.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) xa[q][j] = d < E && j < hc ? xt[(size_t) j * E + d] : 0.0f;
+    }
     // (the slices' partial sums: a thread a value into shared memory - 17 threads read their 24 one after another,
     //  each a trip past L1 - then summed in the slices' order as before: the same bits)
     constexpr int kNp = kHcBlocks * (kMaxM + 1);
@@ -448,18 +523,14 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
         }
     }
     __syncthreads();
-    const float* xt = x + (size_t) t * HE;
-    constexpr int kPer = KPER;   // (E <= blockDim kPer: a thread's values kept for the norm)
-    float vals[kPer], ss = 0.0f;
+    float vals[kPer], ss = 0.0f, pre[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) pre[j] = j < hc ? s_pre[j] : 0.0f;
 #pragma unroll
     for (int q = 0; q < kPer; ++q) {
-        const int d = threadIdx.x + q * blockDim.x;
-        float a[8];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) a[j] = d < E && j < hc ? xt[(size_t) j * E + d] : 0.0f;
         float v = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) v = fmaf(j < hc ? s_pre[j] : 0.0f, a[j], v);
+        for (int j = 0; j < 8; ++j) v = fmaf(pre[j], xa[q][j], v);
         vals[q] = v;
         ss += v * v;
     }
@@ -472,7 +543,7 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
     for (int q = 0; q < kPer; ++q) {
         const int d = threadIdx.x + q * blockDim.x;
         if (d < E) {   // (E a multiple of 32 with q8: a warp's lanes together, 32 values in a row)
-            const float o = nw ? vals[q] * r * nw[d] : vals[q];
+            const float o = nw ? vals[q] * r * nwv[q] : vals[q];
             cur[(size_t) t * E + d] = o;
             if (q8.q != nullptr) q8_put(o, (size_t) t * E + d, q8);
         }
@@ -553,10 +624,34 @@ __global__ void __launch_bounds__(256) hc_post_norm_kernel(float* __restrict__ x
                                                            float* __restrict__ yo) {
     const int t = blockIdx.y, b = blockIdx.x;
     const float* yt = y + (size_t) t * E;
+    // (a slice of one value a thread - 3072 over 12 blocks of 256: that value, its weight - cold - and the streams'
+    //  asked for now, in flight while the row's sum is made; the same products and sums)
+    const int per_one = (E + kPostBlocks - 1) / kPostBlocks, d_one = b * per_one + (int) threadIdx.x;
+    const bool one = per_one <= (int) blockDim.x;
+    const bool in_one = one && d_one < min(E, (b + 1) * per_one);
+    const float y_one = in_one ? yt[d_one] : 0.0f, w_one = in_one ? w[d_one] : 0.0f;
+    float xs_one[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) xs_one[j] = in_one && j < hc ? x[((size_t) t * hc + j) * E + d_one] : 0.0f;
     float ss = 0.0f;
-    for (int d = threadIdx.x * 4; d < E; d += blockDim.x * 4) {
-        const float4 v = *(const float4*) (yt + d);
-        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    if (E <= 4 * 4 * (int) blockDim.x) {   // (a thread's up to 4 loads in flight together, summed in the same order)
+        float4 yv[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int d = ((int) threadIdx.x + j * (int) blockDim.x) * 4;
+            yv[j] = d < E ? *(const float4*) (yt + d) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (((int) threadIdx.x + j * (int) blockDim.x) * 4 < E) {
+                const float4 v = yv[j];
+                ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+    } else {
+        for (int d = threadIdx.x * 4; d < E; d += blockDim.x * 4) {
+            const float4 v = *(const float4*) (yt + d);
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
     }
     ss = block_sum(ss);
     const float r = 1.0f / sqrtf(ss / (float) E + eps);
@@ -565,6 +660,16 @@ __global__ void __launch_bounds__(256) hc_post_norm_kernel(float* __restrict__ x
     float pw[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) pw[j] = j < hc ? post[(size_t) t * hc + j] : 0.0f;
+    if (one) {   // (the slice's one value a thread: its loads were asked for before the sum)
+        if (d_one < d1) {
+            const float v = y_one * r * w_one;
+            if (yo) yo[(size_t) t * E + d_one] = v;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                if (j < hc) xt[(size_t) j * E + d_one] = xs_one[j] + v * pw[j];
+        }
+        return;
+    }
     for (int d = d0 + (int) threadIdx.x; d < d1; d += blockDim.x) {
         const float v = yt[d] * r * w[d];
         if (yo) yo[(size_t) t * E + d] = v;
@@ -2282,7 +2387,8 @@ bool rmsnorm(const float* x, size_t ldx, int rows, int n, const float* w, float 
              Q8Out q8) {
     if (rows <= 0) return false;
     if (n % 32 != 0) q8 = Q8Out{};
-    rms_kernel<<<rows, 256, 0, s>>>(x, ldx, n, w, eps, y, ldy, q8);
+    static const int ahead = !(std::getenv("HY4_RMS_AHEAD") && std::atoi(std::getenv("HY4_RMS_AHEAD")) == 0);   // (=0: as before)
+    rms_kernel<<<rows, 256, 0, s>>>(x, ldx, n, w, eps, y, ldy, q8, ahead);
     check("rmsnorm");
     return q8.q != nullptr;
 }
