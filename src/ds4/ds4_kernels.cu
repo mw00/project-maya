@@ -1397,15 +1397,16 @@ __global__ void __launch_bounds__(kThreads) index_score_sdot4_kernel(
         const int h = blk_id / NB, b = blk_id % NB;
         const float4 v = *(const float4*) (q + ((size_t) t * heads + h) * HD + b * 32 + lane8 * 4);
         float a = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
-        for (int o = 4; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
-        const int e = a > 0.0f ? (int) ((__float_as_uint(a) >> 23) & 0xffu) - 126 : 0;
+        for (int o = 4; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o));
+        const bool nz = a >= 1.17549435e-38f;
+        const int e = nz ? (int) ((__float_as_uint(a) >> 23) & 0xffu) - 126 : 0;
         const float sc = __int_as_float((127 + 4 - e) << 23);
         const uint32_t b0 = (uint8_t) (int8_t) __float2int_rn(v.x * sc);
         const uint32_t b1 = (uint8_t) (int8_t) __float2int_rn(v.y * sc);
         const uint32_t b2 = (uint8_t) (int8_t) __float2int_rn(v.z * sc);
         const uint32_t b3 = (uint8_t) (int8_t) __float2int_rn(v.w * sc);
         qs_i32[blk_id * 8 + lane8] = (int32_t) (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
-        if (lane8 == 0) q_sc[blk_id] = a > 0.0f ? __int_as_float((127 + e - 4) << 23) : 0.0f;
+        if (lane8 == 0) q_sc[blk_id] = nz ? __int_as_float((127 + e - 4) << 23) : 0.0f;
     }
     if (threadIdx.x < heads) ws[threadIdx.x] = w[(size_t) t * 64 + threadIdx.x];
     __syncthreads();
@@ -4384,7 +4385,7 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     }
     const dim3 grid(cdiv(n, kThreads), T);
 #if defined(STRATA_USE_HIP)
-    if (kfmt == kKvFp4p && hd == 128) {
+    if (kfmt == kKvFp4p && hd == 128 && heads > 0 && heads <= 32) {
         static const bool sdot4_env = [] {
             const char* e = std::getenv("DS4_INDEX_SDOT4");
             return e != nullptr && std::atoi(e) != 0;
