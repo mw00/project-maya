@@ -5682,10 +5682,16 @@ mv_q8p_cols_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
 template <int WARPS, int R, int T, int NIT>
 __global__ void __launch_bounds__(WARPS * 32)
 mv_q8p_colsx_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
-                    const float* __restrict__ x, int x_ld, float* __restrict__ y, int y_ld) {
+                    const float* __restrict__ x0, int x_ld, float* __restrict__ y, int y_ld, MvAlt a0, MvAlt a1) {
     constexpr int DX = 1, DW = 4;
     const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
     if (row0 >= N) return;
+    // (a0's and a1's rows have an input of their own - [T][K], rows x_ld apart, as x - so that a layer's fused q | k
+    //  | v | r | gate matrix is one launch where q, k and v each have theirs; their ranges whole warps: r0 and n
+    //  multiples of WARPS R)
+    const float* __restrict__ x = (unsigned) (row0 - a0.r0) < (unsigned) a0.n   ? a0.x
+                                  : (unsigned) (row0 - a1.r0) < (unsigned) a1.n ? a1.x
+                                                                                : x0;
     const uint32_t* qr[R];
     const uint16_t* dr[R];
 #pragma unroll
@@ -7291,9 +7297,22 @@ void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* 
     check("experts_block_down_q8");
 }
 
+bool mv_q8p_cols_alts(int K, int T, const MvAlt& a0, const MvAlt& a1) {
+#ifndef STRATA_USE_HIP
+    static const bool ahead = !(getenv("IK2_COLS_AHEAD") && !atoi(getenv("IK2_COLS_AHEAD")));
+    auto whole = [](const MvAlt& a) { return a.n == 0 || (a.r0 % 16 == 0 && a.n % 16 == 0); };
+    return ahead && T >= 2 && T <= 8 && (K == 18 * 128 || K == 24 * 128) && whole(a0) && whole(a1);
+#else
+    return false;
+#endif
+}
 void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
-                 cudaStream_t s) {
+                 cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
     if (N <= 0 || T <= 0) return;
+    if ((a0.n || a1.n) && !mv_q8p_cols_alts(K, T, a0, a1)) {
+        std::fprintf(stderr, "ik2::k::mv_q8p_cols: rows with an input of their own are not taken here\n");
+        std::abort();
+    }
     if (K % 128 || ((uintptr_t) q & 3) || ((uintptr_t) x & 15) || (x_ld & 3) || T > 8) {
         std::fprintf(stderr, "ik2::k::mv_q8p_cols: K %d, x_ld %d, %d tokens, or q / x not aligned\n", K, x_ld, T);
         std::abort();
@@ -7307,8 +7326,8 @@ void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* 
         const unsigned g4 = (unsigned) ((N + W4 * R4 - 1) / (W4 * R4));
 #define IK2_COLSX(TT) \
         case TT: \
-            if (K == 18 * 128) mv_q8p_colsx_kernel<W4, R4, TT, 18><<<g4, W4 * 32, 0, s>>>(q, d, N, K, x, x_ld, y, y_ld); \
-            else mv_q8p_colsx_kernel<W4, R4, TT, 24><<<g4, W4 * 32, 0, s>>>(q, d, N, K, x, x_ld, y, y_ld); \
+            if (K == 18 * 128) mv_q8p_colsx_kernel<W4, R4, TT, 18><<<g4, W4 * 32, 0, s>>>(q, d, N, K, x, x_ld, y, y_ld, a0, a1); \
+            else mv_q8p_colsx_kernel<W4, R4, TT, 24><<<g4, W4 * 32, 0, s>>>(q, d, N, K, x, x_ld, y, y_ld, a0, a1); \
             break;
         switch (T) {
             IK2_COLSX(2) IK2_COLSX(3) IK2_COLSX(4) IK2_COLSX(5) IK2_COLSX(6) IK2_COLSX(7) IK2_COLSX(8)

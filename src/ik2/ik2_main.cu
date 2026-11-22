@@ -3441,7 +3441,11 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             const int N = m.N;
             if (ex && !sep) {
                 exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
-            } else if (ex) {   // (q, k and v each with its input, as mv_q8p_conv's alternative inputs)
+            } else if (ex && m.q8 && k::mv_q8p_cols_alts(m.K, T, k::MvAlt{W.xk, HD, KD}, k::MvAlt{W.xv, HD + KD, KD})) {
+                // (q, k and v each with its input, as mv_q8p_conv's alternative inputs: one launch, not four)
+                k::mv_q8p_cols(m.q8, m.q8d, N, m.K, W.xq, C, T, W.qkv, N, g_s, k::MvAlt{W.xk, HD, KD},
+                               k::MvAlt{W.xv, HD + KD, KD});
+            } else if (ex) {
                 exact_rows(m, 0, HD, W.xq, C, T, W.qkv, N);
                 exact_rows(m, HD, KD, W.xk, C, T, W.qkv + HD, N);
                 exact_rows(m, HD + KD, KD, W.xv, C, T, W.qkv + HD + KD, N);

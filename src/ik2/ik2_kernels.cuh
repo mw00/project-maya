@@ -557,7 +557,10 @@ void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq,
 /// y [T][N] (rows y_ld apart) = W . x [T][K] (rows x_ld apart, F32) for a planar Q8_0 matrix: each token's row sums
 /// mv_q8p's to the bit (T <= 8), the matrix read once.
 void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
-                 cudaStream_t s);
+                 cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
+/// ... whether rows with an input of their own (a0, a1: x [T][K], rows x_ld apart, the ranges multiples of 16 rows) go
+/// in the same launch - a layer's fused matrix whose q, k and v each have theirs: one launch, not four.
+bool mv_q8p_cols_alts(int K, int T, const MvAlt& a0, const MvAlt& a1);
 /// experts_gate_up_swiglu / experts_down for group_route's groups: each member's h / y the one-token kernels' to the
 /// bit (x [T][C] F32; h [slot][F]; y [slot][C]), an expert's rows read once from memory for its members.
 void experts_gate_up_swiglu_mem(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
