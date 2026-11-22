@@ -8291,6 +8291,10 @@ struct Model::Impl {
     // (HY4_TP_SUM_EACH: each part added as it comes - measured slower on a window of 4: the team's one sum over every
     //  part reads each once, the adds read the sum again each time)
     const bool sum_all = std::getenv("HY4_TP_SUM_EACH") == nullptr;
+    // (a token window's sum: every summing thread waits for the members' parts in their order and adds each over its
+    //  own values as it comes - when the last member's part comes, its addition alone is left, where the team's sum
+    //  of all the parts began then.  The same additions in the same order.  HY4_TP_SUM_STREAM=0: as before)
+    const bool sum_stream = !(std::getenv("HY4_TP_SUM_STREAM") && std::atoi(std::getenv("HY4_TP_SUM_STREAM")) == 0);
     size_t tp_stride() const { return (size_t) Tc * (g.n_lat + g.n_embd); }
     // ------------------------------------------------------------ a prompt chunk in two staggered halves
     // A chunk's rows split in two (A, B): each layer's attention and FFN of one half computed while the other half's
@@ -8681,6 +8685,23 @@ struct Model::Impl {
                 continue;
             }
             double t1 = t0;
+            if (sum_stream && sum_all && T <= W) {   // (the summing threads each wait for the parts in turn and add them)
+                const bool sok = summer->stream(tp_sum, tp_part, N, stride, n, moe ? H : 0, n_help, tp_fout, (size_t) kLine, v,
+                                                [&] { return tp_abort.load() || k::errors() || now_s() - t0 > 60.0; }, &t1);
+                if (!sok) {
+                    ok = false;
+                    break;
+                }
+                if (t1 == 0.0) t1 = now_s();
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile unsigned*) tp_fin = v;
+                if (tp_prof) {
+                    tp_wait[pq][is_ffn ? 1 : 0] += t1 - t0;
+                    tp_sum_s[pq] += now_s() - t1;
+                    if (is_ffn && !stg) ls_now[(size_t) il] = now_s();
+                }
+                continue;
+            }
             for (int j = 0; j < N + (moe ? H : 0) && ok; ++j) {
                 const volatile unsigned* f = tp_fout + (size_t) j * kLine;
                 for (long spin = 0; (int) (*f - v) < 0; ++spin) {

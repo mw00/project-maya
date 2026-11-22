@@ -55,6 +55,14 @@ public:
     void sum(float* dst, const float* parts, int n_parts, size_t stride, size_t n, int n_extra = 0, size_t n_short = 0);
     /// dst = src (first) or dst += src, n values - one member's part as it comes (the same sums as sum()'s, part by part)
     void add(float* dst, const float* src, size_t n, bool first);
+    /// sum()'s result, each part added when its flag has come (flags[j * fstride] at v or past it): every thread waits
+    /// for part 0's flag, takes the part over its own values, waits for part 1's, adds it, ... - the adding beside the
+    /// waiting for the later parts, where sum() begins when the last has come and add() is a hand-off a part.  The same
+    /// additions in the same order: the same bits.  stop: asked by the caller's thread while it waits (true: every
+    /// thread leaves, dst is not the sum) -> false.  t_last: when the caller's thread saw the last part's flag
+    bool stream(float* dst, const float* parts, int n_parts, size_t stride, size_t n, int n_extra, size_t n_short,
+                const volatile unsigned* flags, size_t fstride, unsigned v, const std::function<bool()>& stop,
+                double* t_last = nullptr);
     /// F16 rows (pack16_rows' form): out row r = the sum of the parts' rows (part j's at parts + j * stride rows of E,
     /// its factor at scales + j * sstride), in part order, in F32, packed back to F16 with its own factor (out, osc)
     void sum16(uint16_t* out, float* osc, const uint16_t* parts, const float* scales, int n_parts, size_t stride,
@@ -73,7 +81,7 @@ private:
     int n_parts_ = 0, n_extra_ = 0;
     size_t n_short_ = 0;
     size_t stride_ = 0, n_ = 0, per_ = 0;
-    int mode_ = 0;   // (0: sum()'s, 1: add()'s copy, 2: add()'s add, 3: sum16()'s - by rows)
+    int mode_ = 0;   // (0: sum()'s, 1: add()'s copy, 2: add()'s add, 3: sum16()'s - by rows, 4: stream()'s)
     uint16_t* out16_ = nullptr;
     float* osc_ = nullptr;
     const uint16_t* parts16_ = nullptr;
@@ -81,6 +89,13 @@ private:
     size_t sstride_ = 0;
     int E_ = 0;
     void run16(size_t r0, size_t r1) const;
+    void run_stream(size_t a0, size_t a1) const;
+    const volatile unsigned* flags_ = nullptr;   // (stream()'s)
+    size_t fstride_ = 0;
+    unsigned v_ = 0;
+    const std::function<bool()>* stopf_ = nullptr;
+    mutable std::atomic<bool> stop_{false};
+    mutable double t_last_ = 0.0;
     void go(size_t n);
 };
 
