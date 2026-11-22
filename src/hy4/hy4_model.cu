@@ -24,6 +24,7 @@
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
 #include "../ds4/ds4_pcie.hpp"
+#include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
 
 #include <atomic>
 #include <cublas_v2.h>
@@ -488,6 +489,11 @@ struct Model::Impl {
     bool mtp_async = false;
     bool mtp_own = false;                // (the plan's: that scratch is counted on the head's GPU - tensor_split)
     std::vector<double> free0;           // each GPU's free VRAM as the plan first read it (a plan run again: the same)
+    // (#1026) the reserve held for the whole run: what each GPU's start and requests allocate after the plan, read from
+    // the pack's vram-late.txt by the plan and kept free beside the reserve (src/core/vram_late.hpp; HY4_LATE_FILE /
+    // HY4_LATE_MB or MAYA_VRAM_LATE_*); an integrated GPU (its free figure is the RAM's) is not measured
+    strata::vramlate::Tracker late;
+    std::vector<int> late_devs;
     std::string room_out;                // (--room-report's measurement: Model::room_report)
     std::atomic<bool> emb_pending{false};   // (a queued pass's copy of h_emb maybe still in flight)
     cudaEvent_t ev_hin = nullptr, ev_mtp = nullptr, ev_emb = nullptr;
@@ -1822,7 +1828,20 @@ struct Model::Impl {
         }
         kv_auto_reset();
         std::vector<double> free_b(devs.size());
-        for (size_t i = 0; i < devs.size(); ++i) free_b[i] = free0[i] - o.reserve_gb * 1e9 - (double) scratch_bytes();
+        if (late.gpus.size() != devs.size()) {
+            late.init("hy4", o.pack, "MAYA_HY4_LATE_FILE", "MAYA_HY4_LATE_MB", devs.size());
+            late_devs = devs;
+            const std::string key = "hy4 late|" + draft_key(o);
+            for (size_t i = 0; i < devs.size(); ++i) {
+                int integrated = 0;
+                if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, devs[i]) != cudaSuccess) cudaGetLastError();
+                if (integrated == 0)
+                    (void) late.read(i, key + "|gpu " + std::to_string(i), (size_t) std::max(0.0, o.reserve_gb * 1e9),
+                                     o.reserve_given, devs[i]);
+            }
+        }
+        for (size_t i = 0; i < devs.size(); ++i) free_b[i] = free0[i] - o.reserve_gb * 1e9 - (double) scratch_bytes() -
+                                                       (double) late.gpus[i].g.late;
         // the main GPU: the head's, the drafts', the window's coordination - the fastest memory (then the most VRAM)
         if (o.main_gpu >= (int) devs.size()) {
             err = "--main-gpu " + std::to_string(o.main_gpu) + ": " + std::to_string(devs.size()) + " GPUs given";
@@ -8996,6 +9015,20 @@ std::string draft_key(const Options& o) {
                   hot ? hot : "");
     d += buf;
     return q4x_memo_key(d, o.cpu_threads);
+}
+int Model::late_check(bool loaded) {
+    int cur = 0;
+    if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+    for (size_t i = 0; i < m->late_devs.size() && i < m->late.gpus.size(); ++i) {
+        size_t fr = 0, tot = 0;
+        if (cudaSetDevice(m->late_devs[i]) != cudaSuccess || cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        m->late.check(i, fr, tot, loaded, m->late_devs[i]);
+    }
+    cudaSetDevice(cur);
+    return loaded ? m->late.short_mib : 0;
 }
 int Model::draft_default() const { return m->df.on ? m->df.n_def : 3; }
 int Model::draft_max() const { return W - 1; }

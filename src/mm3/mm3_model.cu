@@ -45,6 +45,7 @@
 #include "mm3_tp.hpp"
 #include "mm3_vision.hpp"
 #include "mm3_wscan.hpp"
+#include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
 
 namespace mm3 {
 namespace x3 = strata::mm3::exl3;
@@ -417,6 +418,10 @@ struct Model::Impl {
     int chunk_run = 0;               // (the prefill calibration: a forward's chunk, at most o.chunk - 0: o.chunk)
     int run_chunk() const { return chunk_run > 0 ? std::min(chunk_run, o.chunk) : o.chunk; }
     std::string tkey, tfile;         // (the prefill calibration's key of this PC and its file)
+    // (#1026) the reserve held for the whole run: what each GPU's start and requests allocate after the residency,
+    // read from the pack's vram-late.txt at the residency and kept free beside the reserve (src/core/vram_late.hpp;
+    // MAYA_MM3_LATE_FILE / MAYA_MM3_LATE_MB or MAYA_VRAM_LATE_*)
+    strata::vramlate::Tracker late;
     std::unique_ptr<Vision> vis;     // the vision tower (Options::vision)
     std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
@@ -1572,6 +1577,20 @@ struct Model::Impl {
                                    " MB kept free: every expert of its layers fits in VRAM");
                 }
                 if (!err.empty()) return false;
+            }
+            // (#1026) ... beside it what this PC's start and requests allocated after the residency before (the default
+            // reserve keeps v1.1.73's residency unless the measured figure uses it up)
+            {
+                const size_t di = (size_t) (&d - D.data());
+                if (late.gpus.size() != D.size()) late.init("mm3", o.pack, "MAYA_MM3_LATE_FILE", "MAYA_MM3_LATE_MB", D.size());
+                cudaDeviceProp pr{};
+                if (cudaGetDeviceProperties(&pr, d.id) != cudaSuccess) (void) cudaGetLastError();
+                char kb[256];
+                std::snprintf(kb, sizeof kb, "|gpu %d %s %x:%x %zu MiB|ctx %d seqs %d staging %d cap %d dspark %d vision %d",
+                              d.id, pr.name, (unsigned) pr.pciBusID, (unsigned) pr.pciDeviceID, tot >> 20, o.max_ctx,
+                              o.seqs, d.n_slots, o.resident_cap, (int) o.dspark, vis != nullptr ? 1 : 0);
+                reserve += late.read(di, "mm3 late|" + tkey + "|pack " + o.pack + kb, reserve, o.reserve_gb >= 0, d.id);
+                late.set_reserve(di, reserve - late.gpus[di].g.late);
             }
             size_t budget = fr > reserve ? fr - reserve : 0;
             std::vector<int> nres(moe_layers.size(), 0);
@@ -3569,6 +3588,21 @@ void Model::set_ablate(bool on) {
     if (ablate_loaded() && p->bound >= 0 && p->bound < (int) p->abl_on.size()) p->abl_on[(size_t) p->bound] = on ? 1 : 0;
 }
 bool Model::ablating() const { return ablate_loaded() && p->abl_row(p->bound); }
+int Model::late_check(bool loaded) {
+    if (tpe != nullptr) return 0;   // (the tensor-parallel path: its plan keeps its own reserve)
+    int cur = 0;
+    if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+    for (size_t i = 0; i < p->D.size() && i < p->late.gpus.size(); ++i) {
+        size_t fr = 0, tot = 0;
+        if (cudaSetDevice(p->D[i].id) != cudaSuccess || cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        p->late.check(i, fr, tot, loaded, p->D[i].id);
+    }
+    cudaSetDevice(cur);
+    return loaded ? p->late.short_mib : 0;
+}
 
 bool Model::forward_rows(const int* ids, const int* seq, const int* pos, int R, float* logits_out, std::string& err) {
     if (R <= 0) return true;

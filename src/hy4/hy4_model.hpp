@@ -27,6 +27,7 @@ struct Options {
     int ring_slack = 16384;       // positions a sliding-window ring keeps beyond its window (how far a rewind may go
                                   // without starting over)
     double reserve_gb = 0.75;     // VRAM each GPU keeps free beyond the plan
+    bool reserve_given = false;   // (--reserve-gb given: #1026 keeps what the run allocates after the plan beside it)
     int prefill_chunk = 0;        // a prompt's tokens a forward takes at once (more than k::kMaxWin: the GEMMs); 0: auto -
                                   // 4096, 2048 or 1024, the largest the VRAM holds beside the model and the pictures
     double vram_experts = 1.0;    // the share of each layer's routed experts kept in VRAM at most (the plan takes less
@@ -127,6 +128,10 @@ public:
     int pack_drafters() const;
     int gpu_count() const;
     int draft_default() const;
+    /// (#1026) every GPU's free VRAM against its reserve, once loaded (`loaded`) and before each request: what the start
+    /// and the requests allocate after the plan is kept for the next start (the pack's vram-late.txt); > 0: this start
+    /// came out short - the MiB the next one keeps beside it
+    int late_check(bool loaded);
     int draft_max() const;
     /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing.
     /// HY4_HOT, in a start that learns (its file missing, or HY4_HOT_LEARN=1): its experts' scores to its file as well
