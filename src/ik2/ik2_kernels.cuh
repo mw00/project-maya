@@ -116,6 +116,11 @@ bool attn_prompt_v70_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const
 /// can this build run attn_flash_* on the current GPU (CUDA: always; AMD: the RDNA matrix-core kernel's archs)
 bool attn_flash_available();
 
+/// out [T][C] = sum over token t's K picks (inv [T * K]: their rows) of wtr[row] y32[row], in row order (the prompt's
+/// batched experts: the AMD path, IK2_BATCH_PREFILL on NVIDIA)
+void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
+                      cudaStream_t s);
+
 #ifdef MAYA_USE_HIP
 /// AMD, RDNA 3 / 3.5 / 4 (ik2_rdna.inc): the prompt's routed experts of a layer in three launches from their blocks.
 /// Rows: a token's pick each, grouped by expert in expert order; tiles: int4 {expert, first row, rows <= 32, 0} over
@@ -133,9 +138,6 @@ void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, 
 /// y32 [rows][C] = h16 . down^T
 void experts_rdna_down(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_down,
                        const uint16_t* h16, int C, int F, float* y32, cudaStream_t s);
-/// out [T][C] = sum over token t's K picks (inv [T * K]: their rows) of wtr[row] y32[row], in row order
-void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
-                      cudaStream_t s);
 /// AMD: y [T][ldy] = x [T][K] . W [N][K]^T, BF16 in, F32 sums, T <= 8 (the drafter's block): the weights read once,
 /// a warp's rows sharing each x load.  False (nothing launched): not this shape (K % 8, alignment, T) - the BLAS then.
 bool gemm_bf16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
