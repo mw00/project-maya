@@ -3357,8 +3357,8 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
 // one-token path's to the bit - its products with mv1's sums (the weights read once), its attention through the
 // token's own kernels, its experts' rows with the token kernels' sums (an expert read once for its tokens).
 bool g_block_exact = true;
-// (IK2_BLOCK_FUSE=0: the window's small kernels a launch each - k's and v's convs, the looped inputs' three norms,
-//  the experts' combine and its conv share launches otherwise: 144 launches of ~3.5 us less a window)
+// (IK2_BLOCK_FUSE=0: the window's small kernels a launch each - k's and v's convs and the looped inputs' three norms
+//  share launches otherwise: 96 launches of ~3.5 us less a window)
 const bool g_blk_fuse = !(getenv("IK2_BLOCK_FUSE") && !std::atoi(getenv("IK2_BLOCK_FUSE")));
 // rows [r0, r0 + n) of a dense matrix times x [T][K] (F32, rows x_ld apart): y [T][ldy], each token's mv1's
 void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, float* y, int ldy) {
@@ -3643,14 +3643,11 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
-        if (g_blk_fuse) {   // (the experts' combine and the conv after it: one launch)
-            k::moe_combine_conv_block(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, C, W.h, C,
-                                      Ly.rec_old[3], Ly.rec_x[3], g_s);
-        } else {
-            k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
-            k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3],
-                          Ly.rec_x[3], g_s);
-        }
+        // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
+        //  tokens' picks - it took 9.4 us where the two take 7)
+        k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
+        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
+                      g_s);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits

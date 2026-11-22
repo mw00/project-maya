@@ -5561,30 +5561,6 @@ __global__ void conv_block2_kernel(ConvJob j0, ConvJob j1, int x_ld, int d_ld, i
     const ConvJob j = blockIdx.y ? j1 : j0;
     conv_block_ch(j.x, x_ld, j.hist, j.w, j.dyn, d_ld, heads, T, C, nullptr, 0, j.y, y_ld, j.rec_old, j.rec_x);
 }
-// a window's moe_combine_f32 and the conv after it in one launch: a channel's combined value of each token (the same
-// sum over its picks), then conv_block_kernel's step with it
-__global__ void moe_combine_conv_block_kernel(const float* __restrict__ yv, const int* __restrict__ inv,
-                                              const float* __restrict__ wt, int T, int K, int C, float* hist,
-                                              const float* __restrict__ w, const float* __restrict__ res, int res_ld,
-                                              float* y, int y_ld, float* rec_old, float* rec_x) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= C) return;
-    float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
-    if (rec_old) rec_old[c] = h0, rec_old[(size_t) C + c] = h1, rec_old[(size_t) 2 * C + c] = h2;
-    const float* wc = w + (size_t) c * 4;
-    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
-    for (int t = 0; t < T; ++t) {
-        float xn = 0.0f;
-        for (int k = 0; k < K; ++k) xn += wt[(size_t) t * K + k] * yv[(size_t) inv[(size_t) t * K + k] * C + c];
-        if (rec_x) rec_x[(size_t) t * C + c] = xn;
-        float a = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xn;
-        if (res) a += res[(size_t) t * res_ld + c];
-        y[(size_t) t * y_ld + c] = a;
-        h0 = h1, h1 = h2, h2 = xn;
-    }
-    hist[c] = h0, hist[(size_t) C + c] = h1, hist[(size_t) 2 * C + c] = h2;
-}
-
 // every short conv's history as after the first n of a window's tokens, all the layers' convs in one launch
 __global__ void rollback_block_kernel(const ConvRec* __restrict__ recs, int n) {
     const ConvRec rc = recs[blockIdx.y];
@@ -7465,14 +7441,6 @@ void conv_block2(const float* xa, float* hist_a, const float* wa, const float* d
     conv_block2_kernel<<<dim3((unsigned) ((C + 127) / 128), 2), 128, 0, s>>>(j0, j1, x_ld, d_ld, heads > 0 ? heads : 1,
                                                                              T, C, y_ld);
     check("conv_block2");
-}
-void moe_combine_conv_block(const float* y, const int* inv, const float* wt, int T, int K, int C, float* hist,
-                            const float* w, const float* res, int res_ld, float* out, int out_ld, float* rec_old,
-                            float* rec_x, cudaStream_t s) {
-    if (T <= 0) return;
-    moe_combine_conv_block_kernel<<<(unsigned) ((C + 127) / 128), 128, 0, s>>>(y, inv, wt, T, K, C, hist, w, res,
-                                                                               res_ld, out, out_ld, rec_old, rec_x);
-    check("moe_combine_conv_block");
 }
 void rms_f16_jobs(const float* const* x, const float* const* w, uint16_t* const* y16, float* const* y32, int n,
                   int rows, int D, float eps, cudaStream_t s) {
