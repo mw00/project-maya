@@ -15,6 +15,7 @@
 //     own cache and PCIe link), else the layers are split between them.
 //
 //   maya-ik2 --model FIRST-SHARD.gguf --serve [--max-context 262144] [--cache-gb 60] [--gpus 1] [--threads 8]
+//            [--kv-streaming auto|on|off] [--kv-resident N]
 //            [--eos a,b]
 //   maya-ik2 --model FIRST-SHARD.gguf --tokens 1,2,3|@FILE [--gen N] [--chunk 2048] [--dump DIR]
 // --serve: Maya's engine protocol on stdin / stdout (serve/server.py's StrataEngine: INFO / READY, GEN, PP, T, DONE,
@@ -245,6 +246,7 @@ struct Layer {
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
     int kv_cap = 0;
+    bool kv_host = false;                          // (KV streaming) kc8 / vc8 (kc / vc) are pinned host RAM
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
 };
@@ -258,6 +260,7 @@ struct Visit {
     uint16_t *kc = nullptr, *vc = nullptr;
     uint8_t *kc8 = nullptr, *vc8 = nullptr;
     int kv_cap = 0;
+    bool kv_host = false;
     float *h_k = nullptr, *h_v = nullptr, *h_attn = nullptr, *h_mlp = nullptr;
     float *rec_old[4] = {}, *rec_x[4] = {};
 };
@@ -276,7 +279,7 @@ struct Model {
 inline Layer& bind_visit(Model& M, int v) {
     const Visit& Vi = M.V[v];
     Layer& Ly = M.L[Vi.l];
-    Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap;
+    Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap, Ly.kv_host = Vi.kv_host;
     Ly.h_k = Vi.h_k, Ly.h_v = Vi.h_v, Ly.h_attn = Vi.h_attn, Ly.h_mlp = Vi.h_mlp;
     for (int i = 0; i < 4; ++i) Ly.rec_old[i] = Vi.rec_old[i], Ly.rec_x[i] = Vi.rec_x[i];
     return Ly;
@@ -390,6 +393,33 @@ bool g_dense_q8 = false;
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
 bool g_kv_fp8 = false;
+// KV streaming (--kv-streaming auto|on|off, --kv-resident N): the full-attention visits' K / V (the context's whole
+// length each) of all but N of them in pinned host RAM, mapped for the GPU.  Every attention over a full visit reads
+// all its positions, so the GPU reads those rows over the bus as it goes (a token, a short verify window), and a
+// prompt's chunk copies a host visit's rows into one VRAM staging pair first (one read a chunk, not one a few
+// queries).  The same kernels on the same bytes: the answers are those of the cache in VRAM.  auto: only where the
+// cache would not fit in VRAM beside the model (a 24 GB card past ~352K, the trained 1M), else off - as before.
+int g_kv_stream = -1;        // -1 auto, 0 off, 1 on
+int g_kv_resident = -1;      // full visits whose K / V stay in VRAM (-1: as many as fit)
+std::vector<char> g_kv_host; // [visit] 1: its K / V in host RAM (set by the plan)
+uint8_t *g_kv_stage_k = nullptr, *g_kv_stage_v = nullptr;   // a host visit's rows for a prompt chunk (VRAM)
+int g_depth = 0;             // IK2_DEPTH=N (CLI tests): the prompt placed at position N, the cache before it zeros
+// the RAM the system has free now (bytes; 0 unknown)
+size_t host_ram_avail() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (size_t) ms.ullAvailPhys : 0;
+#else
+    FILE* mi = std::fopen("/proc/meminfo", "r");
+    if (!mi) return 0;
+    char line[256];
+    unsigned long long av_kb = 0;
+    while (std::fgets(line, sizeof line, mi)) std::sscanf(line, "MemAvailable: %llu kB", &av_kb);
+    std::fclose(mi);
+    return (size_t) av_kb * 1024;
+#endif
+}
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
 bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
@@ -1563,6 +1593,19 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
+    // (KV streaming: a prompt chunk's attention over a host visit reads every row many times - its rows so far, this
+    //  chunk's included, go to the VRAM staging pair first, the kernels then read those; a token or a short window
+    //  reads the host rows once, in place)
+    uint16_t *kc_h = Ly.kc, *vc_h = Ly.vc;
+    uint8_t *kc8_h = Ly.kc8, *vc8_h = Ly.vc8;
+    const bool staged = Ly.kv_host && !Ly.sliding && T > 1 && !(T <= 8 && g_group && g_group_attn);
+    if (staged) {
+        const size_t b = (size_t) (pos0 + T) * KD * (g_kv_fp8 ? 1 : 2);
+        CU(cudaMemcpyAsync(g_kv_stage_k, g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, b, cudaMemcpyDefault, g_s));
+        CU(cudaMemcpyAsync(g_kv_stage_v, g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, b, cudaMemcpyDefault, g_s));
+        if (g_kv_fp8) Ly.kc8 = g_kv_stage_k, Ly.vc8 = g_kv_stage_v;
+        else Ly.kc = (uint16_t*) g_kv_stage_k, Ly.vc = (uint16_t*) g_kv_stage_v;
+    }
     if (T == 1) {
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
@@ -1696,6 +1739,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             ts += Tq;
         }
     }
+    if (staged) Ly.kc = kc_h, Ly.vc = vc_h, Ly.kc8 = kc8_h, Ly.vc8 = vc8_h;
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
@@ -4495,6 +4539,14 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--image-token") image_token = std::atoi(next().c_str());
+        else if (a == "--kv-streaming") {
+            const std::string v = next();
+            if (v == "auto") g_kv_stream = -1;
+            else if (v == "on") g_kv_stream = 1;
+            else if (v == "off") g_kv_stream = 0;
+            else die("--kv-streaming: auto, on or off");
+        }
+        else if (a == "--kv-resident") g_kv_resident = std::max(0, std::atoi(next().c_str()));
         else if (a == "--dump") dump = next();
         else if (a == "--drafting") {   // (auto: measured once on this PC; on: the drafter and the prompt lookup; off)
             drafting = next();
@@ -4502,6 +4554,7 @@ int main(int argc, char** argv) {
         }
         else die("unknown argument " + a);
     }
+    g_depth = getenv("IK2_DEPTH") ? std::max(0, std::atoi(getenv("IK2_DEPTH"))) : 0;   // (tests: a long context's speed without its prompt)
     if (drafting.empty()) drafting = draft_path.empty() ? "off" : "on";   // (--draft alone: as before, drafting on)
     if (drafting == "off") draft_path.clear();
     g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
@@ -4793,7 +4846,72 @@ int main(int argc, char** argv) {
         }
 #endif
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
-        const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        // KV streaming (g_kv_stream): auto takes it only where the cache does not fit beside the model - then every
+        // expert stays in VRAM where they fit beside the full visits kept there plus one staging pair; an offload
+        // layout (the experts never all fit) streams only where its cache alone would not fit, and only where the RAM
+        // holds the rows beside its experts.  The rows in RAM are pinned: never more than the RAM has free.
+        if (g_kv_stream != 0) {
+            const size_t eb = g_kv_fp8 ? 1 : 2, vis_b = (size_t) ctx * c.KV * c.D * eb * 2;
+            size_t slide_b = 0;
+            int n_full = 0;
+            for (int l = 0; l < c.n_layer; ++l) {
+                const int mult = l >= c.core0 && l < c.core1 ? c.n_pass : 1;
+                if (!c.sliding[l]) n_full += mult;
+                else slide_b += (size_t) mult * std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) * c.KV * c.D * eb * 2;
+            }
+            // (the attention's logits / probabilities scratch grows with the context: 8 H floats a position, half
+            //  again for its FP16 probabilities - counted here, the 1.5 GiB reserve aside)
+            const size_t scratch = (size_t) 48 * c.H * (size_t) ctx;
+            const size_t base = exp_b + dense_b + slide_b + reserve + scratch;
+            const size_t cap_b = (size_t) (cache_gb * 1073741824.0);
+            const size_t GiB = (size_t) 1 << 30;
+            int host_n = 0, n_res = n_full;
+            bool all_exp = false;
+            if (n_full > 0 && (g_kv_stream == 1 || !fits)) {
+                if (g_kv_resident >= 0) n_res = std::min(g_kv_resident, n_full);
+                else n_res = base + vis_b <= fr0 ? (int) std::min<size_t>(n_full, (fr0 - base - vis_b) / vis_b) : 0;
+                all_exp = exp_b <= cap_b && base + vis_b + (size_t) n_res * vis_b <= fr0;
+                if (!all_exp && g_kv_stream != 1) {
+                    // (an offload layout: the cache in VRAM as in v1.1.73 wherever it leaves the experts a tier of half a GiB)
+                    const size_t rest = dense_b + slide_b + reserve + scratch + GiB / 2;
+                    if (rest + (size_t) n_full * vis_b <= fr0) n_res = n_full;
+                    else if (g_kv_resident < 0)
+                        n_res = rest + vis_b <= fr0 ? (int) std::min<size_t>(n_full, (fr0 - rest - vis_b) / vis_b) : 0;
+                }
+                host_n = n_full - n_res;
+            }
+            if (host_n > 0) {
+                const size_t host_b = (size_t) host_n * vis_b;
+                const size_t ram = host_ram_avail();
+                const size_t need = host_b + 4 * GiB + (all_exp ? 0 : exp_b);   // (offload: its experts pinned too)
+                if (ram && need > ram) {
+                    char nb[320];
+                    std::snprintf(nb, sizeof nb, "KV streaming: the context of %d tokens needs %.1f GiB of RAM for %d "
+                                  "full-attention visits' K / V (%.1f GiB with %s), %.1f GiB free - a smaller --ctx, "
+                                  "or more RAM", ctx, host_b / (double) GiB, host_n, need / (double) GiB,
+                                  all_exp ? "4 GiB for the system" : "the experts and 4 GiB for the system",
+                                  ram / (double) GiB);
+                    if (g_kv_stream == 1) die(nb);
+                    std::printf("NOTE %s; streaming not taken\n", nb);
+                    host_n = 0;
+                } else {
+                    kv_b = slide_b + (size_t) (n_full - host_n) * vis_b + vis_b;
+                    fits = all_exp;
+                    std::printf("INFO kv_streaming=on kv_resident=%d kv_host_gb=%.2f: %d of %d full-attention visits' "
+                                "K / V in RAM, %d in VRAM + a staging pair (%.2f GiB)%s\n",
+                                n_full - host_n, host_b / (double) GiB, host_n, n_full, n_full - host_n,
+                                vis_b / (double) GiB, all_exp ? "; every expert stays in VRAM" : "");
+                }
+            }
+            g_kv_host.assign(c.n_visit, 0);
+            for (int v = c.n_visit - 1, left = host_n; v >= 0 && left > 0; --v) {   // (the last full visits)
+                const int l = (c.n_pass == 1 || v < c.core0) ? v
+                            : v < c.core0 + c.n_pass * (c.core1 - c.core0) ? c.core0 + (v - c.core0) % (c.core1 - c.core0)
+                                                                          : v - (c.n_pass - 1) * (c.core1 - c.core0);
+                if (!c.sliding[l]) g_kv_host[v] = 1, --left;
+            }
+        }
         // Where they do not all fit (a card under 24 GB, or a context past what one holds), the offload token path:
         // the resident path's launches with a tier of the experts in VRAM and the others fetched by the GPU from
         // host memory (ik2_off.cuh).  IK2_OFF=0: the cache path instead (forward() a visit at a time); IK2_OFF=1:
@@ -5061,12 +5179,31 @@ int main(int argc, char** argv) {
         const Layer& Ly = M.L[Vi.l];
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
-        if (g_kv_fp8) {
+        if (v < (int) g_kv_host.size() && g_kv_host[v]) {   // (KV streaming: pinned host RAM, mapped for the GPU)
+            const size_t b = (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2);
+            void *hk = nullptr, *hv = nullptr, *dk = nullptr, *dv = nullptr;
+            if (cudaHostAlloc(&hk, b, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostAlloc(&hv, b, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+                die("KV streaming: no " + std::to_string(2 * b >> 20) + " MiB of pinned RAM for visit " +
+                    std::to_string(v) + "'s K / V - a smaller --ctx");
+            CU(cudaHostGetDevicePointer(&dk, hk, 0));
+            CU(cudaHostGetDevicePointer(&dv, hv, 0));
+            if (g_depth > 0) std::memset(hk, 0, b), std::memset(hv, 0, b);
+            if (g_kv_fp8) Vi.kc8 = (uint8_t*) dk, Vi.vc8 = (uint8_t*) dv;
+            else Vi.kc = (uint16_t*) dk, Vi.vc = (uint16_t*) dv;
+            Vi.kv_host = true;
+            if (!g_kv_stage_k) g_kv_stage_k = dalloc<uint8_t>(b), g_kv_stage_v = dalloc<uint8_t>(b);
+        } else if (g_kv_fp8) {
             Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
             Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
         } else {
             Vi.kc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
             Vi.vc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
+        }
+        if (g_depth > 0 && !Vi.kv_host) {   // (IK2_DEPTH tests: the positions before the prompt read as zeros)
+            const size_t b = (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2);
+            CU(cudaMemset(g_kv_fp8 ? (void*) Vi.kc8 : (void*) Vi.kc, 0, b));
+            CU(cudaMemset(g_kv_fp8 ? (void*) Vi.vc8 : (void*) Vi.vc, 0, b));
         }
         Vi.h_k = dalloc<float>(3 * KD);
         Vi.h_v = dalloc<float>(3 * KD);
@@ -6378,7 +6515,8 @@ int main(int argc, char** argv) {
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         return 0;
     }
-    if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
+    if (g_depth + (int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
+    if (g_depth > 0 && (serve || drafter || g_lookup || g_dev[0].W.T_sup > 0)) die("IK2_DEPTH: the CLI's plain path only (no drafting)");
     // the prompt
     std::vector<float> logits;
     double t_exp = 0;
@@ -6408,7 +6546,7 @@ int main(int argc, char** argv) {
             const OutMode om = all ? OutMode::kLogits : (!last ? OutMode::kNone : ((gen > 0 || drafter) ? OutMode::kArgmax : OutMode::kNone));
             std::vector<float> lo;
             std::vector<int> ag;
-            forward(M, prompt.data() + p0, n, p0, all, om, all ? dump : std::string(), lo, &ag, t_exp);
+            forward(M, prompt.data() + p0, n, g_depth + p0, all, om, all ? dump : std::string(), lo, &ag, t_exp);
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
@@ -6479,7 +6617,7 @@ int main(int argc, char** argv) {
         if (i + 1 == gen) break;
         std::vector<int> ag;
         if (lo) logits.clear();
-        forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
+        forward(M, &tok, 1, g_depth + (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
                 logits, &ag, t_exp);
         if (lo) {
             std::fwrite(logits.data(), sizeof(float), (size_t) c.n_vocab, lo);

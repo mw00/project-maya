@@ -568,7 +568,9 @@ function ik2Fields(m, d, ch) {
   return [
     {label: "Model", rows: [
       contextRow(m, d, ch, {vram: kvb}, ["kv"],
-        fit && !fit.resident ? "At this size the model and its cache do not all fit on the card: the engine runs its slower path." : null),
+        fit && !fit.resident ? "At this size the model and its cache do not all fit on the card: the engine runs its slower path." +
+          (fit.kv_streamed ? ` About ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM (KV streaming).` : "")
+        : fit && fit.kv_streamed ? `At this size about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM (KV streaming): every expert stays on the card, but each token reads that part over the bus - slower the deeper a chat goes. The same answers.` : null),
       html`<${Row} label="Drafting" flag=${"--drafting " + ({auto: "auto", dspark: "on"}[d.draft] || "off")} changed=${ch("draft")}
         hint=${(m.choices.draft.includes("dspark") ? "The model's own drafter (DSpark) and the prompt lookup draft tokens the model checks: the same answers, faster where the drafts are kept (code, edits). " :
           "The prompt lookup drafts tokens the model checks (copied text): the same answers. ") +
