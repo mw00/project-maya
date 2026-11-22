@@ -18822,7 +18822,8 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(s));
         std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
         // pv_n is this run's resident prefix: slots lent to buffers are streamed, not hits.
-        if (S.collect_prefill && !S.prefill.add_bounds(b.data(), (size_t) n_vs, (size_t) L0.pv_n)) {
+        // Device-local routing totals; the model's Stats are merged by the owner after every worker finishes.
+        if (!S.prefill.add_bounds(b.data(), (size_t) n_vs, (size_t) L0.pv_n)) {
             err = "invalid prefill routing bounds for statistics";
             return false;
         }
@@ -19189,13 +19190,14 @@ struct Model::Impl {
     // layer after layer, each through all the chunks in order - a chunk's state to host memory after each of its
     // layers and back before the next - so a layer's experts are read from the files once for the whole run (the
     // layer cache keeps what a chunk read for the chunks after it), where chunk after chunk reads them once a chunk
-    bool run_dev_layers(int di, const Run& run, std::string& err, double stream_start) {
+    bool run_dev_layers(int di, const Run& run, std::string& err, double stream_start, PrefillCounts& counts) {
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
         Streamer S;   // (none: the flow streams)
+        PrefillCountsCapture capture{counts, S.prefill};
         const size_t hb = chunk_hand_bytes();
         // the Engram rows: (layer, chunk) after (layer, chunk) in the run's order, each read on a helper thread while
         // the one before runs (slot u % 2, once unit u - 2's copy of it is done)
@@ -19299,7 +19301,7 @@ struct Model::Impl {
         S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
         return true;
     }
-    bool run_dev_chunks(int di, const Run& run, std::string& err) {
+    bool run_dev_chunks(int di, const Run& run, std::string& err, PrefillCounts& counts) {
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
         // A selected helper/drafter-only device has no trunk chunks to admit.
@@ -19321,6 +19323,7 @@ struct Model::Impl {
         cudaStream_t s = d.st;
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
         Streamer S;
+        PrefillCountsCapture capture{counts, S.prefill};
         const double stream_start = c.stream_bytes;
         const int B = std::max(1, c.ring_n / Chunk::kParts);
         // (DS4_RUN_TRACE: this device's timeline of the run - each chunk's first layer and its end on the compute stream,
@@ -19380,7 +19383,7 @@ struct Model::Impl {
                     if (!flow_pump(c, err)) return false;
                 }
             }
-            if (c.lm) return run_dev_layers(di, run, err, stream_start);
+            if (c.lm) return run_dev_layers(di, run, err, stream_start, counts);
         }
         // (a device whose ring holds less than half a layer of its CPU-lane experts queues next to nothing ahead of a
         //  layer's routing anyway: every chunk of it skips - an RTX 3090's 400 MB, 17 of its ~210 a layer)
@@ -21374,10 +21377,11 @@ struct Model::Impl {
             part_failed = true;
             return false;
         }
+        std::vector<PrefillCounts> prefill_by_device(devs.size());
         for (size_t di = 0; di < devs.size(); ++di)
-            workers[di]->submit([this, di, &run, &errs] {
+            workers[di]->submit([this, di, &run, &errs, &prefill_by_device] {
                 std::string e;
-                if (!run_dev_chunks((int) di, run, e)) {
+                if (!run_dev_chunks((int) di, run, e, prefill_by_device[di])) {
                     errs[di] = e.empty() ? "a device's thread failed" : e;
                     // (said now: the other devices may wait on this one's work for good - the hand-off, the sums - and
                     //  the run's own report would never come)
@@ -21437,6 +21441,12 @@ struct Model::Impl {
             }
         }
         const double trc_done = now_ms();
+        // Worker::idle() acquired each worker's completion mutex. No device writes these Stats fields; no extra atomics or
+        // synchronization enter the layer/chunk path. Include routing completed before cancellation or failure.
+        PrefillCounts prefill_total;
+        for (const auto& counts : prefill_by_device) prefill_total.merge(counts);
+        st.pf_picks += (int64_t) prefill_total.picks;
+        st.pf_hits += (int64_t) prefill_total.vram_picks;
         main_at.store("a run of chunks: the devices done, the head next", std::memory_order_relaxed);
         if (part_run) {   // (the part's answer: its layers through the same chunks)
             bool here_ok = true;

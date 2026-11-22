@@ -3871,6 +3871,8 @@ class Service:
                  "eg_lookup_rows": "Consumer Engram row lookups since engine start",
                  "eg_lookup_hits": "Consumer Engram row lookups served without a file read since engine start",
                  "eg_lookup_reads": "Consumer Engram on-demand file reads since engine start (prefetch reads are separate)",
+                 "pf_picks": "Prefill expert-row picks since engine start (all devices)",
+                 "pf_hits": "Prefill expert-row picks already in VRAM since engine start (the rest streamed in)",
                  "slot_ram": "Parked DeepSeek conversations held in RAM",
                  "slot_disk": "Parked DeepSeek conversations held in the slot folder",
                  "slot_ram_bytes": "Parked DeepSeek conversation payload bytes in RAM",
@@ -5278,7 +5280,7 @@ class Service:
                     # over the time since it - `n / span` read a one-token answer as thousands of tok/s
                     rate = last["generated"] / (last["decode_ms"] / 1000) if n and last.get("generated") and \
                         last.get("decode_ms") else (n - 1) / (now - ft) if ft and n > 1 and now > ft else 0.0
-                    hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                    hit_msg = f", decode expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[maya] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("MAYA_DEBUG") and raw_ids:

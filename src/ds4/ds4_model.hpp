@@ -166,6 +166,9 @@ struct Stats {
     double lent_back_ms = 0.0;
     int64_t lend_kept = 0, lend_picks = 0;
     int64_t eg_ahead = 0;   // a prompt read in parts: Engram lookups of its next part's first chunk read ahead
+    // the prompt path's expert rows: routed, and of them the ones already in VRAM (the rest streamed in) - since the
+    // engine started, summed over its devices (the dashboard's Prefill VRAM hit; the decode's own hits ride DONE)
+    int64_t pf_picks = 0, pf_hits = 0;
 };
 
 class Model {

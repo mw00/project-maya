@@ -1438,6 +1438,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::snprintf(b, sizeof b, " eg_lookup_hits=%lld eg_lookup_reads=%lld", (long long) s.eg_hits,
                       (long long) s.eg_reads);
         out += b;
+        // the prompt path's expert rows (the dashboard's Prefill VRAM hit): routed and VRAM-resident, since the start
+        std::snprintf(b, sizeof b, " pf_picks=%lld pf_hits=%lld", (long long) s.pf_picks, (long long) s.pf_hits);
+        out += b;
         if (slot_max > 0) {
             int slot_ram = 0, slot_disk = 0;
             slot_count(slot_ram, slot_disk);

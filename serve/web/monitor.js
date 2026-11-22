@@ -83,6 +83,8 @@ function Throughput({m}) {
   const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
   const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   const hit = fresh && tn.vram_hit != null ? 100 * tn.vram_hit : last && last.hit_rate != null ? 100 * last.hit_rate : null;
+  // prefill: the prompt path's expert rows already in VRAM, since the engine started (the engine's STAT totals)
+  const phit = tn && tn.pf_picks > 0 ? 100 * (tn.pf_hits || 0) / tn.pf_picks : null;
   const a = sparkPath(h.tok_s), b = sparkPath(h.prefill_tok_s_mean);
   // (the drafters on, and the share of their drafts the model kept: live from the engine's STAT lines, else the last answer's)
   const spec = speculationView(m);
@@ -113,7 +115,8 @@ function Throughput({m}) {
     </div>
     <div class="stats">
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>
-      <div class="stat"><span class="stat__label">VRAM hit</span><${Num} v=${hit == null ? null : fmt(hit, 1)} unit="%"/></div>
+      <div class="stat" title="While writing the answer: the share of the routed experts that were already in VRAM. Live while an answer is written, else the last answer's."><span class="stat__label">Decode VRAM hit</span><${Num} v=${hit == null ? null : fmt(hit, 1)} unit="%"/></div>
+      <div class="stat" title="While reading the prompt: the share of the routed expert rows that were already in VRAM, the rest streamed in. Since the engine started, summed over its devices; a dash until a prompt has been read."><span class="stat__label">Prefill VRAM hit</span><${Num} v=${phit == null ? null : fmt(phit, 1)} unit="%"/></div>
       <div class="stat" title="Answers finished since the server started: the one being written counts when it ends"><span class="stat__label">Requests served</span><${Num} v=${m.totals && m.totals.requests != null ? fmt(m.totals.requests) : null}/></div>
       <div class="stat stat--spec" title=${spec.state === "off" ? "No drafter is running for this answer: every token comes from a full model step"
           : "Drafting: a small drafter proposes tokens and the full model checks them. Shown: the drafts the model kept of those offered, live while an answer is written, else the last answer's. A dash: nothing drafted yet."}>
@@ -580,7 +583,7 @@ function Requests({m}) {
     <div class=${`table-wrap${reqAll.on ? " is-all" : ""}`}><table class="table num">
       <thead><tr><th class="l">Time</th><th class="l">Status</th><th>Prompt</th><th title="Prompt tokens the conversation cache already held">Reused</th>
         <th title="Prompt tokens read per second (the reused ones not counted)">Prefill</th><th>Output</th>
-        <th title="Answer tokens written per second">Decode</th><th title="While writing the answer: the share of the routed experts that were already in VRAM">VRAM hit</th><th>Took</th></tr></thead>
+        <th title="Answer tokens written per second">Decode</th><th title="While writing the answer: the share of the routed experts that were already in VRAM">Decode VRAM hit</th><th>Took</th></tr></thead>
       <tbody>${rows.length ? rows.map((r) => {
         const [tone, text] = FINISH[r.finish] || ["muted", r.finish || "–"];
         const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
