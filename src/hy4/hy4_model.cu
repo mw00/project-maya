@@ -436,6 +436,7 @@ struct Gpu {
     cudaEvent_t evp = nullptr;
     unsigned* pf_sink = nullptr;
     size_t pf_cap = 0;   // (the bytes its cache was measured to hold - pf_probe; 0: no prefetch on this GPU)
+    int pf_early_il = -1;   // (the layer whose FFN has queued the next layer's attention matrices already)
     int pf_blocks = 0;   // (the prefetch kernel's blocks: one a multiprocessor)
     bool ixf = false, atf = false;   // (this GPU's forks: the indexer's, the window layers' - fork_wanted)
     int8_t* xq4 = nullptr;
@@ -2868,14 +2869,32 @@ struct Model::Impl {
 #endif
     const int pf_bits = pf_mode > 0 ? pf_mode : 15;
     const int pf_blocks_env = std::getenv("HY4_PF_BLOCKS") ? std::atoi(std::getenv("HY4_PF_BLOCKS")) : 0;
+    const bool pf_attn_early = !(std::getenv("HY4_PF_ATTN_EARLY") && std::atoi(std::getenv("HY4_PF_ATTN_EARLY")) == 0);
     static size_t mat_bytes(const Mat& m) { return m.w ? m.ld * (size_t) m.n * (size_t) std::max(1, m.batch) : 0; }
     // (queued on the member's prefetch stream, started when what its main stream holds so far is done; the matrices in
     //  their order as far as the cache holds them)
     //  (after: started when that event is done instead)
-    void pf_queue(Gpu& gp, std::initializer_list<const Mat*> ms, cudaEvent_t after = nullptr) {
+    //  (first: a few small arrays of floats - the norms' and the hyper-connections' weights the kernels right behind
+    //   the sum read, cold too, a memory trip of about a microsecond each kernel: a small job of its own before the
+    //   matrices', a thread a line.  The matrices' kernel is left as it is: with its ranges in shared memory, picked
+    //   by compares, or with more than 12 of them it reads behind the memory's speed and a window is 5% slower.
+    //   HY4_PF_SMALL=0: the matrices alone, as before)
+    struct PfSmall {
+        const float* p;
+        size_t n;
+    };
+    void pf_queue(Gpu& gp, std::initializer_list<const Mat*> ms, cudaEvent_t after = nullptr,
+                  std::initializer_list<PfSmall> first = {}) {
         if (gp.s5 == nullptr || gp.pf_cap == 0) return;
-        k::Prefetch j;
+        k::Prefetch j, js;
         size_t sum = 0;
+        static const bool small_on = !(std::getenv("HY4_PF_SMALL") && std::atoi(std::getenv("HY4_PF_SMALL")) == 0);
+        if (small_on)
+            for (const PfSmall& f : first)
+                if (f.p != nullptr && f.n > 0) {
+                    js.add((const uint8_t*) f.p, f.n * sizeof(float), true);
+                    sum += f.n * sizeof(float);
+                }
         for (const Mat* m : ms) {
             if (m == nullptr || m->w == nullptr) continue;
             const size_t b = mat_bytes(*m);
@@ -2883,22 +2902,27 @@ struct Model::Impl {
             sum += b;
             j.add(m->w, b);
         }
-        if (j.n == 0) return;
+        if (j.n == 0 && js.n == 0) return;
         if ((after == nullptr && cudaEventRecord(gp.evp, gp.s) != cudaSuccess) ||
             cudaStreamWaitEvent(gp.s5, after != nullptr ? after : gp.evp, 0) != cudaSuccess) {
             (void) cudaGetLastError();
             return;
         }
-        k::prefetch(j, gp.pf_sink, gp.s5, gp.pf_blocks);
+        if (js.n > 0) k::prefetch(js, gp.pf_sink, gp.s5, gp.pf_blocks, 1);
+        if (j.n > 0) k::prefetch(j, gp.pf_sink, gp.s5, gp.pf_blocks);
     }
     void pf_ffn(const Layer& l, Gpu& gp, int T) {   // (behind member l.tpm's attention partial)
         if (gp.s5 == nullptr || gp.pf_cap == 0 || T > W || l.tpm < 0) return;
         const bool a = (pf_bits & 1) != 0, b = (pf_bits & 2) != 0 && T <= 2;
+        const size_t E = (size_t) g.n_embd, hc = (size_t) g.hc;
+        const std::initializer_list<PfSmall> first = {{l.post_attn, E}, {l.hcf_fn, 2 * hc * hc * E}, {l.hcf_base, 2 * hc},
+                                                      {l.hcf_scale, 2}, {l.ffn_norm, E},
+                                                      {l.dense ? nullptr : l.router_b, (size_t) g.n_expert}};
         if (l.dense) {
-            if (a) pf_queue(gp, {&l.ffn_gate, &l.ffn_up, &l.ffn_down});
-        } else if (a || b) {
+            pf_queue(gp, {a ? &l.ffn_gate : nullptr, a ? &l.ffn_up : nullptr, a ? &l.ffn_down : nullptr}, nullptr, first);
+        } else {
             pf_queue(gp, {a ? &l.router : nullptr, a ? &l.rdown : nullptr, a ? &l.sh_gate : nullptr, a ? &l.sh_up : nullptr,
-                          b ? &l.rup : nullptr, b ? &l.sh_down : nullptr});
+                          b ? &l.rup : nullptr, b ? &l.sh_down : nullptr}, nullptr, first);
         }
     }
     const Layer* next_layer(const Layer& l) const {   // (member l.tpm's layer after l; null: none)
@@ -2910,15 +2934,20 @@ struct Model::Impl {
     }
     void pf_attn(const Layer& l, Gpu& gp, int T) {   // (behind its FFN partial: the next layer's)
         const Layer* n = next_layer(l);
-        if (n != nullptr) pf_attn_of(*n, gp, T, nullptr);
+        if (n != nullptr) pf_attn_of(*n, gp, T, nullptr, &l);
     }
     // (layer n's attention matrices: behind the main stream's state now, or behind `after`)
-    void pf_attn_of(const Layer& n, Gpu& gp, int T, cudaEvent_t after) {
+    void pf_attn_of(const Layer& n, Gpu& gp, int T, cudaEvent_t after, const Layer* before = nullptr) {
         if (gp.s5 == nullptr || gp.pf_cap == 0 || T > W || n.tpm < 0 || (pf_bits & 12) == 0) return;
         const bool a = (pf_bits & 4) != 0, b = (pf_bits & 8) != 0;
+        const size_t E = (size_t) g.n_embd, hc = (size_t) g.hc;
+        const std::initializer_list<PfSmall> first = {{before ? before->post_ffn : nullptr, E}, {n.hca_fn, 2 * hc * hc * E},
+                                                      {n.hca_base, 2 * hc}, {n.hca_scale, 2}, {n.attn_norm, E},
+                                                      {n.q_a_norm, (size_t) g.q_lora}, {n.kv_a_norm, (size_t) g.kv_lora},
+                                                      {n.sinks, (size_t) n.H}};
         pf_queue(gp, {a ? &n.q_a : nullptr, a ? &n.kv_a : nullptr, a ? &n.gate : nullptr, a && n.ix ? &n.ix_k : nullptr,
                       b ? &n.q_b : nullptr, b && n.ix ? &n.ix_q_b : nullptr, b ? &n.k_b : nullptr, b ? &n.v_b : nullptr,
-                      b ? &n.wo : nullptr}, after);
+                      b ? &n.wo : nullptr}, after, first);
     }
     // An Engram layer of a tensor-parallel member's token window: its lookup rows, their norm and their GEMV (25 MB of
     // weights every member reads, and nothing of the layer's state) go on the side stream behind the layer before's FFN
@@ -5290,6 +5319,18 @@ struct Model::Impl {
         a.hq = gp.ehq;
         a.hd = gp.ehd;
         ok = ok && iq::down(a, groups, ne_max, s);
+        // (the next layer's attention matrices read ahead from here - behind the experts' last kernel, the memory's last
+        //  busy one of the layer - not from behind the FFN's partial some 20 us later: the job is 22 MB on most layers,
+        //  about 55 us of reading, where the sum's round trip and the mix leave some 43 before the first of them is
+        //  used - it ended inside the layer's first GEMVs.  HY4_PF_ATTN_EARLY=0: behind the partial, as before)
+        if (pf_attn_early && gp.s5 != nullptr && l.tpm >= 0 && l.tpm < tp && &gp == &G[(size_t) mem[(size_t) l.tpm]] &&
+            T <= W) {   // (a member's layer - not a helper's slices)
+            const Layer* n = next_layer(l);
+            if (n != nullptr && !eg_early(*n, gp, T)) {
+                pf_attn_of(*n, gp, T, nullptr, &l);
+                gp.pf_early_il = l.il;
+            }
+        }
         const bool pre = k::moe_sum(gp.part, T, nu, lat, gp.rw, out, s, q8o(f8 && out_pre != nullptr, gp.xq, gp.xd));
         if (out_pre != nullptr) *out_pre = pre;
         return ok;
@@ -8170,7 +8211,8 @@ struct Model::Impl {
         } else if (pf != nullptr && pf_kind == 2) {
             const Layer* n = next_layer(*pf);
             if (n != nullptr && eg_early(*n, gp, pf_T) && cudaEventRecord(gp.evg, gp.s) == cudaSuccess) gp.eg_armed = n->il;
-            else pf_attn(*pf, gp, pf_T);   // (an armed Engram layer's: engram() queues it behind its GEMV)
+            else if (gp.pf_early_il != pf->il) pf_attn(*pf, gp, pf_T);   // (an armed Engram layer's: engram() queues it behind its GEMV)
+            gp.pf_early_il = -1;
         }
         k::wait_pull(tp_fin, v, buf, tp_sum, n, gp.s);
     }

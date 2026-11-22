@@ -3190,11 +3190,13 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
     check("publish");
     submit(s);
 }
-void prefetch(const Prefetch& j, unsigned* sink, cudaStream_t s, int max_blocks) {
+void prefetch(const Prefetch& j, unsigned* sink, cudaStream_t s, int max_blocks, int lines) {
     if (j.n <= 0 || j.pre[j.n] == 0) return;
-    // (a thread a few lines: 16 thousand threads and more read 5 MB at the memory's speed, 4 thousand at half of it)
+    // (a thread a few lines: 16 thousand threads and more read 5 MB at the memory's speed, 4 thousand at half of it;
+    //  lines 1: a small job's - a thread a line where the blocks allow, each line a memory trip the thread waits for)
     const unsigned blocks = (unsigned) std::max<uint32_t>(
-        8, std::min<uint32_t>(max_blocks > 0 ? (uint32_t) max_blocks : 128u, j.pre[j.n] / (256 * 8)));
+        lines > 1 ? 8 : 1, std::min<uint32_t>(max_blocks > 0 ? (uint32_t) max_blocks : 128u,
+                                             (j.pre[j.n] + 256 * (uint32_t) lines - 1) / (256 * (uint32_t) lines)));
     prefetch_kernel<<<blocks, 256, 0, s>>>(j, sink);
     check("prefetch");
 }

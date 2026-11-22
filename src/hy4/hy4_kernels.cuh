@@ -308,17 +308,18 @@ struct Prefetch {
     const uint8_t* p[kMax];
     uint32_t pre[kMax + 1];   // (lines before range i; pre[n]: all of them)
     int n = 0;
-    void add(const uint8_t* w, size_t bytes) {   // (the whole 4-byte words inside [w, w + bytes))
+    // (the whole 4-byte words inside [w, w + bytes); small: a range of a few bytes too - a norm's or a mix's weights)
+    void add(const uint8_t* w, size_t bytes, bool small = false) {
         const uint8_t* a = (const uint8_t*) (((uintptr_t) w + 3) & ~(uintptr_t) 3);
         const uint8_t* e = w + bytes;
-        if (w == nullptr || n >= kMax || e < a + 64) return;
+        if (w == nullptr || n >= kMax || e < a + (small ? 4 : 64)) return;
         if (n == 0) pre[0] = 0;
         p[n] = a;
         pre[n + 1] = pre[n] + (uint32_t) ((size_t) (e - a - 4) / 32 + 1);
         ++n;
     }
 };
-void prefetch(const Prefetch& j, unsigned* sink, cudaStream_t s, int max_blocks = 0);
+void prefetch(const Prefetch& j, unsigned* sink, cudaStream_t s, int max_blocks = 0, int lines = 8);
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s);
 /// dst = a (na words) | b (nb) | c (nc), 4-byte words; split3 the other way
 void pack3(const void* a, size_t na, const void* b, size_t nb, const void* c, size_t nc, void* dst, cudaStream_t s);
