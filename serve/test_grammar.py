@@ -26,6 +26,39 @@ class GrammarAdapter(unittest.TestCase):
         return Service(engine or MockEngine(tok, "A", max_context=4096), tok,
                        ChatTemplate(ROOT / "serve/chat_template.jinja"))
 
+    def test_parallel_grammar_cancel_during_quiet_read_keeps_fast_stop_and_cleans_file(self):
+        # #1057's prompt-read retry fix must also pass through the grammar file wrapper.
+        import time
+        from serve.test_multi import QUIET_READ_ENGINE, script_exe
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "quiet-read-engine.py"
+            script.write_text(QUIET_READ_ENGINE)
+            script.chmod(0o755)
+            engine = StrataEngine(script_exe(script), [])
+            try:
+                cancel = threading.Event()
+                paths = []
+                original = engine.grammar_keys
+                def keys(sampling):
+                    paths.append(Path(sampling["_grammar_path"]))
+                    return original(sampling)
+                with patch.object(engine, "grammar_keys", side_effect=keys), patch("serve.server.REQUEST_QUIET_S", 0):
+                    gen = engine.generate(list(range(10)), 10, {"_grammar_text": GRAMMAR}, cancel)
+                    self.assertIsNone(next(gen))
+                    self.assertTrue(paths[0].exists())
+                    timer = threading.Timer(0.2, cancel.set)
+                    timer.start()
+                    started = time.monotonic()
+                    self.assertEqual(list(gen), [])
+                    self.assertLess(time.monotonic() - started, 3.0)
+                    timer.join()
+                self.assertEqual(engine.last.get("finish"), "cancel")
+                self.assertEqual(engine._routes, {})
+                self.assertTrue(paths)
+                self.assertTrue(all(not path.exists() for path in paths))
+            finally:
+                engine.close()
+
     def test_aliases_and_ambiguities(self):
         self.assertEqual(structured.normalize_request({"grammar": GRAMMAR, "structured_outputs": {
             "grammar": GRAMMAR, "disable_any_whitespace": True}}), (GRAMMAR, None))
