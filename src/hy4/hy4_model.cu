@@ -21,6 +21,7 @@
 #include "hy4_plan.hpp"
 #include "hy4_pstream.hpp"
 #include "hy4_ring.hpp"
+#include "hy4_snap.hpp"
 #include "hy4_spill.hpp"
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
@@ -857,6 +858,134 @@ struct Model::Impl {
     // the lowest position the sliding-window rings (and hring) may still hold: a rewind moves `end` back, but the
     // slots of the positions below the old end - ring were overwritten when the sequence was read (#1091)
     int64_t ring_lo = 0;
+    // restore points (Options::snap_every, hy4_snap.hpp): slot i keeps the point (i + 1) * snap_every - each
+    // sliding-window layer's rows of the n_swa positions before it, then the head's state a position before (the MTP
+    // block's first input) - in pinned host memory (snap_host[i], snap_bytes; kept once allocated)
+    std::vector<SnapPoint> snaps;
+    std::vector<uint8_t*> snap_host;
+    size_t snap_bytes = 0;
+    bool snap_setup(std::string& err) {
+        if (o.snap_every <= 0) return true;
+        if (o.snap_every % g.ix_kpool || o.snap_every < g.n_swa || g.ix_kpool > g.n_swa) {
+            err = "--snap-every " + std::to_string(o.snap_every) + ": a multiple of " + std::to_string(g.ix_kpool) +
+                  ", at least " + std::to_string(g.n_swa);
+            return false;
+        }
+        // (rows a restore point does not hold: tensor parallel's rings, the DFly2 drafter's caches, the indexed layers'
+        //  rows when they are streamed - a start with one of these keeps none, and says so)
+        const char* why = tp > 1 ? "tensor parallel" : o.dfly2 ? "the DFly2 drafter" : nullptr;
+        for (const Layer& l : L)
+            if (!why && l.res > 0) why = "KV streaming";
+        if (why) {
+            info.push_back(std::string("INFO restore points: off with ") + why + " (--snap-every keeps none there)");
+            return true;
+        }
+        size_t b = sizeof(float) * (size_t) g.n_embd;
+        for (const Layer& l : L)
+            if (l.ring > 0) b += (size_t) g.n_swa * kv_rb();
+        snap_bytes = b;
+        snaps.assign((size_t) (o.max_ctx / o.snap_every), SnapPoint{});
+        snap_host.assign(snaps.size(), nullptr);
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "INFO restore points: every %d positions, %.1f MB each in pinned host memory (%.2f GB at the full "
+                      "context)",
+                      o.snap_every, (double) snap_bytes / 1e6, (double) snap_bytes * (double) snaps.size() / 1e9);
+        info.push_back(buf);
+        return true;
+    }
+    // rows [a, a + n) of a ring of `ring` rows of rb bytes to (out) or from the host (n <= ring: two runs at most)
+    bool snap_copy(uint8_t* dev, size_t rb, int64_t a, int n, uint8_t* host, cudaStream_t s, bool out,
+                   std::string& err) {
+        for (int d = 0; d < n;) {
+            const int64_t r0 = (a + d) % ring;
+            const int run = (int) std::min<int64_t>(n - d, ring - r0);
+            if (out)
+                CK(cudaMemcpyAsync(host + (size_t) d * rb, dev + (size_t) r0 * rb, (size_t) run * rb,
+                                   cudaMemcpyDeviceToHost, s));
+            else
+                CK(cudaMemcpyAsync(dev + (size_t) r0 * rb, host + (size_t) d * rb, (size_t) run * rb,
+                                   cudaMemcpyHostToDevice, s));
+            d += run;
+        }
+        return true;
+    }
+    // before a window at q (the positions before it are the sequence's): the points the rings still hold, each copy
+    // queued on its layer's stream ahead of the window that may write over the rows
+    bool snap_take(int64_t q, std::string& err) {
+        if (snaps.empty()) return true;
+        const int n = g.n_swa, step = o.snap_every;
+        int dev0 = 0;
+        CK(cudaGetDevice(&dev0));
+        for (int64_t s = snap_first(q, ring_lo, ring, n, step); s <= q; s += step) {
+            const size_t i = (size_t) (s / step - 1);
+            if (i >= snaps.size()) break;
+            if (snaps[i].at == s) continue;   // (held: this sequence's - another's was dropped)
+            uint8_t*& host = snap_host[i];
+            if (!host && cudaHostAlloc((void**) &host, snap_bytes, cudaHostAllocPortable) != cudaSuccess) {
+                (void) cudaGetLastError();
+                host = nullptr;
+                break;   // (no pinned memory left: no more points, the rest as without them)
+            }
+            size_t off = 0;
+            for (Layer& l : L) {
+                if (l.ring <= 0) continue;
+                Gpu& gp = G[(size_t) l.gpu];
+                CK(cudaSetDevice(gp.dev));
+                if (!snap_copy((uint8_t*) l.kv, kv_rb(), s - n, n, host + off, gp.s, true, err)) return false;
+                off += (size_t) n * kv_rb();
+            }
+            Gpu& hg = G[(size_t) head_gpu];
+            CK(cudaSetDevice(hg.dev));
+            if (!snap_copy((uint8_t*) hring, sizeof(float) * (size_t) g.n_embd, s - 1, 1, host + off, hg.s, true, err))
+                return false;
+            snaps[i] = SnapPoint{s, snap_hash(tokens.data(), s)};
+        }
+        CK(cudaSetDevice(dev0));
+        return true;
+    }
+    // the latest point at or before upto whose sequence is ids' start, put back in the rings (every stream idle first)
+    // and the sequence cut there: its position.  0: none, or a CUDA error (err) - the caller reads from 0, which
+    // writes the rings over
+    int64_t snap_restore(const int* ids, int64_t upto, std::string& err) {
+        const int64_t i = snap_pick(snaps, ids, upto, end);
+        if (i < 0) return 0;
+        const int n = g.n_swa;
+        const int64_t s = snaps[(size_t) i].at;
+        uint8_t* host = snap_host[(size_t) i];
+        int dev0 = 0;
+        CK(cudaGetDevice(&dev0));
+        mtp_settle();
+        for (Gpu& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            CK(cudaStreamSynchronize(gp.s));
+        }
+        size_t off = 0;
+        for (Layer& l : L) {
+            if (l.ring <= 0) continue;
+            Gpu& gp = G[(size_t) l.gpu];
+            CK(cudaSetDevice(gp.dev));
+            if (!snap_copy((uint8_t*) l.kv, kv_rb(), s - n, n, host + off, gp.s, false, err)) return 0;
+            off += (size_t) n * kv_rb();
+        }
+        Gpu& hg = G[(size_t) head_gpu];
+        CK(cudaSetDevice(hg.dev));
+        if (!snap_copy((uint8_t*) hring, sizeof(float) * (size_t) g.n_embd, s - 1, 1, host + off, hg.s, false, err))
+            return 0;
+        for (Gpu& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            CK(cudaStreamSynchronize(gp.s));
+        }
+        CK(cudaSetDevice(dev0));
+        snap_drop(snaps, s);
+        tokens.resize((size_t) s);
+        end = s;
+        ring_lo = snap_ring_lo(s, n);
+        mtp_done = s;   // (hring holds the row before the point only: the MTP block's rows below it are left as they
+                        //  are, as a rewind leaves the states written over before it)
+        mtp_apos = -1;  // (no MTP anchor across a restore)
+        return s;
+    }
     std::unique_ptr<Vision> vis;         // the vision tower (Options::vision)
     VisionGeo vgeo;
     double vis_room = 0;                 // its room for the largest picture this start reads
@@ -1049,6 +1178,8 @@ struct Model::Impl {
         for (uint16_t* p : kv_host)
             if (p) cudaFreeHost(p);
         for (int* p : sp_host)
+            if (p) cudaFreeHost(p);
+        for (uint8_t* p : snap_host)
             if (p) cudaFreeHost(p);
         for (Gpu& gp : G)
             for (void* p : {(void*) gp.hs_ids, (void*) gp.hs_stage, (void*) gp.hs_pmap})
@@ -9760,7 +9891,8 @@ bool Model::load(const Options& o, std::string& err) {
         std::fprintf(stderr, "maya-hy4: %s%s\n", buf + 5, how.c_str());
         return true;
     };
-    if (std::getenv("HY4_NO_WARMUP")) return measure();
+    // (the restore points start after the warm-up and the measuring: their forwards are not a client's sequence)
+    if (std::getenv("HY4_NO_WARMUP")) return measure() && m->snap_setup(err);
     const double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     const Stats keep = m->st;
     const int T = std::min<int64_t>(m->Tc, m->o.max_ctx - 8), V = m->g.n_vocab;
@@ -9811,7 +9943,7 @@ bool Model::load(const Options& o, std::string& err) {
     std::snprintf(buf, sizeof buf, "INFO warmed up in %.1f s (a prompt chunk, a token window, a draft%s)", t1 - t0,
                   m->vis ? ", a picture" : "");
     m->info.push_back(buf);
-    return measure() && measure_pc();
+    return measure() && measure_pc() && m->snap_setup(err);
 }
 
 bool Model::resumable(int64_t pos) const {
@@ -9819,6 +9951,7 @@ bool Model::resumable(int64_t pos) const {
     return ring_holds(pos, m->end, m->ring_lo, m->ring, (int64_t) std::max(m->g.n_swa, m->g.ix_kpool) - 1);
 }
 int64_t Model::end() const { return m->end; }
+int64_t Model::restore(const int* ids, int64_t upto, std::string& err) { return m->snap_restore(ids, upto, err); }
 
 bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err) {
     if (n <= 0) {
@@ -9852,6 +9985,7 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         }
     }
     m->ring_lo = ring_lo_at(pos0, m->ring_lo, m->end, m->ring);   // (#1091)
+    snap_drop(m->snaps, pos0);   // (restore points past pos0 are another sequence's)
     m->tokens.resize((size_t) pos0);
     // (the MTP cache's rows from pos0 on are the drafts' own - but the row at pos0 when this is the token the last
     //  drafts started from, there: that one is the model's)
@@ -9867,6 +10001,7 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
     while (done < n) {
         const int T = done < head ? std::min(Tc, head - done) : last;
         if (m->spill() && !m->spill_flush(pos0 + done, pos0 + done, err)) return false;
+        if (!m->snap_take(pos0 + done, err)) return false;   // (restore points the window may write over)
         if (!m->window(ids + done, T, pos0 + done, done + T == n ? want : 0, logits_out, err)) {
             m->name_fault(err);
             return false;

@@ -2700,6 +2700,21 @@ drive only are read from it before its attention (the same bits). The start meas
 drive that reads slower than 10 MB/s in 4 KB pieces one at a time (a hard disk; an NVMe reads about 50). `--kv-spill off` never uses a drive; `on` asks for
 it where the context is streamed.
 
+**Restore points (Hy4-Flash, opt-in).** The 30 sliding-window layers keep their rows in rings of the last 16,896
+positions (the 512 of the window and `HY4_RING_SLACK`'s 16,384), so a prompt that leaves the conversation further back
+than that - an agent client that compacts its history, or rewrites an early message - is read again from 0.
+`--snap-every N` (off by default; a multiple of 4, at least 512) copies what a read from N, 2N, ... needs that the rings
+write over later - the sliding-window layers' rows of the 512 positions before it and the trunk's state a position
+before (the MTP block's first input) - to pinned RAM as the conversation passes the point, and such a prompt is read
+from the latest point at or before where it leaves the conversation (`maya hy4 serve: restore point P of S shared
+tokens`). The indexed layers' and the MTP block's caches keep a row a position, so a point needs nothing of them. A point
+is kept only while the conversation still starts with its tokens (checked by a hash of them before it is used). The
+start says the size (`INFO restore points: every 2048 positions, 10.3 MB each in pinned host memory (1.32 GB at the full
+context)` with `--kv q8` at 262,144 tokens). The rows put back are the bits the read wrote; the positions after the point
+are read as a continuation is, so where a prompt's kernels depend on the chunk's shape (the indexer's tensor-core scores,
+`HY4_IX_GEMM`) a word can differ from a read from 0, as it can after any reuse. With tensor parallel, the DFly2 drafter
+or KV streaming the start keeps none and says so.
+
 Engine options, in the config's `"args"`:
 
 | Option | Default | What it does |
@@ -2725,6 +2740,7 @@ Engine options, in the config's `"args"`:
 | `--draft-streak` | 1 | with `--draft-more`: the steps in a row with all their drafts kept that an added draft needs (`0`: none) |
 | `--eos` | the GGUF's | the token ids that end an answer |
 | `--kv` | `auto` | the latent cache's rows: `f16`, `q8` (8 bits: 58% of the VRAM a position), or `auto` - F16 where the context fits in VRAM with it, the 8-bit rows where it fits only with them (any layout: one GPU, the layer split, tensor parallel) |
+| `--snap-every` | 0 (off) | restore points every N positions (a multiple of 4, at least 512): a prompt that leaves the conversation where the rings no longer reach is read from the latest one before it instead of from 0 (above) |
 | `--vision` | on when the pack has the tower | `off`: text only, and no room kept for pictures on the main GPU; `on`: an error when the pack has no tower |
 | `--images` | - | with `--ids`: a pictures file (the server's GENI file, `MMI1`) for the prompt's image spans |
 
