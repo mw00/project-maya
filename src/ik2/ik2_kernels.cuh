@@ -446,6 +446,17 @@ void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int 
 void draft_attn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float k_inv, float v_inv, float* scratch,
                     float* out, cudaStream_t s, int cap);
+/// draft_attn for a recorded graph: the block's position read on the device (par[0] = P), its context keys the span
+/// before it ([max(0, P - span), P)); the same output as draft_attn(k_lo, P).
+void draft_attn_dyn(const float* q, const float* kc, const float* vc, const int* par, int span, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                    int cap);
+void draft_attn_dyn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, const int* par, int span,
+                        const float* kb, const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
+                        cudaStream_t s, int cap);
+void draft_attn_dyn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, const int* par, int span, const float* kb,
+                        const float* vb, int nq, int H, int Hkv, float scale, float k_inv, float v_inv, float* scratch,
+                        float* out, cudaStream_t s, int cap);
 size_t draft_attn_scratch(int H);
 /// y [n] = E4M3 of x [n] * scale (saturating at +-448).
 void to_e4m3(const float* x, size_t n, float scale, uint8_t* y, cudaStream_t s);

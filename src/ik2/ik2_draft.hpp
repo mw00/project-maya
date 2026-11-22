@@ -58,6 +58,8 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 /// The base logits through the target's head kept as planar Q8_0 (int8 [n_rows][C], FP16 scales [n_rows][C / 32]):
 /// propose's lm_f16 is not read then (the FP16 copy is fold()'s only).
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
+/// propose's mean host time to queue its launches and its wait for them after, ms (a profile).
+void propose_times(double* submit_ms, double* wait_ms);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
 

@@ -4590,11 +4590,18 @@ __device__ __forceinline__ float ld_f(const uint8_t* p) { return e4m3fn_to_f32(*
 template <class KVT>
 __global__ void draft_attn_part_kernel(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi,
                                        const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int per,
-                                       float* part_o, float2* part_ml, int cap, float k_mul, float v_mul) {
+                                       float* part_o, float2* part_ml, int cap, float k_mul, float v_mul,
+                                       const int* par = nullptr, int span = 0) {
     __shared__ float sh[128];
     __shared__ float qs[kDraftQ][128];
     __shared__ float lg[kDraftQ][kDraftTile];
     __shared__ float m_run[kDraftQ], l_run[kDraftQ], corr[kDraftQ];
+    if (par) {   // (a replayed graph: the block's position read here - its keys [P - span, P), the chunks they need)
+        k_hi = par[0], k_lo = max(0, k_hi - span);
+        const int nk0 = k_hi - k_lo + nq, s0 = max(1, min(64, (nk0 + 31) / 32));
+        per = (nk0 + s0 - 1) / s0;
+        if ((int) blockIdx.y >= s0) return;
+    }
     const int h = blockIdx.x, sp = blockIdx.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int KD = Hkv * 128, nc = k_hi - k_lo, nk = nc + nq;
     const int j0 = min(nk, sp * per), j1 = min(nk, j0 + per), n = j1 - j0;
@@ -4664,8 +4671,13 @@ __global__ void draft_attn_part_kernel(const float* q, const KVT* kc, const KVT*
     for (int qi = 0; qi < nq; ++qi) part_o[(((size_t) sp * H + h) * kDraftQ + qi) * 128 + tid] = o[qi];
     if (tid < nq) part_ml[((size_t) sp * H + h) * kDraftQ + tid] = make_float2(m_run[tid], l_run[tid]);
 }
-__global__ void draft_attn_merge_kernel(const float* part_o, const float2* part_ml, int S, int H, float* out) {
+__global__ void draft_attn_merge_kernel(const float* part_o, const float2* part_ml, int S, int H, float* out,
+                                        const int* par = nullptr, int span = 0, int nq = 0) {
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
+    if (par) {
+        const int k_hi = par[0], nk0 = k_hi - max(0, k_hi - span) + nq;
+        S = max(1, min(64, (nk0 + 31) / 32));
+    }
     float m = -INFINITY;
     for (int sp = 0; sp < S; ++sp) m = fmaxf(m, part_ml[((size_t) sp * H + h) * kDraftQ + qi].x);
     float den = 0.0f, acc = 0.0f;
@@ -6552,6 +6564,41 @@ static void draft_attn_impl(const float* q, const KVT* kc, const KVT* vc, int k_
     check("draft_attn (chunks)");
     draft_attn_merge_kernel<<<dim3((unsigned) H, (unsigned) nq), 128, 0, s>>>(part_o, part_ml, S, H, out);
     check("draft_attn (merge)");
+}
+// ... the block's position on the device (par[0]) and its keys the span before it: the launches of a recorded graph
+// (the chunks' grid the most the span needs; the blocks past what the position needs return at once)
+template <class KVT>
+static void draft_attn_dyn_impl(const float* q, const KVT* kc, const KVT* vc, const int* par, int span, const float* kb,
+                                const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
+                                cudaStream_t s, int cap, float k_mul = 1.0f, float v_mul = 1.0f) {
+    if (nq > kDraftQ || span < 0) {
+        std::fprintf(stderr, "ik2::k::draft_attn_dyn: %d queries, a span of %d\n", nq, span);
+        std::abort();
+    }
+    const int s_max = std::max(1, std::min(64, (span + nq + 31) / 32));
+    float* part_o = scratch;
+    float2* part_ml = (float2*) (part_o + (size_t) s_max * H * kDraftQ * 128);
+    draft_attn_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) s_max), 128, 0, s>>>(
+        q, kc, vc, 0, 0, kb, vb, nq, H, Hkv, scale, 0, part_o, part_ml, cap > 0 ? cap : (1 << 30), k_mul, v_mul, par,
+        span);
+    check("draft_attn_dyn (chunks)");
+    draft_attn_merge_kernel<<<dim3((unsigned) H, (unsigned) nq), 128, 0, s>>>(part_o, part_ml, 0, H, out, par, span, nq);
+    check("draft_attn_dyn (merge)");
+}
+void draft_attn_dyn(const float* q, const float* kc, const float* vc, const int* par, int span, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                    int cap) {
+    draft_attn_dyn_impl<float>(q, kc, vc, par, span, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
+}
+void draft_attn_dyn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, const int* par, int span,
+                        const float* kb, const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
+                        cudaStream_t s, int cap) {
+    draft_attn_dyn_impl<uint16_t>(q, kc, vc, par, span, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
+}
+void draft_attn_dyn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, const int* par, int span, const float* kb,
+                        const float* vb, int nq, int H, int Hkv, float scale, float k_inv, float v_inv, float* scratch,
+                        float* out, cudaStream_t s, int cap) {
+    draft_attn_dyn_impl<uint8_t>(q, kc, vc, par, span, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap, k_inv, v_inv);
 }
 void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int k_hi, const float* kb, const float* vb,
                 int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s, int cap) {

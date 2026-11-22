@@ -8503,6 +8503,11 @@ int main(int argc, char** argv) {
                     (unsigned long long) g_sp_n, g_sp_draft * 1e3 / g_sp_n, g_sp_block * 1e3 / g_sp_n,
                     g_sp_tail * 1e3 / g_sp_n);
     if (g_sp_n) std::printf("step widths and kept drafts: %s\n", g_sp_seq.c_str());
+    if (g_sp_n && drafter) {
+        double sub = 0, wait = 0;
+        ik2::draft::propose_times(&sub, &wait);
+        std::printf("the drafter's step: %.2f ms queueing its launches, %.2f ms waiting for them after\n", sub, wait);
+    }
     if (g_window_rows)
         std::printf("window check: %llu of %llu rows the one-token path's to the bit\n",
                     (unsigned long long) g_window_same, (unsigned long long) g_window_rows);

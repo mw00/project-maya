@@ -26,6 +26,7 @@ static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -380,6 +381,13 @@ struct Drafter {
     __half* x16;
     int *pos, *ctx_pos, *toks;
     int* h_out = nullptr;   // pinned host [kBlock - 1]
+    // a step's launches as a recorded CUDA graph, one a draft count (a GGUF drafter - no cuBLAS call in it): the
+    // block's position and anchor go through par (pinned par_h copied in by the graph), the attention reads them there
+    int* par = nullptr;     // device [2]: P, anchor
+    int* par_h = nullptr;   // pinned host
+    cudaGraphExec_t graph[kBlock] = {};
+    const float* graph_anchor = nullptr;   // (the anchor row the graphs were recorded with)
+    int graph_rows = 0, graph_vocab = 0;
 };
 
 namespace {
@@ -393,7 +401,8 @@ __global__ void iota_kernel(int* out, int start, int n) {
 }
 
 __global__ void init_block_kernel(const float* anchor_h, const float* mask, float* res, int* pos, int* toks, int T,
-                                  int C, int P, int anchor) {
+                                  int C, int P, int anchor, const int* par) {
+    if (par) P = par[0], anchor = par[1];   // (a recorded graph: read here)
     const int t = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (t == 0 && blockIdx.x == 0) {
@@ -496,7 +505,31 @@ void act(Drafter* d, const float* x, size_t n, uint16_t* y) {
     else k::to_bf16(x, n, y, d->s);
 }
 
-void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
+// y [N] = W [N][K] . x [K], both BF16, F32 sums - the Markov head's projection as a kernel of ours (a warp a row, a
+// lane 8 values a step), so that a step's launches can be a recorded graph.  K a multiple of 256.
+__global__ void rnn_proj_bf_kernel(const uint16_t* __restrict__ W, const uint16_t* __restrict__ x, int N, int K,
+                                   float* __restrict__ y) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint4* w4 = (const uint4*) (W + (size_t) row * K) + lane;
+    const uint4* x4 = (const uint4*) x + lane;
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int i = 0, n = K >> 8; i < n; ++i) {
+        const uint4 w = __ldg(w4 + i * 32), v = __ldg(x4 + i * 32);
+        const uint32_t ww[4] = {w.x, w.y, w.z, w.w}, vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc = fmaf(__uint_as_float((ww[j] & 0xFFFFu) << 16), __uint_as_float((vv[j] & 0xFFFFu) << 16), acc);
+            acc = fmaf(__uint_as_float(ww[j] & 0xFFFF0000u), __uint_as_float(vv[j] & 0xFFFF0000u), acc);
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[row] = acc;
+}
+
+void layer_attn(Drafter* d, DLayer& l, int P, float* out, bool dyn = false) {
     const int T = kBlock, HD = d->H * 128, KD = d->KV * 128;
     act(d, d->h, (size_t) T * d->C, d->hb);
     gemm(d, l.wq, HD, d->C, d->hb, T, d->q, HD);
@@ -509,7 +542,19 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     // Local layers (0, 1, 3, 4): a window of 1024 positions anchored at the block's start -
     // every query in the block [P .. P+7] sees context [max(0, P - 1023) .. P-1] plus all 8 block tokens.
     const int k_lo = l.local ? std::max(0, P - 1023) : std::max(0, P - l.cap);
-    if (l.kc8)
+    const float sc = 1.0f / std::sqrt(128.0f);
+    if (dyn) {   // (a recorded graph: the position from d->par, the keys the layer's span before it)
+        const int span = l.local ? 1023 : l.cap;
+        if (l.kc8)
+            k::draft_attn_dyn_fp8(d->q, l.kc8, l.vc8, d->par, span, d->kk, d->vv, T, d->H, d->KV, sc, 1.0f / d->k_scale,
+                                  1.0f / d->v_scale, d->scratch, d->o, d->s, l.cap);
+        else if (l.kc16)
+            k::draft_attn_dyn_f16(d->q, l.kc16, l.vc16, d->par, span, d->kk, d->vv, T, d->H, d->KV, sc, d->scratch, d->o,
+                                  d->s, l.cap);
+        else
+            k::draft_attn_dyn(d->q, l.kc, l.vc, d->par, span, d->kk, d->vv, T, d->H, d->KV, sc, d->scratch, d->o, d->s,
+                              l.cap);
+    } else if (l.kc8)
         k::draft_attn_fp8(d->q, l.kc8, l.vc8, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
                           1.0f / d->k_scale, 1.0f / d->v_scale, d->scratch, d->o, d->s, l.cap);
     else if (l.kc16)
@@ -689,6 +734,8 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->x16 = dalloc<__half>((kBlock - 1) * (size_t) C);
     d->pos = dalloc<int>(T), d->ctx_pos = dalloc<int>(kMixRows), d->toks = dalloc<int>(kBlock);
     cu(cudaHostAlloc(&d->h_out, (kBlock - 1) * sizeof(int), cudaHostAllocDefault), "h_out");
+    d->par = dalloc<int>(2);
+    cu(cudaHostAlloc(&d->par_h, 2 * sizeof(int), cudaHostAllocDefault), "par_h");
     return d;
 }
 
@@ -786,20 +833,33 @@ void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
                d->eps, d->f_rnn, d->s);
 }
 
-void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out, int proposals) {
+double g_prop_submit = 0, g_prop_wait = 0;
+uint64_t g_prop_n = 0;
+void propose_times(double* submit_ms, double* wait_ms) {
+    *submit_ms = g_prop_n ? g_prop_submit * 1e3 / g_prop_n : 0, *wait_ms = g_prop_n ? g_prop_wait * 1e3 / g_prop_n : 0;
+}
+static double pnow() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+namespace {
+// a step's launches; dyn: for a recorded graph - the position and the anchor read from d->par on the device
+void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows,
+                      int n_vocab, int proposals, bool dyn) {
     const int C = d->C, T = kBlock;
+    if (dyn) cu(cudaMemcpyAsync(d->par, d->par_h, 2 * sizeof(int), cudaMemcpyHostToDevice, d->s), "par");
     // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
     // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
     init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
-        anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor);
+        anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor, dyn ? d->par : nullptr);
     const size_t TC = (size_t) T * C;
     // pre-norm layers, the residual carried apart (res = x + res before each norm)
     for (size_t i = 0; i < d->L.size(); ++i) {
         DLayer& l = d->L[i];
         if (i > 0) k::add(d->x, d->res, TC, d->res, d->s);
         k::rms(d->res, l.in_norm, T, C, d->eps, d->h, d->s);
-        layer_attn(d, l, P, d->x);
+        layer_attn(d, l, P, d->x, dyn);
         k::add(d->x, d->res, TC, d->res, d->s);
         k::rms(d->res, l.post_norm, T, C, d->eps, d->h, d->s);
         layer_mlp(d, l, d->x);
@@ -821,9 +881,14 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     // the Markov head, a token at a time (note: k::rnn_gates keeps state/latent in F32, its gate/tanh steps not
     // rounded to BF16 between them; fused argmax_gemv_f16 reads FP16 fold_w/fold_b + F32 base/latent)
     cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");
+    const int rk = 2 * d->R + 2 * C;
     for (int t = 0; t < proposals; ++t) {
         k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in, d->s);
-        gemm_bf(d, d->rnn_w, 3 * d->R, 2 * d->R + 2 * C, d->rnn_in, 1, d->proj, 3 * d->R);
+        if (dyn)
+            rnn_proj_bf_kernel<<<(unsigned) ((3 * d->R + 3) / 4), 128, 0, d->s>>>(d->rnn_w, d->rnn_in, 3 * d->R, rk,
+                                                                                  d->proj);
+        else
+            gemm_bf(d, d->rnn_w, 3 * d->R, rk, d->rnn_in, 1, d->proj, 3 * d->R);
         k::rnn_gates(d->proj, d->rnn_b, d->R, d->state, d->latent, d->s);
         if (d->shortlist) {
             const int* ids = d->shortlist + t * shortlist_n;
@@ -837,7 +902,37 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         }
     }
     cu(cudaMemcpyAsync(d->h_out, d->toks + 1, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
+}
+}  // namespace
+
+void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
+             int* out, int proposals) {
+    const double t_p0 = pnow();
+    // (IK2_DRAFT_GRAPH=0: its launches one by one.  A drafter of ~75 short launches a step: queueing them took the
+    //  host 0.75 ms of a 2.7 ms step, the GPU waiting in between; recorded, a step is its kernels' 2.1 ms)
+    static const bool graph_on = !(getenv("IK2_DRAFT_GRAPH") && !atoi(getenv("IK2_DRAFT_GRAPH")));
+    const bool can = graph_on && d->q8 && d->head_q8 && d->head_tiles && !d->shortlist && proposals >= 1 &&
+                     proposals < kBlock && (2 * d->R + 2 * d->C) % 256 == 0 &&
+                     (!d->graph_anchor || (d->graph_anchor == anchor_h && d->graph_rows == n_rows &&
+                                           d->graph_vocab == n_vocab));
+    if (can) {
+        d->par_h[0] = P, d->par_h[1] = anchor;
+        if (!d->graph[proposals]) {
+            cudaGraph_t g = nullptr;
+            cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeThreadLocal), "the drafter's graph");
+            propose_launches(d, anchor, anchor_h, P, lm_f16, n_rows, n_vocab, proposals, true);
+            cu(cudaStreamEndCapture(d->s, &g), "the drafter's graph");
+            cu(cudaGraphInstantiate(&d->graph[proposals], g, 0), "the drafter's graph");
+            cudaGraphDestroy(g);
+            d->graph_anchor = anchor_h, d->graph_rows = n_rows, d->graph_vocab = n_vocab;
+        }
+        cu(cudaGraphLaunch(d->graph[proposals], d->s), "the drafter's graph");
+    } else {
+        propose_launches(d, anchor, anchor_h, P, lm_f16, n_rows, n_vocab, proposals, false);
+    }
+    const double t_p1 = pnow();
     cu(cudaStreamSynchronize(d->s), "propose");
+    g_prop_submit += t_p1 - t_p0, g_prop_wait += pnow() - t_p1, ++g_prop_n;
     std::memcpy(out, d->h_out, proposals * sizeof(int));
 }
 
@@ -847,8 +942,11 @@ bool context_fp8(const Drafter* d) { return d->kv8; }
 void destroy(Drafter* d) {
     if (!d) return;
     cudaStreamSynchronize(d->s);
+    for (auto& g : d->graph)
+        if (g) cudaGraphExecDestroy(g);
     for (void* p : d->mem) cudaFree(p);
     if (d->h_out) cudaFreeHost(d->h_out);
+    if (d->par_h) cudaFreeHost(d->par_h);
     delete d;
 }
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) {
