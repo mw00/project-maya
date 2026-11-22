@@ -117,7 +117,7 @@ def decode_samples(answers) -> list:
 DRAFT_LINE = re.compile(r"^(?:INFO )?drafting: (.+?)(?: - |, \d|$)")
 
 
-def drafting_choice(args, env: dict, engine_lines, answers) -> str:
+def drafting_choice(args, env: dict, engine_lines, answers, family: str = "") -> str:
     """What drafting the engine used: its own 'drafting: X - why' line (--drafting auto's choice), else the config's
     setting, else what its log shows; with the share of drafted tokens accepted when the engine counts them."""
     said = ""
@@ -133,10 +133,13 @@ def drafting_choice(args, env: dict, engine_lines, answers) -> str:
             if flag(k) is not None:
                 said = f"{name} {flag(k)}"
                 break
-    if not said:
+    if not said:                             # (GLM's and DeepSeek's engines say it in their log lines)
         text = "\n".join(engine_lines).lower()
-        said = ("MTP" if "glm mtp:" in text or "mtp decode" in text else
-                "DFlash" if "dflash" in text else "DSpark" if "dspark" in text else "none seen")
+        if family in ("glm", ""):
+            said = "MTP" if "glm mtp:" in text else "DFlash2" if "glm dflash" in text else ""
+        elif family == "deepseek":
+            said = "DSpark" if re.search(r"^dspark", text, re.M) else ""
+        said = said or "no drafting"
     acc = sum(x["d_acc"] for x in answers)
     off = sum(x["d_off"] for x in answers)
     return said + (f", {100.0 * acc / off:.0f}% of drafts accepted" if off > 0 and acc <= off else "")
@@ -162,6 +165,19 @@ def exactness(ref: dict, other: dict) -> list:
         if i is not None:
             out.append(f"{k}: differs from token {i} ({len(ref[k])} vs {len(other[k])} tokens)")
     return out
+
+
+def exact_verdict(this_runs, other_runs) -> tuple:
+    """Every pairing of this build's rounds with the other's: ('yes', []) when all are equal; 'yes in k of n
+    pairings' when some are (an engine that varies between its own starts); ('NO', the first pairing's differences)
+    when none is."""
+    pairs = [(a, b) for a in this_runs for b in other_runs]
+    same = sum(not exactness(b, a) for a, b in pairs)
+    if pairs and same == len(pairs):
+        return "yes", []
+    if same:
+        return f"yes in {same} of {len(pairs)} pairings (the answers vary between starts)", []
+    return "NO", exactness(pairs[0][1], pairs[0][0]) if pairs else ["no rounds"]
 
 
 def pct(new: float, base: float) -> str:
@@ -501,6 +517,11 @@ def learned_files(root: Path, cfg: dict) -> list:
     return out
 
 
+def learned_listing(root: Path, cfg: dict) -> list:
+    """The learned files that exist now (a file a first start writes shows up as new between two listings)."""
+    return sorted(str(p) for p in learned_files(root, cfg))
+
+
 class LearnedState:
     """A snapshot of the learned files at the start: restored before each round (both builds start from the same
     state, nothing learned again) and at the end; a second build's data folder gets the same copies (its own files
@@ -676,9 +697,9 @@ def phase_line(runs) -> str:
     return ", ".join(f"{k} {tot[k]:.0f} s" for k in keys) + f" (total {sum(tot.values()):.0f} s)"
 
 
-def compare_line(a: dict, b: dict, a_name: str, b_name: str, exact: list) -> str:
+def compare_line(a: dict, b: dict, a_name: str, b_name: str, verdict: str) -> str:
     """The one-line A/B summary: exactness, then this build's speed against the other's."""
-    parts = [f"compare {b_name} vs {a_name}", "exact: yes" if not exact else f"exact: NO ({len(exact)} differ)",
+    parts = [f"compare {b_name} vs {a_name}", f"exact: {verdict}",
              f"decode {b['decode'][0]:.1f} vs {a['decode'][0]:.1f} {pct(b['decode'][0], a['decode'][0])}"]
     for n in sorted(set(a["prompt"]) & set(b["prompt"])):
         parts.append(f"{n // 1024}K {b['prompt'][n][0]:.0f} vs {a['prompt'][n][0]:.0f} "

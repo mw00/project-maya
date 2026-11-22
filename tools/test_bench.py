@@ -188,8 +188,9 @@ class BenchStandard(unittest.TestCase):
         self.assertEqual(MB.drafting_choice([], {}, ["INFO drafting: the MTP block - the fastest on this PC (x)"], a),
                          "the MTP block, 75% of drafts accepted")
         self.assertEqual(MB.drafting_choice(["--drafting", "off"], {}, [], []), "drafting off")
-        self.assertEqual(MB.drafting_choice([], {}, ["glm mtp: CUDA0 the MTP decode drafts over ..."], []), "MTP")
-        self.assertEqual(MB.drafting_choice([], {}, [], []), "none seen")
+        self.assertEqual(MB.drafting_choice([], {}, ["glm mtp: CUDA0 the MTP decode drafts"], [], "glm"), "MTP")
+        self.assertEqual(MB.drafting_choice([], {}, ["dspark: x"], [], "ik2"), "no drafting")
+        self.assertEqual(MB.drafting_choice([], {}, ["dspark: 3 drafts"], [], "deepseek"), "DSpark")
 
     def test_exactness(self):
         self.assertIsNone(MB.first_difference([1, 2, 3], [1, 2, 3]))
@@ -202,8 +203,15 @@ class BenchStandard(unittest.TestCase):
     def test_compare_line(self):
         a = {"decode": (60.0, 59, 61), "prompt": {2048: (400.0, 1, 1)}}
         b = {"decode": (63.0, 62, 64), "prompt": {2048: (420.0, 1, 1)}}
-        self.assertEqual(MB.compare_line(a, b, "old", "new", []),
+        self.assertEqual(MB.compare_line(a, b, "old", "new", "yes"),
                          "compare new vs old | exact: yes | decode 63.0 vs 60.0 +5.0% | 2K 420 vs 400 +5.0%")
+
+    def test_exact_verdict_over_every_pairing(self):
+        x, y = {"decode 1": [1, 2, 3]}, {"decode 1": [1, 2, 4]}
+        self.assertEqual(MB.exact_verdict([x, x], [x, x]), ("yes", []))
+        self.assertTrue(MB.exact_verdict([x, y], [x, x])[0].startswith("yes in 2 of 4 pairings"))
+        self.assertEqual(MB.exact_verdict([x, x], [y, y]),
+                         ("NO", ["decode 1: differs from token 2 (3 vs 3 tokens)"]))
 
     def test_prompt_plan_has_different_openings(self):
         doc = list(range(40000))

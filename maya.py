@@ -6952,12 +6952,19 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         base = {"machine": socket.gethostname().split(".")[0], "gpus": gpu_text, "driver": driver,
                 "model": bench_model_name(cfg), "date": time.strftime("%Y-%m-%d")}
         if not compare:
+            before = MB.learned_listing(ROOT, cfg)
             run = MB.run_session(here, chats, prompts, warm, "", say)
             res = MB.summarize([run], prompts)
-            drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"])
+            drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"],
+                                        config_family(cfg))
+            new = sorted(set(MB.learned_listing(ROOT, cfg)) - set(before))
+            if new:                              # (a first start here: it measured this PC - not a speed number yet)
+                warn("this was the model's first start here: it measured this PC and wrote " +
+                     ", ".join(Path(p).name for p in new[:4]) + " - run --bench again for the speed number")
             rec = dict(base, config=bench_config_text(cfg, ctx, drafting), commit=MB.commit_of(ROOT), version=version,
                        decode=res["decode"], prompt=res["prompt"],
-                       note="prompt reuse seen" if run["reused"] else "")
+                       note="; ".join(x for x in ("first start: rough" if new else "",
+                                                  "prompt reuse seen" if run["reused"] else "") if x))
             lines = bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, [run], t_quiet, t_all)
             records = [MB.record_line(rec)]
         else:
@@ -7029,25 +7036,29 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
     finally:
         learned.finish()
     res = {k: MB.summarize(v, prompts) for k, v in runs.items()}
-    exact = MB.exactness(runs["other"][0]["tokens"], runs["this"][0]["tokens"])
+    verdict, exact = MB.exact_verdict([r["tokens"] for r in runs["this"]], [r["tokens"] for r in runs["other"]])
     again = {k: MB.exactness(v[0]["tokens"], v[-1]["tokens"]) for k, v in runs.items() if len(v) > 1}
     o_ver = (other / "VERSION").read_text().strip() if (other / "VERSION").exists() else "?"
     names = {"this": f"{MB.commit_of(ROOT)} (v{version})", "other": f"{MB.commit_of(other)} (v{o_ver})"}
     records, lines = [], []
     for side, root, ver in (("other", other, o_ver), ("this", ROOT, version)):
-        drafting = MB.drafting_choice(args, cfg.get("env") or {}, runs[side][0]["engine_lines"], res[side]["answers"])
+        drafting = MB.drafting_choice(args, cfg.get("env") or {}, runs[side][0]["engine_lines"], res[side]["answers"],
+                                        config_family(cfg))
         records.append(MB.record_line(dict(base, config=bench_config_text(cfg, ctx, drafting),
                                            commit=MB.commit_of(root), version=ver, decode=res[side]["decode"],
                                            prompt=res[side]["prompt"], note=f"A/B {rounds} rounds")))
         lines += [f"{side} build {names[side]}: {root}"] + [
             "  " + x for x in bench_text(ver, cfg_path, cfg, ctx, gpu_text, res[side], drafting, runs[side],
                                          t_quiet, t_all)[2:]]
-    lines.append("exactness (greedy tokens of every bench request, this vs other): " +
-                 ("equal" if not exact else "DIFFERENT - " + "; ".join(exact)))
+    lines.append("exactness (greedy tokens of every bench request, this vs other, every pairing of rounds): " +
+                 verdict + ("" if not exact else " - " + "; ".join(exact)))
     for side, d in again.items():
         lines.append(f"  {side} build, round 1 vs round {rounds}: " + ("equal" if not d else "; ".join(d)))
+    if any(again.values()):
+        lines.append("  (a build that differs from itself between starts: this engine is not repeatable start to "
+                     "start on this PC, so a difference between the builds is not proof of an answer change)")
     lines.append(f"wall time all: {time.time() - t_all:.0f} s (quiet check {t_quiet:.0f} s)")
-    records.append(MB.compare_line(res["other"], res["this"], names["other"], names["this"], exact))
+    records.append(MB.compare_line(res["other"], res["this"], names["other"], names["this"], verdict))
     return lines, records
 
 
