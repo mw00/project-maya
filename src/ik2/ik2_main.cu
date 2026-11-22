@@ -6713,6 +6713,9 @@ int main(int argc, char** argv) {
                 const Layer& Ly = M.L[l];
                 const size_t slot_bytes = Ly.eb[0] + Ly.eb[1] + Ly.eb[2];
                 const size_t layer_bytes = (size_t) c.E * slot_bytes;
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
                 void* p = ::mmap(nullptr, layer_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (p == MAP_FAILED) {
                     for (int k = 0; k < l; ++k) ::munmap(pin.blocks[k].ptr, pin.blocks[k].bytes);
@@ -6720,6 +6723,7 @@ int main(int argc, char** argv) {
                     use_mmap_reg = false;
                     break;
                 }
+                ::madvise(p, layer_bytes, MADV_HUGEPAGE);   // (B1v2: 2 MiB pages back the registered arena - fewer IOMMU walks per fetch read)
                 pin.blocks[l] = {p, layer_bytes, true, false};
             }
         }
