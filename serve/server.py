@@ -1149,7 +1149,10 @@ class StrataEngine:
             self.close()
             if self.log is not subprocess.DEVNULL:
                 self.log.close()
-            self.__init__(exe, args, cwd, log, dict(env if env is not None else os.environ, MAYA_RESERVE_RESTARTED="1"))
+            try:
+                self.__init__(exe, args, cwd, log, dict(env if env is not None else os.environ, MAYA_RESERVE_RESTARTED="1"))
+            finally:
+                self.deep_sleep = sleep_mode
             return
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones

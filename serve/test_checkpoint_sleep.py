@@ -168,6 +168,26 @@ class CheckpointTests(unittest.TestCase):
                     self.assertEqual(starts[-1][1], ["--max-context", "2048"])
                     self.assertEqual(engine.deep_sleep, mode)
 
+    def test_reserve_short_restart_keeps_sleep_mode_and_upstream_retry_guard(self):
+        for mode in ("off", "checkpoint"):
+            with self.subTest(mode=mode):
+                processes = []
+                def launch(*args, **kwargs):
+                    proc = unittest.mock.Mock()
+                    proc.stdout = iter(["INFO reserve_short=256\n", "READY 1024 stop\n"] if not processes
+                                       else ["READY 1024 stop\n"])
+                    processes.append(proc)
+                    return proc
+                with patch.object(server_module.subprocess, "Popen", side_effect=launch) as popen, \
+                     patch.object(server_module.threading.Thread, "start"), \
+                     patch.object(StrataEngine, "close") as close:
+                    engine = StrataEngine("engine", [], env={}, sleep_mode=mode)
+                self.assertEqual(len(processes), 2)
+                close.assert_called_once()
+                self.assertEqual(popen.call_args.kwargs["env"]["MAYA_RESERVE_RESTARTED"], "1")
+                self.assertEqual(engine.deep_sleep, mode)
+                self.assertEqual(engine.max_context, 1024)
+
     def test_idle_unload_of_checkpointed_engine_reloads_with_new_slot_capacity(self):
         svc = self.service()
         engine = svc.engine
