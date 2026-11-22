@@ -6724,9 +6724,6 @@ void check_hardware(int n_gpu, bool serve) {
     };
     const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
     const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
-#if defined(_WIN32) && defined(MAYA_USE_HIP)
-    if (!force) refuse("Inkling 2 on AMD is supported on Linux only, not on Windows" + run_anyway);
-#endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
 #ifdef MAYA_USE_HIP

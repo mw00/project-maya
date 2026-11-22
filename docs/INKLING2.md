@@ -501,8 +501,8 @@ other work costs this order more than the old one.
 measured by the setup). Elsewhere `maya-ik2` stops at the start with one line saying why (under
 `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
 tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 7 GiB of VRAM,
-`--gpus 3` or more, AMD on Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU
-modes (`IK2_EP=1` or `IK2_TP=1`, section 6) - untested here.
+`--gpus 3` or more. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU modes (`IK2_EP=1`
+or `IK2_TP=1`, section 6) - untested here.
 
 **Two NVIDIA GPUs** (`--gpus 2`, Linux; the setup offers it where two cards can be used, the larger first): where the
 first card holds every expert it runs alone (the resident path - faster there than the split: 2x V100 32 GB, one card
@@ -564,7 +564,7 @@ two-nobridge two-nvlink` (stdlib only; it writes your config's rows over a copy 
 part, `table` prints the rows as the markdown above, `list` the rows' settings). `tests/ik2_p2p_stream.cu` (one `nvcc` line in its header)
 shows which way a pair of cards' peer copies behave; `tests/ik2_kernels_test.cu` covers the flash kernel's layouts against a double reference.
 
-**AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
+**AMD (HIP, Linux and Windows).** A HIP build has `maya-ik2` for every arch of its list. The kernels
 written for `mma.sync` / `ldmatrix` / `cp.async` run through AMD versions that keep their fragment layouts; the prompt's
 hot paths have kernels of their own on RDNA 3 / 3.5 / 4's matrix cores (`src/ik2/ik2_rdna.inc`): a layer's routed
 experts in three launches straight from their blocks (`IK2_RDNA_MOE=0`: off) and the fused attention in 24 KB of shared
@@ -578,6 +578,12 @@ system has available, less max(8 GiB, 10%), as the GPU's room, and keeps every e
 time): mode A only by default - the resident path's expert kernels, so the same greedy answers as with every expert in
 VRAM; lane parity (`IK2_LANE=1`) sums in other bits there and is a test option. Run on a Radeon 8065S (Ubuntu, ROCm
 7.1), also set as a 12 and a 16 GB card (`IK2_VRAM_GB`: on an APU the free figures are capped, no ballast).
+Under Windows a user ran it on a Radeon AI PRO R9700 (`gfx1201`, 32 GB, Windows 10, AMD's ROCm 7.14.1 SDK wheels):
+`ik2_kernels_test` passes, and greedy decode after a 4,025-token prompt ran at 86 tok/s, after 65,450 tokens at 70 (FP8
+cache, the CLI). On Windows the engine is built with ROCm's clang as the other HIP engines there;
+`tools\hip\build_ik2_windows.bat` builds it alone (and copies the SDK's HIP runtime next to it - Windows would otherwise
+load the driver's from System32 first). The setup does not offer Inkling 2 on AMD under Windows yet (tools/ik2_fit.py):
+a config of one's own runs it, with `"lib_dirs"` naming the SDK's `bin`.
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`
