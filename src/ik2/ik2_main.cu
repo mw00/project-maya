@@ -7435,7 +7435,8 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
             }
             g_offs.lane.reset();
-            return 0;
+            std::fflush(stdout);
+            std::_Exit(0);   // (QUIT: out at once - the OS frees the pinned runs and the driver's state; a full teardown took >30 s)
         }
         std::string line;
         std::mt19937_64 rng(1234);
@@ -7819,7 +7820,8 @@ int main(int argc, char** argv) {
             g_wd_busy = false;
         }
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
-        return 0;
+        std::fflush(stdout);
+        std::_Exit(0);   // (QUIT / end of input: out at once, as maya-hy4 - the OS frees the pinned runs and the driver's state)
     }
     if (g_depth + (int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
     if (g_depth > 0 && (serve || drafter || g_lookup || g_dev[0].W.T_sup > 0)) die("IK2_DEPTH: the CLI's plain path only (no drafting)");
