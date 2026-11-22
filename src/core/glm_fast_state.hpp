@@ -417,8 +417,11 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
     // an EXL3 blob: every piece is a multiple of 256 bytes, no ggml blocks to keep whole (the prompt path does not
     // multiply these with MMQ)
-    if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
-        return (blob + 255) / 256 * 256;
+    if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3) {
+        // MAYA_GLM_EXPERTS_BIN: slots at 4096-byte boundaries, so an expert is read straight into its slot
+        static const size_t a = std::getenv("MAYA_GLM_EXPERTS_BIN") != nullptr ? 4096 : 256;
+        return (blob + a - 1) / a * a;
+    }
     size_t a = 16;
     const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
     if (b1 > 0) a = std::lcm(a, b1);
@@ -507,6 +510,10 @@ struct Glm5Model::FastState {
     std::vector<std::thread> ah_th;
     bool ah_quit = false;
     std::atomic<int> ah_inflight{0};
+    // MAYA_GLM_AHEAD_YIELD: a route is reading its misses (rd_busy), and the look-ahead reads it waits for (rd_want:
+    // class << 32 | slot, -1 none) - the look-ahead's other reads stand back meanwhile
+    std::atomic<int> rd_busy{0};
+    std::atomic<long long> rd_want[8] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}};
     // per RAM class and slot, for kRLoad slots: tag << 2 | phase (0 queued, 1 reading, 2 landed) - a job reads only while
     // the tag it carries is current (a slot freed and reused under it gets a new tag)
     std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> rload;

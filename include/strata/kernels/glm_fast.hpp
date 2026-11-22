@@ -410,7 +410,7 @@ struct MoeResponse {
     unsigned int stream_mask;
     unsigned int ready[8];
     unsigned long long s_gu, s_dn;
-    int s_chunks;
+    int s_chunks;   // (negative, MAYA_GLM_XSTREAM: the experts file - one run of s_gu bytes in 3 x -s_chunks equal pieces)
     int n_upd;                        // table updates: tab[key] = val
     int upd_key[64];
     unsigned long long upd_val[64];
