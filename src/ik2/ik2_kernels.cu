@@ -5118,6 +5118,9 @@ __device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
 }
 __device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) { return h2_mul(q8_pair(w), scale); }
 
+#ifndef IK2_Q8_TILE_AHEAD
+#define IK2_Q8_TILE_AHEAD 2
+#endif
 // Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
 // both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
 // for all 256 inputs; the product rounds to half as in decode_q8p_f16_kernel.
@@ -5129,14 +5132,36 @@ __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int 
     const int row0 = min(row, N - 1), row1 = min(row + 8, N - 1);
     const int blocks = K / 32;
     float acc[4] = {};
-    for (int i = split; i < blocks; i += Splits) {
+    // (a step's values, scales and inputs asked for kQ8Ahead steps before its sums - a warp waited at every one of
+    //  its 18 steps for bytes it had only just asked for; the same sums)
+    struct QStep {
+        uint2 a0, a1;
+        uint32_t s0, s1;
+        uint4 v;
+    };
+    constexpr int kQ8Ahead = IK2_Q8_TILE_AHEAD;
+    auto ld = [&](int i) {
         const int col = i * 32 + t * 8;
-        const uint2 a0 = *(const uint2*)(q + (size_t)row0 * K + col);
-        const uint2 a1 = *(const uint2*)(q + (size_t)row1 * K + col);
-        uint32_t s0 = scales[(size_t)row0 * blocks + i], s1 = scales[(size_t)row1 * blocks + i];
+        QStep r;
+        r.a0 = __ldg((const uint2*) (q + (size_t) row0 * K + col));
+        r.a1 = __ldg((const uint2*) (q + (size_t) row1 * K + col));
+        r.s0 = __ldg(scales + (size_t) row0 * blocks + i), r.s1 = __ldg(scales + (size_t) row1 * blocks + i);
+        r.v = *(const uint4*) (x + (size_t) min(token, T - 1) * K + col);
+        return r;
+    };
+    QStep pipe[kQ8Ahead + 1];
+#pragma unroll
+    for (int j = 0; j <= kQ8Ahead; ++j) pipe[j] = ld(min(split + j * Splits, blocks - 1));
+    for (int i = split; i < blocks; i += Splits) {
+        const QStep cur = pipe[0];
+#pragma unroll
+        for (int j = 0; j < kQ8Ahead; ++j) pipe[j] = pipe[j + 1];
+        if (i + (kQ8Ahead + 1) * Splits < blocks) pipe[kQ8Ahead] = ld(i + (kQ8Ahead + 1) * Splits);
+        const uint2 a0 = cur.a0, a1 = cur.a1;
+        uint32_t s0 = cur.s0, s1 = cur.s1;
         s0 |= s0 << 16;
         s1 |= s1 << 16;
-        const uint4 v = *(const uint4*)(x + (size_t)min(token, T - 1) * K + col);
+        const uint4 v = cur.v;
         uint32_t a[4] = {q8_h2(a0.x, s0), q8_h2(a1.x, s1), q8_h2(a0.y, s0), q8_h2(a1.y, s1)};
         mma16816(acc, a, v.x, v.z);
         a[0] = q8_h2(a0.x >> 16, s0);
