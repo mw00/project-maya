@@ -6482,7 +6482,9 @@ static void draft_attn_impl(const float* q, const KVT* kc, const KVT* vc, int k_
         std::abort();
     }
     const int nk = k_hi - k_lo + nq;
-    const int S = std::max(1, std::min(64, (nk + 255) / 256)), per = (nk + S - 1) / S;
+    // (chunks of 32 keys while there are 64 or fewer of them: a block's threads go through their keys one after the
+    //  other, so a window's ~1,000 keys in chunks of 256 took 190 us a layer - the blocks were there, idle)
+    const int S = std::max(1, std::min(64, (nk + 31) / 32)), per = (nk + S - 1) / S;
     float* part_o = scratch;
     float2* part_ml = (float2*) (part_o + (size_t) S * H * kDraftQ * 128);
     draft_attn_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
