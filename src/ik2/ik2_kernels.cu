@@ -36,8 +36,10 @@ __device__ __forceinline__ float2 u32_to_f2(uint32_t u) {
                                       __ushort_as_half((uint16_t) (u >> 16)));
     return __half22float2(h2);
 }
+// (HIP's device pass defines no __CUDA_ARCH__, and there the other branch's std::memcpy is the host's - with MSVC's
+//  headers a host-only function, which device code may not call)
 __host__ __device__ __forceinline__ float bits_to_float(uint32_t u) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return __uint_as_float(u);
 #else
     float f;
@@ -46,7 +48,7 @@ __host__ __device__ __forceinline__ float bits_to_float(uint32_t u) {
 #endif
 }
 __host__ __device__ __forceinline__ uint32_t float_to_bits(float f) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return __float_as_uint(f);
 #else
     uint32_t u;

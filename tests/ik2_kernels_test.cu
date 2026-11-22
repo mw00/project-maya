@@ -2620,11 +2620,19 @@ void test_experts_rdna() {
         k::moe_rows_combine(dy, dinv, dw, T, K, C, dout, 0);
         const auto yv = host(dy, (size_t) rows * C);
         std::vector<double> want_o((size_t) T * C, 0.0);
+        double mag_o = 0;   // (the largest sum of |terms|: three F32 rows that cancel lose that much to the sum's order)
         for (int t = 0; t < T; ++t)
-            for (int kk = 0; kk < K; ++kk)
-                for (int c = 0; c < C; ++c) want_o[(size_t) t * C + c] += (double) wtr[inv[t * K + kk]] * yv[(size_t) inv[t * K + kk] * C + c];
+            for (int c = 0; c < C; ++c) {
+                double m = 0;
+                for (int kk = 0; kk < K; ++kk) {
+                    const double v = (double) wtr[inv[t * K + kk]] * yv[(size_t) inv[t * K + kk] * C + c];
+                    want_o[(size_t) t * C + c] += v;
+                    m += std::fabs(v);
+                }
+                mag_o = std::max(mag_o, m);
+            }
         std::snprintf(name, sizeof name, "moe_rows_combine %s", nm);
-        expect(name, host(dout, want_o.size()), want_o, 1e-5, 1e-5);
+        expect(name, host(dout, want_o.size()), want_o, 1e-5, std::max(1e-5, 1e-6 * mag_o));
         for (void* p : {(void*) dpool, (void*) deptr, (void*) dtiles, (void*) dx, (void*) dh, (void*) dsg, (void*) dsu,
                         (void*) dy, (void*) dinv, (void*) dw, (void*) dout})
             cudaFree(p);
