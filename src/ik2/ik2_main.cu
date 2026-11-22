@@ -30,6 +30,7 @@
 #include "mm3_link.cuh"   // (two GPUs: the copies between them, peer only where tested)
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "../ds4/ds4_watchdog.hpp"   // (--serve's heartbeat rule, maya-ds4's)
 #ifdef STRATA_USE_HIP
 #include "ds4_lt.hpp"   // (AMD: the prompt's FP16 GEMMs on hipBLASLt, the kernel a shape measured and kept)
 #endif
@@ -77,6 +78,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <fstream>
 #include <condition_variable>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <chrono>
 #include <cmath>
@@ -2302,6 +2304,7 @@ struct FastGraph {
     cudaGraphExec_t exec = nullptr;
 };
 FastGraph g_fgraph[4];      // by OutMode
+int g_slot_cur = 0, g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits, the one g_fgraph holds)
 
 // ---- two GPUs (--gpus 2, the split): GPU 0 runs the offload path (the dense weights, the K / V cache, every prompt,
 // its tier of the experts, the misses fetched from host memory); GPU 1 holds the next experts by the profile's picks a
@@ -3034,6 +3037,11 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     kv_swing(M, false, pos);
+    if (g_graph && g_fgraph_slot != g_slot_cur) {   // (--parallel: the graphs hold a conversation's state pointers)
+        for (auto& G : g_fgraph)
+            if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
+        g_fgraph_slot = g_slot_cur;
+    }
     if (!g_graph || g_kv_streaming) {   // (streamed visits: the copies follow the position - launched as they go)
         fast_token_launches(M, W, out_mode);
     } else {
@@ -3446,6 +3454,386 @@ bool block_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) 
 // every conv's history as after the first n tokens of the last window (fast_block's records)
 void block_rollback(int n) {
     k::rollback_block(g_blk.recs, g_blk.n_recs, n, g_s);
+}
+
+
+// ---- --parallel N (the resident path): N conversations, each its own state - a slot: its visits' KV (a full layer's
+// positions [0, ctx / N) of the one buffer, at s ctx / N; a sliding layer its own ring) and short convs' histories.
+// bind_slot points the visits at a slot, so that the prompt path, the snapshots and the resets run on it unchanged.
+// A step takes every writing conversation's token at once (par_launches): the dense products read once for all of
+// them (mv_q8p_cols: each row mv_q8p's sums), each row's convs, KV, attention and experts through the one-token
+// path's own kernels with its slot's state - every row's values the one-token path's (the same answers as alone).
+constexpr int kParMax = 8;
+struct SlotVisit {
+    uint8_t *kc8 = nullptr, *vc8 = nullptr;
+    uint16_t *kc = nullptr, *vc = nullptr;
+    float *h_k = nullptr, *h_v = nullptr, *h_attn = nullptr, *h_mlp = nullptr;
+};
+std::vector<std::vector<SlotVisit>> g_slots;   // [slot][visit]; slot 0: the visits' own buffers
+int g_par = 1;                                 // --parallel
+size_t g_dense_bytes = 0, g_exp_bytes = 0;     // (the VRAM line's weights and STAT's experts, as the plan counted them)
+
+// --serve's watchdog (#29, #539 as maya-ds4's): a request has hung when its heartbeat - a prompt pass, a token, a step -
+// has not moved for IK2_WATCHDOG_S seconds (600; 0: off) while it runs; the engine then ends (exit 3) with a line
+// naming the stage it was in, and the server starts a fresh one for the next request.  Never the request's length.
+std::atomic<uint64_t> g_beat{0};
+std::atomic<const char*> g_wd_stage{"waiting"};
+std::atomic<bool> g_wd_busy{false};
+inline void beat(const char* stage) {
+    g_wd_stage.store(stage, std::memory_order_relaxed);
+    g_beat.fetch_add(1, std::memory_order_relaxed);
+}
+void watchdog_start() {
+    const char* v = getenv("IK2_WATCHDOG_S");
+    const int limit = v && *v ? std::atoi(v) : 600;
+    if (limit <= 0) return;
+    std::thread([limit] {
+        strata::ds4::StallRule rule;
+        rule.limit_s = limit;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!rule.stalled(g_wd_busy.load(), g_beat.load(), t)) continue;
+            std::printf("END maya-ik2: no progress for %d s in %s - stopping the engine so the server starts it again "
+                        "(issue #29; IK2_WATCHDOG_S)\n", limit, g_wd_stage.load());
+            std::fflush(stdout);
+            std::fprintf(stderr, "maya-ik2 serve: no progress for %d s during a request, stuck in %s - stopping the "
+                                 "engine so the server starts it again (issue #29, #539; IK2_WATCHDOG_S)\n",
+                         limit, g_wd_stage.load());
+            std::fflush(stderr);
+            std::_Exit(3);
+        }
+    }).detach();
+}
+
+void bind_slot(Model& M, int s) {
+    if (s == g_slot_cur || g_slots.empty()) return;
+    for (size_t v = 0; v < M.V.size(); ++v) {
+        Visit& Vi = M.V[v];
+        const SlotVisit& x = g_slots[s][v];
+        Vi.kc8 = x.kc8, Vi.vc8 = x.vc8, Vi.kc = x.kc, Vi.vc = x.vc;
+        Vi.h_k = x.h_k, Vi.h_v = x.h_v, Vi.h_attn = x.h_attn, Vi.h_mlp = x.h_mlp;
+    }
+    g_slot_cur = s;
+}
+// the slots: n of them, ctx_s positions each (slot 0 the visits' buffers as loaded) -> extra bytes on the device
+size_t slots_init(Model& M, int n, int ctx, int ctx_s) {
+    const Config& c = M.c;
+    const size_t KD = (size_t) c.KV * c.D, eb = g_kv_fp8 ? 1 : 2;
+    size_t extra = 0;
+    g_slots.assign(n, std::vector<SlotVisit>(M.V.size()));
+    for (size_t v = 0; v < M.V.size(); ++v) {
+        Visit& Vi = M.V[v];
+        g_slots[0][v] = {Vi.kc8, Vi.vc8, Vi.kc, Vi.vc, Vi.h_k, Vi.h_v, Vi.h_attn, Vi.h_mlp};
+        const bool ring = M.L[Vi.l].sliding;   // (a sliding layer reads its ring modulo kv_cap: a ring a slot)
+        use_dev(M.L[Vi.l].dev);
+        for (int s = 1; s < n; ++s) {
+            SlotVisit& x = g_slots[s][v];
+            if (ring) {
+                if (g_kv_fp8) x.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD), x.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
+                else x.kc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD), x.vc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
+                extra += 2 * (size_t) Vi.kv_cap * KD * eb;
+            } else {
+                const size_t off = (size_t) s * ctx_s * KD;
+                if (g_kv_fp8) x.kc8 = Vi.kc8 + off, x.vc8 = Vi.vc8 + off;
+                else x.kc = Vi.kc + off, x.vc = Vi.vc + off;
+            }
+            x.h_k = dalloc<float>(3 * KD), x.h_v = dalloc<float>(3 * KD);
+            x.h_attn = dalloc<float>(3 * (size_t) c.C), x.h_mlp = dalloc<float>(3 * (size_t) c.C);
+            CU(cudaMemset(x.h_k, 0, 3 * KD * 4));
+            CU(cudaMemset(x.h_v, 0, 3 * KD * 4));
+            CU(cudaMemset(x.h_attn, 0, 3 * (size_t) c.C * 4));
+            CU(cudaMemset(x.h_mlp, 0, 3 * (size_t) c.C * 4));
+            extra += (6 * KD + 6 * (size_t) c.C) * 4;
+        }
+    }
+    (void) ctx;
+    use_dev(0);
+    return extra;
+}
+
+struct ParBufs {
+    bool ready = false;
+    float* emb_h = nullptr;   // pinned [kParMax][C]
+    int* pos_h = nullptr;     // pinned [kParMax]
+    int *cand_d = nullptr, *cand_h = nullptr;   // each row's k::cand_topk out, [kParMax][2 + 2 kCandCap]
+    float* lp_msg = nullptr;  // a pass's messages, [n_core][4][kParMax][C]
+};
+ParBufs g_parb;
+std::map<int, FastGraph> g_pgraph;   // by the rows' slots (a bit each) and whether candidates are wanted
+
+void par_init(Model& M) {
+    const Config& c = M.c;
+    CU(cudaHostAlloc(&g_parb.emb_h, (size_t) kParMax * c.C * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_parb.pos_h, (size_t) kParMax * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_parb.cand_h, (size_t) kParMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+    g_parb.cand_d = dalloc<int>((size_t) kParMax * (2 + 2 * kCandCap));
+    if (c.n_pass > 1) g_parb.lp_msg = dalloc<float>((size_t) (c.core1 - c.core0) * 4 * kParMax * c.C);
+    g_parb.ready = true;
+}
+
+// T rows (slots sl[t], tokens' embeddings in g_parb.emb_h, positions in g_parb.pos_h): argmax per row into W.argmax_h,
+// and with cand each row's candidates (as the token path's kCand) into g_parb.cand_h
+void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
+    const Config& c = M.c;
+    const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D;
+    const size_t TC = (size_t) T * C, TCb = TC * 4;
+    const float qk_scale = 1.0f / std::sqrt((float) c.D);
+    const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
+    CU(cudaMemcpyAsync(W.tmp, g_parb.emb_h, TCb, cudaMemcpyHostToDevice, g_s));
+    k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+    CU(cudaMemcpyAsync(W.pos, g_parb.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
+    auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
+#ifdef STRATA_USE_HIP
+    static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
+#else
+    static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+#endif
+    int nb = 0, nb_pre = 0, n_bank = 0;
+    for (int vis = 0; vis < c.n_visit; ++vis) {
+        const int l = M.V[vis].l;
+        Layer& Ly = bind_visit(M, vis);
+        const float* msg = nullptr;
+        if (c.n_pass > 1 && l == c.core0) {
+            if (M.V[vis].pass == 0) {
+                nb_pre = nb;
+                CU(cudaMemcpyAsync(W.lp_pre, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                n_bank = 0;
+                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TCb, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+                ++n_bank;
+                CU(cudaMemcpyAsync(W.h, W.lp_pre, TCb, cudaMemcpyDeviceToDevice, g_s));
+                nb = nb_pre;
+                k::ResStates st{};
+                for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * TC;
+                k::attn_res_jobs_block(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), T, C, 1e-6f,
+                                       g_parb.lp_msg, g_s);
+            }
+        }
+        if (M.V[vis].pass > 0) msg = g_parb.lp_msg + (size_t) (l - c.core0) * 4 * TC;   // [4][T][C]: q, k, v, MoE
+        float* x3[3] = {W.xq, W.xk, W.xv};
+        uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
+        const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
+                              Ly.sliding ? Ly.attn_norm : Ly.v_in_norm};
+        bool sep = !Ly.sliding;
+        {
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.h;
+            if (msg) {
+                k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, T, C, 1e-6f, W.lp_in, g_s);
+                k::LoopGate gt[3];
+                for (int j = 0; j < 3; ++j)
+                    gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
+                             Ly.lp_forget[j], Ly.lp_gain[j], x3[j]};
+                k::loop_gates(gt, 3, T, C, c.rank, 1e-6f, W.lp_g, g_s);
+                for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], T, C, c.eps, y16[j], x3[j], g_s);
+                sep = true;
+            } else if (l > 0) {
+                k::RmsOuts outs{};
+                for (int j = 0; j < Ly.n_res_q; ++j) outs.w[j] = nw[j], outs.y16[j] = y16[j], outs.y32[j] = x3[j];
+                k::attn_res_rms_f16(st, nb + 1, Ly.res_score, Ly.n_res_q, T, C, 1e-6f, c.eps, outs, g_s);
+            } else {
+                for (int j = 0; j < (sep ? 3 : 1); ++j) k::rms_f16(W.h, nw[j], T, C, c.eps, y16[j], x3[j], g_s);
+            }
+        }
+        // the projections (each row's mv_q8p sums), then each row's k and v short convs on its slot's histories
+        float *q_p, *r_p, *gate_p;
+        int q_ld;
+        if (Ly.sliding) {
+            const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
+            const int N = m.N;
+            if (!sep) {
+                exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            } else {
+                exact_rows(m, 0, HD, W.xq, C, T, W.qkv, N);
+                exact_rows(m, HD, KD, W.xk, C, T, W.qkv + HD, N);
+                exact_rows(m, HD + KD, KD, W.xv, C, T, W.qkv + HD + KD, N);
+                exact_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.xq, C, T, W.qkv + HD + 2 * KD, N);
+            }
+            q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + (size_t) c.H * c.d_rel;
+            q_ld = N;
+            for (int t = 0; t < T; ++t) {
+                const SlotVisit& S = g_slots[sl[t]][vis];
+                k::conv_block(W.qkv + (size_t) t * N + HD, N, S.h_k, Ly.sc_k, nullptr, 0, 0, 1, KD, nullptr, 0,
+                              W.kconv + (size_t) t * KD, KD, nullptr, nullptr, g_s);
+                k::conv_block(W.qkv + (size_t) t * N + HD + KD, N, S.h_v, Ly.sc_v, nullptr, 0, 0, 1, KD, nullptr, 0,
+                              W.vconv + (size_t) t * KD, KD, nullptr, nullptr, g_s);
+            }
+        } else {
+            const Mat& m = Ly.wqrg;     // q | r | gate
+            const int N = m.N;
+            exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + (size_t) c.H * c.d_rel;
+            q_ld = N;
+            const int DL = c.KV * 4;
+            float *kd = W.dyn, *vd = W.dyn + (size_t) T * DL;
+            k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, T, kd, DL, g_s);
+            k::mv_f16_rows(Ly.sc_v_dyn16, DL, C, W.xv, C, T, vd, DL, g_s);
+            exact_rows(Ly.wk, 0, KD, W.xk, C, T, W.kk, KD);
+            exact_rows(Ly.wv, 0, KD, W.xv, C, T, W.vv, KD);
+            for (int t = 0; t < T; ++t) {
+                const SlotVisit& S = g_slots[sl[t]][vis];
+                k::conv_block(W.kk + (size_t) t * KD, KD, S.h_k, Ly.sc_k, kd + (size_t) t * DL, DL, c.KV, 1, KD, nullptr,
+                              0, W.kconv + (size_t) t * KD, KD, nullptr, nullptr, g_s);
+                k::conv_block(W.vv + (size_t) t * KD, KD, S.h_v, Ly.sc_v, vd + (size_t) t * DL, DL, c.KV, 1, KD, nullptr,
+                              0, W.vconv + (size_t) t * KD, KD, nullptr, nullptr, g_s);
+            }
+        }
+        // each row: its K and V into its slot's cache at its position, its attention (the one-token path's kernels)
+        const int extent = Ly.sliding ? c.extent_swa : c.extent;
+        const int window = Ly.sliding ? c.window : (1 << 30);
+        const int ring = Ly.sliding ? Ly.kv_cap : 0;
+        const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+        const bool mma = g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding);
+        const int P = Ly.sliding ? std::min(128, std::max(1, (c.window + 63) / 64)) : 128;
+        for (int t = 0; t < T; ++t) {
+            const SlotVisit& S = g_slots[sl[t]][vis];
+            float *qt = q_p + (size_t) t * q_ld, *rt = r_p + (size_t) t * q_ld, *ot = W.o + (size_t) t * HD;
+            const float* gt = gate_p + (size_t) t * q_ld;
+            const int* pt = W.pos + t;
+            uint16_t* q16t = mma ? W.x16 + (size_t) t * HD : nullptr;
+            float* sk = W.sink + (size_t) t * c.H;
+            if (g_kv_fp8) {
+                k::prep_qkv_r_fp8_at(qt, Ly.q_clip, W.kconv + (size_t) t * KD, S.kc8, W.vconv + (size_t) t * KD, S.vc8, rt,
+                                     Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, pt, !Ly.sliding,
+                                     c.alpha, c.n_floor, Ly.kv_cap, k_scale, v_scale, q16t, g_s, Ly.sink16,
+                                     W.xq + (size_t) t * C, C, sk);
+                if (mma)
+                    k::attn_decode_mma_fp8(q16t, rt, sk, S.kc8, S.vc8, ring, c.H, c.KV, pt, 0, ns, qk_scale / k_scale,
+                                           1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, ot, gt,
+                                           W.x16 + (size_t) t * HD, g_s);
+                else
+                    k::attn_decode_fp8_at(qt, rt, sk, S.kc8, S.vc8, ring, c.H, c.KV, pt, P, qk_scale / k_scale,
+                                          1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, ot, g_s);
+            } else {
+                k::prep_qkv_r_f16_at(qt, Ly.q_clip, W.kconv + (size_t) t * KD, S.kc, W.vconv + (size_t) t * KD, S.vc, rt,
+                                     Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, pt, !Ly.sliding,
+                                     c.alpha, c.n_floor, Ly.kv_cap, q16t, g_s, Ly.sink16, W.xq + (size_t) t * C, C, sk);
+                if (mma)
+                    k::attn_decode_mma_f16(q16t, rt, sk, S.kc, S.vc, ring, c.H, c.KV, pt, 0, ns, qk_scale, Ly.rel_proj,
+                                           c.d_rel, extent, window, W.lg, ot, gt, W.x16 + (size_t) t * HD, g_s);
+                else
+                    k::attn_decode_f16_at(qt, rt, sk, S.kc, S.vc, ring, c.H, c.KV, pt, P, qk_scale, Ly.rel_proj, c.d_rel,
+                                          extent, window, W.lg, ot, g_s);
+            }
+            if (!mma) k::gate_mul_f16(ot, gt, (size_t) HD, W.x16 + (size_t) t * HD, true, g_s);
+        }
+        // the output projection, each row's conv (the stream added, but where a block starts)
+        const bool first = l % c.block == 0;
+        if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+        exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
+        for (int t = 0; t < T; ++t)
+            k::conv_block(W.tmp + (size_t) t * C, C, g_slots[sl[t]][vis].h_attn, Ly.sc_attn, nullptr, 0, 0, 1, C,
+                          first ? nullptr : W.h + (size_t) t * C, C, W.r + (size_t) t * C, C, nullptr, nullptr, g_s);
+        if (first) ++nb;
+        // the MoE: its input and the router for all rows, then each row's experts as the one-token path's
+        {
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.r;
+            if (msg) {
+                k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, W.xq, g_s);
+                const k::LoopGate gt{W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], W.xq};
+                k::loop_gates(&gt, 1, T, C, c.rank, 1e-6f, W.lp_g, g_s);
+                k::rms(W.xq, Ly.ffn_norm, T, C, c.eps, W.xq, g_s);
+            } else {
+                k::RmsOuts outs{};
+                outs.w[0] = Ly.ffn_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+                k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+            }
+        }
+        k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, T, W.rlog, c.E, g_s);
+        const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+        int* rtop = W.route_d;
+        float* rw = (float*) (W.route_d + c.K);
+        for (int t = 0; t < T; ++t) {
+            float* xt = W.xq + (size_t) t * C;
+            k::route_token(W.rlog + (size_t) t * c.E, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0],
+                           Ly.tab_sc[1], Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, xt, C,
+                           exp_tc ? (uint16_t*) W.gu32 : nullptr);
+            if (exp_tc) {
+                k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+                                              c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            } else {
+                k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], xt, C, c.F, W.sg, W.su,
+                                          c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            }
+            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, g_slots[sl[t]][vis].h_mlp, Ly.sc_mlp, W.r + (size_t) t * C,
+                                W.h + (size_t) t * C, g_s);
+        }
+    }
+    {   // the head: every row's argmax (on the raw logits, as the token path's), and with cand its candidates
+        k::ResStates st{};
+        for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+        st.st[nb] = W.h;
+        k::RmsOuts outs{};
+        outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+        k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+        exact_rows(M.out_w, 0, c.n_rows, W.xq, C, T, W.logits, c.n_rows);
+        k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
+        CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
+        if (cand) {
+            const size_t cs = 2 + 2 * (size_t) kCandCap;
+            k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
+            for (int t = 0; t < T; ++t)
+                k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap,
+                             W.cand_part, g_parb.cand_d + t * cs, g_s);
+            CU(cudaMemcpyAsync(g_parb.cand_h, g_parb.cand_d, (size_t) T * cs * 4, cudaMemcpyDeviceToHost, g_s));
+        }
+    }
+}
+
+// one step of T rows (sorted by slot): tok[t] at pos[t] in slot sl[t] -> am[t] each row's argmax (and with cand its
+// candidates: par_cands)
+void par_step(Model& M, int T, const int* tok, const int* pos, const int* sl, bool cand, int* am) {
+    const Config& c = M.c;
+    if (T < 1 || T > kParMax) die("par_step: 1 .. 8 rows");
+    if (!g_parb.ready) par_init(M);
+    Work& W = dev_work(0);
+    const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+    int key = cand ? 1 : 0;
+    for (int t = 0; t < T; ++t) {
+        k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_parb.emb_h + (size_t) t * c.C);
+        g_parb.pos_h[t] = pos[t];
+        key |= 2 << sl[t];
+    }
+    if (!g_graph) {
+        par_launches(M, W, T, sl, cand);
+    } else {
+        FastGraph& G = g_pgraph[key];
+        if (!G.exec) {
+            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
+            par_launches(M, W, T, sl, cand);
+            CU(cudaStreamEndCapture(g_s, &G.graph));
+            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+        }
+        CU(cudaGraphLaunch(G.exec, g_s));
+    }
+    CU(cudaStreamSynchronize(g_s));
+    for (int t = 0; t < T; ++t) am[t] = W.argmax_h[t];
+}
+// row t's candidates of the last par_step with cand (logit, token); false: more than kept (then its logits)
+bool par_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) {
+    const int* r = g_parb.cand_h + (size_t) t * (2 + 2 * kCandCap);
+    if (r[0] > kCandCap) {
+        std::vector<float> row((size_t) M.c.n_vocab);
+        CU(cudaMemcpy(row.data(), dev_work(0).logits + (size_t) t * M.c.n_rows, (size_t) M.c.n_vocab * 4,
+                      cudaMemcpyDeviceToHost));
+        cd.resize(M.c.n_vocab);
+        for (int v = 0; v < M.c.n_vocab; ++v) cd[v] = {row[v], v};
+        return false;
+    }
+    const int* idx = r + 2;
+    const float* val = (const float*) (r + 2 + kCandCap);
+    cd.resize(r[0]);
+    for (int i = 0; i < r[0]; ++i) cd[i] = {val[i], idx[i]};
+    return true;
 }
 
 
@@ -4873,6 +5261,7 @@ int main(int argc, char** argv) {
             else die("--kv-streaming: auto, on or off");
         }
         else if (a == "--kv-resident") g_kv_resident = std::max(0, std::atoi(next().c_str()));
+        else if (a == "--parallel") g_par = std::clamp(std::atoi(next().c_str()), 1, kParMax);
         else if (a == "--dump") dump = next();
         else if (a == "--drafting") {   // (auto: measured once on this PC; on: the drafter and the prompt lookup; off)
             drafting = next();
@@ -4884,6 +5273,10 @@ int main(int argc, char** argv) {
     if (drafting.empty()) drafting = draft_path.empty() ? "off" : "on";   // (--draft alone: as before, drafting on)
     if (drafting == "off") draft_path.clear();
     g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
+    if (g_par > 1 && serve && (!draft_path.empty() || g_lookup)) {   // (a drafter's state is one conversation's)
+        std::printf("NOTE maya-ik2: drafting off with --parallel %d (several conversations decode together)\n", g_par);
+        draft_path.clear(), g_lookup = false, drafting = "off";
+    }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
 #ifdef STRATA_USE_HIP
@@ -5170,8 +5563,10 @@ int main(int argc, char** argv) {
         }
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
-            kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2 *
+                    (c.sliding[l] && serve ? g_par : 1);   // (--parallel: a sliding ring a conversation)
         }
+        g_dense_bytes = dense_b, g_exp_bytes = exp_b;
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
 #ifdef STRATA_USE_HIP
@@ -6397,6 +6792,7 @@ int main(int argc, char** argv) {
         // goes back to that point instead of the start. Full-layer KV needs nothing: positions rewrite cleanly.
         struct Snap {
             int pos = -1;
+            int slot = 0;   // (--parallel: the conversation's)
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
         };
@@ -6574,13 +6970,54 @@ int main(int argc, char** argv) {
                 if (draft_choice != 1 && draft_choice != 3) g_lookup = false;
             }
         }
+        // --parallel N: the resident path on one GPU only (the offload / cache paths, two GPUs and KV streaming: one at a time)
+        int ctx_s = ctx;
+        size_t slot_extra = 0;
+        if (g_par > 1 && !(serve_maya && g_fast && !g_off && n_gpu == 1 && !g_two.on && !g_kv_streaming && !g_tp &&
+                            ctx / g_par >= 4096)) {
+            std::printf("NOTE maya-ik2: --parallel %d not taken - several conversations at once run where every expert "
+                        "stays in VRAM on one GPU (the resident path), with at least 4096 positions each; one at a time\n",
+                        g_par);
+            g_par = 1;
+        }
+        if (g_par > 1) {
+            ctx_s = ctx / g_par;
+            slot_extra = slots_init(M, g_par, ctx, ctx_s);
+            std::printf("parallel: %d conversations at once, %d positions each (%.2f GiB more for their rings and "
+                        "convs)\n", g_par, ctx_s, slot_extra / 1073741824.0);
+        }
+        size_t kv_total = slot_extra;
+        for (const auto& Vi : M.V) kv_total += (size_t) Vi.kv_cap * KD * kv_elem_b * 2;
         if (serve_maya) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
             const bool sp = (drafter || g_lookup) && g_fast && g_block;
+            const char* wd = getenv("IK2_WATCHDOG_S");
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
-                        "drafting=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx, g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0,
-                        drafting.c_str());
-            std::printf("READY %d stop\n", ctx);
+                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx,
+                        g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0, drafting.c_str(),
+                        c.n_layer * c.E, g_par, wd && *wd ? std::max(0, std::atoi(wd)) : 600,
+                        g_fast ? "resident" : g_off ? "offload" : "cache");
+            // what fills each GPU (the Monitor's map): the dense weights, the experts' pool, the K / V cache
+            // (two GPUs, the split: GPU 1 holds only its experts - g_two's own bytes)
+            for (int d = 0; d < (g_two.on ? 2 : n_gpu); ++d) {
+                const int pd = g_two.on && d == 1 ? g_two.dev : d;
+                if (!(g_two.on && d == 1)) use_dev(d);
+                else CU(cudaSetDevice(pd));
+                size_t fr = 0, tot = 0;
+                CU(cudaMemGetInfo(&fr, &tot));
+                char pci[32] = "-";
+                cudaDeviceGetPCIBusId(pci, sizeof pci, pd);
+                size_t kv_d = d == 0 ? slot_extra : 0;
+                if (!(g_two.on && d == 1))
+                    for (const auto& Vi : M.V)
+                        if (M.L[Vi.l].dev == d) kv_d += (size_t) Vi.kv_cap * KD * kv_elem_b * 2;
+                std::printf("VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu pool=%zu\n", d, pci, tot, fr,
+                            n_gpu == 1 && d == 0 ? g_dense_bytes : (size_t) 0, kv_d,
+                            g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes());
+            }
+            use_dev(0);
+            if (g_par > 1) std::printf("READY %d stop multi=%d\n", ctx_s, g_par);
+            else std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
         }
@@ -6595,7 +7032,7 @@ int main(int argc, char** argv) {
         std::thread([]() {
             std::string l;
             while (std::getline(std::cin, l)) {
-                if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
+                if ((l == "STOP" || l.rfind("STOP ", 0) == 0) && g_par == 1) {   // (--parallel: the loop's, by rid)
                     if (busy) g_cancel = 1;
                     continue;
                 }
@@ -6615,6 +7052,391 @@ int main(int argc, char** argv) {
             in_q.pop_front();
             return true;
         };
+        // STAT's expert tiers and K / V figures (the Monitor's "Where the experts live", Throughput and Context): the
+        // experts in VRAM and in RAM (count, GB), the share of the picks VRAM held and those a token fetched from RAM or
+        // ran on the CPU lane since the last reading; the positions held, the cache's size
+        k::OffCount oc_prev{};
+        double ec_h_prev = ec_sum([](ExpertCache& e) { return e.hits; });
+        double ec_m_prev = ec_sum([](ExpertCache& e) { return e.misses; });
+        auto tier_kv = [&](int toks, long long kv_used) -> std::string {
+            int nv = 0;
+            double vb = 0;
+            for (auto& D : g_dev) {
+                for (int v : D.EC.loc) nv += v >= 0;
+                vb += (double) D.EC.total_bytes();
+            }
+            nv = std::min(nv, c.n_layer * c.E);
+            double hit = 1, fetch = 0, cpu = 0;
+            if (g_off) {
+                k::OffCount oc{};
+                CU(cudaMemcpyAsync(&oc, g_offs.cnt, sizeof oc, cudaMemcpyDeviceToHost, g_s));
+                CU(cudaStreamSynchronize(g_s));
+                const double p = (double) (oc.picks - oc_prev.picks);
+                if (p > 0) hit = (double) (oc.tier - oc_prev.tier + oc.stage - oc_prev.stage) / p;
+                if (toks > 0) fetch = (double) (oc.fetched - oc_prev.fetched) / toks, cpu = (double) (oc.cpu - oc_prev.cpu) / toks;
+                oc_prev = oc;
+            } else if (!g_fast) {
+                const double h = ec_sum([](ExpertCache& e) { return e.hits; });
+                const double m = ec_sum([](ExpertCache& e) { return e.misses; });
+                if (h + m > ec_h_prev + ec_m_prev) hit = (h - ec_h_prev) / (h + m - ec_h_prev - ec_m_prev);
+                if (toks > 0) fetch = (m - ec_m_prev) / toks;
+                ec_h_prev = h, ec_m_prev = m;
+            }
+            char b[400];
+            std::snprintf(b, sizeof b, "vram_used=%d ram_used=%d vram_gb=%.2f ram_gb=%.2f vram_hit=%.4f ram_fetch=%.2f "
+                          "cpu=%.2f disk=0 promo=0 kv_used=%lld kv_cap=%d kv_gb=%.2f", nv, c.n_layer * c.E - nv, vb / 1e9,
+                          std::max(0.0, (double) g_exp_bytes - vb) / 1e9, hit, fetch, cpu, kv_used, ctx, kv_total / 1e9);
+            return std::string(b);
+        };
+        // a request's expert picks found in VRAM and all of them, as counters (DONE's last two fields: the differences)
+        auto pick_counts = [&](int decoded, unsigned long long& h, unsigned long long& n) {
+            if (g_off) {
+                k::OffCount oc{};
+                CU(cudaMemcpyAsync(&oc, g_offs.cnt, sizeof oc, cudaMemcpyDeviceToHost, g_s));
+                CU(cudaStreamSynchronize(g_s));
+                h = oc.tier + oc.stage, n = oc.picks;
+            } else if (g_fast) {
+                h = n = (unsigned long long) decoded * c.n_visit * c.K;
+            } else {
+                h = (unsigned long long) ec_sum([](ExpertCache& e) { return e.hits; });
+                n = h + (unsigned long long) ec_sum([](ExpertCache& e) { return e.misses; });
+            }
+        };
+        if (serve_maya) watchdog_start();
+        if (g_par > 1) {
+            // ---- --parallel N: requests tagged rid=<id> ("T <rid> <id>", "PP <rid> ...", "DONE <rid> ...", "ERR <rid>
+            // ..."), "STOP <rid>" ends one.  Arrival order: a request takes a free conversation as it comes (the one
+            // whose kept tokens it shares the most of, else the longest unused); each turn the earliest one still
+            // reading its prompt runs one pass of it (the same passes as alone), then every writing one's next token
+            // in one step.  Drafting is off (a drafter's state is one conversation's).
+            struct Req {
+                int rid = 0;
+                std::vector<int> ids;
+                std::vector<uint64_t> sig;
+                Pictures img;
+                int max_new = 0, top_k = 0;
+                double temp = 0, top_p = 1;
+                std::mt19937_64 rng;
+                int slot = -1, phase = 0;   // 1: reading its prompt, 2: writing
+                size_t p0 = 0;
+                int cached = 0, n_out = 0, tok = -1;
+                double t0 = 0, t1 = 0;
+                bool cancel = false;
+            };
+            struct SlotH {
+                std::vector<int> hist;
+                std::vector<uint64_t> sig;
+                std::vector<float> last;
+                double used = 0;
+                bool busy = false;
+            };
+            std::vector<SlotH> sh(g_par);
+            std::deque<Req> waiting;
+            std::list<Req> act;
+            std::mt19937_64 rng_g(1234);
+            bool quit = false;
+            auto slot_reset = [&](int s) {
+                bind_slot(M, s);
+                for (int vis = 0; vis < (int) M.V.size(); ++vis) {
+                    Layer& Ly = bind_visit(M, vis);
+                    use_dev(Ly.dev);
+                    CU(cudaMemsetAsync(Ly.h_k, 0, 3 * KD * 4, g_s));
+                    CU(cudaMemsetAsync(Ly.h_v, 0, 3 * KD * 4, g_s));
+                    CU(cudaMemsetAsync(Ly.h_attn, 0, 3 * C * 4, g_s));
+                    CU(cudaMemsetAsync(Ly.h_mlp, 0, 3 * C * 4, g_s));
+                }
+                for (auto& sn : snaps)
+                    if (sn.slot == s) sn.pos = -1;
+                sh[s].hist.clear(), sh[s].sig.clear(), sh[s].last.clear();
+            };
+            auto sample = [&](Req& r, std::vector<std::pair<float, int>>& cd) -> int {   // (as the one-at-a-time loop's)
+                const int kk = std::min((int) cd.size(), r.top_k > 0 ? std::min(r.top_k, kCandK) : kCandK);
+                std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
+                                  [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
+                                      return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
+                                  });
+                std::vector<double> pr(kk);
+                double z = 0;
+                for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / r.temp));
+                double acc = 0;
+                int keep = kk;
+                for (int j = 0; j < kk; ++j) {
+                    acc += pr[j] / z;
+                    if (acc >= r.top_p) {
+                        keep = j + 1;
+                        break;
+                    }
+                }
+                double zk = 0;
+                for (int j = 0; j < keep; ++j) zk += pr[j];
+                double u = std::uniform_real_distribution<double>(0, zk)(r.rng);
+                for (int j = 0; j < keep; ++j) {
+                    u -= pr[j];
+                    if (u <= 0) return cd[j].second;
+                }
+                return cd[keep - 1].second;
+            };
+            auto pick_last = [&](Req& r, const std::vector<float>& lg) -> int {
+                if (r.temp <= 0) return (int) (std::max_element(lg.begin(), lg.begin() + c.n_vocab) - lg.begin());
+                std::vector<std::pair<float, int>> cd(c.n_vocab);
+                for (int v = 0; v < c.n_vocab; ++v) cd[v] = {lg[v], v};
+                return sample(r, cd);
+            };
+            auto done_line = [&](Req& r, const char* reason) {
+                const double tn = now();
+                const unsigned long long picks = (unsigned long long) r.n_out * c.n_visit * c.K;
+                std::printf("DONE %d %d %zu %.1f %.1f %s 0 0 %d %llu %llu\n", r.rid, r.n_out, r.ids.size(),
+                            ((r.phase == 2 ? r.t1 : tn) - r.t0) * 1e3, r.phase == 2 ? (tn - r.t1) * 1e3 : 0.0, reason,
+                            r.cached, picks, picks);
+                if (r.slot >= 0) sh[r.slot].busy = false, sh[r.slot].used = tn;
+            };
+            // the prompt read: its kept state saved (the conversation's next turn goes back to it), its first token
+            auto prompt_done = [&](Req& r) {
+                SlotH& S = sh[r.slot];
+                if ((size_t) r.cached < r.ids.size()) {
+                    S.hist = r.ids, S.sig = r.sig;
+                    Snap& sn = snaps[snap_next];
+                    snap_next = (snap_next + 1) % (int) snaps.size();
+                    sn.pos = (int) S.hist.size(), sn.slot = r.slot;
+                    bind_slot(M, r.slot);
+                    snap_copy(sn, true);
+                }
+                r.t1 = now();
+                r.phase = 2;
+                r.tok = pick_last(r, S.last);
+            };
+            auto admit = [&](Req&& rq) {
+                int s = -1;
+                size_t bestL = 0;
+                for (int i = 0; i < g_par; ++i) {
+                    if (sh[i].busy) continue;
+                    size_t L = 0;
+                    const auto& H = sh[i].hist;
+                    while (L < H.size() && L < rq.ids.size() && H[L] == rq.ids[L] &&
+                           (L < sh[i].sig.size() ? sh[i].sig[L] : 0) == rq.sig[L])
+                        ++L;
+                    if (s < 0 || L > bestL || (L == bestL && sh[i].used < sh[s].used)) s = i, bestL = L;
+                }
+                act.push_back(std::move(rq));
+                Req& r = act.back();
+                r.slot = s;
+                sh[s].busy = true;
+                bind_slot(M, s);
+                SlotH& S = sh[s];
+                size_t L = bestL;
+                if (L < S.hist.size() || L == r.ids.size()) {
+                    int best = -1;
+                    for (int i = 0; i < (int) snaps.size(); ++i)
+                        if (snaps[i].slot == s && snaps[i].pos >= 0 && snaps[i].pos <= (int) L &&
+                            snaps[i].pos < (int) r.ids.size() && (best < 0 || snaps[i].pos > snaps[best].pos))
+                            best = i;
+                    if (L == S.hist.size() && L == r.ids.size() && !S.last.empty()) {
+                        // (the same tokens again: the last logits answer)
+                    } else if (best >= 0) {
+                        const int sp = snaps[best].pos;
+                        snap_copy(snaps[best], false);
+                        for (auto& sn : snaps)
+                            if (sn.slot == s && sn.pos > sp) sn.pos = -1;
+                        S.hist.resize(sp);
+                        if (S.sig.size() > (size_t) sp) S.sig.resize(sp);
+                        S.last.clear();
+                        L = sp;
+                    } else {
+                        slot_reset(s), L = 0;
+                    }
+                }
+                r.cached = (int) L, r.p0 = L, r.t0 = now(), r.phase = 1;
+                if (L == r.ids.size()) prompt_done(r);
+            };
+            auto take = [&](const std::string& l) {   // one input line
+                std::istringstream in(l);
+                std::string cmd;
+                in >> cmd;
+                if (cmd == "QUIT") {
+                    quit = true;
+                    return;
+                }
+                if (cmd == "STOP") {   // "STOP <rid>": that request; "STOP": every one
+                    std::string w;
+                    const bool all = !(in >> w);
+                    const int rid = all ? -1 : std::atoi(w.c_str());
+                    for (auto& r : act)
+                        if (all || r.rid == rid) r.cancel = true;
+                    for (auto it = waiting.begin(); it != waiting.end();)
+                        if (all || it->rid == rid) {
+                            std::printf("DONE %d 0 %zu 0 0 cancel 0 0 0 0 0\n", it->rid, it->ids.size());
+                            it = waiting.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    return;
+                }
+                const bool geni = cmd == "GENI";
+                if (cmd != "GEN" && !geni) return;
+                Req r;
+                std::string w, ids_s, emb_path;
+                long long seed = -1;
+                in >> r.max_new;
+                while (in >> w) {
+                    const size_t eq = w.find('=');
+                    if (eq == std::string::npos) {
+                        if (geni && emb_path.empty() && ids_s.empty() && w.find_first_not_of("0123456789,-") != std::string::npos)
+                            emb_path = w;
+                        else
+                            ids_s = w;
+                        continue;
+                    }
+                    const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
+                    if (k == "temperature") r.temp = std::atof(v.c_str());
+                    else if (k == "top_p") r.top_p = std::atof(v.c_str());
+                    else if (k == "top_k") r.top_k = std::atoi(v.c_str());
+                    else if (k == "seed") seed = std::atoll(v.c_str());
+                    else if (k == "rid") r.rid = std::atoi(v.c_str());
+                }
+                r.ids = parse_ints(ids_s);
+                r.rng.seed(seed >= 0 ? (uint64_t) seed : rng_g());
+                if (r.ids.empty() || (int) r.ids.size() + r.max_new > ctx_s) {
+                    std::printf("ERR %d %s\nDONE %d 0 %zu 0 0 cancel 0 0 0 0 0\n", r.rid,
+                                r.ids.empty() ? "an empty prompt" :
+                                    ("the prompt and max_tokens pass the context (" + std::to_string(ctx_s) + ")").c_str(),
+                                r.rid, r.ids.size());
+                    return;
+                }
+                r.sig.assign(r.ids.size(), 0);
+                if (!emb_path.empty()) {
+                    const std::string err = load_pictures(emb_path, r.ids, image_token, c.C, r.img, r.sig);
+                    if (!err.empty()) {
+                        std::printf("ERR %d %s\nDONE %d 0 %zu 0 0 cancel 0 0 0 0 0\n", r.rid, err.c_str(), r.rid,
+                                    r.ids.size());
+                        return;
+                    }
+                }
+                waiting.push_back(std::move(r));
+            };
+            uint64_t steps = 0;
+            int stat_tok = 0;
+            double stat_t = now();
+            while (!quit) {
+                {   // the input: wait for it when nothing runs, else take what came
+                    std::unique_lock<std::mutex> lk(in_m);
+                    if (act.empty() && waiting.empty()) in_cv.wait(lk, [&] { return !in_q.empty() || in_eof; });
+                    if (in_q.empty() && in_eof && act.empty() && waiting.empty()) break;
+                    std::vector<std::string> got(in_q.begin(), in_q.end());
+                    in_q.clear();
+                    lk.unlock();
+                    for (const auto& l : got)
+                        if (!quit) take(l);
+                }
+                if (quit) {
+                    pop_dump();
+                    break;
+                }
+                int n_busy = 0;
+                for (const auto& S : sh) n_busy += S.busy;
+                while (!waiting.empty() && n_busy < g_par) {
+                    Req r = std::move(waiting.front());
+                    waiting.pop_front();
+                    admit(std::move(r));
+                    ++n_busy;
+                }
+                g_wd_busy = !act.empty();
+                if (act.empty()) {
+                    std::fflush(stdout);
+                    continue;
+                }
+                // a reader stopped: nothing of its prompt is kept
+                for (auto it = act.begin(); it != act.end();) {
+                    if (it->phase == 1 && it->cancel) {
+                        slot_reset(it->slot);
+                        done_line(*it, "cancel");
+                        it = act.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                // one prompt pass: the earliest reader's (act is in arrival order)
+                for (auto& r : act) {
+                    if (r.phase != 1) continue;
+                    bind_slot(M, r.slot);
+                    const int n = (int) std::min<size_t>(chunk, r.ids.size() - r.p0);
+                    const bool last_c = r.p0 + n == r.ids.size();
+                    std::vector<float> lo;
+                    beat("a prompt pass (--parallel)");
+                    std::swap(g_img, r.img);
+                    forward(M, r.ids.data() + r.p0, n, (int) r.p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
+                            std::string(), lo, nullptr, t_exp);
+                    std::swap(g_img, r.img);
+                    if (last_c) sh[r.slot].last = std::move(lo);
+                    r.p0 += n;
+                    const double ms = (now() - r.t0) * 1e3;
+                    std::printf("PP %d %zu %zu %.0f %.1f %d\n", r.rid, r.p0, r.ids.size(), ms,
+                                (r.p0 - r.cached) / std::max(1e-3, ms / 1e3), r.cached);
+                    if (last_c) prompt_done(r);
+                    break;
+                }
+                // the writers: each one's token out, then the next of those going on in one step
+                std::vector<Req*> rows;
+                for (auto& r : act)
+                    if (r.phase == 2) rows.push_back(&r);
+                std::sort(rows.begin(), rows.end(), [](const Req* a, const Req* b) { return a->slot < b->slot; });
+                std::vector<Req*> go;
+                for (Req* r : rows) {
+                    if (r->cancel || r->max_new <= 0) {
+                        done_line(*r, r->cancel ? "cancel" : "length");
+                        r->phase = 3;
+                        continue;
+                    }
+                    ++r->n_out;
+                    std::printf("T %d %d\n", r->rid, r->tok);
+                    if (std::find(eos_ids.begin(), eos_ids.end(), r->tok) != eos_ids.end()) {
+                        done_line(*r, "stop");
+                        r->phase = 3;
+                    } else if (r->n_out >= r->max_new) {
+                        done_line(*r, "length");
+                        r->phase = 3;
+                    } else {
+                        go.push_back(r);
+                    }
+                }
+                if (!go.empty()) {
+                    const int T = (int) go.size();
+                    int tk[kParMax], ps[kParMax], sl[kParMax], am[kParMax];
+                    bool cand = false;
+                    for (int t = 0; t < T; ++t) {
+                        tk[t] = go[t]->tok, ps[t] = (int) sh[go[t]->slot].hist.size(), sl[t] = go[t]->slot;
+                        cand = cand || go[t]->temp > 0;
+                    }
+                    beat("a decode step (--parallel, the conversations' tokens together)");
+                    par_step(M, T, tk, ps, sl, cand, am);
+                    for (int t = 0; t < T; ++t) {
+                        Req& r = *go[t];
+                        sh[r.slot].hist.push_back(r.tok);
+                        if (r.temp <= 0) {
+                            r.tok = am[t];
+                        } else {
+                            std::vector<std::pair<float, int>> cd;
+                            par_cands(M, t, cd);
+                            r.tok = sample(r, cd);
+                        }
+                    }
+                    stat_tok += T;
+                    if (++steps % 16 == 0) {
+                        long long held = 0;
+                        for (const auto& S : sh) held += (long long) S.hist.size();
+                        const double tn = now();
+                        std::printf("STAT tok_s=%.1f ms_tok=%.2f active=%d %s\n", stat_tok / std::max(1e-9, tn - stat_t),
+                                    stat_tok ? (tn - stat_t) * 1e3 / stat_tok * T : 0.0, T,
+                                    tier_kv(stat_tok, held).c_str());
+                        stat_tok = 0, stat_t = tn;
+                    }
+                }
+                act.remove_if([](const Req& r) { return r.phase == 3; });
+                g_wd_busy = !act.empty();
+                std::fflush(stdout);
+            }
+            g_offs.lane.reset();
+            return 0;
+        }
         std::string line;
         std::mt19937_64 rng(1234);
         // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
@@ -6674,7 +7496,7 @@ int main(int argc, char** argv) {
             const std::vector<int> ids = parse_ints(ids_s);
             if (ids.empty() || (int) ids.size() + max_new > ctx) {
                 if (serve_maya)
-                    std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0\n",
+                    std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0 0 0\n",
                                 ids.empty() ? "an empty prompt" :
                                     ("the prompt and max_tokens pass the context (" + std::to_string(ctx) + ")").c_str(),
                                 ids.size());
@@ -6689,12 +7511,14 @@ int main(int argc, char** argv) {
                 const std::string err = load_pictures(emb_path, ids, image_token, c.C, g_img, sig);
                 if (!err.empty()) {
                     g_img.clear();
-                    std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0\n", err.c_str(), ids.size());
+                    std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0 0 0\n", err.c_str(), ids.size());
                     std::fflush(stdout);
                     continue;
                 }
             }
             busy = true;
+            g_wd_busy = true;
+            beat("the request's start (its kept state)");
             if (seed >= 0) rng.seed((uint64_t) seed);
             g_cancel = 0;
             // (drafting for this request: spec=1 asks for none; the prompt lookup's history its tokens; the Monitor's
@@ -6708,10 +7532,23 @@ int main(int argc, char** argv) {
                 lk.reset();
                 lk.append(ids.data(), ids.size());
             }
-            auto stat_line = [&]() {
-                std::printf("STAT draft_acc=%llu draft_off=%llu draft_rounds=%llu draft_ms=%.1f verify_ms=%.1f\n",
-                            (unsigned long long) (sctl.kept() - kept0), (unsigned long long) (sctl.offered() - offered0),
-                            (unsigned long long) req_rounds, req_draft_s * 1e3, req_verify_s * 1e3);
+            int stat_n = 0;      // (the tokens and the time at the last STAT: its rate the interval's)
+            double stat_t = 0;
+            auto stat_line = [&](int made, double t_now) {
+                const double dt = t_now - stat_t;
+                const int dn = made - stat_n;
+                std::string dr;
+                if (req_spec) {
+                    char b[160];
+                    std::snprintf(b, sizeof b, " draft_acc=%llu draft_off=%llu draft_rounds=%llu draft_ms=%.1f verify_ms=%.1f",
+                                  (unsigned long long) (sctl.kept() - kept0),
+                                  (unsigned long long) (sctl.offered() - offered0), (unsigned long long) req_rounds,
+                                  req_draft_s * 1e3, req_verify_s * 1e3);
+                    dr = b;
+                }
+                std::printf("STAT tok_s=%.1f ms_tok=%.2f active=1 %s%s\n", dt > 0 && dn > 0 ? dn / dt : 0.0,
+                            dn > 0 ? dt * 1e3 / dn : 0.0, tier_kv(dn, (long long) hist.size()).c_str(), dr.c_str());
+                stat_n = made, stat_t = t_now;
             };
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
@@ -6752,6 +7589,7 @@ int main(int argc, char** argv) {
                     BigScratch bs;
                     const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) (ids.size() - L), (int) ids.size(), bs);
                     for (size_t p0 = L; p0 < ids.size(); p0 += T_pass) {
+                        beat("a prompt pass (the layer-major path)");
                         if (g_cancel) {   // (a prompt half run: nothing of it is kept)
                             cancelled = true;
                             break;
@@ -6772,6 +7610,7 @@ int main(int argc, char** argv) {
                     big_end(g_dev[0].W, dev_cache(0), bs);
                 } else {
                     for (size_t p0 = L; p0 < ids.size(); p0 += chunk) {
+                        beat("a prompt pass");
                         if (g_cancel) {   // (a prompt half run: nothing of it is kept)
                             cancelled = true;
                             break;
@@ -6791,10 +7630,11 @@ int main(int argc, char** argv) {
             }
             if (cancelled) {
                 reset();
-                if (serve_maya) std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d\n", ids.size(), (now() - t0) * 1e3, cached);
+                if (serve_maya) std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d 0 0\n", ids.size(), (now() - t0) * 1e3, cached);
                 else std::printf("@END cancelled %zu %d %.3f %.3f\n", ids.size(), cached, now() - t0, 0.0);
                 std::fflush(stdout);
                 busy = false;
+                g_wd_busy = false;
                 continue;
             }
             if (L < ids.size()) {
@@ -6866,11 +7706,16 @@ int main(int argc, char** argv) {
             const char* reason = "length";
             int n_out = 0;
             int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
+            stat_t = t1;
+            unsigned long long ph0 = 0, pn0 = 0;
+            pick_counts(0, ph0, pn0);
             for (int i = 0; i < max_new; ++i) {
+                beat("a decode step");
                 if (g_cancel) {
                     reason = "cancelled";
                     break;
                 }
+                if (serve_maya && !req_spec && n_out && n_out % 32 == 0) stat_line(n_out, now());
                 const int tok = temp <= 0             ? greedy_tok
                                 : pending_sample >= 0 ? pending_sample
                                 : cand                ? pick_cand()
@@ -6914,7 +7759,7 @@ int main(int argc, char** argv) {
                         hist.push_back(next[j]);
                         lk.append(next[j]);
                     }
-                    if (serve_maya && req_rounds % 8 == 0) stat_line();
+                    if (serve_maya && req_rounds % 8 == 0) stat_line(n_out + (int) next.size() - 1, now());
                     std::fflush(stdout);
                     n_out += (int) next.size() - 1;
                     i += (int) next.size() - 1;
@@ -6958,16 +7803,20 @@ int main(int argc, char** argv) {
                              (unsigned long long) sctl.kept(), (unsigned long long) sctl.offered(),
                              (unsigned long long) sctl.l_accepted, (unsigned long long) sctl.l_drafted,
                              (unsigned long long) sctl.plain);
-            if (serve_maya && req_rounds) stat_line();
-            if (serve_maya)   // (DONE's 6th and 7th fields: this answer's drafts kept and offered)
-                std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
+            if (serve_maya) stat_line(n_out, now());
+            unsigned long long ph1 = 0, pn1 = 0;
+            pick_counts(n_out, ph1, pn1);
+            if (serve_maya)   // (DONE's 6th and 7th fields: this answer's drafts kept and offered; 9th, 10th its picks
+                              //  found in VRAM and all its picks)
+                std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %d %llu %llu\n", n_out, ids.size(), (t1 - t0) * 1e3,
                             (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason,
                             (unsigned long long) (sctl.kept() - kept0), (unsigned long long) (sctl.offered() - offered0),
-                            cached);
+                            cached, ph1 - ph0, pn1 - pn0);
             else
                 std::printf("@END %s %zu %d %.3f %.3f\n", reason, ids.size(), cached, t1 - t0, now() - t1);
             std::fflush(stdout);
             busy = false;
+            g_wd_busy = false;
         }
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         return 0;

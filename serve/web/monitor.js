@@ -241,9 +241,16 @@ const TIER_SETS = {
     {key: "disk", label: "From the model file", unit: "/tok", digits: 2, tone: "warn",
      sub: "experts read from the model file (page cache or SSD)"},
   ],
+  // Inkling 2 (maya-ik2): every expert in VRAM (the resident path), or a tier of them with the rest in pinned RAM -
+  // fetched over PCIe by the GPU or computed by the CPU lane (the offload path)
+  ik2: [
+    {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts the GPU fetched from pinned RAM"},
+    {key: "cpu", label: "On the CPU", unit: "/tok", digits: 2, sub: "experts the CPU lane computed from RAM"},
+  ],
 };
 export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds4" : eng && eng.engine_kind === "mm3" ? "mm3"
                                            : eng && eng.engine_kind === "qwen" ? "qwen"
+                                           : eng && eng.engine_kind === "ik2" ? "ik2"
                                            : eng && eng.engine_kind === "hy4" ? "hy4" : "glm"];
 // the card's advice, from the live reading n (stale: the last answer's), the SSD-only share (disk: experts with no home
 // in VRAM or RAM) and the helper pool.  The "more RAM" advice only where experts really live on the SSD alone: a model
@@ -270,7 +277,7 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
 }
 function Tiers({t, eng}) {
   if (!t || !t.now) return null;
-  // (STAT lines with no expert tiers - Inkling 2's drafting figures alone: every expert in VRAM, nothing to show here)
+  // (STAT lines with no expert tiers - an engine's drafting figures alone: nothing to show here)
   if (!(eng && eng.engine_kind === "hy4") && t.now.vram_used == null && t.now.ram_used == null) return null;
   const ds4 = !!(eng && eng.engine_kind === "ds4"), hy4 = !!(eng && eng.engine_kind === "hy4");
   const set = tierSet(eng);
