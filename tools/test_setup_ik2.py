@@ -149,8 +149,8 @@ class Refusals(unittest.TestCase):
             ("hip", False, 0, [amd("gfx1030", 16)], "RDNA 3, 3.5 or 4"),
             ("hip", False, 0, [amd("gfx1201", 16)], "24 GB of VRAM or more"),
             ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "24 GB of VRAM or more"),
-            ("cuda", True, 0, ok, "Linux only"),
             ("cuda", False, 2, ok, "one GPU only"),
+            ("cuda", True, 0, [card(6, arch="86")], "8 GB of VRAM or more"),   # (Windows: the same card rules)
             ("cuda", False, 0, [card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
             ("cuda", False, 0, [card(6, arch="86")], "8 GB of VRAM or more"),
             ("cuda", False, 0, [card(6, arch="70"), card(4, 1, arch="89")], "8 GB of VRAM or more"),
@@ -163,6 +163,7 @@ class Refusals(unittest.TestCase):
                       [card(32, arch="70", name="Tesla V100-PCIE-32GB")], [card(24, arch="75", name="NVIDIA TITAN RTX")],
                       [card(8, arch="86")], [card(16, arch="70"), card(12, 1, arch="89")]):
             self.assertIsNone(F.unsupported("cuda", False, 1, cards))
+            self.assertIsNone(F.unsupported("cuda", True, 1, cards))   # (Windows + NVIDIA: as on Linux)
         # (AMD on Linux: RDNA 3 / 3.5 / 4 with 24 GB, or an APU whose shared memory leaves that much)
         for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
                       [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], []):
@@ -186,8 +187,26 @@ class Refusals(unittest.TestCase):
                 out = refusal(lambda: maya.check_pc(a, "ik2"))
             self.assertIn(part, out)
             self.assertEqual(len([ln for ln in out.splitlines() if "[X]" in ln]), 1)
+        with patch.object(maya, "WIN", True):   # (Windows: AMD only - NVIDIA runs it as on Linux)
+            self.assertIn("Linux only", refusal(lambda: maya.check_pc(args(backend="hip"), "ik2")))
+
+    def test_windows_vram_measured(self):
+        """Windows + NVIDIA: the card as CUDA gets it (an RTX 3050 8 GB: 7.0 GiB free), measured, kept per PC, card
+        and driver, read back while a Maya engine holds the card; Linux keeps nvidia-smi's figure."""
+        g = dict(card(8, arch="86", name="NVIDIA GeForce RTX 3050"), pci="00000000:01:00.0")
+        pc = {"backend": "cuda", "gpus": [g]}
+        probe = {maya.S._pci_key(g["pci"]): (int(7.0 * 2**30), int(6.7 * 2**30), int(8.0 * 2**30))}
         with patch.object(maya, "WIN", True):
-            self.assertIn("Linux only", refusal(lambda: maya.check_pc(args(), "ik2")))
+            room, how = maya.ik2_engine_vram(pc, probe=probe, saved={}, busy={})
+            self.assertEqual(how, "measured")
+            self.assertAlmostEqual(room, 7.0 + F.MARGIN_GIB, places=3)
+            self.assertLess(F.plan(room, 32768)["tier_gib"], F.plan(8.0, 32768)["tier_gib"])
+            saved = {"ik2|" + maya.hy4_room_key(g): {"ik2_free_gib": 6.9}}
+            self.assertEqual(maya.ik2_engine_vram(pc, probe={}, saved=saved, busy={0: 5000}),
+                             (6.9 + F.MARGIN_GIB, "measured"))
+            self.assertEqual(maya.ik2_engine_vram(pc, probe={}, saved={}, busy={}), (8.0, ""))
+        with patch.object(maya, "WIN", False):
+            self.assertEqual(maya.ik2_engine_vram(pc, probe=probe, saved={}, busy={}), (8.0, ""))
 
     def test_check_pc_refuses_an_old_or_small_card(self):
         for found, part in (([card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),

@@ -11291,6 +11291,8 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
     inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}
+    if pc["gpus"][0].get("ik2_vram_gb"):              # (Windows: the card as CUDA gets it, measured - the Models page)
+        inst["ik2_vram_gb"] = pc["gpus"][0]["ik2_vram_gb"]
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
            **({"backend": "hip"} if pc.get("backend") == "hip" else {}),
@@ -11326,10 +11328,40 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     return cfg_path
 
 
+def ik2_engine_vram(pc: dict, probe=None, saved: dict | None = None, busy: dict | None = None) -> tuple:
+    """Windows, NVIDIA: the card's VRAM in tools/ik2_fit.py's terms as maya-ik2's CUDA gets it - (GiB, "measured"),
+    else (nvidia-smi's VRAM, "").  Windows keeps part of every card from CUDA (the display driver's budget, the
+    desktop) that nvidia-smi does not show - an RTX 3050 8 GB gave CUDA 7.0 GB free - and maya-ik2 plans its start on
+    CUDA's free figure (every expert in VRAM or the offload path, the tier's size), so the setup's sums take that
+    figure (cuda_room_bytes: free with a context held, in a process of its own) plus ik2_fit's MARGIN_GIB (the share
+    its sums leave for the context and the desktop).  Measured now and kept for this PC, card and driver in
+    HY4_ROOM_STORE ("ik2|" + hy4_room_key), the kept figure read back where the card is busy (a Maya engine holds it)
+    or the driver gives no reading.  Not Windows, AMD, an APU, nothing measured: nvidia-smi's figure.  probe, saved,
+    busy: the readings, the records and maya_engine_mib's cards (tests; else read)."""
+    g = ((pc or {}).get("gpus") or [{}])[0]
+    vram = float(g.get("vram_gb") or 0)
+    if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not g.get("pci") or not vram or \
+            g.get("unified_memory"):
+        return vram, ""
+    key = "ik2|" + hy4_room_key(g)
+    if g.get("index") not in (maya_engine_mib() if busy is None else busy):
+        r = (cuda_room_bytes() if probe is None else probe).get(S._pci_key(str(g["pci"])))
+        if r:
+            free = float(r[0]) / 2**30
+            if saved is None:                          # (this card's figure under another driver: gone)
+                hy4_room_store(key, {"ik2_free_gib": round(free, 3), "measured": time.strftime("%Y-%m-%d %H:%M:%S")},
+                               lambda k: k.split("|")[:4] == key.split("|")[:4])
+            return min(vram, free + IK2F.MARGIN_GIB), "measured"
+    rec = (hy4_room_load() if saved is None else saved).get(key) or {}
+    if isinstance(rec.get("ik2_free_gib"), (int, float)):
+        return min(vram, float(rec["ik2_free_gib"]) + IK2F.MARGIN_GIB), "measured"
+    return vram, ""
+
+
 def set_up_ik2(a, prev: dict) -> Path | None:
     """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
-    run: a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB, an AMD GPU older
-    than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
+    run: a Mac, AMD on Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
+    GPU older than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
     (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
     sha256-checked), the tokenizer with the model's own template, the pictures (its mmproj and maya-vision), the
     config."""
@@ -11349,9 +11381,16 @@ def set_up_ik2(a, prev: dict) -> Path | None:
         why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), [g])
         if why:
             fail(why)
+    else:   # (Windows: the card as CUDA gets it, measured - the figure the engine plans with)
+        room, how = ik2_engine_vram(pc)
+        if how:
+            ok(f"VRAM for the engine: {room - IK2F.MARGIN_GIB:.1f} GB of the card's {vram:.1f} GB (measured: "
+               "Windows keeps the rest for the display)")
+            vram = pc["gpus"][0]["ik2_vram_gb"] = round(room, 2)
     step(2, "your choices")                            # 2
-    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux), not yet by "
-         "Maya's team on every card - tell us how it goes in an issue" if not amd else
+    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux) and by Maya's "
+         "team on V100s (Linux) and an RTX 3050 8 GB (Windows), not yet on every card - tell us how it goes in "
+         "an issue" if not amd else
          f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
          "Linux), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes in an issue")
     m = ik2_entry()

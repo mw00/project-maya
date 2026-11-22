@@ -366,21 +366,23 @@ router, with no host step, and the same expert kernels read the same bytes, so t
 in VRAM gives. With `IK2_LANE=1` (lane parity) the CPU lane takes a share of the misses beside the copies, split by
 measured costs; every expert then runs one exact arithmetic on either side (`src/ik2/ik2_exact.h`, held bit for bit
 by `tests/ik2_off_test.cu`), so an answer does not depend on where an expert ran. Only the experts the tier does not
-hold are pinned (on Linux): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
+hold are pinned (Linux and Windows - Windows maps each pinned run at a device address of its own, so the GPU
+finds an expert through a table of them): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
 the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not need (12.1 GiB pinned; 12 GB card
 ~8 GiB, 16 GB ~4 GiB). `IK2_PIN_ALL=1` pins every expert. The PC needs the model in RAM and VRAM together (about
 24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting stays off on
 the offload path (its window runs only where every expert is in VRAM; a NOTE says so).
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 8 GB or more, sm_70
+**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux or Windows, one NVIDIA GPU of 8 GB or more, sm_70
 (Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
-(sm_100 / sm_120) compile-checked only. Elsewhere `maya-ik2` stops at the start with one line saying why (under
+(sm_100 / sm_120) compile-checked only; Windows run on an RTX 3050 8 GB (@cobra91's MSVC port, its VRAM as CUDA gets it
+measured by the setup). Elsewhere `maya-ik2` stops at the start with one line saying why (under
 `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
 tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 7 GiB of VRAM,
-`--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs (`IK2_EP=1` or
-`IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13 port -
-untested here. CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list, and on Windows unless
-`-DSTRATA_IK2_WINDOWS=ON`.
+`--gpus 2` or more, AMD on Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs (`IK2_EP=1` or
+`IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM -
+untested here. CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list (`-DSTRATA_IK2_WINDOWS=OFF`:
+not on Windows).
 
 **AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
 written for `mma.sync` / `ldmatrix` / `cp.async` run through AMD versions that keep their fragment layouts; the prompt's
