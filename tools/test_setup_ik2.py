@@ -443,12 +443,12 @@ class Steps(unittest.TestCase):
 
     def test_drafter_room(self):
         """tools/ik2_fit.py's drafter room (maya-ik2's draft_room): 24 GB cards hold it up to about 200K tokens with the
-        FP8 cache, 32 GB at 262K; it grows 4.75 KiB a token."""
+        FP8 cache, 32 GB at 262K; it grows 4 KiB a token (its attention's logits in shared memory, no scratch a token)."""
         self.assertTrue(F.draft_fits(24, 131072, "fp8"))
         self.assertFalse(F.draft_fits(24, 262144, "fp8"))
         self.assertTrue(F.draft_fits(32, 262144, "fp8"))
         self.assertTrue(F.draft_fits(0, 262144, "fp8"))          # (not known: the engine measures)
-        self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4864 / 2**30, places=6)
+        self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4096 / 2**30, places=6)
 
     def test_drafting_off_reason(self):
         """Volta / Turing and the offload path run with drafting off; sm_80+ with every expert in VRAM and AMD keep it."""

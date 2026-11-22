@@ -401,6 +401,19 @@ void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
                          float* out, const float* gate, uint16_t* out16, cudaStream_t s, int blk0 = 0, int nblk = -1,
                          int phase = 0);
+/// attn_decode_mma for the T tokens of a window in two launches (q16 rows q_ld apart, r rows r_ld, sink [T][H], pos
+/// [T] on the device, out and out16 [T][H][D], gate rows gate_ld apart; scratch: T x attn_decode_mma_scratch):
+/// each token's output attn_decode_mma's to the bit.  false: nothing launched (Volta: a token at a time).
+bool attn_decode_mma_toks_f16(const uint16_t* q16, int q_ld, const float* r, int r_ld, const float* sink,
+                              const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T,
+                              int n_split, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                              float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
+                              cudaStream_t s);
+bool attn_decode_mma_toks_fp8(const uint16_t* q16, int q_ld, const float* r, int r_ld, const float* sink,
+                              const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T,
+                              int n_split, float qk_scale, float v_inv_scale, const float* proj, int d_rel, int extent,
+                              int window, float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
+                              cudaStream_t s);
 /// (KV streaming) a part of the above: phase 1 the blocks blk0 .. blk0 + nblk - 1 of the n_split only (their
 /// partials, the same as the whole launch's), phase 2 the combine only.  attn_decode_mma_keys: the keys [lo, hi) the
 /// blocks b0 .. b1 - 1 read for a token at qpos (a layer without a window).
@@ -421,15 +434,39 @@ void mix_rms(const float* x, int n_tap, size_t tap_stride, int rows, int C, cons
 void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaStream_t s);
 /// The drafter's attention: nq queries q [nq][H][128] over the context keys at positions k_lo .. k_hi - 1 of kc / vc
 /// ([ctx][Hkv][128]) and the block's own nq keys kb / vb ([nq][Hkv][128], all visible to every query); softmax(q . k *
-/// scale) . v -> out [nq][H][128].  scratch: H x nq x (k_hi - k_lo + nq) floats.
+/// scale) . v -> out [nq][H][128].  scratch: draft_attn_scratch(H) floats, whatever the context (the key chunks'
+/// partial outputs; the logits stay in shared memory, a tile at a time).
 void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int k_hi, const float* kb, const float* vb,
                 int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s, int cap = 0);
 /// ... over a context of FP16 rows.
 void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
                     int cap);
+/// ... over a context of FP8 (E4M3) rows stored times 1 / k_inv and 1 / v_inv (the block's own rows F32 as they are).
+void draft_attn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float k_inv, float v_inv, float* scratch,
+                    float* out, cudaStream_t s, int cap);
+/// draft_attn for a recorded graph: the block's position read on the device (par[0] = P), its context keys the span
+/// before it ([max(0, P - span), P)); the same output as draft_attn(k_lo, P).
+void draft_attn_dyn(const float* q, const float* kc, const float* vc, const int* par, int span, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                    int cap);
+void draft_attn_dyn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, const int* par, int span,
+                        const float* kb, const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
+                        cudaStream_t s, int cap);
+void draft_attn_dyn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, const int* par, int span, const float* kb,
+                        const float* vb, int nq, int H, int Hkv, float scale, float k_inv, float v_inv, float* scratch,
+                        float* out, cudaStream_t s, int cap);
+size_t draft_attn_scratch(int H);
+/// A context of FP8 or FP16 rows goes through the tensor cores (q and the probabilities FP16 there: the drafts
+/// only); IK2_DRAFT_ATTN=scalar, AMD and Volta: the F32 kernels.
+bool draft_attn_mma();
+/// y [n] = E4M3 of x [n] * scale (saturating at +-448).
+void to_e4m3(const float* x, size_t n, float scale, uint8_t* y, cudaStream_t s);
 /// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
+/// ... as FP16 (the input of q8_tile: a drafter whose matrices are Q8_0).
+void silu_mul_f16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
 /// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].
 void rnn_inputs(const float* state, const uint16_t* emb, const int* prev, const float* hidden, const float* f, int R,
                 int C, uint16_t* out, cudaStream_t s);
@@ -440,6 +477,28 @@ void rnn_gates(const float* proj, const float* bias, int R, float* state, float*
 void argmax_sum(const float* a, const float* b, const float* c, int n, int* out, cudaStream_t s);
 /// out[r] = argmax over c < n_cols of x[r * ld + c] for 0 <= r < n_rows (ties: the lower index), written on the device.
 void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaStream_t s);
+/// A sampled token's noise: Gumbel(0, 1) from a request's salt, the token's position and the token - the same for
+/// whoever asks, so that the drafter's draft of a position (argmax of its logits / T + this) and the model's token
+/// there (argmax of the model's log-probabilities + this: an exact sample of them, the Gumbel-max trick) agree
+/// wherever the two distributions are close.  The uniform is taken as the exponential's small side, so the large
+/// values - the ones an argmax over many tokens finds - keep a float's relative precision.
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__
+#endif
+inline float gumbel_noise(uint64_t salt, int pos, int token) {
+    uint64_t z = salt + 0x9E3779B97F4A7C15ull * ((uint64_t) (uint32_t) pos + 1ull) +
+                 0xD6E8FEB86659FD93ull * ((uint64_t) (uint32_t) token + 1ull);
+    z ^= z >> 30, z *= 0xBF58476D1CE4E5B9ull, z ^= z >> 27, z *= 0x94D049BB133111EBull, z ^= z >> 31;
+    const float e = ((float) (uint32_t) (z >> 40) + 0.5f) * (1.0f / 16777216.0f);   // uniform in (0, 1)
+    return -logf(-log1pf(-e));
+}
+/// argmax_gemv_f16 over a table kept as int8 [R][ld] with each row's scale folded into xs (xs[r] = x[r] * scale[r]):
+/// *out = argmax over v < n of base[v] + bias_f16[v] + sum_r W[r * ld + v] * xs[r].  ld a multiple of 8.
+/// par (or null): the sampled drafts' noise - par[0] the block's position, par[2], par[3] the salt, par[4] the bits of
+/// 1 / temperature (0: none) - then the token is the argmax of cap tanh(logit / cap) / temperature + gumbel_noise(salt,
+/// par[0] + pos_off, v).
+void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base, const uint16_t* bias_f16, int R, int n,
+                    int* out, cudaStream_t s, const int* par = nullptr, int pos_off = 0, float cap = 0.0f);
 /// *out = argmax over v < n of (base[v] + bias_f16[v] + sum_{r<R} W[r * ld + v] * x[r]), where W is [R][ld] FP16,
 /// x is [R] F32, base (optional) is [n] F32, bias_f16 (optional) is [n] FP16.  Ties: the lower index.
 void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* base, const uint16_t* bias_f16,
@@ -492,6 +551,15 @@ void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int 
                  cudaStream_t s);
 /// x [T][C] as two FP16 limbs a token: out [T][2][C] (hi, lo).
 void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s);
+/// Launches shared (the kernels' blocks as they are, so the same values): two conv_block of the same width - a layer's
+/// k and v (x rows x_ld apart, y rows y_ld, dyn rows d_ld or null, no residual); rms_f16 of up to three inputs of the
+/// same rows (both outputs each).
+void conv_block2(const float* xa, float* hist_a, const float* wa, const float* dyn_a, float* ya, float* rec_old_a,
+                 float* rec_x_a, const float* xb, float* hist_b, const float* wb, const float* dyn_b, float* yb,
+                 float* rec_old_b, float* rec_x_b, int x_ld, int d_ld, int heads, int T, int C, int y_ld,
+                 cudaStream_t s);
+void rms_f16_jobs(const float* const* x, const float* const* w, uint16_t* const* y16, float* const* y32, int n,
+                  int rows, int D, float eps, cudaStream_t s);
 /// route()'s picks of a window (S = T K <= 64 slots) grouped by expert on the device: blob [S], n [S] (0 past the
 /// last group), tok / row [S][kGroupMax], and a slot's sg, su, wt (down's scale folded) and inv (the slot).
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
@@ -534,7 +602,10 @@ void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq,
 /// y [T][N] (rows y_ld apart) = W . x [T][K] (rows x_ld apart, F32) for a planar Q8_0 matrix: each token's row sums
 /// mv_q8p's to the bit (T <= 8), the matrix read once.
 void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
-                 cudaStream_t s);
+                 cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
+/// ... whether rows with an input of their own (a0, a1: x [T][K], rows x_ld apart, the ranges multiples of 16 rows) go
+/// in the same launch - a layer's fused matrix whose q, k and v each have theirs: one launch, not four.
+bool mv_q8p_cols_alts(int K, int T, const MvAlt& a0, const MvAlt& a1);
 /// experts_gate_up_swiglu / experts_down for group_route's groups: each member's h / y the one-token kernels' to the
 /// bit (x [T][C] F32; h [slot][F]; y [slot][C]), an expert's rows read once from memory for its members.
 void experts_gate_up_swiglu_mem(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
