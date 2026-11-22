@@ -6918,7 +6918,7 @@ int main(int argc, char** argv) {
     const size_t T_buf = std::max(Tm, (size_t) W.T_sup), S_buf = T_buf * c.K;
     W.blk_ld = T_buf;
     for (float** p : {&W.h, &W.r, &W.tmp}) *p = dalloc<float>(T_buf * C);
-    for (float** p : {&W.res, &W.a, &W.xq, &W.xk, &W.xv}) *p = dalloc<float>(Tm * C);
+    for (float** p : {&W.xq, &W.xk, &W.xv}) *p = dalloc<float>(Tm * C);   // (A3b: W.res / W.a were dead - never read)
     W.q = dalloc<float>(Tm * HD), W.gate = dalloc<float>(Tm * HD), W.o = dalloc<float>(Tm * HD);
     W.kk = dalloc<float>(Tm * KD), W.vv = dalloc<float>(Tm * KD), W.kconv = dalloc<float>(Tm * KD);
     W.vconv = dalloc<float>(Tm * KD);
@@ -6945,7 +6945,16 @@ int main(int argc, char** argv) {
     }
     W.pos = dalloc<int>(T_buf);
     W.rlog = dalloc<float>(T_buf * c.E), W.route_d = dalloc<int>(S_buf * 2);
-    W.ex16 = dalloc<uint16_t>(T_buf * C), W.w16 = dalloc<uint16_t>((size_t) 2 * c.F * C);   // (one expert's tokens)
+    // (A3b: the !grp fallback's FP16 tile w16 and gather rows ex16 - 83 MiB at c512 - are dead when every
+    // layer takes the grouped path: g_grp, all grp_ok, grp_cap always >= S here, and no sup/dual/tp path.
+    // The tier's blobs are read directly by the grouped kernels instead.)
+    const bool grp_all = g_grp && !dual() && W.T_sup == 0 && [&] {
+        for (const Layer& Ly : M.L)
+            if (!grp_ok(Ly)) return false;
+        return true;
+    }();
+    if (!grp_all)
+        W.ex16 = dalloc<uint16_t>(T_buf * C), W.w16 = dalloc<uint16_t>((size_t) 2 * c.F * C);   // (one expert's tokens)
     W.h16 = dalloc<uint16_t>(S_buf * c.F);
     W.gu32_bytes = 4 * std::max({S8 * 2 * (size_t) c.F,
                   Tm * std::max<size_t>(2 * HD + 2 * KD + (size_t) c.H * c.d_rel + c.H,
