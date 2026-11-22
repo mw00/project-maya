@@ -8,7 +8,7 @@ namespace {
 
 __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restrict__ top, int K, int key0,
                                       const uint8_t* host, size_t hstride, OffStage st, OffFetch* fl, OffCount* cnt,
-                                      uint32_t* heat) {
+                                      uint32_t* heat, int* prev, int* prev_n) {
     const int lane = threadIdx.x;
     uint32_t seq = 0;
     if (lane == 0) seq = ++cnt->seq;
@@ -61,6 +61,20 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
         cnt->stage += (unsigned long long) n_stage;
         cnt->fetched += (unsigned long long) n_fetch;
         cnt->bytes += (unsigned long long) n_fetch * hstride;
+        if (prev) {   // (IK2_DF: this visit's picks, from which the layer's next visit's misses are predicted)
+            const int npr = prev_n ? *prev_n : 0;
+            int again = 0;   // (how many were the last visit's too: the predictor's own hit rate)
+            for (int i = 0; i < K; ++i)
+                for (int j = 0; j < npr && j < K; ++j)
+                    if (prev[j] == top[i]) {
+                        ++again;
+                        break;
+                    }
+            for (int i = 0; i < K; ++i) prev[i] = top[i];
+            for (int i = K; i < kOffMaxK; ++i) prev[i] = -1;
+            if (prev_n) *prev_n = K;
+            if (npr) cnt->prevhit += (unsigned long long) again;
+        }
     }
 }
 
@@ -78,6 +92,55 @@ __global__ void off_fetch_copy_kernel(const OffFetch* __restrict__ fl, size_t n1
             dst[i] = a, dst[i + stride] = b, dst[i + 2 * stride] = c, dst[i + 3 * stride] = d;
         }
         for (; i < n16; i += stride) dst[i] = src[i];
+    }
+}
+
+// IK2_DF: the next visit's k likeliest misses into staging slots of their own, reserved for it.  What predicts them:
+// the picks the layer took at its last visit (df_prev, written by off_fetch_plan_kernel) - the pass before, for a
+// looped core's second and third, and the last pass of the token before otherwise.  An expert already in the tier or
+// already staged is skipped (no second copy), and the slot is taken by the plan's own clock hand.
+__global__ void off_df_plan_kernel(const int* __restrict__ prev, const int* __restrict__ prev_n,
+                                   int key0, const uint8_t* const* __restrict__ tier, OffStage st, OffFetch* fl,
+                                   OffCount* cnt, int k, const uint8_t* host, size_t hstride) {
+    if (threadIdx.x) return;
+    const int npr = *prev_n;   // (0: the layer has not been visited yet, nothing to predict from)
+    const uint32_t seq = cnt->seq + 1;   // (the visit these are for: its plan's seq)
+    int nf = 0;
+    for (int i = 0; i < npr && i < k; ++i) {
+        const int e = prev[i];
+        if (e < 0) continue;
+        bool dup = false;   // (the last visit's picks are distinct, but a slot is never taken twice)
+        for (int j = 0; j < nf; ++j) dup = dup || fl->src[j] == host + (size_t) e * hstride;
+        if (dup) continue;
+        if (tier[e]) continue;   // (in the VRAM tier: never a miss; the layer's own table, E entries)
+        const int key = key0 + e;
+        int have = -1;
+        for (int s = 0; s < st.n; ++s)
+            if (st.tag[s] == key) {
+                have = s;
+                break;
+            }
+        if (have >= 0) {   // (already staged: no second copy, and held for the visit that will want it)
+            st.used[have] = seq;
+            continue;
+        }
+        int h = *st.hand, s = h, t = 0;
+        for (; t < st.n; ++t) {
+            s = h, h = h + 1 == st.n ? 0 : h + 1;
+            if (st.used[s] != cnt->seq && st.used[s] != seq) break;
+        }
+        if (t == st.n) break;   // (no slot the running or the predicted visit does not hold: fewer than k)
+        *st.hand = h;
+        st.tag[s] = key;
+        st.used[s] = seq;
+        fl->src[nf] = host + (size_t) e * hstride;
+        fl->dst[nf] = st.data + (size_t) s * st.sb;
+        ++nf;
+    }
+    fl->n = nf;
+    if (nf) {   // (what a wrong prediction costs, in the offload's figures; atomic: its plan runs beside this)
+        atomicAdd(&cnt->bytes, (unsigned long long) nf * hstride);
+        atomicAdd(&cnt->pred, (unsigned long long) nf);
     }
 }
 
@@ -320,12 +383,17 @@ __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C,
 }  // namespace
 
 void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
-                    OffStage st, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s) {
-    off_fetch_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, st, fl, cnt, heat);
+                    OffStage st, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* prev, int* prev_n, cudaStream_t s) {
+    off_fetch_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, st, fl, cnt, heat, prev, prev_n);
 }
 
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s) {
     off_fetch_copy_kernel<<<blocks, 256, 0, s>>>(fl, bytes / 16);
+}
+
+void off_df_plan(const int* prev, const int* prev_n, int key0, const uint8_t* const* tier, OffStage st, OffFetch* fl,
+                 OffCount* cnt, int k, const uint8_t* host, size_t hstride, cudaStream_t s) {
+    off_df_plan_kernel<<<1, 32, 0, s>>>(prev, prev_n, key0, tier, st, fl, cnt, k, host, hstride);
 }
 
 void off_lane_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,

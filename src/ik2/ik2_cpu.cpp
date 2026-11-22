@@ -4,17 +4,23 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 
 namespace ik2::cpu {
 
-bool available() {
+bool available() { return nvfp4_ok(); }
+
+bool nvfp4_ok() {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
 #else
     return false;
 #endif
 }
+
+bool native_ok() { return strata::kernels::cpu::native_experts_available(); }
 
 Pool::Pool(int n) {
     for (int i = 0; i < n; ++i)
@@ -157,6 +163,114 @@ void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* 
     }
 #endif
     nvfp4_rows_scalar(W, K, r0, r1, x, out);
+}
+
+// ---- IK2_CPU_FRAC: the GGUF forms through ggml-cpu's quantized dots (see the header)
+
+bool native_layer(int ty0, int ty1, int ty2, int64_t C, int64_t F, size_t slot_bytes, NativeLayer& l) {
+    std::string err;
+    l.ok = strata::kernels::cpu::native_fmt_mixed(ty0, ty1, ty2, C, F, l.f, err) && l.f.bytes == slot_bytes;
+    return l.ok;
+}
+
+void post_expert_native(Pool& pool, NativeJob* job, int C, int F, float gcap, float ucap) {
+    namespace kn = strata::kernels::cpu;
+    const kn::NativeFmt* fp = &job->lay->f;
+    const uint8_t* gate = job->blob;
+    const uint8_t* up = job->blob + fp->up_off;
+    const uint8_t* down = job->blob + fp->down_off;
+    const int up_ty = fp->mixed() ? fp->u_type : fp->gu_type;
+    const size_t up_row = fp->mixed() ? fp->u_row : fp->gu_row;
+    const int nF = (int) fp->n_ff, nC = (int) fp->n_embd;
+    job->gu.resize((size_t) 2 * F);
+    job->h.resize(F);
+    job->act.resize(std::max<size_t>(fp->act_bytes, 16));
+    job->hac.resize(std::max<size_t>(fp->h_bytes, 16));
+    kn::native_quant_act(*fp, job->x, job->act.data());
+    const int n = std::max(1, pool.size());
+    job->left = 2 * n;   // gate's chunks and up's
+    auto dchi = [&pool, job, fp, C, nC, nF, n, down]() {
+        for (int c = 0; c < n; ++c) {
+            const int r0 = (int) ((long) C * c / n), r1 = (int) ((long) C * (c + 1) / n);
+            pool.post([job, fp, r0, r1, nF, down]() {
+                strata::kernels::cpu::native_dot_rows(fp->d_type, fp->d_row, down, job->hac.data(), nF, r0, r1,
+                                                      job->y + r0);
+            });
+        }
+    };
+    for (int part = 0; part < 2; ++part)
+        for (int c = 0; c < n; ++c) {
+            const int r0 = (int) ((long) F * c / n), r1 = (int) ((long) F * (c + 1) / n);
+            pool.post([job, fp, part, r0, r1, nF, nC, up_ty, up_row, gate, up, gcap, ucap, dchi]() {
+                strata::kernels::cpu::native_dot_rows(part ? up_ty : fp->gu_type, part ? up_row : fp->gu_row,
+                                                      part ? up : gate, job->act.data(), nC, r0, r1,
+                                                      job->gu.data() + (size_t) part * nF + r0);
+                if (--job->left == 0) {   // (the last chunk: the activation, then down's rows)
+                    for (int i = 0; i < nF; ++i) {
+                        const float g = job->gu[i] * job->sg, u = job->gu[(size_t) nF + i] * job->su;
+                        job->h[i] = gcap * std::tanh(g / gcap) * (1.0f / (1.0f + std::exp(-g))) * ucap *
+                                    std::tanh(u / ucap);
+                    }
+                    strata::kernels::cpu::native_quant_h(*fp, job->h.data(), job->hac.data());
+                    dchi();
+                }
+            });
+        }
+}
+
+bool selftest(const std::vector<int>& types, std::string& out) { return strata::kernels::cpu::native_selftest(types, out); }
+
+const char* type_name(int type) { return strata::kernels::cpu::native_type_name(type); }
+
+bool make_test_row(int type, std::vector<uint8_t>& row, std::vector<float>& ref, size_t* row_bytes) {
+    return strata::kernels::cpu::native_make_test_row(type, row, ref, row_bytes);
+}
+
+static double now_s() {
+    using clk = std::chrono::steady_clock;
+    static const clk::time_point t0 = clk::now();
+    return std::chrono::duration<double>(clk::now() - t0).count();
+}
+
+void bench(Pool& pool, const std::vector<int>& types, int rows, int reps, const char* which, std::string& out) {
+    char line[256];
+    for (int ty : types) {
+        std::vector<uint8_t> one;
+        std::vector<float> ref;
+        size_t rb = 0;
+        if (!make_test_row(ty, one, ref, &rb) || rb == 0) {
+            std::snprintf(line, sizeof line, "  bench %-8s n/a\n", strata::kernels::cpu::native_type_name(ty));
+            out += line;
+            continue;
+        }
+        const int n = 256;
+        std::vector<uint8_t> w((size_t) rb * rows);
+        for (int r = 0; r < rows; ++r) std::memcpy(w.data() + (size_t) r * rb, one.data(), rb);
+        std::vector<uint8_t> act(strata::kernels::cpu::native_act_bytes_for(ty), 0);
+        std::vector<float> xf(256), af(256);
+        std::memcpy(xf.data(), ref.data(), 256 * 4);
+        for (int i = 0; i < 256; ++i) af[i] = std::sin(0.11f * (float) i);
+        strata::kernels::cpu::native_quant_act_test(ty, af.data(), act.data());
+        std::vector<float> out_v(rows);
+        const int nw = std::max(1, pool.size());
+        const bool hand = std::strcmp(which, "ggml") != 0;
+        const double t0 = now_s();
+        for (int rep = 0; rep < reps; ++rep) {
+            for (int c = 0; c < nw; ++c) {
+                const int r0 = rows * c / nw, r1 = rows * (c + 1) / nw;
+                pool.post([&w, &act, &out_v, rb, r0, r1, ty, hand]() {
+                    strata::kernels::cpu::native_dot_rows_ex(ty, rb, w.data(), act.data(), 256, r0, r1, out_v.data(),
+                                                             hand);
+                });
+            }
+            pool.wait();
+        }
+        const double dt = now_s() - t0;
+        const double gb = (double) rows * rb * reps / dt / 1e9;
+        std::snprintf(line, sizeof line, "  bench %-8s %6.2f GB/s  (%s, %d rows x %zu B, %d threads)\n",
+                      strata::kernels::cpu::native_type_name(ty), gb, hand ? "hand" : "ggml", rows, rb, nw);
+        out += line;
+    }
 }
 
 void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float ucap) {

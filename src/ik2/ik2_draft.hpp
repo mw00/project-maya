@@ -47,5 +47,8 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
+/// Whether it was loaded from a GGUF (a quantized drafter: its weights stay blocks on the device) rather than the
+/// BF16 mtp.safetensors.
+bool is_gguf(const Drafter* d);
 
 }  // namespace ik2::draft

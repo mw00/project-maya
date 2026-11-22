@@ -2,6 +2,7 @@
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "ik2_rows.hpp"   // (ik2's hand-tuned AVX2 rows: NVFP4's own dot is ggml-cpu's scalar loop)
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx512_one.hpp"
@@ -439,6 +440,178 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
             out[t][r] = s;
         }
     }
+}
+
+void native_dot_rows(int type, size_t row_bytes, const uint8_t* base, const void* act, int n, int r0, int r1,
+                     float* out) {
+    init_once();
+    const ggml_type_traits_cpu* t = traits(type);
+    if (t == nullptr || t->vec_dot == nullptr) {
+        for (int r = r0; r < r1; ++r) out[r - r0] = 0.0f;
+        return;
+    }
+    for (int r = r0; r < r1; ++r) {
+        float s = 0.0f;
+        t->vec_dot(n, &s, 0, base + (size_t) r * row_bytes, 0, act, 0, 1);
+        out[r - r0] = s;
+    }
+}
+
+void native_to_float(int type, const void* blocks, float* out, int n) {
+    init_once();
+    const struct ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
+    if (t != nullptr && t->to_float != nullptr)
+        t->to_float(blocks, out, n);
+    else
+        for (int i = 0; i < n; ++i) out[i] = 0.0f;
+}
+
+const char* native_type_name(int type) {
+    const char* n = ggml_type_name((ggml_type) type);
+    return n != nullptr ? n : "?";
+}
+
+size_t native_act_bytes_for(int type) {
+    const ggml_type_traits_cpu* t = traits(type);
+    return t != nullptr ? ggml_row_size(t->vec_dot_type, 256) : 0;
+}
+
+void native_quant_act_test(int type, const float* x, void* dst) {
+    const ggml_type_traits_cpu* t = traits(type);
+    if (t == nullptr) return;
+    const ggml_type_traits_cpu* a = traits((int) t->vec_dot_type);
+    if (a != nullptr && a->from_float != nullptr) a->from_float(x, dst, 256);
+}
+
+bool native_make_test_row(int type, std::vector<uint8_t>& row, std::vector<float>& ref, size_t* row_bytes) {
+    init_once();
+    const ggml_type_traits_cpu* tc = traits(type);
+    const struct ggml_type_traits* ts = ggml_get_type_traits((ggml_type) type);
+    if (tc == nullptr || tc->from_float == nullptr || ts == nullptr || ts->to_float == nullptr) return false;
+    const int n = 256;
+    const size_t rb = ggml_row_size((ggml_type) type, n);
+    std::vector<float> xf(n);
+    uint64_t st = 0x243F6A8885A308D3ull;
+    const auto next = [&st] {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        return st;
+    };
+    for (int i = 0; i < n; ++i) xf[i] = (float) (next() % 2001) / 1000.0f - 1.0f;
+    row.assign(rb, 0);
+    tc->from_float(xf.data(), row.data(), n);
+    ref.resize(n);
+    ts->to_float(row.data(), ref.data(), n);
+    if (row_bytes != nullptr) *row_bytes = rb;
+    return true;
+}
+
+bool native_hand_ok() {
+#if defined(__x86_64__) || defined(_M_X64)
+    int r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    __cpuid(r, 0);
+    const int nids = r[0];
+    if (nids < 7) return false;
+    __cpuidex(r, 1, 0);
+    const bool fma = (r[2] & (1 << 12)) != 0, osxsave = (r[2] & (1 << 27)) != 0;
+    __cpuidex(r, 7, 0);
+    const bool avx2 = (r[1] & (1 << 5)) != 0;
+    return fma && osxsave && avx2;
+#else
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#endif
+#else
+    return false;
+#endif
+}
+
+void native_dot_rows_ex(int type, size_t row_bytes, const uint8_t* base, const void* act, int n, int r0, int r1,
+                        float* out, bool hand) {
+    if (hand && native_hand_ok() && hand_rows(type, row_bytes, base, act, n, r0, r1, out)) return;
+    native_dot_rows(type, row_bytes, base, act, n, r0, r1, out);
+}
+
+bool native_selftest(const std::vector<int>& types, std::string& out) {
+    init_once();
+    bool ok = true;
+    char line[256];
+    for (int ty : types) {
+        const ggml_type_traits_cpu* tc = traits(ty);
+        const ggml_type_traits_cpu* tac = traits((int) (tc != nullptr ? tc->vec_dot_type : GGML_TYPE_F32));
+        const struct ggml_type_traits* ts = ggml_get_type_traits((ggml_type) ty);
+        const struct ggml_type_traits* tas = tc != nullptr ? ggml_get_type_traits(tc->vec_dot_type) : nullptr;
+        // (a type ggml-cpu has no quantizer for cannot be given a test row of known values - the IQ forms: their dot
+        //  is exercised by the model's own runs instead, the coherence gate)
+        if (tc == nullptr || tc->vec_dot == nullptr || tc->from_float == nullptr || ts == nullptr ||
+            ts->to_float == nullptr || tac == nullptr || tac->from_float == nullptr) {
+            std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s n/a (%s)\n", ggml_type_name((ggml_type) ty),
+                          tc == nullptr || tc->vec_dot == nullptr ? "no ggml-cpu dot, the lane skips the layer"
+                                                                  : "no ggml-cpu quantizer for a test row");
+            out += line;
+            continue;
+        }
+        if (tas == nullptr || tas->to_float == nullptr) {   // (Q8_K: the activation, one fp32 scale over int8 values)
+            if (tc->vec_dot_type != GGML_TYPE_Q8_K) {
+                std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s n/a (no activation widener)\n",
+                              ggml_type_name((ggml_type) ty));
+                out += line;
+                continue;
+            }
+        }
+        const int n = 256;   // (one 256-value block, or eight 32-value ones of Q8_0 / Q5_0)
+        const ggml_type at = tc->vec_dot_type;
+        const size_t rb = ggml_row_size((ggml_type) ty, n), ab = ggml_row_size(at, n);
+        std::vector<float> xf(n), af(n), wf(n), af2(n);
+        uint64_t st = 0x243F6A8885A308D3ull;
+        const auto next = [&st] {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            return st;
+        };
+        for (int i = 0; i < n; ++i) xf[i] = (float) (next() % 2001) / 1000.0f - 1.0f;
+        for (int i = 0; i < n; ++i) af[i] = (float) (next() % 2001) / 1000.0f - 1.0f;
+        std::vector<uint8_t> w(rb, 0), a(ab, 0);
+        tc->from_float(xf.data(), w.data(), n);
+        tac->from_float(af.data(), a.data(), n);
+        ts->to_float(w.data(), wf.data(), n);
+        if (tas != nullptr && tas->to_float != nullptr) {
+            tas->to_float(a.data(), af2.data(), n);
+        } else {   // (Q8_K: y[i] = d * qs[i], d the block's fp32 scale, qs the 256 int8 after it)
+            const float dq = *(const float*) a.data();
+            const int8_t* q = (const int8_t*) ((const uint8_t*) a.data() + 4);
+            for (int i = 0; i < n; ++i) af2[i] = dq * (float) q[i];
+        }
+        double ref = 0.0;
+        for (int i = 0; i < n; ++i) ref += (double) wf[i] * (double) af2[i];
+        if (std::fabs(ref) < 1e-6) {   // (a type whose wideners are stubs: nothing to compare against)
+            std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s n/a (its wideners give zeros)\n",
+                          ggml_type_name((ggml_type) ty));
+            out += line;
+            continue;
+        }
+        float got = 0.0f;
+        tc->vec_dot(n, &got, 0, w.data(), 0, a.data(), 0, 1);
+        double err = std::fabs((double) got - ref) / std::max(1e-9, std::fabs(ref));
+        double herr = -1.0;
+        if (native_hand_ok()) {   // (and the hand-tuned rows, when this build has one for the type)
+            float hgot = 0.0f;
+            if (hand_rows(ty, rb, w.data(), a.data(), n, 0, 1, &hgot))
+                herr = std::fabs((double) hgot - ref) / std::max(1e-9, std::fabs(ref));
+        }
+        if (herr >= 0.0)
+            std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s rel %.2e (ggml) / %.2e (hand)%s\n",
+                          ggml_type_name((ggml_type) ty), err, herr, (err < 1e-3 && herr < 1e-3) ? "" : "  FAIL");
+        else
+            std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s rel %.2e%s\n", ggml_type_name((ggml_type) ty), err,
+                          err < 1e-3 ? "" : "  FAIL");
+        ok = ok && err < 1e-3 && (herr < 0.0 || herr < 1e-3);
+        out += line;
+    }
+    return ok;
 }
 
 }  // namespace strata::kernels::cpu

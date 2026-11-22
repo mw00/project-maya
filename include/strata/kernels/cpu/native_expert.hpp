@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace strata::kernels::cpu {
 
@@ -76,5 +77,36 @@ bool native_rows1_exact(int ggml_type);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
+
+/// out[r - r0] = row r of one tensor of ggml type `type` (rows of `n` values, `row_bytes` each, `base` at the first)
+/// against the quantized activation `act` of traits(type)->vec_dot_type (native_quant_act / native_quant_h) - ggml-
+/// cpu's own dot, so the caller takes the same sums llama.cpp's CPU backend does for that row, and gets gate and up
+/// apart (its own activation between them, not native_gu_rows' silu).
+void native_dot_rows(int type, size_t row_bytes, const uint8_t* base, const void* act, int n, int r0, int r1,
+                     float* out);
+/// The dequantized row (`out` [n] floats) and the dequantized activation, ggml's own wideners - the reference a
+/// caller checks its own scalar decode and dots against.
+void native_to_float(int type, const void* blocks, float* out, int n);
+
+/// The row dots against a host scalar dequant, a type: rows of the type quantized from known values, the activation
+/// too, then vec_dot against the same two widened and summed in double.  One line a type into `out` (rel error);
+/// false when one is off by more than 1e-3 - a type whose kernel and scalar disagree cannot be trusted on the lane.
+bool native_selftest(const std::vector<int>& types, std::string& out);
+
+// ---- the micro-bench and the hand-tuned rows
+/// ggml's name of the type ("q3_K", ...).
+const char* native_type_name(int type);
+/// Bytes the type's activation takes for 256 values (the vec_dot_type's row).
+size_t native_act_bytes_for(int type);
+/// 256 values quantized the way the type's dot wants them (from_float of vec_dot_type).
+void native_quant_act_test(int type, const float* x, void* dst);
+/// A synthetic row of the type (8 x 256 values) and its dequantization - the same bytes for the selftest and the
+/// bench; false when the type has no quantizer to make one.
+bool native_make_test_row(int type, std::vector<uint8_t>& row, std::vector<float>& ref, size_t* row_bytes = nullptr);
+/// The rows through a hand-tuned kernel when this build has one for the type and `hand` is set, else ggml-cpu's.
+void native_dot_rows_ex(int type, size_t row_bytes, const uint8_t* base, const void* act, int n, int r0, int r1,
+                        float* out, bool hand);
+/// Whether this PC runs the hand-tuned AVX2 rows at all (AVX2 + FMA).
+bool native_hand_ok();
 
 }  // namespace strata::kernels::cpu

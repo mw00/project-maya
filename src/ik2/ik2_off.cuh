@@ -41,6 +41,8 @@ struct OffCount {
     uint32_t seq;
     uint32_t pad;
     unsigned long long picks, tier, stage, fetched, bytes, cpu;
+    // (IK2_DF: the predictions issued, and the picks that were the last visit of that layer's too)
+    unsigned long long pred, prevhit;
 };
 
 // ---- the lane-parity mode (IK2_LANE): every expert in ik2_exact.h's arithmetic, so the CPU lane can take misses too
@@ -99,9 +101,19 @@ void off_lane_wait(LaneState* ls, const LaneDone* done, int C, float* y, cudaStr
 /// host: the layer's pinned experts as the device sees them (expert e at host + e * hstride), key0 = layer * E.
 /// heat (null: not counted): heat[key0 + top[i]] += 1.  One launch of one warp.
 void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
-                    OffStage st, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s);
+                    OffStage st, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* prev, int* prev_n, cudaStream_t s);
 /// The listed copies (an expert's `bytes` each, bytes % 16 == 0), host-mapped memory to VRAM, 16 bytes a thread at
 /// a time; blocks: the grid.
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s);
+
+/// IK2_DF: the prediction for the visit after the one running - the picks the layer took at its last visit (prev:
+/// that layer's row, prev_n how many; a looped core's pass before, else the token before's last pass) - planned into
+/// staging slots of their pool now, so that off_fetch_copy can put them there while the next visit's dense work and
+/// router run.  k of them: the ones the tier does not already hold and that are not staged yet (no second copy).  A
+/// slot is taken by the plan's own rule (the clock hand, never one this or the predicted visit holds), tagged
+/// key0 + expert and marked the predicted visit's (cnt->seq + 1: its plan then finds it as a stage hit and never
+/// takes it for another expert).  Only staging slots; the bytes and the count go to cnt->bytes / cnt->pred.
+void off_df_plan(const int* prev, const int* prev_n, int key0, const uint8_t* const* tier, OffStage st, OffFetch* fl,
+                 OffCount* cnt, int k, const uint8_t* host, size_t hstride, cudaStream_t s);
 
 }  // namespace ik2::k
