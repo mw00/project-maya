@@ -401,6 +401,19 @@ void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
                          float* out, const float* gate, uint16_t* out16, cudaStream_t s, int blk0 = 0, int nblk = -1,
                          int phase = 0);
+/// attn_decode_mma for the T tokens of a window in two launches (q16 rows q_ld apart, r rows r_ld, sink [T][H], pos
+/// [T] on the device, out and out16 [T][H][D], gate rows gate_ld apart; scratch: T x attn_decode_mma_scratch):
+/// each token's output attn_decode_mma's to the bit.  false: nothing launched (Volta: a token at a time).
+bool attn_decode_mma_toks_f16(const uint16_t* q16, int q_ld, const float* r, int r_ld, const float* sink,
+                              const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T,
+                              int n_split, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                              float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
+                              cudaStream_t s);
+bool attn_decode_mma_toks_fp8(const uint16_t* q16, int q_ld, const float* r, int r_ld, const float* sink,
+                              const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T,
+                              int n_split, float qk_scale, float v_inv_scale, const float* proj, int d_rel, int extent,
+                              int window, float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
+                              cudaStream_t s);
 /// (KV streaming) a part of the above: phase 1 the blocks blk0 .. blk0 + nblk - 1 of the n_split only (their
 /// partials, the same as the whole launch's), phase 2 the combine only.  attn_decode_mma_keys: the keys [lo, hi) the
 /// blocks b0 .. b1 - 1 read for a token at qpos (a layer without a window).

@@ -3492,7 +3492,32 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (ex) {   // (each token through fast_token_launches' own clips and attention, its position from W.pos + t)
             const bool mma = g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding);
             const int P = Ly.sliding ? std::min(128, std::max(1, (c.window + 63) / 64)) : 128;
-            for (int t = 0; t < T; ++t) {
+            // (the tensor cores' kernels: every token's clips in one launch, then its attention's blocks and its
+            //  combine as one launch each - a grid z a token, each block the one-token launch's, the tokens' K and V
+            //  all in the cache first (a token's kernel reads no key past its own).  240 launches of 3 .. 5 us a
+            //  window of 5 were 3.1 ms.  IK2_ATTN_TOKS=0: a token at a time)
+            static const bool toks_on = !(getenv("IK2_ATTN_TOKS") && !std::atoi(getenv("IK2_ATTN_TOKS")));
+            bool toks = false;
+            if (mma && toks_on && k::arch_class() != 70 && (size_t) T * k::attn_decode_mma_scratch(c.H, ns) <= W.lg_cap) {
+                if (g_kv_fp8) {
+                    k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip,
+                                            T, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding,
+                                            c.alpha, c.n_floor, Ly.kv_cap, k_scale, v_scale, W.x16, g_s, Ly.sink16, W.xq,
+                                            C, W.sink);
+                    toks = k::attn_decode_mma_toks_fp8(W.x16, HD, r_p, r_ld, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV,
+                                                       W.pos, T, ns, qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj,
+                                                       c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s);
+                } else {
+                    k::prep_qkv_r_f16_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, r_ld, Ly.r_clip, T,
+                                            c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding,
+                                            c.alpha, c.n_floor, Ly.kv_cap, W.x16, g_s, Ly.sink16, W.xq, C, W.sink);
+                    toks = k::attn_decode_mma_toks_f16(W.x16, HD, r_p, r_ld, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos,
+                                                       T, ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o,
+                                                       gate_p, gate_ld, W.x16, g_s);
+                }
+                if (!toks) die("the block path: the tokens' attention was not launched");
+            }
+            for (int t = 0; t < T && !toks; ++t) {
                 float *qt = q_p + (size_t) t * q_ld, *rt = r_p + (size_t) t * r_ld, *ot = W.o + (size_t) t * HD;
                 const float* gt = gate_p + (size_t) t * gate_ld;
                 const int* pt = W.pos + t;

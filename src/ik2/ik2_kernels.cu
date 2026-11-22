@@ -1554,13 +1554,20 @@ __device__ __forceinline__ int wa_active(int qpos, int window, int nw, int& k_lo
 
 template <class KVT>
 __global__ void __launch_bounds__(kWaNW * 32, 4)
-attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
+attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                        int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
-                       const float* __restrict__ r, const float* __restrict__ proj, int d_rel, bool rel4, int extent,
-                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part,
-                       int blk0) {
+                       const float* __restrict__ r_0, const float* __restrict__ proj, int d_rel, bool rel4, int extent,
+                       int window, int n_split, float* __restrict__ o_part_0, float2* __restrict__ ml_part_0,
+                       int blk0, int tok_q = 0, int tok_r = 0, size_t tok_part = 0) {
     constexpr bool F8 = sizeof(KVT) == 1;
-    if (pos_d) qpos = *pos_d;   // (a token of a replayed graph: its position read here)
+    // (a window's tokens, a grid z each - the token's own q, r, position and partials tok_q, tok_r and tok_part
+    //  apart: every token's launch as one, each block the one-token launch's)
+    const int tz = blockIdx.z;
+    const uint16_t* __restrict__ q16 = q16_0 + (size_t) tz * tok_q;
+    const float* __restrict__ r = r_0 + (size_t) tz * tok_r;
+    float* __restrict__ o_part = o_part_0 + (size_t) tz * tok_part;
+    float2* __restrict__ ml_part = (float2*) ((float*) ml_part_0 + (size_t) tz * tok_part);
+    if (pos_d) qpos = pos_d[tz];   // (a token of a replayed graph: its position read here)
     const int lane = threadIdx.x & 31, gr = lane >> 2, tq = lane & 3;
     const int g = blockIdx.x, R = H / Hkv, KD = Hkv * kFaD;
     const int w = (blockIdx.y + blk0) * kWaNW + (threadIdx.x >> 5);   // this warp of the K / V head's (blk0: a part's)
@@ -1744,14 +1751,22 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
 // the warps merged with the sink: out [H][D] (times v_inv: an FP8 cache's V scale; times the sigmoid of gate [H][D]
 // if given; out16: an FP16 copy); a block a head, D threads.  A warp's weight (the exp2 of its max less the overall
 // one) is found once and kept in shared memory.
-__global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part, const float2* __restrict__ ml_part,
-                                               int n_split, int H, const float* __restrict__ sink, float v_inv,
-                                               const int* pos_d, int qpos, int window, const float* __restrict__ gate,
-                                               float* out, uint16_t* out16) {
+__global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part_0, const float2* __restrict__ ml_part_0,
+                                               int n_split, int H, const float* __restrict__ sink_0, float v_inv,
+                                               const int* pos_d, int qpos, int window, const float* __restrict__ gate_0,
+                                               float* out_0, uint16_t* out16_0, size_t tok_part = 0, int tok_gate = 0) {
     extern __shared__ float cm_sm[];
     float* red = cm_sm;         // [kFaD] the block's reductions
     float* cw = cm_sm + kFaD;   // [n_split * kWaNW] the warps' weights
-    if (pos_d) qpos = *pos_d;
+    // (a window's tokens, a grid z each: sink [T][H], out and out16 [T][H][D], gate rows tok_gate apart)
+    const int tz = blockIdx.z;
+    const float* __restrict__ o_part = o_part_0 + (size_t) tz * tok_part;
+    const float2* __restrict__ ml_part = (const float2*) ((const float*) ml_part_0 + (size_t) tz * tok_part);
+    const float* __restrict__ sink = sink_0 + (size_t) tz * H;
+    const float* __restrict__ gate = gate_0 ? gate_0 + (size_t) tz * tok_gate : nullptr;
+    float* out = out_0 + (size_t) tz * H * kFaD;
+    uint16_t* out16 = out16_0 ? out16_0 + (size_t) tz * H * kFaD : nullptr;
+    if (pos_d) qpos = pos_d[tz];
     int k_lo, n_steps;
     const int n_act = wa_active(qpos, window, n_split * kWaNW, k_lo, n_steps);
     const int h = blockIdx.x, d = threadIdx.x;
@@ -6986,6 +7001,51 @@ void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink,
                          int phase) {
     attn_decode_mma_impl(q16, r, sink, kc, vc, kv_cap, H, Hkv, pos, qpos, n_split, qk_scale, v_inv_scale, proj, d_rel,
                          extent, window, scratch, out, gate, out16, s, blk0, nblk, phase);
+}
+// attn_decode_mma for the T tokens of a window in two launches: every token's blocks the one-token launch's (its
+// partials in its own part of scratch), so each token's output is attn_decode_mma's to the bit.  false: not here
+// (Volta's kernels: a token at a time).
+template <class KV>
+static bool attn_decode_mma_toks_impl(const uint16_t* q16, int q_ld, const float* r, int r_ld, const float* sink,
+                                      const KV* kc, const KV* vc, int kv_cap, int H, int Hkv, const int* pos, int T,
+                                      int n_split, float qk_scale, float v_inv, const float* proj, int d_rel, int extent,
+                                      int window, float* scratch, float* out, const float* gate, int gate_ld,
+                                      uint16_t* out16, cudaStream_t s) {
+    if (arch_class() == 70 || T < 1) return false;
+    if (H % Hkv || H / Hkv > 8 || n_split < 1 || (kv_cap > 0 && kv_cap < 16)) {
+        std::fprintf(stderr, "ik2::k::attn_decode_mma_toks: %d heads on %d, %d splits, a cache of %d\n", H, Hkv, n_split,
+                     kv_cap);
+        std::abort();
+    }
+    const size_t part = attn_decode_mma_scratch(H, n_split);
+    float* o_part = scratch;
+    float2* ml_part = (float2*) (o_part + (size_t) n_split * kWaNW * H * kFaD);
+    const bool rel4 = d_rel % 4 == 0 && (((uintptr_t) r | (uintptr_t) proj) & 15) == 0 && r_ld % 4 == 0;
+    attn_decode_mma_kernel<KV><<<dim3((unsigned) Hkv, (unsigned) n_split, (unsigned) T), kWaNW * 32, 0, s>>>(
+        q16, kc, vc, kv_cap, H, Hkv, pos, 0, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part, ml_part, 0,
+        q_ld, r_ld, part);
+    check("attn_decode_mma_toks");
+    attn_decode_mma_combine_kernel<<<dim3((unsigned) H, 1, (unsigned) T), kFaD,
+                                     (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
+        o_part, ml_part, n_split, H, sink, v_inv, pos, 0, window, gate, out, out16, part, gate_ld);
+    check("attn_decode_mma_toks (combine)");
+    return true;
+}
+bool attn_decode_mma_toks_f16(const uint16_t* q16, int q_ld, const float* r, int r_ld, const float* sink,
+                              const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T,
+                              int n_split, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                              float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
+                              cudaStream_t s) {
+    return attn_decode_mma_toks_impl(q16, q_ld, r, r_ld, sink, kc, vc, kv_cap, H, Hkv, pos, T, n_split, qk_scale, 1.0f,
+                                     proj, d_rel, extent, window, scratch, out, gate, gate_ld, out16, s);
+}
+bool attn_decode_mma_toks_fp8(const uint16_t* q16, int q_ld, const float* r, int r_ld, const float* sink,
+                              const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T,
+                              int n_split, float qk_scale, float v_inv_scale, const float* proj, int d_rel, int extent,
+                              int window, float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
+                              cudaStream_t s) {
+    return attn_decode_mma_toks_impl(q16, q_ld, r, r_ld, sink, kc, vc, kv_cap, H, Hkv, pos, T, n_split, qk_scale,
+                                     v_inv_scale, proj, d_rel, extent, window, scratch, out, gate, gate_ld, out16, s);
 }
 void attn_decode_mma_keys(int qpos, int n_split, int b0, int b1, int& lo, int& hi) {
     // (the kernels' split of a layer without a window: wa_active / wa_used_v70 on the host)
