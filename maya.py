@@ -11423,8 +11423,10 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     rec = IK2F.recommended_context(vram, kv)
     ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
     fit = IK2F.plan(vram, ctx, kv)
+    kv_gb = ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30
     ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
-       f"; its cache: {ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30:.1f} GB of VRAM ({kv.upper()})")
+       (f"; its cache: {kv_gb:.1f} GB ({kv.upper()}), about {fit['kv_ram_gib']:.0f} GB of it in RAM (KV streaming)"
+        if fit.get("kv_streamed") else f"; its cache: {kv_gb:.1f} GB of VRAM ({kv.upper()})"))
     vram1 = float(pc["gpus"][1].get("vram_gb") or 0) if len(pc["gpus"]) == 2 and not amd else 0.0
     if vram1:   # (two GPUs: the first alone where it holds every expert, else the split)
         word, line = IK2F.verdict_two(vram, vram1, mem_gb()[0], ctx, kv)
@@ -11435,6 +11437,10 @@ def set_up_ik2(a, prev: dict) -> Path | None:
             ok(f"two GPUs: {line}")
         else:
             warn(f"two GPUs at {context_label(ctx)}: {line}" + (" - it may not start" if word == "tight" else ""))
+    elif fit["resident"] and fit.get("kv_streamed"):   # (one GPU only: KV streaming is off on two GPUs)
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv)
+        warn(line if word == "does not fit" else
+             f"at {context_label(ctx)}: {line} (a context of {context_label(rec)} keeps the cache in VRAM)")
     elif not fit["resident"]:
         word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv)
         keep = (f" (a context of {context_label(rec)} keeps everything in VRAM)"

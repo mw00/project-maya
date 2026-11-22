@@ -23,8 +23,17 @@ OFF_HOST_GIB = 0.5                                  # the offload path's RAM bes
 OS_GIB = 1.5                                       # the system's and the server's RAM beside the engine ("tight" under)
 KV_BYTES = {"fp8": 16384, "f16": 32768}             # the cache of a context token (IK2_KV)
 MARGIN_GIB = 0.5                                    # the driver's and the desktop's share of the card
-CONTEXTS = [32768, 65536, 131072, 262144]           # the setup's choices (the engine keeps every expert in VRAM up
-                                                    # to 352,256 with an FP8 cache on a 24 GB card: text only)
+CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # the setup's choices, up to the trained 1,048,576 (the
+                                                    # engine keeps every expert and the cache in VRAM up to 352,256
+                                                    # with an FP8 cache on a 24 GB card; past it KV streaming)
+RECOMMEND_MAX = 262144                              # the largest context the setup recommends by itself
+FULL_VISITS = 8                                     # the visits of the layers without a window: KV_BYTES / 8 each
+SCRATCH_TOKEN_BYTES = 1152                          # the attention's scratch a context token past 262,144 (48 x 24 heads)
+RING_OF_VISIT = 0.1                                 # the tokens' copy ring beside a full visit (V100: 2 x 2 slots of a
+                                                    # twentieth of a visit's rows; more SMs, smaller slots)
+STREAM_HOST_GIB = 4.0                              # the RAM the engine leaves the system beside the streamed rows
+OFF_TIER_MIN_GIB = 0.5                              # an offload layout streams only where its cache leaves the tier less
+                                                    # (the engine: else its cache in VRAM, as in v1.1.73)
 DEFAULT_KV = "fp8"
 MIN_VRAM_GB = 7.0                                   # the engine's own floor (check_preview: 7 GiB - an "8 GB" card)
 AMD_MIN_VRAM_GB = 22.0                              # AMD: every expert in memory (check_preview: 22 GiB - "24 GB")
@@ -42,15 +51,42 @@ def need_gib(ctx: int, kv: str = DEFAULT_KV) -> float:
 def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
     """What this card holds at `ctx`: {"resident": every expert in VRAM, "need_gib", "layout": "resident" or
     "offload", "tier_gib": the experts' GiB the card keeps, "ram_gib": the engine's RAM (the offload path pins the
-    experts the card does not keep)}.  A card whose VRAM is not known (0): resident - the engine measures at its start."""
+    experts the card does not keep; KV streaming pins the cache's rows it keeps in RAM), "kv_streamed": the cache of
+    some full-attention visits in RAM (maya-ik2 --kv-streaming auto: only where the cache does not fit beside the
+    model), "kv_ram_gib": those rows' GiB}.  A card whose VRAM is not known (0): resident - the engine measures at its
+    start."""
     if not vram_gb:
-        return {"resident": True, "need_gib": None, "layout": "resident", "tier_gib": EXPERTS_GIB, "ram_gib": HOST_GIB}
+        return {"resident": True, "need_gib": None, "layout": "resident", "tier_gib": EXPERTS_GIB, "ram_gib": HOST_GIB,
+                "kv_streamed": False, "kv_ram_gib": 0.0}
+    room = float(vram_gb) - MARGIN_GIB
     need = need_gib(ctx, kv)
-    if float(vram_gb) - MARGIN_GIB >= need:
-        return {"resident": True, "need_gib": need, "layout": "resident", "tier_gib": EXPERTS_GIB, "ram_gib": HOST_GIB}
-    tier = round(max(0.0, min(EXPERTS_GIB, float(vram_gb) - MARGIN_GIB - (need - EXPERTS_GIB) - OFF_ROOM_GIB)), 1)
+    if room >= need:
+        return {"resident": True, "need_gib": need, "layout": "resident", "tier_gib": EXPERTS_GIB, "ram_gib": HOST_GIB,
+                "kv_streamed": False, "kv_ram_gib": 0.0}
+    kv_gib = ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB
+    vis = kv_gib / FULL_VISITS
+    base = BASE_GIB + max(0, ctx - 262144) * SCRATCH_TOKEN_BYTES / GIB   # (beside the full visits' cache)
+    # KV streaming with every expert in VRAM: as many full visits in VRAM as fit beside the tokens' ring, one of
+    # them (the swing visit) the prompts' staging pair - its rows in RAM too
+    ring = vis * RING_OF_VISIT
+    n_res = min(FULL_VISITS, int((room - base - ring) // vis)) if room >= base + ring + vis else -1
+    if n_res >= 1:
+        kv_ram = round((FULL_VISITS - n_res + 1) * vis, 1)
+        return {"resident": True, "need_gib": round(base + n_res * vis + ring, 1), "layout": "resident",
+                "tier_gib": EXPERTS_GIB, "ram_gib": round(HOST_GIB + kv_ram + STREAM_HOST_GIB, 1),
+                "kv_streamed": True, "kv_ram_gib": kv_ram}
+    # the offload path: its cache in VRAM where that leaves the tier OFF_TIER_MIN_GIB, else streamed
+    dense = base - EXPERTS_GIB
+    tier = room - dense - kv_gib - OFF_ROOM_GIB
+    kv_ram = 0.0
+    if tier < OFF_TIER_MIN_GIB:
+        n_res = max(1, min(FULL_VISITS, int((room - dense - OFF_ROOM_GIB - OFF_TIER_MIN_GIB - ring) // vis)))
+        kv_ram = (FULL_VISITS - n_res + 1) * vis
+        tier = room - dense - n_res * vis - ring - OFF_ROOM_GIB
+    tier = round(max(0.0, min(EXPERTS_GIB, tier)), 1)
     return {"resident": False, "need_gib": need, "layout": "offload", "tier_gib": tier,
-            "ram_gib": round(EXPERTS_GIB - tier + OFF_HOST_GIB, 1)}
+            "ram_gib": round(EXPERTS_GIB - tier + OFF_HOST_GIB + (kv_ram + STREAM_HOST_GIB if kv_ram else 0.0), 1),
+            "kv_streamed": kv_ram > 0, "kv_ram_gib": round(kv_ram, 1)}
 
 
 TWO_ROOM_GIB = 0.3                                  # the second card's room beside its experts (token buffers, slack)
@@ -132,7 +168,8 @@ def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hi
 def recommended_context(vram_gb: float, kv: str = DEFAULT_KV) -> int:
     """The largest of CONTEXTS whose cache leaves every expert in VRAM, else the smallest (the one that leaves the
     most experts on the card)."""
-    fits = [c for c in CONTEXTS if plan(vram_gb, c, kv)["resident"]]
+    fits = [c for c in CONTEXTS if c <= RECOMMEND_MAX and plan(vram_gb, c, kv)["resident"]
+            and not plan(vram_gb, c, kv)["kv_streamed"]]
     return max(fits) if fits else CONTEXTS[0]
 
 
@@ -159,6 +196,13 @@ def verdict(vram_gb: float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> tu
     "tight" (the offload path, with less RAM beside what it takes than the system needs - it may not start),
     "does not fit" (RAM under what the offload path takes with this card: RAM + VRAM under the model).  ram_gb 0: not known."""
     p = plan(vram_gb, ctx, kv)
+    if ram_gb and ram_gb < p["ram_gib"] and p["kv_streamed"]:
+        return "does not fit", (f"at this context the cache keeps about {p['kv_ram_gib']:.0f} GB in RAM (KV "
+                                f"streaming): about {p['ram_gib']:.0f} GB of RAM in all, this PC has {ram_gb:.0f} GB - "
+                                "a smaller context")
+    if p["resident"] and p["kv_streamed"]:
+        return "streamed", (f"every expert in VRAM; about {p['kv_ram_gib']:.0f} GB of the cache in RAM (KV streaming), "
+                            "read over the bus at every token - slower the deeper a chat goes")
     if p["resident"]:
         return "fast", "every expert in VRAM"
     if ram_gb and ram_gb < p["ram_gib"]:
@@ -166,6 +210,8 @@ def verdict(vram_gb: float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> tu
     share = 100.0 * p["tier_gib"] / EXPERTS_GIB
     line = (f"about {p['tier_gib']:.1f} of the experts' {EXPERTS_GIB:.1f} GB on the card ({share:.0f}%), the other "
             f"{EXPERTS_GIB - p['tier_gib']:.1f} GB pinned in RAM - slower than with every expert in VRAM")
+    if p["kv_streamed"]:
+        line += f"; about {p['kv_ram_gib']:.0f} GB of the cache in RAM too (KV streaming)"
     if ram_gb and ram_gb < p["ram_gib"] + OS_GIB:
         return "tight", line + f"; it takes about {p['ram_gib']:.0f} GB of RAM, this PC has {ram_gb:.0f} GB"
     return "runs", line

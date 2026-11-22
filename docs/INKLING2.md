@@ -290,7 +290,17 @@ expert's blocks once for up to 8 of its tokens, instead of decoded to FP16 for a
 
 **Context.** The eight visits of the layers without a window keep 32 KB a token in FP16, 16 KB in FP8. With an FP8
 cache every expert stays in VRAM up to `--max-context 352256` (text only; 22.3 GiB at 262,144), and 262,144 fits
-beside the image encoder. Past that the engine falls back to the cache path (64 tok/s). An FP8 cache is as far
+beside the image encoder. Past that, up to the trained 1,048,576, KV streaming (`--kv-streaming auto`, the default;
+`on` / `off`, `--kv-resident N`): every expert stays in VRAM, the cache of all but N (at least 1) of the eight full
+visits sits in pinned RAM. A token copies those rows by DMA into a small VRAM ring, a few of the attention kernel's
+blocks a slot, the copies running ahead of the kernels (their partials those of the whole launch); a prompt chunk
+copies a visit's rows into one VRAM staging pair first - the VRAM of one of the N visits (the swing visit: its rows
+go to RAM while a prompt runs, back to VRAM for the tokens). The same kernels on the same bytes: the same answers as
+with the cache in VRAM. auto takes it only where the cache does not fit beside the model (an offload layout: only
+where its cache would leave the experts' tier under half a GiB), and only where the RAM holds the rows (plus 4 GiB);
+it says so at the start. On a 24 GB card at 1M: two full visits in VRAM, 14 GiB in RAM. Measured on a V100 (PCIe 3)
+as a 24 GB card, decode at 256K / 512K / 1M: 3.69 / 1.86 / 0.93 tok/s (the cache in VRAM: 58 / 44 at 256K / 512K) -
+each token copies the RAM part over the bus, so the link's speed sets it; prompts +1-3%. An FP8 cache is as far
 from the FP16 logits whichever kernels read it (KL 1.9e-3 on the tensor cores, 2.0e-3 scalar, over 199 forced
 tokens; FP16 on the tensor cores 2.2e-5) - but any two FP8 runs part within a few tokens: a difference of 1e-5
 flips codes of a 3-bit mantissa.

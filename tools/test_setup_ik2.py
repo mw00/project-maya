@@ -259,8 +259,27 @@ class Fit(unittest.TestCase):
         p = F.plan(24.0, 262144)
         self.assertTrue(p["resident"])
         self.assertLessEqual(p["need_gib"], 24.0 - F.MARGIN_GIB)
-        self.assertFalse(F.plan(24.0, 262144, "f16")["resident"])   # (F16: twice the cache - the slower path)
+        self.assertTrue(F.plan(24.0, 262144, "f16")["kv_streamed"])   # (F16: twice the cache - part of it in RAM)
         self.assertEqual(F.recommended_context(24.0, "f16"), 131072)
+
+    def test_the_trained_million_streams(self):
+        """1M on a 24 GB card: every expert in VRAM, one full visit's cache beside a staging pair, 7 in RAM - the
+        engine's own plan (Jupiter V100 as a 24 GB card: kv_resident=1 kv_host_gb=14.00)."""
+        p = F.plan(24.0, 1048576)
+        self.assertTrue(p["resident"] and p["kv_streamed"])
+        self.assertEqual(p["kv_ram_gib"], 14.0)
+        self.assertEqual(F.verdict(24.0, 64.0, 1048576)[0], "streamed")
+        self.assertEqual(F.verdict(24.0, 16.0, 1048576)[0], "does not fit")   # (the rows need the RAM)
+        self.assertEqual(F.recommended_context(24.0), 262144)                  # (never a streamed one by itself)
+        self.assertEqual(F.recommended_context(32.0), 262144)
+        self.assertFalse(F.plan(32.0, 524288)["kv_streamed"])
+        self.assertIn(1048576, F.CONTEXTS)
+
+    def test_small_cards_stream_only_where_the_cache_does_not_fit(self):
+        self.assertFalse(F.plan(12.0, 262144)["kv_streamed"])   # (v1.1.73's offload layout as it was)
+        p = F.plan(8.0, 1048576)
+        self.assertTrue(p["kv_streamed"] and not p["resident"])
+        self.assertGreater(p["ram_gib"], 16.0)
 
     def test_scales_with_the_card(self):
         self.assertTrue(F.plan(32.0, 262144, "f16")["resident"])     # (an RTX 5090: F16 at 256K too)

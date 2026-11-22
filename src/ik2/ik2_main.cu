@@ -15,6 +15,7 @@
 //     own cache and PCIe link), else the layers are split between them.
 //
 //   maya-ik2 --model FIRST-SHARD.gguf --serve [--max-context 262144] [--cache-gb 60] [--gpus 1] [--threads 8]
+//            [--kv-streaming auto|on|off] [--kv-resident N]
 //            [--eos a,b]
 //   maya-ik2 --model FIRST-SHARD.gguf --tokens 1,2,3|@FILE [--gen N] [--chunk 2048] [--dump DIR]
 // --serve: Maya's engine protocol on stdin / stdout (serve/server.py's StrataEngine: INFO / READY, GEN, PP, T, DONE,
@@ -247,6 +248,7 @@ struct Layer {
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
     int kv_cap = 0;
+    bool kv_host = false;                          // (KV streaming) kc8 / vc8 (kc / vc) are pinned host RAM
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
 };
@@ -260,6 +262,7 @@ struct Visit {
     uint16_t *kc = nullptr, *vc = nullptr;
     uint8_t *kc8 = nullptr, *vc8 = nullptr;
     int kv_cap = 0;
+    bool kv_host = false;
     float *h_k = nullptr, *h_v = nullptr, *h_attn = nullptr, *h_mlp = nullptr;
     float *rec_old[4] = {}, *rec_x[4] = {};
 };
@@ -278,7 +281,7 @@ struct Model {
 inline Layer& bind_visit(Model& M, int v) {
     const Visit& Vi = M.V[v];
     Layer& Ly = M.L[Vi.l];
-    Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap;
+    Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap, Ly.kv_host = Vi.kv_host;
     Ly.h_k = Vi.h_k, Ly.h_v = Vi.h_v, Ly.h_attn = Vi.h_attn, Ly.h_mlp = Vi.h_mlp;
     for (int i = 0; i < 4; ++i) Ly.rec_old[i] = Vi.rec_old[i], Ly.rec_x[i] = Vi.rec_x[i];
     return Ly;
@@ -392,6 +395,48 @@ bool g_dense_q8 = false;
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
 bool g_kv_fp8 = false;
+// KV streaming (--kv-streaming auto|on|off, --kv-resident N): the full-attention visits' K / V (the context's whole
+// length each) of all but N of them in pinned host RAM, mapped for the GPU.  Every attention over a full visit reads
+// all its positions: a token copies them into a VRAM ring as it goes (below), a short verify window reads them over
+// the bus in place, and a prompt's chunk copies a host visit's rows into one VRAM staging pair first (one read a
+// chunk, not one a few queries).  The same kernels on the same bytes: the answers are those of the cache in VRAM.  auto: only where the
+// cache would not fit in VRAM beside the model (a 24 GB card past ~352K, the trained 1M), else off - as before.
+int g_kv_stream = -1;        // -1 auto, 0 off, 1 on
+int g_kv_resident = -1;      // full visits whose K / V stay in VRAM (-1: as many as fit)
+std::vector<char> g_kv_host; // [visit] 1: its K / V in host RAM (set by the plan)
+uint8_t *g_kv_stage_k = nullptr, *g_kv_stage_v = nullptr;   // a host visit's rows for a prompt chunk (VRAM)
+// The staging pair is the "swing" visit's VRAM: a full visit kept in VRAM for tokens that, while a prompt runs, has
+// its rows in RAM like the streamed ones (copied there first) and lends its VRAM to the staging - one more visit in
+// VRAM for the tokens, no pair kept aside.  A token's attention over a streamed visit: its rows copied by DMA (the
+// copy stream, faster than the GPU's reads over the bus) into a ring of kKvRing slots, a few of the kernel's blocks a
+// slot, the copies ahead of the kernels (their partials the whole launch's: the same answers).
+int g_kv_swing = -1;                       // the swing visit (-1: none)
+bool g_kv_swing_host = false;              // its rows in RAM now (a prompt's), its VRAM the staging pair
+void *g_swing_dk = nullptr, *g_swing_dv = nullptr, *g_swing_hk = nullptr, *g_swing_hv = nullptr;
+constexpr int kKvRing = 2;
+uint8_t *g_ring_k[kKvRing] = {}, *g_ring_v[kKvRing] = {};
+size_t g_ring_rows = 0;                    // a slot's rows
+int g_ring_tgt = 16384;                    // rows a slot aims at (a few blocks a slot at short positions)
+cudaStream_t g_kv_cs = nullptr;
+cudaEvent_t g_ring_ready[kKvRing] = {}, g_ring_done[kKvRing] = {};
+bool g_kv_streaming = false;               // any visit streamed (the token and block paths without their graphs)
+int g_depth = 0;            // IK2_DEPTH=N (CLI tests): the prompt placed at position N, the cache before it zeros
+// the RAM the system has free now (bytes; 0 unknown)
+size_t host_ram_avail() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (size_t) ms.ullAvailPhys : 0;
+#else
+    FILE* mi = std::fopen("/proc/meminfo", "r");
+    if (!mi) return 0;
+    char line[256];
+    unsigned long long av_kb = 0;
+    while (std::fgets(line, sizeof line, mi)) std::sscanf(line, "MemAvailable: %llu kB", &av_kb);
+    std::fclose(mi);
+    return (size_t) av_kb * 1024;
+#endif
+}
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
 bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
@@ -1389,6 +1434,25 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
     }
 }
 
+// (KV streaming) the swing visit's rows [0, pos) to RAM - a prompt follows, its VRAM then the staging pair - or back
+// to VRAM for the tokens (the same bytes either way)
+void kv_swing(Model& M, bool to_host, int pos) {
+    if (g_kv_swing < 0 || g_kv_swing_host == to_host) return;
+    Visit& Vi = M.V[g_kv_swing];
+    const size_t b = (size_t) std::max(0, pos) * M.c.KV * M.c.D * (g_kv_fp8 ? 1 : 2);
+    void *k = to_host ? g_swing_hk : g_swing_dk, *v = to_host ? g_swing_hv : g_swing_dv;
+    if (b) {
+        CU(cudaMemcpyAsync(k, to_host ? g_swing_dk : g_swing_hk, b, cudaMemcpyDefault, g_s));
+        CU(cudaMemcpyAsync(v, to_host ? g_swing_dv : g_swing_hv, b, cudaMemcpyDefault, g_s));
+    }
+    if (g_kv_fp8) Vi.kc8 = (uint8_t*) k, Vi.vc8 = (uint8_t*) v;
+    else Vi.kc = (uint16_t*) k, Vi.vc = (uint16_t*) v;
+    Vi.kv_host = to_host;
+    g_kv_stage_k = to_host ? (uint8_t*) g_swing_dk : nullptr;
+    g_kv_stage_v = to_host ? (uint8_t*) g_swing_dv : nullptr;
+    g_kv_swing_host = to_host;
+}
+
 // One layer's attention + post-attention conv + residual into r_out ([T][C]).
 // h_in ([T][C]) is unmodified and acts as the residual input; when l % c.block == 0, it is saved to blk(nb).
 // msg: a looped core's later pass - the layer's messages [4][T][C] (q's, k's, v's, the MoE's), which gate its q, k and
@@ -1569,6 +1633,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
+    // (KV streaming: a prompt chunk's attention over a host visit reads every row many times - its rows so far, this
+    //  chunk's included, go to the VRAM staging pair first, the kernels then read those; a token or a short window
+    //  reads the host rows once, in place)
+    uint16_t *kc_h = Ly.kc, *vc_h = Ly.vc;
+    uint8_t *kc8_h = Ly.kc8, *vc8_h = Ly.vc8;
+    const bool staged = Ly.kv_host && !Ly.sliding && T > 1 && !(T <= 8 && g_group && g_group_attn);
+    if (staged) {
+        if (!g_kv_stage_k) die("KV streaming: a prompt chunk without its staging pair");
+        const size_t b = (size_t) (pos0 + T) * KD * (g_kv_fp8 ? 1 : 2);
+        CU(cudaMemcpyAsync(g_kv_stage_k, g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, b, cudaMemcpyDefault, g_s));
+        CU(cudaMemcpyAsync(g_kv_stage_v, g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, b, cudaMemcpyDefault, g_s));
+        if (g_kv_fp8) Ly.kc8 = g_kv_stage_k, Ly.vc8 = g_kv_stage_v;
+        else Ly.kc = (uint16_t*) g_kv_stage_k, Ly.vc = (uint16_t*) g_kv_stage_v;
+    }
     if (T == 1) {
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
@@ -1702,6 +1780,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             ts += Tq;
         }
     }
+    if (staged) Ly.kc = kc_h, Ly.vc = vc_h, Ly.kc8 = kc8_h, Ly.vc8 = vc8_h;
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
@@ -2312,6 +2391,49 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
     CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
+    // (KV streaming: the streamed visits' rows this token reads, a slot of the ring a few of the kernel's blocks -
+    //  the first copies start now, under the layers before; a slot's next copy once its kernel is done.  Launched as
+    //  they go: never inside a recorded graph)
+    struct RingPart { int vis, b0, b1, lo, hi; };
+    std::vector<RingPart> parts;
+    size_t next_copy = 0, cur_part = 0;
+    const int qpos = W.pos_h[0];
+    const size_t row_b = (size_t) KD * (g_kv_fp8 ? 1 : 2);
+    auto host_rows = [&](const Visit& Vi, bool v) {
+        return v ? (g_kv_fp8 ? Vi.vc8 : (uint8_t*) Vi.vc) : (g_kv_fp8 ? Vi.kc8 : (uint8_t*) Vi.kc);
+    };
+    auto issue_copy = [&]() {
+        const RingPart& p = parts[next_copy];
+        const int s = (int) (next_copy % kKvRing);
+        CU(cudaStreamWaitEvent(g_kv_cs, g_ring_done[s], 0));
+        const int n = std::min(p.hi, qpos) - p.lo;   // (the token's own row: after its prep, on g_s)
+        if (n > 0) {
+            CU(cudaMemcpyAsync(g_ring_k[s], host_rows(M.V[p.vis], false) + (size_t) p.lo * row_b, (size_t) n * row_b,
+                               cudaMemcpyDefault, g_kv_cs));
+            CU(cudaMemcpyAsync(g_ring_v[s], host_rows(M.V[p.vis], true) + (size_t) p.lo * row_b, (size_t) n * row_b,
+                               cudaMemcpyDefault, g_kv_cs));
+        }
+        CU(cudaEventRecord(g_ring_ready[s], g_kv_cs));
+        ++next_copy;
+    };
+    if (g_kv_streaming && g_ring_k[0] && g_attn_mma != 0) {
+        const int ns = g_mma_split;
+        int lo, hi;
+        k::attn_decode_mma_keys(qpos, ns, 0, 1, lo, hi);
+        const int brows = std::max(1, hi - lo);
+        const int G = (int) std::min<size_t>(std::max(1, g_ring_tgt / brows), g_ring_rows / brows);
+        if (G >= 1)
+            for (int vis = 0; vis < c.n_visit; ++vis) {
+                if (!M.V[vis].kv_host || c.sliding[M.V[vis].l]) continue;
+                for (int b0 = 0; b0 < ns; b0 += G) {
+                    const int b1 = std::min(ns, b0 + G);
+                    k::attn_decode_mma_keys(qpos, ns, b0, b1, lo, hi);
+                    if (hi <= lo) break;
+                    parts.push_back({vis, b0, b1, lo, hi});
+                }
+            }
+        while (next_copy < parts.size() && next_copy < (size_t) kKvRing) issue_copy();
+    }
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
     int nb = 0, nb_pre = 0, n_bank = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {
@@ -2413,11 +2535,37 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = mma ? W.x16 : nullptr;
+        // (a streamed visit: the kernel's blocks slot by slot from the ring, then their combine - the same partials)
+        const bool rung = mma && cur_part < parts.size() && parts[cur_part].vis == vis;
+        auto ring_parts = [&](auto&& part_launch) {
+            for (; cur_part < parts.size() && parts[cur_part].vis == vis; ++cur_part) {
+                const RingPart& p = parts[cur_part];
+                const int s = (int) (cur_part % kKvRing);
+                CU(cudaStreamWaitEvent(g_s, g_ring_ready[s], 0));
+                if (p.hi > qpos) {   // (the token's row, its prep's)
+                    const size_t o = (size_t) qpos * row_b, d = (size_t) (qpos - p.lo) * row_b;
+                    CU(cudaMemcpyAsync(g_ring_k[s] + d, host_rows(M.V[vis], false) + o, row_b, cudaMemcpyDefault, g_s));
+                    CU(cudaMemcpyAsync(g_ring_v[s] + d, host_rows(M.V[vis], true) + o, row_b, cudaMemcpyDefault, g_s));
+                }
+                part_launch(g_ring_k[s] - (size_t) p.lo * row_b, g_ring_v[s] - (size_t) p.lo * row_b, p.b0, p.b1 - p.b0);
+                CU(cudaEventRecord(g_ring_done[s], g_s));
+                if (next_copy < parts.size()) issue_copy();
+            }
+        };
         if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
                                  k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
-            if (mma)
+            if (rung) {
+                ring_parts([&](uint8_t* kr, uint8_t* vr, int b0, int nbk) {
+                    k::attn_decode_mma_fp8(q16, r_p, W.sink, kr, vr, ring, c.H, c.KV, W.pos, 0, ns, qk_scale / k_scale,
+                                           1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p,
+                                           W.x16, g_s, b0, nbk, 1);
+                });
+                k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
+                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
+                                       W.o, gate_p, W.x16, g_s, 0, 0, 2);
+            } else if (mma)
                 k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
                                        W.o, gate_p, W.x16, g_s);
@@ -2429,7 +2577,15 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
                                  g_s, Ly.sink16, W.xq, C, W.sink);
-            if (mma)
+            if (rung) {
+                ring_parts([&](uint8_t* kr, uint8_t* vr, int b0, int nbk) {
+                    k::attn_decode_mma_f16(q16, r_p, W.sink, (uint16_t*) kr, (uint16_t*) vr, ring, c.H, c.KV, W.pos, 0,
+                                           ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p,
+                                           W.x16, g_s, b0, nbk, 1);
+                });
+                k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
+                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s, 0, 0, 2);
+            } else if (mma)
                 k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
                                        Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
             else
@@ -2877,7 +3033,8 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
-    if (!g_graph) {
+    kv_swing(M, false, pos);
+    if (!g_graph || g_kv_streaming) {   // (streamed visits: the copies follow the position - launched as they go)
         fast_token_launches(M, W, out_mode);
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
@@ -3257,7 +3414,7 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
         g_blk.pos_h[t] = pos0 + t;
     }
-    if (!g_graph) {
+    if (!g_graph || g_kv_streaming) {   // (the swing visit's rows move between RAM and VRAM: no recorded pointers)
         fast_block_launches(M, W, T, out_mode);
     } else {
         FastGraph& G = g_bgraph[T][(int) out_mode];
@@ -3553,6 +3710,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
         return;
     }
+    if (T > 1 && !(T <= 8 && g_group && g_group_attn)) kv_swing(M, true, pos0);   // (run_layer_attn's staged chunks)
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
     use_dev(M.L[0].dev);
     Work* Wp = &dev_work(g_cur);
@@ -4707,6 +4865,14 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--image-token") image_token = std::atoi(next().c_str());
+        else if (a == "--kv-streaming") {
+            const std::string v = next();
+            if (v == "auto") g_kv_stream = -1;
+            else if (v == "on") g_kv_stream = 1;
+            else if (v == "off") g_kv_stream = 0;
+            else die("--kv-streaming: auto, on or off");
+        }
+        else if (a == "--kv-resident") g_kv_resident = std::max(0, std::atoi(next().c_str()));
         else if (a == "--dump") dump = next();
         else if (a == "--drafting") {   // (auto: measured once on this PC; on: the drafter and the prompt lookup; off)
             drafting = next();
@@ -4714,6 +4880,7 @@ int main(int argc, char** argv) {
         }
         else die("unknown argument " + a);
     }
+    g_depth = getenv("IK2_DEPTH") ? std::max(0, std::atoi(getenv("IK2_DEPTH"))) : 0;   // (tests: a long context's speed without its prompt)
     if (drafting.empty()) drafting = draft_path.empty() ? "off" : "on";   // (--draft alone: as before, drafting on)
     if (drafting == "off") draft_path.clear();
     g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
@@ -5028,7 +5195,89 @@ int main(int argc, char** argv) {
         }
 #endif
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
-        const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        // KV streaming (g_kv_stream): auto takes it only where the cache does not fit beside the model - then every
+        // expert stays in VRAM where they fit beside the full visits kept there plus the tokens' ring; an offload
+        // layout (the experts never all fit) streams only where its cache alone would not fit, and only where the RAM
+        // holds the rows beside its experts.  The rows in RAM are pinned: never more than the RAM has free.
+        // (KV streaming: one GPU only - off on two GPUs (the split's GPU 1 rows), the CPU lane off beside it below)
+        if (g_kv_stream == 1 && g_two.want)
+            std::printf("NOTE KV streaming is off on two GPUs (--kv-streaming on not taken): the cache stays in VRAM\n");
+        if (g_kv_stream != 0 && !g_two.want) {
+            const size_t eb = g_kv_fp8 ? 1 : 2, vis_b = (size_t) ctx * c.KV * c.D * eb * 2;
+            size_t slide_b = 0;
+            int n_full = 0;
+            for (int l = 0; l < c.n_layer; ++l) {
+                const int mult = l >= c.core0 && l < c.core1 ? c.n_pass : 1;
+                if (!c.sliding[l]) n_full += mult;
+                else slide_b += (size_t) mult * std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) * c.KV * c.D * eb * 2;
+            }
+            // (the attention's logits / probabilities scratch grows with the context: 8 H floats a position, half
+            //  again for its FP16 probabilities - counted here, the 1.5 GiB reserve aside)
+            const size_t scratch = (size_t) 48 * c.H * (size_t) ctx;
+            const size_t base = exp_b + dense_b + slide_b + reserve + scratch;
+            const size_t cap_b = (size_t) (cache_gb * 1073741824.0);
+            const size_t GiB = (size_t) 1 << 30;
+            // (the tokens' ring: kKvRing slots of a K and a V part, a slot at least a block of the attention kernel's
+            //  keys at the last position)
+            int blo = 0, bhi = 0;
+            k::attn_decode_mma_keys(std::max(0, ctx - 1), g_mma_split, 0, 1, blo, bhi);
+            const size_t ring_rows = (size_t) std::max(bhi - blo, g_ring_tgt);
+            const size_t ring_b = (size_t) kKvRing * 2 * ring_rows * c.KV * c.D * eb;
+            // n_res: the full visits in VRAM for the tokens, the swing visit (the prompts' staging pair) one of them
+            int host_n = 0, n_res = n_full;
+            bool all_exp = false;
+            if (n_full > 0 && (g_kv_stream == 1 || !fits)) {
+                if (g_kv_resident >= 0) n_res = std::max(1, std::min(g_kv_resident, n_full));
+                else n_res = base + ring_b + vis_b <= fr0 ? (int) std::min<size_t>(n_full, (fr0 - base - ring_b) / vis_b) : 1;
+                all_exp = exp_b <= cap_b && base + ring_b + (size_t) n_res * vis_b <= fr0;
+                if (!all_exp && g_kv_stream != 1) {
+                    // (an offload layout: the cache in VRAM as in v1.1.73 wherever it leaves the experts a tier of half a GiB)
+                    const size_t rest = dense_b + slide_b + reserve + scratch + GiB / 2;
+                    if (rest + (size_t) n_full * vis_b <= fr0) n_res = n_full;
+                    else if (g_kv_resident < 0)
+                        n_res = rest + ring_b + vis_b <= fr0 ? (int) std::min<size_t>(n_full, (fr0 - rest - ring_b) / vis_b) : 1;
+                }
+                host_n = n_full - n_res;
+            }
+            if (host_n > 0) {
+                const size_t host_b = (size_t) (host_n + 1) * vis_b;   // (the swing visit's rows too, for prompts)
+                const size_t ram = host_ram_avail();
+                const size_t need = host_b + 4 * GiB + (all_exp ? 0 : exp_b);   // (offload: its experts pinned too)
+                if (ram && need > ram) {
+                    char nb[320];
+                    std::snprintf(nb, sizeof nb, "KV streaming: the context of %d tokens needs %.1f GiB of RAM for %d "
+                                  "full-attention visits' K / V (%.1f GiB with %s), %.1f GiB free - a smaller --ctx, "
+                                  "or more RAM", ctx, host_b / (double) GiB, host_n, need / (double) GiB,
+                                  all_exp ? "4 GiB for the system" : "the experts and 4 GiB for the system",
+                                  ram / (double) GiB);
+                    if (g_kv_stream == 1) die(nb);
+                    std::printf("NOTE %s; streaming not taken\n", nb);
+                    host_n = 0;
+                } else {
+                    kv_b = slide_b + (size_t) (n_full - host_n) * vis_b + ring_b;
+                    fits = all_exp;
+                    g_ring_rows = ring_rows;
+                    std::printf("INFO kv_streaming=on kv_resident=%d kv_host_gb=%.2f: %d of %d full-attention visits' "
+                                "K / V in RAM, %d in VRAM (one of them the prompts' staging pair, %.2f GiB) + a ring of "
+                                "%.2f GiB%s\n",
+                                n_full - host_n, host_b / (double) GiB, host_n, n_full, n_full - host_n,
+                                vis_b / (double) GiB, ring_b / (double) GiB, all_exp ? "; every expert stays in VRAM" : "");
+                }
+            }
+            g_kv_host.assign(c.n_visit, 0);
+            // (the last full visits; the one before them the swing visit)
+            for (int v = c.n_visit - 1, left = host_n; v >= 0 && host_n > 0 && left >= 0; --v) {
+                const int l = (c.n_pass == 1 || v < c.core0) ? v
+                            : v < c.core0 + c.n_pass * (c.core1 - c.core0) ? c.core0 + (v - c.core0) % (c.core1 - c.core0)
+                                                                          : v - (c.n_pass - 1) * (c.core1 - c.core0);
+                if (c.sliding[l]) continue;
+                if (left > 0) g_kv_host[v] = 1;
+                else g_kv_swing = v;
+                --left;
+            }
+            g_kv_streaming = host_n > 0;
+        }
         // Where they do not all fit (a card under 24 GB, or a context past what one holds), the offload token path:
         // the resident path's launches with a tier of the experts in VRAM and the others fetched by the GPU from
         // host memory (ik2_off.cuh).  IK2_OFF=0: the cache path instead (forward() a visit at a time); IK2_OFF=1:
@@ -5309,12 +5558,47 @@ int main(int argc, char** argv) {
         const Layer& Ly = M.L[Vi.l];
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
-        if (g_kv_fp8) {
+        const bool kv_host = v < (int) g_kv_host.size() && g_kv_host[v];
+        if (kv_host || v == g_kv_swing) {   // (KV streaming: pinned host RAM, mapped for the GPU)
+            const size_t b = (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2);
+            void *hk = nullptr, *hv = nullptr, *dk = nullptr, *dv = nullptr;
+            if (cudaHostAlloc(&hk, b, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostAlloc(&hv, b, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+                die("KV streaming: no " + std::to_string(2 * b >> 20) + " MiB of pinned RAM for visit " +
+                    std::to_string(v) + "'s K / V - a smaller --ctx");
+            CU(cudaHostGetDevicePointer(&dk, hk, 0));
+            CU(cudaHostGetDevicePointer(&dv, hv, 0));
+            if (g_depth > 0) std::memset(hk, 0, b), std::memset(hv, 0, b);
+            if (kv_host) {
+                if (g_kv_fp8) Vi.kc8 = (uint8_t*) dk, Vi.vc8 = (uint8_t*) dv;
+                else Vi.kc = (uint16_t*) dk, Vi.vc = (uint16_t*) dv;
+                Vi.kv_host = true;
+            } else {   // (the swing visit: its VRAM too, the tokens' - and the prompts' staging pair)
+                g_swing_hk = dk, g_swing_hv = dv;
+                g_swing_dk = dalloc<uint8_t>(b), g_swing_dv = dalloc<uint8_t>(b);
+                if (g_kv_fp8) Vi.kc8 = (uint8_t*) g_swing_dk, Vi.vc8 = (uint8_t*) g_swing_dv;
+                else Vi.kc = (uint16_t*) g_swing_dk, Vi.vc = (uint16_t*) g_swing_dv;
+            }
+            if (!g_ring_k[0] && g_ring_rows) {
+                CU(cudaStreamCreateWithFlags(&g_kv_cs, cudaStreamNonBlocking));
+                for (int s = 0; s < kKvRing; ++s) {
+                    g_ring_k[s] = dalloc<uint8_t>(g_ring_rows * KD * (g_kv_fp8 ? 1 : 2));
+                    g_ring_v[s] = dalloc<uint8_t>(g_ring_rows * KD * (g_kv_fp8 ? 1 : 2));
+                    CU(cudaEventCreateWithFlags(&g_ring_ready[s], cudaEventDisableTiming));
+                    CU(cudaEventCreateWithFlags(&g_ring_done[s], cudaEventDisableTiming));
+                }
+            }
+        } else if (g_kv_fp8) {
             Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
             Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
         } else {
             Vi.kc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
             Vi.vc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
+        }
+        if (g_depth > 0 && !Vi.kv_host) {   // (IK2_DEPTH tests: the positions before the prompt read as zeros)
+            const size_t b = (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2);
+            CU(cudaMemset(g_kv_fp8 ? (void*) Vi.kc8 : (void*) Vi.kc, 0, b));
+            CU(cudaMemset(g_kv_fp8 ? (void*) Vi.vc8 : (void*) Vi.vc, 0, b));
         }
         Vi.h_k = dalloc<float>(3 * KD);
         Vi.h_v = dalloc<float>(3 * KD);
@@ -6011,7 +6295,10 @@ int main(int argc, char** argv) {
         // IK2_LANE=0: mode A, =1 / fetch / cpu: lane parity (tests).
         const char* le = getenv("IK2_LANE");
         // (two GPUs: mode A - GPU 1's rows are the resident kernels', so GPU 0's must be too)
-        const std::string lw = g_two.want ? "0" : le && *le ? le : "auto";
+        // (KV streaming: mode A too - the lane is not combined with the streamed visits' copies)
+        if (g_kv_streaming && le && *le && std::string(le) != "0")
+            std::printf("NOTE IK2_LANE=%s not taken: the CPU lane is off while the KV cache streams (mode A)\n", le);
+        const std::string lw = g_two.want || g_kv_streaming ? "0" : le && *le ? le : "auto";
         if (lw != "0") {
             g_lane = lane_init(M, lw, getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1);
             if (!g_lane) std::printf("lane parity: off - an expert format the exact lane does not have\n");
@@ -6685,7 +6972,8 @@ int main(int argc, char** argv) {
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         return 0;
     }
-    if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
+    if (g_depth + (int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
+    if (g_depth > 0 && (serve || drafter || g_lookup || g_dev[0].W.T_sup > 0)) die("IK2_DEPTH: the CLI's plain path only (no drafting)");
     // the prompt
     std::vector<float> logits;
     double t_exp = 0;
@@ -6715,7 +7003,7 @@ int main(int argc, char** argv) {
             const OutMode om = all ? OutMode::kLogits : (!last ? OutMode::kNone : ((gen > 0 || drafter) ? OutMode::kArgmax : OutMode::kNone));
             std::vector<float> lo;
             std::vector<int> ag;
-            forward(M, prompt.data() + p0, n, p0, all, om, all ? dump : std::string(), lo, &ag, t_exp);
+            forward(M, prompt.data() + p0, n, g_depth + p0, all, om, all ? dump : std::string(), lo, &ag, t_exp);
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
@@ -6786,7 +7074,7 @@ int main(int argc, char** argv) {
         if (i + 1 == gen) break;
         std::vector<int> ag;
         if (lo) logits.clear();
-        forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
+        forward(M, &tok, 1, g_depth + (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
                 logits, &ag, t_exp);
         if (lo) {
             std::fwrite(logits.data(), sizeof(float), (size_t) c.n_vocab, lo);
