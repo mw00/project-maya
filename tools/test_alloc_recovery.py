@@ -64,6 +64,9 @@ class Engine:
 
         self.log_path = ROOT / "maya-alloc-test.log"
         self.env = dict(os.environ)
+        # the scratch pool these tests exhaust is the light prompt path's; v1.1.75's default (MAYA_GLM_SAME_ANSWERS)
+        # reads prompts on the stable path, which does not use it
+        self.env["MAYA_GLM_PREFILL_STABLE"] = "0"
         self.env.update(env)
         child = dict(SV.child_env(cfg))
         child.update(self.env)   # the test's hooks reach the engine
