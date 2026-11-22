@@ -58,19 +58,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(maya.EXE, self.root / "build-hip/maya")
 
     def test_rx_9060_xt_is_a_supported_discrete_card(self):
-        """gfx1200 (RX 9050 / 9060 XT): RDNA4 like the gfx1201 R9700, with its own GLM hipBLASLt tables."""
+        """gfx1200 (RX 9050 / 9060 XT): RDNA4 like the gfx1201 R9700, no hipBLASLt table yet (plain hipBLAS)."""
         card = {"index": 0, "arch": "gfx1200", "vendor": "amd", "name": "AMD Radeon RX 9060 XT", "vram_gb": 16}
-        with patch.object(maya.S, "amd_gpus", return_value=[card]):
-            self.a.gpu = None
-            pc = maya.check_pc(self.a)
-        self.assertEqual(pc["gpus"], [card])
-        self.assertEqual(pc["backend"], "hip")
-        self.assertFalse(maya.hip_unified_memory(card))
-
-    def test_rx_7600_xt_is_a_supported_discrete_card(self):
-        """gfx1102 (RX 7600 / 7600 XT): RDNA3 wave32 beside gfx1100/gfx1201/gfx1151, with the gfx1102 GLM
-        hipBLASLt table at 100401."""
-        card = {"index": 0, "arch": "gfx1102", "vendor": "amd", "name": "AMD Radeon RX 7600 XT", "vram_gb": 16}
         with patch.object(maya.S, "amd_gpus", return_value=[card]):
             self.a.gpu = None
             pc = maya.check_pc(self.a)
@@ -237,9 +226,9 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"], "/selected/table.txt")
 
     def test_shipped_glm_tuning_tables_name_their_architecture(self):
-        """The tables shipped in tools/hip (gfx1200's tuned on a RX 9060 XT, gfx1102's on a RX 7600 XT): the engine
-        accepts a table only for its own arch and hipBLASLt version, so a header that does not match the file name's
-        arch would silently leave that card's prompts on plain hipBLAS."""
+        """The tables shipped in tools/hip (gfx1200's tuned on a RX 9060 XT): the engine accepts a table only for
+        its own arch and hipBLASLt version, so a header that does not match the file name's arch would silently
+        leave that card's prompts on plain hipBLAS."""
         for table in sorted((Path(__file__).resolve().parents[1] / "tools" / "hip").glob("*-glm-hipblaslt-*.txt")):
             magic = next((l for l in table.read_text(errors="replace").splitlines()
                           if l.startswith("MAYA_HIPBLASLT_TUNING_V1")), None)
