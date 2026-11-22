@@ -259,20 +259,28 @@ class Fit(unittest.TestCase):
         p = F.plan(24.0, 262144)
         self.assertTrue(p["resident"])
         self.assertLessEqual(p["need_gib"], 24.0 - F.MARGIN_GIB)
-        self.assertTrue(F.plan(24.0, 262144, "f16")["kv_streamed"])   # (F16: twice the cache - part of it in RAM)
+        p = F.plan(24.0, 262144, "f16")   # (F16: twice the cache - the experts leave first, the cache stays on the card)
+        self.assertTrue(p["layout"] == "offload" and not p["kv_streamed"])
         self.assertEqual(F.recommended_context(24.0, "f16"), 131072)
 
-    def test_the_trained_million_streams(self):
-        """1M on a 24 GB card: every expert in VRAM, one full visit's cache beside a staging pair, 7 in RAM - the
-        engine's own plan (Jupiter V100 as a 24 GB card: kv_resident=1 kv_host_gb=14.00)."""
+    def test_the_trained_million_keeps_the_cache_on_the_card(self):
+        """1M on a 24 GB card: the experts leave VRAM first (a token reads the whole cache, ~8 experts a layer) - the
+        offload path with the whole cache in VRAM, no KV streaming (Jupiter V100 as a 24 GB card: a tier of 2.9 GiB,
+        19 tok/s at 1M deep vs 0.93 streamed).  AMD (no offload path): every expert stays, the cache streams."""
         p = F.plan(24.0, 1048576)
-        self.assertTrue(p["resident"] and p["kv_streamed"])
-        self.assertEqual(p["kv_ram_gib"], 14.0)
-        self.assertEqual(F.verdict(24.0, 64.0, 1048576)[0], "streamed")
-        self.assertEqual(F.verdict(24.0, 16.0, 1048576)[0], "does not fit")   # (the rows need the RAM)
-        self.assertEqual(F.recommended_context(24.0), 262144)                  # (never a streamed one by itself)
+        self.assertEqual((p["layout"], p["kv_streamed"]), ("offload", False))
+        self.assertGreaterEqual(p["tier_gib"], F.OFF_TIER_MIN_GIB)
+        self.assertEqual(F.verdict(24.0, 64.0, 1048576)[0], "runs")
+        self.assertIn("the whole cache stays on the card", F.verdict(24.0, 64.0, 1048576)[1])
+        self.assertEqual(F.verdict(24.0, 8.0, 1048576)[0], "does not fit")    # (the experts need the RAM)
+        h = F.plan(24.0, 1048576, hip=True)
+        self.assertTrue(h["resident"] and h["kv_streamed"])
+        self.assertEqual(h["kv_ram_gib"], 14.0)
+        self.assertEqual(F.verdict(24.0, 64.0, 1048576, hip=True)[0], "streamed")
+        self.assertEqual(F.recommended_context(24.0), 262144)
         self.assertEqual(F.recommended_context(32.0), 262144)
-        self.assertFalse(F.plan(32.0, 524288)["kv_streamed"])
+        self.assertTrue(F.plan(32.0, 524288)["resident"])
+        self.assertEqual(F.plan(32.0, 1048576)["layout"], "offload")
         self.assertIn(1048576, F.CONTEXTS)
 
     def test_small_cards_stream_only_where_the_cache_does_not_fit(self):

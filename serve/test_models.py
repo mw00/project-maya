@@ -429,8 +429,8 @@ class Settings(unittest.TestCase):
         self.assertEqual(m["ik2_kv_bytes"], {"fp8": 16384, "f16": 32768})
         self.assertEqual({k: v for k, v in m["ik2_fit"]["fp8"]["262144"].items() if k in ("resident", "layout")},
                          {"resident": True, "layout": "resident"})
-        self.assertTrue(m["ik2_fit"]["f16"]["262144"]["kv_streamed"])          # (part of the cache in RAM: KV streaming)
-        self.assertTrue(m["ik2_fit"]["fp8"]["1048576"]["kv_streamed"])
+        self.assertEqual(m["ik2_fit"]["f16"]["262144"]["layout"], "offload")    # (the experts leave the card first,
+        self.assertFalse(m["ik2_fit"]["fp8"]["1048576"]["kv_streamed"])         #  the whole cache stays in VRAM)
         self.assertGreaterEqual(m["size"], 1000)                               # (the GGUF)
         plan = M.delete_plan(self.d, self.d / "maya-inkling-2-mini.json")
         self.assertTrue(plan["ok"], plan.get("why"))

@@ -352,6 +352,10 @@ std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
 int g_n_sm = 0;
+bool g_pa70 = false;   // Volta: a prompt chunk's attention on a full layer on mma.m8n8k4 (IK2_PA70=0: cuBLAS)
+// (from this many keys on - a chunk ending there or deeper; below it cuBLAS as before, the answers of v1.1.73;
+//  IK2_PA70_MIN: tests and the owner's choice)
+int g_pa70_min = 65536;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
@@ -1683,6 +1687,26 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                   c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
         };
+        bool pa70 = g_pa70 && !Ly.sliding && c.D == 128 && pos0 + T >= g_pa70_min;
+        if (pa70) {   // (Volta, a full layer: the cached rows streamed through the tensor cores, no logits in memory)
+            if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
+            const int Tq_max = std::max(1, (int) std::min<size_t>(T, W.lg_cap / ((size_t) c.H * (c.D + 2))));
+            for (int ts = 0; ts < T && pa70; ts += Tq_max) {
+                const int Tq = std::min(Tq_max, T - ts);
+                pa70 = g_kv_fp8
+                    ? k::attn_prompt_v70_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, c.H, c.KV, Tq, pos0 + ts,
+                                             qk_scale * k_inv, v_inv, r_p + (size_t) ts * HR, HR, Ly.rel_proj, c.d_rel,
+                                             extent, sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg,
+                                             W.lg_cap, g_n_sm, g_s)
+                    : k::attn_prompt_v70_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, c.H, c.KV, Tq, pos0 + ts,
+                                             qk_scale, r_p + (size_t) ts * HR, HR, Ly.rel_proj, c.d_rel, extent,
+                                             sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap,
+                                             g_n_sm, g_s);
+                if (!pa70 && ts > 0) die("attn_prompt_v70: refused a chunk after taking the first");
+            }
+        }
+        if (pa70) {
+        } else
         if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
@@ -2687,8 +2711,39 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     }
 }
 
-// The offload path's tier tables (Ly.tab_blob) from the cache as it is: an expert's slot, or null where it is not in
-// VRAM.  Made again whenever the cache path ran since (a prompt moves experts in and out of the cache's slots).
+// KV lending (the offload path with the whole cache in VRAM): the part of the full visits' K / V that no position
+// has reached yet holds extra experts - the most picked a byte first, at the top of the cache - and gives them back
+// as the context grows (at a request's start, a prompt chunk's or a token's, never inside one: the token path's
+// tables then say null and the expert is fetched again).  An expert is the same bytes wherever it sits and the
+// kernels are the same, so the answers are those of the layout without lending.  IK2_LEND=0: off.
+struct LendSlot {
+    int key = 0, buf = 0;   // l * E + e; the buffer it sits in
+    size_t lo = 0;          // its first byte in the buffer
+    int pos_lo = 0;         // the first position whose K / V row it covers
+    int state = 0;          // 0 placed (not copied yet), 1 its copy in flight, 2 landed (in the tables)
+};
+struct LendState {
+    bool on = false;
+    std::vector<uint8_t*> buf;           // the full visits' K and V
+    size_t buf_bytes = 0, row_bytes = 0; // (each buffer: kv_cap rows of row_bytes)
+    std::vector<size_t> top;             // [buf] the lowest byte lent (buf_bytes: none)
+    std::vector<LendSlot> slots;
+    std::vector<const uint8_t*> ptr;     // [n_layer * E] the lent copy (landed) or null
+    std::vector<char> placed;            // [n_layer * E] a slot of its own (any state)
+    std::vector<double> value;           // [n_layer * E] the profile's picks (empty: the decode's heat)
+    int floor = 1 << 30;                 // the lowest position a lent expert covers
+    int want = -1;                       // a request's prompt end: lend at its first token (lend_ask)
+    cudaStream_t st = nullptr;
+    cudaEvent_t ready = nullptr, from = nullptr;
+    bool pending = false;                // a batch's copies in flight on st (the tables take it once it landed)
+    uint64_t n_lent = 0, n_back = 0;
+    double t_lend = 0;
+};
+LendState g_lend;
+int kLendRoom = 8192;   // positions kept free above a request's prompt and the latest token (IK2_LEND_ROOM: tests)
+constexpr int kLendGuard = 1024;  // a token or chunk this near a lent expert gives it back first
+constexpr int kLendBatch = 64;    // experts a batch (~0.3 GB; one in flight, the next started at a token's start)
+
 void off_tables(Model& M) {
     ExpertCache& EC = g_dev[0].EC;
     if (g_offs.tick == EC.tick) return;
@@ -2702,6 +2757,8 @@ void off_tables(Model& M) {
             tab[(size_t) l * c.E + e] = s >= 0 && s < P.n_active ? P.data + (size_t) s * P.slot_bytes
                                         : g_two.on && g_two.own[(size_t) l * c.E + e] ? (const uint8_t*) k::kHeldElsewhere
                                                                                       : nullptr;
+            if (!tab[(size_t) l * c.E + e] && g_lend.on)   // (never on two GPUs: lend_init)
+                tab[(size_t) l * c.E + e] = g_lend.ptr[(size_t) l * c.E + e];
         }
     }
     for (int l = 0; l < c.n_layer; ++l)   // (on the compute stream: after whatever still reads them)
@@ -2822,6 +2879,173 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
                 T.link.say.c_str());
     std::fflush(stdout);
     return true;
+}
+
+// (at load, after the tier: the buffers that can lend - every full visit's K and V in VRAM, no KV streaming)
+void lend_init(Model& M) {
+    const Config& c = M.c;
+    if (getenv("IK2_LEND") && !std::atoi(getenv("IK2_LEND"))) return;
+    if (getenv("IK2_LEND_ROOM")) kLendRoom = std::max(kLendGuard + 8, std::atoi(getenv("IK2_LEND_ROOM")));
+    if (!g_off || g_kv_swing >= 0) return;
+    // (one GPU only: off on two GPUs - GPU 1's experts are outside GPU 0's tier too; --parallel never meets it, its
+    //  slots need every expert resident, no offload)
+    if (g_two.want) return;
+    const size_t KD = (size_t) c.KV * c.D;
+    for (const auto& Vi : M.V) {
+        if (Vi.kv_host) return;
+        if (M.L[Vi.l].sliding) continue;
+        uint8_t* k = g_kv_fp8 ? Vi.kc8 : (uint8_t*) Vi.kc;
+        uint8_t* v = g_kv_fp8 ? Vi.vc8 : (uint8_t*) Vi.vc;
+        g_lend.buf.push_back(k), g_lend.buf.push_back(v);
+        g_lend.row_bytes = KD * (g_kv_fp8 ? 1 : 2);
+        g_lend.buf_bytes = (size_t) Vi.kv_cap * g_lend.row_bytes;
+    }
+    if (g_lend.buf.empty()) return;
+    g_lend.top.assign(g_lend.buf.size(), g_lend.buf_bytes & ~(size_t) 255);
+    g_lend.ptr.assign((size_t) c.n_layer * c.E, nullptr);
+    g_lend.placed.assign((size_t) c.n_layer * c.E, 0);
+    CU(cudaStreamCreateWithFlags(&g_lend.st, cudaStreamNonBlocking));
+    CU(cudaEventCreateWithFlags(&g_lend.ready, cudaEventDisableTiming));
+    CU(cudaEventCreateWithFlags(&g_lend.from, cudaEventDisableTiming));
+    g_lend.on = true;
+    std::printf("kv lending: %zu buffers of %.2f GiB lend their unused rows to experts (given back as the context "
+                "grows)\n", g_lend.buf.size(), g_lend.buf_bytes / 1073741824.0);
+}
+
+// the next batch of placed experts copied in (beside the tokens: one batch in flight, so the bus stays theirs too)
+void lend_issue(Model& M) {
+    if (!g_lend.on || g_lend.pending) return;
+    const Config& c = M.c;
+    ExpertCache& EC = g_dev[0].EC;
+    int n = 0;
+    for (auto& sl : g_lend.slots) {
+        if (sl.state != 0) continue;
+        const uint64_t bu = EC.bytes_up;   // (the upload figures: the cache's own copies only)
+        EC.copy_in(M.L[sl.key / c.E], sl.key % c.E, g_lend.buf[sl.buf] + sl.lo, g_lend.st);
+        EC.bytes_up = bu;
+        sl.state = 1;
+        if (++n == kLendBatch) break;
+    }
+    if (!n) return;
+    CU(cudaEventRecord(g_lend.ready, g_lend.st));
+    g_lend.pending = true;
+    g_lend.n_lent += n;
+}
+
+// a batch landed: the tables take it (a token's, a window's or a chunk's start)
+void lend_land(Model& M, bool wait) {
+    if (!g_lend.pending) return;
+    if (wait) CU(cudaEventSynchronize(g_lend.ready));
+    else if (cudaEventQuery(g_lend.ready) != cudaSuccess) return;
+    for (auto& sl : g_lend.slots)
+        if (sl.state == 1) sl.state = 2, g_lend.ptr[sl.key] = g_lend.buf[sl.buf] + sl.lo;
+    g_lend.pending = false;
+    g_offs.tick = ~0ull;
+    off_tables(M);
+}
+
+// every lent expert below position p given back: the tables first (stream order: after whatever read them), then
+// its bytes zeroed (the rows as they were) before a position is written there
+void lend_back(Model& M, int p) {
+    if (g_lend.floor >= p) return;
+    lend_land(M, true);
+    const Config& c = M.c;
+    std::vector<LendSlot> keep, drop;
+    for (const auto& sl : g_lend.slots) (sl.pos_lo < p ? drop : keep).push_back(sl);
+    bool landed = false;
+    for (const auto& sl : drop) {
+        g_lend.placed[sl.key] = 0;
+        if (sl.state == 2) g_lend.ptr[sl.key] = nullptr, landed = true;
+    }
+    if (landed) g_offs.tick = ~0ull, off_tables(M);
+    for (const auto& sl : drop)
+        if (sl.state == 2)
+            CU(cudaMemsetAsync(g_lend.buf[sl.buf] + sl.lo, 0,
+                               std::min(M.L[sl.key / c.E].slot_bytes, g_lend.buf_bytes - sl.lo), g_s));
+    std::fill(g_lend.top.begin(), g_lend.top.end(), g_lend.buf_bytes & ~(size_t) 255);
+    g_lend.floor = 1 << 30;
+    for (const auto& sl : keep) {
+        g_lend.top[sl.buf] = std::min(g_lend.top[sl.buf], sl.lo);
+        g_lend.floor = std::min(g_lend.floor, sl.pos_lo);
+    }
+    g_lend.slots.swap(keep);
+    for (const auto& sl : drop) g_lend.n_back += sl.state == 2;
+    if (getenv("IK2_LEND_LOG"))
+        std::printf("kv lending: %zu experts given back below position %d (%zu left, from %d up)\n", drop.size(), p,
+                    g_lend.slots.size(), g_lend.floor);
+}
+
+// a request's first token (its prompt to end): the rows from end + kLendRoom up that no position has reached take
+// the experts outside the tier, the most picked a byte first - placed now, copied a batch at a time from here on
+// (after the prompt, so its time stays as it was)
+void lend_grow(Model& M, int end) {
+    if (!g_lend.on) return;
+    const Config& c = M.c;
+    const int64_t target = (int64_t) end + kLendRoom;
+    lend_back(M, (int) std::min<int64_t>(target, 1 << 30));
+    const size_t lo_min = (size_t) target * g_lend.row_bytes;
+    if (lo_min >= g_lend.buf_bytes) return;
+    // (worth it only for a GiB or more of new room - a request that grows the context a little lends nothing)
+    size_t room = 0;
+    for (size_t t : g_lend.top) room += t > lo_min ? t - lo_min : 0;
+    if (room < ((size_t) 1 << 30) && !g_lend.slots.empty()) return;
+    ExpertCache& EC = g_dev[0].EC;
+    std::vector<double> val((size_t) c.n_layer * c.E, 0.0);
+    if (!g_lend.value.empty()) val = g_lend.value;
+    else {
+        std::vector<uint32_t> heat(val.size());
+        CU(cudaMemcpy(heat.data(), g_offs.heat, heat.size() * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < val.size(); ++i) val[i] = heat[i];
+    }
+    std::vector<int> cand;
+    for (int key = 0; key < c.n_layer * c.E; ++key)
+        if (EC.loc[key] < 0 && !g_lend.placed[key]) cand.push_back(key);
+    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
+        return val[a] / M.L[a / c.E].slot_bytes > val[b] / M.L[b / c.E].slot_bytes;
+    });
+    const double t0 = now();
+    int n = 0;
+    for (int key : cand) {
+        const size_t sb = M.L[key / c.E].slot_bytes;
+        int best = -1;
+        size_t best_lo = 0;
+        for (size_t b = 0; b < g_lend.buf.size(); ++b) {
+            if (g_lend.top[b] < sb) continue;
+            const size_t lo = (g_lend.top[b] - sb) & ~(size_t) 255;
+            if (lo >= lo_min && (best < 0 || lo > best_lo)) best = (int) b, best_lo = lo;
+        }
+        if (best < 0) break;
+        LendSlot sl;
+        sl.key = key, sl.buf = best, sl.lo = best_lo, sl.pos_lo = (int) (best_lo / g_lend.row_bytes);
+        g_lend.top[best] = best_lo;
+        g_lend.floor = std::min(g_lend.floor, sl.pos_lo);
+        g_lend.placed[key] = 1;
+        g_lend.slots.push_back(sl);
+        ++n;
+    }
+    if (!n) return;
+    lend_land(M, true);
+    CU(cudaEventRecord(g_lend.from, g_s));   // (the rows' last writers - an earlier request's tokens - done first)
+    CU(cudaStreamWaitEvent(g_lend.st, g_lend.from, 0));
+    lend_issue(M);
+    g_lend.t_lend += now() - t0;
+    if (getenv("IK2_LEND_LOG"))
+        std::printf("kv lending: %d experts placed (%zu in all, from position %d up)\n", n, g_lend.slots.size(),
+                    g_lend.floor);
+}
+
+// a token's, a window's or a chunk's start (positions up to end written): lent experts that near given back first;
+// a batch that landed taken into the tables, the next one started
+inline void lend_check(Model& M, int end, bool token = false) {
+    if (!g_lend.on) return;
+    if (token && g_lend.want >= 0) {
+        const int w = std::max(g_lend.want, end);
+        g_lend.want = -1;
+        lend_grow(M, w);
+    }
+    if (end + kLendGuard > g_lend.floor) lend_back(M, end + kLendRoom);
+    if (g_lend.pending) lend_land(M, false);
+    if (!g_lend.pending) lend_issue(M);
 }
 
 // The lane-parity mode (IK2_LANE=1, =fetch / =cpu: every miss to one side - tests): the CPU lane started and the
@@ -3023,6 +3247,7 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
                 std::vector<int>* argmax_out) {
     const Config& c = M.c;
     Work& W = dev_work(0);
+    lend_check(M, pos + 1, true);
     if (g_off) off_tables(M);
     if (g_lane) {   // (the lane re-timed as it runs: its figure sent when it moved by more than a tenth - a busy PC)
         bool moved = false;
@@ -3415,6 +3640,7 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
                 std::vector<int>* argmax_out) {
     const Config& c = M.c;
     if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
+    lend_check(M, pos0 + T, true);
     if (!g_blk.ready) block_init(M);
     Work& W = dev_work(0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
@@ -4093,6 +4319,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C;
+    lend_check(M, pos0 + T);
     if ((g_fast || g_off) && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() &&
         g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
@@ -4821,6 +5048,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
                          std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C;
+    lend_check(M, pos0 + T);
     use_dev(M.L[0].dev);
     Work& W = dev_work(g_cur);
     ExpertCache& EC = dev_cache(g_cur);
@@ -5545,6 +5773,8 @@ int main(int argc, char** argv) {
         for (int d = 0; d < n_gpu; ++d) use_dev(d), cls = std::min(cls, k::arch_class());
         use_dev(0);
         if (cls < 80) g_flash = false;
+        g_pa70 = cls == 70 && !(getenv("IK2_PA70") && !std::atoi(getenv("IK2_PA70")));
+        if (getenv("IK2_PA70_MIN")) g_pa70_min = std::max(0, std::atoi(getenv("IK2_PA70_MIN")));
         if (cls < 75) g_block = false;
         if (cls < 80 && (!draft_path.empty() || g_lookup)) {
             std::printf("NOTE maya-ik2: drafting off - on this GPU (sm_%d class) the verify window does not have the "
@@ -5591,10 +5821,10 @@ int main(int argc, char** argv) {
 #endif
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
         bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
-        // KV streaming (g_kv_stream): auto takes it only where the cache does not fit beside the model - then every
-        // expert stays in VRAM where they fit beside the full visits kept there plus the tokens' ring; an offload
-        // layout (the experts never all fit) streams only where its cache alone would not fit, and only where the RAM
-        // holds the rows beside its experts.  The rows in RAM are pinned: never more than the RAM has free.
+        // KV streaming (g_kv_stream): auto takes it only where the cache alone does not fit beside the dense weights
+        // and a half-GiB tier of experts (the offload layout, below), and only where the RAM holds the rows beside its
+        // experts; where the offload path does not run, where the cache does not fit beside every expert.  The rows
+        // in RAM are pinned: never more than the RAM has free.
         // (KV streaming: one GPU only - off on two GPUs (the split's GPU 1 rows), the CPU lane off beside it below)
         if (g_kv_stream == 1 && g_two.want)
             std::printf("NOTE KV streaming is off on two GPUs (--kv-streaming on not taken): the cache stays in VRAM\n");
@@ -5620,13 +5850,23 @@ int main(int argc, char** argv) {
             const size_t ring_rows = (size_t) std::max(bhi - blo, g_ring_tgt);
             const size_t ring_b = (size_t) kKvRing * 2 * ring_rows * c.KV * c.D * eb;
             // n_res: the full visits in VRAM for the tokens, the swing visit (the prompts' staging pair) one of them
+            // A token reads the WHOLE cache but only the ~8 experts a layer it picks: where the model and the cache do
+            // not fit together, the experts leave VRAM first (the offload path: a tier of the most-used ones stays,
+            // the others in RAM fetched by the GPU / the CPU lane) and the cache stays in VRAM; rows go to RAM only
+            // where the cache alone does not fit beside the dense weights and a half-GiB tier.  (Not where the
+            // offload path does not run: AMD, IK2_OFF=0, IK2_DENSE - there every expert stays and the cache streams.)
+            bool off_ok = !getenv("IK2_DENSE") && !(getenv("IK2_OFF") && *getenv("IK2_OFF") && !std::atoi(getenv("IK2_OFF")));
+#ifdef STRATA_USE_HIP
+            off_ok = false;
+#endif
             int host_n = 0, n_res = n_full;
             bool all_exp = false;
             if (n_full > 0 && (g_kv_stream == 1 || !fits)) {
                 if (g_kv_resident >= 0) n_res = std::max(1, std::min(g_kv_resident, n_full));
                 else n_res = base + ring_b + vis_b <= fr0 ? (int) std::min<size_t>(n_full, (fr0 - base - ring_b) / vis_b) : 1;
                 all_exp = exp_b <= cap_b && base + ring_b + (size_t) n_res * vis_b <= fr0;
-                if (!all_exp && g_kv_stream != 1) {
+                if (g_kv_stream != 1 && (off_ok || !all_exp)) {
+                    all_exp = false;
                     // (an offload layout: the cache in VRAM as in v1.1.73 wherever it leaves the experts a tier of half a GiB)
                     const size_t rest = dense_b + slide_b + reserve + scratch + GiB / 2;
                     if (rest + (size_t) n_full * vis_b <= fr0) n_res = n_full;
@@ -6490,6 +6730,7 @@ int main(int argc, char** argv) {
                 std::fclose(in);
             }
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, off_value.empty() ? nullptr : &off_value);
+    if (g_off_want && d == 0) g_lend.value = off_value;
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
                 EC.pools.size(), EC.total_bytes() / 1073741824.0, now() - t_start);
     for (size_t p = 0; p < EC.pools.size(); ++p)
@@ -6685,6 +6926,7 @@ int main(int argc, char** argv) {
         }
         g_off = true;
         off_tables(M);
+        lend_init(M);
         // The decode mode (owner, v1.1.73): lane parity wherever it is the faster one on this PC (IK2_LANE unset or
         // auto: decided from the calibration's figures), else mode A (the resident kernels, the bus only);
         // IK2_LANE=0: mode A, =1 / fetch / cpu: lane parity (tests).
@@ -7583,6 +7825,7 @@ int main(int argc, char** argv) {
             for (auto& v : g_cnt_hist) v = 0;
             for (auto& v : g_src_hist) v = 0;
             bool cancelled = false;
+            g_lend.want = (int) ids.size();   // (KV lending: at the answer's first token)
             if (L < ids.size()) {
                 const int T_sup = g_dev[0].W.T_sup;
                 const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
@@ -7833,6 +8076,7 @@ int main(int argc, char** argv) {
     int first_best = -1;
     const int T_sup = g_dev[0].W.T_sup;
     const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
+    g_lend.want = g_depth + (int) prompt.size();   // (KV lending: at the answer's first token)
     if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all && (int) prompt.size() > 64) {
         BigScratch bs;
         const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) prompt.size(), (int) prompt.size(), bs);
@@ -7870,6 +8114,14 @@ int main(int argc, char** argv) {
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.hits; }),
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.misses; }),
                 ec_sum([](ExpertCache& e) { return e.bytes_up; }) / 1073741824.0);
+    if (g_lend.want >= 0 && getenv("IK2_LEND_WAIT") && std::atoi(getenv("IK2_LEND_WAIT"))) {   // (tests: the steady speed)
+        const double tw = now();
+        lend_grow(M, g_lend.want);
+        g_lend.want = -1;
+        do lend_land(M, true), lend_issue(M);
+        while (g_lend.pending);
+        std::printf("kv lending: %zu experts landed %.2f s after the prompt\n", g_lend.slots.size(), now() - tw);
+    }
     std::fflush(stdout);
     if (all) {
         // log-probabilities of every prompt position
@@ -8152,6 +8404,11 @@ int main(int argc, char** argv) {
         if (g_lane)
             std::printf("lane: %.0f / %.0f us an expert as measured (NVFP4 / Q8_0)\n", g_offs.lane->us_expert(0),
                         g_offs.lane->us_expert(1));
+        if (g_lend.on)
+            std::printf("kv lending: %zu experts lent now (from position %d up), %llu copied and %llu given back in all; "
+                        "lending %.2f s of host time\n", g_lend.slots.size(),
+                        g_lend.slots.empty() ? -1 : g_lend.floor, (unsigned long long) g_lend.n_lent,
+                        (unsigned long long) g_lend.n_back, g_lend.t_lend);
     }
     if (out.size() > 1)
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
