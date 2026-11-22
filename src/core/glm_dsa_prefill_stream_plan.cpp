@@ -1,9 +1,9 @@
 // src/core/glm_dsa_prefill_stream_plan.cpp - the glm-dsa port B9.9: the stream driver's pure parts (the early
 // prestage schedule and registry, the landing ring's node).  See glm_dsa_prefill_stream.hpp.  Plain C++.
-#include "strata/core/glm_env.hpp"
+#include "maya/core/glm_env.hpp"
 #include "glm_dsa_prefill_stream.hpp"
 
-#include "strata/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_batch.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -13,11 +13,11 @@
 #include <iterator>
 #include <tuple>
 
-namespace strata::core::glmpfs {
+namespace maya::core::glmpfs {
 
 bool stream_on(bool dsa) {
     if (!dsa) return false;
-    return strata::glmenv::env_flag("MAYA_GLM_PREFILL_STREAM", true);
+    return maya::glmenv::env_flag("MAYA_GLM_PREFILL_STREAM", true);
 }
 
 bool split_prestage(bool dsa, int n_parts) { return n_parts > 1 && stream_on(dsa); }
@@ -97,4 +97,4 @@ void early_clear() {
 void set_prestage_only(const void* model) { t_only = model; }
 bool prestage_only(const void* model) { return model != nullptr && t_only == model; }
 
-}  // namespace strata::core::glmpfs
+}  // namespace maya::core::glmpfs

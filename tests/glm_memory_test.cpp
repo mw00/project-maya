@@ -6,7 +6,7 @@
 #include <cstdio>
 
 static void check_ram_plan() {
-    using namespace strata::core::glmfast;
+    using namespace maya::core::glmfast;
     // The old weighted split gives class 0 excess slots while starving class 1,
     // even though the byte budget exactly covers both mandatory capacities.
     const uint64_t budget = 600;
@@ -81,7 +81,7 @@ static void check_ram_plan() {
 // #860: a route's miss on an expert demoted at the last boundary finds its demotion by RAM slot and key, and reads the
 // bytes from the VRAM slot the copy reads while that slot is still draining - never by waiting for the copy
 static void check_drain_source() {
-    using namespace strata::core::glmfast;
+    using namespace maya::core::glmfast;
     struct Drain {   // (glm_fast_state.hpp's FastState::Drain fields the lookup reads)
         int il, vslot, key, rclass, rslot;
     };
@@ -104,12 +104,12 @@ static void check_drain_source() {
 int main() {
     check_ram_plan();
     check_drain_source();
-    using strata::core::glmfast::expert_pool_budget;
-    using strata::core::glmfast::minimal_ram_tier;
-    using strata::core::glmfast::full_unified_pool;
-    using strata::core::glmfast::warm_pool_slots;
-    using strata::core::glmfast::complete_pool;
-    using strata::core::glmfast::complete_pool_slots;
+    using maya::core::glmfast::expert_pool_budget;
+    using maya::core::glmfast::minimal_ram_tier;
+    using maya::core::glmfast::full_unified_pool;
+    using maya::core::glmfast::warm_pool_slots;
+    using maya::core::glmfast::complete_pool;
+    using maya::core::glmfast::complete_pool_slots;
     constexpr size_t G = size_t{1} << 30;
     constexpr size_t experts = 80 * G + 174 * (size_t{1} << 20);
 
@@ -156,7 +156,7 @@ int main() {
     assert(complete_pool_slots(158 * G, 308 * M, 288, 3, -5) == 291);
     // #474: the complete pool is asked for on every GPU (the budget above decides); the setting wins either way
     {
-        using strata::core::glmfast::complete_pool_on;
+        using maya::core::glmfast::complete_pool_on;
         const auto set = [](const char* v) {
 #if defined(_WIN32)
             _putenv_s("MAYA_GLM_COMPLETE_POOL", v ? v : "");
@@ -174,7 +174,7 @@ int main() {
     }
     // The pool's reserve: 700 MiB, except where it leaves the pool short of its floor (here 2 GiB) - an automatic budget
     // then lowers it to leave exactly the floor, never below 300 MiB; one set by hand or a fixed budget keeps it
-    using strata::core::glmfast::pool_reserve;
+    using maya::core::glmfast::pool_reserve;
     const size_t R = 700 * M, S = 300 * M;
     assert(pool_reserve(10 * G, R, false, false, 2 * G, S) == std::make_pair(R, false));            // room for both
     assert(pool_reserve(2 * G + 500 * M, R, false, false, 2 * G, S) == std::make_pair(500 * M, true));
@@ -184,8 +184,8 @@ int main() {
     assert(pool_reserve(2 * G + 500 * M, R, false, true, 2 * G, S) == std::make_pair(R, false));     // --expert-cache N
     // #899: the "no room" error names a smaller hand-set reserve only where it can make the room; a budget of 0 (the
     // free VRAM read no more than the reserve) or more short than the whole reserve says it cannot; a default: nothing
-    using strata::core::glmfast::reserve_hint;
-    using strata::core::glmfast::ReserveHint;
+    using maya::core::glmfast::reserve_hint;
+    using maya::core::glmfast::ReserveHint;
     assert(reserve_hint(true, 2 * G, 600 * M, 3072 * M) == ReserveHint::smaller);
     assert(reserve_hint(true, 2 * G, 3072 * M, 3072 * M) == ReserveHint::smaller);
     assert(reserve_hint(true, 0, 600 * M, 3072 * M) == ReserveHint::budget_zero);                   // (#899's case)
@@ -194,7 +194,7 @@ int main() {
     assert(reserve_hint(false, 2 * G, 600 * M, R) == ReserveHint::none);
     // The written budget's check (20 GiB asked, 700 MiB reserve): free as planned gives nothing back; 200 MiB free
     // gives back the 500 short + 64; nearly nothing free 1 GiB twice, then a quarter; a refused piece what it refused
-    using strata::core::glmfast::pool_give_back;
+    using maya::core::glmfast::pool_give_back;
     int zr = 0;
     assert(pool_give_back(20 * G, 20 * G, 700 * M, R, zr) == 0);
     assert(pool_give_back(20 * G, 20 * G, 640 * M, R, zr) == 0);
@@ -212,8 +212,8 @@ int main() {
     // budget back (13.49 GB, the working run's pool); a card whose frees land at once (CUDA) reads no pause at all;
     // frees that never land stop at the limit with the last read.
     {
-        using strata::core::glmfast::await_check_frees;
-        using strata::core::glmfast::expert_pool_budget;
+        using maya::core::glmfast::await_check_frees;
+        using maya::core::glmfast::expert_pool_budget;
         const double GB = 1073741824.0;
         const size_t total = (size_t) (15.92 * GB), before = total - (size_t) (1.93 * GB), rsv = 512 * M;
         const size_t held = total - (size_t) (15.42 * GB);   // 15.42 of 15.92 GB in use: the reserve's 0.50 GB free
@@ -240,9 +240,9 @@ int main() {
     // take at most 120 GiB, 4 GiB its floor: 100 GiB of commit left caps it at 87.2 GiB and keeps 32.8 off the GPU;
     // with 150 GiB left it is capped to 137.2, still above all the pool takes, so nothing stays off; with 130 it is
     // capped to 117.2 and 2.8 GiB stay off; with no room at all the floor stays; a 16 GiB PC keeps 8 GiB for the others
-    using strata::core::glmfast::commit_margin;
-    using strata::core::glmfast::commit_pool_cap;
-    using strata::core::glmfast::pagefile_hint_gib;
+    using maya::core::glmfast::commit_margin;
+    using maya::core::glmfast::commit_pool_cap;
+    using maya::core::glmfast::pagefile_hint_gib;
     assert(commit_margin(128 * G) == 128 * G / 10 && commit_margin(16 * G) == 8 * G);
     const size_t mg = 128 * G / 10;
     assert(commit_pool_cap(140 * G, 4 * G, 120 * G, 100 * G, 128 * G) == std::make_pair(100 * G - mg, 20 * G + mg));
@@ -261,7 +261,7 @@ int main() {
         // whatever the cap; a discrete AMD card under Windows: a tenth of the cap, rounded up to 256 MB - a 25.5 GB
         // cap (the report's 7900 XT) keeps 2.75 GB, so the tier lands ~2.2 GB lower than before, and a larger cap
         // keeps more; never under 512 MB; the setting wins on every host (rounded up, 0 = no room).
-        using strata::core::glmfast::pin_cap_room;
+        using maya::core::glmfast::pin_cap_room;
         const int64_t M = int64_t{1} << 20, GB = int64_t{1} << 30;
         assert(pin_cap_room(false, 25 * GB, -1) == 512 * M && pin_cap_room(false, 0, -1) == 512 * M);
         assert(pin_cap_room(false, 200 * GB, -1) == 512 * M);
@@ -277,7 +277,7 @@ int main() {
         assert(more - pin_cap_room(false, held + more, -1) > more - pin_cap_room(true, held + more, -1) + 2 * GB);
         // a Windows APU's shared-memory margin: an eighth of the limit, 1 to 4 GB, whole 256 MB (15.84 GB -> 2 GB,
         // above the 1.71 GB under the limit its start needed)
-        using strata::core::glmfast::apu_shared_margin;
+        using maya::core::glmfast::apu_shared_margin;
         assert(apu_shared_margin(16220 * M) == 2 * GB && apu_shared_margin(16220 * M) > 1751 * M);
         assert(apu_shared_margin(4 * GB) == GB && apu_shared_margin(0) == GB && apu_shared_margin(-1) == GB);
         assert(apu_shared_margin(25 * GB) == 3 * GB + 256 * M && apu_shared_margin(64 * GB) == 4 * GB);
@@ -286,20 +286,20 @@ int main() {
         // #924 / #1035: the cap measured before the expert pool - Windows + a discrete Radeon, one GPU only; never
         // on NVIDIA, Linux, an APU or a split; the setting wins on one GPU (an empty one counts as unset), never in a
         // split
-        using strata::core::glmfast::pin_cap_before_pool;
+        using maya::core::glmfast::pin_cap_before_pool;
         assert(pin_cap_before_pool(true, false, 1, nullptr) && pin_cap_before_pool(true, false, 1, ""));
         assert(!pin_cap_before_pool(false, false, 1, nullptr) && !pin_cap_before_pool(true, true, 1, nullptr));
         assert(!pin_cap_before_pool(true, false, 2, nullptr) && !pin_cap_before_pool(false, true, 3, nullptr));
         assert(!pin_cap_before_pool(true, false, 1, "0") && pin_cap_before_pool(false, false, 1, "1"));
         assert(pin_cap_before_pool(false, true, 1, "1") && !pin_cap_before_pool(false, true, 2, "1"));
-        using strata::core::glmfast::pin_left_since;
+        using maya::core::glmfast::pin_left_since;
         const int64_t M = int64_t{1} << 20, GB = int64_t{1} << 30;
         assert(pin_left_since(29 * GB, 300 * M) == 29 * GB - 300 * M && pin_left_since(GB, 2 * GB) == 0);
         assert(pin_left_since(GB, -5) == GB && pin_left_since(0, 0) == 0);
         // the classes sized one after another under a measured cap never pass it less the room kept above them,
         // and with room to spare each keeps its planned slots (the caller's min with the plan)
-        using strata::core::glmfast::pin_cap_share;
-        using strata::core::glmfast::pin_cap_room;
+        using maya::core::glmfast::pin_cap_share;
+        using maya::core::glmfast::pin_cap_room;
         const int64_t stride[] = {6 * M + 3 * 4096, 9 * M + 512, 2 * M + 7};
         const int64_t plan[] = {3000, 1500, 900};   // ~35 GB planned: more than the cap below
         for (const int64_t left0 : {29 * GB + 768 * M, 12 * GB, 40 * GB, 600 * M}) {

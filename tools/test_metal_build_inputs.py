@@ -241,7 +241,7 @@ class TheGuardCatchesBreaks(unittest.TestCase):
         self.assertEqual([2], [no for no, line in enumerate(code.split("\n"), 1) if SYMBOL.search(line)])
         self.assertIn("a # in a string", code)
         self.assertTrue(is_glm_dsa("src/core/glm_dsa_x.cpp"))
-        self.assertTrue(is_glm_dsa("include/strata/core/glm_arch.hpp"))     # a port file (PORT_FILES)
+        self.assertTrue(is_glm_dsa("include/maya/core/glm_arch.hpp"))     # a port file (PORT_FILES)
         self.assertTrue(is_glm_dsa("src/core/new_part.cpp", {"src/core/new_part.cpp"}))   # registered
         self.assertFalse(is_glm_dsa("src/metal/glm_metal.cpp"))
 
@@ -255,21 +255,21 @@ class TheGuardCatchesBreaks(unittest.TestCase):
             "CMakeLists.txt": GOOD_CMAKELISTS,
             METAL_CMAKE: "add_library(maya_metal STATIC src/metal/a.cpp)\n",
             "src/metal/a.cpp": '#include "b.hpp"\n#include "ggml.h"\n',
-            "src/metal/b.hpp": '#include "../../include/strata/platform/c.hpp"   // header only\n',
-            "include/strata/platform/c.hpp": '#include "../core/glm_arch.hpp"\n',
-            "include/strata/core/glm_arch.hpp": "enum class Arch { Flash, GlmDsa };\n",
+            "src/metal/b.hpp": '#include "../../include/maya/platform/c.hpp"   // header only\n',
+            "include/maya/platform/c.hpp": '#include "../core/glm_arch.hpp"\n',
+            "include/maya/core/glm_arch.hpp": "enum class Arch { Flash, GlmDsa };\n",
         }
         with _tree(files) as d:
             root = Path(d)
             self.assertEqual(sorted(set(files) - {"CMakeLists.txt", METAL_CMAKE}), metal_build(root)[1])
-            self.assertEqual(["include/strata/core/glm_arch.hpp: a glm-dsa file the Metal build compiles (#included)"],
+            self.assertEqual(["include/maya/core/glm_arch.hpp: a glm-dsa file the Metal build compiles (#included)"],
                              findings(root))
-        files["include/strata/platform/c.hpp"] = "inline bool glmd_on() { return false; }\n"
+        files["include/maya/platform/c.hpp"] = "inline bool glmd_on() { return false; }\n"
         with _tree(files) as d:
-            self.assertEqual(["include/strata/platform/c.hpp:1: names glm-dsa code in the Metal build (glmd_on)"],
+            self.assertEqual(["include/maya/platform/c.hpp:1: names glm-dsa code in the Metal build (glmd_on)"],
                              findings(Path(d)))
         files[METAL_CMAKE] = "add_library(maya_metal STATIC src/metal/a.cpp src/core/glm_dsa_geometry.cpp)\n"
-        files["include/strata/platform/c.hpp"] = "\n"
+        files["include/maya/platform/c.hpp"] = "\n"
         files["src/core/glm_dsa_geometry.cpp"] = "\n"
         with _tree(files) as d:
             self.assertEqual(["cmake/metal_backend.cmake:1: names glm-dsa code: add_library(maya_metal STATIC "

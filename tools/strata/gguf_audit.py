@@ -65,7 +65,7 @@ MOE_SUPPORTED = {10, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 29}
 MV_SUPPORTED = {F32, BF16, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 29}
 # non-routed types the pack dequantizes to BF16 in dense.bin (B1.6)
 UPCAST_BF16 = {F16, 2, 3, 6, 7, 20}
-# strata_mmq template instances in CMakeLists.txt (read from the file when found, see mmq_types())
+# maya_mmq template instances in CMakeLists.txt (read from the file when found, see mmq_types())
 MMQ_FALLBACK = {"q2_0", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq4_nl", "iq4_xs", "q8_0", "iq1_s",
                 "q2_k", "q3_k", "q4_k", "q5_k", "q6_k"}
 # routed types without an MMQ instance that the prompt path multiplies in FP16 instead (dequantized by llama.cpp's
@@ -363,12 +363,12 @@ def load_dump(path: pathlib.Path) -> list[Shard]:
 
 
 def mmq_types(repo_root: pathlib.Path | None = None) -> set[int]:
-    """strata_mmq instance types, read from CMakeLists.txt (foreach over mmq-instance-<t>.cu) when present."""
+    """maya_mmq instance types, read from CMakeLists.txt (foreach over mmq-instance-<t>.cu) when present."""
     names = set(MMQ_FALLBACK)
     root = repo_root or pathlib.Path(__file__).resolve().parents[2]
     cm = root / "CMakeLists.txt"
     if cm.exists():
-        m = re.search(r"foreach\(_t ([a-z0-9_ ]+)\)[^\n]*\n\s*target_sources\(strata_mmq[^\n]*mmq-instance-",
+        m = re.search(r"foreach\(_t ([a-z0-9_ ]+)\)[^\n]*\n\s*target_sources\(maya_mmq[^\n]*mmq-instance-",
                       cm.read_text(encoding="utf-8", errors="replace"))
         if m:
             names = set(m.group(1).split())
@@ -602,12 +602,12 @@ class Audit:
                     bad.setdefault(t.tname, []).append(i)
         for tn, layers in sorted(bad.items()):
             if tn in F16_EXPERT:
-                c.warn("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: those matrices take the FP16 "
+                c.warn("%s on %d layers (e.g. blk.%d) has no maya_mmq instance: those matrices take the FP16 "
                        "products (slower than MMQ), the prompt stays batched" % (tn, len(set(layers)), layers[0]))
             else:
-                c.fail("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: whole prompt token by token"
+                c.fail("%s on %d layers (e.g. blk.%d) has no maya_mmq instance: whole prompt token by token"
                        % (tn, len(set(layers)), layers[0]))
-        c.info("strata_mmq types: " + ", ".join(sorted(type_name(x) for x in mmq)))
+        c.info("maya_mmq types: " + ", ".join(sorted(type_name(x) for x in mmq)))
         return c
 
     def a6(self) -> Check:

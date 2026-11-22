@@ -1,6 +1,6 @@
 // Real asynchronous CPU/GPU handoff and graph replay, including changing payloads.
 #include <hip/hip_runtime.h>
-#include "strata/kernels/elementwise.hpp"
+#include "maya/kernels/elementwise.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -22,9 +22,9 @@ int main(){
  hipGraph_t graph;hipGraphExec_t exec;
  *flag=0;*seq=1;
  CHECK(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal));
- strata::kernels::doorbell_wait(dflag,dseq,(void*)stream);
- strata::kernels::copy_from_mapped(device,mapped,N,(void*)stream);
- strata::kernels::scale_inplace(device,N,2.0f,(void*)stream);
+ maya::kernels::doorbell_wait(dflag,dseq,(void*)stream);
+ maya::kernels::copy_from_mapped(device,mapped,N,(void*)stream);
+ maya::kernels::scale_inplace(device,N,2.0f,(void*)stream);
  CHECK(hipStreamEndCapture(stream,&graph));CHECK(hipGraphInstantiateWithFlags(&exec,graph,0));
  std::vector<float> got(N);
  for(int r=1;r<=rounds;r++){
@@ -62,7 +62,7 @@ int main(){
  CHECK(hipMemcpyAsync(mapped_copy_out,device,N*4,hipMemcpyDeviceToDevice,stream));
  CHECK(hipMemcpyAsync(mapped_copy_ids,copy_ids_device,10*4,hipMemcpyDeviceToDevice,stream));
  CHECK(hipMemcpyAsync(mapped_copy_weights,copy_weights_device,10*4,hipMemcpyDeviceToDevice,stream));
- strata::kernels::doorbell_ring(device_copy_seq,(void*)stream);
+ maya::kernels::doorbell_ring(device_copy_seq,(void*)stream);
  CHECK(hipStreamEndCapture(stream,&graph));CHECK(hipGraphInstantiateWithFlags(&exec,graph,0));
  for(int r=1;r<=rounds;r++){
   for(int i=0;i<N;i++)got[i]=(float)(r*20000+i);
@@ -95,7 +95,7 @@ int main(){
  std::vector<int32_t> ids_src(10);std::vector<float> ws(10);
  *flag=0;
  CHECK(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal));
- strata::kernels::doorbell_publish(device,gi,gw,N,10,dpublished,dids,dweights,dflag,(void*)stream);
+ maya::kernels::doorbell_publish(device,gi,gw,N,10,dpublished,dids,dweights,dflag,(void*)stream);
  CHECK(hipStreamEndCapture(stream,&graph));CHECK(hipGraphInstantiateWithFlags(&exec,graph,0));
  for(int r=1;r<=rounds;r++){
   for(int i=0;i<N;i++)got[i]=(float)(r*10000+i);

@@ -1,5 +1,5 @@
 // Real EXL3 expert blobs: helper-sized grouped execution against the same GPU's per-token kernels.
-#include "strata/kernels/exl3.hpp"
+#include "maya/kernels/exl3.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -9,7 +9,7 @@
 #include <fstream>
 #include <map>
 #include <vector>
-namespace x3 = strata::kernels::exl3;
+namespace x3 = maya::kernels::exl3;
 #define CK(x)                                                                                                          \
     do {                                                                                                               \
         auto status = (x);                                                                                             \

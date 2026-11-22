@@ -1,6 +1,6 @@
 // src/kernels/cpu/kq_avx512.cpp - Q3_K / Q2_K rows against many Q8_K activations, AVX-512BW
-// (include/strata/kernels/cpu/kq_avx512.hpp).  Compiled with -mavx512f -mavx512bw; kq_avx512_ok() gates the calls.
-#include "strata/kernels/cpu/kq_avx512.hpp"
+// (include/maya/kernels/cpu/kq_avx512.hpp).  Compiled with -mavx512f -mavx512bw; kq_avx512_ok() gates the calls.
+#include "maya/kernels/cpu/kq_avx512.hpp"
 
 #include <immintrin.h>
 
@@ -10,7 +10,7 @@
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 
 bool kq_avx512_ok() noexcept {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -194,4 +194,4 @@ void kq_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const voi
     kq_rows_packed(ggml_type, w, row_bytes, n, p, nt, out, r0, r1);
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

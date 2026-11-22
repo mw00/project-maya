@@ -8,8 +8,8 @@
 // Checks: without the guard the outlier rows are not finite; with it every row is finite and within FP16 precision
 // of an F64 reference; every other row is bit-identical to the unguarded path; a batch without an outlier (Flash, a
 // normal prompt) is bit-identical in every output with every scale 1.  Plus the scale rule itself.
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/glmd_f16_guard.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/glmd_f16_guard.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -19,7 +19,7 @@
 
 namespace {
 
-namespace sk = strata::kernels;
+namespace sk = maya::kernels;
 namespace gt = glmd::guard_twin;
 
 int g_fail = 0;

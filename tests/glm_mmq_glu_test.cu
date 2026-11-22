@@ -8,8 +8,8 @@
 //   glm_mmq_glu_test --iq-s-only  only IQ1_S/IQ2_S/IQ3_S, for targeted Compute Sanitizer checks
 //   glm_mmq_glu_test --bench   Maya-L's shape (IQ3_S, n_embd 4096, n_ff 2048, 288 experts, 8192 tokens x 8): the time
 //                              of the fused product against the plain product + the SwiGLU kernel
-#include "strata/kernels/glm_batch.hpp"
-#include "strata/prefill/moe_mmq.hpp"
+#include "maya/kernels/glm_batch.hpp"
+#include "maya/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
 
@@ -25,8 +25,8 @@
 #include <string>
 #include <vector>
 
-namespace mmq = strata::prefill::mmq;
-namespace gb = strata::kernels::glmb;
+namespace mmq = maya::prefill::mmq;
+namespace gb = maya::kernels::glmb;
 
 namespace {
 void check(cudaError_t e, const char* what) {

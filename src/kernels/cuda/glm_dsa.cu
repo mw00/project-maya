@@ -18,14 +18,14 @@
 // All arithmetic f32 with precise expf (the glm_ffn accuracy contract: __expf's argument-scaled ulp
 // error is visible from |x| ~ 10); the parity harness holds the kernels to ref/glm.py's f64 at f32
 // tolerance.
-#include "strata/kernels/glm_dsa.hpp"
+#include "maya/kernels/glm_dsa.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int DS_THREADS = 256;
@@ -212,4 +212,4 @@ void glm_mla_attention(const float* q_abs, const float* latents, const int* cell
         q_abs, latents, cells, wv_b, kv_lora, n_head, v_head, qk_nope, n_sel, out);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

@@ -5,13 +5,13 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #endif
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 /// F32 -> BF16 bits, round to nearest even (a NaN stays a NaN).
 __device__ __forceinline__ uint16_t bf16_rn(float f) {
@@ -25,7 +25,7 @@ __device__ __forceinline__ uint16_t bf16_rn(float f) {
 
 /// An E4M3 code's value (exact in F32).
 __device__ __forceinline__ float e4m3_value(uint8_t q) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     const __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) q, __NV_E4M3);
     return __half2float(__half(h));
 #else
@@ -40,7 +40,7 @@ __device__ __forceinline__ float e4m3_value(uint8_t q) {
 
 /// v rounded to the nearest E4M3 value (ties to even), saturated at +-448.
 __device__ __forceinline__ float e4m3_round(float v) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     const __nv_fp8_storage_t q = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
     const __half_raw h = __nv_cvt_fp8_to_halfraw(q, __NV_E4M3);
     return __half2float(__half(h));
@@ -59,4 +59,4 @@ __device__ __forceinline__ float e4m3_round(float v) {
 #endif
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

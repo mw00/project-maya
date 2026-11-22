@@ -12,9 +12,9 @@
 //             and for 3 prefill tokens with per-token positions (B10.3); FP16 keys (B10.8) >= 99.5% at 32K;
 //   top-k     vtwin::topk_mb equals twin::topk (the single-block selector) and a sort oracle exactly, n up to
 //             131072, heavy ties, -inf, per-row positions (B10.4).
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_ref.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include "../../src/core/glm_dsa_fast_plan.hpp"
 #include "../../src/kernels/cuda/glmd_rope.cuh"
@@ -497,7 +497,7 @@ void test_topk(std::mt19937& rng) {
 
 // ---------------------------------------------------------------- B10.7 binder rule
 void test_pick_headwise() {
-    namespace gd = strata::core::glmdsa;
+    namespace gd = maya::core::glmdsa;
     static const char q8[4] = {}, b16[4] = {}, q4[4] = {};
     std::map<std::string, std::pair<int, const void*>> native = {{"blk.0.attn_k_b.weight", {8, q8}},
                                                                   {"blk.1.attn_k_b.weight", {2, q4}}};

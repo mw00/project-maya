@@ -10,10 +10,10 @@
 //   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
 //   exl3_test --dump-legacy <f>   fixed-seed cases at v1.1.8's kernels' geometry, every output float to <f> (binary)
 //                                 and its hash: MAYA_GLM_EXL3_DECODE=legacy and =legacy-f32 must write the same bytes
-#include "strata/kernels/cpu/exl3_cpu.hpp"
-#include "strata/kernels/cpu/exl3_ref.hpp"
-#include "strata/kernels/exl3.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_ref.hpp"
+#include "maya/kernels/exl3.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -30,10 +30,10 @@
 #include <string>
 #include <vector>
 
-namespace ex = strata::kernels::exl3;
-namespace cpu = strata::kernels::cpu;
-using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_f16;
+namespace ex = maya::kernels::exl3;
+namespace cpu = maya::kernels::cpu;
+using maya::kernels::f16_from_f32;
+using maya::kernels::f32_from_f16;
 
 namespace {
 
@@ -149,7 +149,7 @@ void test_decode_table() {
     }
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // The legacy kernels' FP32 decode is built for sm_6x only (sm_70+ device code unchanged): on a device of compute
 // capability 7 or more legacy-f32 is accepted and runs the FP16 kernels (the same bits), legacy_f32() is false and
 // legacy_decode_table(cb, true, ...) writes the FP16 decode.
@@ -647,7 +647,7 @@ void test_gemm_rows(int k, int n, int k2, int cb, int rows) {   // (every GPU: b
 }
 
 // the prompt path's expert set: 3 experts (rows 37, 0, 70) through set_gate_up and set_down against the reference
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 struct ScalarRowsSetting {
     bool present;
     std::string saved;
@@ -677,7 +677,7 @@ struct ScalarRowsSetting {
 };
 #endif
 void test_set(int k2, int cb, int kd = 0, int first = 37, int last = 70, int row0 = 0, bool bench = false) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     ScalarRowsSetting scalar_setting; // reference on the unchanged path, even when a caller opted in
 #endif
     if (kd <= 0) kd = k2;   // (every GPU: before sm_80 the portable kernels)
@@ -767,7 +767,7 @@ void test_set(int k2, int cb, int kd = 0, int first = 37, int last = 70, int row
         close(("set K" + kname3(k2, kd) + " cb" + std::to_string(cb) + " (3 experts, " + std::to_string(rows) + " rows)").c_str(),
               host_copy(d_out, ref.size()), ref, 3e-3);
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const auto h8 = host_copy(h_storage, hbytes / 2 + 16);
     const auto y8 = host_copy(y_storage, ybytes / 4 + 8);
     for (int i = 0; i < 16; ++i) {
@@ -1264,7 +1264,7 @@ void test_cpu_had() {
         std::vector<float> x = rand_x(128, 3.0f), want(128), got(128);
         std::vector<uint16_t> suh(128);
         for (int i = 0; i < 128; ++i) suh[(size_t) i] = (uint16_t) (0x3800 + (rep * 131 + i * 37) % 0x800);   // [0.5, 1)
-        for (int i = 0; i < 128; ++i) want[(size_t) i] = x[(size_t) i] * strata::kernels::f32_from_f16(suh[(size_t) i]);
+        for (int i = 0; i < 128; ++i) want[(size_t) i] = x[(size_t) i] * maya::kernels::f32_from_f16(suh[(size_t) i]);
         for (int h = 1; h < 128; h <<= 1)
             for (int i = 0; i < 128; i += 2 * h)
                 for (int j = i; j < i + h; ++j) {
@@ -1820,7 +1820,7 @@ void test_expect(const std::string& dir) {
     if (n_mat == 0) ++g_fail;
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // ---------------------------------------------------------------- --dump-legacy <file>
 // Fixed-seed cases at v1.1.8's kernels' geometry - GLM-5.3-Flash's routed experts (4096 -> 2048 -> 4096: exl3.cu takes
 // the legacy kernels for n_embd and n_ff <= 4096) through moe_gate_up + moe_down, dense GEMVs up to 4096 through mv -
@@ -2559,7 +2559,7 @@ int main(int argc, char** argv) {
     CK(cudaGetDevice(&dev));
     CK(cudaGetDeviceProperties(&p, dev));
     std::printf("exl3_test on %s (%.1f GB)\n", p.name, (double) p.totalGlobalMem / 1e9);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (argc == 2 && std::string(argv[1]) == "--hip-scalar-bench") {
         for (int k2 : {6, 8})
             for (int n : {16, 64, 192, 512}) test_set(k2, 2, 0, n / 2, n, 17, true);
@@ -2580,7 +2580,7 @@ int main(int argc, char** argv) {
         return g_fail || ex::launch_errors() ? 1 : 0;
     }
 #endif
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (argc == 3 && std::string(argv[1]) == "--dump-legacy") return dump_legacy(argv[2]);
 #endif
     std::printf("grouped matrix prefill: %s\n", (ex::mma_supported() || ex::prompt_wmma()) ? "enabled" : "disabled");
@@ -2616,7 +2616,7 @@ int main(int argc, char** argv) {
         return g_fail || ex::launch_errors() ? 1 : 0;
     }
     test_decode_table();
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     test_legacy_choice();
     test_legacy_decode_exhaustive();   // (no random numbers: the cases below keep their matrices)
 #endif
@@ -2629,7 +2629,7 @@ int main(int argc, char** argv) {
     test_mv(4096, 1024, 4, 2, false, 384, 256);   // a column view
     test_batch(8, 6);
     test_batch(16, 12);                     // 8-bit attention / shared experts (EXL3-sc_4.10bpw)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     for (int k2 = 2; k2 <= 16; k2 += 2)
         for (int cb = 0; cb < 3; ++cb) test_mv_mixed_columns(k2, cb);
     for (int k2 : {3, 5, 7}) test_mv_mixed_columns(k2, 2);

@@ -1,8 +1,8 @@
 // src/kernels/cuda/gdn.cu - P2.S2: the gated delta-net's non-projection parts.
 //
-// See include/strata/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
+// See include/maya/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
-#include "strata/kernels/gdn.hpp"
+#include "maya/kernels/gdn.hpp"
 
 #include <cuda_runtime.h>
 
@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int JTHREADS = 32;   ///< threads along j, the state's fast axis
@@ -245,4 +245,4 @@ void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* 
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

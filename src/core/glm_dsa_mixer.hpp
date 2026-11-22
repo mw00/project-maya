@@ -28,7 +28,7 @@
 // only host-dependent launch is the dense switch's attention (n_sel = p + 1): a diagnostic mode, documented as not
 // graph-safe.
 //
-// glm-dsa wave 5: the Volta kernels behind the decode policy (include/strata/kernels/glmd_decode_policy.hpp, the ONE
+// glm-dsa wave 5: the Volta kernels behind the decode policy (include/maya/kernels/glmd_decode_policy.hpp, the ONE
 // dispatch table): MixerDims::pol says which scorer / selector / attention kernel the backend runs (the GPU backend
 // calls glmd::decode_score / decode_topk / decode_mla, the twin backend their glmd::twin versions), MixerCache::ik_f16
 // carries the state layout's index-key dtype (B10.8) into dsa_prep and the scorer, MixerLayer::w_type the binder's
@@ -36,16 +36,16 @@
 // and n_sel_preset a device cell count the caller already wrote (glmd::DevPos, B10.1 / B14.4).
 #pragma once
 
-#include "strata/kernels/glmd_decode_policy.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_mixer.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_mixer.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
 
-namespace strata::core::glmdsa {
+namespace maya::core::glmdsa {
 
 /// The geometry the mixer reads (from Glm5Geometry; the CPU test fills it directly).
 struct MixerDims {
@@ -532,4 +532,4 @@ inline size_t mixer_work_bytes(const MixerDims& d, bool dense) {
     return glmd::decode_mla_work_bytes(d.pol, d.n_head, d.kv_lora, d.qk_rope, dense ? (int) d.max_ctx : d.top_k);
 }
 
-}  // namespace strata::core::glmdsa
+}  // namespace maya::core::glmdsa

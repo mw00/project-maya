@@ -3,7 +3,7 @@
 // setup instead of failing to link.
 #include "glm_dsa_fast.hpp"
 
-namespace strata::core {
+namespace maya::core {
 
 namespace glmdsa {
 bool mixer_setup(GlmDsaFast&, const Glm5Geometry&, int64_t, std::string& err) {
@@ -47,4 +47,4 @@ int Glm5Model::dsa_n_sel_last() const { return -1; }
 
 bool Glm5Model::prefill_tokens_dsa(const std::vector<int32_t>&, int32_t, std::string&) { return false; }
 
-}  // namespace strata::core
+}  // namespace maya::core

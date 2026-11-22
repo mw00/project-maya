@@ -21,7 +21,7 @@
 #include "glm_dsa_prefill_stream.hpp"
 #include "glm_tier_lane.hpp"
 #include "glm_tier_plan.hpp"
-#include "strata/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_batch.hpp"
 
 #include "ggml.h"
 
@@ -37,9 +37,9 @@
 #include <vector>
 #include "glm_test_env.hpp"   // setenv / unsetenv / getpid (<unistd.h> on POSIX; mapped on Windows)
 
-namespace gp = strata::core::glmpfs;
-namespace gt = strata::core::glmtier;
-namespace kc = strata::kernels::cpu;
+namespace gp = maya::core::glmpfs;
+namespace gt = maya::core::glmtier;
+namespace kc = maya::kernels::cpu;
 
 namespace {
 

@@ -1,4 +1,4 @@
-#include "strata/core/glm_helper_link.hpp"
+#include "maya/core/glm_helper_link.hpp"
 
 #include <cstdio>
 #include <mutex>
@@ -8,7 +8,7 @@
 #include <unistd.h>
 #endif
 
-namespace strata::core::hlink {
+namespace maya::core::hlink {
 namespace {
 std::mutex g_mu;
 std::vector<Block> g_blocks;
@@ -103,4 +103,4 @@ void* device_view(const void* p) {
     return nullptr;
 }
 
-}  // namespace strata::core::hlink
+}  // namespace maya::core::hlink

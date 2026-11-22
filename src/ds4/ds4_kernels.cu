@@ -8,10 +8,10 @@
 #include "ds4_pool.hpp"
 
 #include <cuda_fp16.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <cuda.h>   // (cuStreamWaitValue32's types: the function itself from the driver at run time, ar_wait_fn)
 #endif
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <mma.h>   // (sparse_attn_v7_kernel: Volta / Turing's FP16 tensor cores)
 #endif
 
@@ -36,7 +36,7 @@
 #include <unistd.h>
 #endif
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 namespace {
 
 constexpr int kThreads = 256;
@@ -50,7 +50,7 @@ __device__ __forceinline__ uint16_t f2bf16(float f) {   // round to nearest even
     return (uint16_t) (u >> 16);
 }
 
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
 template<int Mask> __device__ __forceinline__ float ds4_lane_swizzle(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), Mask));
 }
@@ -60,7 +60,7 @@ template<int Ctrl> __device__ __forceinline__ float ds4_lane_dpp(float v) {
 #endif
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v += ds4_lane_swizzle<0x401f>(v);
     v += ds4_lane_swizzle<0x201f>(v);
     v += ds4_lane_swizzle<0x101f>(v);
@@ -73,7 +73,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v = fmaxf(v, ds4_lane_swizzle<0x401f>(v));
     v = fmaxf(v, ds4_lane_swizzle<0x201f>(v));
     v = fmaxf(v, ds4_lane_swizzle<0x101f>(v));
@@ -116,7 +116,7 @@ __device__ __forceinline__ float pow2_ceil(float x) {
 // 32-bit loads)
 template <class T>
 __device__ __forceinline__ T ld_fresh(const T* p) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     T v;
     const volatile uint32_t* s = (const volatile uint32_t*) p;
     uint32_t* d = (uint32_t*) &v;
@@ -129,7 +129,7 @@ __device__ __forceinline__ T ld_fresh(const T* p) {
 }
 // (a byte: HIP's volatile load of it)
 __device__ __forceinline__ unsigned char ld_fresh_byte(const unsigned char* p) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return *(const volatile unsigned char*) p;
 #else
     return __ldcv(p);
@@ -138,12 +138,12 @@ __device__ __forceinline__ unsigned char ld_fresh_byte(const unsigned char* p) {
 
 // ld_fresh in one 16- or 8-byte load a lane (HIP: a volatile vector load - the same cache bypass as ld_fresh's 32-bit
 // loads, which cut a lane's float4 into four reads over PCIe)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 typedef unsigned int u32x4_v __attribute__((ext_vector_type(4)));
 typedef unsigned int u32x2_v __attribute__((ext_vector_type(2)));
 #endif
 __device__ __forceinline__ float4 ld_fresh_v(const float4* p) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const u32x4_v v = *(const volatile u32x4_v*) p;
     return make_float4(__uint_as_float(v.x), __uint_as_float(v.y), __uint_as_float(v.z), __uint_as_float(v.w));
 #else
@@ -151,7 +151,7 @@ __device__ __forceinline__ float4 ld_fresh_v(const float4* p) {
 #endif
 }
 __device__ __forceinline__ uint2 ld_fresh_v(const uint2* p) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const u32x2_v v = *(const volatile u32x2_v*) p;
     return make_uint2(v.x, v.y);
 #else
@@ -701,7 +701,7 @@ __device__ __forceinline__ float4 gate_ld(const uint16_t* __restrict__ w, int c)
 // a decoded token's router row is 5120 values a warp: kGateLd of a lane's float4s are loaded before any is summed
 // (the loads in flight, not one at a time), then summed in the order c = lane + 32 j as before - the same bits.  On
 // AMD 4 (gfx1151: the router 52 -> 21 us with BF16 weights); NVIDIA keeps one at a time, the loop as it was
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 constexpr int kGateLd = 4;
 #else
 constexpr int kGateLd = 1;
@@ -1027,7 +1027,7 @@ __device__ __forceinline__ void rows_at(const Rows& r, int t, int& n, int& k) {
 // 2i + lane / 16 of key lane % 16 - a warp 16 keys, a lane's 8 heads summed in place and the other 8 a shuffle away.
 // The powers of two as floats (sq: the query blocks', in D's head order; ek: the keys' - ue8m0_val's, a scale byte 0
 // a zero block), their product exact.
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+#if defined(MAYA_USE_HIP) && (defined(__GFX11__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
                                 defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || \
                                 defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__))   // (gfx12: RDNA 4 - its iu8 WMMA is a _gfx12 intrinsic with another lane layout; local trial)
 #define DS4_INDEX_WMMA 1
@@ -1043,7 +1043,7 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
                                                              int ntiles) {
     pdl_wait();
     pdl_trigger();
-#if (!defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)) || defined(DS4_INDEX_WMMA)   // (int8 MMAs)
+#if (!defined(MAYA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)) || defined(DS4_INDEX_WMMA)   // (int8 MMAs)
     constexpr int HD = 128, KT = 128, LD = HD + 16, NQ = QT * 32, NB = HD / 32;
     constexpr size_t RB = kv_row_bytes(kKvFp4p, HD);   // (a packed key row: its codes, its scales, padded to 16)
     extern __shared__ __align__(16) int8_t tc_smem[];   // Ks [KT][LD], Qs [NQ][LD] (int8), ek [KT][NB], eq [NQ][NB]
@@ -1296,7 +1296,7 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
 #endif
         __syncthreads();   // (the next tile's rows over these)
     }
-#elif defined(STRATA_USE_HIP)
+#elif defined(MAYA_USE_HIP)
     __builtin_trap();   // (index_score takes it on CUDA devices of compute capability 8.0 and up, and RDNA 3, alone)
 #else
     __trap();
@@ -2035,7 +2035,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
             const int n = min(kStage, nt - s0);
             stage(t0, s0, n);
             __syncthreads();
-#if !defined(STRATA_USE_HIP)   // (HIP leaves a loop with shuffles and a remainder rolled anyway)
+#if !defined(MAYA_USE_HIP)   // (HIP leaves a loop with shuffles and a remainder rolled anyway)
 #pragma unroll 2
 #endif
             for (int r = wr; r < n; r += W) {   // (two rows' chains at once)
@@ -2115,7 +2115,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
 // dimensions w * 64 .. + 64 (A: lane m and m + 16 hold head m's 16 values; B: lane n and n + 16 column n's; D's
 // element i: head 2i + lane / 16 on gfx11, 8 * (lane / 16) + i on gfx12; column lane % 16). gfx12 takes only
 // dimensions 8 * (lane / 16) .. + 7 of each operand, rather than gfx11's duplicated 16-value operands.
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+#if defined(MAYA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
 #define DS4_ATTN_WMMA 1
 typedef short ds4_s16 __attribute__((ext_vector_type(16)));
 typedef float ds4_f8 __attribute__((ext_vector_type(8)));
@@ -2356,7 +2356,7 @@ __global__ void __launch_bounds__(kThreads * G) sparse_attn_wmma_kernel(const fl
 // dots' K (a tile row is a column of B), transposed for the weighted sums' V; D's four values: heads g and g + 8 at
 // columns 2c, 2c + 1.  Within rounding of the FP32 kernels and of the RDNA 3 kernel (the same arithmetic, the
 // products and sums in a different order).
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 __device__ __forceinline__ void mma_ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const unsigned a = (unsigned) __cvta_generic_to_shared(p);
@@ -2554,7 +2554,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_mma_kernel(const float* 
     (void) q, (void) win, (void) ckv, (void) sel, (void) sel_stride, (void) ar, (void) sink, (void) heads, (void) scale, (void) out;
 #endif
 }
-#endif   // !STRATA_USE_HIP
+#endif   // !MAYA_USE_HIP
 
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
 // a window buffer's row (dst) of position p: the ring's row decoded, zeros before position 0
@@ -2848,7 +2848,7 @@ __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, 
         *tok = bi;
     }
     __syncthreads();
-#if defined(STRATA_USE_HIP)   // (E is fixed once loaded: a plain load is as fresh)
+#if defined(MAYA_USE_HIP)   // (E is fixed once loaded: a plain load is as fresh)
     for (int i = threadIdx.x; i < R; i += blockDim.x) erow[i] = E[(size_t) pick * R + i];
 #else
     for (int i = threadIdx.x; i < R; i += blockDim.x) erow[i] = __ldcv(E + (size_t) pick * R + i);
@@ -3579,7 +3579,7 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if defined(MAYA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 __global__ void __launch_bounds__(kThreads) ar_peer_kernel(float* x, int n4, PeerAr a, int mi, unsigned seq) {
     __shared__ int ready;
     if (threadIdx.x == 0) ready = (*reinterpret_cast<volatile unsigned*>(a.error) & 1u) == 0;
@@ -3884,7 +3884,7 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 }  // namespace
 
 bool pdl_on() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static const bool env = [] {
@@ -4082,7 +4082,7 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s) {
     pdl_launch(gemv_f16_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, alpha, y);
 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // DS4_PROMPT_F16 (ds4_model.cu's prompt_f16): float c overwrites halves 2c and 2c + 1, so
 // a row is walked from its end in blocks of 256 values: a block's halves read into registers, the block synced, then its
 // floats written - they only cover halves of blocks already read
@@ -4213,7 +4213,7 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
         const char* e = std::getenv("DS4_INDEX_TC");
         return e == nullptr ? -1 : std::atoi(e) != 0 ? 1 : 0;
     }();
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const bool tc_ok = tc_env != 0;
     if (tc_env == 0 && tc && kfmt == kKvFp4p) {
         static std::atomic<bool> said{false};
@@ -4230,7 +4230,7 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
         if (!(opted.load(std::memory_order_relaxed) >> dev & 1u)) {
             int major = 0;
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
             if (major >= 8) {
                 cudaFuncSetAttribute(index_score_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<1>());
                 cudaFuncSetAttribute(index_score_tc_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<2>());
@@ -4258,7 +4258,7 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
             opted.fetch_or(1ull << dev);
         }
         // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         // (RDNA 3: a window of 5 or 6 queries in one block - 10 or 12 head tiles' accumulators a lane - ties or loses to
         //  the CUDA cores' kernel, measured on an RX 7900 XTX; it goes as two blocks of up to 3 queries instead)
         const int qt = cand != nullptr ? 1 : T <= 4 ? T : T <= 6 ? 3 : 4;
@@ -4389,7 +4389,7 @@ __global__ void __launch_bounds__(kV7Threads, 1) sparse_attn_v7_kernel(const flo
                                                                        int heads, float scale, float* __restrict__ out) {
     pdl_wait();
     pdl_trigger();
-#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+#if !defined(MAYA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
     namespace wm = nvcuda::wmma;
     constexpr int d = 512, NW = kV7Threads / 32;
     extern __shared__ __align__(32) unsigned char v7_smem[];
@@ -4611,7 +4611,7 @@ __global__ void __launch_bounds__(kV7Threads, 1) sparse_attn_v7_kernel(const flo
 }
 // sparse_attn_v7_kernel's device: compute capability 7.x (V100, RTX 20) on CUDA, unless DS4_ATTN_V7=0
 static bool attn_v7_now() {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     static const bool off = std::getenv("DS4_ATTN_V7") != nullptr && std::atoi(std::getenv("DS4_ATTN_V7")) == 0;
     static std::atomic<int> known[64];
     int dev = 0;
@@ -4634,7 +4634,7 @@ static bool attn_v7_now() {
 }
 
 static bool attn_wmma_now() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const bool off = std::getenv("DS4_ATTN_WMMA") != nullptr && std::atoi(std::getenv("DS4_ATTN_WMMA")) == 0;
     static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
@@ -4658,7 +4658,7 @@ static bool attn_wmma_now() {
 // DS4_ATTN_SHARE=0|1|4 forces one (the device's arch cached a device)
 constexpr int kAttnShareT = 64;   // (fewer queries: a quarter of the blocks would leave the GPU idle)
 static int attn_wmma_mode(int heads, int T) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const int forced = std::getenv("DS4_ATTN_SHARE") != nullptr ? std::atoi(std::getenv("DS4_ATTN_SHARE")) : -1;
     static std::atomic<int> known[64];   // 0: not asked yet, 1: not gfx11, 2: gfx11
     int mode = 0, dev = 0;
@@ -4685,7 +4685,7 @@ static int attn_wmma_mode(int heads, int T) {
 // sparse_attn_mma_kernel's device: an Ampere or newer GPU (sm_80+), unless DS4_ATTN_MMA=0 (cached a device; the
 // first yes a line on stderr)
 static bool attn_mma_now() {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     static const bool off = std::getenv("DS4_ATTN_MMA") != nullptr && std::atoi(std::getenv("DS4_ATTN_MMA")) == 0;
     static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
@@ -4736,7 +4736,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
             else go(sparse_attn_wmma_kernel<1, 0>, 1);
             return;
         }
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
         if (a.gen && a.kcap + a.win <= kV7Max && heads % 16 == 0 && attn_v7_now()) {
             pdl_launch(sparse_attn_v7_kernel, dim3(heads / 16, T), kV7Threads, kV7Smem, s, q, win, (const uint8_t*) ckv, sel,
                        sel_stride, a, sink, heads, scale, out);
@@ -4756,7 +4756,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (few && attn_scr_fits(T, sel_stride, scr)) {
         pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
                    scr->cap, scr->rows);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
         if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
             pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                        heads, d, scale, out);
@@ -4775,7 +4775,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads % G != 0) G = 1;
     const dim3 grid(heads / G, T);
     const uint8_t* c = (const uint8_t*) ckv;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const char* swizzle = std::getenv("DS4_HIP_ATTN_SWIZZLE");
     if (swizzle && std::atoi(swizzle) == 1) {
         if (G == 8) pdl_launch(sparse_attn_packed_kernel<8, true>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
@@ -4799,7 +4799,7 @@ bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, con
     if (d != 512 || a.gen != 0 || T < 1 || T > kWin || !attn_scr_fits(T, sel_stride, scr)) return false;
     pdl_launch(unpack_sel_rows_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, c, sel, sel_stride, a, scr->cap,
                scr->rows);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (one)
         pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                    heads, d, scale, out);
@@ -4980,7 +4980,7 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     pdl_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if defined(MAYA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s) {
     if (!x || (reinterpret_cast<uintptr_t>(x) & 15u) || n <= 0 || n % 4 || mi < 0 || mi > 1 || !a.recv || !a.peer_recv ||
         (reinterpret_cast<uintptr_t>(a.recv) & 15u) || (reinterpret_cast<uintptr_t>(a.peer_recv) & 15u) || !a.flags ||
@@ -4994,7 +4994,7 @@ bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cuda
 // their partner, so a first launch beside a spinning partner never returns: calibrate_peer submits both ranks from
 // one thread and hung for good on 8x RTX 3090 (NVLink pairs). Load them up front on the current device.
 void peer_ar_preload() {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     cudaFuncAttributes fa{};
     (void) cudaFuncGetAttributes(&fa, ar_peer_kernel);
     (void) cudaFuncGetAttributes(&fa, ar_sum_kernel);
@@ -5267,7 +5267,7 @@ void HostReducer::submit(unsigned seq, int n) {
     p_->cv.notify_one();
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 namespace {
 // cuStreamWaitValue32 from the driver (no link to libcuda): nullptr where the driver or the runtime has none
 using WaitValue32 = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
@@ -5310,7 +5310,7 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
         if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDefault, aux.s2);
         pdl_launch(set_flag_kernel, 1, 1, 0, aux.s2, a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
     }
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (const WaitValue32 wait = ar_wait_fn()) {
         bool ok = true;
         for (int p = 0; p < NP && ok; ++p) {
@@ -5342,5 +5342,5 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
     }
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4
 

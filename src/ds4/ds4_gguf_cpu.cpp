@@ -1,7 +1,7 @@
 // src/ds4/ds4_gguf_cpu.cpp - a GGUF's MXFP4 experts on the CPU lane (see ds4_gguf_cpu.hpp).
 #include "ds4_gguf_cpu.hpp"
 
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -39,7 +39,7 @@
 #define MX_AVXVNNI 1
 #endif
 
-namespace strata::ds4::gguf {
+namespace maya::ds4::gguf {
 namespace {
 
 constexpr int kBlock = 32, kBytes = 17;
@@ -341,7 +341,7 @@ void q8_round(const float* x, int k, float* out) {
 
 void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float* const* x, int n, float* const* y) {
 #if defined(MX_X86)
-    static const bool avx2 = strata::kernels::cpu::exl3_cpu_tier() >= 1;
+    static const bool avx2 = maya::kernels::cpu::exl3_cpu_tier() >= 1;
     if (avx2) return rows_avx2(w, rb, k, r0, r1, x, n, y);
 #endif
     rows_scalar(w, rb, k, r0, r1, x, n, y);
@@ -416,4 +416,4 @@ void mx_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* con
     mx_rows_tier(mx_tier(), w, rb, k, r0, r1, act, n, y, pf);
 }
 
-}  // namespace strata::ds4::gguf
+}  // namespace maya::ds4::gguf

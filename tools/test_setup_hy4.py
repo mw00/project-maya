@@ -500,7 +500,7 @@ class Gate(unittest.TestCase):
     def test_cmake_builds_it_for_cuda_and_hip(self):
         text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         at = text.index("add_executable(maya-hy4 ")
-        self.assertIn("if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)", text[at - 60:at])
+        self.assertIn("if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)", text[at - 60:at])
         # (its vision tower's BF16 type on HIP: the compat header, not CUDA's own)
         self.assertTrue((ROOT / "include" / "strata" / "hip_compat" / "cuda_bf16.h").exists())
 

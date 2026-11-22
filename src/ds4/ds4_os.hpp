@@ -26,7 +26,7 @@
 #endif
 #include <windows.h>
 #include <psapi.h>   // (K32QueryWorkingSetEx: kernel32's, no psapi.lib)
-#include "strata/platform/commit.hpp"
+#include "maya/platform/commit.hpp"
 #else
 #include <fcntl.h>
 #include <pthread.h>
@@ -37,7 +37,7 @@
 #include <unistd.h>
 #endif
 
-namespace strata::ds4::os {
+namespace maya::ds4::os {
 
 using fd_t = intptr_t;
 constexpr fd_t kBadFd = -1;
@@ -842,11 +842,11 @@ inline Commit commit() {
     if (GlobalMemoryStatusEx(&s)) {
         c.limit = (uint64_t) s.ullTotalPageFile;
         // (+ what a page file Windows manages may still grow by)
-        c.avail = (uint64_t) s.ullAvailPageFile + strata::platform::commit_growth((uint64_t) s.ullTotalPhys);
+        c.avail = (uint64_t) s.ullAvailPageFile + maya::platform::commit_growth((uint64_t) s.ullTotalPhys);
         c.ram = (uint64_t) s.ullTotalPhys;
     }
 #endif
     return c;
 }
 
-}  // namespace strata::ds4::os
+}  // namespace maya::ds4::os

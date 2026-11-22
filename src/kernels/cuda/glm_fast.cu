@@ -1,26 +1,26 @@
-// src/kernels/cuda/glm_fast.cu - see include/strata/kernels/glm_fast.hpp.
+// src/kernels/cuda/glm_fast.cu - see include/maya/kernels/glm_fast.hpp.
 //
 // The dot products are llama.cpp's vecdotq (ggml/src/ggml-cuda/vecdotq.cuh, MIT, third_party/ggml/LICENSE),
 // the same expressions iq_kernels.cu and native_mmvq.cu transcribe; the block structs and codebooks come
 // from ggml-common.h.  Every reduction below is parallel, so the summation ORDER differs from the
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
-#include "strata/kernels/exl3.hpp"
-#if defined(STRATA_USE_HIP)
-#include "strata/kernels/glm_expert_bench.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
+#include "maya/kernels/exl3.hpp"
+#if defined(MAYA_USE_HIP)
+#include "maya/kernels/glm_expert_bench.hpp"
 #include <cstring>
 #endif
-#include "strata/kernels/glmd_random_route.hpp"   // glm-dsa B15.7
-#include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
+#include "maya/kernels/glmd_random_route.hpp"   // glm-dsa B15.7
+#include "maya/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <cuda_bf16.h>
 #endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
+#include "maya/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -34,7 +34,7 @@
 #include <cstring>   // glm-dsa: std::memcpy for glmd_mv_dots.cuh's host path (included below, inside the namespace)
 #include <string>
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // The HC grid exchanges FP32 partials between workgroups. An agent-scope
 // acquire load preserves visibility after their publication fences; HIP only
 // supplies CUDA's __ldcg spelling for half types.
@@ -48,18 +48,18 @@ __device__ __forceinline__ float __ldcg(const float* p) {
 // or later", 22 kernels here), so below sm_70 it is left out - the arguments are const either way.  HIP keeps
 // hip_compat's empty definition (__CUDA_ARCH__ is undefined there).
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
-#define STRATA_GRID_CONSTANT __grid_constant__
+#define MAYA_GRID_CONSTANT __grid_constant__
 #else
-#define STRATA_GRID_CONSTANT
+#define MAYA_GRID_CONSTANT
 #endif
 // the device pass for cc 6.0 (Tesla P100 / PH402, GP100: no dp4a, the SIMD-in-word intrinsics emulated)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(STRATA_USE_HIP)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(MAYA_USE_HIP)
 #define GLMF_SM60 1
 #else
 #define GLMF_SM60 0
 #endif
 
-namespace strata::kernels::glmf {
+namespace maya::kernels::glmf {
 namespace {
 
 // ---------------------------------------------------------------- small helpers
@@ -77,7 +77,7 @@ __device__ __forceinline__ float warp_max_shfl(float v) {
 // across the VALU's lanes on RDNA3 (v_permlanex16 with the identity selects for ^16: a row's lane i reads lane i of the
 // other row; DPP row_xmask for 8, 4, 2, 1) instead of through LDS (__shfl_xor_sync is a ds_bpermute on AMD): the same
 // operations on the same values in the same order, so the same bits (glm_attn_bench checks it); elsewhere the shuffles
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
+#if defined(MAYA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
 template<int Mask> __device__ __forceinline__ float lane_swizzle(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), Mask));
 }
@@ -125,14 +125,14 @@ __device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum_shfl(
 __device__ __forceinline__ float warp_max_lanes(float v) { return warp_max_shfl(v); }
 #endif
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     return warp_sum_lanes(v);
 #else
     return warp_sum_shfl(v);
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     return warp_max_lanes(v);
 #else
     return warp_max_shfl(v);
@@ -815,7 +815,7 @@ template<> __device__ __forceinline__ float dw<19>(const uint8_t* row, int kbx, 
     const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
     return d1q * (x.d * sumi + x.s * delta);
 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // Fast bit-parallel sign expansion for HIP (gfx906/gfx11/gfx12) where __vcmpne4/__vsub4 are software-emulated.
 // Every IQ2/IQ3 grid byte is nonzero and <= 62, so two's-complement negation uses a whole-word add without carries.
 __device__ __forceinline__ uint4 hip_fast_signs(unsigned b, bool parity) {
@@ -835,7 +835,7 @@ template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[k0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[k0 + 1], sumi);
@@ -860,7 +860,7 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[l0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
@@ -902,7 +902,7 @@ template<> __device__ __forceinline__ float dw<17>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[q2[l0 / 2] & 0x1FF];
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         const uint4 sgn = hip_fast_signs(q2[l0 / 2] >> 9, true);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
@@ -937,7 +937,7 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
@@ -971,7 +971,7 @@ template<> __device__ __forceinline__ float dw<21>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)], tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
@@ -1134,7 +1134,7 @@ template<> __device__ __forceinline__ float dws<21>(const uint8_t* row, int kbx,
 // a four-bit sign nibble by 0x10204080 puts its bits at each byte's high bit;
 // after masking/shifting, these are the +1 corrections and *255 gives the masks.
 // The integer scale divisions and floating-point accumulation order stay intact.
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 __device__ __forceinline__ uint4 direct_signs(unsigned b, bool parity) {
     b &= parity ? 127u : 255u;
     if (parity) b |= (__popc(b) & 1) << 7;
@@ -1456,7 +1456,7 @@ constexpr int MV_ROWS = 8;   // rows (warps) per block
 // depended on the instantiation), so a batched output could differ in its last bit from the same one alone.  Without a
 // bias (every call of the decode) both ways give the same bits.
 __device__ __forceinline__ float mv_out(float alpha, float s, float bias) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     float m = alpha * s;
     asm volatile("" : "+v"(m));   // the product materialised: never fused with the sum
     return m + bias;
@@ -1465,7 +1465,7 @@ __device__ __forceinline__ float mv_out(float alpha, float s, float bias) {
 #endif
 }
 
-__global__ void __launch_bounds__(256) mv_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel(const MAYA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1481,7 +1481,7 @@ __global__ void __launch_bounds__(256) mv_kernel(const STRATA_GRID_CONSTANT MvBa
 
 // ... several columns (a verify window's tokens) of a type the tiled kernels below do not take, or every type with
 // MAYA_GLM_MV_TILED=0: kernels of their own, so the one-column kernels keep their registers and their speed
-__global__ void __launch_bounds__(256) mv_kernel_cols(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_cols(const MAYA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1510,7 +1510,7 @@ __global__ void __launch_bounds__(256) mv_kernel_cols(const STRATA_GRID_CONSTANT
 // ... the same for jobs of ONE quantized type: compiled for that type alone (the switch over every type costs the
 // generic kernel registers and occupancy - a Q6_K 8192 x 4096 GEMV on a V100: 53.4 -> 47.8 us, the same arithmetic)
 template<int T>
-__global__ void __launch_bounds__(256) mv_kernel_t(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_t(const MAYA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1525,7 +1525,7 @@ __global__ void __launch_bounds__(256) mv_kernel_t(const STRATA_GRID_CONSTANT Mv
     if (lane == 0) J.y[row] = mv_out(J.alpha, s, J.bias ? J.bias[row] : 0.0f);
 }
 template<int T>
-__global__ void __launch_bounds__(256) mv_kernel_t_cols(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_t_cols(const MAYA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1624,7 +1624,7 @@ __device__ __forceinline__ void any_row_dot_nt(int type, const void* w, int row,
     }
 }
 template<int NT>
-__global__ void __launch_bounds__(256) mv_kernel_nt(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_nt(const MAYA_GRID_CONSTANT MvBatch b) {
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -1642,7 +1642,7 @@ __global__ void __launch_bounds__(256) mv_kernel_nt(const STRATA_GRID_CONSTANT M
     }
 }
 template<int T, int NT>
-__global__ void __launch_bounds__(256) mv_kernel_t_nt(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_t_nt(const MAYA_GRID_CONSTANT MvBatch b) {
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -1669,8 +1669,8 @@ __global__ void __launch_bounds__(256) mv_kernel_t_nt(const STRATA_GRID_CONSTANT
 // column's bit for bit (the order differs) - the same value to float rounding.
 constexpr int MMA_W = 8;   // warps a block
 
-__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const STRATA_GRID_CONSTANT MvBatch b) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const MAYA_GRID_CONSTANT MvBatch b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(MAYA_USE_HIP)
     if (b.skip != nullptr && *b.skip) return;
     __shared__ float red[MMA_W][16][kMaxMvCols + 1];
     const int bid = blockIdx.x;
@@ -1754,8 +1754,8 @@ __global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const STRATA_GRID_CON
 // m16n8k32, then its scale and min in float (the min against the block's int8 sum, as the dp4a kernel).  A lane's eight k slots are eight
 // consecutive values - one 8-byte load of the packed pair of sub-blocks, the activations in the same order.  The
 // dp4a kernel re-reads every column's activations for each pair of rows (8 columns: ~half the memory's speed)
-__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q4_K(const STRATA_GRID_CONSTANT MvBatch b) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q4_K(const MAYA_GRID_CONSTANT MvBatch b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(MAYA_USE_HIP)
     if (b.skip != nullptr && *b.skip) return;
     __shared__ float red[MMA_W][16][kMaxMvCols + 1];
     const int bid = blockIdx.x;
@@ -1859,7 +1859,7 @@ constexpr int MVC_R = 4;   // rows a warp - 2 for Q8_0 / Q4_K from 8 columns (fo
 constexpr int mvc_rows(int type, int nc) { return nc >= 8 && type != 14 ? 2 : MVC_R; }
 
 template<int T, int NC, int R = mvc_rows(T, NC)>
-__global__ void __launch_bounds__(256) mvc_kernel_t(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mvc_kernel_t(const MAYA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     using Fm = F<T>;
     using D = DecW<T>;
@@ -1916,7 +1916,7 @@ __global__ void __launch_bounds__(256) mvc_kernel_t(const STRATA_GRID_CONSTANT M
 // 140 -> 190, the rest within noise or mixed).  On by default on compute capability 7.0 only (the one measured);
 // MAYA_GLM_MV_EXACT_COLS=1 turns it on on any NVIDIA card, =0 off (A/B).  Not compiled for AMD.
 bool mvc_exact_cols() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static int cache[64];
@@ -1937,7 +1937,7 @@ bool mvc_exact_cols() {
 
 template<int T>
 void mvc_launch(const MvBatch& b, int blocks, int nc, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if ((nc == 3 || nc == 5) && mvc_exact_cols()) {
         if (nc == 3) mvc_kernel_t<T, 3, mvc_rows(T, 4)><<<blocks, 256, 0, s>>>(b);
         else mvc_kernel_t<T, 5, mvc_rows(T, 8)><<<blocks, 256, 0, s>>>(b);
@@ -1952,7 +1952,7 @@ void mvc_launch(const MvBatch& b, int blocks, int nc, cudaStream_t s) {
 
 // whether this device has the int8 mma.sync of the tensor-core GEMVs (NVIDIA sm_80+), asked once per device
 bool mma_arch() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static int cache[64];
@@ -1971,7 +1971,7 @@ bool mma_arch() {
 
 // whether this device runs mvc_mma_q8_0 (NVIDIA sm_80+), asked once per device
 bool mma_ok() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static int cache[64];
@@ -2001,7 +2001,7 @@ bool mma_ok() {
 // (R = 2), the FFN 12288 x 4096 287 -> 204, the head 154880 x 4096 3466 -> 2362.
 // p100_mv_mode: 0 off (mv_kernel_t; MAYA_GLM_MV_P100=0), else R by the launch's rows (MAYA_GLM_MV_P100_R=2 / 4
 // forces one), asked once per device
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // a Q6_K block's 53 words, two a lane: w0 = word lane, w1 = word 32 + lane (lanes 0-20) of the words starting sh = the
 // block's address mod 4 (0 or 2) bytes before it; its first / last half word read as a half, so nothing outside the
 // block is read
@@ -2038,7 +2038,7 @@ __device__ __forceinline__ void q6_fields(DecW<14>& D, uint32_t w0, uint32_t w1,
 }
 // R rows a warp (MV_ROWS warps a block); dynamic shared memory: the largest job's n_in / 32 q8_1 blocks
 template<int R>
-__global__ void __launch_bounds__(256) mv_q6_p100_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mv_q6_p100_kernel(const MAYA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     extern __shared__ int mvq6_xs[];
     const int bid = blockIdx.x;
@@ -2085,7 +2085,7 @@ __global__ void __launch_bounds__(256) mv_q6_p100_kernel(const STRATA_GRID_CONST
 #endif
 // moe_gate_up on cc 6.0 stages the layer input in shared memory (MAYA_GLM_GU_STAGE=0: it reads it from global)
 bool sm60_gu_stage() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static int cache[64];
@@ -2103,7 +2103,7 @@ bool sm60_gu_stage() {
 #endif
 }
 int p100_mv_mode() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return 0;
 #else
     static int cache[64];
@@ -2127,7 +2127,7 @@ int p100_mv_mode() {
 // ... BF16 weights against float activations (the routers, the indexer's projections): the same staging, in floats
 constexpr int MVC_FTILE = 512;   // floats of every column per tile
 
-__global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(256) mvc_kernel_bf16(const MAYA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     extern __shared__ __align__(16) uint8_t mvc_smem[];
     float* sx = (float*) mvc_smem;   // [ncol][MVC_FTILE]
@@ -2181,7 +2181,7 @@ __global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTAN
 }
 #include "glmd_mv_ext.cuh"   // glm-dsa B10.6/B10.7: more mv types and the sm_70 GEMV variants (ext_mv)
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // ---------------------------------------------------------------- the dense GEMV on RDNA3 (gfx11)
 // Q6_K is ~64% of a decode token's bytes (Maya-S: the KDA/DSA projections, the shared experts, the dense FFN and the
 // head), and on a Radeon 8065S row_dot<14> ran them at 165-220 GB/s of the 273 the LPDDR5X gives: its loop is not
@@ -2302,7 +2302,7 @@ __device__ __forceinline__ void bf16_rows_rdna(const uint16_t* row, const float*
 // big Q6_K GEMVs instead of a second, 36-block launch behind them).  A Q6_K job's block holds WPB waves of R rows, a
 // BF16 job's WPB waves of one row; the dispatcher puts the BF16 jobs first so their long-K rows start early.
 template<int R, int NT, int U, int WPB, bool XL>
-__global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
+__global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const MAYA_GRID_CONSTANT MvBatch b) {
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -2370,7 +2370,7 @@ constexpr int HC_CHUNK = 512;
 constexpr int HC_THREADS = 256;
 constexpr int HC_MIX = 24;      // (2 + hc) * hc for hc = 4
 
-__global__ void __launch_bounds__(HC_THREADS) hc_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+__global__ void __launch_bounds__(HC_THREADS) hc_kernel(const MAYA_GRID_CONSTANT HcArgs a) {
     const int hc = 4;
     const int n_embd = a.n_embd;
     const int hc_dim = hc * n_embd;
@@ -2496,7 +2496,7 @@ __device__ __forceinline__ void grid_barrier(unsigned long long* ctr, unsigned i
     __syncthreads();
 }
 
-__global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+__global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const MAYA_GRID_CONSTANT HcArgs a) {
     const int hc = 4;
     const int n_embd = a.n_embd;
     const int hc_dim = hc * n_embd;
@@ -2731,7 +2731,7 @@ __device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb
         q8_1_store_warp(xv, (block_q8_1*) a.xq + e / 32, lane);
     }
 }
-__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const MAYA_GRID_CONSTANT HcArgs a) {
     hc3_block(a, gridDim.x, blockIdx.x);   // 32 blocks
 }
 // MAYA_GLM_ROWS_BATCH: the rows of a batched decode step in one launch - row y's blocks are hc3_kernel's for its
@@ -2740,7 +2740,7 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONST
 struct HcBatch {
     HcArgs a[kMaxMvNt];
 };
-__global__ void __launch_bounds__(HC_THREADS) hc3_rows_kernel(const STRATA_GRID_CONSTANT HcBatch rb) {
+__global__ void __launch_bounds__(HC_THREADS) hc3_rows_kernel(const MAYA_GRID_CONSTANT HcBatch rb) {
     hc3_block(rb.a[blockIdx.y], gridDim.x, blockIdx.x);
 }
 
@@ -2837,13 +2837,13 @@ __device__ __forceinline__ void kda_prep_block(const KdaPrepArgs& a, int h, int 
     }
 }
 
-__global__ void __launch_bounds__(128) kda_prep_kernel(const STRATA_GRID_CONSTANT KdaPrepArgs a) {
+__global__ void __launch_bounds__(128) kda_prep_kernel(const MAYA_GRID_CONSTANT KdaPrepArgs a) {
     kda_prep_block(a, blockIdx.x, blockIdx.y);
 }
 struct KdaPrepBatch {
     KdaPrepArgs a[kKdaLayers];
 };
-__global__ void __launch_bounds__(128) kda_prep_layers_kernel(const STRATA_GRID_CONSTANT KdaPrepBatch b) {
+__global__ void __launch_bounds__(128) kda_prep_layers_kernel(const MAYA_GRID_CONSTANT KdaPrepBatch b) {
     kda_prep_block(b.a[blockIdx.z], blockIdx.x, blockIdx.y);
 }
 
@@ -2914,7 +2914,7 @@ struct KdaRecBatch {
     KdaRecArgs a[kKdaLayers];
     float eps;
 };
-__global__ void __launch_bounds__(256) kda_rec_layers_kernel(const STRATA_GRID_CONSTANT KdaRecBatch b) {
+__global__ void __launch_bounds__(256) kda_rec_layers_kernel(const MAYA_GRID_CONSTANT KdaRecBatch b) {
     const KdaRecArgs& r = b.a[blockIdx.y];
     kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, (block_q8_1*) r.out, blockIdx.x);
 }
@@ -2950,7 +2950,7 @@ __device__ __forceinline__ void lat_put(uint16_t* lat, int64_t row, float y, boo
         lat[(size_t) kv_lora * row + c] = lat_h(y);
 }
 // ---------------------------------------------------------------- DSA
-__global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTANT DsaPrepArgs a) {
+__global__ void __launch_bounds__(512) dsa_prep_kernel(const MAYA_GRID_CONSTANT DsaPrepArgs a) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
     if (blockIdx.x == 0) {
@@ -3131,7 +3131,7 @@ __device__ __forceinline__ void dsa_select_block(const float* __restrict__ score
     for (int i = threadIdx.x; i < n_sel; i += blockDim.x) cells[i] = -1;
     __syncthreads();
     // the top pools in rank order (score descending, ties by the lower index), O(n_vis) - src/kernels/cuda/dsa_topk.cuh
-    if (n_vis > 0) strata::kernels::dsa::select_top_pools(score, n_vis, min(top_pools, n_vis), kpool, cells);
+    if (n_vis > 0) maya::kernels::dsa::select_top_pools(score, n_vis, min(top_pools, n_vis), kpool, cells);
     __syncthreads();
     if (threadIdx.x == 0) {
         for (int m = 0; m < kpool - 1; ++m) {
@@ -3564,7 +3564,7 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
                                                             const uint16_t* __restrict__ lat,
                                                             const int* __restrict__ cells, int64_t c_stride, MlaToks nt,
                                                             int n_head, int qk_nope, float* __restrict__ part, bool q8) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(MAYA_USE_HIP)
     extern __shared__ uint4 smem4[];
     uint16_t* sL = (uint16_t*) smem4;                       // MLA_CHUNK x MLA_ROW
     float* sS = (float*) (sL + MLA_CHUNK * MLA_ROW);        // per warp: 16 heads x MLA_CHUNK partial scores
@@ -3995,7 +3995,7 @@ struct RouteArgs {
 // shared kernel the extra branch and its local arrays moved the whole kernel's register allocation and schedule
 // (nvcc 12.4, sm_70: 72 registers / 64 B of stack -> 64 / 176 B).  Same arithmetic either way.
 template <bool kExt>
-__global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
+__global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const MAYA_GRID_CONSTANT RouteArgs a) {
     const int tid = threadIdx.x, lane = tid & 31;
     const long long rp_t0 = clock64();
 #define ROUTE_MARK(i) do { if (a.prof != nullptr && tid == 0) atomicAdd(a.prof + (i), (unsigned long long) (clock64() - rp_t0)); } while (0)
@@ -4799,7 +4799,7 @@ constexpr int GU_WARPS = 16;  // ... 2 gate + 2 up rows per warp (8 per warp mea
 
 // grid (n_ff / GU_ROWS, k [+ 1]): the extra row of blocks (blockIdx.y == k) computes the SHARED expert's down rows
 // into sh_out while the routed experts' blocks run - in moe_down it was a serial tail (~25 us of 72)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 template<int TG, int NW = GU_WARPS, bool LUT = false, bool GLOBAL = false, bool SPLIT = false,
          bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, bool MULTI = false>
 __attribute__((amdgpu_waves_per_eu(MINWAVES > 0 ? MINWAVES : 1)))
@@ -4815,7 +4815,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
                                                                     const block_q8_1* __restrict__ sh_hq, int n_ff_sh,
                                                                     float* __restrict__ sh_out) {
     if (d.skip != nullptr && *d.skip) return;
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     constexpr int NW = GU_WARPS;
     const int ei = blockIdx.y, chunk = blockIdx.x, n_chunks = (int) gridDim.x;
 #else
@@ -4835,7 +4835,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
 #endif
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if constexpr (!SPLIT)
 #endif
     if (ei == k) {
@@ -4868,7 +4868,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
         }
     }
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TG> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TG>(s_sign);
     if constexpr (!GLOBAL)
@@ -4888,7 +4888,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
     float s[2 * RPW];
     const uint32_t* tab = s_tab;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if constexpr (GLOBAL) tab = TG == 16 ? (const uint32_t*) iq2xxs_grid :
                                 TG == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
     if constexpr (LUT) {
@@ -4916,7 +4916,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
 
 constexpr int DOWN_ROWS = 4;
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 template<int TD, int NR = DOWN_ROWS, bool LUT = false, bool GLOBAL = false, bool DIRECT = false, bool WIDE = false,
          bool MULTI = false>
 #else
@@ -4926,7 +4926,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
                                                        const block_q8_1* __restrict__ hq,
                                                        const float* __restrict__ sh_out, float* __restrict__ out) {
     if (d.skip != nullptr && *d.skip) return;
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     constexpr int NR = DOWN_ROWS;
     const int rb0 = blockIdx.x;
 #else
@@ -4955,7 +4955,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TD> ? sm60_sign_n<TD> * sm60_sign_w<TD> : 1];
     if constexpr (sm60_sign_on<TD>) sm60_load_signs<TD>(s_sg);
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TD> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TD>(s_sign);
     if constexpr (!GLOBAL)
@@ -4976,7 +4976,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
 #pragma unroll
             for (int j = 0; j < NR; ++j) rows[j] = (const uint8_t*) s_ptr[warp] + down_off + (size_t) (r0 + j) * drb;
             const uint32_t* tab = s_tab;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
             if constexpr (GLOBAL) tab = TD == 16 ? (const uint32_t*) iq2xxs_grid :
                                         TD == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
             if constexpr (LUT) {
@@ -5005,7 +5005,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     }
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // ---------------------------------------------------------------- a verify window's SHARED experts, unpacked once
 // moe_experts_multi with MoeDev::mt_dedup: an expert that several tokens of the window routed has each 32-value
 // sub-block of its rows unpacked ONCE and dotted with every such token's activation (the unpack - grid and sign
@@ -5824,7 +5824,7 @@ size_t row_bytes(int type, int64_t n_in) {
     }
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 namespace {
 // The RDNA3 GEMV's shape: R rows per wave, U super-blocks in flight, WPB waves per block, the Q6_K activations in LDS
 // or not.  The bench sets it (hip_expert_bench::mv_config); r == 0 is the original kernels, r < 0 the default: one row
@@ -6029,7 +6029,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         for (int i = 0; i < n; ++i) all = all && done[i];
         if (all) return true;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // (one-column batches only: a verify window's several-column jobs go to the tiled kernels below)
     bool one_col = true;
     for (int i = 0; i < n; ++i) one_col = one_col && jobs[i].ncol == 1;
@@ -6177,7 +6177,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             // launch of fewer than 1024 rows, and an activation over 48 KB, keep mv_kernel_t)
             int pr = 0;
             size_t xs_bytes = 0;
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
             if (T == 14) {
                 if (const int mode = p100_mv_mode(); mode > 0) {
                     int rows = 0, max_in = 0;
@@ -6201,7 +6201,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 }
             if (m == 0) continue;
             b.n = m;
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
             if (pr > 0) {
                 if (pr == 2) mv_q6_p100_kernel<2><<<acc, 256, xs_bytes, s>>>(b);
                 else mv_q6_p100_kernel<4><<<acc, 256, xs_bytes, s>>>(b);
@@ -6313,7 +6313,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
                 if (!mv(one, k, s)) return false;
                 continue;
             }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
             if (typed) mv_rdna(part, n, w, pd, s);
 #endif
             switch (w) {
@@ -6329,7 +6329,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
         launch_check("mv_nt");
         return true;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
 #endif
     switch (nt) {
@@ -6484,7 +6484,7 @@ void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps
     launch_check("kda_layers");
 }
 
-__global__ void __launch_bounds__(256) kda_gather_kernel(const STRATA_GRID_CONSTANT KdaGatherArgs a) {
+__global__ void __launch_bounds__(256) kda_gather_kernel(const MAYA_GRID_CONSTANT KdaGatherArgs a) {
     const int i = blockIdx.x;
     float* d = a.dst[i];
     if (d == nullptr) return;
@@ -6701,7 +6701,7 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
                              int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token = false);
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 namespace {
 __global__ void lanes_kind_kernel(int* out) { *out = kLaneSum ? 1 : 0; }
 __global__ void warp_reduce_check_kernel(const float* __restrict__ in, float* sum_shfl, float* sum_lanes, float* max_shfl,
@@ -6806,7 +6806,7 @@ static bool mla_mma_on(int dev) {
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         const char* v = getenv("MAYA_GLM_MLA_MMA");
         bool on = major >= 8 && (v == nullptr || std::atoi(v) != 0) && getenv("MAYA_GLM_MLA_ATTN1") == nullptr;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         on = false;
 #endif
         if (on && cudaFuncSetAttribute(mla_split_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -6885,7 +6885,7 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     if (kv_lora == 512 && getenv("MAYA_GLM_MLA_ATTN1") == nullptr) {
         int vcap = 0;
         float* vpart = mla_part(dev, n_head, kv_lora, 64, &vcap);
-        if (vpart != nullptr && strata::kernels::glmb::mla_decode_v70(q_abs, lat, cells, n_sel, n_head, kv_lora,
+        if (vpart != nullptr && maya::kernels::glmb::mla_decode_v70(q_abs, lat, cells, n_sel, n_head, kv_lora,
                                                                       1.0f / std::sqrt((float) qk_nope), ctx, vpart, vcap, s, lat_q8))
             return true;
     }
@@ -7116,7 +7116,7 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
         const char* v = getenv("MAYA_GLM_PREFETCH_BLOCKS");
         return v != nullptr ? std::max(1, std::atoi(v)) : 0;
     }();
-    const int blocks_env = strata::core::glmknob::get(strata::core::glmknob::PrefetchBlocks,
+    const int blocks_env = maya::core::glmknob::get(maya::core::glmknob::PrefetchBlocks,
                                                       blocks_start);   // glm-dsa request knobs: GEN prefetch_blocks=
     moe_prefetch_kernel<<<blocks_env > 0 ? blocks_env : std::max(1, sms / 2), 256, 0, s>>>(d, (blob_bytes + 15) / 16);
     launch_check("moe_prefetch");
@@ -7131,7 +7131,7 @@ __global__ void moe_pf_wait_kernel(const unsigned int* need, const unsigned int*
     if (n == 0u) return;
     for (long long i = 0; i < (1ll << 27); ++i) {
         if ((int) (*(volatile const unsigned int*) flag - n) >= 0) return;
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
+#if !defined(MAYA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
         __nanosleep(200);
 #endif
     }
@@ -7177,7 +7177,7 @@ void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) 
     launch_check("moe_cpu_wait_rows");
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 namespace {
 // Limit automatic dispatch to the measured decode geometry and RDNA3/3.5
 // targets (plus opt-in gfx906 when allow_gfx906 is set via MAYA_GLM_GU22_TUNED=1).
@@ -7266,7 +7266,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     MoeDev d = d_in;
     d.skip = g_skip;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
@@ -7306,7 +7306,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     launch_check("moe_gate_up");
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 namespace hip_expert_bench {
 
 void gate_up(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, float limit,
@@ -7388,7 +7388,7 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
               const float* sh_out, float* out, cudaStream_t s) {
     MoeDev d = d_in;
     d.skip = g_skip;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
     if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         // Two rows lower the register budget; IQ2_S prefers global grid reads,
@@ -7427,7 +7427,7 @@ void keep_busy(unsigned n, unsigned* sink, cudaStream_t s) {
 }
 
 bool win_dedup_shape(int gu_type, int d_type, int T, int k) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const auto ok = [](int t) { return t == 16 || t == 18 || t == 22; };
     return ok(gu_type) && ok(d_type) && T >= 2 && T <= WD_MU && k >= 1 && k <= 8 && T * k <= 32;
 #else
@@ -7439,7 +7439,7 @@ bool win_dedup_shape(int gu_type, int d_type, int T, int k) {
 bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit,
                        size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
                        int n_ff_sh, float* sh_out, float* out, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     MoeDev d = d_in;
     d.skip = g_skip;
     const int T = d.mt_T;
@@ -7542,7 +7542,7 @@ constexpr int kWinEnt = kMaxWinTokens * 8;
 // the entries grouped by expert slot (in order of first appearance), each group's members in entry order (t * 8 + i)
 // (the tables in shared memory: as locals they were a 2.6 KB stack a thread, which the driver reserves for every thread
 // the device can hold - ~420 MB on a V100 - and a launch failed "out of memory" once the expert pool had the rest)
-__global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+__global__ void moe_win_group_kernel(const MAYA_GRID_CONSTANT MoeWin w) {
     __shared__ unsigned long long gp[kWinEnt], pp[kWinEnt];
     __shared__ int cnt[kWinEnt], gof[kWinEnt], fill[kWinEnt + 1];
     // the plan read by every thread at once (one thread's loads, one after another, took most of the kernel's time)
@@ -7579,7 +7579,7 @@ __global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
 
 // moe_win_group_kernel's grouping with a thread an entry (MAYA_GLM_ROWS_SMALL): the same groups in the same order (by
 // each plan's first entry), the same members in entry order - every array it writes, value for value
-__global__ void __launch_bounds__(kWinEnt) moe_win_group_par_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+__global__ void __launch_bounds__(kWinEnt) moe_win_group_par_kernel(const MAYA_GRID_CONSTANT MoeWin w) {
     __shared__ unsigned long long sp[kWinEnt];
     __shared__ int first[kWinEnt];
     const int e = threadIdx.x, ne = w.T * 8;
@@ -7624,7 +7624,7 @@ __global__ void __launch_bounds__(kWinEnt) moe_win_group_par_kernel(const STRATA
 // grid (n_ff / GU_ROWS, groups): a group's expert's gate / up rows of this chunk against each member's FFN input, the
 // clamped swiglu into the member's h (moe_gate_up_kernel's rows, arithmetic and layout per member)
 template<int TG>
-__global__ void __launch_bounds__(GU_WARPS * 32) moe_win_gu_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+__global__ void __launch_bounds__(GU_WARPS * 32) moe_win_gu_kernel(const MAYA_GRID_CONSTANT MoeWin w) {
     const int g = blockIdx.y, chunk = blockIdx.x;
     if (g >= *w.n_groups) return;
     constexpr int NW = GU_WARPS;
@@ -7668,7 +7668,7 @@ __global__ void __launch_bounds__(GU_WARPS * 32) moe_win_gu_kernel(const STRATA_
 // grid (n_embd / DOWN_ROWS, groups): a group's expert's down rows of this chunk against each member's h (a warp a
 // member, moe_down_kernel's rows and arithmetic) into the member's partial rows
 template<int TD>
-__global__ void __launch_bounds__(256) moe_win_down_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+__global__ void __launch_bounds__(256) moe_win_down_kernel(const MAYA_GRID_CONSTANT MoeWin w) {
     const int g = blockIdx.y;
     if (g >= *w.n_groups) return;
     constexpr int NR = DOWN_ROWS;
@@ -7694,7 +7694,7 @@ __global__ void __launch_bounds__(256) moe_win_down_kernel(const STRATA_GRID_CON
 
 // each token's output rows: its entries' partials in plan order, the host's disk answer, the shared expert (moe_down's
 // combine)
-__global__ void moe_win_combine_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+__global__ void moe_win_combine_kernel(const MAYA_GRID_CONSTANT MoeWin w) {
     const int t = blockIdx.y;
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= w.n_embd) return;
@@ -7880,4 +7880,4 @@ void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s) {
     launch_check("argmax_join");
 }
 
-}  // namespace strata::kernels::glmf
+}  // namespace maya::kernels::glmf

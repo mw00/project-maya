@@ -1786,7 +1786,7 @@ int main(int argc, char** argv) {
         o.vision = true;
         o.vision_auto = false;
     }
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
     // (first, so a log of a start that fails has it too)
     std::fprintf(stderr, "INFO experimental platform: an AMD GPU under Windows (HIP) - Hy4-Flash has not been tested "
                          "there by Maya's team; please include this log when reporting a problem\n");

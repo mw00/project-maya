@@ -3,8 +3,8 @@
 // limits, native_fmt's activation caps at 6144 for the expert types a UD-IQ2_M pack carries, and one CPU-lane
 // call (8 synthetic experts, gate/up then down then the weighted sum, as fast_cpu_experts runs it) against a
 // double-precision reference.
-#include "strata/kernels/cpu/native_expert.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include "ggml.h"
 
@@ -20,8 +20,8 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
-namespace cpu = strata::kernels::cpu;
+namespace gf = maya::kernels::glmf;
+namespace cpu = maya::kernels::cpu;
 
 // the structs the device writes and the host reads: wide enough for 6144, and the residual vectors are float4-aligned
 static_assert(gf::kMaxEmbd >= 6144, "glm-dsa's n_embd 6144 must fit the routing ring");

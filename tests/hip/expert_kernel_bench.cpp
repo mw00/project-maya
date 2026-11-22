@@ -2,7 +2,7 @@
 // HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/opt/rocm/lib build-multi/hip_expert_kernel_bench
 // --parity-only also checks sparse plans, CPU contributions and shared experts.
 // --sweep exposes rejected tuning variants; --shared times the fused Q6_K shared down.
-#include "strata/kernels/glm_expert_bench.hpp"
+#include "maya/kernels/glm_expert_bench.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #define GGML_COMMON_DECL_CPP
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 namespace bench = gf::hip_expert_bench;
 using V = bench::Variant;
 namespace {

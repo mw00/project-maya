@@ -1,14 +1,14 @@
-// src/kernels/cuda/iq_kernels.cu - see include/strata/kernels/iq_kernels.hpp.
+// src/kernels/cuda/iq_kernels.cu - see include/maya/kernels/iq_kernels.hpp.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
+#include "maya/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -18,7 +18,7 @@
 #include <cstdlib>
 #include <type_traits>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 void check(const char* what) {
@@ -1192,14 +1192,14 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/down");
     return true;   // glm-dsa B3.5: launched
 }
-}  // namespace strata::kernels
+}  // namespace maya::kernels
 
 // ---- Volta prompt experts (MAYA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
 // dequantized into shared memory by dq_dispatch (the FP16 path's own formulas), the activations FP16, FP32 sums.
 // Replaces MMQ's dp4a products on sm_70, and the FP16 path's dequantize-to-global + one cuBLAS call per expert.
 #if !defined(__HIPCC__)
 #include <mma.h>
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 constexpr int WG_BM = 64, WG_BN = 128, WG_THREADS = 256, WG_XK = 128, WG_MT = 4;
 // The static codebook a TY carries (the kernel's `codebook`), which counts toward the block's shared memory.
@@ -1512,13 +1512,13 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
             ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     return cudaGetLastError() == cudaSuccess;
 }
-}  // namespace strata::kernels
+}  // namespace maya::kernels
 #else
-namespace strata::kernels {
+namespace maya::kernels {
 bool gemm_iq_f16_grouped(int, const void*, size_t, int, int, const void*, int, const int32_t*, int, int, float*, int, void*,
                          const int32_t*, const GroupedWeightTable*, bool) {
     return false;
 }
 bool gemm_iq_f16_grouped_supported(int) { return false; }
-}  // namespace strata::kernels
+}  // namespace maya::kernels
 #endif

@@ -1,4 +1,4 @@
-// src/kernels/cpu/exl3_cpu.cpp - EXL3 routed experts on the CPU (see include/strata/kernels/cpu/exl3_cpu.hpp).
+// src/kernels/cpu/exl3_cpu.cpp - EXL3 routed experts on the CPU (see include/maya/kernels/cpu/exl3_cpu.hpp).
 //
 // The vector kernels follow exllamav3's CPU expert kernel (MIT, turboderp - exllamav3_ext/cpu/moe_mul1.cpp, its
 // AVX-512 BW and AVX2 tiers): a tile row's 16 states come out of the tile's words with cross-lane permutes and a
@@ -7,10 +7,10 @@
 // device's FP16 constant, so the CPU lane computes what the device kernels compute up to the FP16 rounding of each
 // weight.  The AVX-512 and AVX2 tiers do the same FMAs in the same order: they give the same bits (the bands,
 // the split-K pieces, the GEMM's sums and the vectorised transforms alike).
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <algorithm>
 #include <array>
@@ -49,7 +49,7 @@
 #define EXL3_AVX2_INLINE inline
 #endif
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 constexpr uint32_t kMul1 = 0x83DCD12Du;
@@ -1494,4 +1494,4 @@ void exl3_cpu_band(const Exl3Part& m, const float* xh, float xsum, int c0, float
     exl3_cpu_band_out(m, acc, xsum, c0, y);
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

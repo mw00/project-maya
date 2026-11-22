@@ -2,8 +2,8 @@
 // selectively ported from q8atnight/Strata PR #108
 // (acd487233c0bbe2217a6881c5bb43f8a283b0de5).
 #include <cuda_runtime.h>
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
+#include "maya/kernels/iq_kernels.hpp"
+#include "maya/kernels/native_qsa_indexer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -76,9 +76,9 @@ bool qsa_case(cudaStream_t stream, int64_t max_cells, int64_t pos0, int64_t T, s
     if (!alloc_state(serial, max_cells) || !alloc_state(batched, max_cells)) return false;
     if (!upload_state(serial, max_cells) || !upload_state(batched, max_cells)) return false;
 
-    const auto shapes = strata::kernels::qsa_real_shapes();
-    const strata::kernels::QsaIndexerBuffers sb{serial.tail, serial.dead, serial.pooled, serial.block_pos};
-    const strata::kernels::QsaIndexerBuffers bb{batched.tail, batched.dead, batched.pooled, batched.block_pos};
+    const auto shapes = maya::kernels::qsa_real_shapes();
+    const maya::kernels::QsaIndexerBuffers sb{serial.tail, serial.dead, serial.pooled, serial.block_pos};
+    const maya::kernels::QsaIndexerBuffers bb{batched.tail, batched.dead, batched.pooled, batched.block_pos};
     std::vector<int32_t> positions((size_t) (pos0 + T));
     for (size_t p = 0; p < positions.size(); ++p) positions[p] = (int32_t) p;
 
@@ -86,15 +86,15 @@ bool qsa_case(cudaStream_t stream, int64_t max_cells, int64_t pos0, int64_t T, s
     // same per-cell prefix, then replaces only this chunk with the two-launch API.
     for (int64_t p = 0; p < pos0 + T; ++p) {
         CHECK(cudaMemcpyAsync(pos_d, positions.data() + p, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        strata::kernels::native_qsa_indexer_append(raw_d + p * IDX, pos_d, 0, gamma_d, EPS, sb,
+        maya::kernels::native_qsa_indexer_append(raw_d + p * IDX, pos_d, 0, gamma_d, EPS, sb,
                                                    shapes, max_cells, 10000.0f, stream);
         if (p < pos0) {
             CHECK(cudaMemcpyAsync(pos_d, positions.data() + p, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-            strata::kernels::native_qsa_indexer_append(raw_d + p * IDX, pos_d, 0, gamma_d, EPS, bb,
+            maya::kernels::native_qsa_indexer_append(raw_d + p * IDX, pos_d, 0, gamma_d, EPS, bb,
                                                        shapes, max_cells, 10000.0f, stream);
         }
     }
-    strata::kernels::native_qsa_indexer_append_batch(raw_d + pos0 * IDX, T, pos0, 0, gamma_d, EPS,
+    maya::kernels::native_qsa_indexer_append_batch(raw_d + pos0 * IDX, T, pos0, 0, gamma_d, EPS,
                                                       bb, shapes, max_cells, 10000.0f, stream);
     CHECK(cudaStreamSynchronize(stream));
 
@@ -138,19 +138,19 @@ bool qsa_chunks_case(cudaStream_t stream, std::mt19937& rng, int64_t max_cells,
     IndexState serial, chunked;
     if (!alloc_state(serial, max_cells) || !alloc_state(chunked, max_cells)) return false;
     if (!upload_state(serial, max_cells) || !upload_state(chunked, max_cells)) return false;
-    const auto shapes = strata::kernels::qsa_real_shapes();
-    const strata::kernels::QsaIndexerBuffers sb{serial.tail, serial.dead, serial.pooled, serial.block_pos};
-    const strata::kernels::QsaIndexerBuffers cb{chunked.tail, chunked.dead, chunked.pooled, chunked.block_pos};
+    const auto shapes = maya::kernels::qsa_real_shapes();
+    const maya::kernels::QsaIndexerBuffers sb{serial.tail, serial.dead, serial.pooled, serial.block_pos};
+    const maya::kernels::QsaIndexerBuffers cb{chunked.tail, chunked.dead, chunked.pooled, chunked.block_pos};
     std::vector<int32_t> positions((size_t) total);
     for (int i = 0; i < total; ++i) positions[(size_t) i] = i;
     for (int p = 0; p < total; ++p) {
         CHECK(cudaMemcpyAsync(pos_d, positions.data() + p, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        strata::kernels::native_qsa_indexer_append(raw_d + (size_t) p * IDX, pos_d, 0, gamma_d, EPS, sb,
+        maya::kernels::native_qsa_indexer_append(raw_d + (size_t) p * IDX, pos_d, 0, gamma_d, EPS, sb,
                                                    shapes, max_cells, 10000.0f, stream);
     }
-    strata::kernels::native_qsa_indexer_append_batch(raw_d, first, 0, 0, gamma_d, EPS, cb, shapes,
+    maya::kernels::native_qsa_indexer_append_batch(raw_d, first, 0, 0, gamma_d, EPS, cb, shapes,
                                                       max_cells, 10000.0f, stream);
-    strata::kernels::native_qsa_indexer_append_batch(raw_d + (size_t) first * IDX, second, first, 0,
+    maya::kernels::native_qsa_indexer_append_batch(raw_d + (size_t) first * IDX, second, first, 0,
                                                       gamma_d, EPS, cb, shapes, max_cells, 10000.0f, stream);
     CHECK(cudaStreamSynchronize(stream));
     const size_t tail_n = (BLOCK - 1) * IDX, pooled_n = (size_t) (max_cells / BLOCK + 1) * IDX;
@@ -176,7 +176,7 @@ bool qsa_chunks_case(cudaStream_t stream, std::mt19937& rng, int64_t max_cells,
 
 bool embed_case(cudaStream_t stream, int type, int64_t T) {
     constexpr int vocab = 19;
-    const size_t row_bytes = strata::kernels::iq_row_bytes(type, EMB);
+    const size_t row_bytes = maya::kernels::iq_row_bytes(type, EMB);
     const size_t block_bytes = type == 20 ? 18 : 110;  // IQ4_NL or IQ3_S GGML block layout
     const size_t table_bytes = (size_t) vocab * row_bytes;
     if (row_bytes == 0 || row_bytes % block_bytes != 0) {
@@ -224,9 +224,9 @@ bool embed_case(cudaStream_t stream, int type, int64_t T) {
     CHECK(cudaMalloc((void**) &serial, (size_t) T * EMB * sizeof(float)));
     CHECK(cudaMalloc((void**) &ids_d, (size_t) T * sizeof(int32_t)));
     CHECK(cudaMemcpyAsync(ids_d, ids.data(), (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    strata::kernels::iq_embed_rows(type, table_dev, row_bytes, ids_d, T, EMB, batched, stream);
+    maya::kernels::iq_embed_rows(type, table_dev, row_bytes, ids_d, T, EMB, batched, stream);
     for (int64_t t = 0; t < T; ++t) if (!image_rows[(size_t) t])
-        strata::kernels::iq_dequant_f32(type,
+        maya::kernels::iq_dequant_f32(type,
             (const uint8_t*) table_dev + (size_t) ids[(size_t) t] * row_bytes, EMB, serial + t * EMB, stream);
 
     std::vector<float> image(EMB);

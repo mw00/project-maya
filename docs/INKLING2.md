@@ -123,7 +123,7 @@ which keeps the experts' original bits) is the bar.
 
 `src/ik2/` runs unsloth's GGUFs in place (UD-Q4_K_XL: NVFP4 experts in layers 0-39; UD-Q3_K_XL: IQ3_XXS / IQ4_XS),
 CUDA on Linux, Volta (sm_70) on. Built by CMake beside the other engines (`maya-ik2`, and `ik2_kernels_test` with
-`STRATA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention; `all` / `all-major`
+`MAYA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention; `all` / `all-major`
 take the compiler's list from sm_70 on. CUDA 12.x for a V100 (CUDA 13 has no sm_70).
 
 **Kernels per architecture** (`k::arch_class()`; a fix for one class leaves the others' code as it is):
@@ -415,7 +415,7 @@ offers it, the IOMMU translates neither card and a test copy at load arrives int
 decoding there yet). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
 tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
 second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers one card (two
-are untested there). CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list (`-DSTRATA_IK2_WINDOWS=OFF`:
+are untested there). CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list (`-DMAYA_IK2_WINDOWS=OFF`:
 not on Windows).
 
 **AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels

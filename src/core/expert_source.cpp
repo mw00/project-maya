@@ -1,12 +1,12 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
-#include "strata/core/expert_source.hpp"
-#include "strata/core/remote_experts.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "maya/core/expert_source.hpp"
+#include "maya/core/remote_experts.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
 
-#include "strata/core/pinned.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
+#include "maya/core/pinned.hpp"
+#include "maya/kernels/elementwise.hpp"
+#include "maya/kernels/quantize_act.hpp"
+#include "maya/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
 
@@ -44,7 +44,7 @@
 #endif
 #endif
 
-namespace strata::core {
+namespace maya::core {
 
 namespace detail {
 
@@ -282,7 +282,7 @@ FileExpertSource::~FileExpertSource() { close(); }
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
-    const auto& layout = strata::kernels::cpu::expert_layout();
+    const auto& layout = maya::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
         err = "FileExpertSource: the requested geometry does not match the loaded expert layout";
         return false;
@@ -305,16 +305,16 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         return false;
     }
     if (!layout.native) {
-        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) strata::kernels::cpu::BLOB) {
+        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) maya::kernels::cpu::BLOB) {
             err = "FileExpertSource: the canonical expert size overflows";
             return false;
         }
-        const uint64_t canonical_size = blob_count * (uint64_t) strata::kernels::cpu::BLOB;
+        const uint64_t canonical_size = blob_count * (uint64_t) maya::kernels::cpu::BLOB;
         if (want != canonical_size) {
             err = "FileExpertSource: the canonical expert layout has an inconsistent size";
             return false;
         }
-        const uint64_t bytes = (uint64_t) strata::kernels::cpu::BLOB;
+        const uint64_t bytes = (uint64_t) maya::kernels::cpu::BLOB;
         const uint64_t layer_bytes = (uint64_t) n_expert * bytes;
         for (int64_t layer = 0; layer < n_layers; ++layer) {
             layer_offsets[(size_t) layer] = (uint64_t) layer * layer_bytes;
@@ -758,7 +758,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;   // a previous layer already failed; do not make it worse
 
-    using namespace strata::kernels::cpu;
+    using namespace maya::kernels::cpu;
     // Clause 3: the blob's internal offsets are compile-time constants, so a mismatched geometry does not
     // produce a wrong answer - it produces a walk off the end of the blob into the next expert's bytes, which
     // is finite and plausible.  Refuse, name the number, and let the driver report it.
@@ -876,7 +876,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
-    using namespace strata::kernels::cpu;
+    using namespace maya::kernels::cpu;
     if (d.failed) return;
     if (n_tok < 1 || n_tok > MAXT) {
         d.failed = true;
@@ -1111,7 +1111,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                 // count of distinct experts moved rather than of looks.
                 const uint8_t* b = d.src->blob(d.layers, e);
                 std::string ferr;
-                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(d.layers);
+                const int64_t nb = (int64_t) maya::kernels::cpu::expert_layout().blob_bytes(d.layers);
                 // (an expert staged from the model file: its ring slot is reused, so the copy is waited for - a
                 //  queued one could read it after it was overwritten where the runtime defers queued copies)
                 const bool staged = !d.src->stable(d.layers, e);
@@ -1162,13 +1162,13 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             d.fail = "the hit path has no fp32 activation scales (R4.2h)";
             return;
         }
-        strata::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, strata::kernels::cpu::H,
+        maya::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, maya::kernels::cpu::H,
                                               cs);
         if (d.hit_cpu_order)
-            strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
+            maya::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
                 d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         else
-            strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
+            maya::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
         if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
@@ -1188,7 +1188,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         if (cudaEventQuery((cudaEvent_t) d.hit_done) == cudaSuccess) ++d.hit_ready;
         else ++d.hit_late;
     }
-    strata::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
+    maya::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
 }
 
 // ================================ THE RESIDENT ARENA (R2.1) ================================
@@ -1196,7 +1196,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 // Plan v0.3 P6: the arena from the model's shard 1.  Each layer's gate, up and down tensors hold the 512 experts
 // one after another; they are read in chunks and each expert's slice lands at its place in the blob
 // [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.
-LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
+LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const maya::kernels::cpu::ExpertLayout& lay,
                             int threads) {
     LoadStats st;
     st.layers = (uint64_t) lay.n_layers;
@@ -1269,7 +1269,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     close();
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
-    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const maya::kernels::cpu::ExpertLayout& lay = maya::kernels::cpu::expert_layout();
     if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
         err = "ArenaExpertSource: the expert layout was loaded for a different geometry";
         return false;
@@ -1365,13 +1365,13 @@ void ArenaExpertSource::close() {
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;
@@ -1386,13 +1386,13 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
-    return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+    return base_ + maya::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
 
 bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint8_t* b = blob(layer, expert);
     if (b == nullptr || dst == nullptr) return false;
-    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+    std::memcpy(dst, b, (size_t) maya::kernels::cpu::expert_layout().blob_bytes(layer));
     return true;
 }
 
@@ -1607,7 +1607,7 @@ void GgufExpertSource::close() {
 bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t n_expert, int64_t per_layer,
                             std::string& err) {
     close();
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     if (!lay.native || lay.n_layers != n_layers || lay.n_expert != n_expert || n_layers <= 0 || n_expert <= 0 ||
         lay.gguf_off.size() != (size_t) (3 * n_layers) || lay.fmt.size() != (size_t) n_layers) {
         err = "GgufExpertSource: the experts' GGUF offsets are not in the pack (re-pack it with tools/iq_pack.py)";
@@ -1741,7 +1741,7 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
     direct_ = false;
 #endif
     if (direct_) {   // a sample of experts read both ways must agree, or the mapping stays the way the misses are read
-        const auto& lay2 = strata::kernels::cpu::expert_layout();
+        const auto& lay2 = maya::kernels::cpu::expert_layout();
         std::vector<uint8_t> tmp((size_t) lay2.max_blob + 4096);
         const int64_t sample[3][2] = {{0, 0}, {n_layers - 1, n_expert - 1}, {n_layers / 2, n_expert / 3}};
         for (const auto& pr : sample) {
@@ -1768,7 +1768,7 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
 
 void GgufExpertSource::parts(int64_t layer, int64_t expert, const uint8_t* src[3], uint64_t bytes[3],
                              uint64_t file_off[3]) const {
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     const auto& fm = lay.fmt[(size_t) layer];
     const uint64_t blob = lay.bytes[(size_t) layer];
     bytes[0] = fm.up_off;
@@ -1785,7 +1785,7 @@ void GgufExpertSource::assemble(int64_t layer, int64_t expert, uint8_t* dst) con
     const uint8_t* src[3];
     uint64_t bytes[3], off[3];
     parts(layer, expert, src, bytes, off);
-    const auto& fm = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
+    const auto& fm = maya::kernels::cpu::expert_layout().fmt[(size_t) layer];
     std::memcpy(dst, src[0], (size_t) bytes[0]);
     std::memcpy(dst + fm.up_off, src[1], (size_t) bytes[1]);
     std::memcpy(dst + fm.down_off, src[2], (size_t) bytes[2]);
@@ -1798,7 +1798,7 @@ bool GgufExpertSource::read_part_direct(int64_t layer, int64_t expert, int part,
     const uint8_t* src[3];
     uint64_t bytes[3], off[3];
     parts(layer, expert, src, bytes, off);
-    const auto& fm = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
+    const auto& fm = maya::kernels::cpu::expert_layout().fmt[(size_t) layer];
     uint8_t* to = part == 0 ? dst : part == 1 ? dst + fm.up_off : dst + fm.down_off;
     // the read is rounded out to 4 KB (O_DIRECT) into this thread's bounce buffer, then the slice copied out
     struct Bounce {
@@ -1838,7 +1838,7 @@ void GgufExpertSource::assemble_part(int64_t layer, int64_t expert, int part, ui
     const uint8_t* src[3];
     uint64_t bytes[3], off[3];
     parts(layer, expert, src, bytes, off);
-    const auto& fm = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
+    const auto& fm = maya::kernels::cpu::expert_layout().fmt[(size_t) layer];
     std::memcpy(part == 0 ? dst : part == 1 ? dst + fm.up_off : dst + fm.down_off, src[part], (size_t) bytes[part]);
 }
 
@@ -1847,7 +1847,7 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
                                      const std::vector<std::pair<int32_t, int32_t>>& drop, std::string& err) {
     if (maps_.empty()) { err = "GgufExpertSource: not open"; return false; }
     if (arena_ != nullptr) { err = "GgufExpertSource: the resident arena is already made"; return false; }
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     // ---- the budget: this PC's available RAM less a headroom for the OS and the page cache the other experts and
     // the n-gram rows are read through (12% of the RAM, at least 6 GiB); MAYA_EXPERT_RAM_GB caps it
     uint64_t avail = 0, headroom = 0;
@@ -2013,7 +2013,7 @@ bool GgufExpertSource::stable(int64_t layer, int64_t expert) const {
 bool GgufExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (maps_.empty() || !valid(layer, expert) || dst == nullptr) return false;
     const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     if (res_off_[i] != kNone) std::memcpy(dst, res_base_ + res_off_[i], (size_t) lay.bytes[(size_t) layer]);
     else assemble(layer, expert, dst);
     return true;
@@ -2022,7 +2022,7 @@ bool GgufExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 bool GgufExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (!valid(layer, expert) || registered_bytes_ == 0) return false;
     const uint64_t off = res_off_[(size_t) layer * (size_t) n_expert_ + (size_t) expert];
-    return off != kNone && off + strata::kernels::cpu::expert_layout().bytes[(size_t) layer] <= registered_bytes_;
+    return off != kNone && off + maya::kernels::cpu::expert_layout().bytes[(size_t) layer] <= registered_bytes_;
 }
 
 const uint8_t* GgufExpertSource::device_alias(int64_t layer, int64_t expert) const {
@@ -2103,4 +2103,4 @@ void GgufExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
     }
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

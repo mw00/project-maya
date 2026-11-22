@@ -1,4 +1,4 @@
-// src/kernels/cuda/qsa.cu - P2.S2: the QSA cache, indexer and attention (see include/strata/kernels/qsa.hpp).
+// src/kernels/cuda/qsa.cu - P2.S2: the QSA cache, indexer and attention (see include/maya/kernels/qsa.hpp).
 //
 // The header documents the layouts and the scope; this file documents the four decisions that are about the
 // KERNEL rather than about the interface.
@@ -40,12 +40,12 @@
 //    Every comparison still passed at any sane tolerance, the spare key landing 0.4 f32 ulp away; only a
 //    BIT-EXACT assertion plus a full-precision probe of the intermediate found it.  That is the strongest
 //    argument in this file for keeping both.
-#include "strata/kernels/qsa.hpp"
+#include "maya/kernels/qsa.hpp"
 
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/kv_stream.hpp"
-#include "strata/kernels/rope.hpp"
-#include "strata/kernels/mrope.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/kv_stream.hpp"
+#include "maya/kernels/rope.hpp"
+#include "maya/kernels/mrope.hpp"
 
 #include <cuda_runtime.h>
 
@@ -55,7 +55,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int THREADS = 128;
@@ -808,4 +808,4 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
     if (stream == nullptr) check_sync("qsa_gate_apply");
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

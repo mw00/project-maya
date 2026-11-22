@@ -1,12 +1,12 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
-#include "strata/kernels/cpu/pool.hpp"
-#include "strata/core/progress.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/pool.hpp"
+#include "maya/core/progress.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include "strata/platform/cpu_relax.hpp"
+#include "maya/platform/cpu_relax.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +19,7 @@
 #include <sched.h>
 #endif
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 
 namespace {
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
@@ -184,7 +184,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
+    maya::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
@@ -242,7 +242,7 @@ void ExpertPool::worker(int id) {
         uint32_t spins = 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            strata_cpu_pause();
+            maya_cpu_pause();
             if ((++spins & 1023u) != 0) continue;
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
@@ -300,7 +300,7 @@ void ExpertPool::wait_parked(const char* what) {
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
-        strata_cpu_pause();
+        maya_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
@@ -322,7 +322,7 @@ void ExpertPool::wait_done(int n) {
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        strata_cpu_pause();
+        maya_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
@@ -535,7 +535,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //
-    // The loop below used to be `while (done_ != n) strata_cpu_pause();`.  The host is pinned to core 0 - the core
+    // The loop below used to be `while (done_ != n) maya_cpu_pause();`.  The host is pinned to core 0 - the core
     // `physical_cores(true)` deliberately keeps the five workers off - so for the whole drain that core was
     // idle while five cores did six cores' worth of work.  Measured before the change: 33.7 GB/s against
     // 5/6 x 44.14 = 36.8 for five workers and 44.14 for six.
@@ -573,4 +573,4 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     ms_repark_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

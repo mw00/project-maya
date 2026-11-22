@@ -1,24 +1,24 @@
 // src/core/glm_state_layout.cpp - the glm-dsa port B4.1 / B4.2: the per-layer state layout descriptor (see
-// include/strata/core/glm_state_layout.hpp).  The Flash branch is Maya's carvers' arithmetic in their order; the
+// include/maya/core/glm_state_layout.hpp).  The Flash branch is Maya's carvers' arithmetic in their order; the
 // glm-dsa branch is the latent + k_pe + full-layer index-key layout of BUILD-PLAN B4.1.
-#include "strata/core/glm_env.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glmd_random_route.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glmd_random_route.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
 int64_t lat_floats_per_pos(const Glm5Geometry& g, GlmStateMode mode) {
     const bool dsa = g.arch == GlmArch::GlmDsa;
     switch (mode) {
-    case GlmStateMode::Int8: return (int64_t) strata::kernels::glmf::lat8_rec_bytes(g.kv_lora) / 4;
+    case GlmStateMode::Int8: return (int64_t) maya::kernels::glmf::lat8_rec_bytes(g.kv_lora) / 4;
     case GlmStateMode::Fp16: return (int64_t) g.kv_lora / 2;
     case GlmStateMode::SlowF32: break;
     }
@@ -136,9 +136,9 @@ bool glm_state_carve(const Glm5Geometry& g, int l0, int l1, int mtp_il, int64_t 
                   " of " + std::to_string(g.n_layers) + " layers)";
             return false;
         }
-        if (mode == GlmStateMode::Int8 && strata::kernels::glmf::lat8_rec_bytes(g.kv_lora) % 16 != 0) {
+        if (mode == GlmStateMode::Int8 && maya::kernels::glmf::lat8_rec_bytes(g.kv_lora) % 16 != 0) {
             err = "glm state layout: the INT8 latent record (" +
-                  std::to_string(strata::kernels::glmf::lat8_rec_bytes(g.kv_lora)) + " B) is not 16-byte aligned";
+                  std::to_string(maya::kernels::glmf::lat8_rec_bytes(g.kv_lora)) + " B) is not 16-byte aligned";
             return false;
         }
         L.ik_ring = (int) max_ctx;   // no ring: cell s holds position s
@@ -237,11 +237,11 @@ bool glm_state_carve(const Glm5Geometry& g, int l0, int l1, int mtp_il, int64_t 
 }
 
 bool glm_state_idx_fp16() {
-    return strata::glmenv::env_flag("MAYA_GLM_IDX_FP16", false);
+    return maya::glmenv::env_flag("MAYA_GLM_IDX_FP16", false);
 }
 
 bool glm_state_idx_hadamard() {
-    return strata::glmenv::env_flag("MAYA_GLM_IDX_HADAMARD", false);
+    return maya::glmenv::env_flag("MAYA_GLM_IDX_HADAMARD", false);
 }
 
 GlmStateFingerprint glm_state_fingerprint(const Glm5Geometry& g, const GlmStateLayout& lay) {
@@ -266,4 +266,4 @@ GlmStateFingerprint glm_state_fingerprint(const Glm5Geometry& g, const GlmStateL
                                0, 0};   // B15.3: NextN block id, carrier bytes (Glm5Model::state_fp fills them)
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

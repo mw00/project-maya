@@ -10,10 +10,10 @@
 //   exl3_test --exllamav3 <dir>   the decoders against exllamav3 itself: tools/exl3_exllamav3_fixture.py's random
 //                                 tiles (data/exl3-exllamav3) - the same states and W' bit for bit
 //   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
-#include "strata/kernels/cpu/exl3_cpu.hpp"
-#include "strata/kernels/cpu/exl3_ref.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_ref.hpp"
 #include "mm3_exl3.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -29,10 +29,10 @@
 #include <string>
 #include <vector>
 
-namespace ex = strata::mm3::exl3;
-namespace cpu = strata::kernels::cpu;
-using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_f16;
+namespace ex = maya::mm3::exl3;
+namespace cpu = maya::kernels::cpu;
+using maya::kernels::f16_from_f32;
+using maya::kernels::f32_from_f16;
 
 namespace {
 
@@ -1005,7 +1005,7 @@ void test_cpu_had() {
         std::vector<float> x = rand_x(128, 3.0f), want(128), got(128);
         std::vector<uint16_t> suh(128);
         for (int i = 0; i < 128; ++i) suh[(size_t) i] = (uint16_t) (0x3800 + (rep * 131 + i * 37) % 0x800);   // [0.5, 1)
-        for (int i = 0; i < 128; ++i) want[(size_t) i] = x[(size_t) i] * strata::kernels::f32_from_f16(suh[(size_t) i]);
+        for (int i = 0; i < 128; ++i) want[(size_t) i] = x[(size_t) i] * maya::kernels::f32_from_f16(suh[(size_t) i]);
         for (int h = 1; h < 128; h <<= 1)
             for (int i = 0; i < 128; i += 2 * h)
                 for (int j = i; j < i + h; ++j) {
@@ -1917,7 +1917,7 @@ int main(int argc, char** argv) {
     test_refuse_half_non_mul1();
     // the prompt path's FP16 GEMMs (before sm_80: cuBLAS over the decoded weights for rows >= 64, its scratch on stream
     // 0; sm_80 and later: the tensor-core tiles as above), and the busy experts of a set
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (!ex::blas_enable(0, 8)) {   // (8 MB: the dense cases below take column pieces)
         std::printf("  %-44s FAIL\n", "blas_enable");
         ++g_fail;

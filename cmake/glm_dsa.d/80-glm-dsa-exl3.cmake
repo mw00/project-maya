@@ -8,15 +8,15 @@
 #         expert kernels instead of the matrix-core ones (gfx11's default)
 #   both  MAYA_FORCE_AVX2=1: the CPU lane's AVX2 tier on an AVX-512 CPU, for the calls that take the lane's tier
 #         (no GPU used)
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_kernels AND
-   TARGET strata_kernels_cpu)
+if(MAYA_BUILD_TESTS AND (MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP) AND TARGET maya_kernels AND
+   TARGET maya_kernels_cpu)
   enable_testing()
   add_executable(glm_dsa_exl3_test tests/glm_dsa/glm_dsa_exl3_test.cu)
-  target_link_libraries(glm_dsa_exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
-                        ${_strata_gpu_blas_target})
+  target_link_libraries(glm_dsa_exl3_test PRIVATE maya_kernels maya_kernels_cpu ${_maya_gpu_runtime_target}
+                        ${_maya_gpu_blas_target})
   add_test(NAME glm_dsa_exl3_test COMMAND glm_dsa_exl3_test)
   set(_glm_dsa_exl3_gpu_tests glm_dsa_exl3_test)
-  if(STRATA_ENABLE_HIP)
+  if(MAYA_ENABLE_HIP)
     add_test(NAME glm_dsa_exl3_mv1
              COMMAND ${CMAKE_COMMAND} -E env DS4_EXL3_MV1=1 $<TARGET_FILE:glm_dsa_exl3_test> --only mv,batch,head)
     add_test(NAME glm_dsa_exl3_mv_generic

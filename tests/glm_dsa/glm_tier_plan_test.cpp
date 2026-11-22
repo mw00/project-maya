@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace gt = strata::core::glmtier;
+namespace gt = maya::core::glmtier;
 
 namespace {
 

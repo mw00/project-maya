@@ -1,8 +1,8 @@
 // Exercise Maya's actual fused routing request/response without loading weights.
 // CPU polling must see the signal and payload without a driver query or sync.
 #include <hip/hip_runtime.h>
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glm_batch.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_batch.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -17,7 +17,7 @@
     std::fprintf(stderr, "%s: %s\n", #call, hipGetErrorString(e)); return 2; } } while (0)
 
 int main() {
-    namespace gf = strata::kernels::glmf;
+    namespace gf = maya::kernels::glmf;
     constexpr int E = 64, N = 4096, K = 8, rounds = 100;
     hipDeviceProp_t props{};
     CHECK(hipGetDeviceProperties(&props, 0));
@@ -178,7 +178,7 @@ int main() {
             (reset ? ring[3].error != 0 || *route_error != 0 : ring[2].error == 0)) return 16;
     }
     // Prompt rows reject even one NaN/Inf, leaving -1 IDs that count as no routes.
-    namespace gb = strata::kernels::glmb;
+    namespace gb = maya::kernels::glmb;
     float* batch_logits = (float*) take(2 * E * 4);
     int* ids = (int*) take(2 * K * 4);
     float* weights = (float*) take(2 * K * 4);

@@ -4,7 +4,7 @@
     python tools/exl3_pack.py --model <dir> --check <a GGUF of the same model, shard 1>
 
 The engine serves a pack (index.txt, dense.bin, native_experts.txt, tokenizer/) from beside the model's files.  An
-EXL3 model is a directory of safetensors whose big matrices are trellis-coded (include/strata/kernels/exl3.hpp); the
+EXL3 model is a directory of safetensors whose big matrices are trellis-coded (include/maya/kernels/exl3.hpp); the
 packer leaves those where they are and writes:
 
   <model>/maya-exl3.gguf   what the engine reads its geometry from (llama.cpp's glm5-next keys), the tokenizer, and

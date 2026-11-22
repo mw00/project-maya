@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 // the restore points a conversation keeps besides its three, at most (MAYA_DS4_RESTORE_POINTS is clamped to it)
 constexpr int kMarksMax = 16;
@@ -136,4 +136,4 @@ inline int mark_victim(const std::vector<MarkUse>& v) {
     return -1;
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

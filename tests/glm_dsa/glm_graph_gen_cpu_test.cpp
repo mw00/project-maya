@@ -6,7 +6,7 @@
 //     part, also when the reallocated arena came back at the SAME base address (the case the address fields miss);
 //   - graph_generation_note bumps only for a new name or a changed (base, bytes), and counts per name;
 //   - bumps from several threads are all counted and the generation stays monotonic.
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <atomic>
 #include <cstdio>

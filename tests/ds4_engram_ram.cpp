@@ -5,7 +5,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
-using namespace strata::ds4;
+using namespace maya::ds4;
 static void check(bool ok, const char* what) { if (!ok) { std::cerr << what << '\n'; std::exit(1); } }
 int main() {
     char name[] = "/tmp/maya-engram-ram-XXXXXX";

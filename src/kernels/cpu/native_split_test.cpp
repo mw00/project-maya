@@ -1,6 +1,6 @@
 // src/kernels/cpu/native_split_test.cpp - GLM's split-base expert rows (a GGUF's own gate/up/down tensors, the CPU
 // expert lane) against the contiguous [gate|up|down] blob path, and GLM's clamped SwiGLU.  Synthetic, CPU only.
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include "ggml.h"
 
@@ -19,7 +19,7 @@ static void check(bool ok, const char* what) {
 }
 
 int main() {
-    namespace cpu = strata::kernels::cpu;
+    namespace cpu = maya::kernels::cpu;
     cpu::NativeFmt glm, f;
     std::string err;
     // GLM-5.3-Flash's experts (n_embd 4096, n_ff 2048, IQ1_S gate/up, Q2_K down) fit the pool's activation buffers

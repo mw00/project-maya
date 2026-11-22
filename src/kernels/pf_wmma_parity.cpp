@@ -23,7 +23,7 @@
 // window convention: the host-side launch overhead is amortized, not measured).  Every shape is validated first -
 // three rows of every expert against the double reference, every written output finite, every guard row and column at
 // its sentinel - and a shape that fails is reported and not timed.  The bench assumes an idle GPU.
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -37,7 +37,7 @@
 #include <span>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = maya::kernels;
 
 namespace {
 

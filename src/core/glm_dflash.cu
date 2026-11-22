@@ -1,4 +1,4 @@
-// src/core/glm_dflash.cu - the DFlash2 drafter (include/strata/core/glm_dflash.hpp) and its decode on the GLM trunk.
+// src/core/glm_dflash.cu - the DFlash2 drafter (include/maya/core/glm_dflash.hpp) and its decode on the GLM trunk.
 //
 // The drafter's forward follows beellama's llama_model_dflash (src/models/dflash.cpp), DFlash2 path:
 //   context (per committed position p, from the trunk): g = rms(fc . [f_k0 | f_k1 | ...]) * enc.output_norm, then
@@ -16,13 +16,13 @@
 // conv(x, c, side): out[t][e] = sum_tap (c[t][side][tap][e / group] + base[side][tap][e]) * x[t - tap][e], within the
 // block (x[t - tap] = 0 before row 0).  The context window is the GGUF's sliding window: a row at position P reads
 // the ring's positions above P - window.
-#include "strata/core/glm_dflash.hpp"
+#include "maya/core/glm_dflash.hpp"
 
 #include "glm_fast_state.hpp"
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include "ggml.h"
 
@@ -42,9 +42,9 @@
 #include <utility>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -71,7 +71,7 @@ constexpr int kInjRows = 64;    // context positions an injection batch carries
 constexpr int kHeadDim = 128;   // the attention / rope kernels' head size
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -254,7 +254,7 @@ __global__ void attn_kernel(const float* __restrict__ Q, const __half* __restric
 constexpr int kAttnQ = 32, kAttnKeys = 16, kAttnSplits = 32, kAttnPart = kHeadDim + 2;
 
 __device__ __forceinline__ float half_warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false)));
@@ -268,7 +268,7 @@ __device__ __forceinline__ float half_warp_max(float v) {
 }
 
 __device__ __forceinline__ float half_warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));
@@ -796,14 +796,14 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     Impl& m = *d_;
     m.dev = dev;
     m.path = path;
-    std::unique_ptr<strata::GgufFile> gf_;
+    std::unique_ptr<maya::GgufFile> gf_;
     try {
-        gf_.reset(new strata::GgufFile(path));
+        gf_.reset(new maya::GgufFile(path));
     } catch (const std::exception& e) {
         err = "glm dflash: " + path + ": " + e.what();
         return false;
     }
-    const strata::GgufFile& G = *gf_;
+    const maya::GgufFile& G = *gf_;
     const auto* arch = G.get("general.architecture");
     if (arch == nullptr || arch->s != "dflash") {
         err = "glm dflash: " + path + " is not a DFlash draft (general.architecture " +
@@ -833,7 +833,7 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
         err = "glm dflash: " + path + " asks for causal block attention (this drafter attends non-causally)";
         return false;
     }
-    if (const auto* tlv = G.get("dflash.target_layers"); tlv != nullptr && tlv->type == strata::MetaType::ARRAY)
+    if (const auto* tlv = G.get("dflash.target_layers"); tlv != nullptr && tlv->type == maya::MetaType::ARRAY)
         for (const auto& it : tlv->items) m.tl.push_back((int) it.num());
     if (const auto* mt = G.get("tokenizer.ggml.mask_token_id"); mt != nullptr && mt->is_num()) m.mask_tok = (int) mt->u;
     m.K = (int) m.tl.size();
@@ -871,12 +871,12 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     m.ring = m.window + 2 * gf::kMaxMvCols;
     m.cdyn = 2 * m.taps * (m.E / m.group);
     // ---- the weights: every tensor raw into one arena
-    std::vector<const strata::TensorInfo*> ts;
+    std::vector<const maya::TensorInfo*> ts;
     size_t total = 0;
     const auto al = [](size_t b) { return (b + 255u) & ~(size_t) 255u; };
-    const auto tbytes = [](const strata::TensorInfo& t) -> size_t {
+    const auto tbytes = [](const maya::TensorInfo& t) -> size_t {
         int el = 0, by = 0;
-        if (!strata::block_geometry(t.type, el, by)) return 0;
+        if (!maya::block_geometry(t.type, el, by)) return 0;
         return (size_t) (t.elements() / (uint64_t) el) * (size_t) by;
     };
     for (const auto& t : G.tensors()) {
@@ -886,7 +886,7 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     if (!ck(cudaSetDevice(dev), "set device", err)) return false;
     if (!ck(cudaMalloc(&m.arena, total), "weights", err)) return false;
     m.arena_bytes = total;
-    std::map<std::string, std::pair<const void*, const strata::TensorInfo*>> at;
+    std::map<std::string, std::pair<const void*, const maya::TensorInfo*>> at;
     {
         uint8_t* p = (uint8_t*) m.arena;
         for (const auto* t : ts) {
@@ -1722,7 +1722,7 @@ void Glm5Model::dflash_reset() {
 // selector's confidence falls below p_min), a verify window of that token and the drafts, its longest right prefix and
 // the pick after it kept (window_commit) - the same tokens the token-at-a-time loop produces for the same samples -
 // and the kept positions' trunk features into the drafter's ring.  After the prompt's last forward().
-bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_new, int n_max, float p_min,
+bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new, int n_max, float p_min,
                               const std::function<bool(int)>& emit, int64_t& produced, std::string& err, int n_min,
                               float p_cum) {
     produced = 0;
@@ -2072,4 +2072,4 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

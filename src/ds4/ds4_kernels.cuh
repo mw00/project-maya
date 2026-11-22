@@ -1,5 +1,5 @@
 // src/ds4/ds4_kernels.cuh - DeepSeek-V4.1's own device kernels for a window of T tokens (1 <= T <= kWin) at positions
-// p0 .. p0 + T - 1 (the EXL3 matrices go through strata::kernels::exl3).  The math is DeepSeek's inference/model.py
+// p0 .. p0 + T - 1 (the EXL3 matrices go through maya::kernels::exl3).  The math is DeepSeek's inference/model.py
 // (MIT); tools/ds4/ref.py is the oracle the engine is checked against.  Every pointer is device memory, every activation
 // F32, rows of a window back to back; the KV caches keep the reference's FP8 / FP4 roundings packed as DeepSeek stores
 // them (codes and scales, kv_row_bytes), the window attention's working rows BF16 (those values are exact in BF16).
@@ -11,12 +11,12 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#include "strata/kernels/sampler.hpp"
+#include "maya/kernels/sampler.hpp"
 #include "ds4_logprobs.hpp"
 
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 constexpr int kWin = 16;      // tokens a window takes at most (the EXL3 GEMV's activations per job)
 constexpr int kPicks = 8;     // routed experts a token can take at most
@@ -120,7 +120,7 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
 /// The same for T activations x[t] = x + t ldx into y + t ldy, each weight read once for all of them; each output is
 /// gemv_f16's bit for bit.
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 /// (DS4_PROMPT_F16) rows of n values an FP16-out GEMM left as FP16 at the start of each FP32 row (ldy floats apart), widened
 /// in place (exact); count_bad: the values that are not finite counted (widen_bad_take, the current device)
 void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad = 0);
@@ -518,7 +518,7 @@ constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 /// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if defined(MAYA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
 // Optional diagnostic written only by the first block to set the timeout bit.
 struct PeerArFailure {
@@ -597,4 +597,4 @@ private:
 void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
                     cudaStream_t s, const ArAux& aux);
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

@@ -13,8 +13,8 @@
 // pieces: the rows' scores (dsa_score_rows), KV resolves (glm_kv_resolve_rows: each selected cell reads its position's
 // bytes, as glm_kv_resolve's) and the experts' grouping with a thread an entry, against the one-a-row / one-thread
 // kernels.
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glm_kv_stream.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_kv_stream.hpp"
 
 #include <cuda_runtime.h>
 
@@ -28,8 +28,8 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
-namespace k = strata::kernels;
+namespace gf = maya::kernels::glmf;
+namespace k = maya::kernels;
 
 namespace {
 

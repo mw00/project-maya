@@ -12,7 +12,7 @@
 //     glmfast::expert_stride), the others are copied from the pinned RAM tier (or read from disk) into a small ring
 //     of staging groups on the copy stream while the resident ones compute.
 //
-// The kernels are the token path's arithmetic (strata/kernels/glm_batch.hpp); what differs is the projections'
+// The kernels are the token path's arithmetic (maya/kernels/glm_batch.hpp); what differs is the projections'
 // rounding (FP16 activations instead of q8_1), as between llama.cpp's batched and one-token paths.  The prompt's
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  MAYA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
@@ -20,25 +20,25 @@
 #include "glm_tier_numa.hpp"   // glm-dsa B8.4
 #include "glm_prefill_dsa.hpp"   // glm-dsa B9: the glm-dsa prompt layer
 #include "glm_dsa_prefill_stream.hpp"   // glm-dsa B9.9
-#include "strata/kernels/glmd_f16_guard.hpp"   // glm-dsa B15.1
-#include "strata/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
+#include "maya/kernels/glmd_f16_guard.hpp"   // glm-dsa B15.1
+#include "maya/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
 
-#include "strata/core/exl3_mma_rows.hpp"
-#include "strata/core/prefill_chunks.hpp"
-#include "strata/core/prefill_gaps.hpp"
-#include "strata/core/progress.hpp"
-#include "strata/kernels/cpu/exl3_cpu.hpp"
-#include "strata/kernels/cpu/kq_avx512.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/exl3.hpp"
-#include "strata/kernels/glm_batch.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/platform/env_switch.hpp"
-#if defined(STRATA_USE_HIP)
-#include "strata/prefill/gemm.hpp"
-#include "strata/prefill/moe_fused_rdna4.hpp"
+#include "maya/core/exl3_mma_rows.hpp"
+#include "maya/core/prefill_chunks.hpp"
+#include "maya/core/prefill_gaps.hpp"
+#include "maya/core/progress.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/kq_avx512.hpp"
+#include "maya/kernels/dequant_bf16.hpp"
+#include "maya/kernels/exl3.hpp"
+#include "maya/kernels/glm_batch.hpp"
+#include "maya/kernels/iq_kernels.hpp"
+#include "maya/platform/env_switch.hpp"
+#if defined(MAYA_USE_HIP)
+#include "maya/prefill/gemm.hpp"
+#include "maya/prefill/moe_fused_rdna4.hpp"
 #endif
-#include "strata/prefill/moe_mmq.hpp"
+#include "maya/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
 
@@ -67,10 +67,10 @@
 #include <windows.h>
 #endif
 
-namespace strata::core {
+namespace maya::core {
 
-namespace gb = strata::kernels::glmb;
-namespace mmq = strata::prefill::mmq;
+namespace gb = maya::kernels::glmb;
+namespace mmq = maya::prefill::mmq;
 
 // The floats a prompt token's residual rows hold that the next part reads: Flash's four mHC streams (4 x n_embd),
 // GLM-5.3's one (n_embd - glm-dsa writes and reads T x n_embd of R, glm_prefill_dsa.cu).  The split's hand-over copies
@@ -182,7 +182,7 @@ KdaBufs carve_kda(Carve& c, size_t T, const Glm5Geometry& g) {
     return b;
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // The MLA batched products in FP16 with every head's tokens contiguous (hipBLAS picks far faster kernels than for the
 // F32 ones).  The prompt attention has three paths: the rocWMMA kernel on FP16 q_abs (f16q), the wave32 WMMA kernel on
 // F32 q_abs (wmma2), and the F32 kernel.  Both FP16 products and the WMMA attention are on by default;
@@ -245,7 +245,7 @@ bool wmma_env_on() {
     return want;
 }
 bool moe_wmma_on(int gu_type, int d_type, int E, int nff) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) gu_type; (void) d_type; (void) E; (void) nff;
     return false;
 #else
@@ -267,7 +267,7 @@ bool moe_wmma_on(int gu_type, int d_type, int E, int nff) {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok = major == 7 && minor == 0 && strata::kernels::gemm_iq_f16_grouped_supported(dev);
+        ok = major == 7 && minor == 0 && maya::kernels::gemm_iq_f16_grouped_supported(dev);
         probed = dev;
         if (ok) std::fprintf(stderr, "glm prefill: Volta grouped-WMMA prompt experts on (CUDA%d)\n", dev);
     }
@@ -278,8 +278,8 @@ bool moe_wmma_on(int gu_type, int d_type, int E, int nff) {
 bool expert_mmq(const Glm5Geometry& g, int t) { return mmq::supported(t) && glmpf::mmq_ok(g, t); }
 // whether the HIP fused expert kernel takes the layer (run_set's first branch; it has its own type list)
 bool experts_fused(const Glm5Geometry& g, int gu_type, int d_type) {
-#if defined(STRATA_HIP_PREFILL_FUSED)
-    return g.n_embd == 4096 && g.n_ff_exp == 2048 && strata::prefill::rdna4::supported(gu_type, d_type);
+#if defined(MAYA_HIP_PREFILL_FUSED)
+    return g.n_embd == 4096 && g.n_ff_exp == 2048 && maya::prefill::rdna4::supported(gu_type, d_type);
 #else
     (void) g; (void) gu_type; (void) d_type;
     return false;
@@ -353,7 +353,7 @@ struct MoeBufs {
     float *sh_g, *sh_u;
     uint16_t* sh16;
     int *ids, *rank, *counts, *base, *row_tok, *pos, *bounds;
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
     int* tiles;
 #endif
     uint8_t *Xq, *Hq;
@@ -372,17 +372,17 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     b.base = c.take<int>((size_t) g.n_expert);
     b.bounds = c.take<int>(8192);
     const size_t W = (size_t) moe_window_rows(T, g);
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
     const bool fused = g.n_embd == 4096 && g.n_ff_exp == 2048 &&
-                       strata::prefill::rdna4::available();
+                       maya::prefill::rdna4::available();
     if (fused) b.tiles = c.take<int>(2 * ((W + 63) / 64 + g.n_expert));
 #endif
     size_t x_bytes = mmq::q8_bytes((int64_t) W, g.n_embd);
     size_t h_bytes = mmq::q8_bytes((int64_t) W, g.n_ff_exp);
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
     if (fused) {
-        x_bytes = std::max(x_bytes, strata::prefill::rdna4::act_bytes(T, g.n_embd));
-        h_bytes = std::max(h_bytes, strata::prefill::rdna4::act_bytes(W, g.n_ff_exp));
+        x_bytes = std::max(x_bytes, maya::prefill::rdna4::act_bytes(T, g.n_embd));
+        h_bytes = std::max(h_bytes, maya::prefill::rdna4::act_bytes(W, g.n_ff_exp));
     }
 #endif
     if (wmma_env_on()) {   // the WMMA branch's FP16 activation windows (a part's rows, at most W): 2 bytes a value
@@ -406,7 +406,7 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
 // ones than the mixers; MAYA_GLM_PREFILL_SH_SUB overrides, sub_env sets it
 int shexp_sub(int sub_env) {
     if (sub_env > 0) return sub_env;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return kSub;
 #else
     static const int v = [] {
@@ -424,7 +424,7 @@ int shexp_sub(int sub_env) {
 int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, bool moe, int max_pools, int sub_env) {
     if (sub_env > 0) return sub_env;
     if (dsa && g.arch == GlmArch::GlmDsa) return (int) std::min<size_t>(T, glmpf::kSubBatch);   // glm-dsa B9.1
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) T; (void) g; (void) kda; (void) dsa; (void) dense; (void) moe; (void) max_pools;
     return kSub;
 #else
@@ -464,7 +464,7 @@ struct X3Lane {
     float* OUTP = nullptr;            // the output window, W rows
     int W = 0;
     std::function<int(int, int)> place;   // sorted rows [a, a + n) -> the window row of a (it adds what it holds first)
-    const strata::kernels::exl3::ExpertLayout* lay = nullptr;
+    const maya::kernels::exl3::ExpertLayout* lay = nullptr;
     int E = 0, nff = 0;
     float limit = 0.0f;               // the experts' swiglu clamp
     int T = 0;                        // the chunk's tokens (MAYA_GLM_EXL3_MMA_ROWS_SHORT; 0: unknown)
@@ -472,7 +472,7 @@ struct X3Lane {
 // experts [i0, i1) of a set through the tensor-core kernels, in parts whose rows fit the window and w16's h
 void x3_run_mma(const X3Lane& L, const uint8_t* wbase, size_t stride, const int* d_bounds, const int* hb, int r0, int i0,
                 int i1) {
-    namespace x3 = strata::kernels::exl3;
+    namespace x3 = maya::kernels::exl3;
     const int E = L.E, nff = L.nff;
     const int cap = std::min(L.W, (int) std::max<int64_t>(1, L.w16_elems / nff));
     while (i0 < i1) {
@@ -505,7 +505,7 @@ void x3_run_mma(const X3Lane& L, const uint8_t* wbase, size_t stride, const int*
 // transforms of every weight - and the inputs and outputs of its few hundred rows take the rotations, as in
 // decode.  MAYA_GLM_EXL3_ROT=0: the weights rotated (reconstruct_rows), as before
 void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0) {
-    namespace x3 = strata::kernels::exl3;
+    namespace x3 = maya::kernels::exl3;
     static const bool rot_rows = [] {
         const char* v = getenv("MAYA_GLM_EXL3_ROT");
         return v == nullptr || std::atoi(v) != 0;
@@ -586,24 +586,24 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
 // one set's experts in set order (the window takes the rows in order): runs of light experts to the tensor cores, the
 // rest alone.  MAYA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none);
 // MAYA_GLM_EXL3_MMA_ROWS_SHORT=<rows>[,<max chunk tokens>]: that in a chunk of up to <max chunk tokens> (4096)
-// tokens instead (strata/core/exl3_mma_rows.hpp)
+// tokens instead (maya/core/exl3_mma_rows.hpp)
 void x3_run_set(const X3Lane& L, const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                 int r0) {
     static const int mma_base = [] {
         const char* v = getenv("MAYA_GLM_EXL3_MMA_ROWS");
         return v ? std::max(0, std::atoi(v)) : 64;
     }();
-    static const strata::core::MmaRowsShort mma_short = [] {
-        const strata::core::MmaRowsShort r =
-            strata::core::mma_rows_short_parse(getenv("MAYA_GLM_EXL3_MMA_ROWS_SHORT"));
+    static const maya::core::MmaRowsShort mma_short = [] {
+        const maya::core::MmaRowsShort r =
+            maya::core::mma_rows_short_parse(getenv("MAYA_GLM_EXL3_MMA_ROWS_SHORT"));
         if (r.rows > 0)
             std::fprintf(stderr, "glm prefill: EXL3 experts with up to %d rows through the tensor-core kernels in chunks "
                                  "of up to %d tokens (MAYA_GLM_EXL3_MMA_ROWS_SHORT), %d in longer ones\n",
                          r.rows, r.max_tokens, mma_base);
         return r;
     }();
-    const int mma_rows = strata::core::mma_rows_for(L.T, mma_base, mma_short);
-    const bool use_mma = mma_rows > 0 && strata::kernels::exl3::prompt_tc();
+    const int mma_rows = maya::core::mma_rows_for(L.T, mma_base, mma_short);
+    const bool use_mma = mma_rows > 0 && maya::kernels::exl3::prompt_tc();
     for (int i = 0; i < n_exp;) {
         const int rows = hb[i + 1] - hb[i];
         if (use_mma && rows <= mma_rows) {
@@ -642,7 +642,7 @@ void x3_blas_close(void* blas) {
     if (blas != nullptr) cublasDestroy((cublasHandle_t) blas);
 }
 void x3_expert_rows(void* blas, cudaStream_t s, uint16_t* w16, int64_t w16_elems, const uint8_t* blob,
-                    const strata::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
+                    const maya::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
                     const int* row_tok, int nrows, float* out) {
     X3Lane L;
     L.s = s;
@@ -675,8 +675,8 @@ struct Glm5Model::PrefillState {
     int max_pools = 0;
     cublasHandle_t blas = nullptr;
     void* ws = nullptr;
-#if defined(STRATA_USE_HIP)
-    std::unique_ptr<strata::prefill::Gemm> lt;   // hipBLASLt with a tuning table (MAYA_HIPBLASLT_TUNING)
+#if defined(MAYA_USE_HIP)
+    std::unique_ptr<maya::prefill::Gemm> lt;   // hipBLASLt with a tuning table (MAYA_HIPBLASLT_TUNING)
     bool lt_tried = false;
 #endif
     std::unique_ptr<mmq::Context> mq;
@@ -984,7 +984,7 @@ struct Glm5Model::PrefillState {
 struct Glm5Model::CalcJob {
     Glm5Model* owner = nullptr;      // the working part (its pinned routes, x and sum buffers)
     int T = 0;
-    const strata::kernels::exl3::ExpertLayout* lay = nullptr;   // the layer's experts' layout ...
+    const maya::kernels::exl3::ExpertLayout* lay = nullptr;   // the layer's experts' layout ...
     size_t blob = 0;                 // ... and bytes
     std::vector<const uint8_t*> ram;   // the share's experts in the working part's pinned RAM tier
     std::vector<int> e, cnt;           // ... their ids and rows
@@ -1171,7 +1171,7 @@ static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool ha
     if (has_dsa)
         w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
     int64_t w16 = std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (has_dsa)   // the MLA products' FP16 copy of wk_b / wv_b
         w16 = std::max<int64_t>({w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
     // MAYA_GLM_PREFILL_BLAS (the FP16 expert path) needs one expert's gate + up in FP16 and a row: 2 x ff x E + E.
@@ -1187,7 +1187,7 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 // ---------------------------------------------------------------- setup
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
-    if (strata::platform::env_switch("MAYA_GLM_NO_PREFILL")) return true;
+    if (maya::platform::env_switch("MAYA_GLM_NO_PREFILL")) return true;
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;
@@ -1204,7 +1204,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     std::string f16_why;                      // the layers whose expert matrices take the FP16 products (expert_f16)
     bool f16_gu = false, f16_dn = false;      // ... for a gate/up, for a down
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
-        if (w.q == nullptr || (w.type != gf::kTypeBF16 && w.type != strata::kernels::exl3::kTypeEXL3 &&
+        if (w.q == nullptr || (w.type != gf::kTypeBF16 && w.type != maya::kernels::exl3::kTypeEXL3 &&
                                !glmpf::f16_covers(w.type, g.arch == GlmArch::GlmDsa)))   // glm-dsa B9.1: Maya's set (+ glm-dsa's i-quants, extra types)
             why += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
     };
@@ -2240,11 +2240,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // projection the GGUF keeps unquantized) is narrowed to FP16 the same way
     const auto hgemm_q = [&](const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y, int ldy, int Tn,
                              float beta) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (!S->lt_tried) {
             S->lt_tried = true;
             if (getenv("MAYA_HIPBLASLT_TUNING")) {
-                auto lt = std::make_unique<strata::prefill::Gemm>();
+                auto lt = std::make_unique<maya::prefill::Gemm>();
                 std::string lt_err;
                 if (lt->init_external(F->cs, S->w16, S->w16_elems, S->ws, S->ws_bytes, lt_err))
                     S->lt = std::move(lt);
@@ -2257,7 +2257,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // an EXL3 weight: reconstructed in slices of whole 128-row output rotation blocks (at a sub-batch's 1-2K rows
         // the decode once + cuBLAS beat exl3::gemm_rows, which decodes again for every 32 rows: KDA projections 2.3 vs
         // 3.3 s over 9 GPUs for a 6.4K-token prompt)
-        const bool x3w = w.type == strata::kernels::exl3::kTypeEXL3;
+        const bool x3w = w.type == maya::kernels::exl3::kTypeEXL3;
         int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / Kd));
         if (x3w) rows = std::max(128, rows / 128 * 128);
         for (int r0 = 0; r0 < N; r0 += rows) {
@@ -2265,11 +2265,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (w.type == gf::kTypeBF16)
                 gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
             else if (x3w)
-                strata::kernels::exl3::reconstruct_rows(
-                    strata::kernels::exl3::view(*(const strata::kernels::exl3::Mat*) w.q, r0, n), S->w16, false, s);
+                maya::kernels::exl3::reconstruct_rows(
+                    maya::kernels::exl3::view(*(const maya::kernels::exl3::Mat*) w.q, r0, n), S->w16, false, s);
             else
                 glmpf::dequant16(w.type, w.q, r0, n, Kd, S->w16, s);   // glm-dsa B9.1: dequant_f16 + glm-dsa's extra types
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
             if (S->lt && ldx == Kd) {
                 S->lt->f16(X16, S->w16, Y + r0, Tn, n, Kd, ldy, beta);
                 continue;
@@ -2300,14 +2300,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         pkv.stage_rows = S->kv_stage_rows;
         pio.kv = &pkv;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // glm-dsa (S7): the attention layer's FP16 projections through the same hipBLASLt GEMM as hgemm_q below (made here
     // when the layer comes first; the tuning tables' rows for its shapes, plain hipBLAS for a shape without one)
     if (g.arch == GlmArch::GlmDsa) {
         if (!S->lt_tried) {
             S->lt_tried = true;
             if (getenv("MAYA_HIPBLASLT_TUNING")) {
-                auto lt = std::make_unique<strata::prefill::Gemm>();
+                auto lt = std::make_unique<maya::prefill::Gemm>();
                 std::string lt_err;
                 if (lt->init_external(F->cs, S->w16, S->w16_elems, S->ws, S->ws_bytes, lt_err))
                     S->lt = std::move(lt);
@@ -3073,7 +3073,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                B.cells, B.n_sel, s);
                 S->mark("dsa_index", s);
                 // q_abs[t][h] = wk_b[h] (kv_lora x qk_nope) . q[t][h]
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
                 // FP16 products; q is packed per head into B.attn's space and the context into B.q_abs's (both idle there)
                 const bool f16 = mla_f16_on() && (int64_t) g.qk_nope <= 2 * (int64_t) g.v_head;
                 const MlaAttnPath attn_path = mla_attn_path();
@@ -3101,7 +3101,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         "q_abs");
                 }
                 S->mark("dsa_qabs", s);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
                 if (use_f16q)
                     gb::mla_attn_f16q((const uint16_t*) B.q_abs, lat, B.cells,
                                       B.n_sel, g.n_sel_max(), g.n_head, g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn,
@@ -3116,7 +3116,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                              g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn, B.ctx, s, lat_q8_);
                 S->mark("dsa_attn", s);
                 // out[t][h] = wv_b[h] (v_head x kv_lora) . ctx[t][h]
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
                 if (f16) {
                     bf16_to_f16<<<1024, 256, 0, s>>>(Ly.v_b, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.ctx, hp_c, tn, g.n_head, g.kv_lora);
@@ -3145,7 +3145,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dump_row("dsa_qr-" + Ls, B.qr, g.q_lora, tn - 1);
                     dump_row("dsa_q-" + Ls, B.q, g.n_head * g.qk_nope, tn - 1);
                     dump_row("dsa_iq-" + Ls, B.iq, g.idx_heads * g.idx_key, tn - 1);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
                     if (!f16)   // with the FP16 products q_abs holds FP16 / the packed context
 #endif
                     dump_row("pf_qabs-" + Ls, B.q_abs, g.n_head * g.kv_lora, tn - 1);
@@ -3609,7 +3609,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const float lim = g.swiglu_exp;
             HlpPend* hpp = &H;
             std::mutex* mx = &link_mx;
-            const strata::kernels::exl3::ExpertLayout* xlp = Ly.exl3 ? &Ly.xl : nullptr;   // (the model's layer: it outlives the call)
+            const maya::kernels::exl3::ExpertLayout* xlp = Ly.exl3 ? &Ly.xl : nullptr;   // (the model's layer: it outlives the call)
             H.th = std::thread([=] {
                 cudaSetDevice(dev);
                 if (cudaEventSynchronize(hpp->ev) != cudaSuccess) {
@@ -3631,7 +3631,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // experts, queued after it, started near the end of the copies they were planned beside (an 8K prompt on one
         // 3090: at plan + ~290 of a layer's ~400 ms, ~110 ms of work).  Joined before their outputs go up
         const auto x3_cpu = [&]() {
-            namespace kc = strata::kernels::cpu;
+            namespace kc = maya::kernels::cpu;
             const int ncx = (int) cpu_set.size();
             std::vector<int> r_of((size_t) ncx);   // each expert's first row in the CPU segment
             for (int j = 0; j < ncx; ++j) r_of[(size_t) j] = S->h_base[cpu_set[(size_t) j].e] - cpu_r0;
@@ -3837,7 +3837,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // writes them; the activations are the chunk's rows the set's sorted rows name (row_tok)
         const auto f16_gate_up = [&](const uint8_t* wbase, int i0, int i1, size_t stride, const int* hb, int a, int r0,
                                      float* GU) {
-            namespace x3 = strata::kernels::exl3;
+            namespace x3 = maya::kernels::exl3;
             const int cap = f16_cap((S->w16_elems - f16_wgu) / E);
             uint16_t* X16 = S->w16 + f16_wgu;
             for (int i = i0; i < i1; ++i) {
@@ -3860,7 +3860,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // range guard on h (B15.1; MoE down inputs can pass 65504), as the shared expert's products have it.
         const auto f16_down = [&](const uint8_t* wbase, int i0, int i1, size_t stride, const int* hb, int a, float* GU,
                                   float* Y0) {   // (not OUT: an empty macro in the Windows headers)
-            namespace x3 = strata::kernels::exl3;
+            namespace x3 = maya::kernels::exl3;
             const bool guard = g.arch == GlmArch::GlmDsa;
             const int cap = f16_cap((S->w16_elems - f16_wdn) / nff);
             uint16_t* H16 = S->w16 + f16_wdn;
@@ -3882,11 +3882,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             }
         };
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
         // X is rounded once per token; the fused GU epilogue writes rounded H.
         // The shared scratch reserves the larger of the two activation formats.
         const bool fused = E == 4096 && nff == 2048 &&
-                           strata::prefill::rdna4::supported(Ly.gu_type, Ly.d_type);
+                           maya::prefill::rdna4::supported(Ly.gu_type, Ly.d_type);
         bool fused_x_ready = false;
 #endif
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
@@ -3901,9 +3901,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 for (int i = i0; i < i1; ++i) max_rows = std::max(max_rows, hb[i + 1] - hb[i]);
                 if (nrows > 0) {
                     const int o = place(r0 + a, nrows);
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
                     if (fused) {
-                        namespace rf = strata::prefill::rdna4;
+                        namespace rf = maya::prefill::rdna4;
                         if (!fused_x_ready) {
                             rf::quantize(S->x, T, E, M.Xq, s);
                             fused_x_ready = true;
@@ -3927,15 +3927,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         // the set's from a and the activations start a rows back, as in the MMQ products' trick.
                         auto* x16 = reinterpret_cast<uint16_t*>(M.Xq) - (size_t) a * E;
                         auto* h16 = reinterpret_cast<uint16_t*>(M.Hq) - (size_t) a * nff;
-                        strata::kernels::exl3::rows_f16(S->x, E, M.row_tok + r0 + a, nrows, E, x16 + (size_t) a * E, s);
-                        if (!strata::kernels::gemm_iq_f16_grouped(Ly.gu_type, wbase + (size_t) i0 * stride, stride,
+                        maya::kernels::exl3::rows_f16(S->x, E, M.row_tok + r0 + a, nrows, E, x16 + (size_t) a * E, s);
+                        if (!maya::kernels::gemm_iq_f16_grouped(Ly.gu_type, wbase + (size_t) i0 * stride, stride,
                                 2 * nff, E, x16, E, d_bounds + i0, i1 - i0, max_rows, GU - (size_t) a * (2 * nff),
                                 2 * nff, s)) {
                             wmma_fell_back = true;
                             std::fprintf(stderr, "glm prefill: grouped WMMA rejected the gate/up shape, MMQ from here\n");
                         } else {
                             gb::swiglu_rows_h16(GU, h16 + (size_t) a * nff, nrows, nff, g.swiglu_exp, s);
-                            if (!strata::kernels::gemm_iq_f16_grouped(Ly.d_type, wbase + (size_t) i0 * stride + Ly.down_off,
+                            if (!maya::kernels::gemm_iq_f16_grouped(Ly.d_type, wbase + (size_t) i0 * stride + Ly.down_off,
                                     stride, E, nff, h16, nff, d_bounds + i0, i1 - i0, max_rows,
                                     M.OUTP + (size_t) (o - a) * E, E, s)) {
                                 wmma_fell_back = true;
@@ -4033,7 +4033,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 return v ? std::max(0, std::atoi(v)) : -1;
             }();
             if (env >= 0) return env;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
             return 0;   // (MMQ only: the FP16 path is measured on Volta)
 #else
             static int blas_dev[16] = {};   // rows + 1 per device, 0: not looked at yet
@@ -4052,7 +4052,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const bool use_blas = blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
                               mmq::to_f16_supported(Ly.d_type) && S->w16_mmq_elems >= (int64_t) 2 * nff * E + E;
         const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {
-            namespace x3 = strata::kernels::exl3;
+            namespace x3 = maya::kernels::exl3;
             const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
             // (the scratch as it was before the FP16 expert products' room: this rule's GEMMs as without them)
             const int gu_rows = (int) std::max<int64_t>(1, (S->w16_mmq_elems - wgu) / E);
@@ -4322,7 +4322,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // waited out the whole prestage (one copy engine a direction), and the combine with it
         if (cpu_nrows == 0) prestage(next_moe(il + 1));
         if (cpu_nrows > 0) {
-            namespace kc = strata::kernels::cpu;
+            namespace kc = maya::kernels::cpu;
             auto tc = std::chrono::steady_clock::now();
             const auto& nf = F->cpu_fmt[(size_t) il];
             constexpr size_t kA = kc::kNativeActBytes, kH = kc::kNativeHBytes;
@@ -4889,23 +4889,23 @@ int Glm5Model::prefill_chunk_for(int64_t nn) const {   // (prefill's own choice 
         if (m->pf_ == nullptr) return 0;
         Tmax = std::min(Tmax, m->pf_->T);
     }
-    return strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr, prefill_floor(nn, 1));
+    return maya::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr, prefill_floor(nn, 1));
 }
 
 // The fewest chunks a split cuts a call of nn tokens into: the call's own floor (prefill_min_chunks, none under 256
-// tokens) or MAYA_GLM_PREFILL_MIN_CHUNKS's (strata/core/prefill_chunks.hpp), whichever is more; one GPU: 1
+// tokens) or MAYA_GLM_PREFILL_MIN_CHUNKS's (maya/core/prefill_chunks.hpp), whichever is more; one GPU: 1
 int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
-    static const strata::core::PrefillMinChunks set = [] {
-        const strata::core::PrefillMinChunks s =
-            strata::core::prefill_min_chunks_parse(getenv("MAYA_GLM_PREFILL_MIN_CHUNKS"));
+    static const maya::core::PrefillMinChunks set = [] {
+        const maya::core::PrefillMinChunks s =
+            maya::core::prefill_min_chunks_parse(getenv("MAYA_GLM_PREFILL_MIN_CHUNKS"));
         if (s.n > 1)
             std::fprintf(stderr, "glm prefill: on a split a prompt-path call is cut into %d chunks at least, none under "
                                  "%d tokens (MAYA_GLM_PREFILL_MIN_CHUNKS), so the parts pipeline it\n", s.n, s.min_tokens);
         return s;
     }();
     if (split_next_ == nullptr) return 1;
-    return std::max(strata::core::prefill_floor_chunks(nn, call_min, 256),
-                    strata::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
+    return std::max(maya::core::prefill_floor_chunks(nn, call_min, 256),
+                    maya::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
 }
 
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
@@ -4932,7 +4932,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, MAYA_GLM_PREFILL_MIN_CHUNKS)
     const int Trun_max = prefill_force_chunk > 0
                           ? std::min(Tmax, prefill_force_chunk)
-                          : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                          : maya::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
                                                             prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
@@ -5357,8 +5357,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         std::condition_variable cv;
         // produced[k]: chunks part k has put in its slots; consumed[k]: chunks part k + 1 has copied out of them
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
-        // gaps: the chunks each part has read and the boundaries released (strata/core/prefill_gaps.hpp)
-        strata::core::PipelineGaps G(np, nc);
+        // gaps: the chunks each part has read and the boundaries released (maya/core/prefill_gaps.hpp)
+        maya::core::PipelineGaps G(np, nc);
         bool stop = false;
         std::string stage_err;
         const size_t slot = (size_t) Tc * 4 * E;
@@ -5521,9 +5521,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         }
     }
     // glm-dsa B15.2: an MMQ product moe_mmq.cu refused (an expert stride that is not whole blocks) is a failed launch
-    if (gb::launch_errors() > 0 || strata::kernels::glmf::launch_errors() > 0 || mmq::launch_errors() > 0) {
+    if (gb::launch_errors() > 0 || maya::kernels::glmf::launch_errors() > 0 || mmq::launch_errors() > 0) {
         err = "glm prefill: " +
-              std::to_string(gb::launch_errors() + strata::kernels::glmf::launch_errors() + mmq::launch_errors()) +
+              std::to_string(gb::launch_errors() + maya::kernels::glmf::launch_errors() + mmq::launch_errors()) +
               " kernel launch(es) failed (see stderr)";
         return false;
     }
@@ -5592,4 +5592,4 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

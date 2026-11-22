@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_draft_adaptive_test.cpp - glm-dsa B15.9 (CPU): the adaptive draft depth controller
-// (include/strata/core/glm_draft_adaptive.hpp) and its use in NgramSession (MAYA_GLM_DRAFT_ADAPTIVE).
+// (include/maya/core/glm_draft_adaptive.hpp) and its use in NgramSession (MAYA_GLM_DRAFT_ADAPTIVE).
 //   1. AdaptiveDepth: the climb thresholds (2, 4, the 3 -> 4 barrier of 10), the drop pressure max(5d, 20), floor and
 //      cap, no pressure at the floor, reset;
 //   2. ProposalTracker: full accept, first-miss resolution, one round at a time;
@@ -9,8 +9,8 @@
 //      rows than fixed-8); the numbers are printed;
 //   4. NgramSession: off -> depth() is MAYA_GLM_NGRAM_MAX and nothing is tracked; on -> the proposals are cut to
 //      depth(), the depth climbs on a repetitive conversation, a floor of 2 starts at 2, and it resets per session.
-#include "strata/core/glm_draft_adaptive.hpp"
-#include "strata/core/glm_ngram_draft.hpp"
+#include "maya/core/glm_draft_adaptive.hpp"
+#include "maya/core/glm_ngram_draft.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -27,7 +27,7 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-using namespace strata::core::glmng;
+using namespace maya::core::glmng;
 
 void test_controller() {
     std::printf("[1. AdaptiveDepth]\n");

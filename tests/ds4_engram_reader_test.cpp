@@ -14,9 +14,9 @@
 #include <unistd.h>
 #include <vector>
 
-using strata::ds4::EgBatch;
-using strata::ds4::EgRead;
-using strata::ds4::EgReader;
+using maya::ds4::EgBatch;
+using maya::ds4::EgRead;
+using maya::ds4::EgReader;
 
 namespace {
 

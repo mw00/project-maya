@@ -51,9 +51,9 @@
 
 namespace hy4 {
 
-namespace iq = strata::ds4::gguf::iq;
-namespace lt = strata::ds4::lt;
-namespace pcie = strata::ds4::pcie;
+namespace iq = maya::ds4::gguf::iq;
+namespace lt = maya::ds4::lt;
+namespace pcie = maya::ds4::pcie;
 
 extern "C" void quantize_row_q4_K_ref(const float* x, void* y, int64_t k);   // (ggml-quants: ggml's own Q4_K rounding)
 // (ggml-quants' row decoders: a token's embedding row in the K types - the host reads one row a token)
@@ -529,7 +529,7 @@ struct Model::Impl {
     // (#1026) the reserve held for the whole run: what each GPU's start and requests allocate after the plan, read from
     // the pack's vram-late.txt by the plan and kept free beside the reserve (src/core/vram_late.hpp; HY4_LATE_FILE /
     // HY4_LATE_MB or MAYA_VRAM_LATE_*); an integrated GPU (its free figure is the RAM's) is not measured
-    strata::vramlate::Tracker late;
+    maya::vramlate::Tracker late;
     std::vector<int> late_devs;
     std::string room_out;                // (--room-report's measurement: Model::room_report)
     std::atomic<bool> emb_pending{false};   // (a queued pass's copy of h_emb maybe still in flight)
@@ -1821,7 +1821,7 @@ struct Model::Impl {
                     }
                 }
 #endif
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
                 // AMD under Windows (experimental), an APU's GPU (Strix Halo / Gorgon Halo): HIP counts its carve-out
                 // plus shared system memory, and what fills into the shared part pages under Windows (GLM's #206,
                 // maya-ds4's Maya-S at 2.45 tok/s on a 160 GB Strix Halo) - so the model keeps within the DEDICATED
@@ -1919,7 +1919,7 @@ struct Model::Impl {
         free_b[(size_t) main_gi] -= vis_keep;
         // tensor parallel: --tp N, or auto (-1): over the largest group of GPUs of one kind when it holds everything -
         // the layer split otherwise (an INFO line says why)
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
         // (AMD under Windows, experimental: tensor parallel's hand-offs - flags in mapped host memory that the GPUs and
         //  the host's summing threads spin on - have never run there; auto takes the layer split, --tp N still asks)
         if (o.tp < 0 && devs.size() > 1) {
@@ -2882,7 +2882,7 @@ struct Model::Impl {
     // HY4_PREFETCH unset: measured, on NVIDIA; 0: off; N: bits, unmeasured (1 the FFN's router, routed down, shared
     // gate / up; 2 its routed up and shared down; 4 the next layer's q_a, kv_a, gate; 8 its other attention matrices).
     // HY4_PF_BLOCKS: the kernel's blocks
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const int pf_mode = std::getenv("HY4_PREFETCH") ? std::atoi(std::getenv("HY4_PREFETCH")) : 0;   // (AMD: not run)
 #else
     const int pf_mode = std::getenv("HY4_PREFETCH") ? std::atoi(std::getenv("HY4_PREFETCH")) : -1;
@@ -3773,7 +3773,7 @@ struct Model::Impl {
                     CK(cudaGetDeviceProperties(&pi, gp.dev));
                     tensor_cores = tensor_cores && pi.major >= 7;
                 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
                 tensor_cores = false;   // (AMD: measured slower past kDenseBase on a 16K prompt - the span stays)
 #endif
                 ix_gemm = tensor_cores ? 16 : 0;
@@ -3786,7 +3786,7 @@ struct Model::Impl {
                 if (const char* se = std::getenv("HY4_SPARSE")) sparse_attn = std::atoi(se) != 0;
                 if (const char* se = std::getenv("HY4_SPARSE_SUB")) sparse_sub = std::max(8, std::min(kSub, std::atoi(se)));
                 if (const char* se = std::getenv("HY4_SPARSE_FRAC")) sparse_frac = std::max(0, std::min(100, std::atoi(se)));
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
                 ix_split = false;   // (AMD: not measured there)
 #else
                 ix_split = true;
@@ -4386,7 +4386,7 @@ struct Model::Impl {
                 info.push_back(vb);
             }
         }
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
         // AMD under Windows: the load's legacy-stream work (the counters' and the indexer pools' cudaMemset) finished
         // before any of the non-blocking streams' - nothing orders the two, and Windows' HIP submits queued work only
         // when the host waits (GLM's #133: a legacy-stream memset still pending at the first answer)
@@ -4691,7 +4691,7 @@ struct Model::Impl {
                 if (!iq::mv(jobs.data() + h0, std::min(64, H - h0), gp.s)) return false;
             return true;
         };
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (one()) return true;
         return eight();
 #else
@@ -7177,9 +7177,9 @@ struct Model::Impl {
             (void) cudaGetLastError();
             return false;
         }
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
+#if defined(MAYA_USE_HIP) && defined(_WIN32)
         return false;   // (Windows' HIP submits queued work only at a host wait: no second stream there untested)
-#elif defined(STRATA_USE_HIP)
+#elif defined(MAYA_USE_HIP)
         return true;
 #else
         return p.major >= 8;

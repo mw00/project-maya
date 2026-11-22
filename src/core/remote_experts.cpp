@@ -1,13 +1,13 @@
-#include "strata/core/remote_experts.hpp"
+#include "maya/core/remote_experts.hpp"
 
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/glm_batch.hpp"
-#include "strata/prefill/moe_mmq.hpp"
-#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
-#include "strata/prefill/moe_fused_rdna4.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/iq_kernels.hpp"
+#include "maya/kernels/quantize_act.hpp"
+#include "maya/kernels/s2_expert_grouped.hpp"
+#include "maya/kernels/glm_batch.hpp"
+#include "maya/prefill/moe_mmq.hpp"
+#if defined(MAYA_USE_HIP) && defined(MAYA_HIP_PREFILL_FUSED)
+#include "maya/prefill/moe_fused_rdna4.hpp"
 #endif
 
 #include <algorithm>
@@ -28,20 +28,20 @@
 extern char** environ;
 #endif
 
-namespace strata::core {
+namespace maya::core {
 namespace glmpf {   // glm_prefill_dsa.cu (B14.1: the glm-dsa clamp after MMQ's quantizer, HIP only)
 void mmq_clamp(bool on, void* xq, int64_t rows, int64_t cols, int type, cudaStream_t s);
 // glm_prefill.cu: the prompt path's EXL3 lane (a BLAS handle on a stream; one expert's rows)
 void* x3_blas_open(cudaStream_t s);
 void x3_blas_close(void* blas);
 void x3_expert_rows(void* blas, cudaStream_t s, uint16_t* w16, int64_t w16_elems, const uint8_t* blob,
-                    const strata::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
+                    const maya::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
                     const int* row_tok, int nrows, float* out);
 }
 namespace {
-constexpr int64_t H = strata::kernels::cpu::H;
-constexpr int64_t FF = strata::kernels::cpu::FF;
-constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;
+constexpr int64_t H = maya::kernels::cpu::H;
+constexpr int64_t FF = maya::kernels::cpu::FF;
+constexpr int64_t CAP = maya::kernels::cpu::MAXT * 10;
 
 // Small enough to copy as one pinned buffer per layer. The kernels read the
 // individual arrays through pointers into the same device allocation.
@@ -159,7 +159,7 @@ struct HelperWarm {
         else if (asleep.load()) cv.notify_one();
     }
     void run(int device) {
-        namespace gf = strata::kernels::glmf;
+        namespace gf = maya::kernels::glmf;
         cudaStream_t st = nullptr;
         unsigned* sink = nullptr;
         if (cudaSetDevice(device) != cudaSuccess || cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess ||
@@ -235,7 +235,7 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     if (!check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "helper stream", err, device) ||
         !check(cudaMalloc((void**) &arena_, need), "helper scratch", err, device)) return false;
     // EXL3: the stream's kernel scratch now (the first launch would make it), before reserve() sizes the cache
-    if (exl3 && !strata::kernels::exl3::prepare(stream_)) {
+    if (exl3 && !maya::kernels::exl3::prepare(stream_)) {
         err = "CUDA" + std::to_string(device) + " experts: the EXL3 kernels' scratch did not allocate";
         return false;
     }
@@ -276,7 +276,7 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
         zplan_.plan_w = (float*) (z + 2 * xb + 8 * sizeof(unsigned long long));
         zero_copy_ = true;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // the window call (win_run; glm_helper_link.hpp kComputeWin): kWinTokens tokens' rows and plans in mapped pinned
     // memory, their quants in device memory.  Not made (no window call: a call a token, as before) when either
     // allocation fails, without the zero-copy path, or with MAYA_GLM_HELPER_WIN=0
@@ -463,7 +463,7 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
     return start(nullptr, gu_type, d_type, down_off, limit, ne, keys, weights, x, out, err) && finish(err, false);
 }
 
-bool GlmExpertHelper::compute_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+bool GlmExpertHelper::compute_exl3(const maya::kernels::exl3::ExpertLayout& lay, float limit, int ne,
                                    const int* keys, const float* weights, const float* x,
                                    float* out, std::string& err) {
     return start(&lay, 0, 0, 0, limit, ne, keys, weights, x, out, err) && finish(err, false);
@@ -475,7 +475,7 @@ bool GlmExpertHelper::enqueue(int gu_type, int d_type, size_t down_off, float li
     return start(nullptr, gu_type, d_type, down_off, limit, ne, keys, weights, x, out, err);
 }
 
-bool GlmExpertHelper::enqueue_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+bool GlmExpertHelper::enqueue_exl3(const maya::kernels::exl3::ExpertLayout& lay, float limit, int ne,
                                    const int* keys, const float* weights, const float* x,
                                    float* out, std::string& err) {
     return start(&lay, 0, 0, 0, limit, ne, keys, weights, x, out, err);
@@ -565,8 +565,8 @@ bool GlmExpertHelper::win_wait(int T, const int* ne, float* const* out, std::str
 // bit (a mismatch fails the call).
 bool GlmExpertHelper::win_run(int gu_type, int d_type, size_t down_off, float limit, const hlink::WinCall& c,
                               const float* x, float* out, std::string& err) {
-#if defined(STRATA_USE_HIP)
-    namespace gf = strata::kernels::glmf;
+#if defined(MAYA_USE_HIP)
+    namespace gf = maya::kernels::glmf;
     const int T = c.T, E = n_embd_;
     constexpr int WT = hlink::kWinTokens;
     if (win_z_ == nullptr || device_ < 0 || T < 1 || T > WT || c.k < 1 || c.k > 8 || !gf::moe_supported(gu_type) ||
@@ -727,11 +727,11 @@ bool GlmExpertHelper::win_run(int gu_type, int d_type, size_t down_off, float li
 // call holds pending_ from here to its wait (Claim), so no replace or other call overlaps it.  A failure after anything
 // was queued waits for the stream (nothing may land in out later; on the helper's device, current here) and leaves
 // nothing pending - unless that wait failed too (the claim then stays until close()).
-bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off,
+bool GlmExpertHelper::start(const maya::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off,
                             float limit, int ne, const int* keys, const float* weights, const float* x,
                             float* out, std::string& err) {
-    namespace gf = strata::kernels::glmf;
-    namespace x3 = strata::kernels::exl3;
+    namespace gf = maya::kernels::glmf;
+    namespace x3 = maya::kernels::exl3;
     bool free_now = false;
     if (!pending_.compare_exchange_strong(free_now, true, std::memory_order_acq_rel)) {
         err = "GLM expert helper: a call before this one was not waited for, or a cache replacement runs";
@@ -843,7 +843,7 @@ bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int g
 // has been synchronized: nothing is pending afterwards, whatever the outcome - unless no synchronize succeeded (the
 // claim then stays until close(), and out may still be written).
 bool GlmExpertHelper::finish(std::string& err, bool split) {
-    namespace x3 = strata::kernels::exl3;
+    namespace x3 = maya::kernels::exl3;
     if (!pending_.load(std::memory_order_acquire)) {
         err = "GLM expert helper: nothing to wait for";
         return false;
@@ -953,7 +953,7 @@ void GlmExpertHelper::close() {
         pf_fx_ = nullptr;
         pf_off_h_ = pf_off_d_ = nullptr;
         pf_fx_T_ = 0;
-        delete (strata::prefill::mmq::Context*) pf_mq_;
+        delete (maya::prefill::mmq::Context*) pf_mq_;
         pf_scratch_ = nullptr;
         pf_bnd_h_ = pf_bnd_d_ = nullptr;
         pf_mq_ = nullptr;
@@ -1237,7 +1237,7 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
     // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
     // before the device's context exists, so first thing; MAYA_REMOTE_SPIN=0 keeps the driver's default.
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     const char* spin = std::getenv("MAYA_REMOTE_SPIN");
     if (!(spin && spin[0] == '0')) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
     cudaGetLastError();
@@ -1297,7 +1297,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     if (!scope.ok) { err = scope.error(device); return false; }
     device_ = device;
     n_expert_ = experts;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     std::vector<std::pair<int32_t, int32_t>> selected;
     selected.reserve((size_t) slots);
     std::vector<uint8_t> picked(claimed.size(), 0);
@@ -1347,8 +1347,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     }
 
     const size_t scratch = std::max<size_t>(
-        (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
-        strata::kernels::native_expert_scratch_bytes(CAP, FF));
+        (size_t) maya::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
+        maya::kernels::native_expert_scratch_bytes(CAP, FF));
     const bool allocated =
         check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err, device) &&
         check(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err, device) &&
@@ -1400,7 +1400,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
     const int64_t n = n_tok * k;
-    if (n <= 0 || n > CAP || n_tok > strata::kernels::cpu::MAXT || k != 10 || layer < 0 ||
+    if (n <= 0 || n > CAP || n_tok > maya::kernels::cpu::MAXT || k != 10 || layer < 0 ||
         (size_t) layer >= layers_present_.size() || device_ < 0) {
         err = "CUDA" + std::to_string(device_) + " experts: invalid layer, routing width or window size";
         return false;
@@ -1456,20 +1456,20 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         (zero_copy_ || check(cudaMemcpyAsync(d_x_, h_x_, (size_t) n_tok * H * sizeof(float), cudaMemcpyHostToDevice, s), "copy input", err, device_)) &&
         check(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(RemoteMeta), cudaMemcpyHostToDevice, s), "copy group metadata", err, device_);
     if (!staged) return false;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = maya::kernels::cpu::expert_layout();
     if (lay.native) {
-        strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
+        maya::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         const auto& fmt = lay.fmt[(size_t) layer];
-        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.u_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
-        if (!strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
+        auto L = maya::kernels::native_expert_layout(fmt.gu_type, fmt.u_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+        if (!maya::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s)) {
             err = "CUDA" + std::to_string(device_) + " experts: no device kernel for layer " + std::to_string(layer) +
                   "'s expert types";   // glm-dsa B3.5: was std::exit in the kernel
             return false;
         }
     } else {
-        strata::kernels::quantize_q8_0_scaled(zero_copy_ ? z_x_ : d_x_, d_q8_, d_scales_, n_tok * H, s);
-        strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
+        maya::kernels::quantize_q8_0_scaled(zero_copy_ ? z_x_ : d_x_, d_q8_, d_scales_, n_tok * H, s);
+        maya::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                         groups_, (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s);
     }
     const uint64_t compact_bytes = (uint64_t) dst_.size() * H * sizeof(float);
@@ -1497,7 +1497,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
 
 bool GlmExpertHelper::pf_post(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
                               int rows, int r0, std::string& err, int slot,
-                              const strata::kernels::exl3::ExpertLayout* xl) {
+                              const maya::kernels::exl3::ExpertLayout* xl) {
     if (!link_ || ctl_ == nullptr || pf_cap_ <= 0 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || slot < 0 || slot > 2 || K > hlink::kPfMaxK || n > hlink::kPfMaxExperts) {
         err = "GLM expert helper link: no prompt exchange for this layer";
         return false;
@@ -1559,12 +1559,12 @@ bool GlmExpertHelper::pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std
 // the helper's prompt product for a layer's expert types: 1 the fused kernel (gate/up and down), 2 MMQ's gate/up and the
 // fused down, 0 MMQ, -1 none.  pf_type_bits: a type's part of that for kOpen's answer (hlink::Ctl::pf_types).
 static bool pf_fused_here(int n_embd, int n_ff) {
-#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_USE_HIP) && defined(MAYA_HIP_PREFILL_FUSED)
     static const bool env = [] {
         const char* v = std::getenv("MAYA_GLM_LINK_PF_FUSED");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    return env && n_embd == 4096 && n_ff == 2048 && strata::prefill::rdna4::shape_ok(n_embd, n_ff) && strata::prefill::rdna4::available();
+    return env && n_embd == 4096 && n_ff == 2048 && maya::prefill::rdna4::shape_ok(n_embd, n_ff) && maya::prefill::rdna4::available();
 #else
     (void) n_embd; (void) n_ff;
     return false;
@@ -1572,13 +1572,13 @@ static bool pf_fused_here(int n_embd, int n_ff) {
 }
 
 int GlmExpertHelper::pf_type_bits(int t) const {
-    namespace mmq = strata::prefill::mmq;
+    namespace mmq = maya::prefill::mmq;
     int bits = mmq::built() && mmq::supported(t) ? hlink::kPfMmq : 0;
-#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_USE_HIP) && defined(MAYA_HIP_PREFILL_FUSED)
     constexpr int kAny = 16;   // (IQ2_XXS: the fused kernel takes it on either side)
     if (pf_fused_here(n_embd_, n_ff_)) {
-        if (strata::prefill::rdna4::supported(t, kAny)) bits |= hlink::kPfFusedGu;
-        if (strata::prefill::rdna4::supported(kAny, t)) bits |= hlink::kPfFusedDown;
+        if (maya::prefill::rdna4::supported(t, kAny)) bits |= hlink::kPfFusedGu;
+        if (maya::prefill::rdna4::supported(kAny, t)) bits |= hlink::kPfFusedDown;
     }
 #endif
     return bits;
@@ -1590,9 +1590,9 @@ int GlmExpertHelper::pf_mode(int gu_type, int d_type) const {
 
 bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
                              int rows, int r0, const uint8_t* const* blobs, std::string& err, int slot) {
-#if defined(STRATA_USE_HIP)
-    namespace mmq = strata::prefill::mmq;
-    namespace gb = strata::kernels::glmb;
+#if defined(MAYA_USE_HIP)
+    namespace mmq = maya::prefill::mmq;
+    namespace gb = maya::kernels::glmb;
     if (pf_ == nullptr || T <= 0 || slot < 0 || slot > 2 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
         rows < 0 || rows > T * K || r0 < 0) {
         err = "GLM expert helper: invalid prompt call";
@@ -1694,8 +1694,8 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
     // gate/up (a type the fused kernel does not decode), its H rounded for the fused down.
     // MAYA_GLM_LINK_PF_FUSED=0: MMQ as before.
     const bool fused = fmode > 0 && n > 0 && rows > 0;
-#if defined(STRATA_HIP_PREFILL_FUSED)
-    namespace rf = strata::prefill::rdna4;
+#if defined(MAYA_HIP_PREFILL_FUSED)
+    namespace rf = maya::prefill::rdna4;
     uint8_t* Xa = nullptr;
     uint8_t* Ha = nullptr;
     int* tiles = nullptr;
@@ -1777,7 +1777,7 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
             jr += take;
             if (jr == cnts[j]) { ++j; jr = 0; }
         }
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
         if (fused && fmode == 1) {
             fused_run(ps, a, true);
             gb::moe_combine_add(OUTP, r0 + a, r0 + a, r0 + b, pos_d, rw_d, T, K, E, out_d, s);
@@ -1810,7 +1810,7 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
             mq.run(P, s);
         }
         gb::swiglu_rows(GU, GU, nr, nff, limit, s, 2 * nff);
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
         if (fused) {   // (mode 2: H rounded as the fused gate/up writes it, the down in one launch)
             rf::quantize_rows(GU, 2 * (int64_t) nff, iota, nr, nff, Ha, s);
             fused_run(ps, a, false);
@@ -1841,7 +1841,7 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
         if (2 * (bp + n + 2) > 2 * (hlink::kPfMaxExperts + 8192)) {   // (the bounds table is reused from its start)
             if (!check(cudaStreamSynchronize(s), "prompt window", err, device_)) return false;
             bp = 0;
-#if defined(STRATA_HIP_PREFILL_FUSED)
+#if defined(MAYA_HIP_PREFILL_FUSED)
             cq = 0;
 #endif
         }
@@ -1877,11 +1877,11 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
 // The same layer for an EXL3 pack's experts: MMQ does not read their trellis, so each expert's rows go through the
 // prompt path's EXL3 lane (glmpf::x3_expert_rows: the weights decoded once, FP16 GEMMs), a window of rows at a time,
 // and the window's weighted rows are added into out as pf_run does.
-bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int T, int K, int n,
+bool GlmExpertHelper::pf_run_x3(const maya::kernels::exl3::ExpertLayout& lay, float limit, int T, int K, int n,
                                 int rows, int r0, const uint8_t* const* blobs, std::string& err, int slot) {
-#if defined(STRATA_USE_HIP)
-    namespace gb = strata::kernels::glmb;
-    namespace x3 = strata::kernels::exl3;
+#if defined(MAYA_USE_HIP)
+    namespace gb = maya::kernels::glmb;
+    namespace x3 = maya::kernels::exl3;
     if (pf_ == nullptr || T <= 0 || slot < 0 || slot > 2 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
         rows < 0 || rows > T * K || r0 < 0) {
         err = "GLM expert helper: invalid prompt call";
@@ -1964,7 +1964,7 @@ bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, 
 }
 
 bool GlmExpertHelper::pf_x3_init(std::string& err) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (pf_x3_win_ != 0) return true;
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
@@ -1993,4 +1993,4 @@ bool GlmExpertHelper::pf_x3_init(std::string& err) {
 #endif
 }
 
-} // namespace strata::core
+} // namespace maya::core

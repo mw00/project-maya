@@ -16,9 +16,9 @@
 // IQ4_XS; other quants: IQ2_S, Q2_K, Q4_K) at the GLM-5.3 expert shapes (gate+up 2 x 2048 x 6144, down 6144 x 2048),
 // each first through the prompt path's MMQ gate (mmq::supported, B14.2's sm_70 instance check): a refused type FAILs.
 // Needs a GPU; exits 77 when there is none.
-#include "strata/kernels/glmd_mmq_pad.hpp"
-#include "strata/prefill/moe_mmq.hpp"
-#include "strata/prefill/moe_mmq_strata.hpp"
+#include "maya/kernels/glmd_mmq_pad.hpp"
+#include "maya/prefill/moe_mmq.hpp"
+#include "maya/prefill/moe_mmq_strata.hpp"
 
 #include "ggml.h"
 
@@ -32,8 +32,8 @@
 #include <string>
 #include <vector>
 
-namespace mmq = strata::prefill::mmq;
-namespace ma = strata::prefill::mmq_strata;
+namespace mmq = maya::prefill::mmq;
+namespace ma = maya::prefill::mmq_strata;
 
 namespace {
 
@@ -198,7 +198,7 @@ int main() {
         // a type the gate refuses is not multiplied with MMQ in production, and here it would hit NO_DEVICE_CODE (a
         // trap that ends the binary before the other types run): a FAIL with the reason, never a skip
         std::string why = "not covered by mmq::supported";
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         // (a HIP build: glmpf::mmq_ok asks only mmq::supported - B14.2's instance rule is CUDA's sm_70 one)
         (void) cc;
         (void) optin;

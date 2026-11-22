@@ -1,5 +1,5 @@
 // src/core/glm_tier_plan.cpp - the glm-dsa port B8.2-B8.4 / B8.7 host-side rules (see glm_tier_plan.hpp).  Plain C++.
-#include "strata/core/glm_env.hpp"
+#include "maya/core/glm_env.hpp"
 #include "glm_tier_plan.hpp"
 
 #include <algorithm>
@@ -9,7 +9,7 @@
 #include <cstring>
 #include <sstream>
 
-namespace strata::core::glmtier {
+namespace maya::core::glmtier {
 
 // ---------------------------------------------------------------- B8.2
 
@@ -168,7 +168,7 @@ int seg_node(int k, int half, bool split, const std::vector<int>& nodes) {
 // ---------------------------------------------------------------- B8.7
 
 int thp_mode(const char* env) {
-    return strata::glmenv::switch_value("MAYA_GLM_THP", env, strata::glmenv::kAuto, true);
+    return maya::glmenv::switch_value("MAYA_GLM_THP", env, maya::glmenv::kAuto, true);
 }
 
 int64_t buddy_huge_free(const std::string& text) {
@@ -310,7 +310,7 @@ const char* lane_pool_name(LanePool m) {
 // ---------------------------------------------------------------- B8.4
 
 bool numa_split_requested(bool glm_dsa, const char* env) {
-    return glm_dsa && strata::glmenv::switch_value("MAYA_GLM_NUMA_SPLIT", env, strata::glmenv::kOff) == strata::glmenv::kOn;
+    return glm_dsa && maya::glmenv::switch_value("MAYA_GLM_NUMA_SPLIT", env, maya::glmenv::kOff) == maya::glmenv::kOn;
 }
 
 bool split_layout(size_t gu_row, size_t d_row, int64_t n_ff, int64_t n_embd, int64_t d_blck, size_t d_blck_bytes,
@@ -411,4 +411,4 @@ void add_partial(const float* y0, const float* y1, float* y, int64_t n) {
     for (int64_t r = 0; r < n; ++r) y[r] = y0[r] + y1[r];
 }
 
-}  // namespace strata::core::glmtier
+}  // namespace maya::core::glmtier

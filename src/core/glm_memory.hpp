@@ -8,14 +8,14 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core::glmfast {
+namespace maya::core::glmfast {
 
 // The all-resident launch skip (MAYA_GLM_RESIDENT_SKIP; the complete pool was here too until v1.1.35): on by
 // default on AMD, where the Strix / Gorgon Halo APUs hold every expert (measured there); an NVIDIA build launches
 // every route's kernels unless the setting is 1.  The setting, when given, wins either way.
 inline bool on_by_default_on_amd(const char* env) {
     if (const char* v = std::getenv(env)) return std::atoi(v) != 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return true;
 #else
     return false;
@@ -33,7 +33,7 @@ inline bool complete_pool_on() {
 // ... and the other way round: on by default on NVIDIA, off on AMD unless the setting is 1
 inline bool off_by_default_on_amd(const char* env) {
     if (const char* v = std::getenv(env)) return std::atoi(v) != 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     return true;
@@ -137,7 +137,7 @@ inline bool complete_pool(int main_slots, int experts, int spares) {
 // that holds every expert, the spares and the prompt path's tail the pool is the complete one too - short of it, the
 // experts' bytes exactly, as before.  An AMD APU under Linux; CUDA's unified hosts keep the exact pool.
 inline bool unified_complete_pool() {
-#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+#if defined(MAYA_USE_HIP) && !defined(_WIN32)
     return true;
 #else
     return false;
@@ -295,4 +295,4 @@ inline bool drain_reads_vram(int drain_layer, int route_layer, char vslot_state,
     return drain_layer == route_layer && vslot_state == draining_state;
 }
 
-}  // namespace strata::core::glmfast
+}  // namespace maya::core::glmfast

@@ -25,10 +25,10 @@
 #include <string>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
-using strata::ds4::Exl3Lane;
-using strata::ds4::LaneEnt;
-using strata::ds4::Pool;
+namespace kc = maya::kernels::cpu;
+using maya::ds4::Exl3Lane;
+using maya::ds4::LaneEnt;
+using maya::ds4::Pool;
 
 static void* node_alloc(size_t bytes, int node) {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -159,10 +159,10 @@ int main(int argc, char** argv) {
     for (int k = 0; k < cases; ++k) {
         const int rows = window(1 + (int) (rs() % 12), 1 + (int) (rs() % 6), ents);
         std::fill(yd.begin(), yd.end(), -1.0f);
-        strata::ds4::exl3_experts(c, x.data(), E, ents.data(), (int) ents.size(), part, nodes, nophase, false);
+        maya::ds4::exl3_experts(c, x.data(), E, ents.data(), (int) ents.size(), part, nodes, nophase, false);
         std::vector<float> a(yd.begin(), yd.begin() + (size_t) rows * E);
         std::fill(yd.begin(), yd.end(), -2.0f);
-        strata::ds4::exl3_experts(c, x.data(), E, ents.data(), (int) ents.size(), part, nodes, nophase, true);
+        maya::ds4::exl3_experts(c, x.data(), E, ents.data(), (int) ents.size(), part, nodes, nophase, true);
         if (std::memcmp(a.data(), yd.data(), a.size() * 4) != 0) {
             ++bad;
             size_t i = 0;
@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
                     ents.push_back(en);
                 }
                 const auto t0 = std::chrono::steady_clock::now();
-                strata::ds4::exl3_experts(c, x.data(), E, ents.data(), cf.ne, part, nodes, nophase, way == 1);
+                maya::ds4::exl3_experts(c, x.data(), E, ents.data(), cf.ne, part, nodes, nophase, way == 1);
                 ms[way] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             }
         std::printf("%2d experts x %d tokens: steps %.3f ms, flow %.3f ms a call (%+.1f%%)\n", cf.ne, cf.n, ms[0] / iters,

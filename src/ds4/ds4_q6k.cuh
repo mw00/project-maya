@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 constexpr int kQ6kBytes = 210;
 
@@ -158,4 +158,4 @@ inline uint32_t eg_block_row_bytes(int fmt, int hd) {
     return (uint32_t) (fmt == 1 ? hd / 256 * kQ6kBytes : fmt == 3 ? hd / 256 * kQ5kBytes : hd / 32 * kIq4nlBytes);
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

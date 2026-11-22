@@ -5,7 +5,7 @@
 //
 // Prints the median time of one layer's experts (gate/up + down, as rf::experts launches them), its int8 TOPS and an
 // FNV-1a hash of the output's bits (the same hash = the same arithmetic).
-#include "strata/prefill/moe_fused_rdna4.hpp"
+#include "maya/prefill/moe_fused_rdna4.hpp"
 #include "ggml.h"
 #include <hip/hip_runtime.h>
 
@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace rf = strata::prefill::rdna4;
+namespace rf = maya::prefill::rdna4;
 int E = 4096, FF = 2048, NE = 288, TOPK = 8;   // GLM-5.3-Flash's; `ds4` as the 5th argument: DeepSeek-V4.1's
 
 void ck(hipError_t e) { if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e)); }

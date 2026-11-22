@@ -6,7 +6,7 @@
 #pragma once
 #include <cstdint>
 
-namespace strata::ds4::lt {
+namespace maya::ds4::lt {
 
 /// y[r][c] = x[r] . W[c] for r < t, c < n: W FP16 [n][k] row-major, x FP16 rows of ldx, y FP32 rows of ldy (beta 0).
 /// false: not taken (not an AMD build with hipBLASLt, DS4_LT=0, fewer than kMinRows rows, no candidate runs) - the
@@ -34,4 +34,4 @@ void set_store(const char* path, const char* setting = nullptr);
 /// Whether this build has hipBLASLt (an AMD build with it; DS4_LT=0 counts as without).
 bool available();
 
-}  // namespace strata::ds4::lt
+}  // namespace maya::ds4::lt

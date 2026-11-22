@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_prompt_cache_test.cpp - glm-dsa B14.14 (CPU only): the content-addressed prompt-cache store
-// (include/strata/core/glm_prompt_cache.hpp) with fake state payloads (a file of the tokens; the "load" checks the
+// (include/maya/core/glm_prompt_cache.hpp) with fake state payloads (a file of the tokens; the "load" checks the
 // requested prefix against them), in a scratch directory under the build tree (or $TMPDIR).
 //   1. hashing: token-sensitive and length-sensitive keys, the block chain, entry names;
 //   2. restore_len: the whole entry, a divergence (one token before it), a prompt that ends inside the entry;
@@ -10,7 +10,7 @@
 //   5. fingerprint refusal: a store opened with another identity sees none of the entries and leaves them on disk;
 //      damaged files (.tmp, a .bin without .meta, a .bin of the wrong size, a bad magic) are removed at open;
 //   6. a failed load removes that entry and restores nothing.
-#include "strata/core/glm_prompt_cache.hpp"
+#include "maya/core/glm_prompt_cache.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -22,7 +22,7 @@
 #include "glm_test_env.hpp"   // setenv / unsetenv / getpid (<unistd.h> on POSIX; mapped on Windows)
 #include <vector>
 
-using namespace strata::core::glmpc;
+using namespace maya::core::glmpc;
 namespace fs = std::filesystem;
 
 namespace {

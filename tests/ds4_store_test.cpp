@@ -28,8 +28,8 @@
 #include <utility>
 #include <vector>
 
-using strata::ds4::ExpertStore;
-namespace os = strata::ds4::os;
+using maya::ds4::ExpertStore;
+namespace os = maya::ds4::os;
 
 namespace {
 
@@ -200,11 +200,11 @@ std::vector<uint8_t> ask(ExpertStore& st, const Model& m, int l, const std::vect
 
 void test_auto_size() {
     const uint64_t G = 1ull << 30;
-    EXPECT(strata::ds4::store_auto_bytes(64 * G, 12 * G, 100 * G, 4 * G) == 52 * G);
-    EXPECT(strata::ds4::store_auto_bytes(64 * G, 12 * G, 30 * G, 4 * G) == 30 * G);
-    EXPECT(strata::ds4::store_auto_bytes(14 * G, 12 * G, 100 * G, 4 * G) == 0);
-    EXPECT(strata::ds4::store_auto_bytes(10 * G, 12 * G, 100 * G, 4 * G) == 0);
-    EXPECT(strata::ds4::store_auto_bytes(~0ull, 12 * G, 100 * G, 4 * G) == 0);
+    EXPECT(maya::ds4::store_auto_bytes(64 * G, 12 * G, 100 * G, 4 * G) == 52 * G);
+    EXPECT(maya::ds4::store_auto_bytes(64 * G, 12 * G, 30 * G, 4 * G) == 30 * G);
+    EXPECT(maya::ds4::store_auto_bytes(14 * G, 12 * G, 100 * G, 4 * G) == 0);
+    EXPECT(maya::ds4::store_auto_bytes(10 * G, 12 * G, 100 * G, 4 * G) == 0);
+    EXPECT(maya::ds4::store_auto_bytes(~0ull, 12 * G, 100 * G, 4 * G) == 0);
 }
 
 void test_reads(const Model& m, bool direct) {

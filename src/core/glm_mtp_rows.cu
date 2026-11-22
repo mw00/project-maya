@@ -14,7 +14,7 @@
 //   1. mtpw_front / mtpw_back: the rows through the parts and the head (a group's front can run while another
 //      group's back does: the split's GPUs work on different groups, as with the plain batched rows);
 //   2. mtpw_picks: the picks; the host keeps each window's rows up to the first draft that differs from what was
-//      written before it (strata/core/mtp_rows.hpp) - the kept rows' picks are the tokens written;
+//      written before it (maya/core/mtp_rows.hpp) - the kept rows' picks are the tokens written;
 //   3. mtpw_commit: where a window kept fewer rows than it had, every part's recurrent states (KDA S and conv
 //      history) go back to the copy taken before the window and the kept rows are replayed from their inputs (kept
 //      by the forward pass); the positions become the window's start + kept rows.  The DSA caches' rows past that are
@@ -33,9 +33,9 @@
 // NextN cache rows' embeddings (last part); on the last part the rows' trunk hidden states and a draft chain's state.
 #include "glm_rows_state.hpp"
 
-#include "strata/core/mtp_rows.hpp"
-#include "strata/core/glm_maya_sync.hpp"   // glm-dsa: glm_rows_ok (these rows are Flash kernels)
-#include "strata/kernels/sampler.hpp"
+#include "maya/core/mtp_rows.hpp"
+#include "maya/core/glm_maya_sync.hpp"   // glm-dsa: glm_rows_ok (these rows are Flash kernels)
+#include "maya/kernels/sampler.hpp"
 
 #include "ggml.h"
 
@@ -52,7 +52,7 @@
 #include <mutex>
 #include <thread>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 using glmrows::image_row_in;
@@ -321,7 +321,7 @@ bool Glm5Model::rows_bind_win(const int* seqs, const int* counts, int n, RowSeq*
 
 // one part's share of a group's step (mtpw_front's parts, mtpw_back's last one)
 bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32_t* tokens,
-                          const strata::kernels::SamplerParams* sps, Glm5Model* prev, bool last, std::string& err) {
+                          const maya::kernels::SamplerParams* sps, Glm5Model* prev, bool last, std::string& err) {
     MtpRows* M = mtpw_;
     const size_t W = M->W;
     FastState* F = fast_;
@@ -418,7 +418,7 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
         }
         for (int c = 0, row = 0; c < n; row += counts[c], ++c) {
             const float* lg = row_at(S->logits, g.n_vocab, row);
-            if (strata::core::rows_pick_argmax(sps[c])) {
+            if (maya::core::rows_pick_argmax(sps[c])) {
                 for (int t = 0; t < counts[c]; ++t) gf::argmax(lg + (size_t) t * g.n_vocab, g.n_vocab, S->tok + row + t, s);
             } else {
                 // row t: the request's draw index + t, its penalties over the window's tokens before it
@@ -449,7 +449,7 @@ namespace {
 struct RowsJob {
     std::vector<int> seqs, counts;
     std::vector<int32_t> toks;
-    const strata::kernels::SamplerParams* sps = nullptr;  // the back's per-conversation sampler (the caller's array)
+    const maya::kernels::SamplerParams* sps = nullptr;  // the back's per-conversation sampler (the caller's array)
     RowsJob* prev_job = nullptr;      // the front's job of the same group (the back's stage chain reads it)
     unsigned tag = 0;                  // the job's serial: the workers wait the previous part's stage == tag
     std::atomic<unsigned> stage[8];    // set to tag when that part's enqueue of the group ended
@@ -643,7 +643,7 @@ void Glm5Model::rows_crew_start(std::string& err) {
 }
 
 bool Glm5Model::mtpw_back(const int* seqs, const int* counts, int n, const int32_t* tokens,
-                          const strata::kernels::SamplerParams* sps, std::string& err) {
+                          const maya::kernels::SamplerParams* sps, std::string& err) {
     static const bool crews = getenv("MAYA_GLM_MTPW_CREWS") != nullptr &&
                               std::atoi(getenv("MAYA_GLM_MTPW_CREWS")) != 0;
     if (crews) {
@@ -1131,4 +1131,4 @@ bool Glm5Model::mtpw_draft_take(int32_t* out, std::string& err) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

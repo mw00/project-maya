@@ -2,23 +2,18 @@
 # the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
 #
 #   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
-#         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native]
+#         [-DMAYA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native]
 #   cmake --build build-vision --target maya-vision
 cmake_minimum_required(VERSION 3.21)
-project(strata_vision C CXX)
+project(maya_vision C CXX)
 
-# Maya's build options by the names its docs give them: -DMAYA_X=... sets MAYA_X, the name this file reads
-get_cmake_property(_maya_cache CACHE_VARIABLES)
-foreach(_v IN LISTS _maya_cache)
-  if(_v MATCHES "^MAYA_(.+)$")
-    set(STRATA_${CMAKE_MATCH_1} "${${_v}}")
-  endif()
-endforeach()
+# the older -DSTRATA_X spelling of the build options still works (as MAYA_X, with a deprecation note)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/maya_old_names.cmake)
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
-option(STRATA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
-option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
-if(STRATA_PORTABLE AND MSVC)
+option(MAYA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
+option(MAYA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
+if(MAYA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
@@ -33,7 +28,7 @@ set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
-  if(STRATA_PORTABLE)
+  if(MAYA_PORTABLE)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     set(GGML_OPENMP OFF CACHE BOOL "" FORCE)        # no vcomp140.dll / libgomp needed on the user's PC
     foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
@@ -49,15 +44,15 @@ else()
   endif()
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA ${STRATA_VISION_CUDA} CACHE BOOL "" FORCE)
-option(STRATA_VISION_HIP "run the vision encoder on the GPU via HIP/ROCm (builds ggml's HIP backend)" OFF)
-set(STRATA_VISION_HIP_TARGETS "" CACHE STRING "AMDGPU targets for the HIP vision build, e.g. gfx1201")
-set(GGML_HIP ${STRATA_VISION_HIP} CACHE BOOL "" FORCE)
-if(STRATA_VISION_HIP)
-  if(STRATA_VISION_CUDA)
-    message(FATAL_ERROR "STRATA_VISION_CUDA and STRATA_VISION_HIP are mutually exclusive")
+set(GGML_CUDA ${MAYA_VISION_CUDA} CACHE BOOL "" FORCE)
+option(MAYA_VISION_HIP "run the vision encoder on the GPU via HIP/ROCm (builds ggml's HIP backend)" OFF)
+set(MAYA_VISION_HIP_TARGETS "" CACHE STRING "AMDGPU targets for the HIP vision build, e.g. gfx1201")
+set(GGML_HIP ${MAYA_VISION_HIP} CACHE BOOL "" FORCE)
+if(MAYA_VISION_HIP)
+  if(MAYA_VISION_CUDA)
+    message(FATAL_ERROR "MAYA_VISION_CUDA and MAYA_VISION_HIP are mutually exclusive")
   endif()
-  set(AMDGPU_TARGETS "${STRATA_VISION_HIP_TARGETS}" CACHE STRING "" FORCE)
+  set(AMDGPU_TARGETS "${MAYA_VISION_HIP_TARGETS}" CACHE STRING "" FORCE)
 endif()
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)

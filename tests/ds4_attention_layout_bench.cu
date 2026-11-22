@@ -7,7 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-using namespace strata::ds4;
+using namespace maya::ds4;
 #define CK(call) do {auto e=(call);if(e!=hipSuccess){std::fprintf(stderr,"line%d %s: %s\n",__LINE__,#call,hipGetErrorString(e));std::exit(2);}}while(0)
 static unsigned rng=0x8153ab71u;
 static unsigned next(){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;return rng;}

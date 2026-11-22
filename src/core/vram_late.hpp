@@ -21,7 +21,7 @@
 #include <system_error>
 #include <vector>
 
-namespace strata::vramlate {
+namespace maya::vramlate {
 
 constexpr int64_t kStep = (int64_t) 32 << 20;      // the figure moves in steps of 32 MiB
 constexpr size_t kSpare = (size_t) 128 << 20;      // the default reserve keeps the plan while it holds this beyond it
@@ -190,4 +190,4 @@ struct Tracker {
     }
 };
 
-}  // namespace strata::vramlate
+}  // namespace maya::vramlate

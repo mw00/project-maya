@@ -1,12 +1,12 @@
 // src/core/device.cu - P2.S1: the CUDA side of the runtime core.
-#include "strata/core/device.hpp"
+#include "maya/core/device.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstring>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -24,9 +24,9 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
     if (i < n_floats) p[i] = __int_as_float(0x7fc00000);
 }
 
-#if defined(STRATA_USE_HIP)
-#if !defined(STRATA_HIP_ARCHS)
-#error "STRATA_HIP_ARCHS (the compiled HIP architectures) is set by cmake/hip_backend.cmake"
+#if defined(MAYA_USE_HIP)
+#if !defined(MAYA_HIP_ARCHS)
+#error "MAYA_HIP_ARCHS (the compiled HIP architectures) is set by cmake/hip_backend.cmake"
 #endif
 // "gfx1201:sramecc-:xnack-" -> "gfx1201"
 std::string base_arch(const char* gcn_arch_name) {
@@ -37,7 +37,7 @@ std::string base_arch(const char* gcn_arch_name) {
 }
 
 bool compiled_for(const std::string& arch) {
-    const std::string list = STRATA_HIP_ARCHS;
+    const std::string list = MAYA_HIP_ARCHS;
     size_t a = 0;
     while (a <= list.size()) {
         size_t b = list.find(',', a);
@@ -52,7 +52,7 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
     const std::string arch = base_arch(p.gcnArchName);
     const std::string card = "GPU " + std::to_string(ordinal) + " (" + p.name + ", " + arch + ")";
     if (!compiled_for(arch)) {
-        return card + " is not an architecture this Maya engine was compiled for (" + STRATA_HIP_ARCHS +
+        return card + " is not an architecture this Maya engine was compiled for (" + MAYA_HIP_ARCHS +
                "); compile it for this card (./maya.sh --backend hip, or -DCMAKE_HIP_ARCHITECTURES=" + arch +
                ", docs/AMD_MAYA.md) or choose another GPU with HIP_VISIBLE_DEVICES";
     }
@@ -70,8 +70,8 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
 }  // namespace
 
 const char* compiled_gpu_archs() {
-#if defined(STRATA_USE_HIP)
-    return STRATA_HIP_ARCHS;
+#if defined(MAYA_USE_HIP)
+    return MAYA_HIP_ARCHS;
 #else
     return "";
 #endif
@@ -81,8 +81,8 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-#if defined(STRATA_USE_HIP)
-        throw CudaError(std::string("no HIP device is present; this engine was compiled for ") + STRATA_HIP_ARCHS, -1);
+#if defined(MAYA_USE_HIP)
+        throw CudaError(std::string("no HIP device is present; this engine was compiled for ") + MAYA_HIP_ARCHS, -1);
 #else
         throw CudaError("no CUDA device is present; this engine needs an NVIDIA GPU (RTX 20 series or newer)", -1);
 #endif
@@ -119,7 +119,7 @@ DeviceInfo device_info(int ordinal) {
     // to a machine with an older card and would otherwise silently take whatever path the driver chose.  The HIP
     // backend checks the compiled architecture list and requires wave32 (wave64 gfx908 runs through the
     // hip_compat half-wavefront layer).
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
 #else
@@ -180,4 +180,4 @@ void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     return (char*) base_ + start;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

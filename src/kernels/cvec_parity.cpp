@@ -1,12 +1,12 @@
-// src/kernels/cvec_parity.cpp - the control vector kernel (strata/kernels/cvec.hpp) against a host reference.
+// src/kernels/cvec_parity.cpp - the control vector kernel (maya/kernels/cvec.hpp) against a host reference.
 //   1. project: h - s (h.v) v per stream and token, against double precision; the steered component is gone.
 //   2. add: h + d.
 //   3. switched off: R unchanged without a pending write; with one, R is BITWISE the write the fused read folds
 //      (fused_gr_read with apply), which is what keeps a loaded-but-off vector identical to the stock engine.
 //   4. a layer without a direction is untouched.
 
-#include "strata/kernels/cvec.hpp"
-#include "strata/kernels/fused_gr.hpp"
+#include "maya/kernels/cvec.hpp"
+#include "maya/kernels/fused_gr.hpp"
 
 #include <cuda_runtime.h>
 
@@ -17,7 +17,7 @@
 #include <random>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = maya::kernels;
 
 namespace {
 

@@ -102,7 +102,7 @@ struct Q4xSet {
 };
 
 struct CpuExperts {
-    strata::ds4::gguf::IqCpu f;
+    maya::ds4::gguf::IqCpu f;
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
     size_t g_stride = 0, d_stride = 0;   // bytes an expert in the gate / up tensors, in the down tensor
     // (0: g_stride / d_stride) the step from one expert's matrix to the next's - the GPU fetch's RAM store, where an
@@ -172,10 +172,10 @@ uint64_t ram_total();
 /// share, which the system does not count as RAM) - 0 where the driver does not say
 uint64_t gpu_own_free(int domain, int bus, int dev);
 /// Windows: the dedicated memory DXGI reports for the adapter with this LUID (a device property's luid: an APU's
-/// carve-out; strata/platform/dedicated.hpp) - 0 where unknown, and off Windows
+/// carve-out; maya/platform/dedicated.hpp) - 0 where unknown, and off Windows
 uint64_t gpu_dedicated(const void* luid);
 /// Windows: what this process can still commit (RAM + page file, with what a page file Windows manages may still
-/// grow by; strata/platform/commit.hpp) - every allocation on an APU's GPU is charged to it; 0 off Windows
+/// grow by; maya/platform/commit.hpp) - every allocation on an APU's GPU is charged to it; 0 off Windows
 uint64_t commit_available();
 
 /// Whether 4-bit copies make this host's lane faster: up to 64 of ex's experts re-coded (freed after), then lane calls

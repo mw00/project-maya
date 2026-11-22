@@ -3,7 +3,7 @@
 // It compares GGML's MMQ result (with its intended q8_1 activation rounding) to a CPU FP32 product using
 // GGML's own dequantizer for the exact same weight blocks. The tolerances screen layout/stride/bounds errors;
 // they do not assert bitwise or FP16 parity.
-#include "strata/prefill/moe_mmq.hpp"
+#include "maya/prefill/moe_mmq.hpp"
 #include "ggml.h"
 #include <hip/hip_runtime.h>
 
@@ -19,12 +19,12 @@
 #include <vector>
 
 namespace {
-using strata::prefill::mmq::Context;
-using strata::prefill::mmq::Product;
-using strata::prefill::mmq::matrix_bytes;
-using strata::prefill::mmq::q8_bytes;
-using strata::prefill::mmq::quantize;
-using strata::prefill::mmq::supported;
+using maya::prefill::mmq::Context;
+using maya::prefill::mmq::Product;
+using maya::prefill::mmq::matrix_bytes;
+using maya::prefill::mmq::q8_bytes;
+using maya::prefill::mmq::quantize;
+using maya::prefill::mmq::supported;
 
 void hip_check(hipError_t e, const char * what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));

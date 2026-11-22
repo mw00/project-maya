@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace strata::ds4::gguf::iq {
+namespace maya::ds4::gguf::iq {
 
 // ggml type ids
 constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19,
@@ -107,7 +107,7 @@ struct SetArgs {
     int tu = 0;                // (kActOai) the up's type when it is not the gate's (0: tg) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
 };
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.
 // Keeping it here leaves the shared EXL3/GGUF SetArgs ABI unchanged.
 class MmqRowsScope {
@@ -184,4 +184,4 @@ bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* 
 bool persist_on();
 void set_persist(int on);
 
-}  // namespace strata::ds4::gguf::iq
+}  // namespace maya::ds4::gguf::iq

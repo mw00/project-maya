@@ -1,8 +1,8 @@
-// tests/glm_mv_bench.cu - the fast path's GEMV (strata::kernels::glmf::mv) with several activation columns: each
+// tests/glm_mv_bench.cu - the fast path's GEMV (maya::kernels::glmf::mv) with several activation columns: each
 // column's result against the single-column call (bit for bit), and the time of 1 - 8 and 16 columns.
 //
 //   glm_mv_bench [n_in n_out]      (default 4096 8192, the KDA projections' shape)
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
 
@@ -14,7 +14,7 @@
 #include <algorithm>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace {
 

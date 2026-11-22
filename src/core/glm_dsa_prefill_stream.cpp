@@ -3,12 +3,12 @@
 // knobs are in glm_dsa_prefill_stream.hpp; the pure schedule in glm_dsa_prefill_stream_plan.cpp; one node's share
 // arithmetic in glm_dsa_prefill_share.cpp.  Maya-owned glm_prefill.cu calls in through one-line hooks
 // (STRATA-EDITS.txt, B9.9).
-#include "strata/core/glm_env.hpp"
+#include "maya/core/glm_env.hpp"
 #include "glm_dsa_prefill_stream.hpp"
 
 #include "glm_fast_state.hpp"
 #include "glm_tier_numa.hpp"
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <cuda_runtime.h>
 
@@ -28,7 +28,7 @@
 #include <unistd.h>
 #endif
 
-namespace strata::core {
+namespace maya::core {
 
 namespace glmpfs {
 
@@ -144,7 +144,7 @@ void host_free_node(void* p) {
 bool share_ok(const glmtier::TierState* T, int il) {
     if (!glmtier::split_layer(T, il)) return true;
     static const bool on = [] {
-        return strata::glmenv::env_flag("MAYA_GLM_PREFILL_SPLIT_SHARE", true);
+        return maya::glmenv::env_flag("MAYA_GLM_PREFILL_SPLIT_SHARE", true);
     }();
     return on && T->lane[0] != nullptr && T->lane[1] != nullptr && il < (int) T->half.size() &&
            T->half[(size_t) il].n_ff > 0 && il < (int) T->L.size() && T->L[(size_t) il].blob > 0;
@@ -218,4 +218,4 @@ bool Glm5Model::prefill_stream_early(int64_t p0, int T, int chunk, bool pipeline
     return ok;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

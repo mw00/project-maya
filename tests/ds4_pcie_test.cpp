@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace pcie = strata::ds4::pcie;
+namespace pcie = maya::ds4::pcie;
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
 
 int main() {

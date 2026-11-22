@@ -4,7 +4,7 @@
 
 #include <cstdio>
 
-namespace d = strata::ds4;
+namespace d = maya::ds4;
 
 static int fails = 0;
 #define CHECK(c)                                                       \

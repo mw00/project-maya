@@ -3,9 +3,9 @@
 // a pipelined read - every part idle in a gap, every chunk read once in order by every part, no deadlock; prefill_chunks
 // (MAYA_GLM_PREFILL_MIN_CHUNKS): the chunks a call is cut into - as before when off, the floor's count when on.  CPU
 // only.
-#include "strata/core/prefill_chunks.hpp"
-#include "strata/core/prefill_gaps.hpp"
-#include "strata/core/prefill_pieces.hpp"
+#include "maya/core/prefill_chunks.hpp"
+#include "maya/core/prefill_gaps.hpp"
+#include "maya/core/prefill_pieces.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -29,7 +29,7 @@ std::vector<size_t> walk(size_t from, size_t end, const std::vector<size_t>& mar
     size_t at = from, mi = 0;
     while (at < end) {
         const size_t seg = mi < marks.size() ? marks[mi] : end;
-        const size_t e = strata::core::prefill_piece_end(at, seg, piece);
+        const size_t e = maya::core::prefill_piece_end(at, seg, piece);
         out.push_back(e);
         if (e == seg && mi < marks.size()) ++mi;
         at = e;
@@ -43,7 +43,7 @@ bool pipeline(int np, int nc, long long gaps, int* n_gaps) {
     std::mutex mu;
     std::condition_variable cv;
     std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
-    strata::core::PipelineGaps G(np, nc);
+    maya::core::PipelineGaps G(np, nc);
     std::atomic<int> busy{0};
     std::atomic<bool> bad{false};
     std::vector<std::vector<int>> order((size_t) np);
@@ -109,7 +109,7 @@ bool pipeline(int np, int nc, long long gaps, int* n_gaps) {
 }  // namespace
 
 int main() {
-    using strata::core::prefill_piece_end;
+    using maya::core::prefill_piece_end;
     // off: the whole segment
     expect(prefill_piece_end(0, 10000, 0) == 10000, "off: one call");
     expect(prefill_piece_end(100, 1000, 2048) == 1000, "shorter than a piece: one call");
@@ -138,7 +138,7 @@ int main() {
         expect(off == std::vector<size_t>({3000, 20000, 30001}), "walk off: the marks and the end, as before");
     }
     // the setting
-    using strata::core::prefill_interleave_parse;
+    using maya::core::prefill_interleave_parse;
     expect(prefill_interleave_parse(nullptr).tokens == 0, "unset: off");
     expect(prefill_interleave_parse("0").tokens == 0, "0: off");
     expect(prefill_interleave_parse("2048").tokens == 2048 && prefill_interleave_parse("2048").rounds == 1,
@@ -146,23 +146,23 @@ int main() {
     expect(prefill_interleave_parse("1024,4").rounds == 4, "1024,4: four rounds");
     expect(prefill_interleave_parse("16").tokens == 256, "a piece is 256 at least");
     expect(prefill_interleave_parse("2048").exact && !prefill_interleave_parse("2048,1,cut").exact, "exact unless ,cut");
-    using strata::core::prefill_aligned_piece;
+    using maya::core::prefill_aligned_piece;
     expect(prefill_aligned_piece(2048, 8128) == 8128, "exact: one whole chunk at least");
     expect(prefill_aligned_piece(16384, 8128) == 16256, "exact: two chunks");
     expect(prefill_aligned_piece(2048, 0) == 2048, "no chunk: as asked");
     // the decode gaps' setting
-    using strata::core::prefill_gaps_parse;
+    using maya::core::prefill_gaps_parse;
     expect(prefill_gaps_parse(nullptr).percent == 0 && prefill_gaps_parse("0").percent == 0, "gaps unset / 0: off");
     expect(prefill_gaps_parse("25").percent == 25 && prefill_gaps_parse("25").max_ms == 4000.0, "gaps 25");
     expect(prefill_gaps_parse("95").percent == 90, "gaps: 90% at most");
     expect(prefill_gaps_parse("20,1500").max_ms == 1500.0, "gaps: the longest gap");
-    using strata::core::prefill_gap_budget_ms;
+    using maya::core::prefill_gap_budget_ms;
     expect(prefill_gap_budget_ms(prefill_gaps_parse("20"), 2800.0) == 700.0, "a 20% gap after a 2.8 s stage: 0.7 s");
     expect(prefill_gap_budget_ms(prefill_gaps_parse("50,1000"), 2800.0) == 1000.0, "the cap");
     expect(prefill_gap_budget_ms(prefill_gaps_parse("0"), 2800.0) == 0.0, "off: none");
     // the gaps' gate: part k starts chunk c after boundary c + k - 1, none past the last
     {
-        strata::core::PipelineGaps G(2, 4);
+        maya::core::PipelineGaps G(2, 4);
         expect(G.may_start(1, 0) == false && G.all_idle(0), "boundary 0: part 1 waits, nothing to wait for");
         G.released = 0;
         expect(G.may_start(1, 0) && !G.may_start(1, 1) && !G.all_idle(1), "after boundary 0: chunk 0 only");
@@ -183,7 +183,7 @@ int main() {
     }
     // the chunks a call is cut into (MAYA_GLM_PREFILL_MIN_CHUNKS)
     {
-        using namespace strata::core;
+        using namespace maya::core;
         expect(prefill_min_chunks_parse(nullptr).n == 1 && prefill_min_chunks_parse("1").n == 1 &&
                    prefill_min_chunks_parse("0").n == 1,
                "min chunks unset / 0 / 1: off");

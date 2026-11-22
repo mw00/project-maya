@@ -30,8 +30,8 @@
 #include <string>
 #include <vector>
 
-namespace x3 = strata::mm3::exl3;
-namespace iq = strata::ds4::gguf::iq;
+namespace x3 = maya::mm3::exl3;
+namespace iq = maya::ds4::gguf::iq;
 namespace gg = mm3::gg;
 
 namespace {
@@ -669,7 +669,7 @@ void test_gv(cudaStream_t s) {
                 const std::vector<float> h0 = host(y0, (size_t) nc * n), h1 = host(y1, (size_t) nc * n);
                 char what[96];
                 std::snprintf(what, sizeof what, "gv %s k %d, %d activations = ds4_iq's mv", iq::name(t), k, nc);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
                 const bool hip = true;   // (HIP: the GEMVs stay ds4_iq's - mm3_gv covers nothing there)
 #else
                 const bool hip = false;

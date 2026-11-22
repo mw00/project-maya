@@ -12,12 +12,12 @@
 #include <cstdio>
 #include <vector>
 
-using strata::ds4::latest_point;
-using strata::ds4::mark_plan;
-using strata::ds4::mark_victim;
-using strata::ds4::MarkAt;
-using strata::ds4::MarkUse;
-using strata::ds4::TailCost;
+using maya::ds4::latest_point;
+using maya::ds4::mark_plan;
+using maya::ds4::mark_victim;
+using maya::ds4::MarkAt;
+using maya::ds4::MarkUse;
+using maya::ds4::TailCost;
 
 namespace {
 

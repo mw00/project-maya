@@ -13,7 +13,7 @@ int main() {
         std::array<int, 2> active{41, 41}, spare{-7, -7};
         int read_calls = 0, copy_calls = 0, inflight = 1, incoming = 9;
         bool pending = true;
-        const bool ready = strata::ds4::prepare_cache_swap(2, [&] {
+        const bool ready = maya::ds4::prepare_cache_swap(2, [&] {
             ++read_calls;
             return failure != 0;
         }, [&](int member) {
@@ -23,7 +23,7 @@ int main() {
         });
         assert(read_calls == 1);
         assert(ready == (failure == -1));
-        if (!strata::ds4::discard_failed_cache_swap(ready, pending, incoming, inflight)) {
+        if (!maya::ds4::discard_failed_cache_swap(ready, pending, incoming, inflight)) {
             active = spare;  // the production cache_switch's publication branch
             pending = false;
             incoming = -1;
@@ -34,8 +34,8 @@ int main() {
         assert(copy_calls == (failure == 0 ? 0 : failure == 1 ? 1 : 2));
         // Failed reservations can be retried; readiness must not leak from the previous attempted move.
         pending = true; incoming = 10; inflight = 1;
-        const bool retry = strata::ds4::prepare_cache_swap(2, [] { return true; }, [](int) { return true; });
-        assert(retry && !strata::ds4::discard_failed_cache_swap(retry, pending, incoming, inflight));
+        const bool retry = maya::ds4::prepare_cache_swap(2, [] { return true; }, [](int) { return true; });
+        assert(retry && !maya::ds4::discard_failed_cache_swap(retry, pending, incoming, inflight));
         assert(pending && incoming == 10 && inflight == 1);
     }
     // The table inputs (tick_flush): in turn; an input whose reader is done is taken without a wait; one whose reader
@@ -46,7 +46,7 @@ int main() {
         int next = 0, waits = 0, last_wait = -1;
         bool wait_ok = true;
         auto take = [&] {
-            return strata::ds4::take_table_input(next, kSlots, [&](int k) { return state[(size_t) k]; },
+            return maya::ds4::take_table_input(next, kSlots, [&](int k) { return state[(size_t) k]; },
                                                  [&](int k) {
                                                      ++waits;
                                                      last_wait = k;

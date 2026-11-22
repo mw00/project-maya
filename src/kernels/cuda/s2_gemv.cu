@@ -3,7 +3,7 @@
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads, no __ldg hints.  Phase 3 changes this file; the parity test is what says whether a change is
 // still right.
-#include "strata/kernels/s2_gemv.hpp"
+#include "maya/kernels/s2_gemv.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int QK = 64;
@@ -60,4 +60,4 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

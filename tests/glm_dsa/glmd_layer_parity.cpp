@@ -19,7 +19,7 @@
 //                 feeds hnorm the post-output-norm hidden, as llama.cpp's t_h_nextn and Glm5Model's head_x do)
 //   dsa_n_sel_last = p + 1 after every token (top_k 2048 > 12: the identity selection).
 // Exits 77 without a device or without the fixture tools.
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include "glm_dsa_fixtures.hpp"
 #include "glm_test_env.hpp"   // setenv / unsetenv (<unistd.h> on POSIX; mapped on Windows)
@@ -77,7 +77,7 @@ bool run(bool slow, const fs::path& pack, const fs::path& cb, const std::vector<
         setenv("MAYA_GLM_SLOW", "1", 1);
     else
         unsetenv("MAYA_GLM_SLOW");
-    strata::core::Glm5Model m;
+    maya::core::Glm5Model m;
     const bool ok = m.load_pack(pack.string(), kCtx, r.err);
     unsetenv("MAYA_GLM_SLOW");
     if (!ok) return false;
@@ -127,7 +127,7 @@ int main() {
     }
     {   // the pack passes the glm-dsa loader's shape checks (no GPU work)
         setenv("MAYA_GLM_CHECK_ONLY", "1", 1);
-        strata::core::Glm5Model m;
+        maya::core::Glm5Model m;
         std::string e;
         m.load_pack(pack.string(), kCtx, e);
         unsetenv("MAYA_GLM_CHECK_ONLY");

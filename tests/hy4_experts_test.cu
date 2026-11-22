@@ -20,7 +20,7 @@
 #include "../src/hy4/hy4_kernels.cuh"
 #include "../src/hy4/hy4_lane.hpp"
 
-namespace iq = strata::ds4::gguf::iq;
+namespace iq = maya::ds4::gguf::iq;
 
 namespace {
 

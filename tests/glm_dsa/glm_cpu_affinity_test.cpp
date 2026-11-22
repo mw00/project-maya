@@ -1,16 +1,16 @@
 // tests/glm_dsa/glm_cpu_affinity_test.cpp - glm-dsa B15.5 on the CPU: thread pools sized from the affinity mask.
 //
-// strata::core::glmaff::mask_cpus() (include/strata/core/glm_cpu_affinity.hpp), which the CPU-lane setup and the
+// maya::core::glmaff::mask_cpus() (include/maya/core/glm_cpu_affinity.hpp), which the CPU-lane setup and the
 // split search's RAM-bandwidth probe now use instead of std::thread::hardware_concurrency(): the test narrows this
 // process's affinity mask with sched_setaffinity (what numactl --cpunodebind / taskset / a cgroup do) and checks that
 // mask_cpus() follows it, while hardware_concurrency() keeps reporting the machine (llama.cpp #29301's bug).
-#include "strata/core/glm_cpu_affinity.hpp"
+#include "maya/core/glm_cpu_affinity.hpp"
 
 #include <cstdio>
 #include <thread>
 
 int main() {
-    namespace aff = strata::core::glmaff;
+    namespace aff = maya::core::glmaff;
     int fail = 0;
 #if defined(__linux__)
     cpu_set_t orig;

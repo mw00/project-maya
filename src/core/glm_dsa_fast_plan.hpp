@@ -13,9 +13,9 @@
 #include <functional>
 #include <string>
 
-namespace strata::core::glmdsa {
+namespace maya::core::glmdsa {
 
-// The weight types the binder hands to gf::mv (mirrors strata::kernels::glmf::kTypeF32 / kTypeBF16; glm_dsa_fast.cu
+// The weight types the binder hands to gf::mv (mirrors maya::kernels::glmf::kTypeF32 / kTypeBF16; glm_dsa_fast.cu
 // static_asserts they agree).
 constexpr int kTypeF32 = 0;
 constexpr int kTypeBF16 = 30;
@@ -122,4 +122,4 @@ void q8_1_quantize_host(const float* x, int64_t n, void* xq);
 float half_to_float(uint16_t h);
 uint16_t float_to_half(float f);
 
-}  // namespace strata::core::glmdsa
+}  // namespace maya::core::glmdsa

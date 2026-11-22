@@ -41,7 +41,7 @@ is the pinned dependency Maya builds its native path and `maya-vision` against.
 
 ## 2. What the engine already is
 
-For reference, the implemented geometry (`include/strata/core/layout.hpp:27-59`): n_embd 2560, 48 layers,
+For reference, the implemented geometry (`include/maya/core/layout.hpp:27-59`): n_embd 2560, 48 layers,
 full attention every 4th layer (12 QSA), GDN linear layers (16 k-heads / 48 v-heads, state 128, conv 4),
 QSA full attention (24 heads, 2 KV heads, head_dim 256, indexer 4 q-heads over one shared 128-dim key),
 gated residual with hc = 4 streams and a 320-wide bottleneck, MoE 512 experts × top-10 × intermediate 640,
@@ -50,11 +50,11 @@ a layer-1 PLE module backed by a 28.8 GB n-gram table, and an MTP draft layer. P
     gr_read (attn) -> GDN | QSA -> gr_write (attn) -> gr_read (ffn) -> MoE -> gr_write (ffn)
 
 The engine's unit is a captured per-layer CUDA graph replayed by a host loop that overlaps a CPU expert
-pool and a VRAM expert cache behind a doorbell (`include/strata/core/session.hpp`). Experts live in
+pool and a VRAM expert cache behind a doorbell (`include/maya/core/session.hpp`). Experts live in
 `experts.bin` (fixed-size blobs, `layer * n_expert + expert`), served from a pinned arena by default or
-from an mmap in low-RAM mode (`--mmap-experts`, `include/strata/core/expert_source.hpp:303-360`). Dense
+from an mmap in low-RAM mode (`--mmap-experts`, `include/maya/core/expert_source.hpp:303-360`). Dense
 weights load from the pack into VRAM. A "native pack" path runs directly from GGUF shards with per-layer
-runtime geometry (`include/strata/kernels/cpu/native_expert.hpp`) - this is how the Coder (mixed i-quant
+runtime geometry (`include/maya/kernels/cpu/native_expert.hpp`) - this is how the Coder (mixed i-quant
 types, 256 experts/layer) works, and it is the path a GLM pack would ride.
 
 ## 3. Component-by-component gap analysis
@@ -162,7 +162,7 @@ Either way this is the *cheapest* architecture delta; the risk is only parity di
   factor - small, but it is a *selection semantics* change: parity must be checked at the router output
   (the BF16-GEMV → logits → top-8 boundary), because a flipped selection is a different expert, not a
   rounding error (the repo's own note, `layer.hpp:131-139`).
-* **The hard wall: the canonical Q2_0 CPU expert kernel.** `include/strata/kernels/cpu/expert.hpp:34-45`
+* **The hard wall: the canonical Q2_0 CPU expert kernel.** `include/maya/kernels/cpu/expert.hpp:34-45`
   bakes H = 2560, FF = 640, NE = 512 and BLOB = 1,382,400 as compile-time constants, and its contract
   REFUSES other shapes ("a different n_embd or a different expert width is REFUSED rather than
   mis-indexed", `expert_source.hpp:18-21`). GLM does not go through it: the **native path**
@@ -178,7 +178,7 @@ Either way this is the *cheapest* architecture delta; the risk is only parity di
 ### 3.6 MTP, PLE-class extras, vision, tokenizer
 
 * **MTP.** One nextn layer, same protocol. Two fixes: the drafter's geometry is hardcoded to canonical
-  defaults (`static const strata::core::ModelGeometry draft_geometry{}`, `generate.cpp:1726`) and must
+  defaults (`static const maya::core::ModelGeometry draft_geometry{}`, `generate.cpp:1726`) and must
   follow the target model; the Qwen draft-vocab embed size is hardcoded at one call site
   (`generate.cpp:1374`, 248320) and must come from the pack. GLM's MTP tensors must be in the GGUF
   (llama.cpp's glm5 conversion carries nextn tensors) and `tools/mtp_pack.py` taught the tensor names.
@@ -311,7 +311,7 @@ draft layer's exact form stays a Phase 3 question.
 repo's negative-test discipline (every wrong reading must differ materially before the right one is
 judged):
 
-* **mHC** (`include/strata/kernels/glm_hc.hpp`, `src/kernels/cuda/glm_hc.cu`, `glm_hc_parity`): the
+* **mHC** (`include/maya/kernels/glm_hc.hpp`, `src/kernels/cuda/glm_hc.cu`, `glm_hc_parity`): the
   read half is three kernels - the joint-stack inverse RMS (ONE norm over all four streams, not
   gr's per-stream), the 24-row mixes GEMV, and a serial lane that forms the three gates, runs the
   Sinkhorn on the 4×4 comb (softmax over dst, +eps onto the values, dst-norm, then
@@ -321,14 +321,14 @@ judged):
   sum-vs-mean, and the pre-gate floor (with hc_eps exaggerated to 3e-2 in the structural fixture,
   since the real 1e-6 sits below f32 noise). Weights are F32 for now - the BF16-input variant is a
   Phase 3 wiring decision, pinned against this F32 reference.
-* **Router** (`include/strata/kernels/router_sigmoid.hpp`, `src/kernels/cuda/router_sigmoid.cu`,
+* **Router** (`include/maya/kernels/router_sigmoid.hpp`, `src/kernels/cuda/router_sigmoid.cu`,
   `router_sigmoid_parity`): one block per token, no reductions (sigmoid is bounded), the rank
   formula from router_top10 reproduced for the tie rule, bias applied to the SELECTION only, weights
   gathered from the unbiased sigmoid, renormalised with the 2**-14 clamp, scaled. The negative tests
   pin biased-weights (the noaux_tc trap), softmax-vs-sigmoid, missing renorm/scale, and tie order
   via a quantised fixture.
 
-* **KDA** (`include/strata/kernels/glm_kda.hpp`, `src/kernels/cuda/glm_kda.cu`, `glm_kda_parity`): the
+* **KDA** (`include/maya/kernels/glm_kda.hpp`, `src/kernels/cuda/glm_kda.cu`, `glm_kda_parity`): the
   linear-attention layer's four pieces, in ggml layouts end to end so Phase 3 wiring needs no
   transposes - the causal conv + SiLU with the history slide as a separate kernel (an in-place slide
   while earlier tokens' threads still read the old columns is a race), the low-rank gate's lower-bound
@@ -337,7 +337,7 @@ judged):
   baked in like ggml's kernel), and the normed-and-gated output. The negative tests pin the GDN
   readings: scalar per-head gate, value-axis gate, NO delta correction (plain linear attention - the
   shapes all agree), the softplus form, the missing output scale, and reversed conv taps.
-* **Clamped SwiGLU** (`include/strata/kernels/glm_ffn.hpp`, `src/kernels/cuda/glm_ffn.cu`,
+* **Clamped SwiGLU** (`include/maya/kernels/glm_ffn.hpp`, `src/kernels/cuda/glm_ffn.cu`,
   `glm_ffn_parity`): the dense-lead, routed-expert and shared-expert activation -
   `silu(min(gate, limit)) * clamp(up, ±limit)`. The negative tests pin the one-sided gate clamp and
   the clamp-before-silu order, whose differences live in silu's damped tail and are bounded
@@ -345,7 +345,7 @@ judged):
   This kernel also settled an accuracy contract: `__expf`'s argument-scaled ulp error is visible at
   |x| ~ 10, so these kernels use precise `expf`.
 
-* **DSA indexer + absorbed-MLA attention** (`include/strata/kernels/glm_dsa.hpp`,
+* **DSA indexer + absorbed-MLA attention** (`include/maya/kernels/glm_dsa.hpp`,
   `src/kernels/cuda/glm_dsa.cu`, `glm_dsa_parity`): the pool (per-key-dim softmax over
   gate+ape weighted member average), the score (relu'd multi-head dots against prescaled weights),
   the selection (the router rank formula over VISIBLE pools - pool p visible to query t only when

@@ -15,10 +15,10 @@
 #include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the mixer's window rows
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa L1-4: the plain residual's embed / head for a window's rows
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/exl3.hpp"
-#include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/exl3.hpp"
+#include "maya/core/glm_req_knobs.hpp"   // glm-dsa request knobs
+#include "maya/kernels/glm_fast.hpp"
 
 #include "ggml.h"
 
@@ -39,9 +39,9 @@
 #include <thread>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -122,7 +122,7 @@ static bool enable_peer_cached(int dst_dev, int src_dev) {
 // 3-token window of 45 layers).  On by default on compute capability 7.0 (Tesla V100, the one measured);
 // MAYA_GLM_WIN_HC_ROWS=1 turns it on on any NVIDIA card, =0 off (A/B).  Not on AMD.
 bool win_hc_rows() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static std::atomic<int> cache[64];
@@ -167,7 +167,7 @@ int win_stagger_mode() {
         if (v != nullptr) {
             mode = std::strcmp(v, "auto") == 0 ? kStagAuto : std::atoi(v) != 0 ? kStagOn : kStagOff;
         } else {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
             int major = 0, minor = 0;
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
@@ -676,7 +676,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     md.pf_src = F->pf_buf[il & 1];
     md.pf_dst = F->pf_buf[il & 1] + 8;
     md.pf_n = F->pf_n_buf[il & 1];
-    namespace x3 = strata::kernels::exl3;
+    namespace x3 = maya::kernels::exl3;
     const auto x3_args = [&](const gf::MoeDev& m) {
         x3::MoeArgs a;
         a.plan_ptr = m.plan_ptr;
@@ -1155,7 +1155,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
 }
 
 bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& err,
-                       const strata::kernels::SamplerParams* sp) {
+                       const maya::kernels::SamplerParams* sp) {
     if (fast_ == nullptr || T < 1 || T > kWinMax) {
         err = "glm window: needs the fast path and 1.." + std::to_string(kWinMax) + " tokens";
         return false;
@@ -1566,7 +1566,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
             return false;
         }
         if (W.pick_sampled) {
-            strata::kernels::SamplerParams sp = W.pick_sp;
+            maya::kernels::SamplerParams sp = W.pick_sp;
             sp.counter += (uint64_t) t;
             // (penalties: this window's tokens 1..t before it - pick_tok, written before token t was queued)
             m->pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
@@ -1632,7 +1632,7 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
     if (W.pick_sampled) {
         cudaStreamWaitEvent(F->cs, h->hh_ev_[sl], 0);
         cudaMemcpyAsync(lg + c0, ht_lg_h_ + (size_t) sl * nc, (size_t) nc * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-        strata::kernels::SamplerParams sp = W.pick_sp;
+        maya::kernels::SamplerParams sp = W.pick_sp;
         sp.counter += (uint64_t) t;
         pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
     } else {
@@ -1713,7 +1713,7 @@ bool Glm5Model::win_pipe_begin_part(bool fresh, std::string& err) {
     return true;
 }
 
-bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::kernels::SamplerParams* sp,
+bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const maya::kernels::SamplerParams* sp,
                                bool fresh) {
     const bool hold_last = first < 0;
     if (hold_last) first = -1 - first;
@@ -1976,7 +1976,7 @@ bool Glm5Model::win_pipe_end(int32_t* out, std::string& err) {
 }
 
 bool Glm5Model::window_pipe(const int32_t* tokens, int T, int32_t* out, std::string& err,
-                            const strata::kernels::SamplerParams* sp) {
+                            const maya::kernels::SamplerParams* sp) {
     if (fast_ == nullptr || T < 1 || T > kPipeMax) {
         err = "glm window: needs the fast path and 1.." + std::to_string(kPipeMax) + " tokens";
         return false;
@@ -2168,4 +2168,4 @@ bool Glm5Model::window_commit(int n_keep, std::string& err, bool wait) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

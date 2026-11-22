@@ -15,14 +15,14 @@
 // All arithmetic is f32 (the contract in glm_hc.hpp); the parity harness holds the kernel to
 // ref/glm.py's f64 reference at f32 tolerances, and the negative tests require the wrong readings
 // (per-stream norm, dst-major comb, mean-not-sum, no eps floor) to differ materially.
-#include "strata/kernels/glm_hc.hpp"
+#include "maya/kernels/glm_hc.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -211,4 +211,4 @@ void glm_hc_post(const float* block_out, const float* residual, const float* pos
                                                                             (int) s.n_embd, (int) s.hc, out);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

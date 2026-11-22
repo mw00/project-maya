@@ -24,7 +24,7 @@
 #define DS4_LP_HD
 #endif
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 constexpr int kTopLogprobs = 20;   // OpenAI's top_logprobs at most
 
@@ -134,4 +134,4 @@ inline std::string lp_line(long long rid, const LogprobRow& r) {
     return s;
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

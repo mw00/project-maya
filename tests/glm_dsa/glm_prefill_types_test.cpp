@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace pf = strata::core::glmpf;
+namespace pf = maya::core::glmpf;
 
 namespace {
 

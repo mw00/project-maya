@@ -4,7 +4,7 @@
 // vector loads.  The kernel is templated on the code WIDTH (a compile-time property of the unpacking loop) and
 // takes the rest of the per-type attributes as run-time arguments, because the manifest supplies them per
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
-#include "strata/kernels/s_gemv.hpp"
+#include "maya/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 // `kvalues_iq4nl`: the non-linear codebook, verbatim from ggml-common.h / ggml-quants.c.
@@ -683,4 +683,4 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
     finish("s_gemv_q8_0_split", stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

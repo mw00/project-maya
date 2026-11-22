@@ -3,12 +3,12 @@
 #
 # glm_warm_seq.cpp is plain C++ (the switches, the file order, the run count, the counters); glm_warm_seq_model.cu the
 # engine side (the parts' turn on the disk, the digests).  Maya-owned glm_fast_path.cu calls both from fast_warm
-# (STRATA-EDITS.txt), so they join strata_engine on any GPU backend (a HIP build compiles src/*.cu as HIP).
-if(TARGET strata_engine)
-  target_sources(strata_engine PRIVATE src/core/glm_warm_seq.cpp src/core/glm_warm_seq_model.cu)
+# (STRATA-EDITS.txt), so they join maya_engine on any GPU backend (a HIP build compiles src/*.cu as HIP).
+if(TARGET maya_engine)
+  target_sources(maya_engine PRIVATE src/core/glm_warm_seq.cpp src/core/glm_warm_seq_model.cu)
 endif()
 
-if(STRATA_BUILD_TESTS)
+if(MAYA_BUILD_TESTS)
   enable_testing()
   # CPU: the switches, file_order / read_order / runs, fast_warm's job list in slot order vs file order on mock packs
   # (3 runs a batch; printed at GLM-5.3's shape), the digest hash, the counters.  No engine.

@@ -13,7 +13,7 @@
 // Both kernels put ONE BLOCK per token over the vocabulary: `sampler_greedy_kernel` is the plain argmax,
 // `sampler_kernel` runs the sampled chain as `top_k` block-argmax rounds followed by the top_p / temperature /
 // draw chain (its header says why the selection must be parallel and why the tie rule keeps the semantics).
-#include "strata/kernels/sampler.hpp"
+#include "maya/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -21,7 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 // Philox 4x32-10, the counter-based generator the phase asks for.  Counter-based matters because it makes the
@@ -580,4 +580,4 @@ void sample_verify(const float* logits, int n_tokens, int n_vocab, const Sampler
     spec_launched("sample_verify", stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

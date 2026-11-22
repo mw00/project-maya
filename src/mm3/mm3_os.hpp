@@ -22,7 +22,7 @@
 
 namespace mm3::os {
 
-namespace sys = strata::ds4::os;
+namespace sys = maya::ds4::os;
 
 #if !defined(_WIN32)
 inline std::string read_small(const std::string& path) {

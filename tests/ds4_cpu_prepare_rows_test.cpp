@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <stdexcept>
 
-namespace gg = strata::ds4::gguf;
+namespace gg = maya::ds4::gguf;
 
 static void require(bool ok, const char* why) {
     if (!ok) throw std::runtime_error(why);
@@ -38,7 +38,7 @@ struct Backend {
 int main() {
     try {
 #if defined(DS4_CPU_PREPARE_STUB_TEST)
-        // Linked to the real ds4_iq_cpu.cpp without STRATA_NATIVE_EXPERTS.
+        // Linked to the real ds4_iq_cpu.cpp without MAYA_NATIVE_EXPERTS.
         gg::iq_cpu_prepare_rows(19);
         gg::iq_cpu_prepare_rows(29);
         require(!gg::iq_cpu_own_rows(19), "stub must not enable own rows");

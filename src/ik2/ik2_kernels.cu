@@ -3,10 +3,10 @@
 #include "ik2_iq_tables.h"
 
 #include <cuda_fp16.h>
-#ifndef STRATA_USE_HIP
+#ifndef MAYA_USE_HIP
 #include <cuda_fp8.h>   // (AMD: the FP8 conversions are the portable ones below)
 #else
-#include "strata/kernels/rdna_wmma.hpp"   // (AMD: the matrix cores - ik2_rdna.inc)
+#include "maya/kernels/rdna_wmma.hpp"   // (AMD: the matrix cores - ik2_rdna.inc)
 
 #include <string>
 #include <type_traits>
@@ -172,7 +172,7 @@ __device__ float bmax(float v, float* sh) {
 constexpr int kBlk = 256;
 
 // two FP16 a register: a * b / a - b, each half rounded to nearest (as PTX's mul.rn / sub.rn.f16x2)
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
 typedef _Float16 ik2_h2v __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ uint32_t h2_mul(uint32_t a, uint32_t b) {
     return __builtin_bit_cast(uint32_t, __builtin_bit_cast(ik2_h2v, a) * __builtin_bit_cast(ik2_h2v, b));
@@ -921,7 +921,7 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
 constexpr int kFaBN = 64, kFaD = 128, kFaLd = kFaD + 8;   // (row pad: conflict-free fragments/ldmatrix)
 constexpr float kLog2e = 1.4426950408889634f;
 
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
 // AMD: no mma.sync / ldmatrix / cp.async.  These keep their CUDA fragment layouts exactly (a lane's registers hold the
 // same elements), so every kernel written for them runs as it is: the m16n8k16 product from the A rows and B columns
 // gathered by shuffles (each product of two FP16 is exact in FP32; the sums in a fixed order, the same every run), an
@@ -1065,7 +1065,7 @@ __device__ __forceinline__ void cp_async_commit() {}
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {}
 #endif
-#endif   // STRATA_USE_HIP
+#endif   // MAYA_USE_HIP
 // Volta's tensor cores (sm_70, and as an instruction every newer NVIDIA GPU has): mma.m8n8k4 - each quad pair of a
 // warp (lanes 4 q .. 4 q + 3 and 4 q + 16 .. 4 q + 19) its own D [8][8] += A [8][4] B [4][8], FP16 in, F32 sums.
 // Lane (j = lane & 3, hi = lane >> 4): c[i] is D [(j & 1) + 2 ((i >> 1) & 1) + 4 hi][(i & 1) + 2 (j >> 1) + 4 (i >> 2)];
@@ -1223,7 +1223,7 @@ __device__ __forceinline__ void wg_wait0() {
 #endif
 }
 // (keeps the compiler from moving an accumulator's use across the asynchronous MMA's issue or wait)
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
 __device__ __forceinline__ void wg_fence_operand(float&) {}   // (AMD: the warpgroup kernel is never built)
 #else
 __device__ __forceinline__ void wg_fence_operand(float& r) { asm volatile("" : "+f"(r)::"memory"); }
@@ -1235,7 +1235,7 @@ __device__ __forceinline__ void fence_proxy_async() {
 }
 // shared-memory matrix descriptor with the 128-byte swizzle: start, leading / stride byte offsets
 __device__ __forceinline__ uint64_t wg_desc(const void* p, uint32_t lbo, uint32_t sbo) {
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
     const uint32_t a = (uint32_t) (uintptr_t) p;   // (AMD: never used - the warpgroup kernel is Hopper's)
 #else
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
@@ -4354,7 +4354,7 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
                                         : (unsigned) (row - a1.r0) < (unsigned) a1.n ? a1.x
                                                                                      : x);
     float acc = 0.0f;
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
     if ((K & 255) == 0) {   // (AMD: 8 values a lane a step - a wave reads 256 bytes an instruction, three steps ahead)
         const uint2* q2 = (const uint2*) qr;
 #pragma unroll 3
@@ -5577,7 +5577,7 @@ mv_q8p_cols_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
     for (int i = 0; i < R; ++i)
 #pragma unroll
         for (int t = 0; t < TT; ++t) acc[i][t] = 0.0f;
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
     if ((K & 255) == 0) {   // (AMD: mv_q8p_kernel's 8 values a lane a step, the same expression a token)
         for (int it = 0, n_it = K >> 8; it < n_it; ++it) {
             uint2 w[R];
@@ -5872,7 +5872,7 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 }  // namespace
 
 int arch_class() {
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
     return 80;
 #else
     static int cls[64] = {};
@@ -5901,7 +5901,7 @@ static void need_class(int cls, const char* what) {
     std::fprintf(stderr, "ik2::k::%s: not on this GPU (sm_%d class; the kernel needs sm_%d)\n", what, arch_class(), cls);
     std::abort();
 }
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
 #include "ik2_rdna.inc"   // (AMD: the matrix-core kernels)
 #endif
 
@@ -6027,7 +6027,7 @@ bool fa_wgmma() {
     }();
     return on != 0;
 }
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
 // (AMD: the matrix-core kernel of ik2_rdna.inc on RDNA 3 / 3.5 / 4 - the CUDA kernel's 86 KB of shared memory is past
 //  RDNA's 64 KB; IK2_RDNA_FLASH=0: off)
 bool attn_flash_available() {
@@ -6041,7 +6041,7 @@ template <int NW, bool WG, class KVT>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
                        float* o_part, float2* ml_part, cudaStream_t s) {
-#ifdef STRATA_USE_HIP
+#ifdef MAYA_USE_HIP
     attn_flash_rdna<KVT>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window, n_split, o_part,
                          ml_part, s);
     return;

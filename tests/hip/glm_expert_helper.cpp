@@ -1,5 +1,5 @@
 // Helper ownership/replacement and weighted sums against the primary GPU.
-#include "strata/core/remote_experts.hpp"
+#include "maya/core/remote_experts.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #define GGML_COMMON_DECL_CPP
@@ -23,7 +23,7 @@ static int unsetenv(const char* k) { return _putenv_s(k, ""); }
     std::fprintf(stderr, "%s: %s\n", #call, hipGetErrorString(e)); return 2; } } while (0)
 
 static int helper_routing() {
-    namespace gf = strata::kernels::glmf;
+    namespace gf = maya::kernels::glmf;
     constexpr int NE = 64, N = 4096, K = 8, keys = 2 * NE;
     void* arena = nullptr;
     CHECK(hipMalloc(&arena, 256 << 10));
@@ -80,7 +80,7 @@ static int helper_routing() {
 // numbers, different bytes.  Each must answer from its own region (interleaved calls, against the primary GPU's sum
 // of that region's experts), and its answer must not be the other region's.
 static int two_helpers(int helper_device) {
-    namespace gf = strata::kernels::glmf;
+    namespace gf = maya::kernels::glmf;
     constexpr int E = 4096, FF = 2048, K = 4, gu_type = 16, d_type = 22;
     const size_t gu_block = sizeof(block_iq2_xxs), d_block = sizeof(block_iq2_s);
     const size_t gu_bytes = size_t(2) * FF * E / 256 * gu_block, down_bytes = size_t(E) * FF / 256 * d_block;
@@ -106,7 +106,7 @@ static int two_helpers(int helper_device) {
     const float weights[K] = {0.1f, 0.2f, 0.3f, 0.4f};
     const int keys[K] = {3, 1, 0, 2};
     std::string err;
-    strata::core::GlmExpertHelper part[2];
+    maya::core::GlmExpertHelper part[2];
     for (int p = 0; p < 2; ++p) {
         if (!part[p].open(helper_device, E, FF, {{host[p], K * blob_bytes}}, err) || !part[p].reserve(2 * K, K * blob_bytes, err)) {
             std::fprintf(stderr, "%s\n", err.c_str()); return 30;
@@ -234,7 +234,7 @@ static int memory_probe(int device) {
 }
 
 int main() {
-    namespace gf = strata::kernels::glmf;
+    namespace gf = maya::kernels::glmf;
     constexpr int E = 4096, FF = 2048, K = 8;
     int devices = 0, helper_device = -1;
     CHECK(hipGetDeviceCount(&devices));
@@ -295,7 +295,7 @@ int main() {
                 }
             }
         }
-        strata::core::GlmExpertHelper helper;
+        maya::core::GlmExpertHelper helper;
         if (!helper.open(helper_device, E, FF, {{host, K * blob_bytes}}, err)) {
             std::fprintf(stderr, "%s\n", err.c_str()); return 1;
         }

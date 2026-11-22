@@ -1,10 +1,10 @@
 // src/kernels/cuda/glmd_mixer.cu - the glm-dsa decode mixer's own kernels (B4.6, B14.3, B14.4); see
-// include/strata/kernels/glmd_mixer.hpp.  Also the decode dispatch policy's GPU side (glm-dsa wave 5,
-// include/strata/kernels/glmd_decode_policy.hpp): decode_score / decode_topk / decode_mla.
-#include "strata/kernels/glmd_mixer.hpp"
-#include "strata/kernels/glmd_decode_policy.hpp"
+// include/maya/kernels/glmd_mixer.hpp.  Also the decode dispatch policy's GPU side (glm-dsa wave 5,
+// include/maya/kernels/glmd_decode_policy.hpp): decode_score / decode_topk / decode_mla.
+#include "maya/kernels/glmd_mixer.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
 
-#include "glmd_arch.cuh"   // STRATA_GRID_CONSTANT (Pascal pass)
+#include "glmd_arch.cuh"   // MAYA_GRID_CONSTANT (Pascal pass)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -50,7 +50,7 @@ __device__ __forceinline__ float key_at(const float* k, size_t i, std::true_type
 // Maya's dsa_score_kernel arithmetic per cell, a grid-stride loop over the cells, n read on the device; KF16: the
 // keys are FP16 rows (B10.8), each element widened to f32 as it is read (the products and sums stay f32)
 template <bool KF16>
-__global__ void __launch_bounds__(kScoreThreads) idx_score_kernel(const STRATA_GRID_CONSTANT IdxScore a) {
+__global__ void __launch_bounds__(kScoreThreads) idx_score_kernel(const MAYA_GRID_CONSTANT IdxScore a) {
     extern __shared__ float s_iq[];   // idx_heads * idx_dim, then idx_heads weights
     const int n = a.p_dev ? min(a.n_cap, *a.p_dev + 1) : min(a.n_cap, a.p + 1);
     if (blockIdx.x == 0 && threadIdx.x == 0 && a.n_sel_out) *a.n_sel_out = min(n, a.sel_cap);
@@ -149,7 +149,7 @@ bool iota(int* cells, int n, void* stream) {
 // decode_policy_built, keeps them off there, and a policy that asks for them anyway gets the portable kernel,
 // idx_score / mla2)
 bool decode_score(const DecodePolicy& pol, const IdxScore& a, int64_t p, void* stream) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) pol;
     (void) p;
     return idx_score(a, stream);
@@ -176,7 +176,7 @@ bool decode_topk(const DecodePolicy& pol, const float* score, int ld, int n_kv, 
 }
 
 bool decode_mla(const DecodePolicy& pol, const Mla2& a, void* stream) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) pol;
 #else
     if (use_fused_mla(pol, a.n_head, a.qk_nope, a.qk_rope, a.kv_lora, a.v_head, a.w_type))

@@ -2,8 +2,8 @@
 // CUDA cores, the latent cache in F16 as the reference keeps it; the reference is AngelSlim's hy4-flash graph
 // (src/models/hy-v4-flash.cpp of their hy4-flash patch).
 #include "hy4_kernels.cuh"
-#include "strata/kernels/fresh_load.hpp"
-#include "strata/kernels/rdna_wmma.hpp"
+#include "maya/kernels/fresh_load.hpp"
+#include "maya/kernels/rdna_wmma.hpp"
 
 #include <cuda_fp16.h>
 
@@ -365,7 +365,7 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
     static const bool old = std::getenv("HY4_GEMV_OLD") != nullptr;
     const bool v4 = !old && n >= 128 && k % 128 == 0 && ld % 8 == 0 && ldx % 4 == 0 && ((uintptr_t) w & 15) == 0 &&
                     ((uintptr_t) x & 15) == 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (v4 && ncol > 1) {   // (AMD, a window's columns: x staged in shared memory - the same sums; one column: below)
         const dim3 b(256), g1((unsigned) ((n + 7) / 8), 1);
         if (ncol <= 4) gemv4s_kernel<W, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
@@ -381,7 +381,7 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
         // (5 and 6 columns: their own instances - a window of 5 tokens paid for the 8-column one's code; a column's
         //  sums are the same lanes' in the same order whatever the instance.  HY4_GEMV56=0: as before)
         static const bool nc56 = !(std::getenv("HY4_GEMV56") && std::getenv("HY4_GEMV56")[0] == '0');
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
         // (gemv4a_kernel: 4 steps' loads together up to 4 columns, 3 with more - the registers; HY4_GEMV_AHEAD=0: as before)
         static const bool ahead = !(std::getenv("HY4_GEMV_AHEAD") && std::getenv("HY4_GEMV_AHEAD")[0] == '0');
         if (ahead && nc56) {
@@ -584,7 +584,7 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
     //  each a trip past L1 - then summed in the slices' order as before: the same bits)
     constexpr int kNp = kHcBlocks * (kMaxM + 1);
     for (int i = threadIdx.x; i < kNp; i += blockDim.x)
-        s_part[i] = strata::kernels::ld_l2(part + (size_t) t * kNp + i);
+        s_part[i] = maya::kernels::ld_l2(part + (size_t) t * kNp + i);
     __syncthreads();
     if ((int) threadIdx.x <= kMaxM) {
         float v = 0.0f;
@@ -1139,7 +1139,7 @@ __global__ void __launch_bounds__(256) attn2_kernel(const float* __restrict__ q,
 constexpr int kWR = 16, kWDS = 576 + 8;   // (the tile's rows; a row's stride in F16 values: 16-byte reads on other banks)
 // (AMD: registers for 8 waves a SIMD - two blocks of 512 threads a WGP rather than one at the 200 the compiler takes
 //  on its own: the kernel waits on its loads and barriers, so the second block hides them)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #define HY4_WMMA_OCC __attribute__((amdgpu_waves_per_eu(8)))
 #else
 #define HY4_WMMA_OCC
@@ -1911,7 +1911,7 @@ __global__ void to_f16_rows_kernel(const float* __restrict__ src, size_t lds, in
 inline int rows_threads(int n) { return std::min(256, ((n + 3) / 4 + 31) / 32 * 32); }
 // (whether the row kernel takes these operands: AMD only - NVIDIA keeps the one-value kernel)
 inline bool f16_rows_form(const void* src, size_t lds, const void* dst, size_t ldd) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return ((uintptr_t) src & 15) == 0 && lds % 4 == 0 && ((uintptr_t) dst & 7) == 0 && ldd % 4 == 0;
 #else
     (void) src, (void) lds, (void) dst, (void) ldd;
@@ -1953,7 +1953,7 @@ __global__ void __launch_bounds__(1024) moe_sort_kernel(const int* __restrict__ 
         tok[r] = i / n_used;
         row_of[i] = r;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // AMD: the scatter's order within an expert is the order its threads' atomics land in, which differs from one
     // run to the next there - and the expert kernels' sums of a row depend a little on the rows beside it (their
     // tiles), so two starts gave two answers.  Each expert's rows put in token order (a token routes to an expert
@@ -2493,7 +2493,7 @@ __global__ void ix_unpack_kernel(const uint16_t* wire, int ldw, const int* __res
     extern __shared__ float4 ix_row[];
     const int t = blockIdx.x, p = pos[t], nv = p / kpool, nsel = min(nv, top);
     const float4* src = (const float4*) (wire + (size_t) t * ldw);
-    for (int i = threadIdx.x; i < (nsel + 7) / 8; i += blockDim.x) ix_row[i] = strata::kernels::ld_fresh_v(src + i);
+    for (int i = threadIdx.x; i < (nsel + 7) / 8; i += blockDim.x) ix_row[i] = maya::kernels::ld_fresh_v(src + i);
     __syncthreads();
     const uint16_t* sp = (const uint16_t*) ix_row;
     int* kt = keys + (size_t) t * ldk;
@@ -2653,7 +2653,7 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
 namespace {
 // attn_kernel's heads a block: 8 on NVIDIA, 32 on AMD (HY4_ATTN_HB=8 / 16 / 32 sets it there - the same sums)
 int attn_heads_a_block() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const int hb = [] {
         const char* e = std::getenv("HY4_ATTN_HB");
         const int v = e ? std::atoi(e) : 32;
@@ -2700,7 +2700,7 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     check("attn_combine");
 }
 bool attn_wmma_on() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // (the device's arch once a device: gfx11 - RDNA 3 / 3.5 - by default; gfx12 only with HY4_ATTN_WMMA=1, not
     //  measured there; HY4_ATTN_WMMA=0 off everywhere)
     static const int env = std::getenv("HY4_ATTN_WMMA") ? std::atoi(std::getenv("HY4_ATTN_WMMA")) : -1;
@@ -3234,10 +3234,10 @@ __device__ unsigned g_wait_timeouts = 0;
 // thread 0 of the block waits for *flag >= v (wrapping); every thread after it
 __device__ __forceinline__ void wait_for(const unsigned* flag, unsigned v) {
     if (threadIdx.x == 0) {
-        const unsigned long long t0 = strata::kernels::clock_ns();
+        const unsigned long long t0 = maya::kernels::clock_ns();
         while ((int) (*(volatile const unsigned*) flag - v) < 0) {
             __nanosleep(64);
-            if (strata::kernels::clock_ns() - t0 > kWaitLimitNs) {
+            if (maya::kernels::clock_ns() - t0 > kWaitLimitNs) {
                 atomicAdd(&g_wait_timeouts, 1u);
                 break;
             }
@@ -3277,7 +3277,7 @@ __global__ void wait_pull_kernel(const unsigned* flag, unsigned v, float4* __res
                                  size_t n4) {
     wait_for(flag, v);
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x)
-        dst[i] = strata::kernels::ld_fresh_v(src + i);
+        dst[i] = maya::kernels::ld_fresh_v(src + i);
 }
 __global__ void wait_flag_kernel(const unsigned* flag, unsigned v) { wait_for(flag, v); }
 // (the ranges' lines in turn, every thread a line a step: the first ranges' come first)
@@ -3297,7 +3297,7 @@ __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
     __threadfence_system();
 }
 void submit(cudaStream_t s) {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
     static const bool on = [] {
         const char* v = std::getenv("HY4_WIN_SUBMIT");
         return v == nullptr || std::atoi(v) != 0;
