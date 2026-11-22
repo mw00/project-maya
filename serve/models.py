@@ -724,9 +724,11 @@ def apply(cfg: dict, settings: dict) -> dict:
         if hy4_context_check(cfg, {**out, "args": args}) and flag(args, "--kv-streaming") is None:
             args = set_flag(args, "--kv-streaming", "auto")   # (streams only where nothing else fits, as the setup's)
     elif fam == "ik2":
-        # (maya-ik2: --max-context above; one GPU; the cache's format, IK2_KV)
-        if len(set(gpus)) != 1:
-            raise ValueError("GPUs: Inkling 2 Mini runs on one GPU for now - pick one")
+        # (maya-ik2: --max-context above; one GPU or two - --gpus 2, the split; the cache's format, IK2_KV)
+        if len(set(gpus)) not in (1, 2):
+            raise ValueError("GPUs: Inkling 2 Mini runs on one or two GPUs for now - pick one or two")
+        if gpus != gpus_of(cfg):
+            args = set_flag(args, "--gpus", "2") if len(set(gpus)) == 2 else drop_flag(args, "--gpus")
         # (the KV cache setting; IK2_KV typed into the variables by hand where the setting itself was not sent)
         kv = str(settings.get("kv") or clean.get("IK2_KV") or s.get("kv") or IK2F.DEFAULT_KV).lower()
         kv = {"fp16": "f16", "e4m3": "fp8"}.get(kv, kv)

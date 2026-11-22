@@ -2344,7 +2344,8 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
+    # (maya-ik2 on two GPUs splits by experts, not layers - its --gpus 2 is in the config's args)
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) != "ik2":
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
     # needs its own room there.  On a card the model already fills (Maya-XS leaves ~130 MB) the third
@@ -7835,7 +7836,7 @@ def main() -> int:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(vcfg, log=vlog, env=venv)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
-        if len(gpu_list(cfg)) > 1:
+        if len(gpu_list(cfg)) > 1 and models.family(cfg) != "ik2":
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
         mixed = mixed_gpus.config_of(cfg)   # (opt-in: an NVIDIA card beside the AMD GPU runs the first layers)

@@ -947,7 +947,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_source_files_properties(src/ik2/ik2_lane.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     endif()
     add_executable(maya-ik2 src/ik2/ik2_main.cu src/ik2/ik2_draft.cu src/ik2/ik2_cpu.cpp ${_ik2_lane_sources})
-    target_include_directories(maya-ik2 PRIVATE include src/hy4 third_party/ggml)
+    target_include_directories(maya-ik2 PRIVATE include src/hy4 src/mm3 third_party/ggml)
     target_link_libraries(maya-ik2 PRIVATE ik2_kernels strata_kernels_cpu ${_strata_gpu_blas_target} Threads::Threads
                           strata_spec)
     target_compile_definitions(maya-ik2 PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
