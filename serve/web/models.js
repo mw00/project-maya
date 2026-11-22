@@ -558,7 +558,7 @@ function qwenFields(m, d, s, ch, gpus) {
 function ik2Fields(m, d, ch) {
   const kvb = (m.ik2_kv_bytes || {})[d.kv] || 16384;
   const fit = ((m.ik2_fit || {})[d.kv] || {})[String(d.context)];
-  const gpu = html`<${Row} label="GPU" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU for now: NVIDIA 8 GB or more (experts that do not fit stay in RAM), AMD 24 GB."
+  const gpu = html`<${Row} label="GPU" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU for now: NVIDIA 8 GB or more, AMD 12 GB or more (experts that do not fit stay in RAM), a Ryzen AI Max APU with 24 GB."
     below=${html`<div class="mdl-gpus" role="radiogroup" aria-label="GPU">${(MS.data.gpus || []).map((g) => {
       const on = d.gpus.length === 1 && d.gpus[0] === g.index;
       return html`<button type="button" role="radio" aria-checked=${String(on)} class="mdl-gpu" onClick=${() => setDraft({gpus: [g.index]})}>

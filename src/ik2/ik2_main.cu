@@ -1258,6 +1258,19 @@ struct Work {
 
 // --serve: SIGUSR1 asks the request running to stop (its client went away) at its next token or prompt chunk
 volatile std::sig_atomic_t g_cancel = 0;
+bool g_apu = false;   // (AMD: an APU whose memory is the RAM - Strix / Gorgon Halo; set at the plan, AMD only)
+// IK2_VRAM_GB on an AMD APU (tests): its memory is the RAM, so a ballast would take the RAM the offload path pins -
+// instead every free figure the engine reads is capped: the emulated card less what the engine took since the start
+size_t g_emu_cap = 0, g_emu_free0 = 0;
+cudaError_t mem_info(size_t* fr, size_t* tot) {
+    const cudaError_t e = cudaMemGetInfo(fr, tot);
+    if (e == cudaSuccess && g_emu_cap) {
+        const size_t used = g_emu_free0 > *fr ? g_emu_free0 - *fr : 0;
+        *fr = std::min(*fr, g_emu_cap > used ? g_emu_cap - used : (size_t) 0);
+        *tot = g_emu_cap;
+    }
+    return e;
+}
 // IK2_STATS=1: per request, how many tokens the prefill's experts each ran ([0] 1, [1] 2, [2] 3-7, [3] 8+)
 uint64_t g_cnt_hist[4] = {0, 0, 0, 0};
 // IK2_STATS: a request's experts by where they came from: used and already cached / used and prefetched for this
@@ -2074,6 +2087,66 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                 X.slot_ptrs[e] = dst;
                 X.miss_pos[e] = r;
             };
+#ifdef MAYA_USE_HIP
+            if (d < 0 && st.n >= 2 && k::experts_rdna_available(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F)) {
+                // (AMD matrix cores, as the resident path's prompt: the layer's experts in batches of up to half the
+                //  ring's misses - the next batch's copies in flight while one runs - each tile one expert's rows, so
+                //  the same sums as with every expert in VRAM; one combine at the end in expert order)
+                RdnaMoe& R = rdna_moe(S, c.E, C, F);
+                int* th = R.tiles_h[ps];
+                const int half = std::max(1, st.n / 2);
+                std::vector<int> b_end;   // (batch b: the used experts [b_end[b-1], b_end[b]) of `used`)
+                std::vector<int> used;
+                for (int e = 0, m = 0; e < c.E; ++e) {
+                    if (!W.cnt[e]) continue;
+                    if (!X.slot_ptrs[e] && m == half) b_end.push_back((int) used.size()), m = 0;
+                    used.push_back(e);
+                    if (!X.slot_ptrs[e]) ++m;
+                }
+                b_end.push_back((int) used.size());
+                auto issue_batch = [&](int b) {
+                    for (int i = b ? b_end[b - 1] : 0; i < b_end[b]; ++i)
+                        if (!X.slot_ptrs[used[i]]) {
+                            while (X.miss_exps[issued] != used[i]) ++issued;   // (index order: the next miss)
+                            issue();
+                        }
+                };
+                gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, R.x16);
+                issue_batch(0);
+                int nt = 0;
+                for (size_t b = 0; b < b_end.size(); ++b) {
+                    if (b + 1 < b_end.size()) issue_batch((int) b + 1);
+                    const int i0 = b ? b_end[b - 1] : 0, nt0 = nt;
+                    int e_lo = c.E, e_hi = -1;
+                    for (int i = i0; i < b_end[b]; ++i) {
+                        const int e = used[i];
+                        const int r = X.miss_pos[e];
+                        if (r >= 0 && cst != g_s) CU(cudaStreamWaitEvent(g_s, rc[r], 0));
+                        R.eptr_h[ps][e] = X.slot_ptrs[e];
+                        e_lo = std::min(e_lo, e), e_hi = std::max(e_hi, e);
+                        for (int m0 = 0; m0 < W.cnt[e]; m0 += 32, ++nt)
+                            th[4 * nt] = e, th[4 * nt + 1] = W.start[e] + m0, th[4 * nt + 2] = std::min(32, W.cnt[e] - m0),
+                            th[4 * nt + 3] = 0;
+                    }
+                    if (nt == nt0) continue;
+                    CU(cudaMemcpyAsync(R.tiles + (size_t) 4 * nt0, th + (size_t) 4 * nt0, (size_t) (nt - nt0) * 16,
+                                       cudaMemcpyHostToDevice, g_s));
+                    CU(cudaMemcpyAsync(R.eptr + e_lo, R.eptr_h[ps] + e_lo, (size_t) (e_hi - e_lo + 1) * sizeof(void*),
+                                       cudaMemcpyHostToDevice, g_s));
+                    k::experts_rdna_gu(R.eptr, R.tiles + (size_t) 4 * nt0, nt - nt0, Ly.ty[0], Ly.eb[0], R.x16, C, F,
+                                       X.sg, X.su, c.gate_cap, c.up_cap, R.h16, g_s);
+                    k::experts_rdna_down(R.eptr, R.tiles + (size_t) 4 * nt0, nt - nt0, Ly.ty[2], Ly.eb[0] + Ly.eb[1],
+                                         R.h16, C, F, R.y32, g_s);
+                    if (cst != g_s)
+                        for (int i = i0; i < b_end[b]; ++i)
+                            if (X.miss_pos[used[i]] >= 0) CU(cudaEventRecord(rf[X.miss_pos[used[i]]], g_s));
+                }
+                k::moe_rows_combine(R.y32, X.inv, X.wtr, T, c.K, C, X.tmp, g_s);
+                if (n_miss) CU(cudaMemsetAsync(st.tag, 0xff, (size_t) st.n * 4, g_s));   // (no decode copy left there)
+                X.pf_layers[l % Work::kPfRing] = -1;
+                return;
+            }
+#endif
             while (issued < std::min(n_miss, st.n)) issue();
             XC.t_up += now() - tu;
             for (int e = 0; e < c.E; ++e) {
@@ -2786,7 +2859,7 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
     // its room: what is free less a quarter of a GiB (IK2_ROOM1_MB) and its token buffers; GPUs of two kinds compute
     // a row each their own way, so the split must not move between starts there: whole GiB
     size_t fr = 0, tot = 0;
-    CU(cudaMemGetInfo(&fr, &tot));
+    CU(mem_info(&fr, &tot));
     const size_t keep = (size_t) (getenv("IK2_ROOM1_MB") ? std::atof(getenv("IK2_ROOM1_MB")) : 256.0) * 1048576.0 +
                         ((size_t) 8 << 20);
     size_t room = fr > keep ? fr - keep : 0;
@@ -3070,8 +3143,13 @@ bool lane_init(Model& M, const std::string& want, int threads) {
     g_offs.hx = dalloc<float>((size_t) k::kOffMaxK * F);
     CU(cudaMemsetAsync(g_offs.ls, 0, sizeof(k::LaneState), g_s));
     const size_t jb = k::kLaneJobX + (size_t) C * 4, db = k::kLaneDoneY + (size_t) k::kOffMaxK * C * 4;
-    CU(cudaHostAlloc(&g_offs.job_h, jb, cudaHostAllocMapped | cudaHostAllocPortable));
-    CU(cudaHostAlloc(&g_offs.done_h, db, cudaHostAllocMapped | cudaHostAllocPortable));
+#ifdef MAYA_USE_HIP   // (AMD: the GPU and the lane spin on these words - fine-grained memory, never in the GPU's L2)
+    const unsigned door = cudaHostAllocMapped | cudaHostAllocPortable | hipHostMallocCoherent;
+#else
+    const unsigned door = cudaHostAllocMapped | cudaHostAllocPortable;
+#endif
+    CU(cudaHostAlloc(&g_offs.job_h, jb, door));
+    CU(cudaHostAlloc(&g_offs.done_h, db, door));
     std::memset(g_offs.job_h, 0, jb);
     std::memset(g_offs.done_h, 0, db);
     CU(cudaHostGetDevicePointer((void**) &g_offs.job_d, g_offs.job_h, 0));
@@ -3107,7 +3185,7 @@ bool lane_init(Model& M, const std::string& want, int threads) {
         cudaDeviceProp p{};
         CU(cudaGetDeviceProperties(&p, 0));
         size_t fr = 0, tot = 0;
-        CU(cudaMemGetInfo(&fr, &tot));
+        CU(mem_info(&fr, &tot));
         char kb[256];
         std::snprintf(kb, sizeof kb, "%s|%zu MiB|%u logical|%zu physical|%s|lane %d|C %d F %d", p.name, tot >> 20,
                       std::thread::hardware_concurrency(), maya::kernels::cpu::physical_cores(false).size(),
@@ -4652,7 +4730,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_fast && T > 1 && S <= W.rg_slots && !Ly.tab_h.empty()) {
+#ifdef MAYA_USE_HIP   // (AMD, the offload path: a short prompt the resident path's way too - its sums are other bits there
+                      //  than the matrix cores'; a tier expert read in VRAM, the others where they are pinned)
+        const bool rg_off = g_off && !g_offs.tab;
+#else
+        const bool rg_off = false;
+#endif
+        if ((g_fast || rg_off) && T > 1 && S <= W.rg_slots && (rg_off || !Ly.tab_h.empty())) {
             // Every expert in VRAM and a prompt of a few tokens (a chat turn): the experts straight over their
             // blocks, an expert's blocks read once for up to kGroupMax of the tokens that picked it.  (The GEMM path
             // below decodes a whole expert to FP16 for the two or three tokens it has: a 47-token prompt took 0.34 s.)
@@ -4678,7 +4762,14 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 if (g < 0 || gn[g] == k::kGroupMax) {   // the expert's first group, or its next
                     g = G++;
                     W.gi_stamp[e] = stp, W.gi_idx[e] = g;
-                    gb[g] = Ly.tab_h[e], gn[g] = 0;
+                    if (rg_off) {
+                        const auto& P = EC.pools[EC.layer_pool[l]];
+                        const int sl = EC.loc[(size_t) l * c.E + e];
+                        gb[g] = sl >= 0 ? P.data + (size_t) sl * P.slot_bytes : g_offs.host[l] + (size_t) e * Ly.slot_bytes;
+                    } else {
+                        gb[g] = Ly.tab_h[e];
+                    }
+                    gn[g] = 0;
                 }
                 gtok[(size_t) g * k::kGroupMax + gn[g]] = i / c.K;
                 grow[(size_t) g * k::kGroupMax + gn[g]] = i;
@@ -5423,11 +5514,12 @@ void check_preview(int n_gpu, bool serve) {
 #endif
         // (a card that does not hold every expert takes the offload path: a tier of them in VRAM, the rest in RAM;
         //  under 7 GiB - an 8 GB card's - the dense weights, the caches and the smallest tier do not fit beside)
-#ifdef MAYA_USE_HIP   // (AMD: no offload path there yet - every expert in the GPU's memory, a 24 GB card's)
-        if (p.totalGlobalMem < (22ull << 30) && !force) {
+#ifdef MAYA_USE_HIP   // (AMD: a discrete card from 12 GB - 11 GiB - on the offload path; an APU as before, 22 GiB)
+        if (p.totalGlobalMem < ((p.integrated ? 22ull : 11ull) << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs a 24 GB card" + run_anyway);
+            refuse(gpu + " has " + m + ", the Inkling 2 preview needs " +
+                   (p.integrated ? "24 GB of the APU's memory" : "an AMD card of 12 GB or more") + run_anyway);
         }
 #else
         if (p.totalGlobalMem < (7ull << 30) && !force) {
@@ -5559,8 +5651,18 @@ int main(int argc, char** argv) {
         if (!vg || !*vg) continue;
         CU(cudaSetDevice(d));
         size_t fr = 0, tot = 0;
-        CU(cudaMemGetInfo(&fr, &tot));
+        CU(mem_info(&fr, &tot));
         const size_t want = (size_t) (std::atof(vg) * 1073741824.0);
+#ifdef MAYA_USE_HIP
+        cudaDeviceProp pr{};
+        CU(cudaGetDeviceProperties(&pr, d));
+        if (pr.integrated && d == 0 && want < tot) {   // (an APU: the cap above, no ballast)
+            g_emu_cap = want, g_emu_free0 = fr;
+            std::printf("IK2_VRAM_GB=%s: GPU %d (an APU) as a card of %.1f GiB (its free figures capped)\n", vg, d,
+                        want / 1073741824.0);
+            continue;
+        }
+#endif
         if (want < tot) {
             void* ballast = nullptr;
             CU(cudaMalloc(&ballast, tot - want));
@@ -5798,12 +5900,13 @@ int main(int argc, char** argv) {
         }
         g_dense_bytes = dense_b, g_exp_bytes = exp_b;
         size_t fr0 = 0, tot0 = 0;
-        CU(cudaMemGetInfo(&fr0, &tot0));
+        CU(mem_info(&fr0, &tot0));
 #ifdef MAYA_USE_HIP
         {   // (an AMD APU whose memory is the RAM - Strix / Gorgon Halo on Linux: HIP's free figure is the GTT's, which
             //  can exceed what the RAM has left; the engines keep max(8 GiB, 10% of the RAM) free for the system)
             cudaDeviceProp p{};
             CU(cudaGetDeviceProperties(&p, 0));
+            g_apu = p.integrated && !getenv("IK2_VRAM_GB");   // (IK2_VRAM_GB: tests - the APU as a discrete card)
             FILE* mi = p.integrated ? std::fopen("/proc/meminfo", "r") : nullptr;
             if (mi) {
                 char line[256];
@@ -5857,7 +5960,7 @@ int main(int argc, char** argv) {
             // offload path does not run: AMD, IK2_OFF=0, IK2_DENSE - there every expert stays and the cache streams.)
             bool off_ok = !getenv("IK2_DENSE") && !(getenv("IK2_OFF") && *getenv("IK2_OFF") && !std::atoi(getenv("IK2_OFF")));
 #ifdef MAYA_USE_HIP
-            off_ok = false;
+            if (g_apu) off_ok = false;   // (an APU: its memory is the RAM - every expert stays, the cache streams)
 #endif
             int host_n = 0, n_res = n_full;
             bool all_exp = false;
@@ -5935,8 +6038,8 @@ int main(int argc, char** argv) {
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && off_set != 1 && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         g_off_want = (off_set == 1 || (off_set != 0 && !fits)) && !getenv("IK2_DENSE");
-#ifdef MAYA_USE_HIP   // (AMD: the offload path is not checked there yet - the cache path where they do not fit)
-        if (off_set != 1) g_off_want = false;
+#ifdef MAYA_USE_HIP   // (an AMD APU: the RAM is its memory, nothing to gain - the cache path where they do not fit)
+        if (g_apu && off_set != 1) g_off_want = false;
 #endif
         if (g_off_want) g_dense_q8 = true;
         std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
@@ -6262,7 +6365,7 @@ int main(int argc, char** argv) {
     size_t fr = 0, tot = 0;
     for (int d = 0; d < n_gpu; ++d) {
         use_dev(d);
-        CU(cudaMemGetInfo(&fr, &tot));
+        CU(mem_info(&fr, &tot));
         std::printf("dense weights in VRAM: %.1f s; GPU %d: %.1f GiB of %.1f free\n", now() - t_dense, d,
                     fr / 1073741824.0, tot / 1073741824.0);
         std::fflush(stdout);
@@ -6547,7 +6650,7 @@ int main(int argc, char** argv) {
     // the work buffers and the expert cache, a set a GPU
     for (int d = 0; d < n_gpu; ++d) {
     use_dev(d);
-    CU(cudaMemGetInfo(&fr, &tot));
+    CU(mem_info(&fr, &tot));
     Work& W = g_dev[d].W;
     W.Tm = std::max(chunk, 1);
     W.ctx = ctx;
@@ -6709,7 +6812,7 @@ int main(int argc, char** argv) {
         CU(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
         g_offs.blocks = std::max(8, 2 * sms);
     }
-    CU(cudaMemGetInfo(&fr, &tot));
+    CU(mem_info(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph; the offload path: IK2_ROOM_MB, 1 GiB)
     const size_t room = g_fast_want ? (size_t) 256 << 20
@@ -6935,7 +7038,14 @@ int main(int argc, char** argv) {
         // (KV streaming: mode A too - the lane is not combined with the streamed visits' copies)
         if (g_kv_streaming && le && *le && std::string(le) != "0")
             std::printf("NOTE IK2_LANE=%s not taken: the CPU lane is off while the KV cache streams (mode A)\n", le);
-        const std::string lw = g_two.want || g_kv_streaming ? "0" : le && *le ? le : "auto";
+#ifdef MAYA_USE_HIP
+        // (AMD: mode A by default - the resident path's scalar expert kernels, the same answers as every expert in
+        //  VRAM; lane parity's ik2_exact.h sums are other bits there, so only by hand: IK2_LANE=1 / auto)
+        const char* lane_def = "0";
+#else
+        const char* lane_def = "auto";
+#endif
+        const std::string lw = g_two.want || g_kv_streaming ? "0" : le && *le ? le : lane_def;
         if (lw != "0") {
             g_lane = lane_init(M, lw, getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1);
             if (!g_lane) std::printf("lane parity: off - an expert format the exact lane does not have\n");
@@ -7246,7 +7356,7 @@ int main(int argc, char** argv) {
                 if (!(g_two.on && d == 1)) use_dev(d);
                 else CU(cudaSetDevice(pd));
                 size_t fr = 0, tot = 0;
-                CU(cudaMemGetInfo(&fr, &tot));
+                CU(mem_info(&fr, &tot));
                 char pci[32] = "-";
                 cudaDeviceGetPCIBusId(pci, sizeof pci, pd);
                 size_t kv_d = d == 0 ? slot_extra : 0;
