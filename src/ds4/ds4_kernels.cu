@@ -4132,9 +4132,18 @@ static bool gemv_f32_pair_t(const TW* W0, int n0, float* y0, const TW* W1, int n
 }
 template <typename TW>
 static void gemv_f32_t(const TW* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
-    if (T == 1 || (T > 0 && std::getenv("DS4_ROUTER_ROWS") != nullptr && std::atoi(std::getenv("DS4_ROUTER_ROWS")) == 0))
+    // DS4_ROUTER_ROWS=2: a decode window's rows (T <= kWin) take the one-token kernel on a grid of T rows of blocks.
+    // The rows kernel stages x through shared memory (two barriers a 128-float4 chunk) and runs all kGemvT token
+    // chains whatever T, which is latency, not bandwidth, on a router of a few MB; a prompt chunk keeps it (W read
+    // once per kGemvT tokens).  The same bits either way.  Unset or 1: the rows kernel for every T > 1; 0: the
+    // one-token kernel for every T
+    static const int rows_env = [] {
+        const char* v = std::getenv("DS4_ROUTER_ROWS");
+        return v != nullptr ? std::atoi(v) : 1;
+    }();
+    if (T == 1 || (T > 0 && (rows_env == 0 || (rows_env == 2 && T <= kWin))))
         pdl_launch(gemv_f32_kernel<TW>, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
-    else if (T > 1)   // (DS4_ROUTER_ROWS=0: a launch a token, as before - the same bits)
+    else if (T > 1)
         pdl_launch(gemv_f32_rows_kernel<TW>, dim3(cdiv(n, kThreads / 32), cdiv(T, kGemvT)), kThreads, 0, s, W, x, n, k,
                    T, y, ldy);
 }
