@@ -4,6 +4,22 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.74 - 2026-11-22
+
+Inkling 2 Mini now runs on Windows, on two GPUs and with up to its full 1M-token context, and answers several chats at once. Hy4-Flash is faster on tensor parallel, and there are fixes for the VRAM reserve and GPU-to-GPU copies.
+
+- **Inkling 2 Mini on Windows (NVIDIA).** The same cards as on Linux: V100 / RTX 20 and newer from 8 GB, with the experts that don't fit in RAM.
+- **Inkling 2 Mini on two GPUs (Linux).** Where one card can't hold the model, the second holds the next experts before RAM, with the same answers as one card. Where one card holds everything, it runs alone.
+- **Long context for Inkling 2 Mini, up to 1M tokens.** The conversation cache stays on the GPU and experts move to RAM first, so long chats stay usable; the cache's still-empty space holds extra experts until the chat needs it. On V100 cards, new messages deep in a long chat are read much faster. The setup still recommends up to 262K and offers 512K and 1M.
+- **Several chats at once for Inkling 2 Mini** (Answers at once on the Models page, where every expert fits on one GPU). Each answer is the same as when it runs alone.
+- **Inkling 2 Mini on the Monitor:** where its experts live, what fills the GPU, and status lines; a watchdog names a stuck step, and the engine stops at once when asked.
+- **Hy4-Flash on tensor parallel: faster token windows (#1122)**, with the same tokens. The author measured 205 -> 267 tok/s at 256K with `--mtp` on eight RTX 5060 Ti and an RTX 3090.
+- **Fix: the VRAM reserve for GLM, MiniMax and Hy4-Flash (#1026).** Like DeepSeek in v1.1.73, they now keep the reserve free for the whole run; the first start after updating may restart the engine once by itself to measure it.
+- **Fix: MiniMax on two or more GPUs** now copies between them directly only where a test copy works, and otherwise through RAM (as Hy4-Flash in v1.1.73, #1100).
+- **Opt-ins:** `MAYA_DS4_AR2_DECODE=2` for DeepSeek on GPU pairs (#1094), and an RDNA 4 kernel for DeepSeek's indexer, `DS4_INDEX_TC_GFX12=1` (#1097, untested on our side - please report).
+- **Dashboard:** CPU temperature beside the GPU temperature (#893), and Qwen's completed expert promotions (#1103).
+- **Credits.** The Hy4-Flash tensor-parallel windows (#1122) were contributed by @needmorevram, the DeepSeek pair decode option (#1094) by @pepuscz, the RDNA 4 kernel (#1097) by @honozakka, the CPU temperature (#893) by @org-tekeli-borisp and Qwen's promotions (#1103) by @jaffer1979. The rest of this release is by @mw00 (peasantsmith).
+
 ## v1.1.73 - 2026-11-22
 
 Inkling 2 Mini runs on far more PCs: NVIDIA cards from 8 GB (the experts that do not fit stay in RAM), V100 and RTX 20
