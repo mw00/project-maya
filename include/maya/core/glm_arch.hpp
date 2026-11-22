@@ -98,8 +98,10 @@ bool from_gguf_glm_dsa(const maya::GgufFile& g, Glm5Geometry& out, std::string& 
 /// The pack's own geometry (shard 1 named by native_experts.txt), read before anything is sized from it.
 bool glm_pack_geometry(const std::string& pack_dir, Glm5Geometry& out, std::string& err);
 /// The same for any GLM pack, GLM-5.3-Flash included (Glm5Geometry::from_gguf on shard 1): tensor parallel plans its
-/// slices from it before any member loads.  False + err when the pack cannot be read.
-bool glm_pack_geometry_full(const std::string& pack_dir, Glm5Geometry& out, std::string& err);
+/// slices from it before any member loads.  False + err when the pack cannot be read.  types (optional): every tensor's
+/// ggml type over all the pack's shards (the index's native rows do not carry it), for the plan's quant-block cuts.
+bool glm_pack_geometry_full(const std::string& pack_dir, Glm5Geometry& out, std::string& err,
+                            std::vector<std::pair<std::string, int>>* types = nullptr);
 
 /// The split boundaries of a glm-dsa pack must be full-indexer layers (Flash: always true, Maya's own check follows).
 bool glm_split_bounds_ok(const Glm5Geometry& g, const std::vector<int>& bounds, std::string& err);

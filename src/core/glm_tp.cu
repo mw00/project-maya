@@ -259,19 +259,15 @@ bool Glm5Model::tp_plan(const std::string& pack_dir, int n, std::vector<TpSlice>
         err = "glm tp: EXL3 packs are not covered yet (GGUF packs only)";
         return false;
     }
-    // the index: each row's ggml type (native rows) - the column cuts must fall on its quant blocks
+    // every tensor's ggml type from the model's shards - the column cuts must fall on its quant blocks (the index's
+    // native rows carry a fixed "8 0 32" marker, not the tensor's type: a Q6_K attn_output read as Q8_0 got cut
+    // mid-block)
     std::map<std::string, int> qtype;
     {
-        std::ifstream ix(pack_dir + "/index.txt");
-        std::string line;
-        while (std::getline(ix, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            std::istringstream ss(line);
-            std::vector<std::string> f;
-            std::string w;
-            while (ss >> w) f.push_back(w);
-            if (f.size() >= 12 && f[11] == "32") qtype[f[0]] = std::atoi(f[9].c_str());
-        }
+        Glm5Geometry gtmp;
+        std::vector<std::pair<std::string, int>> types;
+        if (!glm_pack_geometry_full(pack_dir, gtmp, err, &types)) return false;
+        for (const auto& t : types) qtype[t.first] = t.second;
     }
     const auto bw_of = [&](const std::string& name) -> int64_t {
         const auto it = qtype.find(name);

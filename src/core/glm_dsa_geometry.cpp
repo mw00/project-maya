@@ -360,7 +360,8 @@ bool glm_pack_geometry(const std::string& pack_dir, Glm5Geometry& out, std::stri
     return true;
 }
 
-bool glm_pack_geometry_full(const std::string& pack_dir, Glm5Geometry& out, std::string& err) {
+bool glm_pack_geometry_full(const std::string& pack_dir, Glm5Geometry& out, std::string& err,
+                            std::vector<std::pair<std::string, int>>* types) {
     std::vector<std::string> names;
     if (!pack_shards(pack_dir, names, err)) return false;
     try {
@@ -368,6 +369,14 @@ bool glm_pack_geometry_full(const std::string& pack_dir, Glm5Geometry& out, std:
         Glm5Geometry geo;
         if (!Glm5Geometry::from_gguf(g, geo, err)) return false;
         out = geo;
+        if (types != nullptr) {
+            types->clear();
+            for (size_t i = 0; i < names.size(); ++i) {
+                std::unique_ptr<maya::GgufFile> other;
+                if (i > 0) other.reset(new maya::GgufFile(pack_dir + "/../" + names[i]));
+                for (const auto& t : (i == 0 ? g : *other).tensors()) types->push_back({t.name, (int) t.type});
+            }
+        }
     } catch (const std::exception& e) {
         err = std::string("glm pack geometry: ") + e.what();
         return false;
