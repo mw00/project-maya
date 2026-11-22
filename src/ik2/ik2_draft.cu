@@ -387,11 +387,13 @@ struct Drafter {
     int* h_out = nullptr;   // pinned host [kBlock - 1]
     // a step's launches as a recorded CUDA graph, one a draft count (a GGUF drafter - no cuBLAS call in it): the
     // block's position and anchor go through par (pinned par_h copied in by the graph), the attention reads them there
-    int* par = nullptr;     // device [2]: P, anchor
+    int* par = nullptr;     // device [8]: P, anchor, the noise's salt (2), the bits of 1 / temperature
     int* par_h = nullptr;   // pinned host
+    float noise_cap = 30.0f;
     cudaGraphExec_t graph[kBlock] = {};
     const float* graph_anchor = nullptr;   // (the anchor row the graphs were recorded with)
     int graph_rows = 0, graph_vocab = 0;
+    float graph_cap = 30.0f;   // (the softcap recorded in the graphs' launches)
 };
 
 namespace {
@@ -742,8 +744,9 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->x16 = dalloc<__half>((kBlock - 1) * (size_t) C);
     d->pos = dalloc<int>(T), d->ctx_pos = dalloc<int>(kMixRows), d->toks = dalloc<int>(kBlock);
     cu(cudaHostAlloc(&d->h_out, (kBlock - 1) * sizeof(int), cudaHostAllocDefault), "h_out");
-    d->par = dalloc<int>(2);
-    cu(cudaHostAlloc(&d->par_h, 2 * sizeof(int), cudaHostAllocDefault), "par_h");
+    d->par = dalloc<int>(8);
+    cu(cudaHostAlloc(&d->par_h, 8 * sizeof(int), cudaHostAllocDefault), "par_h");
+    std::memset(d->par_h, 0, 8 * sizeof(int));
     return d;
 }
 
@@ -889,7 +892,7 @@ namespace {
 void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows,
                       int n_vocab, int proposals, bool dyn) {
     const int C = d->C, T = kBlock;
-    if (dyn) cu(cudaMemcpyAsync(d->par, d->par_h, 2 * sizeof(int), cudaMemcpyHostToDevice, d->s), "par");
+    cu(cudaMemcpyAsync(d->par, d->par_h, 8 * sizeof(int), cudaMemcpyHostToDevice, d->s), "par");
     // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
     // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
     init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
@@ -940,7 +943,7 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
         } else if (d->fold_q) {
             scale_rows_kernel<<<1, 256, 0, d->s>>>(d->latent, d->fold_sc, d->R, d->fold_xs);
             k::argmax_gemv_i8(d->fold_q, n_rows, d->fold_xs, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
-                              d->toks + t + 1, d->s);
+                              d->toks + t + 1, d->s, d->par, t + 1, d->noise_cap);
         } else {
             k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
                            d->toks + t + 1, d->s);
@@ -951,17 +954,25 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
 }  // namespace
 
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out, int proposals) {
+             int* out, int proposals, const Noise* noise) {
     const double t_p0 = pnow();
+    {   // (the launches' parameters, read on the device: the block's position and anchor, the sampled drafts' noise)
+        d->par_h[0] = P, d->par_h[1] = anchor;
+        const uint64_t salt = noise ? noise->salt : 0;
+        const float inv_t = noise ? noise->inv_temp : 0.0f;
+        d->par_h[2] = (int) (uint32_t) salt, d->par_h[3] = (int) (uint32_t) (salt >> 32);
+        std::memcpy(&d->par_h[4], &inv_t, 4);
+        if (noise) d->noise_cap = noise->cap;
+    }
     // (IK2_DRAFT_GRAPH=0: its launches one by one.  A drafter of ~75 short launches a step: queueing them took the
     //  host 0.75 ms of a 2.7 ms step, the GPU waiting in between; recorded, a step is its kernels' 2.1 ms)
     static const bool graph_on = !(getenv("IK2_DRAFT_GRAPH") && !atoi(getenv("IK2_DRAFT_GRAPH")));
     const bool can = graph_on && d->q8 && d->head_q8 && d->head_tiles && !d->shortlist && proposals >= 1 &&
                      proposals < kBlock && (2 * d->R + 2 * d->C) % 256 == 0 &&
                      (!d->graph_anchor || (d->graph_anchor == anchor_h && d->graph_rows == n_rows &&
-                                           d->graph_vocab == n_vocab));
+                                           d->graph_vocab == n_vocab)) &&
+                     (!noise || !d->graph_anchor || noise->cap == d->graph_cap);
     if (can) {
-        d->par_h[0] = P, d->par_h[1] = anchor;
         if (!d->graph[proposals]) {
             cudaGraph_t g = nullptr;
             cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeThreadLocal), "the drafter's graph");
@@ -969,7 +980,7 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
             cu(cudaStreamEndCapture(d->s, &g), "the drafter's graph");
             cu(cudaGraphInstantiate(&d->graph[proposals], g, 0), "the drafter's graph");
             cudaGraphDestroy(g);
-            d->graph_anchor = anchor_h, d->graph_rows = n_rows, d->graph_vocab = n_vocab;
+            d->graph_anchor = anchor_h, d->graph_rows = n_rows, d->graph_vocab = n_vocab, d->graph_cap = d->noise_cap;
         }
         cu(cudaGraphLaunch(d->graph[proposals], d->s), "the drafter's graph");
     } else {

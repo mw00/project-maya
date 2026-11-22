@@ -4916,10 +4916,18 @@ __global__ void argmax_gemv_f16_part_kernel(const uint16_t* W, int ld, const flo
 // the bytes a draft of the drafter's Markov head reads (51 MB where the FP16 table is 103).  A thread 8 columns.
 __global__ void argmax_gemv_i8_part_kernel(const int8_t* __restrict__ W, int ld, const float* __restrict__ xs,
                                            const float* __restrict__ base, const uint16_t* __restrict__ bias_f16, int R,
-                                           int n) {
+                                           int n, const int* par, int pos_off, float cap) {
     extern __shared__ float sx[];
     for (int r = threadIdx.x; r < R; r += blockDim.x) sx[r] = xs[r];
     __syncthreads();
+    // (a sampled request's drafts: the logit softcapped, over the temperature, plus the token's noise)
+    const float inv_t = par ? __int_as_float(par[4]) : 0.0f;
+    const bool noisy = inv_t != 0.0f;
+    const int npos = par ? par[0] + pos_off : 0;
+    const uint64_t salt = par ? ((uint64_t) (uint32_t) par[2] | ((uint64_t) (uint32_t) par[3] << 32)) : 0ull;
+    auto score = [&](float l, int v) {
+        return noisy ? cap * tanhf(l / cap) * inv_t + gumbel_noise(salt, npos, v) : l;
+    };
     const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
     const int gstride = gridDim.x * blockDim.x;
     float best = -INFINITY;
@@ -4941,20 +4949,20 @@ __global__ void argmax_gemv_i8_part_kernel(const int8_t* __restrict__ W, int ld,
         const float4 b0 = __ldg((const float4*) (base + v)), b1 = __ldg((const float4*) (base + v + 4));
         const uint4 bb = __ldg((const uint4*) (bias_f16 + v));
         const float2 f0 = u32_to_f2(bb.x), f1 = u32_to_f2(bb.y), f2 = u32_to_f2(bb.z), f3 = u32_to_f2(bb.w);
-        argmax_better(d[0] + b0.x + f0.x, v + 0, best, idx);
-        argmax_better(d[1] + b0.y + f0.y, v + 1, best, idx);
-        argmax_better(d[2] + b0.z + f1.x, v + 2, best, idx);
-        argmax_better(d[3] + b0.w + f1.y, v + 3, best, idx);
-        argmax_better(d[4] + b1.x + f2.x, v + 4, best, idx);
-        argmax_better(d[5] + b1.y + f2.y, v + 5, best, idx);
-        argmax_better(d[6] + b1.z + f3.x, v + 6, best, idx);
-        argmax_better(d[7] + b1.w + f3.y, v + 7, best, idx);
+        argmax_better(score(d[0] + b0.x + f0.x, v + 0), v + 0, best, idx);
+        argmax_better(score(d[1] + b0.y + f0.y, v + 1), v + 1, best, idx);
+        argmax_better(score(d[2] + b0.z + f1.x, v + 2), v + 2, best, idx);
+        argmax_better(score(d[3] + b0.w + f1.y, v + 3), v + 3, best, idx);
+        argmax_better(score(d[4] + b1.x + f2.x, v + 4), v + 4, best, idx);
+        argmax_better(score(d[5] + b1.y + f2.y, v + 5), v + 5, best, idx);
+        argmax_better(score(d[6] + b1.z + f3.x, v + 6), v + 6, best, idx);
+        argmax_better(score(d[7] + b1.w + f3.y, v + 7), v + 7, best, idx);
     }
     for (int v = (n8 << 3) + gtid; v < n; v += gstride) {
         float d = 0.0f;
         const int8_t* wr = W + v;
         for (int r = 0; r < R; ++r, wr += ld) d = fmaf((float) __ldg(wr), sx[r], d);
-        argmax_better(d + __ldg(base + v) + h2f(__ldg(bias_f16 + v)), v, best, idx);
+        argmax_better(score(d + __ldg(base + v) + h2f(__ldg(bias_f16 + v)), v), v, best, idx);
     }
     argmax_block_reduce(best, idx);
     if (threadIdx.x == 0) g_argmax_v[blockIdx.x] = best, g_argmax_i[blockIdx.x] = idx;
@@ -6822,14 +6830,15 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 }
 
 void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base, const uint16_t* bias_f16, int R, int n,
-                    int* out, cudaStream_t s) {
+                    int* out, cudaStream_t s, const int* par, int pos_off, float cap) {
     if (n <= 0) return;
     if ((ld & 7) || ((uintptr_t) W & 7) || ((uintptr_t) base & 15) || ((uintptr_t) bias_f16 & 15) || R > 4096) {
         std::fprintf(stderr, "ik2::k::argmax_gemv_i8: a table, base or bias not aligned, or rank %d\n", R);
         std::abort();
     }
     const int B = std::min(512, std::max(2, ((n >> 3) + 127) / 128));
-    argmax_gemv_i8_part_kernel<<<B, 128, (size_t) R * sizeof(float), s>>>(W, ld, xs, base, bias_f16, R, n);
+    argmax_gemv_i8_part_kernel<<<B, 128, (size_t) R * sizeof(float), s>>>(W, ld, xs, base, bias_f16, R, n, par, pos_off,
+                                                                          cap);
     check("argmax_gemv_i8_part");
     argmax_final_kernel<<<1, 256, 0, s>>>(B, 1, out);
     check("argmax_gemv_i8_final");

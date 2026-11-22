@@ -474,10 +474,28 @@ void rnn_gates(const float* proj, const float* bias, int R, float* state, float*
 void argmax_sum(const float* a, const float* b, const float* c, int n, int* out, cudaStream_t s);
 /// out[r] = argmax over c < n_cols of x[r * ld + c] for 0 <= r < n_rows (ties: the lower index), written on the device.
 void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaStream_t s);
+/// A sampled token's noise: Gumbel(0, 1) from a request's salt, the token's position and the token - the same for
+/// whoever asks, so that the drafter's draft of a position (argmax of its logits / T + this) and the model's token
+/// there (argmax of the model's log-probabilities + this: an exact sample of them, the Gumbel-max trick) agree
+/// wherever the two distributions are close.  The uniform is taken as the exponential's small side, so the large
+/// values - the ones an argmax over many tokens finds - keep a float's relative precision.
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__
+#endif
+inline float gumbel_noise(uint64_t salt, int pos, int token) {
+    uint64_t z = salt + 0x9E3779B97F4A7C15ull * ((uint64_t) (uint32_t) pos + 1ull) +
+                 0xD6E8FEB86659FD93ull * ((uint64_t) (uint32_t) token + 1ull);
+    z ^= z >> 30, z *= 0xBF58476D1CE4E5B9ull, z ^= z >> 27, z *= 0x94D049BB133111EBull, z ^= z >> 31;
+    const float e = ((float) (uint32_t) (z >> 40) + 0.5f) * (1.0f / 16777216.0f);   // uniform in (0, 1)
+    return -logf(-log1pf(-e));
+}
 /// argmax_gemv_f16 over a table kept as int8 [R][ld] with each row's scale folded into xs (xs[r] = x[r] * scale[r]):
 /// *out = argmax over v < n of base[v] + bias_f16[v] + sum_r W[r * ld + v] * xs[r].  ld a multiple of 8.
+/// par (or null): the sampled drafts' noise - par[0] the block's position, par[2], par[3] the salt, par[4] the bits of
+/// 1 / temperature (0: none) - then the token is the argmax of cap tanh(logit / cap) / temperature + gumbel_noise(salt,
+/// par[0] + pos_off, v).
 void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base, const uint16_t* bias_f16, int R, int n,
-                    int* out, cudaStream_t s);
+                    int* out, cudaStream_t s, const int* par = nullptr, int pos_off = 0, float cap = 0.0f);
 /// *out = argmax over v < n of (base[v] + bias_f16[v] + sum_{r<R} W[r * ld + v] * x[r]), where W is [R][ld] FP16,
 /// x is [R] F32, base (optional) is [n] F32, bias_f16 (optional) is [n] FP16.  Ties: the lower index.
 void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* base, const uint16_t* bias_f16,

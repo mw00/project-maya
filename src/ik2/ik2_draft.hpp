@@ -53,8 +53,15 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row);
 /// Drafts 7 tokens (out, host) after the anchor at position P; anchor_h: its embedding, normed (device [C] F32).
 /// lm_f16: the target's output head; n_vocab: the real rows (the argmax's range).
+/// noise (a sampled request, or null): the drafts are then drawn - draft j the argmax of its softcapped logits over
+/// the temperature plus k::gumbel_noise(salt, P + 1 + j, token), the noise the model's own token of that position
+/// is drawn with - instead of the drafter's best tokens (a GGUF drafter's int8 fold; else its best tokens).
+struct Noise {
+    uint64_t salt = 0;
+    float inv_temp = 0.0f, cap = 30.0f;
+};
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out, int proposals = kBlock - 1);
+             int* out, int proposals = kBlock - 1, const Noise* noise = nullptr);
 /// The base logits through the target's head kept as planar Q8_0 (int8 [n_rows][C], FP16 scales [n_rows][C / 32]):
 /// propose's lm_f16 is not read then (the FP16 copy is fold()'s only).
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);

@@ -4120,6 +4120,7 @@ struct SampleCfg {   // temp <= 0: greedy
     double temp = 0, top_p = 1;
     int top_k = 0;
     std::mt19937_64* rng = nullptr;
+    uint64_t salt = 0;   // the request's: a window's tokens are drawn with k::gumbel_noise(salt, position, token)
 };
 // the serve loop's sampling distribution over candidates cd (logit, token): softmax(logit / temp) over the top_p
 // mass of the min(top_k, kCandK) largest (ties: the lower token first) - pick_top's - as (token, probability)
@@ -4298,6 +4299,22 @@ size_t draft_room(const std::string& path, int ctx, int chunk, const Config& c, 
     return b;
 }
 
+// A window's sampled token of a position: the token of the most log-probability plus its noise (k::gumbel_noise of
+// the request's salt, the position and the token) - a sample of dist exactly (the Gumbel-max trick; the lower token
+// of equal sums).  The drafter draws its draft of the position with the same noise over its own logits, so the two
+// agree wherever the drafter's distribution is close to the model's - not only where the model's best token has the
+// probability to be taken (a draft that was the drafter's best token was kept with the model's probability of it:
+// 60% of the drafts of a code answer at temperature 1, where a greedy one keeps 65%).
+int gumbel_pick(const std::vector<std::pair<int, double>>& dist, uint64_t salt, int pos) {
+    float best = -INFINITY;
+    int tok = dist.empty() ? 0 : dist[0].first;
+    for (const auto& e : dist) {
+        if (e.second <= 0) continue;
+        const float v = std::log((float) e.second) + k::gumbel_noise(salt, pos, e.first);
+        if (v > best || (v == best && e.first < tok)) best = v, tok = e.first;
+    }
+    return tok;
+}
 // a sampled step's pick at a drafted position: the draft with the target's probability of it, else the target's
 // distribution without it - the target's own distribution, whatever drafted (speculative sampling with a point-mass
 // draft).  accepted: the draft was kept.
@@ -4312,6 +4329,8 @@ int spec_pick(const std::vector<std::pair<int, double>>& dist, int draft, std::m
 double g_sp_draft = 0, g_sp_block = 0, g_sp_tail = 0;   // IK2_SPEC_PROF: a step's drafting, window and the rest, s
 uint64_t g_sp_n = 0;
 std::string g_sp_seq;   // (a step's width and kept drafts, "5:4 5:0 ...")
+// (IK2_DRAFT_COUPLE=0: a sampled window's drafts the drafter's best tokens, kept with the model's probability of them)
+const bool g_draft_couple = !(getenv("IK2_DRAFT_COUPLE") && !std::atoi(getenv("IK2_DRAFT_COUPLE")));
 int g_window_check = 0;                       // IK2_WINDOW_CHECK: windows still to check against fast_token
 uint64_t g_window_rows = 0, g_window_same = 0;   // (rows checked, rows the same to the bit)
 
@@ -4332,7 +4351,13 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         static float *raw = nullptr, *anchor_h = nullptr;
         if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
         embed_row(M, anchor, raw, anchor_h);
-        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+        ik2::draft::Noise nz;
+        // (the drafter is less sure than the model where the model is sure: its logits over a share of the temperature,
+        //  IK2_DRAFT_COUPLE_T, so that its draws stay on the model's token there - any draft leaves the model's draw exact)
+        static const double couple_t = getenv("IK2_DRAFT_COUPLE_T") ? std::atof(getenv("IK2_DRAFT_COUPLE_T")) : 1.0;
+        nz.salt = sc.salt, nz.inv_temp = sc.temp > 0 ? (float) (1.0 / (sc.temp * couple_t)) : 0.0f, nz.cap = c.logit_cap;
+        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1,
+                            sc.temp > 0 && g_draft_couple ? &nz : nullptr);
         if (t_draft) *t_draft += now() - t0;
         g_sp_draft += now() - t0;
     }
@@ -4383,6 +4408,12 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
                 for (int v = 0; v < c.n_vocab; ++v) cd[v] = {row[v], v};
             }
             const auto dist = sample_dist(cd, sc);
+            if (g_draft_couple) {   // (the position's token, drawn with its noise; a draft is kept where it is that token)
+                const int tok = gumbel_pick(dist, sc.salt, P + j + 1);
+                next.push_back(tok);
+                if (j == B - 1 || tok != dr[j]) break;
+                continue;
+            }
             if (j == B - 1) {
                 next.push_back(sample_from(dist, *sc.rng));
                 break;
@@ -5423,13 +5454,34 @@ int check_sampling() {
         sc.temp = temps[cs], sc.top_p = tops[cs], sc.top_k = topks[cs];
         const auto dist = sample_dist(cd, sc);
         const int drafts[3] = {dist[0].first, dist[std::min<size_t>(3, dist.size() - 1)].first, 99999};
-        for (int dk = 0; dk < 4; ++dk) {   // (dk 3: the plain pick)
+        // (the drafter's distribution for the noise-coupled draws: the model's logits moved a little, at the same
+        //  temperature - a drafter that is close but not the model)
+        std::vector<std::pair<float, int>> cq = cd;
+        for (auto& e : cq) e.first += (float) std::normal_distribution<double>(0, 0.5)(rng);
+        const uint64_t salt = rng();
+        for (int dk = 0; dk < 6; ++dk) {   // (dk 3: the plain pick; 4, 5: the noise-coupled draws)
             std::map<int, int> n;
             const int N = 400000;
             int kept = 0;
             for (int i = 0; i < N; ++i) {
                 bool acc = false;
-                const int t = dk == 3 ? sample_from(dist, rng) : spec_pick(dist, drafts[dk], rng, acc);
+                int t;
+                if (dk >= 4) {
+                    // the window's token of position i; dk 5: against a draft drawn with the same noise from cq -
+                    // kept where the two agree (the token is the model's draw either way)
+                    t = gumbel_pick(dist, salt, i);
+                    if (dk == 5) {
+                        float bq = -INFINITY;
+                        int dq = -1;
+                        for (const auto& e : cq) {
+                            const float v = e.first / (float) sc.temp + k::gumbel_noise(salt, i, e.second);
+                            if (v > bq) bq = v, dq = e.second;
+                        }
+                        acc = dq == t;
+                    }
+                } else {
+                    t = dk == 3 ? sample_from(dist, rng) : spec_pick(dist, drafts[dk], rng, acc);
+                }
                 ++n[t], kept += acc;
             }
             double chi = 0;
@@ -5449,7 +5501,7 @@ int check_sampling() {
             std::printf("check sampling: temperature %.1f top_p %.2f top_k %d, %s: chi-square %.1f (%d df), p %.3g, "
                         "drafts kept %.1f%%%s - %s\n", sc.temp, sc.top_p, sc.top_k,
                         dk == 3 ? "plain pick" : dk == 0 ? "the likeliest draft" : dk == 1 ? "a less likely draft"
-                                                                                    : "an impossible draft",
+                        : dk == 2 ? "an impossible draft" : dk == 4 ? "the noise's draw" : "a draft drawn with the same noise",
                         chi, df, p, 100.0 * kept / N, outside ? " (tokens outside the distribution)" : "",
                         ok ? "ok" : "FAIL");
         }
@@ -7905,6 +7957,7 @@ int main(int argc, char** argv) {
             g_wd_busy = true;
             beat("the request's start (its kept state)");
             if (seed >= 0) rng.seed((uint64_t) seed);
+            const uint64_t req_salt = rng();   // (the request's noise for its windows' tokens: its seed's, or a new one)
             g_cancel = 0;
             // (drafting for this request: spec=1 asks for none; the prompt lookup's history its tokens; the Monitor's
             //  figures - STAT draft_acc / draft_off, DONE's kept and offered - this request's drafts)
@@ -8127,7 +8180,7 @@ int main(int argc, char** argv) {
                 }
                 if (B >= 2) {
                     SampleCfg sc;
-                    sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng;
+                    sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng, sc.salt = req_salt;
                     std::vector<int> next;
                     const double ts = now();
                     int given[kBlockMax];
