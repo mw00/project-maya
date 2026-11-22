@@ -579,8 +579,10 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         const int pool_done = (int) ((p + 1) / g.idx_kpool);
         const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
         if (pool_done > 0 && !all)
+            // (token = true: MAYA_GLM_DSA_SCORE2's kernel for a window's tokens as for the single-token path - the same
+            //  bits; without it the switch did nothing in a DFlash decode, where every token is a window token)
             gf::dsa_score(iq, state_ + dsa_pool_[(size_t) il], W.iw + (size_t) t * g.idx_heads, g.idx_key, g.idx_heads,
-                          pool_done, F->score, s);
+                          pool_done, F->score, s, true);
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
         int* const sel = rows ? W.cells + (size_t) (t - t0) * nsm : F->cells;
