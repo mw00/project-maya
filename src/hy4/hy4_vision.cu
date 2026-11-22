@@ -66,7 +66,10 @@ __device__ __forceinline__ float clamp_f16_val(float v) {
 
 __device__ __forceinline__ uint16_t pack_act16(float v, bool fp16) {
     if (fp16) return __half_as_ushort(__float2half_rn(clamp_f16_val(v)));
-    return __bfloat16_as_ushort(__float2bfloat16(v));
+    const bf16_t b = __float2bfloat16(v);
+    uint16_t u;
+    std::memcpy(&u, &b, 2);
+    return u;
 }
 
 // one block a row: y16 = LayerNorm(x) (biased variance) . w + b, BF16 or FP16
@@ -405,7 +408,7 @@ struct Vision::Impl {
     // C [rows][ldc] F32 (columns [0, N) of it) = X [rows][K] BF16/FP16 . W [N][K]^T BF16/FP16
     bool gemm(const uint8_t* W, int N, int K, const void* X, int rows, float* C, int ldc, std::string& err) {
         const float one = 1.0f, zero = 0.0f;
-        const cudaDataType_t dt = fp16 ? CUDA_R_16F : CUDA_R_16BF;
+        const auto dt = fp16 ? CUDA_R_16F : CUDA_R_16BF;
         VB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, dt, K, X, dt, K, &zero,
                         C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         return true;
