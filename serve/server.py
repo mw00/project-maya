@@ -81,6 +81,7 @@ def hy4_hot_file(cfg: dict) -> Path:
 
 
 HY4_HOT_SEEDS = ROOT / "data" / "hy4-hot-seed"            # (the scores Maya ships, a file a size: hy4_hot_seed)
+#                                                          (Maya-S and -L: Maya-XS's copied, until learned on their own packs)
 
 
 def hy4_hot_seed(cfg: dict) -> Path | None:
