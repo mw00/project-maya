@@ -4173,7 +4173,7 @@ struct SpecCtl {
     double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
     int plain_run = 0;
     int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 4;   // plain tokens before a look
-    int probe_w = 4;
+    int probe_w = getenv("IK2_DRAFT_PROBE_W") ? std::clamp(atoi(getenv("IK2_DRAFT_PROBE_W")), 2, kBlockMax) : 4;   // the look's width
     double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
     uint64_t hist[kBlockMax] = {};
