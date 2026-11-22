@@ -362,13 +362,65 @@ bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, 
 bool g_grp = true;     // IK2_GRP=0: the batch prefill's experts through decode_f16 + cuBLAS GEMMs, not the grouped kernels
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
+
+// ---- IK2_EVENTS=1: the prompt's GPU timeline. Every Prof point records an event pair (the compute and the
+// copies' streams); the point's time is the later of the two, so the spans between points are the GPU-side
+// walls of the sections including any idle the issue latency inserts. The "start" spans are the per-visit
+// gaps (the idle between a visit's conv4_res and the next visit's first attention work).
+static bool g_events = false;
+static cudaEvent_t g_evx_s[1024], g_evx_c[1024];
+static const char* g_evx_tag[1024];
+static int g_evx_n = 0;
+static cudaEvent_t g_t0_s = nullptr, g_t0_c = nullptr;
+static bool g_t0_ok = false;
+static void evx_rec(const char* tag) {
+    if (!g_events || g_evx_n >= 1024) return;
+    if (!g_t0_ok) {
+        cudaEventRecord(g_t0_s, g_s), cudaEventRecord(g_t0_c, g_cs);
+        g_t0_ok = true;
+    }
+    cudaEventRecord(g_evx_s[g_evx_n], g_s), cudaEventRecord(g_evx_c[g_evx_n], g_cs);
+    g_evx_tag[g_evx_n] = tag;
+    ++g_evx_n;
+}
+static void evx_print(double wall_s) {
+    if (g_evx_n < 2) return;
+    cudaEventSynchronize(g_t0_s), cudaEventSynchronize(g_t0_c);
+    cudaEventSynchronize(g_evx_s[g_evx_n - 1]), cudaEventSynchronize(g_evx_c[g_evx_n - 1]);
+    std::vector<double> t(g_evx_n);
+    for (int i = 0; i < g_evx_n; ++i) {
+        float a = 0.f, b = 0.f;
+        cudaEventElapsedTime(&a, g_t0_s, g_evx_s[i]);
+        cudaEventElapsedTime(&b, g_t0_c, g_evx_c[i]);
+        t[i] = a > b ? a : b;
+    }
+    const char* names[6] = {"start", "attn", "route", "experts", "rest", "upload"};
+    double tot[6] = {0};
+    int cnt[6] = {0};
+    std::printf("events (GPU timeline, %d points, wall %.2f s):\n", g_evx_n, wall_s);
+    for (int i = 1; i < g_evx_n; ++i) {
+        const double span = t[i] - t[i - 1];
+        int k = -1;
+        for (int j = 0; j < 6; ++j)
+            if (std::strcmp(g_evx_tag[i], names[j]) == 0) k = j;
+        if (k >= 0) tot[k] += span, ++cnt[k];
+        if (i <= 25) std::printf("  %7.3f ms %s\n", span, g_evx_tag[i]);
+    }
+    std::printf("  events totals:");
+    for (int j = 0; j < 6; ++j)
+        if (cnt[j]) std::printf(" %s=%.1f ms (%d)", names[j], tot[j], cnt[j]);
+    std::printf(" | gpu span %.1f ms\n", t[g_evx_n - 1] - t[0]);
+}
+
 struct Prof {
     double attn = 0, route = 0, upload = 0, experts = 0, rest = 0;
     double t = 0;
     void start() {
         if (g_prof) cudaStreamSynchronize(g_s), t = now();
+        evx_rec("start");
     }
-    void lap(double& acc) {
+    void lap(double& acc, const char* tag) {
+        evx_rec(tag);
         if (!g_prof) return;
         cudaStreamSynchronize(g_s);
         const double n = now();
@@ -2096,7 +2148,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             if (cst != g_s) CU(cudaEventRecord(X.miss_ev[b], cst));
         }
         XC.t_up += now() - tu;
-        g_pf.lap(g_pf.upload);
+        g_pf.lap(g_pf.upload, "upload");
 
         CU(cudaMemcpyAsync(X.gidx, gidx, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.inv, inv, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
@@ -2359,7 +2411,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     } else {
         exec(-1, W, EC, xq16);
     }
-    g_pf.lap(g_pf.experts);
+    g_pf.lap(g_pf.experts, "experts");
     t_exp += now() - te0;
     conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
     k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
@@ -2418,7 +2470,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
             }
         }
     }
-    g_pf.lap(g_pf.rest);
+    g_pf.lap(g_pf.rest, "rest");
 }
 
 // ---- the resident token path
@@ -4647,7 +4699,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
             }
         }
-        g_pf.lap(g_pf.attn);
+        g_pf.lap(g_pf.attn, "attn");
         gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
         const int S = T * c.K;
         int* rtop = W.route_d;
@@ -4661,7 +4713,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const int* top = W.route_h;
         const float* w = (const float*) (W.route_h + S);
         pop_count(l, top, S);
-        g_pf.lap(g_pf.route);
+        g_pf.lap(g_pf.route, "route");
         if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
             FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
             if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
@@ -4913,11 +4965,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                               G, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             k::moe_combine_f32(W.y32, (const int*) (W.rg_d + o_id), (const float*) (W.rg_d + o_wt), T, c.K, C, W.tmp,
                                false, g_s);
-            g_pf.lap(g_pf.experts);
+            g_pf.lap(g_pf.experts, "experts");
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
-            g_pf.lap(g_pf.rest);
+            g_pf.lap(g_pf.rest, "rest");
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -5060,7 +5112,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     ++gn[g];
                 }
             }
-            g_pf.lap(g_pf.upload);
+            g_pf.lap(g_pf.upload, "upload");
             // one copy of the tables from pinned memory: [64] pointers, then tok, inv, sg, su, wt [64] each
             std::memcpy(pk, blob, S * sizeof(void*));
             std::memcpy(pk + 512, tk, S * 4);
@@ -5110,16 +5162,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                    g_s));
             }
             k::moe_combine_f32(W.y32, pid, pwt, T, c.K, C, W.tmp, false, g_s);
-            g_pf.lap(g_pf.experts);
+            g_pf.lap(g_pf.experts, "experts");
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
-            g_pf.lap(g_pf.rest);
+            g_pf.lap(g_pf.rest, "rest");
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
         run_prefill_moe(M, Ly, l, T, W.x16, top, w, W.r, W.h, W, EC, t_exp);
-        g_pf.lap(g_pf.rest);
+        g_pf.lap(g_pf.rest, "rest");
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
@@ -5328,7 +5380,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
             outs.y16[0] = W.xq16_sup;
             k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
         }
-        g_pf.lap(g_pf.attn);
+        g_pf.lap(g_pf.attn, "attn");
         gemm16(Ly.router16, c.E, C, W.xq16_sup, T, W.rlog, c.E);
         const int S = T * c.K;
         int* rtop = W.route_d;
@@ -5339,7 +5391,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         const int* top_h = W.route_h;
         const float* w_h = (const float*) (W.route_h + S);
         pop_count(l, top_h, S);
-        g_pf.lap(g_pf.route);
+        g_pf.lap(g_pf.route, "route");
         if (g_trace) {
             const int hdr[3] = {l, T, c.K};
             std::fwrite(hdr, 4, 3, g_trace);
@@ -5347,7 +5399,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         }
         run_prefill_moe(M, Ly, l, T, W.xq16_sup, top_h, w_h, W.r, W.h, W, EC, t_exp);
         if (pf) prefetch(l + depth, depth);
-        g_pf.lap(g_pf.rest);
+        g_pf.lap(g_pf.rest, "rest");
     }
     EC.scan = false;
     if (dual()) dev_cache(1).scan = false;
@@ -5377,7 +5429,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
             CU(cudaMemcpyAsync(logits_out.data() + at, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
             CU(cudaStreamSynchronize(g_s));
         }
-        g_pf.lap(g_pf.rest);
+        g_pf.lap(g_pf.rest, "rest");
     } else {
         CU(cudaStreamSynchronize(g_s));
     }
@@ -5941,6 +5993,15 @@ int main(int argc, char** argv) {
     }
     use_dev(0);
     g_overlap = !getenv("IK2_OVERLAP") || std::atoi(getenv("IK2_OVERLAP"));
+    g_events = getenv("IK2_EVENTS") && std::atoi(getenv("IK2_EVENTS"));
+    if (g_events) {
+        CU(cudaEventCreate(&g_t0_s));
+        CU(cudaEventCreate(&g_t0_c));
+        for (int i = 0; i < 1024; ++i) {
+            CU(cudaEventCreate(&g_evx_s[i]));
+            CU(cudaEventCreate(&g_evx_c[i]));
+        }
+    }
     for (auto& e : g_ring) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
@@ -8467,7 +8528,24 @@ int main(int argc, char** argv) {
     // the prompt
     std::vector<float> logits;
     double t_exp = 0;
+    // (A3-warmup: cuBLAS loads its FP16-GEMM and FP32-PEDANTIC kernel modules lazily on the first call -
+    //  ~0.49 s measured on the first prompt's visit 0; run both classes once outside the timed prompt)
+    {
+        Work& W0 = dev_work(0);
+        uint16_t* w16w = dalloc<uint16_t>(32 * 32);
+        CU(cudaMemsetAsync(w16w, 0, 32 * 32 * 2, g_s));
+        gemm16(w16w, 32, 32, w16w, 1, W0.tmp, 32);
+        Layer& L0 = M.L[0];
+        const int ext0 = L0.sliding ? M.c.extent_swa : M.c.extent;
+        const float one_f = 1.0f, zero_f = 0.0f;
+        if (L0.rel_proj && W0.relb)
+            CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, ext0, 2 * M.c.H, M.c.d_rel, &one_f, L0.rel_proj,
+                            CUDA_R_32F, M.c.d_rel, W0.rr, CUDA_R_32F, M.c.d_rel, &zero_f, W0.relb, CUDA_R_32F,
+                            ext0, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+        CU(cudaStreamSynchronize(g_s));
+    }
     const double tp = now();
+    g_evx_n = 0, g_t0_ok = false;   // (the event timeline measures this prompt alone)
     const bool all = !dump.empty();
     int first_best = -1;
     const int T_sup = g_dev[0].W.T_sup;
@@ -8513,6 +8591,7 @@ int main(int argc, char** argv) {
     if (g_prof)   // (debug: the prompt's own profile before the generation's reset)
         std::printf("profile (prompt): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
+    evx_print(prompt_s);
     if (g_lend.want >= 0 && getenv("IK2_LEND_WAIT") && std::atoi(getenv("IK2_LEND_WAIT"))) {   // (tests: the steady speed)
         const double tw = now();
         lend_grow(M, g_lend.want);
