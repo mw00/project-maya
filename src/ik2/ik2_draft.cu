@@ -22,6 +22,7 @@ static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -882,10 +883,8 @@ uint64_t g_prop_n = 0;
 void propose_times(double* submit_ms, double* wait_ms) {
     *submit_ms = g_prop_n ? g_prop_submit * 1e3 / g_prop_n : 0, *wait_ms = g_prop_n ? g_prop_wait * 1e3 / g_prop_n : 0;
 }
-static double pnow() {
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
+static double pnow() {   // (steady_clock: clock_gettime is not in MSVC's runtime)
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 namespace {
 // a step's launches; dyn: for a recorded graph - the position and the anchor read from d->par on the device
