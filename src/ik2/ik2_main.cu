@@ -4682,7 +4682,13 @@ void check_preview(int n_gpu, bool serve) {
 #else
         const std::string gpu = "GPU " + std::to_string(d) + " (" + p.name + ", sm_" + std::to_string(p.major) +
                                 std::to_string(p.minor) + ")";
+#ifdef MAYA_IK2_PASCAL   // (STRATA_IK2_PASCAL: sm_61's tensor cores are mma884's emulation, the rest the Volta route)
+        if (p.major < 6 || (p.major == 6 && p.minor < 1))
+            refuse(gpu + " is too old: this build's Pascal path needs sm_61 (GTX 10xx) or newer");
+        if (p.major == 6) std::printf("note: %s: Pascal (no tensor cores: mma.m8n8k4 emulated)\n", gpu.c_str());
+#else
         if (p.major < 7) refuse(gpu + " is too old: maya-ik2 needs an NVIDIA GPU of sm_70 (Volta) or newer");
+#endif
 #endif
         CU(cudaSetDevice(d));
 #ifndef STRATA_USE_HIP   // (a kernel of this build for the GPU: none when its arch is not in the list)

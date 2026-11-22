@@ -349,6 +349,14 @@ __device__ __forceinline__ unsigned long long globaltimer() {
     return t;
 #endif
 }
+// (the lane's mailbox wait pauses a little: __nanosleep is sm_70's, Pascal spins the read with a compiler barrier)
+__device__ __forceinline__ void lane_pause() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    __nanosleep(256);
+#else
+    asm volatile("" ::: "memory");
+#endif
+}
 __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C, float* __restrict__ y) {
     __shared__ int n;
     if (threadIdx.x == 0) {
@@ -357,7 +365,7 @@ __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C,
             const uint32_t seq = ls->seq;
             const unsigned long long t0 = globaltimer();
             while (*(const volatile uint32_t*) &done->seq != seq) {
-                __nanosleep(256);
+                lane_pause();
                 if (globaltimer() - t0 > 20000000000ull) {   // (20 s: the lane is gone - the engine reports it)
                     ls->err = 1;
                     break;

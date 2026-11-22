@@ -921,8 +921,9 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
 constexpr int kFaBN = 64, kFaD = 128, kFaLd = kFaD + 8;   // (row pad: conflict-free fragments/ldmatrix)
 constexpr float kLog2e = 1.4426950408889634f;
 
-#ifdef STRATA_USE_HIP
-// AMD: no mma.sync / ldmatrix / cp.async.  These keep their CUDA fragment layouts exactly (a lane's registers hold the
+#if defined(STRATA_USE_HIP) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700)
+// AMD (and Pascal and older, which has no tensor cores at all: sm_61's tensor-core path is mma884's emulation below,
+// and these are what any kernel that still asks for m16n8k16 takes there): no mma.sync / ldmatrix / cp.async.  These keep their CUDA fragment layouts exactly (a lane's registers hold the
 // same elements), so every kernel written for them runs as it is: the m16n8k16 product from the A rows and B columns
 // gathered by shuffles (each product of two FP16 is exact in FP32; the sums in a fixed order, the same every run), an
 // ldmatrix from the row addresses of the lanes that give them, a cp.async as a plain copy (the kernels wait for a
@@ -1077,6 +1078,33 @@ __device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1, uint3
                  "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
                  : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#elif defined(__CUDA_ARCH__)
+    // Pascal and older: the same D [8][8] += A [8][4] B [4][8] a quad pair from the lanes' registers, by shuffles (each
+    // product of two FP16 is exact in FP32; the sums in a fixed order, the same every run).  The layout is the one the
+    // comment above documents.  This lane's two A rows are held by the lane (j' = r, same hi, same quad pair) and its
+    // four B columns by the lane (hi' = c >> 2, j' = c & 3, same quad pair).
+    const uint32_t m = 0xffffffffu;
+    const int lane = threadIdx.x & 31, j = lane & 3, hi = lane >> 4, q = (lane >> 2) & 3;
+    float2 a[2][2];   // (this lane's rows (j & 1) + 4 hi and + 2: k 0, 1 and 2, 3)
+#pragma unroll
+    for (int i2 = 0; i2 < 2; ++i2) {
+        const int sl = (hi << 4) | (q << 2) | ((j & 1) + 2 * i2);
+        a[i2][0] = u32_to_f2(__shfl_sync(m, a0, sl));
+        a[i2][1] = u32_to_f2(__shfl_sync(m, a1, sl));
+    }
+    float2 b[4][2];   // (the columns (i & 1) + 2 (j >> 1) + 4 (i >> 2), i = 0 .. 3: k 0, 1 and 2, 3)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int sl = (((i >> 1) & 1) << 4) | (q << 2) | ((i & 1) + 2 * (j >> 1));
+        b[i][0] = u32_to_f2(__shfl_sync(m, b0, sl));
+        b[i][1] = u32_to_f2(__shfl_sync(m, b1, sl));
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = (i >> 1) & 1, bc = (i & 1) + 2 * ((i >> 2) & 1);
+        c[i] = fmaf(a[r][1].y, b[bc][1].y,
+                    fmaf(a[r][1].x, b[bc][1].x, fmaf(a[r][0].y, b[bc][0].y, fmaf(a[r][0].x, b[bc][0].x, c[i]))));
+    }
 #else
     __trap();
 #endif
@@ -1087,6 +1115,31 @@ __device__ __forceinline__ void mma884_cc(float* c, uint32_t a0, uint32_t a1, ui
                  "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
                  : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#elif defined(__CUDA_ARCH__)
+    // (Pascal: A column-major - this lane's values are rows 4 hi .. 4 hi + 3 of column j, so its quad pair's A [8][4]
+    //  comes from the four lanes j' = 0 .. 3 with the same hi, as the row-major form's does its two rows)
+    const uint32_t m = 0xffffffffu;
+    const int lane = threadIdx.x & 31, j = lane & 3, hi = lane >> 4, q = (lane >> 2) & 3;
+    float aa[4][4];   // (the rows 4 hi + 0 .. 3, each k 0 .. 3)
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+        const int sl = (hi << 4) | (q << 2) | kk;
+        const float2 s0 = u32_to_f2(__shfl_sync(m, a0, sl)), s1 = u32_to_f2(__shfl_sync(m, a1, sl));
+        aa[0][kk] = s0.x, aa[1][kk] = s0.y, aa[2][kk] = s1.x, aa[3][kk] = s1.y;
+    }
+    float2 b[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int sl = (((i >> 1) & 1) << 4) | (q << 2) | ((i & 1) + 2 * (j >> 1));
+        b[i][0] = u32_to_f2(__shfl_sync(m, b0, sl));
+        b[i][1] = u32_to_f2(__shfl_sync(m, b1, sl));
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = (j & 1) + 2 * ((i >> 1) & 1), bc = (i & 1) + 2 * ((i >> 2) & 1);
+        c[i] = fmaf(aa[r][3], b[bc][1].y,
+                    fmaf(aa[r][2], b[bc][1].x, fmaf(aa[r][1], b[bc][0].y, fmaf(aa[r][0], b[bc][0].x, c[i]))));
+    }
 #else
     __trap();
 #endif
