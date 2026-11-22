@@ -273,6 +273,17 @@ bool mtp_q4k_on() {
 }
 // (load_layer on the MTP block's thread: its BF16 matrices rounded to Q8_0 by mat())
 thread_local bool t_round_bf16 = false;
+// What each GPU's memory holds, by part - the web app's map of the GPUs (the VRAM lines, Model::vram_lines; the server's
+// serve/gpu_map.py): every allocation on a thread is charged to its part now, which VPart sets for a scope - the dense
+// weights (the default), the KV caches, the routed experts, the drafter (the MTP block, the drafts' head, DFly2), the
+// buffers a prompt chunk and a token window work in (scratch's arena)
+enum VramPart { kVWeights = 0, kVKv, kVPool, kVDrafter, kVPrompt, kVParts };
+thread_local int t_vpart = kVWeights;
+struct VPart {
+    int prev;
+    explicit VPart(int p) : prev(t_vpart) { t_vpart = p; }
+    ~VPart() { t_vpart = prev; }
+};
 
 }  // namespace
 
@@ -388,6 +399,7 @@ struct Gpu {
     cudaEvent_t ho_in[2] = {nullptr, nullptr}, ho_out = nullptr;
     std::vector<void*> allocs;
     size_t used = 0;
+    size_t vbytes[kVParts] = {};   // (alloc's bytes by part: VramPart)
     // scratch()'s buffers: one allocation, carved in order (idle between forwards - the vision tower's room for a
     // picture is lent from its start: vis_encode)
     uint8_t* arena = nullptr;
@@ -492,6 +504,7 @@ struct Gpu {
         }
         allocs.push_back(v);
         used += b;
+        vbytes[t_vpart] += b;
         p = (T*) v;
         return true;
     }
@@ -858,6 +871,67 @@ struct Model::Impl {
     }
     Stats st;
     std::vector<std::string> info;
+    // the web app's map of the GPUs (serve/gpu_map.py): a VRAM line a GPU - its total and free memory now, the bytes of
+    // each part (Gpu::vbytes; the MTP pass's own scratch, hm, the drafter's), the routed experts' slots it holds (a
+    // tensor-parallel member or a helper: the experts it holds slices of), its layers [first, end) and its group's size
+    std::vector<std::string> vram_lines() const {
+        std::vector<std::string> out;
+        auto held = [&](const Layer& l) -> long long {
+            if (l.dense || l.mtp) return 0;
+            if (l.slot_of.empty()) return l.experts != nullptr ? g.n_expert : 0;
+            long long n = 0;
+            for (int x : l.slot_of) n += x >= 0;
+            return n;
+        };
+        int cur = -1;
+        (void) cudaGetDevice(&cur);
+        for (size_t i = 0; i < G.size(); ++i) {
+            const Gpu& gp = G[i];
+            const bool member = tp > 1 && std::find(mem.begin(), mem.end(), (int) i) != mem.end();
+            long long slots = 0;
+            int a = -1, z = -1;
+            auto take = [&](const Layer& l) {
+                if (l.mtp || l.il < 0 || l.il >= g.n_layer) return;
+                slots += held(l);
+                if (a < 0 || l.il < a) a = l.il;
+                z = std::max(z, l.il + 1);
+            };
+            if (tp > 1) {
+                for (size_t m = 0; m < mem.size() && m < TL.size(); ++m)
+                    if (mem[m] == (int) i)
+                        for (const Layer& l : TL[m]) take(l);
+                for (const Helper& h : hel)
+                    if (h.gi == (int) i)
+                        for (const auto& hl : h.L)
+                            for (const Layer& l : hl) take(l);
+            } else {
+                for (const Layer& l : L)
+                    if (l.gpu == (int) i) take(l);
+            }
+            const size_t hm_b = (int) i == head_gpu && hm.dev == gp.dev ? hm.used : 0;
+            if (gp.used == 0 && hm_b == 0) continue;
+            size_t fr = 0, tot = 0;
+            if (cudaSetDevice(gp.dev) != cudaSuccess || cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            char pci[32] = "-";
+            if (cudaDeviceGetPCIBusId(pci, sizeof pci, gp.dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::snprintf(pci, sizeof pci, "-");
+            }
+            char b[512];
+            std::snprintf(b, sizeof b,
+                          "VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu kv_ram=0 act=0 drafter=%zu window=0 "
+                          "pool=%zu helper=0 tail=0 borrow=0 vision=0 vision_own=0 prompt=%zu tp=0 tp_n=%d slots=%lld "
+                          "ctx=%lld layers=%d-%d",
+                          gp.dev, pci, tot, fr, gp.vbytes[kVWeights], gp.vbytes[kVKv], gp.vbytes[kVDrafter] + hm_b,
+                          gp.vbytes[kVPool], gp.vbytes[kVPrompt], member ? tp : 1, slots, (long long) o.max_ctx, a, z);
+            out.push_back(b);
+        }
+        if (cur >= 0) (void) cudaSetDevice(cur);
+        return out;
+    }
     // host staging
     float* h_x = nullptr;                // pinned [Tc][hc][E]
     uint8_t* h_eg = nullptr;             // pinned [modules][Tc][cols][dim]
@@ -1649,6 +1723,7 @@ struct Model::Impl {
     // BF16 head's bytes for the drafts' top token - the drafts are checked by the model's own head, so only how often
     // they hold depends on it (HY4_DRAFT_HEAD=q8: Q8_0, half the bytes)
     bool draft_head_q4k(Gpu& hg, std::string& err) {
+        VPart vpart(kVDrafter);
         const Tensor* t = need("output.weight", err);
         if (!t) return false;
         const int k = g.n_embd;
@@ -3137,6 +3212,7 @@ struct Model::Impl {
         const std::string p = "blk." + std::to_string(il) + ".";
         l.mtp = il >= g.n_layer;
         t_round_bf16 = l.mtp;
+        VPart vpart(l.mtp ? kVDrafter : kVWeights);
         l.tpm = N > 1 ? m : -1;
         const int Hall = g.heads[(size_t) il], h0 = (int) ((int64_t) Hall * m / N), h1 = (int) ((int64_t) Hall * (m + 1) / N);
         l.H = h1 - h0;
@@ -3272,6 +3348,7 @@ struct Model::Impl {
             std::vector<int> res(order.begin(), order.begin() + l.n_res);
             std::sort(res.begin(), res.end());
             for (int s2 = 0; s2 < l.n_res; ++s2) l.slot_of[(size_t) res[(size_t) s2]] = s2;
+            VPart vpool(l.mtp ? kVDrafter : kVPool);
             if (!gp.alloc(l.experts, l.blob * (size_t) std::max(1, l.n_res), err) ||
                 !gp.alloc(l.slot_d, (size_t) g.n_expert, err))
                 return false;
@@ -3344,6 +3421,7 @@ struct Model::Impl {
         return true;
     }
     bool caches(Layer& l, Gpu& gp, std::string& err) {
+        VPart vpart(l.mtp ? kVDrafter : kVKv);
         if (l.swa) {
             l.ring = ring;
             if (!gp.alloc(l.kv, (size_t) ring * kv_rb() / 2, err)) return false;
@@ -3380,6 +3458,7 @@ struct Model::Impl {
     }
     // A helper's layer: its unit's slices of the routed experts, nothing else
     bool helper_layer(Layer& l, int unit, int w, std::string& err) {
+        VPart vpart(kVPool);
         Gpu& gp = G[(size_t) l.gpu];
         CK(cudaSetDevice(gp.dev));
         const std::string p = "blk." + std::to_string(l.il) + ".";
@@ -3405,6 +3484,7 @@ struct Model::Impl {
     // (unsplit experts, unsplit_experts(): every block of expert e is unit tp_own's, the others' slot -1 for it)
     bool expert_slices(Layer& l, Gpu& gp, std::string& err, int m, int N, const uint8_t* sg, const uint8_t* su,
                        const uint8_t* sd, int w = 1) {
+        VPart vpart(kVPool);
         const int lat = g.n_lat, ff = g.n_ff_exp, bv = iq::block_values(l.td), B = ff / bv;
         const size_t rg = iq::row_bytes(l.tg, lat), gb = rg * (size_t) ff;      // (a gate / up row, an expert's)
         const size_t bd = iq::row_bytes(l.td, bv), rd = iq::row_bytes(l.td, ff), db = rd * (size_t) lat;
@@ -3486,6 +3566,7 @@ struct Model::Impl {
     // (only_bytes: nothing allocated - what the buffers come to for this GPU's sH / sFF.  stage_b: the GPU's staging
     //  slots for a prompt's streamed experts, at the allocation's end - a pass's copy, idle between prompts as the rest)
     bool scratch(Gpu& gp, std::string& err, size_t* only_bytes = nullptr, size_t stage_b = 0) {
+        VPart vpart(kVPrompt);
         if (!only_bytes) CK(cudaSetDevice(gp.dev));
         const size_t E = (size_t) g.n_embd, hc = (size_t) g.hc, H = (size_t) gp.sH, maxk = (size_t) g.ix_top_k + g.ix_kpool;
         const size_t lat = (size_t) g.n_lat, ff = (size_t) (gp.sFF ? gp.sFF : g.n_ff), ffe = (size_t) g.n_ff_exp,
@@ -4122,6 +4203,7 @@ struct Model::Impl {
             !hg.alloc(hg.logits, (size_t) W * g.n_vocab, err) || !hg.alloc(hring, (size_t) ring * g.n_embd, err))
             return false;
         if (o.mtp && g.n_mtp > 0) {   // (after the head: its BF16 rounding is the MTP block's alone)
+            VPart vpart(kVDrafter);
             const double tm = now_s();
             M.il = g.n_layer;
             M.gpu = head_gpu;
@@ -7433,6 +7515,7 @@ struct Model::Impl {
         return true;
     }
     bool dfly_load(std::string& err) {
+        VPart vpart(kVDrafter);
         if (kv_res() > 0) {   // (its layers read the trunk's cache rows in VRAM, not a streamed layer's ring or host rows)
             info.push_back("INFO the DFly2 drafter is off with KV streaming (it reads the trunk's cache rows in VRAM "
                            "only): decoding without drafts");
@@ -9543,6 +9626,7 @@ void Model::set_images(std::vector<Image> images) {
 }
 const Stats& Model::stats() const { return m->st; }
 std::vector<std::string> Model::info_lines() const { return m->info; }
+std::vector<std::string> Model::vram_lines() const { return m->vram_lines(); }
 std::string Model::room_report() const { return m->room_out; }
 
 }  // namespace hy4

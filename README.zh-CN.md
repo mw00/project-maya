@@ -243,7 +243,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **在浏览器里：** 聊天 (保存在你的浏览器中，支持搜索、置顶和文件夹，每个聊天可单独设置指令和思考级别，可编辑和重新生成，支持 HTML 预览)，模型与硬件的实时**监控** (细到每块 GPU 的显存都被什么占用)，可在设置中更改的上下文大小和端口，以及 **Models**：这台机器上已安装的所有模型、切换到另一个模型 (Maya 会用它重新启动)，以及每个模型的引擎设置 (上下文、GPU、草稿、图片、内存)，保存在它的 `maya-<model>.json` 中。
 - **Models 页面：** 目录列出每个 Maya 模型及其大小。可以带进度条下载、加载、卸载正在运行的模型或删除模型，无需命令行。
 - **Turbo：** 模型参数旁边的一个按钮，即可为该模型设置最快的配置 (贪心采样、不思考、跳过专家、最快的草稿方式)。这是用一点质量换速度；关闭后会精确恢复你原来的设置。
-- **已节省：** 侧边栏的 Saved 一行会累计相同 token 若用模型自家 API (DeepSeek、Z.ai 或 MiniMax) 会收取的费用 - Maya 从缓存复用的提示按该 API 的缓存价格计算，DeepSeek 的高峰时段按高峰价格计算 - 按模型保存在 `token-savings.json` 中；价格可在 **Settings › Savings** 中修改。
+- **已节省：** 侧边栏的 Saved 一行会累计相同 token 若用模型自家 API (DeepSeek、Z.ai、MiniMax 或 Tencent) 会收取的费用 - Maya 从缓存复用的提示按该 API 的缓存价格计算，DeepSeek 的高峰时段按高峰价格计算 - 按模型保存在 `token-savings.json` 中；价格可在 **Settings › Savings** 中修改。
 - **你的应用和编程智能体：** OpenAI 兼容 API 位于 `http://127.0.0.1:8080/v1`，Anthropic 的位于 `http://127.0.0.1:8080/v1/messages` (Claude Code：`ANTHROPIC_BASE_URL=http://127.0.0.1:8080`)。工具调用会随模型书写实时流式返回，请求时指定 (`"return_progress": true`) 还可流式返回长提示的读取进度。允许来自其他地址的网页的地址后，该网页也可以调用它 (`"cors_origins"`，[docs/SETUP.md](docs/SETUP.md#web-pages-on-another-address))。
 - **Responses API：** `/v1/responses` 支持文本 / 图片对话、流式输出、函数工具调用、经模式校验的输出、可取消和重放的后台任务，以及可选的共享内存历史 (`store:true`、`previous_response_id`)。默认不保存响应。选项与限制：[docs/RESPONSES.md](docs/RESPONSES.md)。
 - **模型 API：** `/api/tags`、`/api/ps`、`/api/show`、`/api/chat`、`/api/generate`、`/api/pull` 和 `/api/delete` 可让任何应用或脚本列出、加载、下载和删除模型。请求一个尚未加载的模型会切换到它，`keep_alive` 会在空闲时卸载它。`/models/load`、`/models/unload` 和 `/models/sse` 也默认开启 (`"model_management": false` 可关闭)。

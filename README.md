@@ -280,7 +280,7 @@ slowest while the caches fill with what you use.
 - **Turbo:** one button beside the model's parameters sets the fastest settings for the model (greedy sampling, no
   thinking, expert skipping, the fastest drafting). It trades some quality for speed; switching it off restores your
   settings exactly.
-- **Saved:** the sidebar's Saved line adds up what the model's own API (DeepSeek's, Z.ai's or MiniMax's) would have
+- **Saved:** the sidebar's Saved line adds up what the model's own API (DeepSeek's, Z.ai's, MiniMax's or Tencent's) would have
   charged for the same tokens - the prompt Maya reuses from its cache at the API's cached price, DeepSeek's peak hours
   at its peak price - kept per model in `token-savings.json`; its prices can be changed in **Settings › Savings**.
 - **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
