@@ -16,6 +16,7 @@
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
+#include "vram_late.hpp"   // (#1026: the reserve held for the whole run)
 #include "glm_dsa_fast.hpp"   // glm-dsa B2.4
 #include "glm_residual.hpp"   // glm-dsa B2.3
 #include "glm_tier_numa.hpp"   // glm-dsa B8.2-B8.4
@@ -1389,7 +1390,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (long long) max_ctx_, (double) state_bytes_ / G,
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
-        // the budget: the free VRAM less the reserve (--vram-reserve-mib), or --expert-cache N's (pool_budget)
+        // the budget: the free VRAM less the reserve (--vram-reserve-mib), or --expert-cache N's (pool_budget), less
+        // what this PC's start and requests allocated after the pool before (#1026: late_read)
+        late_read(free_b, total_b, floor_b, stride_max);
         pool_b_ = part_budget(free_b, total_b, floor_b, stride_max);
         const size_t reserve = pool_b_.reserve;
         size_t avail = pool_b_.avail;
@@ -7646,7 +7649,92 @@ size_t Glm5Model::mmq_scratch_reserve() {
 Glm5Model::PoolBudget Glm5Model::part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const {
     PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, fast_ != nullptr && fast_->unified_memory);
     b.avail = b.avail > pool_short_ ? b.avail - pool_short_ : 0;
+    // (#1026) ... and what this PC's start and requests allocated after the pool before (late_read) - never below the
+    // pool's floor for it: a card that small keeps the pool and says it is short
+    if (late_ > 0 && !b.adapted) b.avail = std::max(b.avail > late_ ? b.avail - late_ : 0, std::min(b.avail, floor_b));
     return b;
+}
+
+// (#1026) the reserve held for the whole run: this part's figure from the pack's vram-late.txt (MAYA_GLM_LATE_FILE /
+// MAYA_VRAM_LATE_FILE: another file, =none: not kept; MAYA_GLM_LATE_MB / MAYA_VRAM_LATE_MB=n: n MiB, 0 the reserve
+// alone), before the pool is carved.  The default reserve keeps v1.1.73's pool unless the figure uses it up; a card
+// whose default reserve was lowered for the pool's floor (adapted) keeps it as it is.  A unified-memory APU (its pool
+// is sized from RAM) is not measured.
+void Glm5Model::late_read(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) {
+    late_on_ = false;
+    late_ = 0;
+    if (fast_ == nullptr || fast_->unified_memory) return;
+    const PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, false);
+    cudaDeviceProp pr{};
+    if (cudaGetDeviceProperties(&pr, dev_) != cudaSuccess) (void) cudaGetLastError();
+    char buf[512];
+    const char* ec = getenv("MAYA_GLM_EXPERT_CACHE");
+    std::snprintf(buf, sizeof buf, "glm late|%s %x:%x %zu MiB|part %d of %d|pack %s|ctx %lld seqs %d cache %s reserve "
+                  "%zu", pr.name, (unsigned) pr.pciBusID, (unsigned) pr.pciDeviceID, total_b >> 20, part_, n_parts_,
+                  pack_dir_.c_str(), (long long) max_ctx_, seq_count(), ec ? ec : "auto", b.reserve >> 20);
+    late_key_ = buf;
+    late_res_ = b.reserve;
+    late_given_ = b.reserve_given;
+    late_on_ = true;
+    const std::string file = strata::vramlate::file_of(pack_dir_, "MAYA_GLM_LATE_FILE");
+    const int64_t fixed = strata::vramlate::fixed_of("MAYA_GLM_LATE_MB");
+    if (fixed >= 0) {
+        late_ = (size_t) fixed << 20;
+    } else if (!file.empty()) {
+        const std::string v = strata::vramlate::get(file, late_key_);
+        late_kept_ = v.empty() ? 0 : (size_t) std::max(0LL, std::atoll(v.c_str())) << 20;
+        late_ = b.adapted ? 0 : strata::vramlate::kept_for(late_kept_, b.reserve, b.reserve_given);
+    }
+    // (what the pool can give up above its floor: a pool already there keeps no more free, and its start is not said
+    //  short - a restart would not help)
+    const size_t avail0 = b.avail > pool_short_ ? b.avail - pool_short_ : 0;
+    late_room_ = b.adapted ? 0 : avail0 > floor_b ? avail0 - floor_b : 0;
+    if (late_ > late_room_) {
+        std::fprintf(stderr, "glm fast: CUDA%d the expert pool is at its floor: %zu of the %zu MiB measured can be kept "
+                             "free beside the reserve on this card\n", dev_, late_room_ >> 20, late_ >> 20);
+        late_ = late_room_;
+    }
+    if (late_ > 0)
+        std::fprintf(stderr, "glm fast: CUDA%d keeps %zu MiB free beside the %zu MiB reserve: what this PC's start and "
+                             "requests allocate after the expert pool%s\n", dev_, late_ >> 20, b.reserve >> 20,
+                     fixed >= 0 ? " (MAYA_GLM_LATE_MB)" : " (measured before)");
+}
+
+int Glm5Model::late_check_part(bool loaded) {
+    if (!late_on_) return 0;
+    size_t fr = 0, tot = 0;
+    cudaSetDevice(dev_);
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    const size_t res = pool_b_.reserve > 0 ? pool_b_.reserve : late_res_;   // (the reserve the pool was carved with)
+    if (loaded)
+        std::fprintf(stderr, "glm fast: CUDA%d: %zu MiB of VRAM free with everything loaded (the reserve %zu MiB%s)\n",
+                     dev_, fr >> 20, res >> 20,
+                     late_ > 0 ? (", " + std::to_string(late_ >> 20) + " MiB more kept beside it").c_str() : "");
+    if (strata::vramlate::fixed_of("MAYA_GLM_LATE_MB") >= 0) return 0;
+    strata::vramlate::Gpu lg{late_, late_kept_, late_fr_min_};
+    const strata::vramlate::Step st = strata::vramlate::check(lg, fr, tot, res, late_given_, late_room_ - std::min(late_room_, late_));
+    late_fr_min_ = lg.fr_min, late_kept_ = lg.kept;
+    if (!st.moved) return 0;
+    const std::string file = strata::vramlate::file_of(pack_dir_, "MAYA_GLM_LATE_FILE");
+    if (st.short_)
+        std::fprintf(stderr, "glm fast: WARNING - CUDA%d: %zu MiB free, short of the %zu MiB reserve - the next start "
+                             "keeps %lld MiB free beside it for what the start and the requests allocate after the "
+                             "expert pool%s\n", dev_, fr >> 20, res >> 20, (long long) (st.want >> 20),
+                     file.empty() ? " (MAYA_GLM_LATE_FILE=none: not kept)" : "");
+    if (!file.empty()) strata::vramlate::put(file, late_key_, std::to_string(st.want >> 20));
+    return loaded && st.short_ && !file.empty() ? (int) (st.want >> 20) : 0;
+}
+
+int Glm5Model::late_check(bool loaded) {
+    int cur = 0;
+    if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+    int short_mib = 0;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) short_mib = std::max(short_mib, m->late_check_part(loaded));
+    cudaSetDevice(cur);
+    return short_mib;
 }
 
 // --expert-cache auto: the budget is checked once it is WRITTEN.  Under Windows' WDDM an allocation is resident only

@@ -752,6 +752,9 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 std::printf("INFO vision=off\n");
                 break;
             }
+    // (#1026: a start that came out short of its VRAM reserve - the server starts the engine once more, which keeps
+    //  what this one measured free beside it)
+    if (const int short_mib = m.late_check(true); short_mib > 0) std::printf("INFO reserve_short=%d\n", short_mib);
     std::printf("READY %lld stop\n", (long long) m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, WRAP, "
@@ -792,6 +795,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             std::fflush(stdout);
             continue;
         }
+        (void) m.late_check(false);   // (#1026: what the requests before allocated, against the reserve)
         in.stop.store(false);
         in.wrap.store(false);
         Req r;
@@ -1687,7 +1691,7 @@ int main(int argc, char** argv) {
             const std::string v = next();
             o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
         }
-        else if (a == "--reserve-gb") o.reserve_gb = std::atof(next().c_str());
+        else if (a == "--reserve-gb") o.reserve_gb = std::atof(next().c_str()), o.reserve_given = true;
         else if (a == "--room-report") o.room_report = true;
         else if (a == "--chunk") {   // (auto, the default: the engine's plan picks it)
             const std::string v = next();

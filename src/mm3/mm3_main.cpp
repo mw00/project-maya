@@ -333,6 +333,9 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
                     vg->patch, vg->merge, vg->max_pixels, vg->min_pixels);
+    // (#1026: a start that came out short of its VRAM reserve - the server starts the engine once more, which keeps
+    //  what this one measured free beside it)
+    if (const int short_mib = m.late_check(true); short_mib > 0) std::printf("INFO reserve_short=%d\n", short_mib);
 }
 
 // Prompt lookup (--suffix-draft N, maya-ds4's): the suffix drafter (strata/spec/suffix_drafter.hpp) proposes the tokens
@@ -401,6 +404,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             std::fflush(stdout);
             continue;
         }
+        (void) m.late_check(false);   // (#1026: what the requests before allocated, against the reserve)
         in.stop.store(false);
         Req r;
         if (!parse_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
@@ -1184,6 +1188,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         if (l == "QUIT") {
             quit = true;
         } else if (l.rfind("GEN ", 0) == 0 || l.rfind("GENI ", 0) == 0) {
+            (void) m.late_check(false);   // (#1026: what the requests before allocated, against the reserve)
             admit(l);
         } else {
             std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", l.substr(0, l.find(' ')).c_str());

@@ -4302,6 +4302,10 @@ static int glm_pack_generate(const Options& o) {
                                      "room\n", (long long) pv.fixed);
         }
     }
+    // (#1026) a start that came out short of its VRAM reserve: the server starts the engine once more, which keeps
+    // what this one measured free beside it
+    if (model.fast())
+        if (const int short_mib = model.late_check(true); short_mib > 0) std::printf("INFO reserve_short=%d\n", short_mib);
     // the serve wire contract (serve/server.py): READY <max_context> [stop] once, then GEN <max_new>
     // [<key>=<value> ...] <id,id,...> lines - the sampling keys are per request and the ids are the LAST
     // token.  "stop" is NOT advertised: a request runs to its end (no mid-request cancel in M3.1).
@@ -4453,6 +4457,7 @@ static int glm_pack_generate(const Options& o) {
             continue;
         }
         if (cmd == "GEN" || cmd == "GENI") {
+            if (model.fast()) (void) model.late_check(false);   // (#1026: what the requests before allocated)
             int64_t max_new = 0;
             ss >> max_new;
             strata::kernels::SamplerParams rq = sp;

@@ -164,6 +164,10 @@ public:
         int64_t fixed = 0;
     };
     std::vector<PoolVram> pool_vram() const;
+    // (#1026) every part's free VRAM against its reserve, once loaded (`loaded`) and before each request: what the
+    // start and the requests allocate after the pool is kept for the next start (the pack's vram-late.txt); > 0:
+    // this start came out short of the reserve - the MiB the next one keeps beside it (INFO reserve_short=)
+    int late_check(bool loaded);
     /// Windows on an APU (AMD's Strix / Gorgon Halo): the bytes of experts the commit (RAM + page file) kept off the
     /// GPU over every part, and the page file (GiB) that keeps them on it - {0, 0} elsewhere (pool_check)
     std::pair<size_t, size_t> commit_capped() const;
@@ -1128,6 +1132,14 @@ public:
     PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
     void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
     size_t pool_short_ = 0;                                // what that check found short of the reserve
+    // (#1026) what this part's start and requests allocate after the pool, measured and kept in the pack's
+    // vram-late.txt (src/core/vram_late.hpp): late_ is kept free beside the reserve (part_budget), late_read before
+    // the pool is carved, late_check_part once loaded and before every request
+    size_t late_ = 0, late_kept_ = 0, late_fr_min_ = ~(size_t) 0, late_res_ = 0, late_room_ = 0;
+    bool late_given_ = false, late_on_ = false;
+    std::string late_key_;
+    void late_read(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b);
+    int late_check_part(bool loaded);
     size_t commit_kept_ = 0, commit_limit_ = 0, commit_ram_ = 0;   // (a Windows APU: what the commit kept off, as read)
     PoolBudget pool_b_;                                    // the budget the pool was carved from
     static size_t mmq_scratch_reserve();      // ... of which the prompt path's MMQ scratch pool needs this much
