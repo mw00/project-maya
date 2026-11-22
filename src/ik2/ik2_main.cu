@@ -2123,6 +2123,51 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         CU(cudaMemcpyAsync(X.sg, sg, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+
+        // an expert's gate / up ([n][2 F] F32 from n FP16 rows of C) and down ([n][C] from n rows of F)
+        auto gate_up = [&](int e, const uint16_t* x16, int n, float* gu) {
+            const uint8_t* sl = X.slot_ptrs[e];
+            if (Ly.ty[0] == Ly.ty[1]) {
+                k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
+            } else {
+                k::decode_f16(Ly.ty[0], sl, (size_t) F * C, X.w16, g_s);
+                k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, X.w16 + (size_t) F * C, g_s);
+            }
+            gemm16(X.w16, 2 * F, C, x16, n, gu, 2 * F);
+        };
+        auto down = [&](int e, const uint16_t* h16, int n, float* y) {
+            k::decode_f16(Ly.ty[2], X.slot_ptrs[e] + Ly.eb[0] + Ly.eb[1], (size_t) C * F, X.w16, g_s);
+            gemm16(X.w16, C, F, h16, n, y, C);
+        };
+        // IK2_BATCH_PREFILL=1 (one GPU, every pick's expert in VRAM, a chunk of 64 tokens or more, the scratch big
+        // enough): the chunk's picks gathered once, grouped by expert; each expert's gate / up and down over its rows;
+        // one SwiGLU over all of them; then each token's picks summed in expert order (moe_rows_combine: the order
+        // run_exp adds them in, the same bits) - a gather, a SwiGLU and an add a chunk instead of one each an expert.
+        // The rows live in lg (the attention's scratch, free until the next visit) and gu32.
+        // (alesha-pro/maya-inkling-mini; AMD: its matrix-core path below)
+#ifndef MAYA_USE_HIP
+        static const bool batch_prefill = getenv("IK2_BATCH_PREFILL") && std::atoi(getenv("IK2_BATCH_PREFILL"));
+        if (batch_prefill && d < 0 && !g_off && n_miss == 0 && T >= 64 && c.K <= 16 && C % 4 == 0 &&
+            (size_t) S * (2 * std::max(C, F) + 4 * C) <= X.lg_cap * 4 && (size_t) S * 2 * F * 4 <= X.gu32_bytes) {
+            if (X.pf_layers[l % Work::kPfRing] == l) {   // (the prefetches these experts are in, waited for)
+                int b = -1;
+                for (int e = 0; e < c.E; ++e)
+                    if (W.cnt[e]) b = std::max(b, X.pf_bs[l % Work::kPfRing][e]);
+                if (b >= 0) CU(cudaStreamWaitEvent(g_s, X.pf_evs[l % Work::kPfRing][b], 0));
+            }
+            uint16_t* rows16 = (uint16_t*) X.lg;                                      // [S][max(C, F)]: x, then h
+            float* rows32 = (float*) (rows16 + (size_t) S * std::max(C, F));          // [S][C]: down's
+            gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, rows16);
+            for (int e : X.hit_exps)
+                gate_up(e, rows16 + (size_t) W.start[e] * C, W.cnt[e], X.gu32 + (size_t) W.start[e] * 2 * F);
+            k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, rows16, g_s);
+            for (int e : X.hit_exps)
+                down(e, rows16 + (size_t) W.start[e] * F, W.cnt[e], rows32 + (size_t) W.start[e] * C);
+            k::moe_rows_combine(rows32, X.inv, X.wtr, T, c.K, C, X.tmp, g_s);
+            X.pf_layers[l % Work::kPfRing] = -1;
+            return;
+        }
+#endif
         CU(cudaMemsetAsync(X.tmp, 0, (size_t) T * C * 4, g_s));
 
         // Each expert: its tokens gathered, gate/up, SwiGLU, down, then added into tmp with their weights. The experts run
@@ -2130,18 +2175,10 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         // depend on the cache. Only [T][C] of scratch: no [T * K][C] copies of the inputs or the outputs.
         auto run_exp = [&](int e) {
             const int cnt_e = W.cnt[e], st_e = W.start[e];
-            const uint8_t* sl = X.slot_ptrs[e];
             gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
-            if (Ly.ty[0] == Ly.ty[1]) {
-                k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
-            } else {
-                k::decode_f16(Ly.ty[0], sl, (size_t) F * C, X.w16, g_s);
-                k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, X.w16 + (size_t) F * C, g_s);
-            }
-            gemm16(X.w16, 2 * F, C, X.ex16, cnt_e, X.gu32, 2 * F);
+            gate_up(e, X.ex16, cnt_e, X.gu32);
             k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
-            k::decode_f16(Ly.ty[2], sl + Ly.eb[0] + Ly.eb[1], (size_t) C * F, X.w16, g_s);
-            gemm16(X.w16, C, F, X.h16, cnt_e, X.y32, C);
+            down(e, X.h16, cnt_e, X.y32);
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
         };
         if (g_off) {

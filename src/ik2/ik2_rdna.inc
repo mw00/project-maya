@@ -281,28 +281,6 @@ __global__ void __launch_bounds__(128) experts_rdna_kernel(const uint8_t* const*
 #endif
 }
 
-// out [T][C] = sum of a token's picks' wtr[row] y[row], in row order (= expert order); a block a token
-__global__ void moe_rows_combine_kernel(const float* __restrict__ y, const int* __restrict__ inv,
-                                        const float* __restrict__ wtr, int K, int C, float* __restrict__ out) {
-    const int t = blockIdx.x;
-    int r[16];
-    const int kk = K < 16 ? K : 16;
-    for (int k = 0; k < kk; ++k) {   // (insertion sort of a token's few rows)
-        int v = inv[(size_t) t * K + k], j = k;
-        while (j > 0 && r[j - 1] > v) r[j] = r[j - 1], --j;
-        r[j] = v;
-    }
-    for (int c4 = threadIdx.x; c4 < C / 4; c4 += blockDim.x) {
-        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        for (int k = 0; k < kk; ++k) {
-            const float w = wtr[r[k]];
-            const float4 v = ((const float4*) (y + (size_t) r[k] * C))[c4];
-            a.x = fmaf(w, v.x, a.x), a.y = fmaf(w, v.y, a.y), a.z = fmaf(w, v.z, a.z), a.w = fmaf(w, v.w, a.w);
-        }
-        ((float4*) (out + (size_t) t * C))[c4] = a;
-    }
-}
-
 // The prompt's fused attention (attn_flash_f16_kernel's job and outputs: a split's unnormalised rows and (max, sum),
 // merged with the sink by attn_flash_combine_kernel) on the matrix cores.  A block: 64 queries (4 warps x 16) of one
 // head against a split of its keys in tiles of 32; S = Q K^T (Q in the registers, K as it lies), the online softmax
@@ -606,10 +584,4 @@ void experts_rdna_down(const uint8_t* const* eptr, const int* tiles, int n_tiles
     rm_launch<false>(ty, g, s, eptr, (const int4*) tiles, off_down, rm_row_bytes(ty, F), h16, F, F, C,
                      (const float*) nullptr, (const float*) nullptr, 0.0f, 0.0f, (uint16_t*) nullptr, y32);
     check("experts_rdna_down");
-}
-void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
-                      cudaStream_t s) {
-    if (T <= 0) return;
-    moe_rows_combine_kernel<<<T, 256, 0, s>>>(y32, inv, wtr, K, C, out);
-    check("moe_rows_combine");
 }

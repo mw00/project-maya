@@ -7379,6 +7379,35 @@ static void need_class(int cls, const char* what) {
     std::fprintf(stderr, "ik2::k::%s: not on this GPU (sm_%d class; the kernel needs sm_%d)\n", what, arch_class(), cls);
     std::abort();
 }
+
+// out [T][C] = sum of a token's picks' wtr[row] y[row], in row order (= expert order); a block a token
+__global__ void moe_rows_combine_kernel(const float* __restrict__ y, const int* __restrict__ inv,
+                                        const float* __restrict__ wtr, int K, int C, float* __restrict__ out) {
+    const int t = blockIdx.x;
+    int r[16];
+    const int kk = K < 16 ? K : 16;
+    for (int k = 0; k < kk; ++k) {   // (insertion sort of a token's few rows)
+        int v = inv[(size_t) t * K + k], j = k;
+        while (j > 0 && r[j - 1] > v) r[j] = r[j - 1], --j;
+        r[j] = v;
+    }
+    for (int c4 = threadIdx.x; c4 < C / 4; c4 += blockDim.x) {
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int k = 0; k < kk; ++k) {
+            const float w = wtr[r[k]];
+            const float4 v = ((const float4*) (y + (size_t) r[k] * C))[c4];
+            a.x = fmaf(w, v.x, a.x), a.y = fmaf(w, v.y, a.y), a.z = fmaf(w, v.z, a.z), a.w = fmaf(w, v.w, a.w);
+        }
+        ((float4*) (out + (size_t) t * C))[c4] = a;
+    }
+}
+void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
+                      cudaStream_t s) {
+    if (T <= 0) return;
+    moe_rows_combine_kernel<<<T, 256, 0, s>>>(y32, inv, wtr, K, C, out);
+    check("moe_rows_combine");
+}
+
 #ifdef MAYA_USE_HIP
 #include "ik2_rdna.inc"   // (AMD: the matrix-core kernels)
 #endif
