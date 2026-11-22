@@ -825,7 +825,17 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             if (x.start < (long long) from &&
                 std::none_of(held.begin(), held.end(), [&](const Held& q) { return x.start == q.start && x.hash == q.hash; }))
                 from = (size_t) x.start;
-        if (from > 0 && !m.resumable((int64_t) from)) from = 0;   // (the windows before it gone: read it all again)
+        if (from > 0 && !m.resumable((int64_t) from)) {   // (the windows before it gone: a restore point, else from 0)
+            const size_t shared = from;
+            const int64_t at = m.restore(r.ids.data(), (int64_t) from, err);
+            from = at > 0 ? (size_t) at : 0;
+            if (at > 0)
+                std::fprintf(stderr, "maya hy4 serve: restore point %zu of %zu shared tokens\n", from, shared);
+            else if (!err.empty()) {
+                std::fprintf(stderr, "maya hy4 serve: restore point: %s - read from 0\n", err.c_str());
+                err.clear();
+            }
+        }
         state.resize(from);
         held.clear();
         {
@@ -1683,6 +1693,7 @@ int main(int argc, char** argv) {
         else if (a == "--gen") gen = std::atoi(next().c_str());
         else if (a == "--gpus") o.gpus = parse_list(next());
         else if (a == "--max-context") o.max_ctx = std::atoll(next().c_str());
+        else if (a == "--snap-every") o.snap_every = std::max(0, std::atoi(next().c_str()));   // (restore points)
         else if (a == "--layer-split") {   // (the server's "auto": each GPU filled in turn)
             const std::string v = next();
             o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
