@@ -4172,7 +4172,7 @@ struct SpecCtl {
     double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
     double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
     int plain_run = 0;
-    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 8;   // plain tokens before a look
+    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 4;   // plain tokens before a look
     int probe_w = 4;
     double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
@@ -4195,15 +4195,31 @@ struct SpecCtl {
         for (int b = 2; b <= kBlockMax && n; ++b)
             if (seen[b] < 2) c[b] = prior[b] * r / n;
     }
+    // The drafter's drafts are kept in runs: a draft whose predecessors were kept is kept far more often than the
+    // first one (code: 0.78 the first, 0.8 .. 0.9 each one after), which one acceptance for every position (a
+    // geometric window) undervalues - it chose windows of 3 where 5 gave 5% more.  So: the kept share by position
+    // (pa / pn: of the drafts reached - every one before them kept - the ones kept; decayed counts over priors).
+    // IK2_DRAFT_POLICY=geo: one acceptance for all positions, as before.
+    bool by_pos = !(getenv("IK2_DRAFT_POLICY") && std::string(getenv("IK2_DRAFT_POLICY")) == "geo");
+    double pn[kBlockMax] = {3, 3, 3, 3, 3, 3, 3, 3}, pa[kBlockMax] = {2.1, 2.25, 2.4, 2.4, 2.4, 2.55, 2.55, 2.55};
+    double pos_decay = getenv("IK2_DRAFT_POS_DECAY") ? atof(getenv("IK2_DRAFT_POS_DECAY")) : 0.9;
+    double expect(int b) const {   // the tokens a window of b gives: the anchor's next and the drafts kept before a miss
+        if (!by_pos) {
+            const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
+            return (1.0 - std::pow(a, b)) / (1.0 - a);
+        }
+        double e = 1.0, reach = 1.0;
+        for (int j = 0; j + 1 < b; ++j) reach *= std::min(0.98, pa[j] / pn[j]), e += reach;
+        return e;
+    }
     int choose(int room) {   // room: the widest a step may be (1: plain)
         const int bmax = std::min(wmax, room);
         if (bmax < 2) return 1;
         if (!adapt) return bmax;
-        const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
         int best = 1;
         double vb = 1.0 / c_plain;
         for (int b = 2; b <= bmax; ++b) {
-            const double e = (1.0 - std::pow(a, b)) / (1.0 - a), v = e / c[b];
+            const double v = expect(b) / c[b];
             if (v > vb) vb = v, best = b;
         }
         if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
@@ -4216,6 +4232,8 @@ struct SpecCtl {
     void took_spec(int B, int acc, double t) {
         took_width(B, t);
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
+        for (int j = 0; j + 1 < B && j <= acc; ++j)   // (draft j was reached: the j before it were kept)
+            pn[j] = pos_decay * pn[j] + 1.0, pa[j] = pos_decay * pa[j] + (j < acc ? 1.0 : 0.0);
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
         plain_run = 0;
     }
@@ -4241,8 +4259,7 @@ struct SpecCtl {
         if (use_model) {
             const int bm = choose(room);
             if (bm >= 2) {
-                const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
-                const double v = (1.0 - std::pow(a, bm)) / (1.0 - a) / c[bm];
+                const double v = expect(bm) / c[bm];
                 if (src == 0 || v > vb || plain_run >= probe) vb = v, B = bm, src = 1;
             }
         }
