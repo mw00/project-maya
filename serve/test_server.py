@@ -2457,6 +2457,34 @@ class VisionRoomOnDemand(unittest.TestCase):
         with mock.patch("serve.server.subprocess.run", return_value=mock.Mock(returncode=9, stdout="")):
             self.assertIsNone(gpu_free_bytes(0))
 
+    def test_amd_free_memory(self):
+        """An AMD GPU's free memory from the amdgpu driver's files (HIP's numbering through KFD); an APU's (a small
+        carve-out beside a larger GTT) is what MemAvailable leaves beyond the max(8 GiB, 10%) kept free."""
+        import tempfile
+        from serve.server import amd_gpu_free_bytes
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def put(path, text):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            nodes = root / "class/kfd/kfd/topology/nodes"
+            put(nodes / "0/properties", "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n")
+            put(nodes / "1/properties", "simd_count 192\ngfx_target_version 110000\ndrm_render_minor 128\n")
+            dev = root / "class/drm/renderD128/device"
+            put(dev / "mem_info_vram_total", str(24 << 30))
+            put(dev / "mem_info_vram_used", str(5 << 30))
+            put(dev / "mem_info_gtt_total", str(16 << 30))
+            meminfo = root / "meminfo"
+            put(meminfo, "MemTotal:       196608000 kB\nMemAvailable:   180000000 kB\n")
+            self.assertEqual(amd_gpu_free_bytes(0, str(root), str(meminfo)), 19 << 30)   # (a card: its VRAM's)
+            self.assertIsNone(amd_gpu_free_bytes(1, str(root), str(meminfo)))             # (no such GPU)
+            put(dev / "mem_info_vram_total", str(512 << 20))                              # (an APU)
+            put(dev / "mem_info_vram_used", str(100 << 20))
+            put(dev / "mem_info_gtt_total", str(180 << 30))
+            self.assertEqual(amd_gpu_free_bytes(0, str(root), str(meminfo)),
+                             180000000 * 1024 - 196608000 * 1024 // 10)
+
 
 class LifecycleEngine(MockEngine):
     """The mock engine with StrataEngine's lifecycle: alive / close (QUIT) / restart, counted."""

@@ -1,5 +1,5 @@
 // src/ik2/ik2_draft.hpp - maya-ik2's drafter: Inkling 2's DSpark draft model (the official checkpoint's
-// mtp.safetensors, BF16) for speculative decoding, after SGLang's models/inkling2_mtp.py, dflash.py and dspark.py.
+// mtp.safetensors, BF16) for speculative decoding.
 //
 //   * The target leaves 8 hidden states a position: its stream at the start of layers 5, 11, .., 41 and the final
 //     normed hidden (taps).  For each committed position, each draft layer mixes them (softmax(fuse_weight[layer])),

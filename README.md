@@ -83,7 +83,8 @@ itself as unsloth's UD-IQ2_XS GGUF, both with pictures
 ([its settings](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)), and Tencent's own Q4_K_M of Hy4-flash (AngelSlim's GGUF)
 with MTP drafting (run on NVIDIA RTX 30 / A100 and newer, Linux; with pictures: `./maya.sh --setup --model hy4-flash-q4_k_m`;
 [its settings](docs/SETTINGS.md#hy4-flash)), and Inkling 2 Mini (26 B) as an experimental preview on its own engine:
-unsloth's UD-Q4_K_XL GGUF, the whole model in one 24 GB NVIDIA card (RTX 30 / A100 and newer, Linux), with pictures
+unsloth's UD-Q4_K_XL GGUF on Linux, on NVIDIA V100 / RTX 20 and newer from 8 GB (the experts that don't fit stay in
+RAM) or AMD RDNA 3 / 4 and Halo with 24 GB, with pictures
 (`./maya.sh --setup --model inkling-2-mini`; [docs/INKLING2.md](docs/INKLING2.md)). **Each model's files, drafters, pictures and options:
 [docs/MODELS.md](docs/MODELS.md).**
 

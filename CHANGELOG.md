@@ -4,6 +4,26 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.73 - 2026-11-22
+
+Inkling 2 Mini runs on far more PCs: NVIDIA cards from 8 GB (the experts that do not fit stay in RAM), V100 and RTX 20
+cards, and AMD on Linux (Radeon RDNA 3 / 4 cards and the Strix / Gorgon Halo); it drafts with its official drafter and
+earlier text where that is faster, with the same answers. Fixes: `--vram-reserve-mib` is kept on every start and
+DeepSeek keeps the reserve for the whole run (#1026); Hy4-Flash on two GPUs copies between them only where that is safe
+(#1100) and no longer crashes at the start when a draft step gets invalid numbers (#1084).
+
+- **Inkling 2 Mini on cards from 8 GB (NVIDIA, Linux):** where the card does not hold every expert, the most-used experts stay in VRAM (from a profile shipped with Maya) and the others in RAM; for each token, the GPU copies the missing experts in or the CPU computes them beside it, split by rates measured once on the PC and saved (`~/.maya/ik2-offload-calib.txt`). An expert gives the same result wherever it runs, so the answers do not depend on the split. RAM holds only the experts the card does not keep: about 13 GB with an 8 GB card, 9 GB with 12 GB, 5 GB with 16 GB. The setup's verdict says what a PC needs and refuses in one line where RAM and VRAM together cannot hold the model. Where every expert fits, the v1.1.72 path runs unchanged.
+- **Inkling 2 Mini on V100 and RTX 20:** their own tensor-core kernels (Volta and Turing); the setup accepts them and refuses only older GPUs, with the reason.
+- **Inkling 2 Mini on AMD (Linux):** `maya-ik2` is built in HIP builds for RDNA 3 / 3.5 / 4 and runs where every expert fits: a Radeon with 24 GB or a Halo / APU with that much free memory. Prompts use the matrix cores and hipBLASLt picks measured once and kept beside the model (a read-only folder says so once). Tested on a Radeon 8065S; Radeon RX 7000 / 9000 cards are built but untested - please report.
+- **Inkling 2 Mini drafting (`--drafting auto`, the setup's default where it can run):** the official drafter (`mtp.safetensors`, 0.6 GB, downloaded and checked by the setup) and prompt lookup (earlier text of the conversation) propose tokens, and one window checks them with the same math as one token at a time, so drafting on and off give the same answers. The first start measures no drafting, lookup and the drafter once and keeps the fastest for the PC (`--speed-calibration` measures again; `--drafting off|on` by hand). A drafter that would change the context or the pictures is left out with a NOTE (on a 24 GB card it fits up to about 200K positions; the lookup still drafts). Off for now on V100 / RTX 20 and where experts stay in RAM.
+- **Inkling 2 Mini: the looped layers' gate step is faster on every card**, with bit-identical results.
+- **Inkling 2 Mini: the Monitor** no longer shows a "0% of experts in VRAM" card for it.
+- **Fix: `--vram-reserve-mib` on a normal start (#1026):** `./maya.sh --vram-reserve-mib N` was only taken by the setup (GLM and DeepSeek); a start now writes it into the config as each engine's own setting, and the MiniMax, Hy4-Flash and Qwen setups take it too.
+- **Fix: DeepSeek kept less VRAM free than the reserve (#1026):** what the engine allocated after placing the experts came out of the reserve, so on an 8 GB card requests could fail for lack of memory. It now measures that once, keeps it free from then on (`vram-late.txt` beside the pack) and, on the start that measured it, restarts once by itself, so no request runs short.
+- **Fix: Hy4-Flash on two GPUs with the IOMMU translating (#1100):** the layer split copied between the GPUs directly, which faults on such PCs. Direct copies are now used only where the driver offers them, the IOMMU allows them and a test copy arrives intact; otherwise the hand-offs go through pinned RAM (`HY4_HOST_STAGE=1` forces it, `HY4_PEER=1` tries direct copies anyway). Tensor parallel no longer turns direct access on.
+- **Fix: Hy4-Flash crashed at the start on some two-GPU PCs (#1084):** a draft step whose numbers were all invalid read far outside the vocabulary; it now ends the draft, and a start whose model gives invalid numbers stops with a clear message.
+- **Credits:** Inkling 2 Mini's engine is @alesha-pro's (with @mrsirg97-rgb, @OscarSheng and @cobra91, v1.1.72), and the experts-in-RAM support builds on @OscarSheng's cache code; the rest of this release is by @mw00 (peasantsmith).
+
 ## v1.1.72 - 2026-11-21
 
 Inkling 2 Mini arrives as an experimental preview on its own engine, `maya-ik2`: the whole model in the VRAM of one

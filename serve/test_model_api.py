@@ -404,7 +404,7 @@ class OtherQuantsTest(unittest.TestCase):
 
     def test_inkling_2_mini_preview(self):
         """Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
-        said experimental; offered only where the setup runs it - NVIDIA RTX 30 / A100 on, Linux (never AMD or a
+        said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux (never AMD or a
         Mac); its setup id on the command line; the size the setup's manifest says."""
         with mock.patch.object(model_pull.sys, "platform", "linux"):
             c = {m["id"]: m for m in self.cat()}
@@ -413,7 +413,8 @@ class OtherQuantsTest(unittest.TestCase):
             self.assertEqual(ik["name"], "Inkling 2 Mini · unsloth UD-Q4_K_XL")
             self.assertIn("experimental preview", ik["note"])
             self.assertIn("24 GB", ik["note"])
-            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70,))})   # (V100: IK2_MIN_CC)
+            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
+            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
             self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70, 89))})
             self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=())})       # (not read: the setup says)
             for backend in ("hip", "metal"):
@@ -427,7 +428,7 @@ class OtherQuantsTest(unittest.TestCase):
         self.assertEqual(model_pull.IK2_MIN_CC, maya.IK2_MIN_CC)
         model_pull._other_gb.clear()
         try:
-            self.assertAlmostEqual(model_pull._other_sizes()["inkling-2-mini"], 18.3, places=1)   # (the GGUF + mmproj)
+            self.assertAlmostEqual(model_pull._other_sizes()["inkling-2-mini"], 18.9, places=1)   # (the GGUF + mmproj + drafter)
         finally:
             model_pull._other_gb.clear()
 

@@ -270,6 +270,8 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
 }
 function Tiers({t, eng}) {
   if (!t || !t.now) return null;
+  // (STAT lines with no expert tiers - Inkling 2's drafting figures alone: every expert in VRAM, nothing to show here)
+  if (!(eng && eng.engine_kind === "hy4") && t.now.vram_used == null && t.now.ram_used == null) return null;
   const ds4 = !!(eng && eng.engine_kind === "ds4"), hy4 = !!(eng && eng.engine_kind === "hy4");
   const set = tierSet(eng);
   const n = t.now, h = t.history || {};

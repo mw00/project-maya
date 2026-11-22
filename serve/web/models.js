@@ -554,11 +554,11 @@ function qwenFields(m, d, s, ch, gpus) {
 
 // Inkling-2-Mini's (maya-ik2, an experimental preview: it stops at a flag it does not know, so only its own are offered).
 // Its cache's VRAM a context token: the 8 visits of the layers without a window, by its format (m.ik2_kv_bytes, the
-// setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card (no drafting in the preview)
+// setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card; drafting auto / DSpark / off
 function ik2Fields(m, d, ch) {
   const kvb = (m.ik2_kv_bytes || {})[d.kv] || 16384;
   const fit = ((m.ik2_fit || {})[d.kv] || {})[String(d.context)];
-  const gpu = html`<${Row} label="GPU" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU for now: the whole model sits on it (24 GB or more)."
+  const gpu = html`<${Row} label="GPU" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU for now: NVIDIA 8 GB or more (experts that do not fit stay in RAM), AMD 24 GB."
     below=${html`<div class="mdl-gpus" role="radiogroup" aria-label="GPU">${(MS.data.gpus || []).map((g) => {
       const on = d.gpus.length === 1 && d.gpus[0] === g.index;
       return html`<button type="button" role="radio" aria-checked=${String(on)} class="mdl-gpu" onClick=${() => setDraft({gpus: [g.index]})}>
@@ -569,7 +569,12 @@ function ik2Fields(m, d, ch) {
     {label: "Model", rows: [
       contextRow(m, d, ch, {vram: kvb}, ["kv"],
         fit && !fit.resident ? "At this size the model and its cache do not all fit on the card: the engine runs its slower path." : null),
-      html`<${Row} label="Drafting" hint="Not offered in this preview: Inkling 2 Mini decodes without drafting for now."/>`,
+      html`<${Row} label="Drafting" flag=${"--drafting " + ({auto: "auto", dspark: "on"}[d.draft] || "off")} changed=${ch("draft")}
+        hint=${(m.choices.draft.includes("dspark") ? "The model's own drafter (DSpark) and the prompt lookup draft tokens the model checks: the same answers, faster where the drafts are kept (code, edits). " :
+          "The prompt lookup drafts tokens the model checks (copied text): the same answers. ") +
+          "Auto measures once on this PC which is fastest, or none, and keeps it. The drafter takes VRAM only where the model's plan stays as it is."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[{id: "auto", label: "Auto"}, ...(m.choices.draft.includes("dspark") ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>`,
       html`<${Row} label="Images" flag="vision" changed=${ch("images")}
         hint=${m.choices.images ? "Reads pictures in chats: the image encoder starts when a picture arrives, no VRAM kept for it (on the GPU where its free VRAM holds it, else on the CPU). Off reads text only."
           : "This model was set up without its image encoder: the setup adds it."}>

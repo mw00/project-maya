@@ -20,7 +20,7 @@ yet):
 | MoE | 384 experts, 8 a token, no shared expert, width 2,304; sigmoid router with a selection bias, the weights normalized x 8; SwiGLU with softcaps (gate 4, up 25) |
 | Head | logits softcapped at 30, the first 200,058 of 201,024 rows real |
 | Weights shipped | experts NVFP4 (layers 0-39: e2m1 x e4m3 per 16 x amax / 2688 per expert) and MXFP8 (40-47); the rest BF16 |
-| Extras | a DSpark-style drafter (`mtp.safetensors`, 5 layers); a vision tower |
+| Extras | a DSpark-style drafter (`mtp.safetensors`, 5 layers: drafting, set up by default); a vision tower |
 
 ## 2. The file: llama.cpp's `inkling2` GGUF
 
@@ -122,8 +122,21 @@ which keeps the experts' original bits) is the bar.
 ## 6. Phase 2: the engine, `maya-ik2`
 
 `src/ik2/` runs unsloth's GGUFs in place (UD-Q4_K_XL: NVFP4 experts in layers 0-39; UD-Q3_K_XL: IQ3_XXS / IQ4_XS),
-CUDA on Linux, Ampere on. Built by CMake beside the other engines (`maya-ik2`, and `ik2_kernels_test` with
-`STRATA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention.
+CUDA on Linux, Volta (sm_70) on. Built by CMake beside the other engines (`maya-ik2`, and `ik2_kernels_test` with
+`STRATA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention; `all` / `all-major`
+take the compiler's list from sm_70 on. CUDA 12.x for a V100 (CUDA 13 has no sm_70).
+
+**Kernels per architecture** (`k::arch_class()`; a fix for one class leaves the others' code as it is):
+
+| GPU class | One token's attention | NVFP4 experts (one token) | Prompt attention | Verify window (drafting) |
+| --- | --- | --- | --- | --- |
+| Ampere and newer (sm_80+) | `mma.sync` m16n8k16 | `mma.sync` m16n8k16 | fused (`mma.sync`, `cp.async`; sm_90a: wgmma) | block path |
+| Turing (sm_75) | Ampere's, m16n8k16 as two m16n8k8 | Ampere's, the same | cuBLAS (the fused kernel needs `cp.async` and more shared memory) | block path; drafting off (a NOTE) until its window is checked against the token path on a Turing card |
+| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS | none: drafting off (a NOTE) |
+
+Each class is exact within itself (the same greedy answers start after start); the classes differ from each other in
+their sums' order, as different kernels do. `IK2_ARCH=70` / `75` takes an older class's kernels on a newer GPU (tests;
+Turing's code only where the build has it - a `75-virtual` build).
 
 **Where the weights sit.** The dense weights (attention, router, head: ~4.7 B) are decoded once to FP16 in VRAM. The
 routed experts stay as the GGUF holds them, all of them in pinned host memory (the files are read and registered
@@ -207,7 +220,7 @@ as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 co
 2. Several requests at once; the vision tower inside the engine (pictures work through `maya-vision`: section 8).
 3. A Maya quant of the experts in the shape of DeepSeek XS (section 5), for 160 GB of host memory.
 
-## 8. Inkling-2-Mini: the looped model, whole on one 24 GB card
+## 8. Inkling-2-Mini: the looped model, whole on one 24 GB card (smaller NVIDIA cards: the rest of the experts in RAM)
 
 [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26 B, Apache 2.0) is the family's small
 model with a loop in it: 24 layers of weights, of which layers 6..17 run three times - 48 layer visits a token.
@@ -292,16 +305,37 @@ CPU) and ends after the request's pictures, so it keeps no VRAM. The server send
 (`GENI`), the engine puts them in place of the image tokens (`--image-token`, 200054) without the embedding's norm.
 640 x 448 is 192 tokens and 22 ms.
 
-**The drafter** (`--draft mtp.safetensors`, the official DSpark checkpoint: 3 layers; its taps the stream at
+**The drafter** (`--draft mtp.safetensors`, the official DSpark checkpoint: 5 layers; its taps the stream at
 visits 5, 23 and 41 and the final hidden, `mtp_config.target_layer_ids`) drafts after the last chosen token, and the
 model checks the window - the anchor and the drafts - in one go on the **block path** (`fast_block`): the resident
 token path for 2 .. 8 tokens, every position read from the device, the picks grouped by expert on the device (an
 expert's blocks read once for the tokens that picked it: 5 tokens need 2.7 times one token's experts, not 5), the
-attention a key's rows read once for the window's queries, the convs' histories and inputs recorded and taken back
-in one launch for the rejected tokens - one CUDA graph a window size. A window of 5 costs 15.6 ms against a token's
-7.8. Greedy keeps the agreeing drafts and the model's next token; sampling accepts a draft with the model's
+convs' histories and inputs recorded and taken back in one launch for the rejected tokens - one CUDA graph a window
+size. Greedy keeps the agreeing drafts and the model's next token; sampling accepts a draft with the model's
 probability of it and otherwise samples the model's distribution without it, which is the model's distribution
 exactly.
+
+**Drafting on = drafting off.** The window gives every token the one-token path's values to the bit (the **exact
+window**, the default): its dense products are `mv_q8p`'s sums for each token with the weights read once
+(`k::mv_q8p_cols`), its attention the token's own kernels a token at a time, its experts the token kernels' sums (the
+tensor cores' NVFP4 blocks with the same warp split and order; the row dots - the Q8_0 layers, and every layer
+where the tensor-core kernels are off - a member at a time, an expert read once for its tokens). So greedy answers
+are the same with drafting and without it, and sampled ones follow the same distribution. `IK2_WINDOW_CHECK=n`
+compares the first n windows with the one-token path row for row. `IK2_BLOCK_EXACT=0` takes the tensor cores' FP16
+tiles and the window's own attention instead (a few 1e-5 off: greedy answers then differ with drafting on; the
+contributor's figures below were measured that way).
+
+**The prompt lookup** (`src/spec/suffix_drafter`) drafts the tokens that followed the latest earlier copy of the
+text's end - edits, quoted code, repeated lines - with no weights; the same window checks them. `--drafting`: **auto**
+(the setup's default) measures once on the PC, before the first answer, which of no drafting, the prompt lookup, the
+drafter and both answers fastest (a chat, a code and a tool-call request, `IK2_DRAFT_IDS`), and keeps it in
+`data/ik2-drafting.txt` (per GPU, driver, model files, context and cache; `maya --speed-calibration` measures again);
+**on** drafts with the drafter and the prompt lookup, the controller choosing each step; **off** loads neither. A
+request's `spec=1` asks for no drafting. The drafter takes room only where the start plan stays as it is without it
+(every expert in VRAM, the same context and cache, and not the free VRAM the pictures' encoder would start in on the
+GPU - `IK2_VISION_GIB`, the server's), else it is left out with a NOTE: on a 24 GB card that is above about 200K tokens of
+context with the FP8 cache (`tools/ik2_fit.py` `draft_gib`: 0.88 GiB + 4.75 KiB a token). The Monitor's Speculation
+shows the drafts kept (STAT `draft_acc` / `draft_off`, `draft_ms`, `verify_ms`).
 
 Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
 document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens, (1 - a^B) / (1 - a)
@@ -325,15 +359,41 @@ To run it (one GPU):
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 24 GB, sm_80
-(Ampere) or newer; tested on RTX 3090s (sm_86). Elsewhere `maya-ik2` stops at the start with one line saying why
-(under `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_80 (a V100 cannot run it:
-the kernels use Ampere's `mma.sync` m16n8k16 and `cp.async`), a build with no kernels for the GPU's arch, less than
-22 GiB of VRAM, `--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
-(the layers split between them - "Two GPUs" below - or `IK2_EP=1` / `IK2_TP=1`, section 6), smaller cards with the
-experts streamed from RAM, @cobra91's Windows / CUDA 13
-port - untested here. CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, in a HIP build, and on
-Windows unless `-DSTRATA_IK2_WINDOWS=ON`.
+**Smaller cards: the offload path.** Where the experts do not all fit (an 8, 12 or 16 GB card, or a 24 GB one past
+its context), tokens still take the resident path's launches, one CUDA graph a token, with a tier of the experts in
+VRAM - the ones Maya's profile (`data/expert-profile-ik2mini.bin`, prompts and answers over code, docs and a tool
+chat) says are picked most a byte, the looped core's counted three times - and every other expert pinned in RAM: a
+pick the tier does not hold is copied by the GPU itself into a staging slot (a small cache of its own) right after the
+router, with no host step, and the same expert kernels read the same bytes, so the answers are the ones every expert
+in VRAM gives. With `IK2_LANE=1` (lane parity) the CPU lane takes a share of the misses beside the copies, split by
+measured costs; every expert then runs one exact arithmetic on either side (`src/ik2/ik2_exact.h`, held bit for bit
+by `tests/ik2_off_test.cu`), so an answer does not depend on where an expert ran. Only the experts the tier does not
+hold are pinned (on Linux): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
+the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not need (12.1 GiB pinned; 12 GB card
+~8 GiB, 16 GB ~4 GiB). `IK2_PIN_ALL=1` pins every expert. The PC needs the model in RAM and VRAM together (about
+24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting stays off on
+the offload path (its window runs only where every expert is in VRAM; a NOTE says so).
+
+**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 8 GB or more, sm_70
+(Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
+(sm_100 / sm_120) compile-checked only. Elsewhere `maya-ik2` stops at the start with one line saying why (under
+`--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
+tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 7 GiB of VRAM,
+`--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs (the layers split
+between them - "Two GPUs" below - or `IK2_EP=1` / `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13 port -
+untested here. CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list, and on Windows unless
+`-DSTRATA_IK2_WINDOWS=ON`.
+
+**AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
+written for `mma.sync` / `ldmatrix` / `cp.async` run through AMD versions that keep their fragment layouts; the prompt's
+hot paths have kernels of their own on RDNA 3 / 3.5 / 4's matrix cores (`src/ik2/ik2_rdna.inc`): a layer's routed
+experts in three launches straight from their blocks (`IK2_RDNA_MOE=0`: off) and the fused attention in 24 KB of shared
+memory (`IK2_RDNA_FLASH=0`: off); the other FP16 GEMMs take hipBLASLt's kernel measured once per shape, kept in
+`lt-picks.txt` beside the GGUF (`IK2_LT_STORE` names another file). Tokens take the scalar expert kernels
+(`IK2_EXPERT_MMA=1`: the mma layout). Answers repeat on a GPU (every sum in a fixed order) but are not CUDA's bits.
+The engine refuses an AMD GPU older than RDNA 3 at its start; on an APU (Strix / Gorgon Halo) it counts the RAM the
+system has available, less max(8 GiB, 10%), as the GPU's room. AMD keeps every expert in the GPU's memory (24 GB, no
+offload path there yet). Run on a Radeon 8065S (Ubuntu, ROCm 7.1).
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`
@@ -345,7 +405,7 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 |---|---|---|
 | `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
 | `mmproj-BF16.gguf` (0.6 GB, pictures) | same | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
-| `mtp.safetensors` (0.6 GB, the drafter: optional) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
+| `mtp.safetensors` (0.6 GB, the drafter: the setup fetches it, not with `--drafting off`) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
 **Two GPUs** (outside the preview: `--gpus 2` with `IK2_UNSUPPORTED=1`). The layers are split between the cards
 (`IK2_SPLIT=b`: layers 0 .. b - 1 on GPU 0; half each by default). Where each card holds its own layers' experts

@@ -43,7 +43,7 @@ OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [(
 GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gated: the setup sends the user's HF token)
 EXL3_MIN_CC = 70                                     # (maya.DS4_MIN_CC / mm3_min_cc: the EXL3 quants from V100 on)
 QWEN_MIN_CC = 70                                     # (maya.QWEN_MIN_CC: the Qwen path from V100 on)
-IK2_MIN_CC = 80                                      # (maya.IK2_MIN_CC: maya-ik2's kernels, RTX 30 / A100 on)
+IK2_MIN_CC = 70                                      # (maya.IK2_MIN_CC: maya-ik2's kernels, V100 / RTX 20 on)
 
 
 def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
@@ -202,9 +202,9 @@ def _other_sizes() -> dict:
             elif fam == "qwen":                        # (its files and the vision tower the setup fetches with them)
                 vision = maya.qwen_vision_model()
                 gb = maya.qwen_entry(key)["download_gb"] + (vision["download_gb"] if vision else 0)
-            elif fam == "ik2":                         # (the GGUF and the vision tower the setup fetches with it)
-                vision = maya.ik2_vision_model()
-                gb = maya.ik2_entry()["download_gb"] + (vision["download_gb"] if vision else 0)
+            elif fam == "ik2":                         # (the GGUF, the vision tower and the drafter the setup fetches)
+                vision, drafter = maya.ik2_vision_model(), maya.ik2_drafter_model()
+                gb = maya.ik2_entry()["download_gb"] + sum(x["download_gb"] for x in (vision, drafter) if x)
             else:
                 continue                               # (GLM's: the MODELS table, as Maya's own)
             _other_gb[ident] = round(float(gb), 1)

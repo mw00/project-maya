@@ -90,10 +90,16 @@ HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a 
 # Inkling-2-Mini (maya-ik2, an experimental preview): its settings, and what its engine does not have yet - said in
 # plain words when a client asks for it (each one's "off": IK2_OFF)
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on its card: the setup's own figures
-IK2_KEYS = ("context", "images", "gpus", "env", "kv")
-IK2_OFF = {"parallel": 1, "draft": "none"}
-IK2_NOT_YET = {"parallel": "Answers at once: Inkling 2 Mini answers one request at a time for now",
-               "draft": "Drafting: not offered in the Inkling 2 Mini preview - it decodes without drafting for now"}
+IK2_KEYS = ("context", "images", "gpus", "env", "kv", "draft")
+IK2_OFF = {"parallel": 1}
+IK2_NOT_YET = {"parallel": "Answers at once: Inkling 2 Mini answers one request at a time for now"}
+
+
+def ik2_draft_of(args: list) -> str:
+    """Inkling 2's drafting as the page shows it: auto (--drafting auto: measured once on this PC - the drafter, the
+    prompt lookup, both or none), dspark (--drafting on: the drafter and the prompt lookup, not measured), none."""
+    how = flag(args, "--drafting") or ("on" if flag(args, "--draft") else "off")
+    return {"auto": "auto", "on": "dspark"}.get(how, "none")
 
 
 # ------------------------------------------------------------------ the engine's arguments
@@ -166,10 +172,20 @@ def pack_of(cfg: dict) -> Path | None:
 
 
 def ik2_vram_gb(cfg: dict) -> float:
-    """The VRAM of the card an Inkling 2 config runs on (its first "gpu"), as the setup reads it; 0 when not known."""
+    """The VRAM of the card an Inkling 2 config runs on (its first "gpu"), as the setup reads it; 0 when not known.
+    (AMD: a Ryzen AI Max APU's memory is the RAM - the larger figure, less the max(8 GB, 10%) kept free, as the
+    setup counts it.)"""
     ids = gpus_of(cfg) or [0]
-    card = next((g for g in machine_gpus("cuda") if g.get("index") == ids[0]), None)
-    return float((card or {}).get("vram_gb") or 0)
+    hip = cfg.get("backend") == "hip"
+    card = next((g for g in machine_gpus("hip" if hip else "cuda") if g.get("index") == ids[0]), None)
+    vram = float((card or {}).get("vram_gb") or 0)
+    if hip and card and card.get("arch") == "gfx1151" and hasattr(os, "sysconf"):
+        try:
+            ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+        except (ValueError, OSError):
+            return vram
+        vram = max(vram, ram) - max(8.0, 0.1 * ram)
+    return vram
 
 
 # ------------------------------------------------------------------ the context a model was trained for
@@ -408,9 +424,16 @@ def _choices(cfg: dict) -> dict:
         # (auto: the engine measures once on this PC which decodes fastest - no drafting or a drafter the pack holds)
         drafters = (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else [])
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
-    if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off; no drafting)
-        return {"draft": ["none"], "images": bool(cfg.get("vision") or cfg.get("vision_off")),
-                "kv": list(IK2F.KV_BYTES)}
+    if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off)
+        # (drafting: auto - measured once on this PC; the drafter by hand where the setup downloaded it; none)
+        ctx = int(flag(cfg.get("args") or [], "--max-context") or 0)
+        card = next((g for g in machine_gpus("cuda") if g.get("index") == (gpus_of(cfg) or [0])[0]), None)             if cfg.get("backend") != "hip" else None
+        off = IK2F.drafting_off_reason((card or {}).get("arch"), ik2_vram_gb(cfg), ctx or IK2F.CONTEXTS[0],
+                                       (cfg.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV,
+                                       cfg.get("backend") == "hip")
+        return {"draft": ["none"] if off else
+                ["auto"] + (["dspark"] if flag(cfg.get("args") or [], "--draft") else []) + ["none"],
+                "images": bool(cfg.get("vision") or cfg.get("vision_off")), "kv": list(IK2F.KV_BYTES)}
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -452,7 +475,7 @@ def settings_of(cfg: dict) -> dict:
         return out
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
         kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
-        out.update(images=bool(cfg.get("vision")),
+        out.update(images=bool(cfg.get("vision")), draft=ik2_draft_of(args),
                    kv="f16" if kv in ("f16", "fp16") else "fp8" if kv in ("fp8", "e4m3") else kv)
         return out
     if family(cfg) == "qwen":
@@ -718,6 +741,13 @@ def apply(cfg: dict, settings: dict) -> dict:
         env2 = dict(out.get("env") or {})
         env2["IK2_KV"] = kv
         out["env"] = env2
+        # (drafting: auto, the drafter by hand (dspark: --drafting on) or none; the drafter's file stays named, so
+        #  auto and dspark can come back - with none the engine does not load it)
+        if s.get("draft") not in can["draft"]:
+            raise ValueError("Drafting: this setup has no drafter (the setup downloads it)" if s.get("draft") == "dspark"
+                             else "Drafting: auto, the drafter (DSpark) or none")
+        if s["draft"] != ik2_draft_of(args):   # (written where it changes: a config from before keeps its flags)
+            args = set_flag(args, "--drafting", {"auto": "auto", "dspark": "on"}.get(s["draft"], "off"))
     elif fam == "minimax":
         # (maya-mm3 --parallel: n conversations at once - each its own KV cache in VRAM, so no KV streaming and no DSpark
         #  while it is above 1; those two settings stay as chosen for the day it is 1 again; written where it changes)
@@ -1364,7 +1394,8 @@ def machine_gpus(backend: str = "cuda") -> list:
         # (an AMD card keeps what says so: maya.py's hy4_usable_gib counts its memory another way - a unified-memory
         #  APU's is the PC's)
         found = [{"index": int(g["index"]), "name": g.get("name"), "vram_gb": g.get("vram_gb"),
-                  **({"arch": g.get("arch"), "vendor": "amd"} if backend == "hip" else {})} for g in raw or []]
+                  **({"arch": g.get("arch"), "vendor": "amd"} if backend == "hip" else
+                     {"arch": g["arch"]} if g.get("arch") else {})} for g in raw or []]
     except (ImportError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         found = []
     _gpu_cache[backend] = (now, found)

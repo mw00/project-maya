@@ -1,6 +1,6 @@
 """tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2, an experimental preview) in the setup: its names and setup ids,
 its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
-does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the
+does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 24 GB), the
 one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
 config it writes (its pictures too) and a start of it.  No GPU, no network.
 
@@ -35,6 +35,10 @@ def args(**kw):
 
 def card(gib, index=0, arch="86", name="NVIDIA GeForce RTX 3090"):
     return {"index": index, "name": name, "arch": arch, "vram_gb": float(gib), "driver": "580.0"}
+
+
+def amd(arch, gib, index=0, **kw):
+    return {"index": index, "name": "AMD Radeon", "arch": arch, "vram_gb": float(gib), **kw}
 
 
 def refusal(fn):
@@ -95,10 +99,23 @@ class Manifest(unittest.TestCase):
         for name, (size, sha) in man["files"].items():
             self.assertGreater(size, 100 << 20, name)
             self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
-        self.assertEqual(list(man["files"]), [man["gguf"]])                  # (no drafter in the preview)
+        self.assertEqual(list(man["files"]), [man["gguf"]])                  # (the drafter: its own entry)
         self.assertEqual(man["files"][man["gguf"]][1],
                          "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")   # (the author's)
-        self.assertNotIn("draft", man)
+
+    def test_drafter_pinned(self):
+        """Drafting: thinkingmachines' own mtp.safetensors from the model's repo at a pinned revision, by size and
+        sha256 (the ones docs/INKLING2.md lists)."""
+        m = maya.ik2_drafter_model()
+        self.assertEqual((m["repo"], m["revision"], m["folder"]),
+                         ("thinkingmachines/Inkling-2-Mini", "ed40e7da625f594fc9c4990f5f66be24873c22d7", ""))
+        self.assertEqual(m["files"], {"mtp.safetensors": 635801416})
+        self.assertEqual(m["sha256"]["mtp.safetensors"],
+                         "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2")
+        self.assertIn("7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2",
+                      (maya.ROOT / "docs" / "INKLING2.md").read_text(encoding="utf-8"))
+        self.assertEqual(maya.file_url(m, "mtp.safetensors"), "https://huggingface.co/thinkingmachines/Inkling-2-Mini/"
+                         "resolve/ed40e7da625f594fc9c4990f5f66be24873c22d7/mtp.safetensors")
 
     def test_vision_pinned(self):
         """The pictures: unsloth's mmproj-BF16.gguf from the GGUF's own repo and revision, by size and sha256."""
@@ -126,23 +143,44 @@ class Refusals(unittest.TestCase):
     def test_the_lines(self):
         ok = [card(24)]
         cases = [
-            ("hip", False, 0, ok, "NVIDIA GPUs only"),
-            ("metal", False, 0, [], "NVIDIA GPUs only"),
+            ("metal", False, 0, [], "NVIDIA and AMD GPUs only"),
+            ("hip", True, 0, [], "Linux only"),
+            ("hip", False, 2, [], "one GPU only"),
+            ("hip", False, 0, [amd("gfx1030", 16)], "RDNA 3, 3.5 or 4"),
+            ("hip", False, 0, [amd("gfx1201", 16)], "24 GB of VRAM or more"),
+            ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "24 GB of VRAM or more"),
             ("cuda", True, 0, ok, "Linux only"),
             ("cuda", False, 2, ok, "one GPU only"),
-            ("cuda", False, 0, [card(32, arch="70", name="Tesla V100")], "RTX 30 / A100 or newer"),
-            ("cuda", False, 0, [card(12, arch="86")], "24 GB of VRAM or more"),
-            ("cuda", False, 0, [card(16, arch="70"), card(12, 1, arch="89")], "24 GB of VRAM or more"),
+            ("cuda", False, 0, [card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
+            ("cuda", False, 0, [card(6, arch="86")], "8 GB of VRAM or more"),
+            ("cuda", False, 0, [card(6, arch="70"), card(4, 1, arch="89")], "8 GB of VRAM or more"),
         ]
         for backend, win, asked, cards, part in cases:
             why = F.unsupported(backend, win, asked, cards)
             self.assertIn(part, why or "", (backend, win, asked))
             self.assertNotIn("\n", why)
-        for cards in (ok, [card(23.99, arch="89")], [card(80, arch="90")], [card(12, arch="86"), card(24, 1)], []):
+        for cards in (ok, [card(23.99, arch="89")], [card(80, arch="90")], [card(12, arch="86"), card(24, 1)], [],
+                      [card(32, arch="70", name="Tesla V100-PCIE-32GB")], [card(24, arch="75", name="NVIDIA TITAN RTX")],
+                      [card(8, arch="86")], [card(16, arch="70"), card(12, 1, arch="89")]):
             self.assertIsNone(F.unsupported("cuda", False, 1, cards))
+        # (AMD on Linux: RDNA 3 / 3.5 / 4 with 24 GB, or an APU whose shared memory leaves that much)
+        for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
+                      [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], []):
+            self.assertIsNone(F.unsupported("hip", False, 1, cards))
+
+    def test_ram_and_vram_together(self):
+        """No SSD tier (the owner's call): RAM + VRAM under the model is refused in one line naming the amount."""
+        why = F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=12.0)
+        self.assertIn("24 GB of RAM and VRAM together", why or "")
+        self.assertNotIn("\n", why)
+        self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=32.0))
+        self.assertIsNone(F.unsupported("cuda", False, 1, [card(24, arch="86")], ram_gb=8.0))   # (all on the card)
+        # (only the experts the card does not keep are pinned: a 16 GB PC, ~15.4 GiB as Linux reports it, with an
+        #  8 GB card)
+        self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=15.4))
 
     def test_check_pc_refuses_first(self):
-        for a, part in ((args(backend="hip"), "NVIDIA GPUs only"), (args(gpus="0,1"), "one GPU only")):
+        for a, part in ((args(gpus="0,1"), "one GPU only"),):
             with patch.object(maya.S, "gpus", side_effect=AssertionError("no GPU read before the refusal")), \
                     patch.object(maya, "WIN", False):
                 out = refusal(lambda: maya.check_pc(a, "ik2"))
@@ -152,24 +190,32 @@ class Refusals(unittest.TestCase):
             self.assertIn("Linux only", refusal(lambda: maya.check_pc(args(), "ik2")))
 
     def test_check_pc_refuses_an_old_or_small_card(self):
-        for found, part in (([card(32, arch="70", name="Tesla V100-SXM2-32GB")], "RTX 30 / A100 or newer"),
-                            ([card(12, arch="86", name="NVIDIA GeForce RTX 3060")], "24 GB of VRAM or more")):
+        for found, part in (([card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
+                            ([card(6, arch="86", name="NVIDIA GeForce RTX 3050 6GB")], "8 GB of VRAM or more")):
             with patch.object(maya, "WIN", False), patch.object(maya.sys, "platform", "linux"), \
                     patch.object(maya.S, "is_wsl", return_value=False), patch.object(maya.S, "gpus", return_value=found):
                 self.assertIn(part, refusal(lambda: maya.check_pc(args(), "ik2")))
         with patch.object(maya, "WIN", False), patch.object(maya.sys, "platform", "linux"), \
                 patch.object(maya.S, "is_wsl", return_value=False), \
-                patch.object(maya.S, "gpus", return_value=[card(12, 0), card(24, 1, arch="86")]):
-            # (--gpu 0 names the 12 GB card: refused; the 24 GB one would do)
-            self.assertIn("24 GB of VRAM or more", refusal(lambda: maya.check_pc(args(gpu=0), "ik2")))
+                patch.object(maya.S, "gpus", return_value=[card(6, 0), card(24, 1, arch="86")]):
+            # (--gpu 0 names the 6 GB card: refused; the 24 GB one would do)
+            self.assertIn("8 GB of VRAM or more", refusal(lambda: maya.check_pc(args(gpu=0), "ik2")))
+        with patch.object(maya, "WIN", False), patch.object(maya.sys, "platform", "linux"), \
+                patch.object(maya.S, "is_wsl", return_value=False), patch.object(maya, "mem_gb", return_value=(12.0, 10.0)), \
+                patch.object(maya.S, "gpus", return_value=[card(8, arch="86", name="NVIDIA GeForce RTX 3050")]):
+            # (no SSD tier: 12 GB of RAM beside an 8 GB card cannot hold the model)
+            self.assertIn("24 GB of RAM and VRAM together", refusal(lambda: maya.check_pc(args(), "ik2")))
 
     def test_one_gpu_picked(self):
-        found = [card(12, 0, arch="86"), card(24, 1, arch="86"), card(24, 2, arch="89"), card(32, 3, arch="70")]
+        found = [card(12, 0, arch="86"), card(24, 1, arch="86"), card(24, 2, arch="89"), card(32, 3, arch="61")]
         with patch.object(maya, "ok"):
             got = maya.choose_gpus(args(), found, maya.IK2_MIN_CC, "ik2")
-            self.assertEqual([g["index"] for g in got], [1])          # (the largest new enough; the V100 is too old)
+            self.assertEqual([g["index"] for g in got], [1])          # (the largest new enough; the Pascal is too old)
             got = maya.choose_gpus(args(), found, maya.IK2_MIN_CC, "ik2", before=[2])
             self.assertEqual([g["index"] for g in got], [2])          # (the one its config ran on)
+            got = maya.choose_gpus(args(), [card(12, 0, arch="86"), card(32, 1, arch="70", name="Tesla V100")],
+                                   maya.IK2_MIN_CC, "ik2")
+            self.assertEqual([g["index"] for g in got], [1])          # (a V100: Volta on)
         self.assertEqual(maya.ik2_gpus_asked(args(gpus="0, 1")), 2)
         self.assertEqual(maya.ik2_gpus_asked(args(gpu=3)), 1)
         self.assertEqual(maya.ik2_gpus_asked(args()), 0)
@@ -191,6 +237,23 @@ class Fit(unittest.TestCase):
         self.assertEqual(F.plan(0, 262144)["resident"], True)          # (VRAM not read: the engine measures)
         self.assertEqual(F.recommended_context(8.0), F.CONTEXTS[0])    # (nothing resident: the smallest)
 
+    def test_smaller_cards_offload(self):
+        """8 / 12 / 16 GB cards: the offload path, a share of the experts on the card growing with it; the verdict
+        says so, and "tight" where the RAM is under what the path pins."""
+        tiers = [F.plan(v, 32768) for v in (8.0, 12.0, 16.0)]
+        self.assertTrue(all(p["layout"] == "offload" and not p["resident"] for p in tiers))
+        self.assertTrue(0 < tiers[0]["tier_gib"] < tiers[1]["tier_gib"] < tiers[2]["tier_gib"] < F.EXPERTS_GIB)
+        self.assertEqual(F.plan(24.0, 262144)["layout"], "resident")
+        self.assertEqual(F.verdict(24.0, 64.0, 262144)[0], "fast")
+        self.assertEqual(F.verdict(8.0, 64.0, 32768)[0], "runs")
+        # (the RAM: the experts the card does not keep, pinned, and the engine's own beside them)
+        for p in tiers:
+            self.assertAlmostEqual(p["ram_gib"], F.EXPERTS_GIB - p["tier_gib"] + F.OFF_HOST_GIB, places=1)
+        self.assertTrue(tiers[0]["ram_gib"] > tiers[1]["ram_gib"] > tiers[2]["ram_gib"])
+        self.assertEqual(F.verdict(8.0, 15.4, 32768)[0], "runs")       # (16 GB of RAM)
+        self.assertEqual(F.verdict(8.0, tiers[0]["ram_gib"] + 0.5, 32768)[0], "tight")
+        self.assertEqual(F.verdict(8.0, 12.0, 32768)[0], "does not fit")
+
 
 class Picker(unittest.TestCase):
     def test_its_row_last_and_picked(self):
@@ -204,7 +267,7 @@ class Picker(unittest.TestCase):
         self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini (experimental)", "ik2"))
         about = got["about"]["Inkling 2 Mini (experimental)"]
         for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
-                     "RTX 30 / A100", "Linux", "one GPU with 24 GB", "pictures"):
+                     "V100 / RTX 20", "Linux", "8 GB or more", "Halo / APU with 24 GB", "pictures"):
             self.assertIn(part, about)
 
 
@@ -220,7 +283,7 @@ class Steps(unittest.TestCase):
 
     def files(self):
         d = self.root / "models" / maya.IK2
-        d.mkdir(parents=True)
+        d.mkdir(parents=True, exist_ok=True)
         gguf = d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"
         gguf.write_bytes(b"GGUF" + b"\0" * 60)
         return d, gguf
@@ -259,7 +322,7 @@ class Steps(unittest.TestCase):
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(path.name, "maya-inkling-2-mini.json")
         self.assertEqual(cfg["exe"], str(maya.IK2_EXE))
-        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144"])   # (no drafter)
+        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144", "--drafting", "auto"])
         self.assertEqual(cfg["env"], {"IK2_KV": "fp8"})
         self.assertEqual((cfg["sampling"], cfg["reasoning_effort"]), ({"temperature": 1.0, "top_p": 1.0}, "high"))
         self.assertEqual((cfg["model_name"], cfg["gpu"], cfg["tokenizer"]), ("inkling-2-mini", [1], str(tok)))
@@ -273,8 +336,84 @@ class Steps(unittest.TestCase):
                 patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
             maya.write_config_ik2(args(), pc, {}, gguf, tok, 65536, self.root / "models", d)
         cfg = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "65536"])
+        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "65536", "--drafting", "auto"])
         self.assertEqual(cfg["env"], {"IK2_KV": "fp8", "MY_VAR": "1"})
+        # (the drafter: --draft beside --drafting auto, the default; on / off by hand; off names no drafter)
+        mtp = d / "mtp.safetensors"
+        for how, want in ((None, ["--draft", str(mtp), "--drafting", "auto"]),
+                          ("measure", ["--draft", str(mtp), "--drafting", "auto"]),
+                          ("on", ["--draft", str(mtp), "--drafting", "on"]), ("off", ["--drafting", "off"])):
+            with patch.object(maya, "ROOT", self.root), \
+                    patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
+                maya.write_config_ik2(args(drafting=how), pc, {}, gguf, tok, 65536, self.root / "models", d,
+                                      None, mtp)
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(cfg["args"][4:], want, how)
+            self.assertEqual(cfg["installer"]["drafting"], {"measure": "auto", None: "auto"}.get(how, how))
+
+    def test_drafter_step(self):
+        """Drafting on by default: the drafter beside the GGUF, sha256-checked; none with --drafting off or a declined
+        download (the prompt lookup then drafts alone); truthful where its room does not fit at the context."""
+        d, gguf = self.files()
+        va = lambda **kw: args(**dict(dict(rebuild=False, download_model=False, yes=False), **kw))   # noqa: E731
+        self.assertIsNone(maya.ik2_drafter_step(va(drafting="off"), d, 24, 65536, "fp8"))
+        with patch.object(maya, "offer_download", lambda *a, **k: False):
+            self.assertIsNone(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"))
+        with patch.object(maya, "file_incomplete", lambda *a: None), \
+                patch.object(maya, "sha256_checked", lambda *a: True):
+            self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"), d / "mtp.safetensors")
+            said = []
+            with patch.object(maya, "warn", said.append):
+                self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 262144, "fp8"), d / "mtp.safetensors")
+            self.assertIn("does not fit beside the model", " ".join(said))
+
+    def test_drafter_room(self):
+        """tools/ik2_fit.py's drafter room (maya-ik2's draft_room): 24 GB cards hold it up to about 200K tokens with the
+        FP8 cache, 32 GB at 262K; it grows 4.75 KiB a token."""
+        self.assertTrue(F.draft_fits(24, 131072, "fp8"))
+        self.assertFalse(F.draft_fits(24, 262144, "fp8"))
+        self.assertTrue(F.draft_fits(32, 262144, "fp8"))
+        self.assertTrue(F.draft_fits(0, 262144, "fp8"))          # (not known: the engine measures)
+        self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4864 / 2**30, places=6)
+
+    def test_drafting_off_reason(self):
+        """Volta / Turing and the offload path run with drafting off; sm_80+ with every expert in VRAM and AMD keep it."""
+        self.assertIn("Volta", F.drafting_off_reason("70", 32, 65536, "fp8"))
+        self.assertIn("Volta", F.drafting_off_reason("75", 24, 65536, "fp8"))
+        self.assertIn("offload", F.drafting_off_reason("86", 8, 65536, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("86", 24, 65536, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("120", 32, 262144, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("gfx1151", 150, 262144, "fp8", hip=True))
+        self.assertIsNone(F.drafting_off_reason(None, 0, 65536, "fp8"))      # (not known)
+
+    def run_setup(self, gpu, ram=64.0, backend="cuda", **kw):
+        """set_up_ik2 with its steps stubbed: what it hands the drafter step and the config (drafting, drafter)."""
+        d, gguf = self.files()
+        pc = {"gpus": [gpu], "backend": backend}
+        seen = {}
+        stub = lambda name, ret: patch.object(maya, name, lambda *a, **k: ret)   # noqa: E731
+        drafter = patch.object(maya, "ik2_drafter_step", lambda *a, **k: seen.setdefault("drafter", d / "mtp.safetensors"))
+        cfg = patch.object(maya, "write_config_ik2", lambda a, *r: seen.update(drafting=a.drafting, drafter=r[-1]))
+        said = []
+        with patch.object(maya, "check_pc", return_value=pc), patch.object(maya, "mem_gb", return_value=(ram, 10.0)),                 patch.object(maya, "choose_context", lambda a, prev, opts, rec: 65536),                 stub("ik2_dir", d), stub("tools_step", d), stub("build_step", {}), stub("ik2_model_step", gguf),                 stub("ik2_tokenizer_step", d), stub("ik2_vision_step", None), drafter, cfg,                 patch.object(maya.IK2_EXE.__class__, "exists", lambda self: True),                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", lambda *a: None),                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "hip_unified_memory", lambda g: False), patch.object(maya, "WIN", False):
+            maya.set_up_ik2(self.va(**kw), {})
+        return seen, " ".join(said)
+
+    def test_setup_drafting_off_where_it_does_not_run(self):
+        """Volta / Turing and offload layouts: no drafter downloaded, drafting off, one line saying why."""
+        for gpu in (card(32, arch="70", name="Tesla V100"), card(24, arch="75", name="RTX 2080 Ti"), card(8)):
+            seen, said = self.run_setup(gpu, drafting="on")
+            self.assertEqual(seen["drafting"], "off", gpu)
+            self.assertIsNone(seen["drafter"], gpu)
+            self.assertIn("drafting off", said)
+
+    def test_setup_drafting_kept_where_it_runs(self):
+        """NVIDIA sm_80+ holding every expert and AMD: the drafter is fetched and drafting stays auto."""
+        for gpu, backend in ((card(24), "cuda"), (card(32, arch="120"), "cuda"), (amd("gfx1100", 24), "hip")):
+            seen, said = self.run_setup(gpu, backend=backend)
+            self.assertIsNone(seen["drafting"], gpu)
+            self.assertEqual(seen["drafter"].name, "mtp.safetensors", gpu)
+            self.assertNotIn("drafting off", said)
 
     def va(self, **kw):
         return args(**dict(dict(rebuild=False, download_model=False, yes=False), **kw))
@@ -308,7 +447,7 @@ class Steps(unittest.TestCase):
             path = maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d, v)
             cfg = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(cfg["vision"], v)
-            self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144"])   # (the same plan)
+            self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144", "--drafting", "auto"])
             maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d)   # (--no-vision)
             self.assertNotIn("vision", json.loads(path.read_text(encoding="utf-8")))
 

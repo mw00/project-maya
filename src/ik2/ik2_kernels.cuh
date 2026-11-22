@@ -5,7 +5,7 @@
 // experts' GEMMs of the prompt path take FP16 rows (an NVFP4 weight is exact in FP16).  docs/INKLING2.md has the model.
 //
 // Layouts: rows of tokens; a token's heads back to back ([T][H][D]); the K / V caches by position, [ctx][Hkv][D] F32.
-// CUDA only for now (no HIP mapping yet).
+// CUDA, and AMD (HIP, Linux) through include/strata/hip_compat.
 #pragma once
 
 #include <cstddef>
@@ -13,6 +13,11 @@
 #include <cuda_runtime.h>
 
 namespace ik2::k {
+
+/// The current GPU's class for the kernels that differ by architecture: 70 (Volta: its own attention and NVFP4
+/// expert kernels on mma.m8n8k4), 75 (Turing: Ampere's kernels with mma.sync m16n8k8 and no cp.async - not the
+/// prompt's fused attention), 80 (Ampere and newer).  IK2_ARCH=70 / 75 takes a lower class on a newer GPU (tests).
+int arch_class();
 
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
@@ -96,6 +101,29 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
                     int n_split, cudaStream_t s);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
+/// can this build run attn_flash_* on the current GPU (CUDA: always; AMD: the RDNA matrix-core kernel's archs)
+bool attn_flash_available();
+
+#ifdef STRATA_USE_HIP
+/// AMD, RDNA 3 / 3.5 / 4 (ik2_rdna.inc): the prompt's routed experts of a layer in three launches from their blocks.
+/// Rows: a token's pick each, grouped by expert in expert order; tiles: int4 {expert, first row, rows <= 32, 0} over
+/// them; eptr [E]: an expert's blocks (gate, then up at off_up / down at off_down, as a cache slot holds them).
+/// Can the current GPU take it for these expert types (all NVFP4 or all Q8_0) and widths (IK2_RDNA_MOE=0: no)?
+bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F);
+/// h16 [rows][F] = SwiGLU(x16 . gate^T * sg[row], x16 . up^T * su[row]) (softcaps gcap / ucap), x16 [rows][C]
+void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_up,
+                     const uint16_t* x16, int C, int F, const float* sg, const float* su, float gcap, float ucap,
+                     uint16_t* h16, cudaStream_t s);
+/// y32 [rows][C] = h16 . down^T
+void experts_rdna_down(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_down,
+                       const uint16_t* h16, int C, int F, float* y32, cudaStream_t s);
+/// out [T][C] = sum over token t's K picks (inv [T * K]: their rows) of wtr[row] y32[row], in row order
+void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
+                      cudaStream_t s);
+/// AMD: y [T][ldy] = x [T][K] . W [N][K]^T, BF16 in, F32 sums, T <= 8 (the drafter's block): the weights read once,
+/// a warp's rows sharing each x load.  False (nothing launched): not this shape (K % 8, alignment, T) - the BLAS then.
+bool gemm_bf16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
+#endif
 
 /// o *= sigmoid(g), n values.
 void gate_mul(float* o, const float* g, size_t n, cudaStream_t s);
@@ -477,5 +505,21 @@ void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* 
 /// attn_res_jobs for T tokens: job j's queries q + j nq C, its output out + j nq T C ([nq][T][C]).
 void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq, int jobs, int T, int C, float eps,
                          float* out, cudaStream_t s);
+
+// ---- the exact window: the one-token path's arithmetic for each of a window's tokens (drafting on = off)
+/// y [T][N] (rows y_ld apart) = W . x [T][K] (rows x_ld apart, F32) for a planar Q8_0 matrix: each token's row sums
+/// mv_q8p's to the bit (T <= 8), the matrix read once.
+void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                 cudaStream_t s);
+/// experts_gate_up_swiglu / experts_down for group_route's groups: each member's h / y the one-token kernels' to the
+/// bit (x [T][C] F32; h [slot][F]; y [slot][C]), an expert's rows read once from memory for its members.
+void experts_gate_up_swiglu_mem(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
+                                int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
+                                const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
+                      const uint16_t* h, int C, int F, float* y, cudaStream_t s);
+/// experts_block_gu / _down give experts_gate_up_swiglu_mma / experts_down_mma's values to the bit (their warp
+/// splits the same: IK2_EXPERT_MMA_SPLIT 8, _DOWN 4, the defaults).
+bool experts_block_exact();
 
 }  // namespace ik2::k
