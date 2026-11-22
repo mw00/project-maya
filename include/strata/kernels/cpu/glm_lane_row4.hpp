@@ -19,9 +19,10 @@
 // Builds: every native-experts build has these functions (src/kernels/cpu/glm_lane_row4.cpp, compiled for any CPU of
 // its architecture: on x86-64 the kernels, glm_lane_row4_avx2.cpp, run only after its CPUID check for AVX2 + FMA +
 // F16C).  The kernels are x86-64 only (the CMake option STRATA_GLM_LANE_ROW4_KERNELS, ON by default).  Without them -
-// aarch64 (DGX Spark / Grace), ppc64le (IBM AC922), or the option OFF - row4_supported() is false for every type,
-// row4_iq1s_form() is -1, lane_row4_on() is false whatever MAYA_GLM_LANE_ROW4 says, lane_row4_types() is 0 and both
-// hooks return false (row4_dot / row4_rows, which require row4_supported(), abort).
+// aarch64 (DGX Spark / Grace), ppc64le (IBM AC922), or the option OFF - row4_supported(), row4_faster() and
+// lane_row4_takes() are false for every type, row4_iq1s_form() is -1, lane_row4_on() and lane_row4_auto_default() are
+// false whatever MAYA_GLM_LANE_ROW4 says, lane_row4_types() is 0 and both hooks return false (row4_dot / row4_rows,
+// which require row4_supported(), abort).
 #pragma once
 
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -47,10 +48,28 @@ void row4_dot(int ggml_type, int n, const uint8_t* const w[4], const void* q8, f
 /// (r1 - r0) % 4 rows left over through ggml-cpu's vec_dot.  Requires row4_supported(type).
 void row4_rows(int ggml_type, int n, const uint8_t* w, size_t row_bytes, const void* q8, float* out, int r0, int r1);
 
-/// MAYA_GLM_LANE_ROW4=0 turns the lane hooks off (default on).  lane_row4_override(-1) = follow the env,
-/// 0 = off, 1 = on (tests and the bench compare both in one process); it leaves lane_row4_set's type mask as it is.
+/// MAYA_GLM_LANE_ROW4: 1 = the hooks take every type that has a kernel, 0 = the hooks off, auto = a type's hooks take
+/// its kernel only where the kernel is the faster one on this CPU (row4_faster).  Unset it is 1 - except on AMD Zen /
+/// Zen+, where it is auto (lane_row4_auto_default(): ggml-cpu's dot is the faster there for every type but IQ1_S).
+/// lane_row4_on(): the hooks are not off.  lane_row4_override(-1) = follow the env, 0 = off, 1 = on for every type,
+/// 2 = auto (tests and the bench compare them in one process); it leaves lane_row4_set's type mask as it is.
 bool lane_row4_on();
+bool lane_row4_auto_default();
 void lane_row4_override(int mode) noexcept;
+
+/// The 4-row kernel of `ggml_type` against ggml-cpu's own dot on this CPU: true where the kernel is the faster of the
+/// two (false without row4_supported()).  Timed once a type, on its first use (40 to 130 ms a type on a Threadripper
+/// 1950X, 0.9 s for IQ1_S, whose dot is that slow there; on the calling thread, and a call from another thread
+/// meanwhile waits for it): rows of 4096 values read in order from more memory than the L3 holds (twice its size, 32
+/// to 256 MB) - from RAM, as the lane reads an expert - each side's best of three passes taken in turns.  The two give
+/// the same bits, so the answer changes no output; it goes either way by the CPU, and on a CPU with two kinds of cores
+/// by the kind the calling thread is on (the numbers are in glm_lane_row4.cpp).
+/// MAYA_GLM_LANE_ROW4_VERBOSE=1 prints each type's two speeds as they are measured.
+bool row4_faster(int ggml_type);
+
+/// What the hooks do for `ggml_type` as the switch stands now (so a log or a bench can say it): the switch not off,
+/// the type in lane_row4_set's mask, a kernel for it, and - in the auto mode - row4_faster().
+bool lane_row4_takes(int ggml_type);
 
 /// lane_row4_set's type mask: bit t lets the hooks take ggml type t (every row4 type is below 32).
 inline constexpr uint32_t kRow4AllTypes = 0xFFFFFFFFu;
