@@ -502,7 +502,7 @@ class Gate(unittest.TestCase):
         at = text.index("add_executable(maya-hy4 ")
         self.assertIn("if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)", text[at - 60:at])
         # (its vision tower's BF16 type on HIP: the compat header, not CUDA's own)
-        self.assertTrue((ROOT / "include" / "strata" / "hip_compat" / "cuda_bf16.h").exists())
+        self.assertTrue((ROOT / "include" / "maya" / "hip_compat" / "cuda_bf16.h").exists())
 
 
 def halo(index=0):

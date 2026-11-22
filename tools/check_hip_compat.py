@@ -91,7 +91,7 @@ def hip_lines(text: str):
 
 def unmapped(repo: Path) -> list:
     """[(file, line, name)] for every name the HIP build compiles without a mapping."""
-    compat = repo / "include" / "strata" / "hip_compat"
+    compat = repo / "include" / "maya" / "hip_compat"
     have = mapped_names(compat)
     found = []
     for top in ("src", "include", "tests"):
