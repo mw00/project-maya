@@ -25,7 +25,8 @@ KV_BYTES = {"fp8": 16384, "f16": 32768}             # the cache of a context tok
 MARGIN_GIB = 0.5                                    # the driver's and the desktop's share of the card
 CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # the setup's choices, up to the trained 1,048,576 (the
                                                     # engine keeps every expert and the cache in VRAM up to 352,256
-                                                    # with an FP8 cache on a 24 GB card; past it KV streaming)
+                                                    # with an FP8 cache on a 24 GB card; past it the offload path
+                                                    # with the cache in VRAM, KV streaming only past that)
 RECOMMEND_MAX = 262144                              # the largest context the setup recommends by itself
 FULL_VISITS = 8                                     # the visits of the layers without a window: KV_BYTES / 8 each
 SCRATCH_TOKEN_BYTES = 1152                          # the attention's scratch a context token past 262,144 (48 x 24 heads)
@@ -48,13 +49,15 @@ def need_gib(ctx: int, kv: str = DEFAULT_KV) -> float:
     return BASE_GIB + ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB
 
 
-def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
+def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hip: bool = False) -> dict:
     """What this card holds at `ctx`: {"resident": every expert in VRAM, "need_gib", "layout": "resident" or
     "offload", "tier_gib": the experts' GiB the card keeps, "ram_gib": the engine's RAM (the offload path pins the
     experts the card does not keep; KV streaming pins the cache's rows it keeps in RAM), "kv_streamed": the cache of
-    some full-attention visits in RAM (maya-ik2 --kv-streaming auto: only where the cache does not fit beside the
-    model), "kv_ram_gib": those rows' GiB}.  A card whose VRAM is not known (0): resident - the engine measures at its
-    start."""
+    some full-attention visits in RAM, "kv_ram_gib": those rows' GiB}.  Where the model and the cache do not fit
+    together the experts leave the card first (a token reads the whole cache, but only ~8 experts a layer): the
+    offload path with the cache in VRAM; maya-ik2 --kv-streaming auto streams the cache only where it alone does not
+    fit beside the dense weights and a tier of OFF_TIER_MIN_GIB.  AMD (hip: no offload path yet): every expert stays,
+    the cache streams.  A card whose VRAM is not known (0): resident - the engine measures at its start."""
     if not vram_gb:
         return {"resident": True, "need_gib": None, "layout": "resident", "tier_gib": EXPERTS_GIB, "ram_gib": HOST_GIB,
                 "kv_streamed": False, "kv_ram_gib": 0.0}
@@ -66,11 +69,11 @@ def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
     kv_gib = ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB
     vis = kv_gib / FULL_VISITS
     base = BASE_GIB + max(0, ctx - 262144) * SCRATCH_TOKEN_BYTES / GIB   # (beside the full visits' cache)
-    # KV streaming with every expert in VRAM: as many full visits in VRAM as fit beside the tokens' ring, one of
-    # them (the swing visit) the prompts' staging pair - its rows in RAM too
+    # (AMD) KV streaming with every expert in VRAM: as many full visits in VRAM as fit beside the tokens' ring, one
+    # of them (the swing visit) the prompts' staging pair - its rows in RAM too
     ring = vis * RING_OF_VISIT
     n_res = min(FULL_VISITS, int((room - base - ring) // vis)) if room >= base + ring + vis else -1
-    if n_res >= 1:
+    if hip and n_res >= 1:
         kv_ram = round((FULL_VISITS - n_res + 1) * vis, 1)
         return {"resident": True, "need_gib": round(base + n_res * vis + ring, 1), "layout": "resident",
                 "tier_gib": EXPERTS_GIB, "ram_gib": round(HOST_GIB + kv_ram + STREAM_HOST_GIB, 1),
@@ -152,11 +155,11 @@ def amd_unsupported(cards: list) -> str | None:
     return None
 
 
-def verdict(vram_gb: float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> tuple:
+def verdict(vram_gb: float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV, hip: bool = False) -> tuple:
     """(word, line) for the setup and the Models page: "fast" (every expert in VRAM), "runs" (the offload path),
     "tight" (the offload path, with less RAM beside what it takes than the system needs - it may not start),
     "does not fit" (RAM under what the offload path takes with this card: RAM + VRAM under the model).  ram_gb 0: not known."""
-    p = plan(vram_gb, ctx, kv)
+    p = plan(vram_gb, ctx, kv, hip)
     if ram_gb and ram_gb < p["ram_gib"] and p["kv_streamed"]:
         return "does not fit", (f"at this context the cache keeps about {p['kv_ram_gib']:.0f} GB in RAM (KV "
                                 f"streaming): about {p['ram_gib']:.0f} GB of RAM in all, this PC has {ram_gb:.0f} GB - "
@@ -173,6 +176,8 @@ def verdict(vram_gb: float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> tu
             f"{EXPERTS_GIB - p['tier_gib']:.1f} GB pinned in RAM - slower than with every expert in VRAM")
     if p["kv_streamed"]:
         line += f"; about {p['kv_ram_gib']:.0f} GB of the cache in RAM too (KV streaming)"
+    else:
+        line += "; the whole cache stays on the card"
     if ram_gb and ram_gb < p["ram_gib"] + OS_GIB:
         return "tight", line + f"; it takes about {p['ram_gib']:.0f} GB of RAM, this PC has {ram_gb:.0f} GB"
     return "runs", line

@@ -4961,10 +4961,10 @@ int main(int argc, char** argv) {
 #endif
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
         bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
-        // KV streaming (g_kv_stream): auto takes it only where the cache does not fit beside the model - then every
-        // expert stays in VRAM where they fit beside the full visits kept there plus the tokens' ring; an offload
-        // layout (the experts never all fit) streams only where its cache alone would not fit, and only where the RAM
-        // holds the rows beside its experts.  The rows in RAM are pinned: never more than the RAM has free.
+        // KV streaming (g_kv_stream): auto takes it only where the cache alone does not fit beside the dense weights
+        // and a half-GiB tier of experts (the offload layout, below), and only where the RAM holds the rows beside its
+        // experts; where the offload path does not run, where the cache does not fit beside every expert.  The rows
+        // in RAM are pinned: never more than the RAM has free.
         if (g_kv_stream != 0) {
             const size_t eb = g_kv_fp8 ? 1 : 2, vis_b = (size_t) ctx * c.KV * c.D * eb * 2;
             size_t slide_b = 0;
@@ -4987,13 +4987,23 @@ int main(int argc, char** argv) {
             const size_t ring_rows = (size_t) std::max(bhi - blo, g_ring_tgt);
             const size_t ring_b = (size_t) kKvRing * 2 * ring_rows * c.KV * c.D * eb;
             // n_res: the full visits in VRAM for the tokens, the swing visit (the prompts' staging pair) one of them
+            // A token reads the WHOLE cache but only the ~8 experts a layer it picks: where the model and the cache do
+            // not fit together, the experts leave VRAM first (the offload path: a tier of the most-used ones stays,
+            // the others in RAM fetched by the GPU / the CPU lane) and the cache stays in VRAM; rows go to RAM only
+            // where the cache alone does not fit beside the dense weights and a half-GiB tier.  (Not where the
+            // offload path does not run: AMD, IK2_OFF=0, IK2_DENSE - there every expert stays and the cache streams.)
+            bool off_ok = !getenv("IK2_DENSE") && !(getenv("IK2_OFF") && *getenv("IK2_OFF") && !std::atoi(getenv("IK2_OFF")));
+#ifdef STRATA_USE_HIP
+            off_ok = false;
+#endif
             int host_n = 0, n_res = n_full;
             bool all_exp = false;
             if (n_full > 0 && (g_kv_stream == 1 || !fits)) {
                 if (g_kv_resident >= 0) n_res = std::max(1, std::min(g_kv_resident, n_full));
                 else n_res = base + ring_b + vis_b <= fr0 ? (int) std::min<size_t>(n_full, (fr0 - base - ring_b) / vis_b) : 1;
                 all_exp = exp_b <= cap_b && base + ring_b + (size_t) n_res * vis_b <= fr0;
-                if (!all_exp && g_kv_stream != 1) {
+                if (g_kv_stream != 1 && (off_ok || !all_exp)) {
+                    all_exp = false;
                     // (an offload layout: the cache in VRAM as in v1.1.73 wherever it leaves the experts a tier of half a GiB)
                     const size_t rest = dense_b + slide_b + reserve + scratch + GiB / 2;
                     if (rest + (size_t) n_full * vis_b <= fr0) n_res = n_full;
