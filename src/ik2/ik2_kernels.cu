@@ -2585,6 +2585,54 @@ __global__ void loop_gate_dots_kernel(LoopGateArgs a, int T, int C, int R, float
         }
     }
 }
+#ifndef STRATA_USE_HIP
+// (1) for a few tokens (a token, a window: T <= 8) and C = 128 NIT: a block a (rank, gate) for every token - its D
+// row's two halves asked for once, at the start, each token's x and m a token ahead of its sums; the sums are
+// loop_gate_dots_kernel's (a thread's FMAs in c's order, the warp sums, the four warps added in order), so the
+// same bits.  A block a (rank, gate, token) read the D row again for every token, each load where it was used:
+// 16.6 us a launch of three gates with 5 tokens.
+template <int NIT>
+__global__ void __launch_bounds__(128) loop_gate_dots_toks_kernel(LoopGateArgs a, int T, int C, int R, float* sc) {
+    __shared__ float sh[8][4][4];
+    const int r = blockIdx.x, j = blockIdx.y, tid = threadIdx.x, warp = tid >> 5;
+    const float* dr = a.D[j] + (size_t) r * 2 * C;
+    float dx[NIT], dm[NIT];
+#pragma unroll
+    for (int i = 0; i < NIT; ++i) dx[i] = __ldg(dr + tid + i * 128), dm[i] = __ldg(dr + C + tid + i * 128);
+    float xa[NIT], ma[NIT];
+#pragma unroll
+    for (int i = 0; i < NIT; ++i) xa[i] = a.x[j][tid + i * 128], ma[i] = a.m[j][tid + i * 128];
+    for (int t = 0; t < T; ++t) {
+        float xn[NIT], mn[NIT];
+        const int tn = min(t + 1, T - 1);
+#pragma unroll
+        for (int i = 0; i < NIT; ++i)
+            xn[i] = a.x[j][(size_t) tn * C + tid + i * 128], mn[i] = a.m[j][(size_t) tn * C + tid + i * 128];
+        float ax = 0.0f, am = 0.0f, sx = 0.0f, sm = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NIT; ++i) {
+            ax = __fmaf_rn(dx[i], xa[i], ax), am = __fmaf_rn(dm[i], ma[i], am);
+            if (r == 0) sx = __fmaf_rn(xa[i], xa[i], sx), sm = __fmaf_rn(ma[i], ma[i], sm);
+        }
+        ax = wsum(ax), am = wsum(am);
+        if (r == 0) sx = wsum(sx), sm = wsum(sm);
+        if ((tid & 31) == 0) sh[t][warp][0] = ax, sh[t][warp][1] = am, sh[t][warp][2] = sx, sh[t][warp][3] = sm;
+#pragma unroll
+        for (int i = 0; i < NIT; ++i) xa[i] = xn[i], ma[i] = mn[i];
+    }
+    __syncthreads();
+    if (tid < T) {
+        const int t = tid;
+        float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
+        o[2 * r] = sh[t][0][0] + sh[t][1][0] + sh[t][2][0] + sh[t][3][0];
+        o[2 * r + 1] = sh[t][0][1] + sh[t][1][1] + sh[t][2][1] + sh[t][3][1];
+        if (r == 0) {
+            o[2 * R] = sh[t][0][2] + sh[t][1][2] + sh[t][2][2] + sh[t][3][2];
+            o[2 * R + 1] = sh[t][0][3] + sh[t][1][3] + sh[t][2][3] + sh[t][3][3];
+        }
+    }
+}
+#endif
 // (2) y = (1 - tanh(F g)) x + tanh(G g) m, F and G by rank ([R][C]).  A block is 32 channels of up to 8 tokens: its
 // 8 warps copy the channels' R rows of F and G into shared memory (the rows spread over the warps, a warp's loads all
 // issued at once - one thread a channel walking the rows itself left the loads in a chain on 27 blocks: 35 us a visit
@@ -6415,6 +6463,12 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
     LoopGateArgs a{};
     for (int j = 0; j < n; ++j)
         a.x[j] = gt[j].x, a.m[j] = gt[j].m, a.D[j] = gt[j].D, a.F[j] = gt[j].F, a.G[j] = gt[j].G, a.y[j] = gt[j].y;
+#ifndef STRATA_USE_HIP
+    static const bool toks = !(getenv("IK2_GATE_TOKS") && !atoi(getenv("IK2_GATE_TOKS")));
+    if (toks && T <= 8 && C == 18 * 128)
+        loop_gate_dots_toks_kernel<18><<<dim3((unsigned) R, (unsigned) n), 128, 0, s>>>(a, T, C, R, sc);
+    else
+#endif
     loop_gate_dots_kernel<<<dim3((unsigned) R, (unsigned) n, (unsigned) T), 128, 0, s>>>(a, T, C, R, sc);
     check("loop_gates (dots)");
     loop_gate_apply_kernel<<<dim3((unsigned) ((C + kGateCh - 1) / kGateCh), (unsigned) n,

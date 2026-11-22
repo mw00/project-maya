@@ -4258,6 +4258,9 @@ int spec_pick(const std::vector<std::pair<int, double>>& dist, int draft, std::m
     return accepted ? draft : sample_from(dist, rng, draft);
 }
 
+double g_sp_draft = 0, g_sp_block = 0, g_sp_tail = 0;   // IK2_SPEC_PROF: a step's drafting, window and the rest, s
+uint64_t g_sp_n = 0;
+std::string g_sp_seq;   // (a step's width and kept drafts, "5:4 5:0 ...")
 int g_window_check = 0;                       // IK2_WINDOW_CHECK: windows still to check against fast_token
 uint64_t g_window_rows = 0, g_window_same = 0;   // (rows checked, rows the same to the bit)
 
@@ -4280,7 +4283,10 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         embed_row(M, anchor, raw, anchor_h);
         ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
         if (t_draft) *t_draft += now() - t0;
+        g_sp_draft += now() - t0;
     }
+    const double t_sp0 = now();
+    double t_sp1 = t_sp0;
     int tk[kBlockMax];
     tk[0] = anchor;
     for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
@@ -4307,6 +4313,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     if (sc.temp <= 0) {
         std::vector<int> g;
         fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g);
+        t_sp1 = now();
         int n = 0;
         while (n < B - 1 && dr[n] == g[n]) ++n;
         for (int j = 0; j < n; ++j) next.push_back(dr[j]);
@@ -4344,6 +4351,12 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     if (drafter) {   // (its context for the kept positions, whichever drafted)
         ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
         ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
+    }
+    static const bool sp_prof = getenv("IK2_SPEC_PROF") && std::atoi(getenv("IK2_SPEC_PROF"));
+    if (sp_prof) {   // (the tail waited for: the rollback and the drafter's context)
+        CU(cudaStreamSynchronize(g_s));
+        g_sp_block += t_sp1 - t_sp0, g_sp_tail += now() - t_sp1, ++g_sp_n;
+        g_sp_seq += std::to_string(B) + ":" + std::to_string(m - 1) + (given ? "L " : " ");
     }
 }
 
@@ -8455,6 +8468,11 @@ int main(int argc, char** argv) {
         for (int b = 2; b <= 6; ++b) std::printf(" %.1f", ctl.c[b] * 1e3);
         std::printf("), a plain token %.1f ms\n", ctl.c_plain * 1e3);
     }
+    if (g_sp_n)
+        std::printf("steps: %llu, a step's drafting %.2f ms, its window %.2f ms, the rest %.2f ms\n",
+                    (unsigned long long) g_sp_n, g_sp_draft * 1e3 / g_sp_n, g_sp_block * 1e3 / g_sp_n,
+                    g_sp_tail * 1e3 / g_sp_n);
+    if (g_sp_n) std::printf("step widths and kept drafts: %s\n", g_sp_seq.c_str());
     if (g_window_rows)
         std::printf("window check: %llu of %llu rows the one-token path's to the bit\n",
                     (unsigned long long) g_window_same, (unsigned long long) g_window_rows);
