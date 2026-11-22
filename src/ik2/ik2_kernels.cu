@@ -198,8 +198,8 @@ __device__ __forceinline__ uint32_t f2_to_u32(float a, float b) {
 }
 
 template <bool WRITE_F16, bool WRITE_F32>
-__global__ void rms_impl_kernel(const float* x, const float* w, int D, float eps, uint16_t* y16, float* y32) {
-    __shared__ float sh[kBlk];
+__device__ __forceinline__ void rms_impl_row(const float* x, const float* w, int D, float eps, uint16_t* y16, float* y32,
+                                             float* sh) {
     const float* xr = x + (size_t) blockIdx.x * D;
     uint16_t* y16r = WRITE_F16 ? y16 + (size_t) blockIdx.x * D : nullptr;
     float* y32r = WRITE_F32 ? y32 + (size_t) blockIdx.x * D : nullptr;
@@ -234,6 +234,24 @@ __global__ void rms_impl_kernel(const float* x, const float* w, int D, float eps
             if (WRITE_F16) y16r[d] = f2h(r);
         }
     }
+}
+template <bool WRITE_F16, bool WRITE_F32>
+__global__ void rms_impl_kernel(const float* x, const float* w, int D, float eps, uint16_t* y16, float* y32) {
+    __shared__ float sh[kBlk];
+    rms_impl_row<WRITE_F16, WRITE_F32>(x, w, D, eps, y16, y32, sh);
+}
+// rms_impl_kernel for up to three inputs of the same rows, each with its weights and outputs, in one launch (a grid
+// row an input; a block rms_impl_kernel's)
+struct RmsF16Jobs {
+    const float* x[3];
+    const float* w[3];
+    uint16_t* y16[3];
+    float* y32[3];
+};
+__global__ void rms_impl_jobs_kernel(RmsF16Jobs j, int D, float eps) {
+    __shared__ float sh[kBlk];
+    const int i = blockIdx.y;
+    rms_impl_row<true, true>(j.x[i], j.w[i], D, eps, j.y16[i], j.y32[i], sh);
 }
 // rms of up to three vectors, each with its own weights, in one launch (a block a vector; rms_impl_kernel's sums)
 __global__ void rms_multi_kernel(RmsJobs jobs, int D, float eps) {
@@ -5419,10 +5437,10 @@ __global__ void attn_block_combine_kernel(const float* __restrict__ o_part, cons
 
 // a few tokens' short conv (conv4_fused_kernel's arithmetic) with row strides; the history before and the inputs
 // kept for a rollback (rec_old [3][C], rec_x [T][C]: conv_hist_after's) when given
-__global__ void conv_block_kernel(const float* __restrict__ x, int x_ld, float* hist, const float* __restrict__ w,
-                                  const float* __restrict__ dyn, int d_ld, int heads, int T, int C,
-                                  const float* __restrict__ res, int res_ld, float* y, int y_ld, float* rec_old,
-                                  float* rec_x) {
+__device__ __forceinline__ void conv_block_ch(const float* __restrict__ x, int x_ld, float* hist,
+                                              const float* __restrict__ w, const float* __restrict__ dyn, int d_ld,
+                                              int heads, int T, int C, const float* __restrict__ res, int res_ld,
+                                              float* y, int y_ld, float* rec_old, float* rec_x) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
@@ -5438,6 +5456,47 @@ __global__ void conv_block_kernel(const float* __restrict__ x, int x_ld, float* 
             const float* dc = dc_base + (size_t) t * d_ld;
             a += dc[0] * xn + dc[1] * h2 + dc[2] * h1 + dc[3] * h0;
         }
+        if (res) a += res[(size_t) t * res_ld + c];
+        y[(size_t) t * y_ld + c] = a;
+        h0 = h1, h1 = h2, h2 = xn;
+    }
+    hist[c] = h0, hist[(size_t) C + c] = h1, hist[(size_t) 2 * C + c] = h2;
+}
+__global__ void conv_block_kernel(const float* __restrict__ x, int x_ld, float* hist, const float* __restrict__ w,
+                                  const float* __restrict__ dyn, int d_ld, int heads, int T, int C,
+                                  const float* __restrict__ res, int res_ld, float* y, int y_ld, float* rec_old,
+                                  float* rec_x) {
+    conv_block_ch(x, x_ld, hist, w, dyn, d_ld, heads, T, C, res, res_ld, y, y_ld, rec_old, rec_x);
+}
+// two convs of the same width in one launch (a layer's k and v: a grid row each, conv_block_kernel's blocks)
+struct ConvJob {
+    const float* x;
+    float* hist;
+    const float* w;
+    const float* dyn;
+    float *y, *rec_old, *rec_x;
+};
+__global__ void conv_block2_kernel(ConvJob j0, ConvJob j1, int x_ld, int d_ld, int heads, int T, int C, int y_ld) {
+    const ConvJob j = blockIdx.y ? j1 : j0;
+    conv_block_ch(j.x, x_ld, j.hist, j.w, j.dyn, d_ld, heads, T, C, nullptr, 0, j.y, y_ld, j.rec_old, j.rec_x);
+}
+// a window's moe_combine_f32 and the conv after it in one launch: a channel's combined value of each token (the same
+// sum over its picks), then conv_block_kernel's step with it
+__global__ void moe_combine_conv_block_kernel(const float* __restrict__ yv, const int* __restrict__ inv,
+                                              const float* __restrict__ wt, int T, int K, int C, float* hist,
+                                              const float* __restrict__ w, const float* __restrict__ res, int res_ld,
+                                              float* y, int y_ld, float* rec_old, float* rec_x) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
+    if (rec_old) rec_old[c] = h0, rec_old[(size_t) C + c] = h1, rec_old[(size_t) 2 * C + c] = h2;
+    const float* wc = w + (size_t) c * 4;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    for (int t = 0; t < T; ++t) {
+        float xn = 0.0f;
+        for (int k = 0; k < K; ++k) xn += wt[(size_t) t * K + k] * yv[(size_t) inv[(size_t) t * K + k] * C + c];
+        if (rec_x) rec_x[(size_t) t * C + c] = xn;
+        float a = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xn;
         if (res) a += res[(size_t) t * res_ld + c];
         y[(size_t) t * y_ld + c] = a;
         h0 = h1, h1 = h2, h2 = xn;
@@ -7297,6 +7356,36 @@ void conv_block(const float* x, int x_ld, float* hist, const float* w, const flo
     conv_block_kernel<<<(unsigned) ((C + 127) / 128), 128, 0, s>>>(x, x_ld, hist, w, dyn, d_ld, heads > 0 ? heads : 1,
                                                                    T, C, res, res_ld, y, y_ld, rec_old, rec_x);
     check("conv_block");
+}
+void conv_block2(const float* xa, float* hist_a, const float* wa, const float* dyn_a, float* ya, float* rec_old_a,
+                 float* rec_x_a, const float* xb, float* hist_b, const float* wb, const float* dyn_b, float* yb,
+                 float* rec_old_b, float* rec_x_b, int x_ld, int d_ld, int heads, int T, int C, int y_ld,
+                 cudaStream_t s) {
+    if (T <= 0) return;
+    const ConvJob j0{xa, hist_a, wa, dyn_a, ya, rec_old_a, rec_x_a}, j1{xb, hist_b, wb, dyn_b, yb, rec_old_b, rec_x_b};
+    conv_block2_kernel<<<dim3((unsigned) ((C + 127) / 128), 2), 128, 0, s>>>(j0, j1, x_ld, d_ld, heads > 0 ? heads : 1,
+                                                                             T, C, y_ld);
+    check("conv_block2");
+}
+void moe_combine_conv_block(const float* y, const int* inv, const float* wt, int T, int K, int C, float* hist,
+                            const float* w, const float* res, int res_ld, float* out, int out_ld, float* rec_old,
+                            float* rec_x, cudaStream_t s) {
+    if (T <= 0) return;
+    moe_combine_conv_block_kernel<<<(unsigned) ((C + 127) / 128), 128, 0, s>>>(y, inv, wt, T, K, C, hist, w, res,
+                                                                               res_ld, out, out_ld, rec_old, rec_x);
+    check("moe_combine_conv_block");
+}
+void rms_f16_jobs(const float* const* x, const float* const* w, uint16_t* const* y16, float* const* y32, int n,
+                  int rows, int D, float eps, cudaStream_t s) {
+    if (rows <= 0 || n <= 0) return;
+    if (n > 3) {
+        std::fprintf(stderr, "ik2::k::rms_f16_jobs: %d inputs\n", n);
+        std::abort();
+    }
+    RmsF16Jobs j{};
+    for (int i = 0; i < n; ++i) j.x[i] = x[i], j.w[i] = w[i], j.y16[i] = y16[i], j.y32[i] = y32[i];
+    rms_impl_jobs_kernel<<<dim3((unsigned) rows, (unsigned) n), kBlk, 0, s>>>(j, D, eps);
+    check("rms_f16_jobs");
 }
 void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s) {
     if (n_recs <= 0) return;

@@ -3357,6 +3357,9 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
 // one-token path's to the bit - its products with mv1's sums (the weights read once), its attention through the
 // token's own kernels, its experts' rows with the token kernels' sums (an expert read once for its tokens).
 bool g_block_exact = true;
+// (IK2_BLOCK_FUSE=0: the window's small kernels a launch each - k's and v's convs, the looped inputs' three norms,
+//  the experts' combine and its conv share launches otherwise: 144 launches of ~3.5 us less a window)
+const bool g_blk_fuse = !(getenv("IK2_BLOCK_FUSE") && !std::atoi(getenv("IK2_BLOCK_FUSE")));
 // rows [r0, r0 + n) of a dense matrix times x [T][K] (F32, rows x_ld apart): y [T][ldy], each token's mv1's
 void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, float* y, int ldy) {
     if (m.q8) {
@@ -3422,7 +3425,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                     gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
                              Ly.lp_forget[j], Ly.lp_gain[j], x3[j]};
                 k::loop_gates(gt, 3, T, C, c.rank, 1e-6f, W.lp_g, g_s);
-                for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], T, C, c.eps, y16[j], x3[j], g_s);
+                if (g_blk_fuse) k::rms_f16_jobs(x3, nw, y16, x3, 3, T, C, c.eps, g_s);   // (one launch, not three)
+                else for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], T, C, c.eps, y16[j], x3[j], g_s);
                 sep = true;
             } else if (l > 0) {
                 k::RmsOuts outs{};
@@ -3460,10 +3464,16 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             }
             q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
             q_ld = r_ld = gate_ld = N;
-            k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                          Ly.rec_x[0], g_s);
-            k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
-                          Ly.rec_old[1], Ly.rec_x[1], g_s);
+            if (g_blk_fuse) {   // (k's and v's convs: one launch)
+                k::conv_block2(W.qkv + HD, Ly.h_k, Ly.sc_k, nullptr, W.kconv, Ly.rec_old[0], Ly.rec_x[0],
+                               W.qkv + HD + KD, Ly.h_v, Ly.sc_v, nullptr, W.vconv, Ly.rec_old[1], Ly.rec_x[1], N, 0, 0, T,
+                               KD, KD, g_s);
+            } else {
+                k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD,
+                              Ly.rec_old[0], Ly.rec_x[0], g_s);
+                k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
+                              Ly.rec_old[1], Ly.rec_x[1], g_s);
+            }
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
             const int N = m.N;
@@ -3482,10 +3492,15 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                 tile_rows(Ly.wk, 0, KD, W.xk16, T, W.kk, KD);
                 tile_rows(Ly.wv, 0, KD, W.xv16, T, W.vv, KD);
             }
-            k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                          Ly.rec_x[0], g_s);
-            k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
-                          Ly.rec_x[1], g_s);
+            if (g_blk_fuse) {
+                k::conv_block2(W.kk, Ly.h_k, Ly.sc_k, kd, W.kconv, Ly.rec_old[0], Ly.rec_x[0], W.vv, Ly.h_v, Ly.sc_v, vd,
+                               W.vconv, Ly.rec_old[1], Ly.rec_x[1], KD, DL, c.KV, T, KD, KD, g_s);
+            } else {
+                k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
+                              Ly.rec_x[0], g_s);
+                k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
+                              Ly.rec_x[1], g_s);
+            }
         }
         // the clips, the window's K and V into the cache at its positions, the attention of its queries
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
@@ -3628,9 +3643,14 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
-        k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
-        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
-                      g_s);
+        if (g_blk_fuse) {   // (the experts' combine and the conv after it: one launch)
+            k::moe_combine_conv_block(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, C, W.h, C,
+                                      Ly.rec_old[3], Ly.rec_x[3], g_s);
+        } else {
+            k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
+            k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3],
+                          Ly.rec_x[3], g_s);
+        }
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits

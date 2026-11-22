@@ -526,6 +526,18 @@ void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int 
                  cudaStream_t s);
 /// x [T][C] as two FP16 limbs a token: out [T][2][C] (hi, lo).
 void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s);
+/// Launches shared (the kernels' blocks as they are, so the same values): two conv_block of the same width - a layer's
+/// k and v (x rows x_ld apart, y rows y_ld, dyn rows d_ld or null, no residual); the MoE's moe_combine_f32 and the
+/// conv_block after it; rms_f16 of up to three inputs of the same rows (both outputs each).
+void conv_block2(const float* xa, float* hist_a, const float* wa, const float* dyn_a, float* ya, float* rec_old_a,
+                 float* rec_x_a, const float* xb, float* hist_b, const float* wb, const float* dyn_b, float* yb,
+                 float* rec_old_b, float* rec_x_b, int x_ld, int d_ld, int heads, int T, int C, int y_ld,
+                 cudaStream_t s);
+void moe_combine_conv_block(const float* y, const int* inv, const float* wt, int T, int K, int C, float* hist,
+                            const float* w, const float* res, int res_ld, float* out, int out_ld, float* rec_old,
+                            float* rec_x, cudaStream_t s);
+void rms_f16_jobs(const float* const* x, const float* const* w, uint16_t* const* y16, float* const* y32, int n,
+                  int rows, int D, float eps, cudaStream_t s);
 /// route()'s picks of a window (S = T K <= 64 slots) grouped by expert on the device: blob [S], n [S] (0 past the
 /// last group), tok / row [S][kGroupMax], and a slot's sg, su, wt (down's scale folded) and inv (the slot).
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
