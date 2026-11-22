@@ -102,17 +102,22 @@ struct Step {
     bool moved = false, short_ = false;
     int64_t want = 0;
 };
-inline Step check(Gpu& g, size_t fr, size_t tot, size_t res, bool given) {
+// `room`: how much more the plan could have kept free at this start (a pool already at its floor: 0) - the figure
+// never grows past late + room, and a start that kept all it could is not said short (a restart would not help)
+inline Step check(Gpu& g, size_t fr, size_t tot, size_t res, bool given, size_t room = ~(size_t) 0 >> 2) {
     Step s;
     if (fr >= g.fr_min) return s;
     g.fr_min = fr;
     int64_t want = (int64_t) g.late + (int64_t) res - (int64_t) fr;
     want = std::min<int64_t>(std::max<int64_t>(0, want), (int64_t) tot / 4);
     want = (want + kStep - 1) / kStep * kStep;
+    const int64_t lim = std::max<int64_t>((int64_t) g.late, ((int64_t) g.late + (int64_t) std::min(room, tot)) / kStep * kStep);
+    want = std::min(want, lim);
     if (std::llabs(want - (int64_t) g.kept) < kStep) return s;
     s.moved = true;
     s.want = want;
-    s.short_ = (int64_t) fr + 2 * kStep < (int64_t) res && (given || want + 4 * kStep > (int64_t) res);
+    s.short_ = (int64_t) fr + 2 * kStep < (int64_t) res && (given || want + 4 * kStep > (int64_t) res) &&
+               want > (int64_t) g.late;
     g.kept = (size_t) want;
     return s;
 }
@@ -126,7 +131,7 @@ struct Tracker {
     struct G {
         Gpu g;
         std::string key;
-        size_t res = 0;
+        size_t res = 0, room = ~(size_t) 0 >> 2;   // (room: what the plan could still have kept free - check)
         bool given = false, read = false;
     };
     std::vector<G> gpus;
@@ -160,6 +165,10 @@ struct Tracker {
     void set_reserve(size_t i, size_t res) {
         if (i < gpus.size()) gpus[i].res = res;
     }
+    /// how much more GPU i's plan could have kept free at this start (check's `room`)
+    void set_room(size_t i, size_t room) {
+        if (i < gpus.size()) gpus[i].room = room;
+    }
     /// GPU i's free VRAM now (`loaded`: the start's last step, else before a request)
     void check(size_t i, size_t fr, size_t tot, bool loaded, int dev) {
         if (i >= gpus.size() || !gpus[i].read) return;
@@ -169,7 +178,7 @@ struct Tracker {
                          tag.c_str(), dev, fr >> 20, x.res >> 20,
                          x.g.late > 0 ? (", " + std::to_string(x.g.late >> 20) + " MiB more kept beside it").c_str() : "");
         if (fixed >= 0) return;
-        const Step s = vramlate::check(x.g, fr, tot, x.res, x.given);
+        const Step s = vramlate::check(x.g, fr, tot, x.res, x.given, x.room);
         if (!s.moved) return;
         if (s.short_)
             std::fprintf(stderr, "%s: WARNING - CUDA%d: %zu MiB free, short of the %zu MiB reserve - the next start keeps "

@@ -1842,6 +1842,7 @@ struct Model::Impl {
         }
         for (size_t i = 0; i < devs.size(); ++i) free_b[i] = free0[i] - o.reserve_gb * 1e9 - (double) scratch_bytes() -
                                                        (double) late.gpus[i].g.late;
+        for (size_t i = 0; i < devs.size(); ++i) late.set_room(i, (size_t) std::max(0.0, free_b[i]));
         // the main GPU: the head's, the drafts', the window's coordination - the fastest memory (then the most VRAM)
         if (o.main_gpu >= (int) devs.size()) {
             err = "--main-gpu " + std::to_string(o.main_gpu) + ": " + std::to_string(devs.size()) + " GPUs given";

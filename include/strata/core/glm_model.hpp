@@ -1135,7 +1135,7 @@ public:
     // (#1026) what this part's start and requests allocate after the pool, measured and kept in the pack's
     // vram-late.txt (src/core/vram_late.hpp): late_ is kept free beside the reserve (part_budget), late_read before
     // the pool is carved, late_check_part once loaded and before every request
-    size_t late_ = 0, late_kept_ = 0, late_fr_min_ = ~(size_t) 0, late_res_ = 0;
+    size_t late_ = 0, late_kept_ = 0, late_fr_min_ = ~(size_t) 0, late_res_ = 0, late_room_ = 0;
     bool late_given_ = false, late_on_ = false;
     std::string late_key_;
     void late_read(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b);

@@ -1591,6 +1591,7 @@ struct Model::Impl {
                               o.seqs, d.n_slots, o.resident_cap, (int) o.dspark, vis != nullptr ? 1 : 0);
                 reserve += late.read(di, "mm3 late|" + tkey + "|pack " + o.pack + kb, reserve, o.reserve_gb >= 0, d.id);
                 late.set_reserve(di, reserve - late.gpus[di].g.late);
+                late.set_room(di, fr > reserve ? fr - reserve : 0);   // (the experts' room: all of it can give way)
             }
             size_t budget = fr > reserve ? fr - reserve : 0;
             std::vector<int> nres(moe_layers.size(), 0);

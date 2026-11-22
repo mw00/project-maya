@@ -35,6 +35,14 @@ int main() {
         const vl::Step s = vl::check(g, 4100 * MiB, tot, 4096 * MiB, true);
         CHECK(!s.moved);
     }
+    // a plan at its floor (no room): nothing kept, not said short - a restart would not help; a little room: capped
+    {
+        vl::Gpu g;
+        CHECK(!vl::check(g, 3744 * MiB, tot, 4096 * MiB, true, 0).moved);
+        vl::Gpu h;
+        const vl::Step s = vl::check(h, 3744 * MiB, tot, 4096 * MiB, true, 100 * MiB);
+        CHECK(s.moved && s.short_ && s.want == (int64_t) 96 * MiB);
+    }
     // the default reserve: 379 of 700 free (320 short) is written but not said short (it holds the figure)
     {
         vl::Gpu g;
