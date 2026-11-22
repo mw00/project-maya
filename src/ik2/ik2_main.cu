@@ -447,7 +447,7 @@ size_t host_ram_avail() {
 }
 
 bool g_kv_q4 = false;
-bool g_kv_stream = false;
+bool g_kv_q4_stream = false;   // (IK2_KV=q4: the Q4 rows past their VRAM share stream from pinned host RAM, IK2_KV_STREAM)
 int g_kv_vram_mb = 64;
 bool g_off_dynamic = false; // IK2_OFF_DYNAMIC=1: GPU-side dynamic Clock-LFU expert cache inside token CUDA graph
 int g_split_mode = 1;       // IK2_SPLIT: 0 the old sequential path, 1 fork+split, 2 fork, GEMMs unsplit (tests)
@@ -2776,7 +2776,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                     k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
                 }
             } else {
-                k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
+                k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, st, g_offs.fl,
+                                  g_offs.cnt,
                                   g_offs.heat, g_s);
                 k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
             }
@@ -5417,7 +5418,7 @@ std::string draft_key(const std::string& model, const std::string& draft_path, i
     char buf[640];
     std::snprintf(buf, sizeof buf, "ik2 drafting v1|%s %.0f GB sm_%d%d|driver %d|%s %lld|drafter %lld|ctx %d %s",
                   p.name, p.totalGlobalMem / 1e9, p.major, p.minor, drv, base.c_str(), fsize(model),
-                  draft_path.empty() ? -1LL : fsize(draft_path), ctx, g_kv_q4 ? "q4" : (g_kv_q4 ? "q4" : (g_kv_q4 ? "q4" : (g_kv_q4 ? "q4" : (g_kv_q4 ? "q4" : (g_kv_q4 ? "q4" : (g_kv_fp8 ? "fp8" : "f16")))))));
+                  draft_path.empty() ? -1LL : fsize(draft_path), ctx, g_kv_q4 ? "q4" : (g_kv_fp8 ? "fp8" : "f16")));
     return buf;
 }
 // the remembered choice (0 .. 3, kDraftNames), or -1; tps: its four figures
@@ -5684,7 +5685,7 @@ int main(int argc, char** argv) {
         else if (kv == "q4" || kv == "int4") g_kv_fp8 = false, g_kv_q4 = true;
         else die("unknown IK2_KV=" + kv + " (expected q4, fp8, or f16)");
     }
-    g_kv_stream = g_kv_q4 && getenv("IK2_KV_STREAM") && std::atoi(getenv("IK2_KV_STREAM"));
+    g_kv_q4_stream = g_kv_q4 && getenv("IK2_KV_STREAM") && std::atoi(getenv("IK2_KV_STREAM"));
     if (getenv("IK2_KV_VRAM_MB")) g_kv_vram_mb = std::max(0, std::atoi(getenv("IK2_KV_VRAM_MB")));
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
@@ -5960,8 +5961,8 @@ int main(int argc, char** argv) {
             if (g_kv_q4) {
                 const size_t n_vis = (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1);
                 const size_t row_b = (size_t) c.KV * (64 + 8) * 2;
-                if (g_kv_stream && !c.sliding[l]) kv_b += (size_t) g_kv_vram_mb << 17;   // approximate per-layer share
-                else kv_b += n_vis * cap * row_b;
+                if (g_kv_q4_stream && !c.sliding[l]) kv_b += (size_t) g_kv_vram_mb << 17;   // approximate per-layer share
+                else kv_b += n_vis * cap * row_b * (c.sliding[l] && serve ? g_par : 1);
             } else {
                 kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
             }
@@ -5998,7 +5999,10 @@ int main(int argc, char** argv) {
         // (KV streaming: one GPU only - off on two GPUs (the split's GPU 1 rows), the CPU lane off beside it below)
         if (g_kv_stream == 1 && g_two.want)
             std::printf("NOTE KV streaming is off on two GPUs (--kv-streaming on not taken): the cache stays in VRAM\n");
-        if (g_kv_stream != 0 && !g_two.want) {
+        if (g_kv_stream == 1 && g_kv_q4)
+            std::printf("NOTE --kv-streaming on not taken with IK2_KV=q4: the Q4 rows stream by their own share "
+                        "(IK2_KV_STREAM, IK2_KV_VRAM_MB)\n");
+        if (g_kv_stream != 0 && !g_two.want && !g_kv_q4) {
             const size_t eb = g_kv_fp8 ? 1 : 2, vis_b = (size_t) ctx * c.KV * c.D * eb * 2;
             size_t slide_b = 0;
             int n_full = 0;
@@ -6378,7 +6382,7 @@ int main(int argc, char** argv) {
             }
             const size_t row_b = (size_t) c.KV * (64 + 8) * 2;
             int vcap = Vi.kv_cap;
-            if (g_kv_stream && !Ly.sliding && n_full_vis > 0) {
+            if (g_kv_q4_stream && !Ly.sliding && n_full_vis > 0) {
                 const size_t per_vis = ((size_t) g_kv_vram_mb << 20) / (size_t) n_full_vis;
                 vcap = std::min(Vi.kv_cap, (int) (per_vis / row_b));
             }
@@ -6438,8 +6442,20 @@ int main(int argc, char** argv) {
         }
         if (g_depth > 0 && !Vi.kv_host) {   // (IK2_DEPTH tests: the positions before the prompt read as zeros)
             const size_t b = (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2);
-            CU(cudaMemset(g_kv_fp8 ? (void*) Vi.kc8 : (void*) Vi.kc, 0, b));
-            CU(cudaMemset(g_kv_fp8 ? (void*) Vi.vc8 : (void*) Vi.vc, 0, b));
+            if (g_kv_q4) {
+                const int vq = Vi.kc4.vram_cap, hn = Vi.kv_cap - vq;
+                if (vq > 0) {
+                    CU(cudaMemset(Vi.kc4.q, 0, (size_t) vq * c.KV * 64)), CU(cudaMemset(Vi.kc4.s, 0, (size_t) vq * c.KV * 8));
+                    CU(cudaMemset(Vi.vc4.q, 0, (size_t) vq * c.KV * 64)), CU(cudaMemset(Vi.vc4.s, 0, (size_t) vq * c.KV * 8));
+                }
+                if (hn > 0) {
+                    CU(cudaMemset(Vi.kc4.q_host, 0, (size_t) hn * c.KV * 64)), CU(cudaMemset(Vi.kc4.s_host, 0, (size_t) hn * c.KV * 8));
+                    CU(cudaMemset(Vi.vc4.q_host, 0, (size_t) hn * c.KV * 64)), CU(cudaMemset(Vi.vc4.s_host, 0, (size_t) hn * c.KV * 8));
+                }
+            } else {
+                CU(cudaMemset(g_kv_fp8 ? (void*) Vi.kc8 : (void*) Vi.kc, 0, b));
+                CU(cudaMemset(g_kv_fp8 ? (void*) Vi.vc8 : (void*) Vi.vc, 0, b));
+            }
         }
         Vi.h_k = dalloc<float>(3 * KD);
         Vi.h_v = dalloc<float>(3 * KD);
