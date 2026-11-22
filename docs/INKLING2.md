@@ -316,7 +316,7 @@ flips codes of a 3-bit mantissa.
 
 **Pictures** go through `tools/vision`'s `maya-vision` built against a llama.cpp that has the Inkling 2 tower
 (`PROJECTOR_TYPE_INKLING2V`; Maya's own build adds it to the pinned llama.cpp: `tools/vision/inkling2v_patch.py`,
-and needs no text model for it - the config's "vision" entry names none) and unsloth's `mmproj-BF16.gguf`. The
+and needs no text model for it - the config's "vision" entry names none) and the model's `mmproj-Inkling-2-Mini-BF16.gguf` (Maya's repo; unsloth's `mmproj-BF16.gguf`, the same bytes, works too). The
 setup sets them up; the encoder starts when a picture arrives (on the GPU while its free VRAM holds it, else on the
 CPU) and ends after the request's pictures, so it keeps no VRAM. The server sends the encoder's rows with the request
 (`GENI`), the engine puts them in place of the image tokens (`--image-token`, 200054) without the embedding's norm.
@@ -369,7 +369,7 @@ To run it (one GPU):
     cat > ik2-mini.json <<EOF
     {"exe": "build/maya-ik2", "args": ["--model", "Inkling-2-Mini-UD-Q4_K_XL.gguf", "--max-context", "262144"],
      "env": {"IK2_KV": "fp8"}, "tokenizer": "ik2/tokenizer", "model_name": "inkling-2-mini",
-     "vision": {"exe": "build-vision/bin/maya-vision", "mmproj": "mmproj-BF16.gguf", "gpu": true}}
+     "vision": {"exe": "build-vision/bin/maya-vision", "mmproj": "mmproj-Inkling-2-Mini-BF16.gguf", "gpu": true}}
     EOF
     python serve/server.py --engine maya --config ik2-mini.json
 
@@ -438,7 +438,7 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 | File | Repository | sha256 |
 |---|---|---|
 | `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
-| `mmproj-BF16.gguf` (0.6 GB, pictures) | same | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
+| `mmproj-Inkling-2-Mini-BF16.gguf` (0.6 GB, pictures; unsloth's `mmproj-BF16.gguf` byte for byte, an existing copy is kept) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`vision/`) | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
 | `mtp.safetensors` (0.6 GB, the drafter: the setup fetches it, not with `--drafting off`) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
 Outside the preview, the older two-GPU mode with a loop runs as expert parallel (`IK2_EP=1`, its caches filled at the

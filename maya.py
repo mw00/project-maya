@@ -873,7 +873,7 @@ HY4_CHUNK_UP_GIB = 0.95
 # stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 or a Halo / APU with 24 GB.
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
 # by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  Pictures: the
-# model's vision tower as unsloth's mmproj-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
+# model's vision tower as the mmproj-Inkling-2-Mini-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
 # read by maya-vision (tools/vision/inkling2v_patch.py) only while a request's pictures are encoded - on the GPU where
 # its free VRAM holds the encoder, else on the CPU; never kept in VRAM, and the context's fit is the same.  What fits on
 # the card (the context): tools/ik2_fit.py, shared with the Models page.  Its defaults: maya_quants.MODEL_DEFAULTS
@@ -11254,12 +11254,13 @@ def ik2_tokenizer_step(a, d: Path, gguf: Path) -> Path:
 
 
 def ik2_vision_model() -> dict | None:
-    """The model's vision tower as offer_download's form (tools/ik2/download.json's "vision": unsloth's mmproj of
-    Inkling-2-Mini's tower, from the GGUF's repo and revision), or None when the manifest names none."""
+    """The model's vision tower as offer_download's form (tools/ik2/download.json's "vision": the mmproj of
+    Inkling-2-Mini's tower from Maya's own repo - unsloth's conversion byte for byte), or None when the manifest
+    names none."""
     man = read_json(IK2_MANIFEST).get("vision") or {}
     if not man.get("files") or not man.get("repo") or not man.get("revision"):
         return None
-    return {"about": f"{IK2_SHOWN}'s vision tower (it lets the model read pictures): unsloth's mmproj of the model's "
+    return {"about": f"{IK2_SHOWN}'s vision tower (it lets the model read pictures): the mmproj of the model's "
                      "own tower (BF16)", "format": "mmproj",
             "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
             "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
@@ -11332,12 +11333,26 @@ def ik2_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path) -> dict | Non
     if m is None:
         warn(f"{IK2_MANIFEST} names no vision tower: the model reads text only")
         return None
-    files = [d / n for n in m["files"]]
-    if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", d, files, m):
+    legacy = (read_json(IK2_MANIFEST).get("vision") or {}).get("legacy_names") or []
+    files, fetch = [], []                              # (the files used; the ones to fetch, by their names here)
+    for n in m["files"]:
+        f = d / n
+        if file_incomplete(m, f):
+            # (before Maya's own repo the tower came as unsloth's mmproj-BF16.gguf - the same bytes: a copy of it on
+            #  the disk whose size and sha256 match is kept under its name, not downloaded again)
+            old = next((d / o for o in legacy if (d / o).is_file() and (d / o).stat().st_size == m["files"][n]
+                        and sha256_checked(d / o, m["sha256"][n])), None)
+            if old is not None:
+                ok(f"the vision tower: {old.name} is already here (the same file as {n})")
+                f = old
+            else:
+                fetch.append(f)
+        files.append(f)
+    if fetch and not offer_download(a, "the vision tower", d, fetch, m):
         warn(f"the vision tower was not downloaded: the model reads text only ({ME} --setup asks again)")
         return None
-    for f in files:                                    # (offer_download checked the ones it fetched; these too)
-        if not sha256_checked(f, m["sha256"][f.name]):
+    for f, n in zip(files, m["files"]):                # (offer_download checked the ones it fetched; these too)
+        if not sha256_checked(f, m["sha256"][n]):
             f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
             fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
     if not vision_encoder_ready(a, pc, meta, llama):
