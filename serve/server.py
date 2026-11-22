@@ -65,6 +65,7 @@ ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run 
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
 HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
 HY4_ROUTE_FILE = ROOT / "data" / "hy4-prompt-route.txt"   # (... its prompt route's rates measured on this PC: child_env)
+GLM_CPU_CAL_FILE = ROOT / "data" / "glm-cpu-cal.txt"      # (the GLM engine's CPU lane timing, kept from its first start)
 HY4_DRAFT_FILE = ROOT / "data" / "hy4-drafting.txt"       # (... and its drafting, --drafting auto: child_env)
 HY4_MEASURE_DOCS = ("docs/SETTINGS.md", "README.md")      # (... the text its first start measures them on: hy4_measure_ids)
 HY4_MEASURE_CHARS = 200_000                               # (... about 55K tokens of it: up to 12 prompt chunks of 4096)
@@ -2491,6 +2492,12 @@ def child_env(cfg: dict) -> dict:
     # Hy4-flash's CPU lane: whether its 4-bit expert copies pay is measured once on this PC (the engine's timed turns,
     # once its experts are warm) and remembered in the data folder beside the expert profiles - per PC, model and
     # lane kernels (maya --speed-calibration measures again)
+    # GLM's CPU lane: its timing (an expert on the CPU vs over PCIe), which plans the split of RAM-tier experts between
+    # the CPU and the GPU, timed at the first start on this PC and kept - re-timed at every start it moved experts
+    # between the two (other bits) and so the same request's greedy answer from start to start (the engine re-times
+    # by itself when decode drifts from it for 5 requests in a row; a new build has its own entry)
+    if models.family(cfg) == "glm":
+        env.setdefault("MAYA_GLM_CPU_CAL", str(GLM_CPU_CAL_FILE))
     if models.family(cfg) == "hy4":
         env.setdefault("HY4_Q4X_FILE", str(HY4_LANE_FILE))
         # (... and the prompt route's rates - a chunk's experts outside VRAM streamed to the GPU or on the CPU lane -

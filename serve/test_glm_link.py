@@ -95,5 +95,18 @@ class GlmLinkTest(unittest.TestCase):
         self.assertEqual(GL.link_config(c, [0])["env"]["MAYA_GLM_MTP_FIXED"], "3")
 
 
+class SameAnswersEnv(unittest.TestCase):
+    def test_cpu_lane_timing_kept_for_every_glm_config(self):
+        """Every GLM start reads the CPU lane's timing from one file in the data folder (the first start on this PC
+        writes it), so the split of RAM-tier experts between the CPU and the GPU - and the greedy answer - is the same
+        start to start; the link mode keeps its own file; other engines get none."""
+        import serve.server as SV
+        c = {"exe": "/b/build/maya", "args": ["--glm-pack", "/m/pack"]}
+        self.assertEqual(SV.child_env(c)["MAYA_GLM_CPU_CAL"], str(SV.ROOT / "data" / "glm-cpu-cal.txt"))
+        own = dict(c, env={"MAYA_GLM_CPU_CAL": "/x/cal.txt"})
+        self.assertEqual(SV.child_env(own)["MAYA_GLM_CPU_CAL"], "/x/cal.txt")
+        self.assertNotIn("MAYA_GLM_CPU_CAL", SV.child_env({"exe": "/b/maya-ds4", "args": ["--model", "/m/x.gguf"]}))
+
+
 if __name__ == "__main__":
     unittest.main()

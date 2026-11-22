@@ -145,7 +145,7 @@ constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
 // MMQ (MAYA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
 constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) / 3;
-// STABLE PRODUCTS (opt-in, MAYA_GLM_PREFILL_STABLE=1; default off = the earlier launches: the stable ones cost
+// STABLE PRODUCTS (MAYA_GLM_PREFILL_STABLE=1; v1.1.75: on by default with glmfast::same_answers; before, off = the earlier launches: the stable ones cost
 // 2-5% prompt speed, and with the CPU lane on the default answers still vary through the decode): a prompt's
 // numbers do not depend on which experts the cache holds at that moment.  Two things made them depend on it: (1) llama.cpp's MMQ stream-k
 // splits each launch's k range by the launch's tile count, and the launches are made up of the resident set and the
@@ -156,8 +156,10 @@ constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) 
 // speed on three V100s (2K / 8K), ~5% on a Radeon 8065S APU.
 inline bool prefill_stable() {
     static const bool on = [] {
+        // (on by default with glmfast::same_answers - without it the same prompt after the same requests gave other
+        //  bits start to start on three V100s; MAYA_GLM_PREFILL_STABLE=0 turns it off)
         const char* v = getenv("MAYA_GLM_PREFILL_STABLE");
-        return v != nullptr && std::atoi(v) != 0;
+        return v != nullptr ? std::atoi(v) != 0 : glmfast::same_answers();
     }();
     return on;
 }
@@ -2551,7 +2553,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return v == nullptr || std::atoi(v) != 0;
     }();
     // repeatable answers (a linked helper): plans from fixed inputs, never from measured times (the CPU share below)
-    const bool rep = glmfast::repeatable(F->helper.linked());
+    const bool rep = glmfast::repeatable(F->helper.linked()) || glmfast::same_answers();   // (and by default)
     // An EXL3 pack's helper layers: every n-th (il % n == phase) streams its experts to this GPU instead of the helper
     // computing them - the copy runs while the helper works on the layer before, so both links work at once (Radeon
     // 8065S + V100, GLM-5.3-Flash EXL3 3.05: 2K prompts 128 tok/s all on the helper, 136 every 4th streamed, 149 every
@@ -4910,6 +4912,7 @@ int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
 
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
     err.clear();
+    if (tp_on()) return false;   // tensor parallel (this version): no prompt path - the token path reads the prompt
     if (prefill_tokens_dsa(tokens, next_token, err) || !err.empty()) return err.empty();   // glm-dsa B11.1: glm-dsa + NextN off the batched path (glm_dsa_mixer.cu)
     prefill_next_ = next_token;
     if (fast_ == nullptr || tokens.empty()) return false;

@@ -392,6 +392,32 @@ public:
     bool win_head_split(int t, int sl, const float* hx, float* lg, std::string& err);
     std::vector<int> split_devs_;                          // ... and the CUDA devices of all of them, part by part
     std::unique_ptr<Glm5Model> split_next_;
+    // TENSOR PARALLEL (MAYA_GLM_TP=N, src/core/glm_tp.cu): this instance is member `rank` of n; it holds every layer
+    // with a slice of it - heads [h0, h1) of the KDA and MLA mixers, FFN width [f0[il], f1[il]) of each layer's
+    // routed experts, shared expert and dense FFN - and copies of the rest.  Member 0 drives the group (tp_peers_
+    // are the others, never on split_next_) and holds the head.  A layer's two partial sums meet on the host.
+    struct TpSlice {
+        int rank = 0, n = 1;
+        int h0 = 0, h1 = 0;
+        std::vector<int> f0, f1;   // per layer (absolute index)
+        bool head = false;
+    };
+    TpSlice tp_;
+    std::vector<std::unique_ptr<Glm5Model>> tp_peers_;
+    struct GlmTpGroup* tpg_ = nullptr;   // the host side (owned by member 0)
+    unsigned tp_seq_ = 0;             // this member's all-reduce count (the host counts the same)
+    bool tp_on() const { return tp_.n > 1; }
+    bool load_pack_tp(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& devs, std::string& err);
+    bool tp_plan(const std::string& pack_dir, int n, std::vector<TpSlice>& out, std::string& err);
+    /// a loaded tensor's TP cut: 0 whole, 1 rows [a0, a1), 2 columns [a0, a1) (elements of ne0), 3 not on this member
+    struct TpCut {
+        int mode = 0;
+        int64_t a0 = 0, a1 = 0;
+    };
+    TpCut tp_cut(const std::string& name) const;
+    void tp_all_reduce(float* buf, cudaStream_t s);
+    bool fast_token_tp(int32_t token, std::string& err);
+    void tp_destroy();
     // parallel split load: parts take the RAM budget in part order, then pin their RAM tiers in part order too
     // (wait_pin / pass_pin); CPU lane setup waits until all have loaded
     struct SplitLoad {
@@ -767,6 +793,11 @@ public:
     /// same tokens the token-at-a-time loop would produce for the same samples.  The sequence state is left for the
     /// next request to restore (snapshot) or reset.
     bool spec_ready() const;
+    /// MAYA_GLM_SPEC_WIN as this split takes it: 1 = the MTP drafts through the pipelined verify window
+    /// (decode_spec_pipe: every GPU of the split on a different token), 0 = the two-group speculative decode
+    /// (decode_spec).  Unset: 1 on a GLM-5.3-Flash split of three GPUs or more that are all Volta (compute capability
+    /// 7.0: Tesla V100, Titan V, Quadro GV100 - #235), 0 elsewhere.  Any part answers for the whole split.
+    int spec_win_mode() const;
     bool decode_spec(maya::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                      int64_t& produced, std::string& err);
     /// GLM-5.3 on 3+ GPUs (the head tuner, glm_dsa_spec.hpp): true when this decode is the tuner's no-drafting turn -
@@ -924,7 +955,9 @@ public:
     /// through the token path's own kernels, so each sequence gets the token the token path would give it.
     /// tokens_out[i]: sequence seqs[i]'s next token after tokens[i] (greedy, or sampled with sps[i]); every
     /// sequence's position advances by one.  n <= rows_max().
-    bool rows_ok() const { return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr; }
+    bool rows_ok() const {
+        return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr && !tp_on();
+    }
     static int rows_max();
     /// MAYA_GLM_SPLIT_ROWS as the scheduler and the parts' setup both take it: 0 (off) .. rows_max()
     static int split_rows_setting();

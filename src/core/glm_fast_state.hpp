@@ -73,6 +73,23 @@ inline bool repeatable(bool linked) {
     }();
     return env >= 0 ? env == 1 : linked;
 }
+// The same greedy answers on every start (default on; MAYA_GLM_SAME_ANSWERS=0: the earlier timing-led choices).  Three
+// choices followed how fast something ran at that moment, and each one moves an expert between this GPU and the CPU
+// lane (other bits for the same expert): (1) the CPU lane's split, planned from a start-up timing taken again at
+// every start and re-planned from decode timing - now timed once on this PC and kept (MAYA_GLM_CPU_CAL, the server's
+// data/glm-cpu-cal.txt) with no live re-plan; (2) tier moves went live as soon as their copy landed - now exactly
+// fixed_moves boundaries after they started; (3) a prompt's CPU / PCIe expert split learned from each layer's
+// times - now planned from the kept timing alone; also the pipelined window's boundary on fresh windows only, the
+// prompts' stable products (glm_prefill.cu) and the draft length fixed at its start length (glm_mtp.cu: the length
+// changes the bits, and one picked by measured round times parted starts).  Three V100s, Maya-S v2, --bench A/B vs
+// the timing-led choices: decode -6% with length 2 (its tokens = no drafting), none with length 3; prompts -2.5%.
+inline bool same_answers() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_SAME_ANSWERS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // repeatable answers: the CPU-lane timing the expert splits plan with in powers of two (MAYA_GLM_LANE_STEPS=0:
 // the measured values - a few percent of timing noise between builds then moves experts and the answers' bits)
 inline bool lane_steps() {
@@ -88,7 +105,7 @@ inline int fixed_moves(bool linked) {
         const char* v = getenv("MAYA_GLM_FIXED_MOVES");
         return v != nullptr ? std::max(0, std::atoi(v)) : -1;
     }();
-    return env >= 0 ? env : repeatable(linked) ? 4 : 0;
+    return env >= 0 ? env : repeatable(linked) || same_answers() ? 4 : 0;
 }
 
 namespace gf = maya::kernels::glmf;
@@ -593,6 +610,11 @@ struct Glm5Model::FastState {
         WSlot ffn_gate, ffn_up, ffn_down;
         int gu_type = 0, d_type = 0;
         size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
+        // the FFN width this instance computes (the routed experts', the shared expert's per expert, the dense FFN's):
+        // the model's own, or a tensor-parallel member's slice [f0, f0 + ff) - then the blob above is the slice's and
+        // src_gu / src_dn / src_d_row are the whole expert's in the shards (the reads take those, glm_tp.cu compacts)
+        int ff = 0, ffd = 0, f0 = 0;
+        size_t src_gu = 0, src_dn = 0, src_d_row = 0, d_row = 0;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         maya::kernels::exl3::ExpertLayout xl;
@@ -1006,7 +1028,8 @@ struct Glm5Model::FastState {
     int read_chunks = 0;         // set_read_chunks: a disk read's pieces (0: MAYA_GLM_READ_CHUNKS, else 8)
     // ---- MAYA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
-    bool kda_graph_on = false;   // experimental, single-device ordinary decode only
+    bool kda_graph_on = false;       // this token's layers go through kda_graphs (fast_layers, MAYA_GLM_KDA_GRAPH)
+    bool kda_graph_broken = false;   // a capture failed once: direct launches for this engine's life
     glmfast::LayerGraphs kda_graphs;
     std::vector<cudaEvent_t> pev;
     std::vector<const char*> pname;
@@ -1059,6 +1082,12 @@ struct Glm5Model::FastState {
         return false;
     }
 };
+namespace glmfast {
+/// Tensor parallel (glm_tp.cu): a whole expert staged at the shards' layout ([gate | up | down] of Ly.src_*) becomes
+/// this member's slice in place - gate and up rows [f0, f0 + ff), every down row's columns [f0, f0 + ff) - at the
+/// layout of Ly.gu_bytes / Ly.d_row (Ly.blob bytes).
+void tp_compact(uint8_t* blob, const Glm5Model::FastState::Layer& Ly, int n_embd);
+}  // namespace glmfast
 
 // KV streaming (Glm5Model::kv_stream_setup): per DSA layer of this part (the NextN block's too), its latent cache in
 // pinned host memory - the authoritative copy, position order - and the residency map of its VRAM slots, which are

@@ -5638,6 +5638,8 @@ def needs_speed_calibration(cfg: dict) -> bool:
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
     if g53_one_gpu_drafting(cfg):                      # (GLM-5.3 on one APU: drafting on or off, measured once)
         return "speed_calibration" not in (cfg.get("installer") or {})
+    if glm_draft_length_wanted(cfg):                   # (GLM on NVIDIA: the one draft length of this PC, measured once)
+        return True
     return "--dflash" in args[:-1] and parallel_of(cfg) <= 1 and \
         "speed_calibration" not in (cfg.get("installer") or {})
 
@@ -5698,6 +5700,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return speed_calibration_ds4(cfg_path, cfg, why)
     if g53_one_gpu_drafting(cfg):
         return speed_calibration_g53(cfg_path, cfg, why)
+    if glm_draft_length_candidate(cfg):
+        return speed_calibration_glm_length(cfg_path, cfg, why)
     drafter = drafter_file(cfg)
     if drafter is None or not drafter.is_file():
         warn("the speed calibration compares the DFlash2 drafter with the MTP block, and the drafter is not on this "
@@ -5886,6 +5890,96 @@ def speed_calibration_g53(cfg_path: Path, cfg: dict, why: str = "") -> bool:
        ("drafts with the MTP block on this GPU" if keep else "decodes without drafting") +
        (" (a tie: the default for this PC)" if abs(d - o) <= G53_DRAFT_TIE * max(o, d) else ""))
     say(f"       (saved in {cfg_path.name}; {ME} --speed-calibration measures again)")
+    return True
+
+
+GLM_DRAFT_LENGTHS = (2, 3, 4)   # GLM on NVIDIA, same answers (MAYA_GLM_SAME_ANSWERS, default): the lengths measured
+GLM_LENGTH_TIE = 0.03           # a longer length is kept only when it decodes faster by more than this (2 otherwise)
+GLM_LENGTH_PROBE = {"mixed": True, "tokens": 512, "answer": 128, "warm": 32}
+
+
+def glm_draft_length_candidate(cfg: dict) -> bool:
+    """A GLM config on NVIDIA GPUs that drafts with its MTP block and keeps the same greedy answers on every start
+    (MAYA_GLM_SAME_ANSWERS on, the default): the engine then drafts one fixed length, and which length is fastest
+    depends on the PC - measured once (installer.glm_draft_length) and kept as MAYA_GLM_MTP_FIXED."""
+    if config_family(cfg) != "glm" or cfg.get("backend") != "cuda" or parallel_of(cfg) > 1:
+        return False
+    if "--dflash" in (cfg.get("args") or [])[:-1] or cfg.get("mixed_gpus") is True:
+        return False
+    env = cfg.get("env") or {}
+    return str(env.get("MAYA_GLM_SAME_ANSWERS", "1")) != "0" and "MAYA_GLM_MTP_ADAPT" not in env
+
+
+def glm_draft_length_wanted(cfg: dict) -> bool:
+    """... and not measured yet (and not set by hand: a MAYA_GLM_MTP_FIXED the user wrote stays theirs)."""
+    inst = cfg.get("installer") or {}
+    return glm_draft_length_candidate(cfg) and "glm_draft_length" not in inst and \
+        "MAYA_GLM_MTP_FIXED" not in (cfg.get("env") or {})
+
+
+def glm_length_pick(speeds: dict) -> int:
+    """The fastest measured draft length; the shorter one unless a longer is faster by more than GLM_LENGTH_TIE."""
+    best = min(speeds)
+    for n in sorted(speeds):
+        if speeds[n] > speeds[best] * (1.0 + GLM_LENGTH_TIE):
+            best = n
+    return best
+
+
+def speed_calibration_glm_length(cfg_path: Path, cfg: dict, why: str = "") -> bool:
+    """GLM on NVIDIA GPUs: the model loaded once for each draft length (GLM_DRAFT_LENGTHS), each writing the same short
+    answers as greedy (decode speed, as --bench measures it); the fastest is kept as MAYA_GLM_MTP_FIXED, so every start
+    of this PC drafts the same length and gives the same answers.  False: not measured."""
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
+        return False
+    say()
+    say("  Speed calibration: how many tokens the MTP block drafts at a time on this PC" + (f" ({why})" if why else ""))
+    say("  The same length is then used on every start, so the same question gets the same answer each time.")
+    say(f"  Maya loads the model {len(GLM_DRAFT_LENGTHS)} times (lengths {', '.join(map(str, GLM_DRAFT_LENGTHS))}); "
+        f"each time it writes about {GLM_LENGTH_PROBE['tokens']} tokens of short answers.  The PC is busy meanwhile.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    speeds: dict[int, float] = {}
+    try:
+        import tempfile
+        from serve.server import StrataEngine, child_env, engine_args
+
+        def start_engine(c):
+            return StrataEngine(c["exe"], engine_args(c), cwd=c.get("cwd"), log=c.get("log"), env=child_env(c))
+        warm, questions, n_doc = CD.requests(cfg, mixed=True)
+        with tempfile.TemporaryDirectory(prefix="maya-speed-") as tmp:
+            for i, n in enumerate(GLM_DRAFT_LENGTHS):
+                c = json.loads(json.dumps(cfg))
+                c["sampling"] = {"temperature": 0.0}
+                c["args"] = CAL.without_writes(list(c.get("args") or []))
+                c["env"] = {**(c.get("env") or {}), **CAL.usage_copy(cfg, Path(tmp)), "MAYA_GLM_SLOTS": "0",
+                            "MAYA_GLM_MTP_FIXED": str(n)}
+                r = CD.measure(c, f"draft length {n}", warm, questions, n_doc, start_engine, say,
+                               f"[{i + 1}/{len(GLM_DRAFT_LENGTHS)}] ", GLM_LENGTH_PROBE)
+                if r["tokens"] < GLM_LENGTH_PROBE["tokens"] // 2:
+                    raise RuntimeError(f"length {n} wrote only {r['tokens']} tokens: too few for a sustained speed")
+                speeds[n] = r["tok_s"]
+    except Exception as e:                             # never stops a setup or a start: the config stays as it was
+        warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps the engine's own start length; "
+             f"{ME} --speed-calibration tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["glm_draft_length"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    n = glm_length_pick(speeds)
+    cfg.setdefault("env", {})["MAYA_GLM_MTP_FIXED"] = str(n)
+    cfg.setdefault("installer", {})["glm_draft_length"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "n": n,
+        "tok_s": {str(k): v for k, v in speeds.items()}}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    say()
+    ok("speed calibration: draft length " + ", ".join(f"{k}: {v:.1f} tokens/s" for k, v in sorted(speeds.items())) +
+       f" - Maya drafts {n} at a time on this PC")
+    say(f"       (saved in {cfg_path.name} as MAYA_GLM_MTP_FIXED; {ME} --speed-calibration measures again)")
     return True
 
 
@@ -7318,6 +7412,10 @@ def _set_up(a, prev: dict) -> Path | None:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: drafting or not")
             speed_calibration(cfg_path, measure_asked(a))
+    elif glm_draft_length_wanted(read_json(cfg_path)) and not getattr(a, "no_speed_calibration", False):
+        if S.UI is not None:
+            S.UI.step(9, "speed calibration: the draft length")
+        speed_calibration(cfg_path, measure_asked(a))
     # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
     # answers (--yes and --no-start setups are not held up by it)
     tuned = None

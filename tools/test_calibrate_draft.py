@@ -489,5 +489,24 @@ class BothGpusDue(unittest.TestCase):
         self.assertTrue(self.due("deepseek", False))
 
 
+class GlmDraftLength(unittest.TestCase):
+    def cfg(self, **kw):
+        c = {"exe": "build/maya", "backend": "cuda", "args": ["--glm-pack", "pack"], "env": {}}
+        c.update(kw)
+        return c
+
+    def test_pick_keeps_the_shorter_unless_clearly_faster(self):
+        self.assertEqual(maya.glm_length_pick({2: 60.0, 3: 61.0, 4: 60.5}), 2)     # within 3%: 2
+        self.assertEqual(maya.glm_length_pick({2: 60.0, 3: 64.0, 4: 62.0}), 3)
+        self.assertEqual(maya.glm_length_pick({2: 60.0, 3: 64.0, 4: 70.0}), 4)
+
+    def test_due_once_on_nvidia_unless_set_by_hand(self):
+        self.assertTrue(maya.glm_draft_length_wanted(self.cfg()))
+        self.assertFalse(maya.glm_draft_length_wanted(self.cfg(installer={"glm_draft_length": {"n": 3}})))
+        self.assertFalse(maya.glm_draft_length_wanted(self.cfg(env={"MAYA_GLM_MTP_FIXED": "3"})))
+        self.assertFalse(maya.glm_draft_length_wanted(self.cfg(env={"MAYA_GLM_SAME_ANSWERS": "0"})))
+        self.assertFalse(maya.glm_draft_length_wanted(self.cfg(backend="hip")))
+
+
 if __name__ == "__main__":
     unittest.main()
