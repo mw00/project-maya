@@ -289,6 +289,75 @@ __global__ void gemv4_kernel(const W* __restrict__ w, size_t ld, int k, int n, c
         if (lane == 0 && c0 + c < ncol) y[(size_t) (c0 + c) * ldy + row] = alpha * v;
     }
 }
+// gemv4_kernel with a lane's loads asked for AH steps at a time: a lane's 24 steps of a row of 3072 each waited for
+// its own weight load and its columns' x loads before the next step's were asked for - a row's time was those round
+// trips, one after another.  Here the AH steps' weights and x are asked for together, then their products made in
+// gemv4_kernel's order (a column's chain x, y, z, w of step after step), and the columns' sums over the lanes go level
+// by level together - each column's own additions.  The same bits.
+template <typename W, int NC, int AH>
+__global__ void gemv4a_kernel(const W* __restrict__ w, size_t ld, int k, int n, const float* __restrict__ x, size_t ldx,
+                              int ncol, float* __restrict__ y, size_t ldy, float alpha) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int c0 = blockIdx.y * NC;
+    if (row >= n) return;
+    const W* wr = w + (size_t) row * ld;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int i0 = lane * 4; i0 < k; i0 += 128 * AH) {
+        float4 wv[AH], xs[AH][NC];
+#pragma unroll
+        for (int a = 0; a < AH; ++a) {
+            const int i = i0 + 128 * a;
+            if constexpr (sizeof(W) == 2) {
+                const uint2 p = i < k ? *(const uint2*) (wr + i) : make_uint2(0u, 0u);
+                wv[a].x = __uint_as_float(p.x << 16);
+                wv[a].y = __uint_as_float(p.x & 0xffff0000u);
+                wv[a].z = __uint_as_float(p.y << 16);
+                wv[a].w = __uint_as_float(p.y & 0xffff0000u);
+            } else {
+                wv[a] = i < k ? *(const float4*) (wr + i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+#pragma unroll
+        for (int a = 0; a < AH; ++a)
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const int i = i0 + 128 * a;
+                const bool in = i < k && c0 + c < ncol;
+                xs[a][c] = in ? *(const float4*) (x + (size_t) (c0 + c) * ldx + i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+#pragma unroll
+        for (int a = 0; a < AH; ++a)
+            if (i0 + 128 * a < k) {
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c0 + c < ncol) acc[c] = fmaf(wv[a].x, xs[a][c].x, acc[c]);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c0 + c < ncol) acc[c] = fmaf(wv[a].y, xs[a][c].y, acc[c]);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c0 + c < ncol) acc[c] = fmaf(wv[a].z, xs[a][c].z, acc[c]);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c0 + c < ncol) acc[c] = fmaf(wv[a].w, xs[a][c].w, acc[c]);
+            }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        float t[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) t[c] = __shfl_xor_sync(0xffffffffu, acc[c], o);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[c] += t[c];
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c0 + c < ncol) y[(size_t) (c0 + c) * ldy + row] = alpha * acc[c];
+    }
+}
 template <typename W>
 void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int ncol, float* y, size_t ldy, float alpha,
           cudaStream_t s) {
@@ -312,6 +381,22 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
         // (5 and 6 columns: their own instances - a window of 5 tokens paid for the 8-column one's code; a column's
         //  sums are the same lanes' in the same order whatever the instance.  HY4_GEMV56=0: as before)
         static const bool nc56 = !(std::getenv("HY4_GEMV56") && std::getenv("HY4_GEMV56")[0] == '0');
+#if !defined(STRATA_USE_HIP)
+        // (gemv4a_kernel: 4 steps' loads together up to 4 columns, 3 with more - the registers; HY4_GEMV_AHEAD=0: as before)
+        static const bool ahead = !(std::getenv("HY4_GEMV_AHEAD") && std::getenv("HY4_GEMV_AHEAD")[0] == '0');
+        if (ahead && nc56) {
+            if (ncol == 1) gemv4a_kernel<W, 1, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+            else if (ncol == 2) gemv4a_kernel<W, 2, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+            else if (ncol <= 4) gemv4a_kernel<W, 4, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+            else if (ncol == 5) gemv4a_kernel<W, 5, 3><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+            else if (ncol == 6) gemv4a_kernel<W, 6, 3><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+            else
+                gemv4a_kernel<W, 8, 3><<<dim3((unsigned) ((n + 7) / 8), (unsigned) ((ncol + 7) / 8)), b, 0, s>>>(
+                    w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+            check("gemv4a");
+            return;
+        }
+#endif
         if (ncol == 1) gemv4_kernel<W, 1><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
         else if (ncol <= 4) gemv4_kernel<W, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
         else if (ncol == 5 && nc56) gemv4_kernel<W, 5><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
