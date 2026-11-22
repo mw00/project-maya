@@ -421,15 +421,25 @@ void mix_rms(const float* x, int n_tap, size_t tap_stride, int rows, int C, cons
 void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaStream_t s);
 /// The drafter's attention: nq queries q [nq][H][128] over the context keys at positions k_lo .. k_hi - 1 of kc / vc
 /// ([ctx][Hkv][128]) and the block's own nq keys kb / vb ([nq][Hkv][128], all visible to every query); softmax(q . k *
-/// scale) . v -> out [nq][H][128].  scratch: H x nq x (k_hi - k_lo + nq) floats.
+/// scale) . v -> out [nq][H][128].  scratch: draft_attn_scratch(H) floats, whatever the context (the key chunks'
+/// partial outputs; the logits stay in shared memory, a tile at a time).
 void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int k_hi, const float* kb, const float* vb,
                 int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s, int cap = 0);
 /// ... over a context of FP16 rows.
 void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
                     int cap);
+/// ... over a context of FP8 (E4M3) rows stored times 1 / k_inv and 1 / v_inv (the block's own rows F32 as they are).
+void draft_attn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float k_inv, float v_inv, float* scratch,
+                    float* out, cudaStream_t s, int cap);
+size_t draft_attn_scratch(int H);
+/// y [n] = E4M3 of x [n] * scale (saturating at +-448).
+void to_e4m3(const float* x, size_t n, float scale, uint8_t* y, cudaStream_t s);
 /// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
+/// ... as FP16 (the input of q8_tile: a drafter whose matrices are Q8_0).
+void silu_mul_f16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
 /// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].
 void rnn_inputs(const float* state, const uint16_t* emb, const int* prev, const float* hidden, const float* f, int R,
                 int C, uint16_t* out, cudaStream_t s);

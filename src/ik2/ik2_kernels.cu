@@ -4515,73 +4515,91 @@ __global__ void rope_neox_kernel(float* x, int heads, const int* pos, float thet
 // a block a (head, query): the logits a key a warp, softmax, the values
 // the drafter's attention, flash-decoding style: a block a (head, key chunk) for all the block's queries (nq <= 8) -
 // a key's K and V rows read once for them - its unnormalised output and (max, sum) a query, then merged.  Keys: the
-// context [k_lo, k_hi) (rows of a ring of cap: (k_lo + j) % cap) and the block's own nq (kb, vb).
-constexpr int kDraftQ = 8;
+// context [k_lo, k_hi) (rows of a ring of cap: (k_lo + j) % cap) and the block's own nq (kb, vb).  A chunk's keys go
+// by tiles of kDraftTile, their logits in shared memory, the softmax online (the running max and sum a query, the
+// output rescaled as the max moves): no scratch in device memory that grows with the context (it was 768 bytes a
+// key: 0.19 GiB at 262,144).  The drafts only - the target checks every token, so the answers do not change.
+constexpr int kDraftQ = 8, kDraftTile = 256;
 __device__ __forceinline__ float ld_f(const float* p) { return *p; }
 __device__ __forceinline__ float ld_f(const uint16_t* p) { return h2f(*p); }
+__device__ __forceinline__ float ld_f(const uint8_t* p) { return e4m3fn_to_f32(*p); }
+// (k_mul, v_mul: the context rows' values times these - an FP8 context's inverse scales; the block's own rows as they are)
 template <class KVT>
 __global__ void draft_attn_part_kernel(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi,
                                        const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int per,
-                                       float* lgs, float* part_o, float2* part_ml, int cap) {
+                                       float* part_o, float2* part_ml, int cap, float k_mul, float v_mul) {
     __shared__ float sh[128];
     __shared__ float qs[kDraftQ][128];
-    __shared__ float mrow[kDraftQ];
-    const int h = blockIdx.x, sp = blockIdx.y, S = gridDim.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31,
-              warp = tid >> 5;
+    __shared__ float lg[kDraftQ][kDraftTile];
+    __shared__ float m_run[kDraftQ], l_run[kDraftQ], corr[kDraftQ];
+    const int h = blockIdx.x, sp = blockIdx.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int KD = Hkv * 128, nc = k_hi - k_lo, nk = nc + nq;
     const int j0 = min(nk, sp * per), j1 = min(nk, j0 + per), n = j1 - j0;
     for (int qi = 0; qi < nq; ++qi) qs[qi][tid] = q[((size_t) qi * H + h) * 128 + tid];
-    __syncthreads();
-    float* lg = lgs + ((size_t) h * S + sp) * kDraftQ * per;   // [nq][per]
-    float mx[kDraftQ];
-#pragma unroll
-    for (int qi = 0; qi < kDraftQ; ++qi) mx[qi] = -INFINITY;
-    for (int jj = warp; jj < n; jj += 4) {
-        const int j = j0 + jj;
-        float k0, k1, k2, k3;
-        if (j < nc) {
-            const KVT* kr = kc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128;
-            k0 = ld_f(kr + lane), k1 = ld_f(kr + lane + 32), k2 = ld_f(kr + lane + 64), k3 = ld_f(kr + lane + 96);
-        } else {
-            const float* kr = kb + (size_t) (j - nc) * KD + (size_t) g * 128;
-            k0 = kr[lane], k1 = kr[lane + 32], k2 = kr[lane + 64], k3 = kr[lane + 96];
-        }
-#pragma unroll
-        for (int qi = 0; qi < kDraftQ; ++qi) {
-            if (qi >= nq) break;
-            float a = qs[qi][lane] * k0 + qs[qi][lane + 32] * k1 + qs[qi][lane + 64] * k2 + qs[qi][lane + 96] * k3;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-            a *= scale;
-            if (lane == 0) lg[(size_t) qi * per + jj] = a;
-            mx[qi] = fmaxf(mx[qi], a);
-        }
-    }
-    __syncthreads();
-    for (int qi = 0; qi < nq; ++qi) {
-        const float m = bmax(mx[qi], sh);
-        float a = 0.0f;
-        for (int jj = tid; jj < n; jj += 128) {
-            const float e = m == -INFINITY ? 0.0f : expf(lg[(size_t) qi * per + jj] - m);
-            lg[(size_t) qi * per + jj] = e;
-            a += e;
-        }
-        const float l = bsum(a, sh);
-        if (tid == 0) mrow[qi] = m, part_ml[((size_t) sp * H + h) * kDraftQ + qi] = make_float2(m, l);
-    }
+    if (tid < kDraftQ) m_run[tid] = -INFINITY, l_run[tid] = 0.0f;
     __syncthreads();
     float o[kDraftQ];
 #pragma unroll
     for (int qi = 0; qi < kDraftQ; ++qi) o[qi] = 0.0f;
-    for (int jj = 0; jj < n; ++jj) {
-        const int j = j0 + jj;
-        const float v = j < nc ? ld_f(vc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128 + tid)
-                               : vb[(size_t) (j - nc) * KD + (size_t) g * 128 + tid];
+    for (int t0 = 0; t0 < n; t0 += kDraftTile) {
+        const int tn = min(kDraftTile, n - t0);
+        float mx[kDraftQ];
+#pragma unroll
+        for (int qi = 0; qi < kDraftQ; ++qi) mx[qi] = -INFINITY;
+        for (int jj = warp; jj < tn; jj += 4) {
+            const int j = j0 + t0 + jj;
+            float k0, k1, k2, k3, ks = scale;
+            if (j < nc) {
+                const KVT* kr = kc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128;
+                k0 = ld_f(kr + lane), k1 = ld_f(kr + lane + 32), k2 = ld_f(kr + lane + 64), k3 = ld_f(kr + lane + 96);
+                ks = scale * k_mul;
+            } else {
+                const float* kr = kb + (size_t) (j - nc) * KD + (size_t) g * 128;
+                k0 = kr[lane], k1 = kr[lane + 32], k2 = kr[lane + 64], k3 = kr[lane + 96];
+            }
+#pragma unroll
+            for (int qi = 0; qi < kDraftQ; ++qi) {
+                if (qi >= nq) break;
+                float a = qs[qi][lane] * k0 + qs[qi][lane + 32] * k1 + qs[qi][lane + 64] * k2 + qs[qi][lane + 96] * k3;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+                a *= ks;
+                if (lane == 0) lg[qi][jj] = a;
+                mx[qi] = fmaxf(mx[qi], a);
+            }
+        }
+        __syncthreads();
+        for (int qi = 0; qi < nq; ++qi) {
+            const float m_old = m_run[qi];
+            const float m = fmaxf(m_old, bmax(mx[qi], sh));
+            float a = 0.0f;
+            for (int jj = tid; jj < tn; jj += 128) {
+                const float e = m == -INFINITY ? 0.0f : expf(lg[qi][jj] - m);
+                lg[qi][jj] = e;
+                a += e;
+            }
+            const float l = bsum(a, sh);   // (bsum's barriers: every thread has read m_run[qi] above)
+            if (tid == 0) {
+                const float c = m_old == -INFINITY ? 0.0f : expf(m_old - m);
+                corr[qi] = c, l_run[qi] = l_run[qi] * c + l, m_run[qi] = m;
+            }
+        }
+        __syncthreads();
 #pragma unroll
         for (int qi = 0; qi < kDraftQ; ++qi)
-            if (qi < nq) o[qi] += lg[(size_t) qi * per + jj] * v;
+            if (qi < nq) o[qi] *= corr[qi];
+        for (int jj = 0; jj < tn; ++jj) {
+            const int j = j0 + t0 + jj;
+            const float v = j < nc ? ld_f(vc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128 + tid) * v_mul
+                                   : vb[(size_t) (j - nc) * KD + (size_t) g * 128 + tid];
+#pragma unroll
+            for (int qi = 0; qi < kDraftQ; ++qi)
+                if (qi < nq) o[qi] += lg[qi][jj] * v;
+        }
+        __syncthreads();   // (the next tile's logits overwrite lg)
     }
     for (int qi = 0; qi < nq; ++qi) part_o[(((size_t) sp * H + h) * kDraftQ + qi) * 128 + tid] = o[qi];
+    if (tid < nq) part_ml[((size_t) sp * H + h) * kDraftQ + tid] = make_float2(m_run[tid], l_run[tid]);
 }
 __global__ void draft_attn_merge_kernel(const float* part_o, const float2* part_ml, int S, int H, float* out) {
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
@@ -4603,6 +4621,13 @@ __global__ void silu_mul_bf16_kernel(const float* gu, int T, int F, uint16_t* ou
     const size_t t = i / F, f = i % F;
     const float g = gu[t * 2 * F + f], u = gu[t * 2 * F + F + f];
     out[i] = f2bf_rn(g / (1.0f + expf(-g)) * u);
+}
+__global__ void silu_mul_f16_kernel(const float* gu, int T, int F, uint16_t* out) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) T * F) return;
+    const size_t t = i / F, f = i % F;
+    const float g = gu[t * 2 * F + f], u = gu[t * 2 * F + F + f];
+    out[i] = f2h(g / (1.0f + expf(-g)) * u);
 }
 
 __global__ void rnn_inputs_kernel(const float* state, const uint16_t* emb, const int* prev, const float* hidden,
@@ -6339,19 +6364,18 @@ void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaS
 template <class KVT>
 static void draft_attn_impl(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi, const float* kb,
                             const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
-                            cudaStream_t s, int cap) {
-    // scratch: the logits [H][S][8][per], the chunks' outputs [S][H][8][128] and (max, sum)
+                            cudaStream_t s, int cap, float k_mul = 1.0f, float v_mul = 1.0f) {
+    // scratch: the chunks' outputs [S][H][8][128] and (max, sum) [S][H][8] - draft_attn_scratch() floats
     if (nq > kDraftQ) {
         std::fprintf(stderr, "ik2::k::draft_attn: %d queries (at most %d)\n", nq, kDraftQ);
         std::abort();
     }
     const int nk = k_hi - k_lo + nq;
     const int S = std::max(1, std::min(64, (nk + 255) / 256)), per = (nk + S - 1) / S;
-    float* lgs = scratch;
-    float* part_o = lgs + (size_t) H * S * kDraftQ * per;
+    float* part_o = scratch;
     float2* part_ml = (float2*) (part_o + (size_t) S * H * kDraftQ * 128);
     draft_attn_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
-        q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, per, lgs, part_o, part_ml, cap > 0 ? cap : (1 << 30));
+        q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, per, part_o, part_ml, cap > 0 ? cap : (1 << 30), k_mul, v_mul);
     check("draft_attn (chunks)");
     draft_attn_merge_kernel<<<dim3((unsigned) H, (unsigned) nq), 128, 0, s>>>(part_o, part_ml, S, H, out);
     check("draft_attn (merge)");
@@ -6365,9 +6389,28 @@ void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int 
                     int cap) {
     draft_attn_impl<uint16_t>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
 }
+void draft_attn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float k_inv, float v_inv, float* scratch,
+                    float* out, cudaStream_t s, int cap) {
+    draft_attn_impl<uint8_t>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap, k_inv, v_inv);
+}
+__global__ void to_e4m3_kernel(const float* x, size_t n, float scale, uint8_t* y) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = f32_to_e4m3fn(x[i] * scale);
+}
+void to_e4m3(const float* x, size_t n, float scale, uint8_t* y, cudaStream_t s) {
+    if (!n) return;
+    to_e4m3_kernel<<<grid(n), kBlk, 0, s>>>(x, n, scale, y);
+    check("to_e4m3");
+}
+size_t draft_attn_scratch(int H) { return (size_t) 64 * H * kDraftQ * (128 + 2); }
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s) {
     silu_mul_bf16_kernel<<<grid((size_t) T * F), kBlk, 0, s>>>(gu, T, F, out);
     check("silu_mul_bf16");
+}
+void silu_mul_f16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s) {
+    silu_mul_f16_kernel<<<grid((size_t) T * F), kBlk, 0, s>>>(gu, T, F, out);
+    check("silu_mul_f16");
 }
 void rnn_inputs(const float* state, const uint16_t* emb, const int* prev, const float* hidden, const float* f, int R,
                 int C, uint16_t* out, cudaStream_t s) {

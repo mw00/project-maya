@@ -4199,18 +4199,21 @@ bool g_lookup = false;   // the prompt lookup (src/spec/suffix_drafter): drafts 
 
 // VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
 // visit's four convs, for rollback_block) and buffers, whichever drafts; with the drafter (path) its weights (the
-// file's BF16), its fold through the head (FP16 [256][n_rows] and a bias), its layer without a window's context
-// (FP16 K and V, 8 heads of 128: 4 KiB a position) and its attention's scratch (24 heads: 768 B a position), the 4
-// windowed layers' rings (F32, 2048 positions) and the target's taps (4 rows of a chunk, F32).  (The head's FP16 copy
-// its fold is made from is gone again before the work buffers take the plan's reserve.)  tools/ik2_fit.py's
-// draft_gib has the same figures.
-size_t draft_room(const std::string& path, int ctx, int chunk, const Config& c, int n_rows) {
+// file's: BF16 in mtp.safetensors, the layers' matrices Q8_0 in a GGUF), its fold through the head (FP16 [256][n_rows]
+// and a bias), its layer without a window's context (FP16 K and V, 8 heads of 128: 4 KiB a position, IK2_DRAFT_CTX's
+// positions), its windowed layers' rings (F32, 2048 positions: Inkling-2-Mini's drafter 2, Small's 4), its
+// attention's partials (not a context's size: its logits stay in shared memory) and the target's taps (4 rows of a
+// chunk, F32).  (The fold reads a Q8_0 head a chunk at a time - no FP16 copy of it; an FP16 head is the model's
+// own.)  tools/ik2_fit.py's draft_gib has the same figures.
+size_t draft_room(const std::string& path, int ctx, int chunk, const Config& c, int n_rows, bool kv8 = false) {
     const size_t C = c.C, KD = (size_t) c.KV * c.D;
     size_t b = (size_t) c.n_visit * (2 * KD + 2 * C) * (3 + 8) * 4 + ((size_t) 16 << 20);
     if (path.empty()) return b;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     const size_t file = f ? (size_t) f.tellg() : ((size_t) 640 << 20);
-    b += file + (size_t) n_rows * 258 * 2 + (size_t) ctx * (4096 + 768) + (size_t) 4 * 2048 * 8 * 128 * 8 +
+    const size_t rings = c.C == 2304 ? 2 : 4, heads = c.C == 2304 ? 24 : 48;
+    b += file + (size_t) n_rows * 258 * 2 + (size_t) ik2::draft::context_rows(ctx) * (kv8 ? 2048 : 4096) +
+         rings * 2048 * 8 * 128 * 8 + k::draft_attn_scratch((int) heads) * 4 +
          (size_t) 4 * std::max(chunk, 8) * C * 4 + ((size_t) 32 << 20);
     return b;
 }
@@ -5964,8 +5967,15 @@ int main(int argc, char** argv) {
             if (model_drafter ? draft_path.empty() : !g_lookup) continue;
             const auto* head = S.info("output.weight");
             const int head_rows = head ? (int) (head->elements() / c.C) : 201024;
-            const size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows);
+            // (the drafter: its context rows in FP16, else in FP8 - IK2_DRAFT_KV takes one; the load below measures)
+            const char* kv_env = getenv("IK2_DRAFT_KV");
+            const bool only16 = kv_env && std::string(kv_env) == "f16", only8 = kv_env && std::string(kv_env) == "fp8";
+            size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8);
             std::string why;
+            if (model_drafter && !only8 && !only16 && !room_ok(need, why)) {
+                why.clear();
+                need = draft_room(draft_path, ctx, chunk, c, head_rows, true);
+            }
             if (room_ok(need, why)) {
                 std::printf("drafting: %s, %.2f GiB of VRAM beside the model (the plan as without it)\n",
                             model_drafter ? (g_lookup ? "the drafter and the prompt lookup" : "the drafter")
@@ -6504,37 +6514,18 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
     }
 
-    // the drafter (before the expert cache takes what VRAM is left)
+    // the drafter: loaded on GPU 0 below, after the work buffers and before the expert cache (draft_path: planned)
     ik2::draft::Drafter* drafter = nullptr;
     uint16_t* draft_head = M.out_w.f16;
     if (!draft_path.empty()) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
-        if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
-            const size_t n = (size_t) c.n_rows * c.C;
-            draft_head = dalloc<uint16_t>(n);
-            k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
-        }
-        if (!draft_head) die("--draft: the output head is neither FP16 nor planar Q8_0");
+        // (a Q8_0 head: the fold reads its blocks a chunk at a time and the base logits are products with them - no
+        //  FP16 copy of it, 0.9 GiB for Inkling 2's, which at a long context's start had no room beside the cache)
+        if (!draft_head && !M.out_w.q8) die("--draft: the output head is neither FP16 nor planar Q8_0");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
-        const double t0 = now();
-        try {
-            drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
-            ik2::draft::fold(drafter, draft_head, c.n_rows);
-        } catch (const std::exception& e) {
-            die(e.what());
-        }
-        if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
-            ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
-            CU(cudaStreamSynchronize(g_s));
-            CU(cudaFree(draft_head));
-            draft_head = nullptr;
-        }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
-        g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
-        std::printf("drafter: %s, %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
-                    ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
-    if (drafter || g_lookup) {   // (the verify window's records of every conv: rollback_block)
+    if (!draft_path.empty() || g_lookup) {   // (the verify window's records of every conv: rollback_block)
         for (auto& Vi : M.V) {
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
@@ -6708,6 +6699,64 @@ int main(int argc, char** argv) {
         int sms = 0;
         CU(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
         g_offs.blocks = std::max(8, 2 * sms);
+    }
+    // The drafter, now that the work buffers have their VRAM: it takes room only where the cache still holds every
+    // expert beside it (the resident path, the plan's - drafting never changes it) - its context rows in FP16, else
+    // in FP8 (2 KiB a position instead of 4: the drafts only, the target checks every token; IK2_DRAFT_KV=f16 / fp8
+    // takes one), else it is left out with a NOTE.  Measured here, not estimated: the plan reserves a fixed 1.5 GiB
+    // for the work buffers, and at 262,144 tokens they take more - a drafter loaded before them took the experts'
+    // last 135 MiB, and the model ran on the cache path at two thirds of its speed.
+    if (d == 0 && !draft_path.empty()) {
+        size_t cache_need = 0;   // (every expert in slots, as ExpertCache::init sizes them)
+        for (int l = 0; l < c.n_layer; ++l)
+            cache_need += (size_t) c.E * ((M.L[l].eb[0] + M.L[l].eb[1] + M.L[l].eb[2] + 255) / 256 * 256);
+        const size_t keep = cache_need + ((size_t) 256 << 20) + ((size_t) 32 << 20);   // (+ the cache's room, slack)
+        const char* kv_env = getenv("IK2_DRAFT_KV");
+        const std::string kv_want = kv_env && *kv_env ? kv_env : "auto";
+        if (kv_want != "auto" && kv_want != "f16" && kv_want != "fp8")
+            die("unknown IK2_DRAFT_KV=" + kv_want + " (expected f16 or fp8)");
+        const double t0 = now();
+        size_t short_b = 0;
+        for (int kv8 = kv_want == "fp8" ? 1 : 0; kv8 <= (kv_want == "f16" ? 0 : 1) && !drafter; ++kv8) {
+            ik2::draft::Drafter* dr = nullptr;
+            try {
+                dr = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, kv8 != 0);
+                if (draft_head) {
+                    ik2::draft::fold(dr, draft_head, c.n_rows);
+                } else {
+                    ik2::draft::fold_q8(dr, M.out_w.q8, M.out_w.q8d, c.n_rows);
+                    ik2::draft::set_head_q8(dr, M.out_w.q8, M.out_w.q8d);
+                }
+            } catch (const std::exception& e) {
+                die(e.what());
+            }
+            g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
+            CU(cudaStreamSynchronize(g_s));
+            size_t fr_now = 0, tot_now = 0;
+            CU(cudaMemGetInfo(&fr_now, &tot_now));
+            if (!g_fast_want || fr_now >= keep) {
+                drafter = dr;
+                break;
+            }
+            short_b = keep - fr_now;
+            ik2::draft::destroy(dr);
+            CU(cudaFree(g_taps));
+            g_taps = nullptr;
+        }
+        if (drafter) {
+            std::printf("drafter: %s, %s matrices, its context rows %s%s, %.2f GiB of VRAM, %.1f s\n",
+                        draft_path.c_str(), ik2::draft::matrices_q8(drafter) ? "Q8_0" : "BF16",
+                        ik2::draft::context_fp8(drafter) ? "FP8" : "FP16",
+                        ik2::draft::context_fp8(drafter) && kv_want == "auto" ? " (FP16's do not fit beside every expert)"
+                                                                               : "",
+                        ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
+        } else {
+            std::printf("NOTE maya-ik2: the drafter left out: beside it the cache would not hold every expert (%.2f "
+                        "GiB short%s) - a smaller --max-context leaves it room\n", short_b / 1073741824.0,
+                        kv_want == "f16" ? " with FP16 context rows" : "");
+            draft_path.clear();
+        }
+        std::fflush(stdout);
     }
     CU(cudaMemGetInfo(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
