@@ -79,8 +79,10 @@ inline bool repeatable(bool linked) {
 // every start and re-planned from decode timing - now timed once on this PC and kept (MAYA_GLM_CPU_CAL, the server's
 // data/glm-cpu-cal.txt) with no live re-plan; (2) tier moves went live as soon as their copy landed - now exactly
 // fixed_moves boundaries after they started; (3) a prompt's CPU / PCIe expert split learned from each layer's
-// times - now planned from the kept timing alone.  The draft length still adapts (its verify gives the token path's
-// bits).  Speed: unchanged within the run-to-run spread on three V100s (see the v1.1.75 notes).
+// times - now planned from the kept timing alone; also the pipelined window's boundary on fresh windows only, the
+// prompts' stable products (glm_prefill.cu) and the draft length fixed at its start length (glm_mtp.cu: the length
+// changes the bits, and one picked by measured round times parted starts).  Three V100s, Maya-S v2, --bench A/B vs
+// the timing-led choices: decode -6% with length 2 (its tokens = no drafting), none with length 3; prompts -2.5%.
 inline bool same_answers() {
     static const bool on = [] {
         const char* v = getenv("MAYA_GLM_SAME_ANSWERS");
