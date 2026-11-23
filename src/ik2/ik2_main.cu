@@ -5753,6 +5753,45 @@ void check_preview(int n_gpu, bool serve) {
     CU(cudaSetDevice(0));
 }
 
+// (A3-warmup + A3-warmup-2, shared by the CLI prompt and the serve path's pre-READY warm: cuBLAS's
+//  FP16-GEMM and FP32-PEDANTIC classes, the prompt attention's flash kernel pair and the relb GEMM's
+//  kernel at the bench's Tq load lazily on the first launch - the CLI's first prompt paid ~0.49 s
+//  (A3-warmup) and a further 41-145 ms on visit 0's attention span; the bench's ctx512 cell pays the
+//  big-Tq relb class inside its timed pf, its ctx1 cell warming only the small-Tq class and the flash
+//  pair. Run each once outside the timed prompt: garbage Q/KV/r in, tiny dedicated scratch/out, zero
+//  sink, outputs discarded - no state touched, accuracy-neutral by construction)
+static void prompt_attn_warm(Model& M) {
+    Work& W0 = dev_work(0);
+    uint16_t* w16w = dalloc<uint16_t>(32 * 32);
+    CU(cudaMemsetAsync(w16w, 0, 32 * 32 * 2, g_s));
+    gemm16(w16w, 32, 32, w16w, 1, W0.tmp, 32);
+    Layer& L0 = M.L[0];
+    const int ext0 = L0.sliding ? M.c.extent_swa : M.c.extent;
+    const float one_f = 1.0f, zero_f = 0.0f;
+    if (L0.rel_proj && W0.relb)
+        CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, ext0, 2 * M.c.H, M.c.d_rel, &one_f, L0.rel_proj,
+                        CUDA_R_32F, M.c.d_rel, W0.rr, CUDA_R_32F, M.c.d_rel, &zero_f, W0.relb, CUDA_R_32F,
+                        ext0, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+    if (g_flash && M.c.D == 128 && W0.relb && W0.rr && W0.x16 && ext0 <= W0.relb_ext && L0.rel_proj
+        && g_kv_q4 && L0.kc4.q && L0.vc4.q) {
+        CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, ext0, W0.relb_rows * M.c.H, M.c.d_rel, &one_f,
+                        L0.rel_proj, CUDA_R_32F, M.c.d_rel, W0.rr, CUDA_R_32F, M.c.d_rel, &zero_f, W0.relb,
+                        CUDA_R_32F, ext0, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+        const int HDw = M.c.H * M.c.D;
+        const size_t fa_n = (size_t) 2 * M.c.H * 130;   // (one split: o_part + ml_part)
+        float* fa_w = dalloc<float>(fa_n);
+        CU(cudaMemsetAsync(fa_w, 0, fa_n * sizeof(float), g_s));
+        float* sink_w = dalloc<float>((size_t) 2 * M.c.H);
+        CU(cudaMemsetAsync(sink_w, 0, (size_t) 2 * M.c.H * sizeof(float), g_s));
+        float* out_w = dalloc<float>((size_t) 2 * HDw);
+        CU(cudaMemsetAsync(out_w, 0, (size_t) 2 * HDw * sizeof(float), g_s));
+        k::attn_flash_q4(W0.x16, HDw, L0.kc4, L0.vc4, 0, M.c.H, M.c.KV, M.c.D, 2, 0,
+                         1.0f / std::sqrt((float) M.c.D), W0.relb, ext0,
+                         L0.sliding ? M.c.window : (1 << 30), sink_w, out_w, HDw, fa_w, fa_n, 1, g_s);
+    }
+    CU(cudaStreamSynchronize(g_s));
+}
+
 int main(int argc, char** argv) {
     std::string model, toks, dump, draft_path, drafting;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
@@ -7778,9 +7817,11 @@ int main(int argc, char** argv) {
                             g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes());
             }
             use_dev(0);
+            prompt_attn_warm(M);   // (before the first request: the bench's ctx512 cell pays the big-Tq JIT inside its timed pf otherwise)
             if (g_par > 1) std::printf("READY %d stop multi=%d\n", ctx_s, g_par);
             else std::printf("READY %d stop\n", ctx);
         } else {
+            prompt_attn_warm(M);   // (--serve-ik2: same, before @READY)
             std::printf("@READY ctx %d\n", ctx);
         }
         std::fflush(stdout);
@@ -8593,20 +8634,7 @@ int main(int argc, char** argv) {
     double t_exp = 0;
     // (A3-warmup: cuBLAS loads its FP16-GEMM and FP32-PEDANTIC kernel modules lazily on the first call -
     //  ~0.49 s measured on the first prompt's visit 0; run both classes once outside the timed prompt)
-    {
-        Work& W0 = dev_work(0);
-        uint16_t* w16w = dalloc<uint16_t>(32 * 32);
-        CU(cudaMemsetAsync(w16w, 0, 32 * 32 * 2, g_s));
-        gemm16(w16w, 32, 32, w16w, 1, W0.tmp, 32);
-        Layer& L0 = M.L[0];
-        const int ext0 = L0.sliding ? M.c.extent_swa : M.c.extent;
-        const float one_f = 1.0f, zero_f = 0.0f;
-        if (L0.rel_proj && W0.relb)
-            CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, ext0, 2 * M.c.H, M.c.d_rel, &one_f, L0.rel_proj,
-                            CUDA_R_32F, M.c.d_rel, W0.rr, CUDA_R_32F, M.c.d_rel, &zero_f, W0.relb, CUDA_R_32F,
-                            ext0, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
-        CU(cudaStreamSynchronize(g_s));
-    }
+    prompt_attn_warm(M);
     const double tp = now();
     g_evx_n = 0, g_t0_ok = false;   // (the event timeline measures this prompt alone)
     const bool all = !dump.empty();
