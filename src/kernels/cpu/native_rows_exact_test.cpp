@@ -223,6 +223,31 @@ void check_iq1m_row_bounds(std::mt19937& rng) {
     }
 }
 
+// Exercise a nonzero range with both the packed fast path and padded source rows.
+void check_optional_1t_row_bounds(int type, std::mt19937& rng) {
+    constexpr int n = 2048, rows = 7, r0 = 2, r1 = 5;
+    constexpr float guard = -12345.25f;
+    const size_t rb = ggml_row_size((ggml_type) type, n);
+    const auto packed = rand_rows(type, n, rows, rng);
+    const auto acts = rand_acts(n, 1, rng);
+    const void* act[1] = {acts.data()};
+    const auto dot = ggml_get_type_traits_cpu((ggml_type) type)->vec_dot;
+    for (size_t stride : {rb, rb + 16}) {
+        std::vector<uint8_t> weights(stride * rows, 0xa5);
+        for (int r = 0; r < rows; ++r) std::memcpy(weights.data() + stride * r, packed.data() + rb * r, rb);
+        std::vector<float> got(rows, guard), expected(got);
+        float* out[1] = {got.data()};
+        for (int r = r0; r < r1; ++r)
+            dot(n, &expected[r], 0, weights.data() + stride * r, 0, act[0], 0, 1);
+        cpu::iq512_one_rows(type, weights.data(), stride, n, act, 1, out, r0, r1);
+        if (std::memcmp(got.data(), expected.data(), got.size() * sizeof(float)) != 0) {
+            std::printf("  optional AVX-512 one-token %s row bounds differ (stride %zu)\n",
+                        ggml_type_name((ggml_type) type), stride);
+            ++failures;
+        }
+    }
+}
+
 // GLM's split rows: nt tokens at once vs each token alone (the token path), bit for bit, swiglu clamp 10
 void check_split(int type, std::mt19937& rng) {
     cpu::NativeFmt f;
@@ -271,6 +296,16 @@ int main() {
                          GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_M};
     const bool avx512 = cpu::cpu_avx512bw_ok(), avx2 = cpu::cpu_avx2_ok();
     std::printf("native_rows_exact_test: AVX-512BW %s, AVX2 %s\n", avx512 ? "yes" : "no", avx2 ? "yes" : "no");
+    const char* opt_in_value = std::getenv("MAYA_GLM_CPU512_1T");
+    const bool opt_in = opt_in_value != nullptr && std::atoi(opt_in_value) != 0;
+    for (int t : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        const bool selected = cpu::iq512_one_supported(t);
+        if (!opt_in && selected) {
+            std::printf("  optional AVX-512 one-token %s selected while disabled\n", ggml_type_name((ggml_type) t));
+            ++failures;
+        }
+        if (opt_in && selected) check_optional_1t_row_bounds(t, rng);
+    }
     for (int t : types) {
         if (avx512 && cpu::iq512_supported(t)) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
         if (avx2) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);

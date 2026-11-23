@@ -1743,6 +1743,8 @@ if(MAYA_NATIVE_EXPERTS)
       add_executable(native_rows_exact_test src/kernels/cpu/native_rows_exact_test.cpp)
       target_link_libraries(native_rows_exact_test PRIVATE maya_kernels_cpu)
       add_test(NAME native_rows_exact_test COMMAND native_rows_exact_test)
+      add_test(NAME native_rows_exact_test_cpu512_1t COMMAND native_rows_exact_test)
+      set_tests_properties(native_rows_exact_test_cpu512_1t PROPERTIES ENVIRONMENT "MAYA_GLM_CPU512_1T=1")
       # DeepSeek's CPU-lane IQ1_S rows (src/ds4/ds4_iq_cpu.cpp) bit for bit against ggml-cpu's dot: the form without pdep
       # (AMD Zen / Zen+ / Zen 2's default) forced on any CPU, and the measured choice
       add_executable(ds4_iq1_rows_test tests/ds4_iq1_rows_test.cpp src/ds4/ds4_iq_cpu.cpp)
