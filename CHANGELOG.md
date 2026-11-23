@@ -4,6 +4,21 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.75 - 2026-11-23
+
+GLM-5.3-Flash now gives the same answers on every start and decodes faster on three GPUs; Inkling 2 Mini drafts at its full context on a 24 GB card and runs on Radeon cards from 12 GB; Hy4-Flash's first start answers like every later one; and a standard benchmark compares two builds in minutes.
+
+- **GLM-5.3-Flash: the same answers on every start.** Choices that followed how fast something happened to run (the CPU side's share, expert moves, the prompt split, the draft length) are now measured once on your PC and kept, so a start answers exactly like the one before. Prompt reading is about 2% slower for it. `MAYA_GLM_SAME_ANSWERS=0` brings back the old behaviour.
+- **GLM-5.3-Flash: faster decoding on three or more V100s**, with the decode steps recorded once and replayed and the drafting window pipelined across the GPUs.
+- **Inkling 2 Mini drafting (#1154).** The drafter now also loads as a GGUF, fits beside the full 262,144-token context on a 24 GB card, and each drafting step is about 30% shorter, with the same tokens as without drafting. The author measured new code going from 140 to about 200 tok/s on an RTX 3090.
+- **Inkling 2 Mini on Radeon cards from 12 GB (Linux).** The experts that don't fit stay in RAM, as on NVIDIA. We tested it with a Gorgon Halo set as a 12 / 16 GB card; reports from Radeon owners are very welcome.
+- **Hy4-Flash: the first start answers like the rest.** Maya now ships each size's expert-use file, so a fresh install places its experts the same way from the very first start.
+- **Hy4-Flash on the Monitor (#1127):** the Saved line, VRAM hit, what fills the GPUs and where the experts live, from the start.
+- **A standard benchmark.** `./maya.sh --bench` checks the PC is quiet, warms up, and reports medians with one result line; `./maya.sh --bench --compare <folder or git ref>` compares two builds on the same PC, answers first, in a few minutes.
+- **Inkling 2 Mini's picture file** now downloads from Maya's own repo (an existing copy is reused).
+- **Maya's own names inside:** the engine's internal folders and build options are now Maya's (`include/maya`, `MAYA_*`); the old `STRATA_*` options and settings still work for now.
+- **Credits.** Inkling 2 Mini's drafting (#1154) and the Hy4-Flash Monitor (#1127) were contributed by @needmorevram. The rest of this release is by @mw00 (peasantsmith).
+
 ## v1.1.74 - 2026-11-22
 
 Inkling 2 Mini now runs on Windows, on two GPUs and with up to its full 1M-token context, and answers several chats at once. Hy4-Flash is faster on tensor parallel, and there are fixes for the VRAM reserve and GPU-to-GPU copies.
