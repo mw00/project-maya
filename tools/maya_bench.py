@@ -224,20 +224,46 @@ def quiet_reasons(busy_gpus, locks, load, hot) -> list:
     return out
 
 
-def gpus_busy_nvidia(apps_csv: str, util_csv: str, ours) -> list:
-    """nvidia-smi's compute apps (gpu index,pid,name,MiB) and readings (index,utilization %) -> [(index, why)] of
-    our GPUs (ours: index list, or None for all) another program uses."""
-    out = []
+# (Windows draws the desktop on the same card: nvidia-smi's "compute apps" then list every program that draws a
+#  window - dwm.exe, explorer.exe, the browser - with no memory figure.  They are not another job on the GPU.)
+DESKTOP_APPS = {"dwm.exe", "explorer.exe", "msedge.exe", "msedgewebview2.exe", "chrome.exe", "firefox.exe",
+                "brave.exe", "opera.exe", "vivaldi.exe"}
+DESKTOP_MIB = 2048        # (Windows: more memory than this in use on a GPU is another job's, not a desktop's)
+
+
+def desktop_app(name: str) -> bool:
+    """A Windows program that only draws on the GPU: the desktop's own (anything in the Windows folder) or a
+    browser."""
+    parts = [x for x in re.split(r"[\\/]", name.lower()) if x]
+    return bool(parts) and (parts[-1] in DESKTOP_APPS or "windows" in parts[:-1])
+
+
+def gpus_busy_nvidia(apps_csv: str, util_csv: str, ours, windows: bool = False) -> list:
+    """nvidia-smi's compute apps (gpu index,pid,name[,MiB]) and readings (index,utilization %[,MiB in use]) ->
+    [(index, why)] of our GPUs (ours: index list, or None for all) another program uses.  Linux: any compute app
+    counts.  Windows: that list holds every program that draws a window, so only one with a memory figure that is not
+    the desktop's counts - and the GPU's own readings decide: 20% busy, or more than DESKTOP_MIB in use."""
+    out, drawing = [], {}
     for row in apps_csv.splitlines():
         f = [x.strip() for x in row.split(",")]
         if len(f) >= 3 and f[0].isdigit() and (ours is None or int(f[0]) in ours):
-            out.append((int(f[0]), f"pid {f[1]} {Path(f[2]).name}"))
+            name = re.split(r"[\\/]", f[2])[-1]
+            if windows and (desktop_app(f[2]) or not (len(f) > 3 and re.match(r"\d", f[3]))):
+                if not desktop_app(f[2]):
+                    drawing.setdefault(int(f[0]), []).append(name)
+                continue
+            out.append((int(f[0]), f"pid {f[1]} {name}"))
     seen = {g for g, _ in out}
     for row in util_csv.splitlines():
         f = [x.strip() for x in row.split(",")]
-        if len(f) >= 2 and f[0].isdigit() and f[1].isdigit() and int(f[1]) >= 20 and int(f[0]) not in seen and \
-                (ours is None or int(f[0]) in ours):
-            out.append((int(f[0]), f"{f[1]}% busy"))
+        if not (len(f) >= 2 and f[0].isdigit() and int(f[0]) not in seen and (ours is None or int(f[0]) in ours)):
+            continue
+        g = int(f[0])
+        who = ": " + ", ".join(sorted(set(drawing.get(g, [])))[:4]) if drawing.get(g) else ""
+        if f[1].isdigit() and int(f[1]) >= 20:
+            out.append((g, f"{f[1]}% busy{who}"))
+        elif windows and len(f) > 2 and f[2].isdigit() and int(f[2]) > DESKTOP_MIB:
+            out.append((g, f"{f[2]} MiB in use by other programs{who}"))
     return out
 
 
@@ -297,6 +323,10 @@ def cpu_load_now():
         return None                          # (Windows: no load figure - the GPU check stands)
 
 
+def on_windows() -> bool:
+    return os.name == "nt"
+
+
 def machine_quiet(backend: str, gpus, lock_note="") -> list:
     if backend == "hip":
         busy = []
@@ -313,19 +343,19 @@ def machine_quiet(backend: str, gpus, lock_note="") -> list:
     else:
         # (compute apps name their GPU by bus id: mapped to nvidia-smi's index first)
         idx, util = {}, []
-        for row in _out(["nvidia-smi", "--query-gpu=index,pci.bus_id,utilization.gpu",
+        for row in _out(["nvidia-smi", "--query-gpu=index,pci.bus_id,utilization.gpu,memory.used",
                          "--format=csv,noheader,nounits"]).splitlines():
             f = [x.strip() for x in row.split(",")]
             if len(f) >= 3:
                 idx[f[1].lower()] = f[0]
-                util.append(f"{f[0]},{f[2]}")
+                util.append(",".join([f[0], f[2]] + f[3:4]))
         apps = []
-        for row in _out(["nvidia-smi", "--query-compute-apps=gpu_bus_id,pid,process_name",
+        for row in _out(["nvidia-smi", "--query-compute-apps=gpu_bus_id,pid,process_name,used_memory",
                          "--format=csv,noheader"]).splitlines():
             f = [x.strip() for x in row.split(",")]
             if len(f) >= 3 and f[0].lower() in idx:
-                apps.append(",".join([idx[f[0].lower()], f[1], f[2]]))
-        busy = gpus_busy_nvidia("\n".join(apps), "\n".join(util), gpus)
+                apps.append(",".join([idx[f[0].lower()]] + f[1:4]))
+        busy = gpus_busy_nvidia("\n".join(apps), "\n".join(util), gpus, windows=on_windows())
     load = cpu_load_now()
     hot = [p for p in list(HOT_FLAGS) + ([os.environ["MAYA_HOT_FLAG"]] if os.environ.get("MAYA_HOT_FLAG") else [])
            if Path(p).expanduser().exists()]

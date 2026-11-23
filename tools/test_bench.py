@@ -183,6 +183,48 @@ class BenchStandard(unittest.TestCase):
         self.assertEqual(MB.lock_names("cuda", [0, 2]), ["gpu0", "gpu2"])
         self.assertEqual(MB.lock_names("hip", [0]), ["radeon"])
 
+    def test_busy_gpus_windows_desktop(self):
+        # (a card that also draws the desktop: nvidia-smi lists the desktop's programs as compute apps, no memory)
+        apps = "\n".join([r"0,1780,C:\Windows\System32\dwm.exe,[N/A]", r"0,8028,C:\Windows\explorer.exe,[N/A]",
+                          r"0,7424,C:\Program Files\Google\Chrome\Application\chrome.exe,[N/A]",
+                          r"0,10680,C:\Program Files\WindowsApps\Notes_1.0\app\notes.exe,[N/A]"])
+        self.assertEqual(MB.gpus_busy_nvidia(apps, "0,3,353", [0], windows=True), [])
+        self.assertEqual(MB.gpus_busy_nvidia(apps, "0,3,353", None, windows=True), [])
+        # (the GPU's own readings decide: busy, or more memory in use than a desktop's)
+        self.assertEqual(MB.gpus_busy_nvidia(apps, "0,45,353", [0], windows=True), [(0, "45% busy: notes.exe")])
+        self.assertEqual(MB.gpus_busy_nvidia(apps, "0,2,6100", [0], windows=True),
+                         [(0, "6100 MiB in use by other programs: notes.exe")])
+        self.assertEqual(MB.gpus_busy_nvidia("", "0,0,2048\n1,0,2049", None, windows=True),
+                         [(1, "2049 MiB in use by other programs")])
+        # (a program with a memory figure that is not the desktop's is another job; the desktop's never is)
+        other = "\n".join([apps, r"0,4242,C:\maya\build\maya-ik2.exe,5120 MiB", r"0,1,C:\Windows\System32\dwm.exe,90 MiB"])
+        self.assertEqual(MB.gpus_busy_nvidia(other, "0,0,5500", [0], windows=True), [(0, "pid 4242 maya-ik2.exe")])
+        self.assertEqual(MB.gpus_busy_nvidia(other, "0,0,5500", [1], windows=True), [])
+        self.assertTrue(MB.desktop_app("C:/Windows/SystemApps/X_cw5n1h2txyewy/SearchHost.exe"))
+        self.assertFalse(MB.desktop_app(r"C:\Users\me\python.exe"))
+
+    def test_machine_quiet_reads_the_desktop_card(self):
+        # (the whole check, nvidia-smi's two answers as a Windows desktop gives them: quiet there, in use on Linux)
+        def smi(cmd, timeout=15):
+            if any("--query-gpu" in x for x in cmd):
+                return "0, 00000000:01:00.0, 0, 353\n"
+            return ("00000000:01:00.0, 1780, C:\\Windows\\System32\\dwm.exe, [N/A]\n"
+                    "00000000:01:00.0, 10680, C:\\Program Files\\WindowsApps\\Notes_1.0\\app\\notes.exe, [N/A]\n")
+        with patch.object(MB, "_out", side_effect=smi), patch.object(MB, "cpu_load_now", return_value=None), \
+                patch.object(MB, "held_locks", return_value=[]), patch.object(MB, "HOT_FLAGS", ()), \
+                patch.dict(MB.os.environ, {"MAYA_HOT_FLAG": ""}):
+            with patch.object(MB, "on_windows", return_value=True):
+                self.assertEqual(MB.machine_quiet("cuda", [0]), [])
+            with patch.object(MB, "on_windows", return_value=False):
+                self.assertEqual(MB.machine_quiet("cuda", [0]), ["GPU 0 is in use (pid 1780 dwm.exe)",
+                                                                 "GPU 0 is in use (pid 10680 notes.exe)"])
+
+    def test_busy_gpus_linux_stays_strict(self):
+        # (Linux: any compute app on our GPU counts, whatever its name or memory; memory in use alone does not)
+        apps = "0,1780,/usr/bin/dwm.exe,[N/A]\n1,7,/usr/lib/firefox/firefox,12 MiB"
+        self.assertEqual(MB.gpus_busy_nvidia(apps, "0,0,300\n1,0,300\n2,0,9000", None),
+                         [(0, "pid 1780 dwm.exe"), (1, "pid 7 firefox")])
+
     def test_drafting_choice(self):
         a = [MB.parse_done("DONE 256 9 1 2 length 150 200 0".split())]
         self.assertEqual(MB.drafting_choice([], {}, ["INFO drafting: the MTP block - the fastest on this PC (x)"], a),
