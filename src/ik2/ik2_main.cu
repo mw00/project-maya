@@ -4318,20 +4318,16 @@ struct SpecCtl {
             const double v = expect(b) / c[b];
             if (v > vb) vb = v, best = b;
         }
-        if (best == 1 && plain_run >= look_every(bmax)) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
+        if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
         return best;
     }
-    // the plain tokens before a look: `probe`, and where a look's window is measured to cost more than the tokens it
-    // gives would in plain, as many as keep the looks to a fiftieth of the time (the gate, below)
-    int look_every(int bmax) const {
-        if (!gate || !adapt) return probe;
-        const int pw = std::min(probe_w, bmax);
-        const double over = c[pw] - expect(pw) * c_plain;
-        return (int) std::clamp(over / (0.02 * c_plain), (double) probe, 4096.0);
-    }
     void took_plain(double t) {
-        if (fresh_plain > 0) c_plain = fresh_plain == kFreshPlain ? t : std::min(c_plain, t), --fresh_plain;
-        else c_plain = 0.9 * c_plain + 0.1 * t;
+        if (fresh_plain > 0) {   // (a depth's first plain tokens: the gate's alone - the widths' estimate as before)
+            p_now = fresh_plain == kFreshPlain ? t : std::min(p_now, t), --fresh_plain;
+        } else {
+            c_plain = 0.9 * c_plain + 0.1 * t;
+            p_now = p_now > 0 ? 0.7 * p_now + 0.3 * t : t;
+        }
         ++plain, ++plain_run;
     }
     // Drafting by its measured speed where the answer is (IK2_DRAFT_GATE=0: without): deep in a long context a
@@ -4340,38 +4336,44 @@ struct SpecCtl {
     // against its plain tokens at this depth - begin(): an answer far from the depth the times were measured at
     // takes them anew (the plain token's first) - and where the rounds give fewer tokens a second the answer goes on
     // in plain tokens (lost), with a look again only as often as the looks cost a fiftieth of its time (kPause plain
-    // tokens at least where a window took longer than as many plain tokens as it is wide), half as often after each look that loses; a look that wins drafts again.  An answer at a new depth times the narrowest
-    // window first (calib: a window of 2, the cheapest look - the other widths follow its ratio).  The decision
-    // only: the tokens are the same.
-    static constexpr int kFreshPlain = 2, kPause = 128;
+    // tokens at least where a window took longer than as many plain tokens as it is wide), half as often after each look that loses; a look that wins drafts again.  An answer at a new depth past kDeep tokens
+    // times the narrowest window first (calib: a window of 2, the cheapest look - the other widths follow its ratio).  The decision
+    // only: the tokens are the same.  (p_now: the plain token's time as measured here - c_plain above stays the
+    // estimate the widths are chosen with, as before.)
+    static constexpr int kFreshPlain = 2, kPause = 128, kDeep = 65536;
     bool gate = !(getenv("IK2_DRAFT_GATE") && !atoi(getenv("IK2_DRAFT_GATE")));
-    int depth0 = -1, fresh_plain = 0, look = 0;
+    int depth0 = -1, fresh_plain = 0, look = 0, n_wide = 0;
     bool lost = false, calib = false;
     double mt = 0, mT = 0, mn = 0;   // (this answer's rounds: tokens, seconds, rounds - decayed)
+    double p_now = 0;
     uint64_t pauses = 0;
     void begin(int P) {
-        lost = false, mt = mT = mn = 0, look = probe;
+        lost = false, mt = mT = mn = 0, look = probe, n_wide = 0;
         if (!gate || !adapt) return;
         if (depth0 >= 0 && P <= depth0 + depth0 / 4 + 4096 && P >= depth0 - depth0 / 5 - 4096) return;
-        depth0 = P, fresh_plain = kFreshPlain, calib = true;
+        depth0 = P, fresh_plain = kFreshPlain, calib = P >= kDeep;
         for (int b = 2; b <= kBlockMax; ++b)
             if (seen[b] >= 2) seen[b] = 1;   // (the next window of the width: its time as it is here)
     }
     bool held() const { return gate && adapt && (fresh_plain > 0 || (lost && plain_run < look)); }
     void measured(int B, int acc, double t) {
-        if (!gate || !adapt || seen[B] < 2 || t <= 0) return;   // (a width's first step is not its time)
+        if (!gate || !adapt || t <= 0 || p_now <= 0) return;
+        if (!lost) n_wide = t >= B * p_now ? n_wide + 1 : 0;
+        if (seen[B] < 2) return;   // (a width's first step is not its time)
         calib = false;
         if (lost) {
-            if ((acc + 1) / t > 1.0 / c_plain) lost = false, mt = acc + 1, mT = t, mn = 1, look = probe;
+            if ((acc + 1) / t > 1.0 / p_now) lost = false, mt = acc + 1, mT = t, mn = 1, look = probe;
             else look = std::min(look * 2, 4096);
             return;
         }
         mt = 0.9 * mt + acc + 1, mT = 0.9 * mT + t, mn = 0.9 * mn + 1;
-        const bool wide = c[B] >= B * c_plain;   // (a window of B longer than B plain tokens: no acceptance wins)
-        if (wide || (mn >= 2.7 && mt / mT < 1.0 / c_plain)) {
-            const double over = std::max(mT / mn, c[B]) - mt / mn * c_plain;   // (a look's seconds over its tokens' in plain)
+        // (a window of B longer than B plain tokens: no acceptance wins - twice in a row, so that one slow window,
+        //  e.g. one that fetched its experts, does not pause an answer)
+        const bool wide = n_wide >= 2 && c[B] >= B * p_now;
+        if (wide || (mn >= 6.0 && mt / mT < 0.9 / p_now)) {
+            const double over = std::max(mT / mn, c[B]) - mt / mn * p_now;   // (a look's seconds over its tokens' in plain)
             lost = true, ++pauses;
-            look = (int) std::clamp(over / (0.02 * c_plain), (double) (wide ? std::max(probe, kPause) : probe), 4096.0);
+            look = (int) std::clamp(over / (0.02 * p_now), (double) (wide ? std::max(probe, kPause) : probe), 4096.0);
         }
     }
     void took_spec(int B, int acc, double t) {
@@ -4410,7 +4412,7 @@ struct SpecCtl {
             const int bm = choose(room);
             if (bm >= 2) {
                 const double v = expect(bm) / c[bm];
-                if (src == 0 || v > vb || plain_run >= look_every(bmax)) vb = v, B = bm, src = 1;
+                if (src == 0 || v > vb || plain_run >= probe) vb = v, B = bm, src = 1;
             }
         }
         return src;
