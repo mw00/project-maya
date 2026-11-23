@@ -420,3 +420,18 @@
   .dialog-scrim--top { padding-top: 12px; }
   .toasts { left: 50%; right: auto; transform: translateX(-50%); bottom: auto; top: max(12px, env(safe-area-inset-top)); }
 }
+
+/* ---------------------------------------------------------------- the sign-in (account.js: a server with users) */
+.login { height: 100%; display: grid; place-items: center; padding: 24px 16px; overflow-y: auto; background: var(--st-bg); }
+.login__card { width: min(380px, 100%); display: flex; flex-direction: column; gap: 14px; padding: 28px 24px 22px;
+               border-radius: var(--st-r-xl); background: var(--st-surface); box-shadow: var(--st-shadow-pop); }
+.login__brand { display: flex; flex-direction: column; align-items: center; gap: 6px; margin-bottom: 6px; text-align: center; }
+.login__brand h1 { margin: 8px 0 0; font-size: var(--st-fs-xl); font-weight: 600; letter-spacing: -.01em; }
+.login__brand p, .login__note { margin: 0; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.login__card .input { height: 42px; background: var(--st-surface-2); }
+.login__go { height: 42px; margin-top: 4px; }
+.login__note { text-align: center; }
+/* the sidebar: who is signed in (the way to Your account) */
+.side__me { margin-bottom: 4px; }
+.side__me .st-icon { color: var(--st-ink-muted); }
+.side__me .badge { flex: none; font-style: normal; }

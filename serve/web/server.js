@@ -1,7 +1,7 @@
 // serve/web/server.js - what the page asks the server: its health (the model, its defaults), the live metrics every
 // second, the MCP servers, the context size and port (each a restart), the update, the shared settings and the report.
 import {api, ctxfmt, esc, fmt, headers} from "./lib.js";
-import {DEFAULTS, P, PENALTIES, S, THINKING, confirmDialog, emit, loadPrefs, modelId, newModelCheck, setFamily, toast} from "./state.js";
+import {DEFAULTS, P, PENALTIES, S, THINKING, confirmDialog, emit, isAdmin, loadPrefs, modelId, newModelCheck, setFamily, toast} from "./state.js";
 
 // ------------------------------------------------------------------ health: the model and its recommended settings
 let onHealth = () => {};
@@ -40,13 +40,19 @@ export async function loadHealth() {
 
 // ------------------------------------------------------------------ the live metrics (the Monitor, the status, the meter)
 let fails = 0, keyWarned = false, mcpTick = 0;
+let onSignedOut = () => {};              // (account.js asks the server again who this page is: app.js sets it)
+export const whenSignedOut = (f) => { onSignedOut = f; };
 export const reqAll = {on: false};       // the request table: the last 12, or every one the server keeps
 export async function poll() {
+  if (S.me.users && !S.me.user) { setTimeout(poll, 5000); return; }   // (the sign-in is shown: nothing to ask yet)
   try {
     const r = await fetch(reqAll.on ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
       S.conn = "key";
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it in Settings › Connect your tools.", 6000); }
+      // a server that keeps users: who we are may have changed (signed out, disabled, its first user just made) -
+      // account.js asks again, and the sign-in shows; else it is the config's key that is missing
+      if (S.me.available) onSignedOut();
+      if (!S.me.users && !keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it in Settings › Connect your tools.", 6000); }
     } else if (r.ok) {
       S.metrics = await r.json();
       S.conn = "ok";
@@ -121,6 +127,7 @@ export function tierShares(n, eng = {}) {
 // true, which only this page sends); Settings lists the servers and what they offer.
 let mcpRetry = null;
 export async function loadMcp() {
+  if (!isAdmin()) return;
   try {
     const r = await fetch("mcp", {headers: headers()});
     if (!r.ok) return;
@@ -130,7 +137,8 @@ export async function loadMcp() {
   clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
   if ((S.mcp.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
 }
-export const mcpOn = () => P.mcp !== false && S.mcp.tools > 0;
+// (a server with users: the tools run on its PC with its rights, so the server offers them to an admin's chat alone)
+export const mcpOn = () => P.mcp !== false && S.mcp.tools > 0 && isAdmin();
 
 // ------------------------------------------------------------------ the context size (a reload of the model)
 export const GLM_KV_BYTES = 12288;   // GLM's attention cache per token (KV streaming keeps all of it in RAM)
@@ -336,7 +344,7 @@ export async function saveShared(on) {
 let sharedTimer = null;
 // the chat settings changed: the server's copy follows (when they are shared)
 export function syncShared() {
-  if (!S.shared.on) return;
+  if (!S.shared.on || !isAdmin()) return;   // (every client's defaults: an admin's; a standard user's stay their own)
   clearTimeout(sharedTimer);
   sharedTimer = setTimeout(() => saveShared(true).catch((e) => toast("error", "Not saved for other apps", e.message, 6000)), 600);
 }

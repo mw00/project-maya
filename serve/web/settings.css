@@ -165,3 +165,22 @@
 .price__in .input--num { width: 100%; min-width: 0; }
 .price__foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
 .price__foot > span { flex: 1 1 200px; line-height: 1.4; }
+
+/* Account (account.js): Your account, API keys, Users - rows with a name, a line under it and what to do with it */
+.acct-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 60px; padding: 12px 0; }
+.acct-row.is-off .acct-row__text { opacity: .6; }
+.acct-row__text { display: flex; flex-direction: column; gap: 3px; min-width: 0; line-height: 1.4; }
+.acct-row__text b { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: var(--st-fs-md); font-weight: 500; overflow-wrap: anywhere; }
+.acct-row__text > span { font-size: var(--st-fs-sm); color: var(--st-ink-muted); overflow-wrap: anywhere; }
+.acct-row__text code { font-family: var(--st-font-mono); font-size: var(--st-fs-xs); color: var(--st-ink-soft); }
+.acct-row > .btn, .acct-row > .icon-btn { flex: none; }
+.acct__new { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.acct__new > .input { flex: 1 1 220px; width: auto; }
+.set-pair.acct__pair { padding: 0; }
+.acct__pw { max-width: 320px; }
+.set-head > .seg { flex: none; }
+.keymade { flex-direction: column; align-items: stretch; gap: 10px; padding: 14px 16px; border-radius: var(--st-r-lg); }
+.keymade > span { flex: none; }
+.keymade__key { padding: 10px 12px; border-radius: var(--st-r-sm); background: var(--st-surface); color: var(--st-ink);
+                font-family: var(--st-font-mono); font-size: var(--st-fs-sm); overflow-wrap: anywhere; user-select: all; }
+.keymade__acts { display: flex; gap: 8px; }

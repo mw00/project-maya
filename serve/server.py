@@ -39,6 +39,7 @@ import os
 import queue
 import socket
 import re
+import sqlite3
 import subprocess
 import struct
 import sys
@@ -58,6 +59,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
+from serve import users  # noqa: E402  the server's users: accounts, their API keys, who may call what
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
@@ -2877,6 +2879,7 @@ class Service:
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.users = None                              # serve/users.py's UserStore: accounts with keys of their own
         self.response_limits = limits_from_env()
         self.responses = ResponseStore.from_limits(self.response_limits)
         self.response_jobs = BackgroundJobs(self.responses, self.response_limits)
@@ -3807,14 +3810,15 @@ class Service:
             reading = self.status.get("busy") and self.latest_request not in self.current_requests
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
-    def metrics(self, all_requests=False) -> dict:
+    def metrics(self, all_requests=False, user=None) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
-        the hardware (with a minute of history per series)."""
+        the hardware (with a minute of history per series).  `user`: a standard user's name - the request table then
+        lists their own requests only."""
         rate = self._tok_s()                            # (first: a live rate above the peak is the peak in `totals`)
         with self.status_lock:
             s = dict(self.status)
             answering = self.latest_request in self.current_requests
-            hist = list(self.history)
+            hist = [r for r in self.history if user is None or r.get("user") == user]
             totals = dict(self.totals)
             guard = dict(self.loop_guard_counts, on=bool(self.loop_guard))   # (what the loop guard did since start)
             active = self.active
@@ -5275,6 +5279,7 @@ class Service:
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                         "api": (sampling or {}).get("_api"),
+                        "user": (sampling or {}).get("_user"),   # (serve/users.py: whose request, when it has users)
                         "prefill_tok_s": round((len(ids) - (last.get("reused") or 0)) / (last["prompt_ms"] / 1000), 1)
                         if last.get("prompt_ms") and len(ids) > (last.get("reused") or 0) else None,
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
@@ -5322,6 +5327,8 @@ class Service:
                 self.status["busy"] = self.active > 0
             if book is not None and self.savings is not None:
                 self.savings.add(*book)
+            if book is not None and self.users is not None and (sampling or {}).get("_uid") is not None:
+                self.users.note_usage(sampling["_uid"], book[0], book[2])   # (the Users page: each user's count)
         was = parser.state
         for ev in with_lp(parser.finish(), was):
             yield "event", ev
@@ -6105,7 +6112,7 @@ def make_handler(svc: Service):
                 self._json(404, {"error": "model management is off (remove \"model_management\": false, or "
                                           "MAYA_MODEL_MANAGEMENT=1, turns it on)"})
                 return False
-            if manage and not svc.api_key:
+            if manage and not svc.api_key and not (svc.users is not None and svc.users.active()):
                 ip = self.client_address[0] if self.client_address else ""
                 if ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
                     self._json(403, {"error": "set an API key to download, delete or switch models over the network"})
@@ -6294,6 +6301,7 @@ def make_handler(svc: Service):
             svc.keep_alive_s = ka                               # (the model stays loaded that long after this request)
             oreq = svc.with_shared(oreq, "openai")
             oreq["_api"] = "openai"
+            self._tag(oreq)
             svc.check_request(oreq)
             messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_new = int(oreq.get("max_tokens") or 0)
@@ -6409,17 +6417,36 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _authorized(self) -> bool:
-            if not svc.api_key:
-                return True
+        def _identify(self):
+            """Who sent this request (serve/users.py's Caller): the config's key, a user's key or a signed-in page's
+            session - or, on a server with neither a key nor users, anyone.  None: nobody this server lets in."""
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if given and any(hmac.compare_digest(given.encode(), k.encode()) for k in key_list(svc.api_key)):
-                return True
-            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
-            return False
+            return users.identify(svc.users, key_list(svc.api_key), given)
+
+        def _authorized(self) -> bool:
+            """The caller is known (else a 401) and may call this route (else a 403: a standard user on an admin's
+            route - users.may() is the list).  self.caller is who it is."""
+            self.caller = who = self._identify()
+            if who is None:
+                asked = svc.users is not None and svc.users.active()
+                self._json(401, {"error": {"type": "authentication_error", "message":
+                                           "sign in, or send your API key" if asked else "missing or wrong API key"}})
+                return False
+            if not users.may(who.role, self.command, self.path.split("?")[0].rstrip("/")):
+                self._json(403, {"error": {"type": "permission_error", "message": "this needs an admin"}})
+                return False
+            return True
+
+        def _tag(self, req: dict) -> None:
+            """Whose request this is, for the Monitor's table and the user's count (a server with users)."""
+            who = getattr(self, "caller", None)
+            req["_user"], req["_uid"] = (who.name, who.id) if who is not None and who.id is not None else (None, None)
 
         def _response_owner(self):
+            who = getattr(self, "caller", None)
+            if who is not None and who.id is not None:       # a user: theirs whichever of their keys asks
+                return f"user:{who.id}"
             if not svc.api_key:
                 return "public"
             auth = self.headers.get("Authorization", "")
@@ -6542,6 +6569,9 @@ def make_handler(svc: Service):
             if path == "/models/sse":
                 self._models_sse()
                 return
+            if path in ("/auth/me", "/api/keys", "/api/users", "/api/chats", "/api/workspace"):
+                users.handle_get(self, svc, path)               # the server's users (serve/users.py)
+                return
             if path in ("/api/tags", "/api/ps", "/api/version", "/api/catalog", "/api/pull/status"):
                 if self._authorized():
                     self._mapi_get(path)
@@ -6595,7 +6625,9 @@ def make_handler(svc: Service):
             if path == "/metrics":
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
-                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                    # (a standard user: their own requests in the table, not everyone's)
+                    own = None if self.caller.admin else self.caller.name
+                    self._json(200, svc.metrics(all_requests="requests=all" in self.path, user=own))
                 return
             if path == "/metrics/prometheus":
                 if self._authorized():
@@ -6710,6 +6742,8 @@ def make_handler(svc: Service):
                         s["tokens_per_s"] = round(svc._tok_s(), 1)
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 s.pop("started", None)
+                if not self.caller.admin:   # (what is being written may be another user's answer)
+                    s.pop("tail", None)
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
@@ -6773,9 +6807,18 @@ def make_handler(svc: Service):
         def do_POST(self):
             TURN.clear() if TURN_TRACE else None
             turn_mark("http")
+            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path == "/auth/login":                    # (signing in: the one POST nobody is known for yet)
+                if not self._foreign_page():
+                    users.handle_post(self, svc, path)
+                return
             if not self._authorized() or self._foreign_page():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path.startswith("/auth/") or path in ("/api/keys", "/api/keys/delete", "/api/users",
+                                                     "/api/users/update", "/api/users/delete", "/api/chats",
+                                                     "/api/chats/delete", "/api/workspace"):
+                users.handle_post(self, svc, path)       # the server's users (serve/users.py)
+                return
             try:
                 if path in ("/models/load", "/models/unload"):
                     self._llamacpp_model(path.rsplit("/", 1)[1])
@@ -7115,6 +7158,7 @@ def make_handler(svc: Service):
             history = input_items(req["input"]) if req.get("store") else None
             sampling = svc.with_shared(sampling, "openai")
             sampling["_api"] = "openai"
+            self._tag(sampling)
             sampling["_responses"] = True
             svc.check_request(sampling)
             if req.get("background"):
@@ -7188,10 +7232,13 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
+            self._tag(req)
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
             messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            if use_mcp and not self.caller.admin:   # (the tools run on this PC with the server's rights: an admin's)
+                use_mcp = False
             own = {t.get("name") for t in tools or []}
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
@@ -7297,6 +7344,7 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
             req["_api"] = "anthropic"
+            self._tag(req)
             svc.check_request(req)                             # a bad sampling field: a 400, now
             messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
@@ -7988,6 +8036,18 @@ def main() -> int:
     if not svc.loop_guard:
         print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    users_db = users.store_path(a.config)               # the users: beside the run config (MAYA_USERS_DB: elsewhere)
+    if users_db is not None:
+        try:
+            svc.users = users.UserStore(users_db)
+            n_users = len(svc.users.users())
+            if n_users:
+                print(f"[maya] users: {n_users} in {users_db} (each signs in, or sends an API key of their own"
+                      f"{'; the config API key is an admin key' if svc.api_key else ''})", flush=True)
+        except (OSError, sqlite3.Error) as e:
+            # (never open by accident: a file that held users and cannot be read must not let everyone in)
+            raise SystemExit(f"the users' file {users_db} cannot be opened: {e}  (MAYA_USERS_DB=off runs without "
+                             "users)") from None
     try:
         svc.cors_origins = parse_cors_origins(cfg.get("cors_origins"))
     except ValueError as e:

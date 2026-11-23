@@ -45,7 +45,7 @@ function leavePrefs() {
   if (!snap) return;
   const back = turboLeave(snap, S.current ? S.current.thinking : null);
   store.set(prefsKey(), back.stored);
-  try { localStorage.removeItem("maya." + snapKey()); } catch (e) { /* ignore */ }
+  store.del(snapKey());
   loadPrefs();
   if (S.current) S.current.thinking = back.chatThinking !== undefined ? back.chatThinking : P.thinking;
 }

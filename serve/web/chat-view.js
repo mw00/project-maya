@@ -3,7 +3,7 @@
 // greeting: the model that answers it and ideas to start from.
 import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
 import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, timeStr, tokfmt} from "./lib.js";
-import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkPill, thinkTitles} from "./state.js";
+import {LEVELS, P, PRESET_NAMES, S, copyText, emit, isAdmin, presetOf, savePrefs, thinkPill, thinkTitles} from "./state.js";
 import {mcpOn} from "./server.js";
 import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, levelLeftAtDefault, newChat, painters,
         regenerate, removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
@@ -27,8 +27,8 @@ function Meter() {
 }
 
 function ModelMenu({open, close, anchor}) {
-  const h = S.health, preset = presetOf(P), c = ctxMeter();
-  useEffect(() => { if (open && !MS.data) loadModels(); }, [open]);   // (the Models row says how many are set up)
+  const h = S.health, preset = presetOf(P), c = ctxMeter(), admin = isAdmin();   // (the Models page: an admin's)
+  useEffect(() => { if (open && !MS.data && admin) loadModels(); }, [open]);   // (the Models row says how many are set up)
   const go = (s) => () => { close(); openSettings(s); };
   return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Model" align="left" cls="model-menu" width=${340}>
     <div class="model-menu__card"><${ModelLogo} model=${h.model} size=${36}/>
@@ -39,10 +39,10 @@ function ModelMenu({open, close, anchor}) {
       <span class="menu__sub">${h.max_context ? ctxfmt(h.max_context) : "–"}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
     <button type="button" role="menuitem" class="menu__item" onClick=${go("chat")}><span class="menu__label">Sampling</span>
       <span class="menu__sub">${preset ? PRESET_NAMES[preset] : "Custom"}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
-    <${MenuSep}/>
+    ${admin ? html`<${MenuSep}/>
     <button type="button" role="menuitem" class="menu__item" onClick=${() => { close(); showView("models"); }}>
       <span class="menu__label">Models</span><span class="menu__sub">${MS.data ? `${MS.data.models.length} set up` : "Switch, settings"}</span>
-      <${Icon} name="chevron" sm cls="chev is-closed"/></button>
+      <${Icon} name="chevron" sm cls="chev is-closed"/></button>` : null}
   <//>`;
 }
 
@@ -424,8 +424,9 @@ function ModelCard({phone}) {
     let facts = [last && last.decode_tok_s ? `${fmt(last.decode_tok_s, last.decode_tok_s < 10 ? 1 : 0)} tok/s` : null,
                  sv && sv.priced ? `${usd(sv.usd)} saved` : null].filter(Boolean);
     if (!facts.length && h.max_context) facts = [`${ctxfmt(h.max_context)} context`];
-    return html`<button type="button" class="model-card model-card--phone" onClick=${() => showView("models")}
-        aria-label=${`${name}, ${state}${facts.length ? `, ${facts.join(", ")}` : ""}. Switch model`}>
+    const admin = isAdmin();   // (a standard user: the Monitor - switching models is an admin's)
+    return html`<button type="button" class="model-card model-card--phone" onClick=${() => showView(admin ? "models" : "monitor")}
+        aria-label=${`${name}, ${state}${facts.length ? `, ${facts.join(", ")}` : ""}. ${admin ? "Switch model" : "Open the Monitor"}`}>
       <${ModelLogo} model=${h.model} size=${40}/>
       <span class="model-card__text"><span class="model-card__name"><b>${name}</b></span>
         <span class="model-card__line num"><span class="model-card__state" data-tone=${ready ? "ok" : st.tone}><i></i>${state}</span>${
@@ -442,7 +443,7 @@ function ModelCard({phone}) {
       <div class="model-card__name" role="status"><b title=${h.model || ""}>${name}</b>${pill}</div>
       ${facts.length ? html`<div class="model-card__facts num">${facts.map(([k, v]) => html`<span>${k}<b>${v}</b></span>`)}</div>` : null}
     </div>
-    <button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>
+    ${isAdmin() ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>` : null}
   </section>`;
 }
 

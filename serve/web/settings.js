@@ -7,12 +7,14 @@
 // on the list of pages and a page has a way back to it.
 import {html, useEffect, useRef, useState} from "./preact.js";
 import {MOD, SUPPORT_URL, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
-import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emit, presetOf, resetPrefs, savePrefs, schemeChoice, setScheme, setTheme,
+import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emit, isAdmin, presetOf, resetPrefs, savePrefs, schemeChoice, setScheme, setTheme,
         themeChoice, thinkTitles, toast} from "./state.js";
+import {AccountPage, KeysPage, UsersPage, accountPages} from "./account.js";
 import {usd} from "./sidebar.js";
 import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
-import {ablateOf, chatInstructions, clearBrowser, estimateTokens, setAblate, updateCtxMeter} from "./chats.js";
+import {ACCOUNT, ablateOf, adoptBrowserChats, browserChats, chatInstructions, clearBrowser, deleteBrowserChats, estimateTokens, setAblate,
+        updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
 import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
@@ -28,6 +30,15 @@ const GROUPS = [
   {label: "Privacy", items: [{id: "data", label: "Data and privacy", icon: "disk"}]},
   {label: "About", items: [{id: "about", label: "About and updates", icon: "info"}]},
 ];
+// ... and, on a server that keeps users (account.js), Account first: Your account, API keys, and Users for an admin.
+// A standard user has no Usage page (the prices and the count are the server's: an admin's) and no MCP tools (they
+// run on the server's PC with its rights)
+const ADMIN_PAGES = ["savings", "tools"];
+function groups() {
+  const acct = accountPages(), admin = isAdmin();
+  const rest = GROUPS.map((g) => ({...g, items: g.items.filter((s) => admin || !ADMIN_PAGES.includes(s.id))})).filter((g) => g.items.length);
+  return acct.length ? [{label: "Account", items: acct}, ...rest] : rest;
+}
 // other names a link or a hash may say: the Model page before the groups (its context size and port are on Chat
 // defaults now), and the revamp's API pages (one page again: Connect your tools)
 const OLD_IDS = {model: "chat", connection: "connect", openai: "connect", anthropic: "connect"};
@@ -92,9 +103,14 @@ function ModelCtx() {
     const tokens = S.ctx.tokens != null ? S.ctx.tokens : estimateTokens(S.current.messages);
     if (await confirmContext(v, tokens)) setCtx(null);
   };
+  const card = html`<div class="model-card"><${ModelLogo} model=${h.model} size=${36}/>
+      <span><b>${modelName(h.model)}</b><span>${[h.model, engine, h.version ? `Project Maya v${h.version}` : ""].filter(Boolean).join(" · ")}</span></span></div>`;
+  if (!isAdmin()) {   // (a standard user: which model, and its context; changing them reloads it for everyone - an admin's)
+    return html`<${Group} cap="The running model">${card}
+      ${c ? html`<${Row} label="Context size" sub="The model and its context are set by this server's admins."><b class="num">${ctxfmt(c.context)} tokens</b><//>` : null}<//>`;
+  }
   return html`<${Group} cap="The running model">
-    <div class="model-card"><${ModelLogo} model=${h.model} size=${36}/>
-      <span><b>${modelName(h.model)}</b><span>${[h.model, engine, h.version ? `Project Maya v${h.version}` : ""].filter(Boolean).join(" · ")}</span></span></div>
+    ${card}
     ${c ? html`<div class="set-block">
       <${CtxSlider} id="set-ctx" value=${v} now=${c.context} stops=${stops} disabled=${!!S.reload} hint=${est}
         onChange=${(n) => setCtx(stops.indexOf(n))}/>
@@ -128,7 +144,7 @@ function Port() {
 function ThinkBudget() {
   const tb = S.thinkBudget, [text, setText] = useState("");
   useEffect(() => { if (tb) setText(String(tb.budget)); }, [tb && tb.budget]);
-  if (!tb || !tb.supported) return null;
+  if (!tb || !tb.supported || !isAdmin()) return null;   // (the model's run config: an admin's)
   const bad = budgetError(text), changed = text.trim() !== String(tb.budget);
   return html`<div class="set-block">
     <label class="field"><span class="field__label">Thinking budget</span>
@@ -183,7 +199,7 @@ function ChatDefaults() {
     : "API clients get them for anything they don't set themselves.";
   return html`<${Head} title=${html`Chat defaults<${Saved} on=${saved}/>`}
       intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
-      <${TurboButton}/><//>
+      ${isAdmin() ? html`<${TurboButton}/>` : null}<//>
     <${ModelCtx}/>
     <${Group} cap="Sampling">
     <${Row} label="Presets"><${Seg} label="Presets" value=${preset} onChange=${(id) => set(PRESETS[id])}
@@ -221,9 +237,9 @@ function ChatDefaults() {
         <input class="input" inputmode="decimal" placeholder=${ph} value=${P[k]} aria-label=${`${label} penalty`}
           onInput=${(e) => set({[k]: e.target.value.replace(/[^\d.]/g, "")})}/></label>`)}
     </div></div><//>
-    <${Group} cap="Other apps" note="The OpenAI and Anthropic APIs both take them: a request's own settings still win.">
+    ${isAdmin() ? html`<${Group} cap="Other apps" note="The OpenAI and Anthropic APIs both take them: a request's own settings still win.">
     <${Row} label="Use these for other apps too" sub=${sharedNow}>
-      <${Switch} label="Use these for other apps too" on=${S.shared.on} onChange=${share}/><//><//>
+      <${Switch} label="Use these for other apps too" on=${S.shared.on} onChange=${share}/><//><//>` : null}
     <div class="set-foot"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => {
       resetPrefs(["thinking", "temperature", "top_p", "top_k", "min_p", "max", "seed", ...PENALTIES]);   // (the model's own again)
       syncShared();
@@ -275,7 +291,9 @@ function Tools() {
 // ------------------------------------------------------------------ Connect your tools (as in v1.1.52: both APIs' base URLs,
 // the model's name and the API key on one page, then the examples)
 function Connect() {
-  const base = location.origin, model = S.health.model, key = !!S.health.api_key;
+  // (a server with users: every request needs a key - a user's own, made on API keys)
+  const base = location.origin, model = S.health.model, users = S.me.users, key = !!S.health.api_key || users;
+  const own = users && S.me.user && S.me.user.id != null;
   const [tab, setTab] = useState("claude");
   const [apikey, setKey] = useState(store.get("apikey", ""));
   const auth = key ? "<your API key>" : "maya";
@@ -289,10 +307,13 @@ function Connect() {
     <${Group} cls="set-group--connect">
     ${addrs.map(([k, v]) => html`<div class="addr"><span>${k}</span><code>${v}</code>
       <button type="button" class="icon-btn icon-btn--sm" aria-label=${`Copy the ${k}`} title="Copy" onClick=${() => copyText(v)}><${Icon} name="copy" sm/></button></div>`)}
-    <${Row} label="API key" htmlFor="set-key" sub=${key ? "This server needs one. It is kept in this browser only." : "Only if the server was started with one. Kept in this browser only."}>
+    ${own ? html`<${Row} label="API key" sub="Your apps use a key of your own: make one, and delete it when the app goes.">
+      <button type="button" class="btn btn--secondary btn--sm" onClick=${() => { S.settings = "keys"; emit(); }}>
+        <${Icon} name="key" sm/>Your API keys</button><//>`
+    : html`<${Row} label="API key" htmlFor="set-key" sub=${key ? "This server needs one. It is kept in this browser only." : "Only if the server was started with one. Kept in this browser only."}>
       <input id="set-key" class="input input--key" type="password" autocomplete="off" placeholder="Not needed" value=${apikey}
         onInput=${(e) => { setKey(e.target.value); store.set("apikey", e.target.value.trim()); }}
-        onChange=${() => toast("success", "API key saved", "Kept in this browser only.")}/><//><//>
+        onChange=${() => toast("success", "API key saved", "Kept in this browser only.")}/><//>`}<//>
     <${Group}><div class="set-block">
       <div class="tabs" role="tablist" aria-label="Examples">${Object.entries(examples).map(([id, [label]]) => html`
         <button type="button" role="tab" aria-selected=${String(tab === id)} class="tabs__tab" onClick=${() => setTab(id)}>${label}</button>`)}</div>
@@ -304,6 +325,20 @@ function Connect() {
 // ------------------------------------------------------------------ Data
 function Data() {
   const n = S.chats.length;
+  const [old, setOld] = useState(0), [busy, setBusy] = useState(false);
+  const count = () => browserChats().then((cs) => setOld(cs.length));
+  useEffect(() => { count(); }, []);
+  if (ACCOUNT) {
+    const u = S.me.user || {};
+    const move = async () => { setBusy(true); try { await adoptBrowserChats(); } finally { setBusy(false); count(); } };
+    return html`<${Head} title="Data and privacy" intro=${`Your chats, their images and attached files are kept in your account on this server (${fmt(n)} chat${n === 1 ? "" : "s"} now): yours alone, and the same on every device you sign in on. The other users do not see them, and you do not see theirs.`}/>
+      <${Group}>
+      ${old ? html`<${Row} label=${`${fmt(old)} earlier chat${old === 1 ? "" : "s"} in this browser`} sub=${`From before ${u.name || "you"} signed in: kept in this browser, where everyone who uses it could read them. Move them into your account, or delete them.`}>
+        <button type="button" class="btn btn--secondary btn--sm" disabled=${busy} onClick=${move}>${busy ? "Moving…" : "Move to my account"}</button>
+        <button type="button" class="btn btn--ghost btn--sm" disabled=${busy} onClick=${() => deleteBrowserChats().then(count)}>Delete</button><//>` : null}
+      <${Row} label="Delete my chats and settings" sub="Every chat and folder in your account, on every device, and your chat settings in this browser. Your account and your API keys stay.">
+        <button type="button" class="btn btn--danger" onClick=${clearBrowser}>Delete</button><//><//>`;
+  }
   return html`<${Head} title="Data and privacy" intro=${`Chats, images and attached files are kept in this browser only (${fmt(n)} chat${n === 1 ? "" : "s"} now). The server keeps none of them. Model files are managed on Models.`}/>
     <${Group}>
     <${Row} label="Clear chats and settings" sub="Every chat and folder, these settings and the API key in this browser. The model, its files and the server's own settings are not touched.">
@@ -377,7 +412,9 @@ const SupportLine = () => html`<p class="set-support"><span>I build Maya because
   local AI. If you enjoy what I'm building, consider${" "}<a class="support-link" href=${SUPPORT_URL} target="_blank" rel="noopener"
   title="Sponsor Maya on GitHub">supporting me</a>. Every little bit helps keep the project alive and growing. ❤️</span></p>`;
 function UpdateCard() {
-  const u = S.update, w = S.updateWatch;
+  const w = S.updateWatch;
+  // (a standard user sees what is out; updating restarts Maya for everyone - an admin's)
+  const u = S.update && !isAdmin() ? {...S.update, can_update: false, by_hand: "", blocker: ""} : S.update;
   if (!w && (!u || !u.enabled)) return null;
   const latest = (u && u.latest) || {}, state = u && u.state;
   const when = u && u.checked ? new Date(u.checked * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) : "";
@@ -399,7 +436,8 @@ function UpdateCard() {
     tone = "accent"; icon = "download";
     title = `Project Maya v${latest.version} is out`;
     text = latest.summary || "";
-    if (!u.can_update) how = `Update by hand: ${u.by_hand}. This page can't, because ${u.blocker}.`;
+    if (!isAdmin()) how = "An admin of this server can update it.";
+    else if (!u.can_update) how = `Update by hand: ${u.by_hand}. This page can't, because ${u.blocker}.`;
     acts = html`${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>Update to v${latest.version}</button>` : null}`;
   } else if (u.error) {
     icon = "warning";
@@ -498,26 +536,31 @@ function About() {
     <${UpdateCard}/>
     <${SupportLine}/>
     <${Group} cap="This server"><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
-    <${Group}>
+    ${isAdmin() ? html`<${Group}>
     <div class="set-row set-row--top">
       <span class="set-row__text"><span class="set-row__label">Troubleshooting</span>
         <span class="set-row__sub">A report for a GitHub issue: the versions, this PC, the engine's settings and the telling lines of its log, never the API key. Read it before you share it.</span></span>
       <span class="set-row__ctl set-row__ctl--two"><button type="button" class="btn btn--secondary btn--sm" onClick=${show}>${log != null ? "Hide" : "Show engine log"}</button>
         <button type="button" class="btn btn--primary btn--sm" onClick=${copy}><${Icon} name="report" sm/>Copy report</button></span></div>
-    ${log != null ? html`<pre class="report">${log}</pre>` : null}<//>`;
+    ${log != null ? html`<pre class="report">${log}</pre>` : null}<//>` : null}`;
 }
 
 // ------------------------------------------------------------------ the dialog
+const UI = {Head, Group, Row};   // (account.js' pages are built from the same pieces)
 const BODIES = {general: General, chat: ChatDefaults, instr: Instructions, connect: Connect,
-                tools: Tools, savings: Savings, data: Data, about: About};
+                tools: Tools, savings: Savings, data: Data, about: About,
+                account: () => html`<${AccountPage} ui=${UI}/>`, keys: () => html`<${KeysPage} ui=${UI}/>`,
+                users: () => html`<${UsersPage} ui=${UI}/>`};
 export function SettingsDialog() {
   const box = useRef(null), body = useRef(null);
+  const shown = groups();
   const want = OLD_IDS[S.settings] || S.settings;
-  const sec = BODIES[want] ? want : "general";
+  const sec = shown.some((g) => g.items.some((s) => s.id === want)) ? want : "general";   // (only a page this user has)
   // a phone: the list of pages first (as opened from the sidebar or Ctrl+,), a page when a link names one
   const [list, setList] = useState(() => isPhone() && (!S.settings || S.settings === "general"));
   useEffect(() => {
-    loadShared(); loadMcp(); loadCtxInfo(); loadPortInfo(); loadThinkBudget(); loadUpdate();
+    loadShared(); loadMcp(); loadCtxInfo(); loadThinkBudget(); loadUpdate();
+    if (isAdmin()) loadPortInfo();                 // (the port: an admin's to see and to move)
     const ret = document.activeElement;
     setTimeout(() => { const b = box.current && box.current.querySelector(".set-nav [aria-current=page]"); if (b) b.focus(); }, 0);
     return () => { if (ret && ret.focus && document.contains(ret)) ret.focus(); };
@@ -537,7 +580,7 @@ export function SettingsDialog() {
           <${Icon} name="chevron-right" sm/>Settings</button>`}<h2 id="settings-title">Settings</h2>
         <button type="button" class="icon-btn" aria-label="Close" onClick=${close}><${Icon} name="close"/></button></div>
       <div class="settings__main">
-        <nav class="set-nav" aria-label="Settings sections">${GROUPS.map((g) => html`
+        <nav class="set-nav" aria-label="Settings sections">${shown.map((g) => html`
           <span class="set-nav__group">${g.label}</span>
           <div class="set-nav__items">${g.items.map((s) => html`
           <button type="button" class="nav-item" aria-current=${s.id === sec && !list ? "page" : undefined}

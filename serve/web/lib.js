@@ -25,21 +25,45 @@ export function ago(s) {
 export const timeStr = (t) => new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 export const rate = (mb) => (mb == null ? "–" : mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`);
 
-// settings in localStorage ("maya.<key>", JSON); the names of releases before Maya ("strata.<key>") are still read
+// Who this page is, as the browser remembered it when the page loaded ("maya.me": account.js keeps it, and signing in
+// or out loads the page again).  A signed-in user of a server with users has an id: a workspace of their own - their
+// chats and folders on the server (accountDb below), their settings in this browser under their own names.  Everyone
+// else (a server without users, a page let in by the server's own API key): null, and all is kept in this browser.
+export const UID = (() => {
+  try {
+    const me = JSON.parse(localStorage.getItem("maya.me")) || {};
+    return me.users && me.user && me.user.id != null ? me.user.id : null;
+  } catch (e) { return null; }
+})();
+const SHARED = new Set(["me", "session", "apikey"]);    // the browser's, not a user's: who is signed in here
+const lsKey = (k) => "maya." + (UID != null && !SHARED.has(k) ? `u${UID}.` : "") + k;
+
+// settings in localStorage ("maya.<key>", JSON; a signed-in user's: "maya.u<id>.<key>"); the names of releases before
+// Maya ("strata.<key>") are still read
 export const store = {
   get(k, d) {
     try {
-      let v = localStorage.getItem("maya." + k);
-      if (v === null) v = localStorage.getItem("strata." + k);
+      let v = localStorage.getItem(lsKey(k));
+      if (v === null && UID == null) v = localStorage.getItem("strata." + k);
       return v === null ? d : JSON.parse(v);
     } catch (e) { return d; }
   },
-  set(k, v) { try { localStorage.setItem("maya." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  set(k, v) { try { localStorage.setItem(lsKey(k), JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  del(k) { try { localStorage.removeItem(lsKey(k)); } catch (e) { /* ignore */ } },
+  // the keys kept that start so ("sampling": every model's stored settings)
+  keys(prefix) {
+    const base = lsKey("");
+    try { return Object.keys(localStorage).filter((k) => k.startsWith(base + prefix)).map((k) => k.slice(base.length)); }
+    catch (e) { return []; }
+  },
+  // what the browser kept before anyone signed in on it (the chats' folders, to move into an account)
+  browser(k, d) { try { const v = localStorage.getItem("maya." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  mine: (name) => UID != null && name.startsWith(`maya.u${UID}.`),
 };
 
 // the chats' store (IndexedDB: no 5 MB cap, pictures and attached files kept, so a reopened chat sends exactly what it
 // sent before)
-export const db = (() => {
+export const browserDb = (() => {
   let opening = null;
   const open = () => opening || (opening = new Promise((ok, bad) => {
     try {
@@ -64,13 +88,16 @@ export const db = (() => {
     put: (c) => run("readwrite", (s) => s.put(c)),
     del: (id) => run("readwrite", (s) => s.delete(id)),
     clear: () => run("readwrite", (s) => s.clear()),
+    queued: () => false,
+    pending: () => 0,
   };
 })();
 
-// the server: relative addresses (the page also works behind a proxy under a path), and the API key when it has one
+// the server: relative addresses (the page also works behind a proxy under a path), and who asks: the session of a
+// signed-in user (a server with users: account.js), else the API key when the page has one
 export function headers(json = false) {
   const h = {};
-  const key = store.get("apikey", "");
+  const key = store.get("session", "") || store.get("apikey", "");
   if (key) h.Authorization = "Bearer " + key;
   if (json) h["Content-Type"] = "application/json";
   return h;
@@ -82,13 +109,76 @@ export async function api(path, {method = "GET", body, signal} = {}) {
   if (!r.ok) {
     let msg = `HTTP ${r.status}`;
     try { const e = (await r.json()).error; msg = (e && e.message) || (typeof e === "string" && e) || msg; } catch (e) { /* not json */ }
-    if (r.status === 401) msg = "This server needs its API key: add it in Settings › Connect your tools.";
+    // (signing in says itself what was wrong; a server with users asks to sign in, not for "its" key)
+    if (r.status === 401 && !path.startsWith("auth/")) {
+      msg = store.get("me", {}).users ? "You are signed out: reload the page and sign in again."
+                                      : "This server needs its API key: add it in Settings › Connect your tools.";
+    }
     const err = new Error(msg);
     err.status = r.status;
     throw err;
   }
   return r.json();
 }
+
+// A signed-in user's chats, kept on the server (serve/users.py: GET/POST /api/chats): the same four calls as the
+// browser's store.  A save is queued and sent in the background, the newest state of a chat only (an answer being
+// written saves its chat many times); what the server cannot be reached for is sent again, what it refuses (a chat
+// too large for the account) is dropped and said (db.onError).
+const accountDb = (() => {
+  const queue = new Map();             // a chat's id -> the chat to save (null: to delete)
+  const sent = new Map();              // a chat's id -> when its last save (or delete) reached the server
+  let running = false;
+  const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  // (?as=: who this page takes itself for - the server refuses, 409, when the browser has since signed in as another)
+  const mine = (path, opts) => api(`${path}${path.includes("?") ? "&" : "?"}as=${UID}`, opts).catch((e) => {
+    if (e.status === 409) location.reload();
+    throw e;
+  });
+  async function flush() {
+    if (running) return;
+    running = true;
+    let fails = 0;
+    while (queue.size) {
+      const [id, c] = queue.entries().next().value;
+      try {
+        if (c === null) await mine("api/chats/delete", {method: "POST", body: {id}});
+        else await mine("api/chats", {method: "POST", body: c});
+        sent.set(id, Date.now());
+        if (queue.get(id) === c) queue.delete(id);     // (changed meanwhile: the newer one is sent next)
+        fails = 0;
+      } catch (e) {
+        if (e.status === 409) { queue.clear(); break; }             // (another user's page now: it loads again)
+        if (e.status && e.status !== 401 && e.status < 500) {      // refused: sending it again changes nothing
+          if (queue.get(id) === c) queue.delete(id);
+          if (out.onError) out.onError(c, e);
+        } else {
+          fails++;
+          await wait(Math.min(30000, 1000 * 2 ** Math.min(fails, 5)));
+        }
+      }
+    }
+    running = false;
+  }
+  const out = {
+    all: async () => (await mine("api/chats")).chats,
+    put: async (c) => { queue.set(c.id, c); flush(); },
+    del: async (id) => { queue.set(id, null); flush(); },
+    clear: async () => { queue.clear(); await mine("api/chats/delete", {method: "POST", body: {all: true}}); },
+    queued: (id) => queue.has(id),     // a save (or a delete) of this chat is still on its way
+    sentAt: (id) => sent.get(id) || 0,
+    pending: () => queue.size,
+    onError: null,
+    // the rest of the account's side: the chats' ids and times, one chat, a chat saved now, the folders
+    index: async () => (await mine("api/chats?index=1")).index,
+    one: async (id) => (await mine(`api/chats?id=${encodeURIComponent(id)}`)).chat,
+    save: async (c) => { await mine("api/chats", {method: "POST", body: c}); sent.set(c.id, Date.now()); },
+    workspace: async () => (await mine("api/workspace")).workspace,
+    setWorkspace: (w) => mine("api/workspace", {method: "POST", body: w}),
+  };
+  return out;
+})();
+export const db = UID != null ? accountDb : browserDb;
 
 export async function writeClipboard(text) {
   try {
