@@ -2978,8 +2978,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             const bool fork = g_off_dynamic && (g_split_mode == 1 || g_split_mode == 2);
             if (g_off_dynamic) {
                 const auto& dc = g_offs.dcache[g_dev[0].EC.layer_pool[l]];
+                static const bool g_ghost_bypass = getenv("IK2_GHOST_BYPASS") && std::atoi(getenv("IK2_GHOST_BYPASS"));
                 k::off_cache_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl, g_offs.cnt,
-                                  g_offs.heat, g_offs.cls_dyn, g_s);
+                                  g_offs.heat, g_offs.cls_dyn, g_s, g_ghost_bypass ? &st : nullptr);
                 if (fork) {   // the split: the copy stream fetches this visit's misses while the residents compute
                     CU(cudaEventRecord(g_cap_ev[2 * vis], g_s));
                     CU(cudaStreamWaitEvent(g_cs, g_cap_ev[2 * vis]));
@@ -3982,8 +3983,11 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         const bool split_moe = g_off_dynamic && (g_split_mode == 1 || g_split_mode == 3);
         if (g_off_dynamic) {
             const auto& dc = g_offs.dcache[g_dev[0].EC.layer_pool[l]];
+            static const bool g_ghost_bypass = getenv("IK2_GHOST_BYPASS") && std::atoi(getenv("IK2_GHOST_BYPASS"));
+            const auto& st_blk = g_offs.stage[g_offs.pool[l]];
             k::off_cache_plan(g_blk.blob_pp, rtop, S, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl,
-                              g_offs.cnt, g_offs.heat, split_moe ? g_offs.cls_dyn : nullptr, g_s);
+                              g_offs.cnt, g_offs.heat, split_moe ? g_offs.cls_dyn : nullptr, g_s,
+                              g_ghost_bypass ? &st_blk : nullptr);
             if (fork) {
                 CU(cudaEventRecord(g_cap_ev[2 * vis], g_s));
                 CU(cudaStreamWaitEvent(g_cs, g_cap_ev[2 * vis]));

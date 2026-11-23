@@ -71,8 +71,8 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
 }
 
 __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restrict__ top, int K, int key0,
-                                      const uint8_t* host, size_t hstride, OffCache dc, OffFetch* fl, OffCount* cnt,
-                                      uint32_t* heat, int* cls) {
+                                      const uint8_t* host, size_t hstride, OffCache dc, OffStage st, bool use_st,
+                                      OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls) {
     const int lane = threadIdx.x;
     if (heat && lane < K) atomicAdd(heat + key0 + top[lane], 1u);
     if (lane != 0) return;
@@ -84,8 +84,8 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
         slot[i] = s;
         if (s >= 0) dc.used[s] = seq;
     }
-    int n_hit = 0, n_fetch = 0;
-    // Pass 2: increment hit frequencies; allocate Clock-LFU victims for misses.
+    int n_hit = 0, n_stage = 0, n_fetch = 0, n_staged = 0;
+    // Pass 2: increment hit frequencies; allocate Clock-LFU victims (or staging bypass for cold !is_ghost misses).
     for (int i = 0; i < K; ++i) {
         int s = slot[i];
         const int key = key0 + top[i];
@@ -104,6 +104,46 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
             if (cls) cls[i] = 1;   // (an earlier pick of this visit fetched it: its bytes arrive with the copy)
             ++n_hit;
             continue;
+        }
+        if (use_st && st.n > 0) {
+            int found = -1;
+            for (int j = 0; j < st.n; ++j) {
+                if (st.tag[j] == key) { found = j; break; }
+            }
+            if (found >= 0) {
+                const bool same_visit = (st.used[found] == seq);
+                st.used[found] = seq;
+                blob[i] = st.data + (size_t) found * st.sb;
+                if (cls) cls[i] = same_visit ? 1 : 0;
+                ++n_stage;
+                continue;
+            }
+            const uint32_t g0 = dc.ghost[key];
+            const bool is_ghost0 = g0 != 0 && (*dc.evict_seq - g0) <= (uint32_t) dc.ghost_win;
+            if (!is_ghost0 && n_staged < st.n) {
+                int sh = *st.hand, ss = sh;
+                bool found_free = false;
+                for (int t = 0; t < st.n; ++t) {
+                    ss = sh;
+                    sh = sh + 1 == st.n ? 0 : sh + 1;
+                    if (st.used[ss] != seq) { found_free = true; break; }
+                }
+                if (found_free) {
+                    *st.hand = sh;
+                    st.tag[ss] = key;
+                    st.used[ss] = seq;
+                    const uint32_t es = ++(*dc.evict_seq);
+                    dc.ghost[key] = es;
+                    uint8_t* dst = st.data + (size_t) ss * st.sb;
+                    blob[i] = dst;
+                    fl->src[n_fetch] = host + (size_t) top[i] * hstride;
+                    fl->dst[n_fetch] = dst;
+                    if (cls) cls[i] = 1;
+                    ++n_fetch;
+                    ++n_staged;
+                    continue;
+                }
+            }
         }
         int h = *dc.hand, v = -1;
         const int max_steps = (dc.max_freq + 2) * dc.n;
@@ -148,6 +188,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
     fl->n = n_fetch;
     cnt->picks += (unsigned long long) K;
     cnt->tier += (unsigned long long) n_hit;
+    cnt->stage += (unsigned long long) n_stage;
     cnt->fetched += (unsigned long long) n_fetch;
     cnt->bytes += (unsigned long long) n_fetch * hstride;
 }
@@ -414,8 +455,11 @@ void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const
 }
 
 void off_cache_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
-                    OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls, cudaStream_t s) {
-    off_cache_plan_kernel<<<1, kOffMaxK, 0, s>>>(blob, top, K, key0, host, hstride, dc, fl, cnt, heat, cls);
+                    OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls, cudaStream_t s,
+                    const OffStage* st) {
+    OffStage dummy{};
+    off_cache_plan_kernel<<<1, kOffMaxK, 0, s>>>(blob, top, K, key0, host, hstride, dc, st ? *st : dummy,
+                                                 st != nullptr, fl, cnt, heat, cls);
 }
 
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s) {
