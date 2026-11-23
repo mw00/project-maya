@@ -1973,6 +1973,7 @@ struct OffState {
     int* dcache_loc = nullptr;          // shared [n_layer * E] device loc table
     uint32_t* dcache_ghost = nullptr;   // shared [n_layer * E] device ghost table
     uint8_t* dcache_pin = nullptr;      // shared [n_layer * E] device pin table (PF-B': IK2_PIN_M)
+    uint32_t* dcache_score = nullptr;   // shared [n_layer * E] LFU pick score (IK2_LFU=1)
     // (prompts: the staging slots as a ring - an event a slot for its copy, one for the expert that read it)
     std::vector<std::vector<cudaEvent_t>> ring_free, ring_full;
     std::vector<int> ring_hand;
@@ -2980,7 +2981,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 const auto& dc = g_offs.dcache[g_dev[0].EC.layer_pool[l]];
                 static const bool g_ghost_bypass = getenv("IK2_GHOST_BYPASS") && std::atoi(getenv("IK2_GHOST_BYPASS"));
                 k::off_cache_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl, g_offs.cnt,
-                                  g_offs.heat, g_offs.cls_dyn, g_s, g_ghost_bypass ? &st : nullptr);
+                                  g_offs.heat, g_offs.cls_dyn, g_s, (g_ghost_bypass || dc.lfu_mode) ? &st : nullptr);
                 if (fork) {   // the split: the copy stream fetches this visit's misses while the residents compute
                     CU(cudaEventRecord(g_cap_ev[2 * vis], g_s));
                     CU(cudaStreamWaitEvent(g_cs, g_cap_ev[2 * vis]));
@@ -3987,7 +3988,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             const auto& st_blk = g_offs.stage[g_offs.pool[l]];
             k::off_cache_plan(g_blk.blob_pp, rtop, S, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl,
                               g_offs.cnt, g_offs.heat, split_moe ? g_offs.cls_dyn : nullptr, g_s,
-                              g_ghost_bypass ? &st_blk : nullptr);
+                              (g_ghost_bypass || dc.lfu_mode) ? &st_blk : nullptr);
             if (fork) {
                 CU(cudaEventRecord(g_cap_ev[2 * vis], g_s));
                 CU(cudaStreamWaitEvent(g_cs, g_cap_ev[2 * vis]));
@@ -7709,6 +7710,15 @@ int main(int argc, char** argv) {
             CU(cudaMemset(g_offs.dcache_ghost, 0, n_keys * sizeof(uint32_t)));
             const int mf = getenv("IK2_MAX_FREQ") ? std::clamp(std::atoi(getenv("IK2_MAX_FREQ")), 1, 63) : 7;
             const int gmult = getenv("IK2_GHOST_MULT") ? std::max(1, std::atoi(getenv("IK2_GHOST_MULT"))) : 2;
+            const int lfu_mode = getenv("IK2_LFU") ? std::atoi(getenv("IK2_LFU")) : 0;
+            const uint32_t lfu_seed = getenv("IK2_LFU_SEED") ? (uint32_t) std::max(0, std::atoi(getenv("IK2_LFU_SEED"))) : 2u;
+            if (lfu_mode > 0) {
+                g_offs.dcache_score = dalloc<uint32_t>(n_keys);
+                std::vector<uint32_t> init_sc(n_keys, 0u);
+                for (size_t k2 = 0; k2 < n_keys; ++k2)
+                    if (EC.loc[k2] >= 0) init_sc[k2] = lfu_seed;
+                CU(cudaMemcpy(g_offs.dcache_score, init_sc.data(), n_keys * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            }
             const char* penv = getenv("IK2_PIN_M");   // (PF-B': the eviction pin - the decode's Clock-LFU walk skips the pinned pairs)
             int pin_m = penv && *penv ? std::clamp(std::atoi(penv), 0, (int) n_keys) : 0;
             if (pin_m > 0) {
@@ -7754,6 +7764,8 @@ int main(int argc, char** argv) {
                 dc.loc = g_offs.dcache_loc;
                 dc.ghost = g_offs.dcache_ghost;
                 dc.pin = g_offs.dcache_pin;   // (PF-B': the pin table, IK2_PIN_M)
+                dc.score = g_offs.dcache_score;
+                dc.lfu_mode = lfu_mode;
                 dc.owner = dalloc<int>(P.n_slots);
                 dc.used = dalloc<uint32_t>(P.n_slots);
                 dc.freq = dalloc<uint8_t>(P.n_slots);
@@ -7772,8 +7784,8 @@ int main(int argc, char** argv) {
                 g_offs.dcache[p] = dc;
             }
             g_offs.cls_dyn = dalloc<int>(k::kOffMaxK);
-            std::printf("offload dynamic GPU cache: %d slots across %zu pools (max_freq=%d, ghost=%dx)\n",
-                        EC.total_slots(), g_offs.dcache.size(), mf, gmult);
+            std::printf("offload dynamic GPU cache: %d slots across %zu pools (max_freq=%d, ghost=%dx, lfu=%d)\n",
+                        EC.total_slots(), g_offs.dcache.size(), mf, gmult, lfu_mode);
         }
         off_tables(M);
         lend_init(M);
@@ -8746,6 +8758,12 @@ int main(int argc, char** argv) {
             const int cached = (int) L;
             const double t0 = now();
             const uint64_t miss0 = dev_cache(0).misses, bytes0 = dev_cache(0).bytes_up;
+            if (g_offs.dcache_score && L == 0) {
+                static const int lfu_decay = getenv("IK2_LFU_DECAY") ? std::atoi(getenv("IK2_LFU_DECAY")) : 32;
+                static const uint32_t lfu_seed = getenv("IK2_LFU_SEED") ? (uint32_t) std::max(0, std::atoi(getenv("IK2_LFU_SEED"))) : 2u;
+                if (lfu_decay > 0)
+                    k::off_cache_decay(g_offs.dcache_score, g_offs.dcache_loc, M.c.n_layer * M.c.E, lfu_decay, lfu_seed, g_s);
+            }
             if (g_offs.heat && getenv("IK2_HEAT_DUMP")) {
                 CU(cudaMemsetAsync(g_offs.heat, 0, (size_t) M.c.n_layer * M.c.E * 4, g_s));
                 g_heat_prom.assign((size_t) M.c.n_layer * M.c.E, 0);

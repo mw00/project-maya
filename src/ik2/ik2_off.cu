@@ -193,6 +193,205 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
     cnt->bytes += (unsigned long long) n_fetch * hstride;
 }
 
+
+__global__ void off_cache_decay_kernel(uint32_t* score, const int* __restrict__ loc, int n_keys, int shift,
+                                       uint32_t seed) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_keys) return;
+    if (shift >= 32) {
+        score[i] = (loc && loc[i] >= 0) ? seed : 0u;
+    } else if (shift > 0) {
+        uint32_t v = score[i] >> shift;
+        if (loc && loc[i] >= 0 && v < seed) v = seed;
+        score[i] = v;
+    }
+}
+
+__global__ void off_cache_plan_lfu_kernel(const uint8_t** blob, const int* __restrict__ top, int K, int key0,
+                                          const uint8_t* host, size_t hstride, OffCache dc, OffStage st, bool use_st,
+                                          OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls) {
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ uint32_t s_seq;
+    __shared__ int s_slot[kOffMaxK];
+    __shared__ int s_miss_idx[kOffMaxK];
+    __shared__ int s_n_miss;
+    __shared__ int s_need_scan;
+    __shared__ int s_cur_i;
+    __shared__ int s_cur_key;
+    __shared__ unsigned long long s_wmet[8];
+    __shared__ int s_wslot[8];
+    __shared__ int s_n_hit, s_n_stage, s_n_fetch, s_n_staged;
+
+    if (tid < K) {
+        const int key = key0 + top[tid];
+        if (heat) atomicAdd(heat + key, 1u);
+        atomicAdd(dc.score + key, 1u);
+    }
+    if (tid == 0) {
+        s_seq = ++cnt->seq;
+        s_n_miss = 0;
+        s_n_hit = 0;
+        s_n_stage = 0;
+        s_n_fetch = 0;
+        s_n_staged = 0;
+    }
+    __syncthreads();
+
+    const uint32_t seq = s_seq;
+    if (tid < K) {
+        const int s = dc.loc[key0 + top[tid]];
+        s_slot[tid] = s;
+        if (s >= 0) dc.used[s] = seq;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int i = 0; i < K; ++i) {
+            const int s = s_slot[i];
+            if (s >= 0) {
+                blob[i] = dc.data + (size_t) s * dc.sb;
+                if (cls) cls[i] = 0;
+                ++s_n_hit;
+            } else {
+                s_miss_idx[s_n_miss++] = i;
+            }
+        }
+        if (s_n_miss == 0) {
+            fl->n = 0;
+            cnt->picks += (unsigned long long) K;
+            cnt->tier += (unsigned long long) s_n_hit;
+        }
+    }
+    __syncthreads();
+    if (s_n_miss == 0) return;
+
+    const int nm = s_n_miss;
+    for (int m = 0; m < nm; ++m) {
+        if (tid == 0) {
+            const int i = s_miss_idx[m];
+            const int key = key0 + top[i];
+            s_cur_i = i;
+            s_cur_key = key;
+            s_need_scan = 0;
+            const int s = dc.loc[key];
+            if (s >= 0) {
+                blob[i] = dc.data + (size_t) s * dc.sb;
+                if (cls) cls[i] = 1;
+                ++s_n_hit;
+            } else {
+                int found = -1;
+                if (use_st && st.n > 0) {
+                    for (int j = 0; j < st.n; ++j) {
+                        if (st.tag[j] == key) { found = j; break; }
+                    }
+                }
+                if (found >= 0) {
+                    const bool same_visit = (st.used[found] == seq);
+                    st.used[found] = seq;
+                    blob[i] = st.data + (size_t) found * st.sb;
+                    if (cls) cls[i] = same_visit ? 1 : 0;
+                    ++s_n_stage;
+                } else {
+                    s_need_scan = 1;
+                }
+            }
+        }
+        __syncthreads();
+        if (!s_need_scan) continue;
+
+        unsigned long long best_met = ~0ull;
+        int best_slot = -1;
+        for (int c = tid; c < dc.n; c += 256) {
+            if (dc.used[c] == seq) continue;
+            const int oc = dc.owner[c];
+            if (oc >= 0 && dc.pin && dc.pin[oc]) continue;
+            const unsigned long long met = (oc < 0)
+                ? 0ull
+                : (((unsigned long long) dc.score[oc] << 32) | (unsigned long long) dc.used[c]);
+            if (met < best_met) {
+                best_met = met;
+                best_slot = c;
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const unsigned long long o_met = __shfl_down_sync(0xffffffffu, best_met, off);
+            const int o_slot = __shfl_down_sync(0xffffffffu, best_slot, off);
+            if (o_met < best_met) {
+                best_met = o_met;
+                best_slot = o_slot;
+            }
+        }
+        if (lane == 0) {
+            s_wmet[warp] = best_met;
+            s_wslot[warp] = best_slot;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            unsigned long long g_met = s_wmet[0];
+            int v = s_wslot[0];
+            for (int w = 1; w < 8; ++w) {
+                if (s_wmet[w] < g_met) {
+                    g_met = s_wmet[w];
+                    v = s_wslot[w];
+                }
+            }
+            const int i = s_cur_i;
+            const int key = s_cur_key;
+            const uint32_t k_sc = dc.score[key];
+            const uint32_t v_sc = (uint32_t) (g_met >> 32);
+            bool bypassed = false;
+            if (use_st && st.n > 0 && s_n_staged < st.n && g_met != 0ull && k_sc < v_sc) {
+                int sh = *st.hand, ss = sh;
+                bool found_free = false;
+                for (int t = 0; t < st.n; ++t) {
+                    ss = sh;
+                    sh = sh + 1 == st.n ? 0 : sh + 1;
+                    if (st.used[ss] != seq) { found_free = true; break; }
+                }
+                if (found_free) {
+                    *st.hand = sh;
+                    st.tag[ss] = key;
+                    st.used[ss] = seq;
+                    uint8_t* dst = st.data + (size_t) ss * st.sb;
+                    blob[i] = dst;
+                    fl->src[s_n_fetch] = host + (size_t) top[i] * hstride;
+                    fl->dst[s_n_fetch] = dst;
+                    if (cls) cls[i] = 1;
+                    ++s_n_fetch;
+                    ++s_n_staged;
+                    bypassed = true;
+                }
+            }
+            if (!bypassed) {
+                const int old_k = dc.owner[v];
+                if (old_k >= 0) dc.loc[old_k] = -1;
+                dc.owner[v] = key;
+                dc.loc[key] = v;
+                dc.used[v] = seq;
+                uint8_t* dst = dc.data + (size_t) v * dc.sb;
+                blob[i] = dst;
+                fl->src[s_n_fetch] = host + (size_t) top[i] * hstride;
+                fl->dst[s_n_fetch] = dst;
+                if (cls) cls[i] = 1;
+                ++s_n_fetch;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        fl->n = s_n_fetch;
+        cnt->picks += (unsigned long long) K;
+        cnt->tier += (unsigned long long) s_n_hit;
+        cnt->stage += (unsigned long long) s_n_stage;
+        cnt->fetched += (unsigned long long) s_n_fetch;
+        cnt->bytes += (unsigned long long) s_n_fetch * hstride;
+    }
+}
+
 // 4 x 16 bytes in flight a thread: the bus's latency (a microsecond or two) hidden by many reads at once
 __global__ void off_fetch_copy_kernel(const OffFetch* __restrict__ fl, size_t n16) {
     const int n = fl->n;
@@ -454,10 +653,20 @@ void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const
     off_fetch_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, st, fl, cnt, heat);
 }
 
+void off_cache_decay(uint32_t* score, const int* loc, int n_keys, int shift, uint32_t seed, cudaStream_t s) {
+    if (!score || n_keys <= 0) return;
+    off_cache_decay_kernel<<<(n_keys + 255) / 256, 256, 0, s>>>(score, loc, n_keys, shift, seed);
+}
+
 void off_cache_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
                     OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls, cudaStream_t s,
                     const OffStage* st) {
     OffStage dummy{};
+    if (dc.lfu_mode && dc.score) {
+        off_cache_plan_lfu_kernel<<<1, 256, 0, s>>>(blob, top, K, key0, host, hstride, dc, st ? *st : dummy,
+                                                    st != nullptr, fl, cnt, heat, cls);
+        return;
+    }
     off_cache_plan_kernel<<<1, kOffMaxK, 0, s>>>(blob, top, K, key0, host, hstride, dc, st ? *st : dummy,
                                                  st != nullptr, fl, cnt, heat, cls);
 }

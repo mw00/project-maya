@@ -121,7 +121,12 @@ struct OffCache {
     int max_freq = 7;              // saturating frequency cap
     int ghost_win = 0;             // ghost window in evictions
     const uint8_t* pin = nullptr;   // shared [n_layer*E] the pinned pairs the decode never evicts (PF-B': IK2_PIN_M)
+    uint32_t* score = nullptr;      // shared [n_layer*E] cumulative/decayed pick score (IK2_LFU=1)
+    int lfu_mode = 0;               // 0: Clock-LFU, 1: parallel exact Heat-LFU with LRU tie-break + staging bypass
 };
+
+/// Decay/reset score[0..n_keys) at request boundaries (shift >= 32 resets residents to seed, non-residents to 0).
+void off_cache_decay(uint32_t* score, const int* loc, int n_keys, int shift, uint32_t seed, cudaStream_t s);
 
 /// Dynamic GPU-side cache lookup + Clock-LFU eviction + fetch list generation (one warp, zero host sync).
 /// Fills blob[0..K-1] with VRAM slot addresses and appends missed experts to fl for off_fetch_copy().
