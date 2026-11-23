@@ -1148,9 +1148,44 @@ void Glm5Model::pen_free() {   // (on this part's device)
     pen_w_ = 0;
 }
 
+void Glm5Model::dump_logits(const float* logits, int T, cudaStream_t s) {
+    // MAYA_GLM_DUMP_LOGITS=<file> (a test, off unless set): every logit row a token is picked from (sampled picks and the greedy argmax sites), in call order - int32
+    // n_vocab, int32 0, then the rows as float32 (harness/glm/oracle.sh hashes them: GLM's logit-level check, the
+    // counterpart of maya-ds4's --dump-logits).  The rows are read back before the pick: slow, a test's.
+    {
+        const int V = (int) g_.n_vocab;
+        static std::FILE* const dump = [] {
+            const char* f = std::getenv("MAYA_GLM_DUMP_LOGITS");
+            std::FILE* x = f != nullptr && f[0] != '\0' ? std::fopen(f, "wb") : nullptr;
+            if (f != nullptr && x == nullptr) std::fprintf(stderr, "glm: MAYA_GLM_DUMP_LOGITS=%s: cannot write it\n", f);
+            return x;
+        }();
+        if (dump != nullptr && T > 0) {
+            static std::mutex mu;
+            static bool head = false;
+            std::lock_guard<std::mutex> lk(mu);
+            std::vector<float> rows((size_t) T * (size_t) V);
+            if (cudaStreamSynchronize(s) == cudaSuccess &&
+                cudaMemcpy(rows.data(), logits, rows.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                if (!head) {
+                    const int32_t h[2] = {V, 0};
+                    std::fwrite(h, sizeof h, 1, dump);
+                    head = true;
+                }
+                std::fwrite(rows.data(), sizeof(float), rows.size(), dump);
+                std::fflush(dump);
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "glm: MAYA_GLM_DUMP_LOGITS: a row could not be read back\n");
+            }
+        }
+    }
+}
+
 void Glm5Model::pick_tokens(const float* logits, int T, const maya::kernels::SamplerParams& sp, const int32_t* win,
                             int n0, int* out, cudaStream_t s) {
     const int V = (int) g_.n_vocab;
+    dump_logits(logits, T, s);
     if (sp.penalty_last_n <= 0) {   // no penalties: the call every site made before, nothing else
         maya::kernels::sample_tokens(logits, T, V, nullptr, 0, sp, out, s);
         return;

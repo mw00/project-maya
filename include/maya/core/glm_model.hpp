@@ -271,6 +271,8 @@ public:
     /// window's tokens, nullptr for a lone pick; n0: the drafts before row 0, a pipelined window's token).  So a draft
     /// stands only where it is the penalized pick: drafting counts exactly the history plain decode counts.  Without
     /// penalties it is exactly the sample_tokens call the sites made before.
+    /// MAYA_GLM_DUMP_LOGITS (a test): the rows a pick is about to read, appended to the dump
+    void dump_logits(const float* logits, int T, cudaStream_t s);
     void pick_tokens(const float* logits, int T, const maya::kernels::SamplerParams& sp, const int32_t* win, int n0,
                      int* out, cudaStream_t s);
     /// Zeroes R, every KDA state and every DSA cache: the next `forward` starts a fresh sequence.
