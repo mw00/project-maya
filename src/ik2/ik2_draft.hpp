@@ -42,6 +42,8 @@ bool matrices_q8(const Drafter* d);
 bool context_fp8(const Drafter* d);
 /// The rows of the context cache of the layer without a window (IK2_DRAFT_CTX, default ctx).
 int context_rows(int ctx);
+/// The engine's plan for them where the whole context's do not fit (the last `rows` positions; 0: the context).
+void plan_context_rows(int rows);
 /// The Markov head's bias folded through the target's output head (FP16 [n_rows][C], on the device).
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);
 /// ... through the head kept as planar Q8_0 (set_head_q8's form), read a chunk at a time: the same fold as through

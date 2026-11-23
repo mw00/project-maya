@@ -70,6 +70,78 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
     }
 }
 
+// off_fetch_plan for a verify window's picks grouped by expert (group_route's blob / n / row; top [S] the picks, a
+// group's expert top[row[g * GM]]): a group the tier does not hold is found in staging or copied there once for all
+// its tokens.  The copies' list in runs of kOffMaxK (fl [n_fl]); st.n >= S, so the clock always finds a slot the
+// window does not use.  One warp.
+__global__ void off_fetch_plan_win_kernel(const uint8_t** blob, const int* __restrict__ n, const int* __restrict__ row,
+                                          int GM, const int* __restrict__ top, int S, int key0, const uint8_t* host,
+                                          size_t hstride, OffStage st, OffFetch* fl, int n_fl, OffCount* cnt,
+                                          uint32_t* heat) {
+    const int lane = threadIdx.x;
+    uint32_t seq = 0;
+    if (lane == 0) seq = ++cnt->seq;
+    seq = __shfl_sync(0xffffffffu, seq, 0);
+    if (heat)
+        for (int i = lane; i < S; i += 32) atomicAdd(heat + key0 + top[i], 1u);
+    int n_fetch = 0, n_tier = 0, n_stage = 0;
+    for (int g = 0; g < S; ++g) {
+        const int ng = n[g];
+        if (ng == 0) break;   // (past the last group)
+        if (blob[g]) {        // in the tier
+            n_tier += ng;
+            continue;
+        }
+        const int e = top[row[g * GM]];
+        const int key = key0 + e;
+        int found = -1;
+        for (int b = 0; b < st.n; b += 32) {
+            const int s = b + lane;
+            const unsigned m = __ballot_sync(0xffffffffu, s < st.n && st.tag[s] == key);
+            if (m) {
+                found = b + __ffs(m) - 1;
+                break;
+            }
+        }
+        if (lane == 0) {
+            if (found >= 0) {
+                st.used[found] = seq;
+                blob[g] = st.data + (size_t) found * st.sb;
+                n_stage += ng;
+            } else {
+                int h = *st.hand, s = h;
+                for (int t = 0; t < st.n; ++t) {
+                    s = h;
+                    h = h + 1 == st.n ? 0 : h + 1;
+                    if (st.used[s] != seq) break;
+                }
+                *st.hand = h;
+                st.tag[s] = key;
+                st.used[s] = seq;
+                uint8_t* dst = st.data + (size_t) s * st.sb;
+                blob[g] = dst;
+                if (n_fetch < n_fl * kOffMaxK) {
+                    fl[n_fetch / kOffMaxK].src[n_fetch % kOffMaxK] = off_src(host, hstride, e);
+                    fl[n_fetch / kOffMaxK].dst[n_fetch % kOffMaxK] = dst;
+                }
+                ++n_fetch;
+            }
+        }
+        __syncwarp();
+    }
+    if (lane == 0) {
+        for (int j = 0; j < n_fl; ++j) {
+            const int left = n_fetch - j * kOffMaxK;
+            fl[j].n = left < 0 ? 0 : left > kOffMaxK ? kOffMaxK : left;
+        }
+        cnt->picks += (unsigned long long) S;
+        cnt->tier += (unsigned long long) n_tier;
+        cnt->stage += (unsigned long long) n_stage;
+        cnt->fetched += (unsigned long long) n_fetch;
+        cnt->bytes += (unsigned long long) n_fetch * hstride;
+    }
+}
+
 // 4 x 16 bytes in flight a thread: the bus's latency (a microsecond or two) hidden by many reads at once
 __global__ void off_fetch_copy_kernel(const OffFetch* __restrict__ fl, size_t n16) {
     const int n = fl->n;
@@ -337,6 +409,12 @@ __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C,
 void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
                     OffStage st, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s) {
     off_fetch_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, st, fl, cnt, heat);
+}
+
+void off_fetch_plan_win(const uint8_t** blob, const int* n, const int* row, int GM, const int* top, int S, int key0,
+                        const uint8_t* host, size_t hstride, OffStage st, OffFetch* fl, int n_fl, OffCount* cnt,
+                        uint32_t* heat, cudaStream_t s) {
+    off_fetch_plan_win_kernel<<<1, 32, 0, s>>>(blob, n, row, GM, top, S, key0, host, hstride, st, fl, n_fl, cnt, heat);
 }
 
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s) {

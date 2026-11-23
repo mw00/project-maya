@@ -138,6 +138,10 @@ DRAFT_TOKEN_BYTES = 4096                            # its 2 rings, its attention
                                                     # (its attention's logits in shared memory: no scratch a token)
 
 
+OFF_WIN_STAGE_GIB = 0.7                             # the offload path's verify window: 64 staging slots a slot size
+DRAFT_MIN_ROWS = 65536                              # the fewest context rows the engine plans for the drafter there
+
+
 def draft_gib(ctx: int) -> float:
     """GiB the drafter takes beside the model at `ctx` (maya-ik2's draft_room: it sees the whole context)."""
     return DRAFT_BASE_GIB + ctx * DRAFT_TOKEN_BYTES / GIB
@@ -149,20 +153,33 @@ def draft_fits(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> bool:
     A card whose VRAM is not known: True (the engine measures)."""
     if not vram_gb:
         return True
-    return plan(vram_gb, ctx, kv)["resident"] and float(vram_gb) - MARGIN_GIB >= need_gib(ctx, kv) + draft_gib(ctx)
+    p = plan(vram_gb, ctx, kv)
+    if p["resident"]:    # (its context rows FP16, else FP8: half of them)
+        return float(vram_gb) - MARGIN_GIB >= need_gib(ctx, kv) + draft_gib(ctx) - ctx * DRAFT_TOKEN_BYTES / GIB / 2
+    # the offload path with the whole cache in VRAM: the tier gives the drafter's room, at most half of its own - the
+    # verify window's staging and at least DRAFT_MIN_ROWS of FP8 context rows (the last positions) with it
+    least = DRAFT_BASE_GIB + OFF_WIN_STAGE_GIB + min(ctx, DRAFT_MIN_ROWS) * DRAFT_TOKEN_BYTES / GIB / 2
+    return not p["kv_streamed"] and (p["tier_gib"] + OFF_ROOM_GIB + MARGIN_GIB) / 2 >= least   # (the engine measures)
 
 
 def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hip: bool = False,
                         apu: bool = False) -> str | None:
     """Why drafting is off on this card (one line), or None: NVIDIA Volta / Turing (sm_70 / sm_75: the drafter's window
-    needs sm_80 or newer) and the offload path (the card does not hold every expert, NVIDIA or AMD) run without it;
-    NVIDIA sm_80+ and AMD with every expert in VRAM keep it (an AMD APU always).  An arch or VRAM not known counts as
-    not a reason."""
+    needs sm_80 or newer) run without it.  The offload path (the card does not hold every expert: a small card, or a
+    long context) drafts where its whole cache stays in VRAM and the experts' tier has the drafter's room: on AMD as
+    everywhere (--drafting auto measures it), on NVIDIA with --drafting on only (auto keeps plain decoding there - its
+    window is not measured against lane parity yet).  NVIDIA sm_80+ and AMD with every expert in VRAM keep it (an AMD
+    APU always).  An arch or VRAM not known counts as not a reason."""
+    off_cache = ("drafting off: at this context part of the cache streams from RAM, where drafting does not run - a "
+                 "smaller context or a bigger card brings it back")
+    off_room = ("drafting off: at this context the experts' tier has no room for the drafter - a smaller context or a "
+                "bigger card brings it back")
     if hip:
         if apu or not vram_gb or plan(vram_gb, ctx, kv)["resident"]:
             return None
-        return ("drafting off: the card does not hold every expert at this context (the offload path), where drafting "
-                "does not run - a smaller context or a bigger card brings it back")
+        if plan(vram_gb, ctx, kv)["kv_streamed"]:
+            return off_cache
+        return None if draft_fits(vram_gb, ctx, kv) else off_room
     try:
         cc = int(arch)
     except (TypeError, ValueError):
@@ -170,8 +187,12 @@ def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hi
     if 0 < cc < 80:
         return "drafting off: this GPU (Volta / Turing) has no drafting for this model - every token comes from a full model step"
     if vram_gb and not plan(vram_gb, ctx, kv)["resident"]:
-        return ("drafting off: the card does not hold every expert at this context (the offload path), where drafting "
-                "does not run - a smaller context or a bigger card brings it back")
+        if plan(vram_gb, ctx, kv)["kv_streamed"]:
+            return off_cache
+        if not draft_fits(vram_gb, ctx, kv):
+            return off_room
+        return ("drafting off with --drafting auto: the card does not hold every expert at this context (the offload "
+                "path) - --drafting on drafts there (the same answers; not measured against plain decoding by auto yet)")
     return None
 
 

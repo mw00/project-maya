@@ -100,6 +100,13 @@ void off_lane_wait(LaneState* ls, const LaneDone* done, int C, float* y, cudaStr
 /// heat (null: not counted): heat[key0 + top[i]] += 1.  One launch of one warp.
 void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
                     OffStage st, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s);
+/// off_fetch_plan for a verify window (drafting on the offload path): the window's picks grouped by expert
+/// (group_route's blob / n / row [S][GM], top [S] the picks) - a group the tier does not hold found in staging or
+/// listed for one copy, its blob filled.  fl [n_fl]: the copies in runs of kOffMaxK (an off_fetch_copy each);
+/// st.n >= S.  The experts' bytes are the tier's, so the window's kernels give the token path's results.
+void off_fetch_plan_win(const uint8_t** blob, const int* n, const int* row, int GM, const int* top, int S, int key0,
+                        const uint8_t* host, size_t hstride, OffStage st, OffFetch* fl, int n_fl, OffCount* cnt,
+                        uint32_t* heat, cudaStream_t s);
 /// The listed copies (an expert's `bytes` each, bytes % 16 == 0), host-mapped memory to VRAM, 16 bytes a thread at
 /// a time; blocks: the grid.
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s);

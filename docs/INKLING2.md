@@ -367,6 +367,19 @@ position) they are kept in FP8 (2 KiB; `IK2_DRAFT_KV=f16|fp8` decides instead), 
 262,144 tokens with the FP8 cache (1.0 GiB; `tools/ik2_fit.py` `draft_gib`: 0.86 GiB + 4 KiB a token for FP16
 rows). The Monitor's Speculation shows the drafts kept (STAT `draft_acc` / `draft_off`, `draft_ms`, `verify_ms`).
 
+Past what a card holds with every expert (524,288 and 1,048,576 tokens on a 24 GB card, any context on a smaller
+one) the experts have already left VRAM for the cache (the offload path), and the drafter's room comes from their
+tier: at most half of the tier's room, with the verify window's own staging (64 slots a slot size, 0.7 GiB) - the
+context, the cache and the pictures' room stay as without it. Its context rows are planned with the context: FP16,
+else FP8, else FP8 rows of the last positions only (half the context, a quarter .. 65,536: the drafts read less far
+back, the model checks every token as ever; the start line says it). The window there is the token path's mode A
+(the resident kernels over the tier's, a lent or a staged expert's bytes - `off_fetch_plan_win` copies a window's
+missing experts once for all its tokens), so drafting on = off to the token there too. It runs on one GPU with the
+whole cache in VRAM: where part of the cache streams from RAM, on two GPUs and under lane parity (`IK2_LANE` by hand)
+drafting stays off with a NOTE. AMD: `--drafting auto` measures it as everywhere. NVIDIA: `--drafting on` takes it
+(mode A instead of lane parity); `auto` keeps plain decoding on the offload path until the window is measured
+against lane parity on those cards.
+
 Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
 document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens - the recent share of
 the drafts kept at each draft position, each given the one before it (`IK2_DRAFT_POLICY=geo`: one acceptance a,
