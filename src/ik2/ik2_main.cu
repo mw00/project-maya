@@ -368,6 +368,7 @@ FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int
 // walls of the sections including any idle the issue latency inserts. The "start" spans are the per-visit
 // gaps (the idle between a visit's conv4_res and the next visit's first attention work).
 static bool g_events = false;
+static bool g_evx_fine = false;
 static cudaEvent_t g_evx_s[1024], g_evx_c[1024];
 static const char* g_evx_tag[1024];
 static int g_evx_n = 0;
@@ -394,20 +395,21 @@ static void evx_print(double wall_s) {
         cudaEventElapsedTime(&b, g_t0_c, g_evx_c[i]);
         t[i] = a > b ? a : b;
     }
-    const char* names[6] = {"start", "attn", "route", "experts", "rest", "upload"};
-    double tot[6] = {0};
-    int cnt[6] = {0};
+    const char* names[18] = {"start", "attn", "route", "experts", "rest", "upload", "qkv", "prep", "relb",
+                             "flash", "wo", "qf", "cf", "qw", "kw", "kc", "vw", "vc"};
+    double tot[18] = {0};
+    int cnt[18] = {0};
     std::printf("events (GPU timeline, %d points, wall %.2f s):\n", g_evx_n, wall_s);
     for (int i = 1; i < g_evx_n; ++i) {
         const double span = t[i] - t[i - 1];
         int k = -1;
-        for (int j = 0; j < 6; ++j)
+        for (int j = 0; j < 18; ++j)
             if (std::strcmp(g_evx_tag[i], names[j]) == 0) k = j;
         if (k >= 0) tot[k] += span, ++cnt[k];
-        if (i <= 25) std::printf("  %7.3f ms %s\n", span, g_evx_tag[i]);
+        if (i <= 25 || g_evx_fine) std::printf("  %7.3f ms %s\n", span, g_evx_tag[i]);
     }
     std::printf("  events totals:");
-    for (int j = 0; j < 6; ++j)
+    for (int j = 0; j < 18; ++j)
         if (cnt[j]) std::printf(" %s=%.1f ms (%d)", names[j], tot[j], cnt[j]);
     std::printf(" | gpu span %.1f ms\n", t[g_evx_n - 1] - t[0]);
 }
@@ -1566,6 +1568,7 @@ void kv_swing(Model& M, bool to_host, int pos) {
 void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const float* h_in, const int* pos_p, int nb,
                     size_t blk_off, float* r_out, Work& W, const float* msg = nullptr) {
     const Config& c = M.c;
+    const bool evx_fine = g_evx_fine && T > 1;
     const int C = c.C;
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + ((size_t) i * W.blk_ld + blk_off) * C; };
@@ -1651,6 +1654,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                     unpack_segments(W.qkv, T, {{W.q, HD}, {W.kk, KD}, {W.vv, KD}, {W.rr, HR}, {W.gate, HD}}, g_s);
             }
             if (!has_sink) gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            if (evx_fine) evx_rec("qf");
         } else {
             matmul(Ly.wq, in_q, W.x16, T, q_p, HD);
             matmul(Ly.wk, in_k, xk16, T, k_p, KD);
@@ -1658,14 +1662,17 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             matmul(Ly.wr, in_q, W.x16, T, r_p, HR);
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
             gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            if (evx_fine) evx_rec("qf");
         }
         conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
         conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
         k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
         k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
+        if (evx_fine) evx_rec("cf");
     } else {
         if (Ly.wqrg.N > 0) {
             matmul(Ly.wqrg, in_q, W.x16, T, W.qkv, Ly.wqrg.N);
+            if (evx_fine) evx_rec("qw");
             const bool has_sink = !g_dense_q8;
             if (T == 1) {
                 q_p = W.qkv;
@@ -1685,6 +1692,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
             gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         }
+        if (evx_fine && !g_dense_q8) evx_rec("kw");
         if (!g_dense_q8) {
             const int off_k = T == 1 ? Ly.wqrg.N : 0;
             const int off_v = T == 1 ? Ly.wqrg.N + Ly.wk_dyn.N : 0;
@@ -1712,16 +1720,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             gemm16(Ly.sc_k_dyn16, c.KV * 4, C, xk16, T, kd_p, c.KV * 4);
             conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
             k::conv4(k_p, Ly.h_k, Ly.sc_k, kd_p, c.KV, T, KD, W.kconv, g_s);
+            if (evx_fine) evx_rec("kc");
 
             matmul(Ly.wv, in_v, xv16, T, v_p, KD);
+            if (evx_fine) evx_rec("vw");
             gemm16(Ly.sc_v_dyn16, c.KV * 4, C, xv16, T, vd_p, c.KV * 4);
             conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
             k::conv4(v_p, Ly.h_v, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv, g_s);
+            if (evx_fine) evx_rec("vc");
         }
     }
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
     const float v_scale = 32.0f;
     const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
+    if (evx_fine) evx_rec("qkv");
     if (g_kv_q4) {
         k::prep_qkv_r_q4(q_p, Ly.q_clip, W.kconv, Ly.kc4, W.vconv, Ly.vc4, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                          c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
@@ -1735,6 +1747,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, g_s);
     }
+    if (evx_fine) evx_rec("prep");
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
     const int window = Ly.sliding ? c.window : (1 << 30);
@@ -1825,6 +1838,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, Tq * c.H, c.d_rel, &one_f, Ly.rel_proj,
                                 CUDA_R_32F, c.d_rel, r_p + (size_t) ts * HR, CUDA_R_32F, c.d_rel, &zero_f, W.relb,
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+                if (evx_fine) evx_rec("relb");
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
                 if (g_kv_q4)
@@ -1840,6 +1854,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                       pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
                                       W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
             }
+            if (evx_fine) evx_rec("flash");
         } else
         for (int ts = 0; ts < T;) {
             const int k0_s = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
@@ -1925,6 +1940,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (staged) Ly.kc = kc_h, Ly.vc = vc_h, Ly.kc8 = kc8_h, Ly.vc8 = vc8_h;
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
+    if (evx_fine) evx_rec("wo");
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
@@ -6220,6 +6236,7 @@ int main(int argc, char** argv) {
     use_dev(0);
     g_overlap = !getenv("IK2_OVERLAP") || std::atoi(getenv("IK2_OVERLAP"));
     g_events = getenv("IK2_EVENTS") && std::atoi(getenv("IK2_EVENTS"));
+    g_evx_fine = getenv("IK2_EVENTS") && std::atoi(getenv("IK2_EVENTS")) >= 2;
     if (g_events) {
         CU(cudaEventCreate(&g_t0_s));
         CU(cudaEventCreate(&g_t0_c));
