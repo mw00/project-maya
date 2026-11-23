@@ -819,6 +819,15 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     set_tests_properties(ds4_iq512_rows PROPERTIES ENVIRONMENT DS4_IQ512=1 TIMEOUT 120)
     add_test(NAME ds4_iq512_rows_default COMMAND ds4_iq512_rows_test)
     set_tests_properties(ds4_iq512_rows_default PROPERTIES TIMEOUT 120)
+    # the CPU lane's own rows for AVX without AVX2 (Sandy / Ivy Bridge: IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S) bit for bit
+    # against ggml-cpu's dot, one thread, no GPU: forced on from one token, and this CPU's default choice; --bench
+    add_executable(ds4_iq_avx1_rows_test tests/ds4_iq_avx1_rows_test.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_iq_avx1_rows_test PRIVATE third_party/ggml)
+    target_link_libraries(ds4_iq_avx1_rows_test PRIVATE maya_kernels_cpu)
+    add_test(NAME ds4_iq_avx1_rows COMMAND ds4_iq_avx1_rows_test)
+    set_tests_properties(ds4_iq_avx1_rows PROPERTIES ENVIRONMENT DS4_IQ_OWN=1 TIMEOUT 300)
+    add_test(NAME ds4_iq_avx1_rows_default COMMAND ds4_iq_avx1_rows_test)
+    set_tests_properties(ds4_iq_avx1_rows_default PROPERTIES TIMEOUT 300)
     # the i-quant pieces on the host (no GPU): IQ1_M's code table (ds4_iq1_codes.hpp, the persistent device kernels'
     # decode) and IQ1_S's codes against ggml's own values bit for bit, IQ4_NL experts on the CPU lane against ggml-cpu's
     # dot bit for bit
