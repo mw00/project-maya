@@ -111,7 +111,9 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
             const int c = h;
             h = (h + 1 == dc.n) ? 0 : (h + 1);
             if (dc.used[c] == seq) continue;
-            if (dc.owner[c] < 0) {
+            const int oc = dc.owner[c];   // (PF-B': the pin - the decode never evicts the pinned pairs)
+            if (oc >= 0 && dc.pin && dc.pin[oc]) continue;
+            if (oc < 0) {
                 v = c;
                 break;
             }

@@ -120,6 +120,7 @@ struct OffCache {
     int* hand = nullptr;           // [1] clock hand in [0..n)
     int max_freq = 7;              // saturating frequency cap
     int ghost_win = 0;             // ghost window in evictions
+    const uint8_t* pin = nullptr;   // shared [n_layer*E] the pinned pairs the decode never evicts (PF-B': IK2_PIN_M)
 };
 
 /// Dynamic GPU-side cache lookup + Clock-LFU eviction + fetch list generation (one warp, zero host sync).

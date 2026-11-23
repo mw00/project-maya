@@ -1972,6 +1972,7 @@ struct OffState {
     std::vector<k::OffCache> dcache;    // [EC.pools.size()] GPU-side dynamic cache pools (IK2_OFF_DYNAMIC=1)
     int* dcache_loc = nullptr;          // shared [n_layer * E] device loc table
     uint32_t* dcache_ghost = nullptr;   // shared [n_layer * E] device ghost table
+    uint8_t* dcache_pin = nullptr;      // shared [n_layer * E] device pin table (PF-B': IK2_PIN_M)
     // (prompts: the staging slots as a ring - an event a slot for its copy, one for the expert that read it)
     std::vector<std::vector<cudaEvent_t>> ring_free, ring_full;
     std::vector<int> ring_hand;
@@ -7704,6 +7705,41 @@ int main(int argc, char** argv) {
             CU(cudaMemset(g_offs.dcache_ghost, 0, n_keys * sizeof(uint32_t)));
             const int mf = getenv("IK2_MAX_FREQ") ? std::clamp(std::atoi(getenv("IK2_MAX_FREQ")), 1, 63) : 7;
             const int gmult = getenv("IK2_GHOST_MULT") ? std::max(1, std::atoi(getenv("IK2_GHOST_MULT"))) : 2;
+            const char* penv = getenv("IK2_PIN_M");   // (PF-B': the eviction pin - the decode's Clock-LFU walk skips the pinned pairs)
+            int pin_m = penv && *penv ? std::clamp(std::atoi(penv), 0, (int) n_keys) : 0;
+            if (pin_m > 0) {
+                std::vector<uint64_t> pcnt((size_t) c.n_layer * c.E, 0);
+                const char* wfp = getenv("IK2_WARM");
+                if (wfp && *wfp) {
+                    FILE* pin_in = std::fopen(wfp, "rb");
+                    int32_t ph[2] = {0, 0};
+                    if (pin_in && std::fread(ph, 4, 2, pin_in) == 2 && ph[0] == c.n_layer && ph[1] == c.E &&
+                        std::fread(pcnt.data(), 8, pcnt.size(), pin_in) == pcnt.size()) {}
+                    else std::printf("pin: the profile read failed; the pin stays off\n");
+                    if (pin_in) std::fclose(pin_in);
+                }
+                std::vector<int> rid;
+                for (int k2 = 0; k2 < n_keys; ++k2)
+                    if (EC.loc[k2] >= 0 && pcnt[k2] > 0) rid.push_back(k2);
+                std::stable_sort(rid.begin(), rid.end(), [&](int a, int b) { return pcnt[a] > pcnt[b]; });
+                std::vector<uint8_t> pinh((size_t) c.n_layer * c.E, 0);
+                std::vector<int> pinned(EC.pools.size(), 0);
+                int np = 0;
+                for (int k2 : rid) {
+                    const size_t pp = (size_t) EC.layer_pool[k2 / c.E];
+                    if (pinned[pp] >= EC.pools[pp].n_slots - 4) continue;   // (the walk must always find a victim)
+                    if (np >= pin_m) break;
+                    pinh[k2] = 1;
+                    ++pinned[pp];
+                    ++np;
+                }
+                if (np > 0) {
+                    g_offs.dcache_pin = dalloc<uint8_t>((size_t) c.n_layer * c.E);
+                    CU(cudaMemcpy(g_offs.dcache_pin, pinh.data(), (size_t) c.n_layer * c.E, cudaMemcpyHostToDevice));
+                }
+                std::printf("pin: %d pairs pinned (pool0 %d, pool1 %d)\n", np, pinned.size() > 0 ? pinned[0] : 0,
+                            pinned.size() > 1 ? pinned[1] : 0);
+            }
             g_offs.dcache.resize(EC.pools.size());
             for (size_t p = 0; p < EC.pools.size(); ++p) {
                 const auto& P = EC.pools[p];
@@ -7713,6 +7749,7 @@ int main(int argc, char** argv) {
                 dc.n = P.n_slots;
                 dc.loc = g_offs.dcache_loc;
                 dc.ghost = g_offs.dcache_ghost;
+                dc.pin = g_offs.dcache_pin;   // (PF-B': the pin table, IK2_PIN_M)
                 dc.owner = dalloc<int>(P.n_slots);
                 dc.used = dalloc<uint32_t>(P.n_slots);
                 dc.freq = dalloc<uint8_t>(P.n_slots);
