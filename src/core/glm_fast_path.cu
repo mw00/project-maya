@@ -883,12 +883,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         cudaEventCreateWithFlags(&F->ev_pred, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pf, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pf_prev, cudaEventDisableTiming) != cudaSuccess ||
-        cudaEventCreateWithFlags(&F->ev_done, cudaEventDisableTiming) != cudaSuccess) {
+        cudaEventCreateWithFlags(&F->ev_done, cudaEventDisableTiming) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&F->shs, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&F->ev_shx, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&F->ev_shd, cudaEventDisableTiming) != cudaSuccess) {
         err = "glm fast: streams/events did not create";
         return false;
     }
     // an EXL3 pack: its kernels' scratch on the compute stream now (a graph capture cannot allocate it)
-    if (exl3_ && !maya::kernels::exl3::prepare(F->cs)) {
+    if (exl3_ && (!maya::kernels::exl3::prepare(F->cs) || !maya::kernels::exl3::prepare(F->shs))) {
         err = "glm fast: the EXL3 scratch did not allocate";
         return false;
     }
@@ -4985,6 +4988,9 @@ void Glm5Model::fast_destroy() {
     if (F->ps) cudaStreamSynchronize(F->ps);
     if (F->ev_hop) cudaEventDestroy(F->ev_hop);
     if (F->ev_done) cudaEventDestroy(F->ev_done);
+    if (F->shs) cudaStreamSynchronize(F->shs), cudaStreamDestroy(F->shs);
+    if (F->ev_shx) cudaEventDestroy(F->ev_shx);
+    if (F->ev_shd) cudaEventDestroy(F->ev_shd);
     if (F->ev_pred) cudaEventDestroy(F->ev_pred);
     if (F->ev_pf) cudaEventDestroy(F->ev_pf);
     if (F->ev_pf_prev) cudaEventDestroy(F->ev_pf_prev);
@@ -6965,6 +6971,25 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wa
     j[0] = {Ly.router_w, nullptr, F->x, F->rlog, nullptr, 1.0f, Ly.router_type, g.n_embd, g.n_expert};
     j[1] = {Ly.sh_gate.q, F->xq, F->x, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
     j[2] = {Ly.sh_up.q, F->xq, F->x, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
+    // MAYA_GLM_SHEXP_SIDE=1: the shared expert on the side stream (its gate/up, the swiglu the route's other blocks
+    // did, its down into sh_out), the router and the routed experts on this one; moe_down waits for it (ev_shd)
+    static const bool side_env = [] {
+        const char* v = getenv("MAYA_GLM_SHEXP_SIDE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    F->sh_side = side_env && Ly.exl3 && Ly.sh_gate.q != nullptr && Ly.sh_up.q != nullptr && Ly.sh_down.q != nullptr &&
+                 !F->kda_graph_on && F->shs != nullptr;
+    if (F->sh_side) {
+        cudaEventRecord(F->ev_shx, s);
+        cudaStreamWaitEvent(F->shs, F->ev_shx, 0);
+        if (!gf::mv(&j[1], 2, F->shs)) { err = "glm fast: shared expert gate/up"; return false; }
+        gf::swiglu_q8(F->sh_g, F->sh_u, g.swiglu_shexp, FFs, F->sh_hq, F->shs);
+        const gf::MvJob sd = {Ly.sh_down.q, F->sh_hq, nullptr, F->sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs,
+                              g.n_embd};
+        if (!gf::mv(&sd, 1, F->shs)) { err = "glm fast: shared expert down"; return false; }
+        cudaEventRecord(F->ev_shd, F->shs);
+        nj = 1;
+    }
     // the next layer's router on THIS layer's FFN input: its experts, one layer early
     // (only with prefetch on: the prediction costs a router GEMV and a second top-k per layer; glm-dsa request knobs: GEN
     // prefetch_n= for this request, else MAYA_GLM_PREFETCH_N's F->max_pf)
@@ -7014,7 +7039,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     const int max_pf = pred ? glmknob::get(glmknob::PrefetchN, F->max_pf) : 0;
     static const int near_n = getenv("MAYA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
     gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
-                  g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
+                  g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, F->sh_side ? 0 : FFs, sh_hq, F->cs,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
                   il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
@@ -7096,7 +7121,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     if (Ly.exl3) {
         // EXL3: the shared expert's down first (its h is moe_route's q8_1), then the routed experts' gate/up/swiglu
         // and down over the F32 FFN input, summed in plan order with the CPU lane's part and the shared expert
-        if (Ly.sh_down.q != nullptr) {
+        if (Ly.sh_down.q != nullptr && !F->sh_side) {
             const gf::MvJob sd = {Ly.sh_down.q, F->sh_hq, nullptr, F->sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs,
                                   g.n_embd};
             if (!gf::mv(&sd, 1, s)) { err = "glm fast: shared expert down"; return false; }
@@ -7113,6 +7138,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
         xa.limit = g.swiglu_exp;
         maya::kernels::exl3::moe_gate_up(xa, io.x, nullptr, s);
         if (F->prof_on) F->mark("moe_gate_up");
+        if (F->sh_side) cudaStreamWaitEvent(s, F->ev_shd, 0), F->sh_side = false;
         maya::kernels::exl3::moe_down(xa, nullptr, Ly.sh_down.q != nullptr ? F->sh_out : nullptr, io.ffn, s);
         if (F->prof_on) F->mark("moe_down");
     } else {
@@ -7268,7 +7294,20 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             j[3] = {Ly.f_a, nullptr, F->x, pfa, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
             j[4] = {Ly.g_a, nullptr, F->x, pga, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
             j[5] = {Ly.beta, nullptr, F->x, pbeta, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_head};
-            if (!gf::mv(j, 6, s)) { err = "glm fast: kda projections"; return false; }
+            // MAYA_GLM_SHEXP_SIDE: the three small BF16 projections (f_a, g_a, beta) on the side stream beside the
+            // q / k / v launch - kda_prep is the first reader of either (the same kernels, the same bits)
+            static const bool kda_side = [] {
+                const char* v = getenv("MAYA_GLM_SHEXP_SIDE");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            if (kda_side && !F->kda_graph_on && F->shs != nullptr) {
+                cudaEventRecord(F->ev_shx, s);
+                cudaStreamWaitEvent(F->shs, F->ev_shx, 0);
+                if (!gf::mv(&j[3], 3, F->shs)) { err = "glm fast: kda projections"; return false; }
+                cudaEventRecord(F->ev_shd, F->shs);
+                if (!gf::mv(j, 3, s)) { err = "glm fast: kda projections"; return false; }
+                cudaStreamWaitEvent(s, F->ev_shd, 0);
+            } else if (!gf::mv(j, 6, s)) { err = "glm fast: kda projections"; return false; }
             if (F->prof_on) F->mark("kda_proj_mv");
             gf::KdaPrepArgs k;
             for (int i = 0; i < 3; ++i) {

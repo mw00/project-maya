@@ -472,6 +472,11 @@ struct Glm5Model::FastState {
     bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
+    // MAYA_GLM_SHEXP_SIDE: an EXL3 MoE layer's shared expert (gate/up, swiglu, down) on its own stream beside the
+    // router, the route and the routed gate/up - the same kernels and bits, joined before the routed down adds it
+    cudaStream_t shs = nullptr;
+    cudaEvent_t ev_shx = nullptr, ev_shd = nullptr;
+    bool sh_side = false;   // (this layer's route leaves the shared swiglu to the side stream)
     int max_pf = 0;   // MAYA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
     unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
