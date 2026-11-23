@@ -1,5 +1,5 @@
 """tools/test_bench.py - --bench (maya.py, tools/maya_bench.py): the engine binary on HIP, the requests, and the
-speed-test standard's parsing, medians, result line, quiet check and A/B parts. No GPU, no network, no engine process.
+speed-test standard's parsing, medians, result line, quiet check and A/B parts. No GPU, no network, no engine process (a few lines of Python stand in for one).
 
     python -m unittest tools.test_bench -v
 """
@@ -233,6 +233,65 @@ class BenchStandard(unittest.TestCase):
         self.assertEqual(MB.drafting_choice([], {}, ["glm mtp: CUDA0 the MTP decode drafts"], [], "glm"), "MTP")
         self.assertEqual(MB.drafting_choice([], {}, ["dspark: x"], [], "ik2"), "no drafting")
         self.assertEqual(MB.drafting_choice([], {}, ["dspark: 3 drafts"], [], "deepseek"), "DSpark")
+
+    def test_drafting_choice_of_a_first_start(self):
+        # (the plan line names every source the engine loaded; the measurement's line says what was kept)
+        plan = "drafting: the drafter and the prompt lookup, 1.54 GiB of VRAM from the experts' tier with the window's"
+        going = "NOTE maya-ik2: measuring this PC once, before the first answer: drafting (3 requests, 128 tokens each)"
+        done = ("NOTE maya-ik2: measured this PC once in 41 s: drafting - no drafting (no drafting 21.4, the prompt "
+                "lookup 7.5, the drafter 8.0, both 7.9 tokens/s); plain decoding was timed in lane parity")
+        self.assertEqual(MB.drafting_choice(["--drafting", "auto"], {}, [plan, going, done], []), "no drafting")
+        self.assertEqual(MB.drafting_choice([], {}, [plan, going, done.replace("- no drafting (", "- the drafter (")],
+                                            []), "the drafter")
+        self.assertEqual(MB.drafting_choice([], {}, [plan, going], []), "measuring")
+        # (the two-run measurement: the start's own line comes last and is the choice)
+        kept = "drafting: no drafting - the fastest on this PC (measured 2026-11-23: no drafting 21.4, ...)"
+        self.assertEqual(MB.drafting_choice([], {}, [going, done, kept], []), "no drafting")
+        self.assertEqual(MB.drafting_choice([], {}, [plan], []), "the drafter and the prompt lookup")
+
+    def test_the_log_keeps_the_start_lines(self):
+        # (a stand-in engine that writes its start lines to stdout only, as maya-ik2 does on Windows)
+        code = ("import sys\n"
+                "print('expert cache, GPU 0: 590 slots', flush=True)\n"
+                "print('drafting: no drafting - the fastest on this PC', flush=True)\n"
+                "print('a note on stderr', file=sys.stderr, flush=True)\n"
+                "print('READY', flush=True)\n"
+                "sys.stdin.readline()\n")
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "maya-bench.log"
+            sess = MB.Session([sys.executable, "-c", code], None, td, log)
+            self.assertEqual(sess.lines, ["expert cache, GPU 0: 590 slots",
+                                          "drafting: no drafting - the fastest on this PC"])
+            sess.close()
+            sess.p.stdin.close(), sess.p.stdout.close()
+            text = log.read_text(encoding="utf-8")
+            for want in sess.lines + ["a note on stderr"]:
+                self.assertIn(want, text)
+            self.assertNotIn("READY", text)
+
+    def test_a_lock_taken_by_hand(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(MB, "LOCK_DIRS", (td,)), \
+                patch.object(MB, "_out", return_value=""), patch.object(MB, "cpu_load_now", return_value=None), \
+                patch.object(MB, "HOT_FLAGS", ()), patch.dict(MB.os.environ, {"MAYA_HOT_FLAG": "", "MAYA_GPU_LOCKS": "",
+                                                                              "MAYA_BENCH_LOCK_OK": ""}):
+            lock = Path(td) / "gpu0"
+            lock.write_text("mine, by hand\n")
+            why = MB.machine_quiet("cuda", [0])                       # (the default: strict)
+            self.assertEqual(why, [f"GPU lock {lock} is held: mine, by hand"])
+            self.assertEqual(MB.machine_quiet("cuda", [0], lock_ok=True), [])
+            self.assertEqual(MB.wait_quiet("cuda", [0], 0, lambda *a: None, lock_ok=True), [])
+            self.assertFalse(MB.lock_ok_asked())
+            self.assertTrue(MB.lock_ok_asked(True))
+            with patch.dict(MB.os.environ, {"MAYA_BENCH_LOCK_OK": "1"}):
+                self.assertTrue(MB.lock_ok_asked())
+            with patch.dict(MB.os.environ, {"MAYA_BENCH_LOCK_OK": "0"}):
+                self.assertFalse(MB.lock_ok_asked())
+            # (the run takes no lock that is there and releases only its own: the hand-made one stays)
+            taken = MB.take_locks("cuda", [0, 1], "bench note")
+            self.assertEqual([p.name for p in taken], ["gpu1"])
+            MB.release_locks(taken + [lock], "bench note")
+            self.assertEqual(sorted(p.name for p in Path(td).iterdir()), ["gpu0"])
+            self.assertEqual(lock.read_text(), "mine, by hand\n")
 
     def test_exactness(self):
         self.assertIsNone(MB.first_difference([1, 2, 3], [1, 2, 3]))
