@@ -20,7 +20,7 @@ yet):
 | MoE | 384 experts, 8 a token, no shared expert, width 2,304; sigmoid router with a selection bias, the weights normalized x 8; SwiGLU with softcaps (gate 4, up 25) |
 | Head | logits softcapped at 30, the first 200,058 of 201,024 rows real |
 | Weights shipped | experts NVFP4 (layers 0-39: e2m1 x e4m3 per 16 x amax / 2688 per expert) and MXFP8 (40-47); the rest BF16 |
-| Extras | a DSpark-style drafter (`mtp.safetensors`, 5 layers: drafting, set up by default); a vision tower |
+| Extras | a DSpark-style drafter (`mtp.safetensors`, or a GGUF of it; 5 layers: drafting, set up by default); a vision tower |
 
 ## 2. The file: llama.cpp's `inkling2` GGUF
 
@@ -379,9 +379,17 @@ whole cache in VRAM: where part of the cache streams from RAM and under lane par
 stays off with a NOTE. On two GPUs (the split) GPU 1 runs its share of a window as it does a token's: the window's
 inputs and picks go over, are grouped there against GPU 1's table and run with the same window kernels, and its rows
 come back (`two_send_win` / `two_take_rows_g`) - every row the token path's wherever its expert sits, so drafting
-there gives the split's plain answers, and `--drafting auto` measures it (the split decodes in mode A anyway). AMD: `--drafting auto` measures it as everywhere. NVIDIA: `--drafting on` takes it
-(mode A instead of lane parity); `auto` keeps plain decoding on the offload path until the window is measured
-against lane parity on those cards.
+there gives the split's plain answers (the split decodes in mode A anyway). `--drafting auto` measures it once on the
+PC as everywhere. On one NVIDIA card, where plain
+decoding on the offload path is lane parity wherever that is the faster mode, the measurement times plain decoding in
+that mode against drafting in mode A and keeps the faster; the choice is remembered with the drafting calibration, so
+every start decodes in the same mode (the start line says which, and the figures), and `--drafting on` / `off` still
+decide by hand (mode A with drafting / plain decoding).
+
+Deep in a long context a window can cost more than the plain tokens it gives. The controller times an answer's
+drafting rounds against its plain tokens at the depth the answer is at, and where the rounds give fewer tokens a
+second the answer goes on in plain tokens, with a rare look again (`IK2_DRAFT_GATE=0`: without). Only the speed
+changes: the tokens are the same with drafting or without.
 
 Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
 document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens - the recent share of
@@ -452,8 +460,8 @@ those picks' places before the sum - so every row and the sum's order are one ca
 on which card holds an expert (two cards of one kind: the one-card offload path's answers, checked on the CLI and the
 server's answers, tool calls, pictures and loop guard). Copies between the cards: peer to peer only where the driver
 offers it, the IOMMU translates neither card and a test copy at load arrives intact, else through pinned host memory
-(`IK2_HOST_STAGE=1` forces that; the same answers). Drafting is off on two cards (a NOTE; not checked against plain
-decoding there yet). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
+(`IK2_HOST_STAGE=1` forces that; the same answers). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
+rows sent back - the split's plain answers; `--drafting auto` measures it). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
 tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
 second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers one card (two
 are untested there). CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list (`-DMAYA_IK2_WINDOWS=OFF`:
@@ -484,7 +492,8 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 |---|---|---|
 | `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
 | `mmproj-Inkling-2-Mini-BF16.gguf` (0.6 GB, pictures; unsloth's `mmproj-BF16.gguf` byte for byte, an existing copy is kept) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`vision/`) | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
-| `mtp.safetensors` (0.6 GB, the drafter: the setup fetches it, not with `--drafting off`) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
+| `dspark-Inkling-2-Mini-Q8_0.gguf` (0.4 GB, the drafter as a GGUF, Q8_0: the setup fetches it, on NVIDIA and on AMD, not with `--drafting off`; unsloth's file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773` |
+| `mtp.safetensors` (0.6 GB, the same drafter as published, BF16: what earlier setups fetched, still read where it is; thinkingmachines' file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
 Outside the preview, the older two-GPU mode with a loop runs as expert parallel (`IK2_EP=1`, its caches filled at the
 start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; refused where the copies between the cards would have to go

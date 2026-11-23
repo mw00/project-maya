@@ -1874,6 +1874,8 @@ bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at 
 // Drafting on the offload path (a long context on a card that then keeps a tier of the experts): the verify window
 // takes the token path's mode A arithmetic - the resident kernels over the tier's or staging's bytes - so it runs
 // where mode A decodes (not lane parity, whose sums are ik2_exact.h's), with the whole cache in VRAM, on one GPU.
+bool g_off_measure = false;        // the plan: --drafting auto there, not measured yet - plain decoding in its own mode
+                                   // (lane parity where it is the default) against drafting in mode A, once
 bool g_off_draft = false;          // the plan: drafting on the offload path (then mode A)
 constexpr int kOffWin = 64;        // a window's picks at most (8 tokens of 8)
 int g_draft_kv8 = -1;              // the plan's choice of the drafter's context rows there (1 FP8, 0 FP16; -1: the load's)
@@ -4380,15 +4382,65 @@ struct SpecCtl {
             const double v = expect(b) / c[b];
             if (v > vb) vb = v, best = b;
         }
-        if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
+        if (best == 1 && plain_run >= look_every(bmax)) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
         return best;
     }
+    // the plain tokens before a look: `probe`, and where a look's window is measured to cost more than the tokens it
+    // gives would in plain, as many as keep the looks to a fiftieth of the time (the gate, below)
+    int look_every(int bmax) const {
+        if (!gate || !adapt) return probe;
+        const int pw = std::min(probe_w, bmax);
+        const double over = c[pw] - expect(pw) * c_plain;
+        return (int) std::clamp(over / (0.02 * c_plain), (double) probe, 4096.0);
+    }
     void took_plain(double t) {
-        c_plain = 0.9 * c_plain + 0.1 * t;
+        if (fresh_plain > 0) c_plain = fresh_plain == kFreshPlain ? t : std::min(c_plain, t), --fresh_plain;
+        else c_plain = 0.9 * c_plain + 0.1 * t;
         ++plain, ++plain_run;
+    }
+    // Drafting by its measured speed where the answer is (IK2_DRAFT_GATE=0: without): deep in a long context a
+    // window can cost more than the plain tokens it gives (a Radeon 250,000 tokens deep: a window of 2 the time of 4
+    // plain tokens), which the looks above then pay again every `probe` tokens.  So the answer's rounds are timed
+    // against its plain tokens at this depth - begin(): an answer far from the depth the times were measured at
+    // takes them anew (the plain token's first) - and where the rounds give fewer tokens a second the answer goes on
+    // in plain tokens (lost), with a look again only as often as the looks cost a fiftieth of its time (kPause plain
+    // tokens at least where a window took longer than as many plain tokens as it is wide), half as often after each look that loses; a look that wins drafts again.  An answer at a new depth times the narrowest
+    // window first (calib: a window of 2, the cheapest look - the other widths follow its ratio).  The decision
+    // only: the tokens are the same.
+    static constexpr int kFreshPlain = 2, kPause = 128;
+    bool gate = !(getenv("IK2_DRAFT_GATE") && !atoi(getenv("IK2_DRAFT_GATE")));
+    int depth0 = -1, fresh_plain = 0, look = 0;
+    bool lost = false, calib = false;
+    double mt = 0, mT = 0, mn = 0;   // (this answer's rounds: tokens, seconds, rounds - decayed)
+    uint64_t pauses = 0;
+    void begin(int P) {
+        lost = false, mt = mT = mn = 0, look = probe;
+        if (!gate || !adapt) return;
+        if (depth0 >= 0 && P <= depth0 + depth0 / 4 + 4096 && P >= depth0 - depth0 / 5 - 4096) return;
+        depth0 = P, fresh_plain = kFreshPlain, calib = true;
+        for (int b = 2; b <= kBlockMax; ++b)
+            if (seen[b] >= 2) seen[b] = 1;   // (the next window of the width: its time as it is here)
+    }
+    bool held() const { return gate && adapt && (fresh_plain > 0 || (lost && plain_run < look)); }
+    void measured(int B, int acc, double t) {
+        if (!gate || !adapt || seen[B] < 2 || t <= 0) return;   // (a width's first step is not its time)
+        calib = false;
+        if (lost) {
+            if ((acc + 1) / t > 1.0 / c_plain) lost = false, mt = acc + 1, mT = t, mn = 1, look = probe;
+            else look = std::min(look * 2, 4096);
+            return;
+        }
+        mt = 0.9 * mt + acc + 1, mT = 0.9 * mT + t, mn = 0.9 * mn + 1;
+        const bool wide = c[B] >= B * c_plain;   // (a window of B longer than B plain tokens: no acceptance wins)
+        if (wide || (mn >= 2.7 && mt / mT < 1.0 / c_plain)) {
+            const double over = std::max(mT / mn, c[B]) - mt / mn * c_plain;   // (a look's seconds over its tokens' in plain)
+            lost = true, ++pauses;
+            look = (int) std::clamp(over / (0.02 * c_plain), (double) (wide ? std::max(probe, kPause) : probe), 4096.0);
+        }
     }
     void took_spec(int B, int acc, double t) {
         took_width(B, t);
+        measured(B, acc, t);
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
         for (int j = 0; j + 1 < B && j <= acc; ++j)   // (draft j was reached: the j before it were kept)
             pn[j] = pos_decay * pn[j] + 1.0, pa[j] = pos_decay * pa[j] + (j < acc ? 1.0 : 0.0);
@@ -4404,7 +4456,11 @@ struct SpecCtl {
     int pick(int room, int k, int& B) {
         const int bmax = std::min(wmax, room);
         B = 1;
-        if (bmax < 2) return 0;
+        if (bmax < 2 || held()) return 0;
+        if (gate && adapt && calib) {   // (this depth's first window: the narrowest)
+            B = 2;
+            return use_model ? 1 : use_lookup && k > 0 ? 2 : (B = 1, 0);
+        }
         int src = 0;
         double vb = 1.0 / c_plain;
         if (use_lookup && k > 0) {
@@ -4418,13 +4474,14 @@ struct SpecCtl {
             const int bm = choose(room);
             if (bm >= 2) {
                 const double v = expect(bm) / c[bm];
-                if (src == 0 || v > vb || plain_run >= probe) vb = v, B = bm, src = 1;
+                if (src == 0 || v > vb || plain_run >= look_every(bmax)) vb = v, B = bm, src = 1;
             }
         }
         return src;
     }
     void took_lookup(int B, int acc, double t) {
         took_width(B, t);
+        measured(B, acc, t);
         SL = decay * SL + acc, FL = decay * FL + (acc < B - 1 ? 1 : 0);
         ++l_steps, l_drafted += B - 1, l_accepted += acc;
         plain_run = 0;
@@ -5504,6 +5561,7 @@ void decode_greedy(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, in
     const SampleCfg sc;
     std::vector<int> next;
     out.push_back(anchor);
+    ctl.begin(P);
     while ((int) out.size() < gen && P < ctx) {
         lk.append(anchor);
         const int room = std::min(gen - (int) out.size(), ctx - P);
@@ -6316,9 +6374,12 @@ int main(int argc, char** argv) {
             else if (le && *le && !lane0)
                 off_why = "IK2_LANE asks for lane parity, and the verify window has mode A's arithmetic (plain decoding)";
 #ifndef MAYA_USE_HIP
-            else if (!lane0 && drafting != "on")
-                off_why = "with the experts in host memory the verify window is mode A's, not measured against lane "
-                          "parity on this GPU class yet - --drafting on takes it (plain decoding)";
+            // (NVIDIA: plain decoding there is lane parity where that is the faster mode, the window mode A's -
+            //  --drafting auto measures the two once on this PC, below; a remembered choice of a drafter: mode A)
+            else if (!lane0 && drafting == "auto" && draft_choice < 0)
+                g_off_measure = true;
+            else if (!lane0 && drafting != "on" && drafting != "auto")
+                off_why = "with the experts in host memory the verify window is mode A's (plain decoding)";
 #endif
             const size_t fixed = dense_b + kv_b + reserve + (size_t) 48 * c.H * (size_t) ctx;
             tier_room = fr0 > fixed ? fr0 - fixed : 0;
@@ -7430,8 +7491,10 @@ int main(int argc, char** argv) {
         const char* lane_def = "auto";
 #endif
         // (drafting on the offload path: mode A - the verify window's arithmetic)
-        const std::string lw = g_two.want || g_kv_streaming || g_off_draft ? "0" : le && *le ? le : lane_def;
-        if (g_off_draft && !(le && *le) && std::string(lane_def) != "0")
+        g_off_measure = g_off_measure && g_off_draft && !g_two.want && !g_kv_streaming;
+        const std::string lw = g_two.want || g_kv_streaming || (g_off_draft && !g_off_measure) ? "0"
+                               : le && *le ? le : lane_def;
+        if (g_off_draft && !g_off_measure && !(le && *le) && std::string(lane_def) != "0")
             std::printf("NOTE maya-ik2: drafting on the offload path decodes in mode A (the resident kernels; lane "
                         "parity off): the answers are mode A's with drafting or without (IK2_LANE=0), and can differ "
                         "from lane parity's where two tokens are nearly tied\n");
@@ -7463,6 +7526,7 @@ int main(int argc, char** argv) {
                         100.0 * h);
             if (!faster) g_lane = false, g_offs.lane.reset();
         }
+        g_off_measure = g_off_measure && g_lane;   // (mode A is this PC's plain decoding anyway: measured as everywhere)
         // two GPUs: GPU 1's experts - a token's launches on both devices one by one (2x V100, 2x 12 GB: 78.7 tok/s,
         // against 73.1 as one CUDA graph across them; IK2_TWO_GRAPH=1: the graph, where every copy is a peer one)
         if (g_two.want && two_setup(M, EC, off_value))
@@ -7635,7 +7699,16 @@ int main(int argc, char** argv) {
         // drafter, both - times greedy answers to IK2_DRAFT_IDS's requests (IK2_DRAFT_TOKENS each, 128), the
         // fastest kept (within IK2_DRAFT_TIE, 3%, of none: none) and remembered; the answers are the same whichever
         // (drafting on = off), so one load measures them all
-        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && spec_path()) {
+        // (the offload path where plain decoding is lane parity: that against drafting in mode A - set_lane - and the
+        //  mode of the fastest kept; the remembered choice gives every later start the same mode, so the same answers)
+        const bool lane_meas = g_off_measure && g_lane && g_block && !g_offs.wstage.empty();
+        auto set_lane = [&](bool on) {
+            if (g_lane == on) return;
+            for (auto& G : g_fgraph)   // (the tokens' graphs hold a mode's launches)
+                if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
+            g_lane = on;
+        };
+        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && (spec_path() || lane_meas)) {
             std::vector<std::vector<int>> reqs;
             if (const char* f = getenv("IK2_DRAFT_IDS")) {
                 std::ifstream in(f);
@@ -7646,7 +7719,11 @@ int main(int argc, char** argv) {
                         if (!v.empty() && (int) v.size() + 256 < ctx) reqs.push_back(std::move(v));
                     }
             }
-            if (reqs.empty()) {
+            if (reqs.empty() && lane_meas) {
+                std::printf("NOTE maya-ik2: drafting off, not measured against plain decoding here (no requests to time "
+                            "it on: IK2_DRAFT_IDS) - lane parity, as without a drafter; --drafting on drafts (mode A)\n");
+                drafter = nullptr, g_lookup = false;
+            } else if (reqs.empty()) {
                 std::printf("NOTE maya-ik2: drafting on, not measured (no requests to time it on: IK2_DRAFT_IDS)\n");
             } else {
                 const int gen_n = getenv("IK2_DRAFT_TOKENS") ? std::max(16, std::atoi(getenv("IK2_DRAFT_TOKENS"))) : 128;
@@ -7659,6 +7736,7 @@ int main(int argc, char** argv) {
                 auto trial = [&](int mode, int gen_t, double& secs) {
                     int made = 0;
                     secs = 0;
+                    if (lane_meas) set_lane(mode == 0);
                     for (const auto& ids : reqs) {
                         reset();
                         int first = 0;
@@ -7701,10 +7779,18 @@ int main(int argc, char** argv) {
                 if (best && tps[best] < tps[0] * (1.0 + tie)) best = 0;   // (no clear gain: no drafting)
                 draft_choice = best;
                 draft_remember(draft_key_s, tps, best);
+                if (lane_meas) {
+                    set_lane(best == 0);
+                    if (best) g_offs.lane.reset();
+                }
                 reset();
                 std::printf("NOTE maya-ik2: measured this PC once in %.0f s: drafting - %s (no drafting %.1f, the prompt "
-                            "lookup %.1f, the drafter %.1f, both %.1f tokens/s)\n", now() - tm0, kDraftNames[best],
-                            tps[0], tps[1], tps[2], tps[3]);
+                            "lookup %.1f, the drafter %.1f, both %.1f tokens/s)%s\n", now() - tm0, kDraftNames[best],
+                            tps[0], tps[1], tps[2], tps[3],
+                            !lane_meas ? "" : best ? "; plain decoding was timed in lane parity, drafting in mode A - "
+                                                     "this PC decodes in mode A, at every start"
+                                               : "; plain decoding was timed in lane parity, drafting in mode A - "
+                                                 "this PC keeps lane parity, at every start");
             }
             if (draft_choice >= 0) {   // (the sources not chosen: off - the drafter's room stays as it was planned)
                 if (draft_choice < 2) drafter = nullptr;
@@ -8274,6 +8360,7 @@ int main(int argc, char** argv) {
             if (req_spec) {
                 lk.reset();
                 lk.append(ids.data(), ids.size());
+                sctl.begin((int) ids.size());
             }
             int stat_n = 0;      // (the tokens and the time at the last STAT: its rate the interval's)
             double stat_t = 0;
@@ -8719,6 +8806,7 @@ int main(int argc, char** argv) {
         lk.append(prompt.data(), prompt.size());
         int anchor = first_best, P = g_depth + (int) prompt.size();   // (IK2_DEPTH: the tests' deep points)
         out.push_back(anchor);
+        ctl.begin(P);
         const SampleCfg sc;
         std::vector<int> next;
         while ((int) out.size() < gen && P < ctx) {
@@ -8891,7 +8979,11 @@ int main(int argc, char** argv) {
         std::printf("), %llu plain tokens; a window %.1f ms (widths 2 .. 6:", (unsigned long long) ctl.plain,
                     ctl.c[std::min(ctl.wmax, kBlockMax)] * 1e3);
         for (int b = 2; b <= 6; ++b) std::printf(" %.1f", ctl.c[b] * 1e3);
-        std::printf("), a plain token %.1f ms\n", ctl.c_plain * 1e3);
+        std::printf("), a plain token %.1f ms", ctl.c_plain * 1e3);
+        if (ctl.pauses)
+            std::printf("; drafting paused %llu time%s (its rounds measured slower than plain tokens at this depth)",
+                        (unsigned long long) ctl.pauses, ctl.pauses == 1 ? "" : "s");
+        std::printf("\n");
     }
     if (g_sp_n)
         std::printf("steps: %llu, a step's drafting %.2f ms, its window %.2f ms, the rest %.2f ms\n",

@@ -873,7 +873,7 @@ HY4_CHUNK_UP_GIB = 0.95
 # stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 from 12 GB (the same
 # offload path under 24 GB) or a Halo / APU with 24 GB.
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
-# by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  Pictures: the
+# by size and sha256; its drafter from Maya's own repo (download.json's "drafter", ik2_drafter_step).  Pictures: the
 # model's vision tower as the mmproj-Inkling-2-Mini-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
 # read by maya-vision (tools/vision/inkling2v_patch.py) only while a request's pictures are encoded - on the GPU where
 # its free VRAM holds the encoder, else on the CPU; never kept in VRAM, and the context's fit is the same.  What fits on
@@ -11372,17 +11372,41 @@ def ik2_vision_model() -> dict | None:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
-def ik2_drafter_model() -> dict | None:
-    """The model's drafter as offer_download's form (tools/ik2/download.json's "drafter": thinkingmachines' own
-    mtp.safetensors at a pinned revision), or None when the manifest names none."""
+def ik2_drafter_model(amd: bool = False, name: str | None = None) -> dict | None:
+    """The model's drafter as offer_download's form (tools/ik2/download.json's "drafter": Inkling-2-Mini's own drafter
+    from Maya's own repo at a pinned revision), or None when the manifest names none.  One file of the manifest's two
+    forms of it: `name`, else the one the setup fetches - the GGUF (Q8_0, unsloth's conversion: the engine's fastest
+    drafting path, "default"; on AMD the manifest's "amd" - the GGUF too, measured there as well)."""
     man = read_json(IK2_MANIFEST).get("drafter") or {}
     if not man.get("files") or not man.get("repo") or not man.get("revision"):
         return None
+    pick = name or (man.get("amd") if amd else None) or man.get("default")
+    if pick not in man["files"]:
+        pick = next(iter(man["files"]))
+    size, sha = man["files"][pick]
+    form = "GGUF, Q8_0" if pick.endswith(".gguf") else "safetensors, BF16"
     return {"about": f"{IK2_SHOWN}'s drafter (it drafts tokens the model checks: faster answers, the same ones): "
-                     f"thinkingmachines' own ({man.get('license', 'Apache 2.0')})", "format": "safetensors",
+                     f"the model's own ({form}; {man.get('license', 'Apache 2.0')})",
+            "format": "gguf" if pick.endswith(".gguf") else "safetensors",
             "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
-            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
-            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+            "files": {pick: size}, "sha256": {pick: sha}, "download_gb": size / 1e9}
+
+
+def ik2_drafter_here(d: Path, amd: bool = False) -> tuple[Path, dict] | None:
+    """A whole copy of the drafter already beside the model (in d), with its form's entry, or None: the form the setup
+    fetches on this PC first, else the other one (its size and sha256 the published ones) - what the engine drafts
+    with where this PC's form was not downloaded (an earlier setup's mtp.safetensors)."""
+    man = read_json(IK2_MANIFEST).get("drafter") or {}
+    first = ik2_drafter_model(amd)
+    if first is None:
+        return None
+    pick = next(iter(first["files"]))
+    for n in [pick] + [n for n in man["files"] if n != pick]:
+        m = ik2_drafter_model(amd, n)
+        f = d / n
+        if file_incomplete(m, f) is None and (n == pick or sha256_checked(f, m["sha256"][n])):
+            return f, m                                # (the fetched form's sha256: the step's own check, which fails)
+    return None
 
 
 def ik2_drafting(a) -> str:
@@ -11393,23 +11417,29 @@ def ik2_drafting(a) -> str:
     return how if how in ("on", "off") else "auto"
 
 
-def ik2_drafter_step(a, d: Path, vram: float, ctx: int, kv: str) -> Path | None:
-    """The drafter beside the GGUF (in d), downloaded when it is not there and checked against its published sha256,
-    or None: drafting off (--drafting off), or not downloaded - the engine then drafts with the prompt lookup alone.
+def ik2_drafter_step(a, d: Path, vram: float, ctx: int, kv: str, amd: bool = False) -> Path | None:
+    """The drafter beside the GGUF (in d) - the form this PC's engine drafts with best (ik2_drafter_model), downloaded
+    from Maya's repo when it is not there (an earlier setup's mtp.safetensors stays on the disk, and is
+    what the engine drafts with where the GGUF was not downloaded) - checked against its published sha256, or None: drafting off (--drafting off), or not downloaded - the engine then drafts with the prompt lookup alone.
     Truthful about this card: where the drafter's room does not fit beside the model at this context, the engine
     leaves it out at its start (the plan as without it)."""
     how = ik2_drafting(a)
     if how == "off":
         ok("drafting: off (--drafting off) - every token from a full model step")
         return None
-    m = ik2_drafter_model()
+    m = ik2_drafter_model(amd)
     if m is None:
         warn(f"{IK2_MANIFEST} names no drafter: drafting with the prompt lookup alone")
         return None
     files = [d / n for n in m["files"]]
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the drafter", d, files, m):
-        warn(f"the drafter was not downloaded: drafting with the prompt lookup alone ({ME} --setup asks again)")
-        return None
+        here = ik2_drafter_here(d, amd)                # (the other form, from an earlier setup: the same drafter)
+        if here is None:
+            warn(f"the drafter was not downloaded: drafting with the prompt lookup alone ({ME} --setup asks again)")
+            return None
+        warn(f"{files[0].name} was not downloaded: drafting with {here[0].name}, which is already here "
+             f"({ME} --setup asks again)")
+        files, m = [here[0]], here[1]
     for f in files:
         if not sha256_checked(f, m["sha256"][f.name]):
             f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
@@ -11636,12 +11666,12 @@ def set_up_ik2(a, prev: dict) -> Path | None:
         return None
     off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd, apu,
                                    bool(vram1) and IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 2)
-    if off:                                            # (one NVIDIA card's offload path, no room: no drafter, drafting off)
+    if off:                                            # (a streamed cache, no room: no drafter, drafting off)
         ok(off)
         a.drafting = "off"
         drafter = None
     else:
-        drafter = ik2_drafter_step(a, d, vram, ctx, kv)   # (5: its drafter)
+        drafter = ik2_drafter_step(a, d, vram, ctx, kv, amd)   # (5: its drafter)
     tok = ik2_tokenizer_step(a, d, gguf)              # 6
     vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
     return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
