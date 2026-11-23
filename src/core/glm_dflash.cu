@@ -17,6 +17,7 @@
 // block (x[t - tap] = 0 before row 0).  The context window is the GGUF's sliding window: a row at position P reads
 // the ring's positions above P - window.
 #include "maya/core/glm_dflash.hpp"
+#include "maya/core/glm_lookup.hpp"
 
 #include "glm_fast_state.hpp"
 #include "maya/artifact/gguf_reader.hpp"
@@ -1848,6 +1849,28 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
     DraftAhead ahead;
     bool ahead_queued = false;
     uint64_t rng = 0x9e3779b97f4a7c15ull ^ (uint64_t) pos_;
+    // MAYA_GLM_LOOKUP (glm_lookup.hpp): the prompt lookup's run for the round, beside the drafter's block - on the
+    // pipelined window only (a draft that fails costs little there; the batched window and the token path decode as
+    // without it).  The index holds the prompt (the caller's begin) and takes every token as it is written; the next
+    // round's run is looked up as soon as its anchor is known (lk_next), before that round's draft is queued, so a
+    // run verified alone (lk_alone) never starts the drafter.  A request's own window cap (--spec, "spec") holds
+    // for a lookup window too
+    GlmLookup* const LK = pipe && !explore ? dflash_lookup_ : nullptr;
+    const int lk_cap = n_max_req >= 0 ? n_max : kPipeMax - 1;
+    int32_t lk_buf[kPipeMax], lk_win[kPipeMax];
+    int lk_n = 0, lk_match = 0;
+    bool lk_alone = false;
+    const auto lk_next = [&](int64_t n_at) {
+        lk_n = lk_match = 0;
+        lk_alone = false;
+        if (LK == nullptr) return;
+        lk_n = LK->propose((int) std::min<int64_t>(lk_cap, max_ctx_ - n_at - 1), lk_buf, lk_match);
+        lk_alone = LK->alone(lk_n, lk_match);
+    };
+    if (LK != nullptr) {
+        LK->wrote(y);
+        lk_next(pos_);
+    }
     for (;;) {
         const int64_t N = pos_;
         tnow = std::chrono::steady_clock::now();
@@ -1882,8 +1905,9 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
                 inj_lo = inj_hi = 0;
             }
             if (tl != nullptr) tl_inj = ms_since(t_anchor);
-            if (room > 0 && !D.draft_start(y, N, explore ? D.block() - 1 : room, explore ? 0.0f : p_min, head,
-                                           pack_emb_src_, pack_emb_type_, ts, err))
+            if (room > 0 && !lk_alone &&
+                !D.draft_start(y, N, explore ? D.block() - 1 : room, explore ? 0.0f : p_min, head, pack_emb_src_,
+                               pack_emb_type_, ts, err))
                 return false;
             if (tl != nullptr) tl_ds = ms_since(t_anchor);
         }
@@ -1898,6 +1922,15 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
             rng = rng * 6364136223846793005ull + 1442695040888963407ull;
             const int nk = 1 + (int) ((rng >> 33) % (uint64_t) std::min<int>((int) d.size(), std::max(1, room)));
             d.resize((size_t) nk);
+        }
+        // MAYA_GLM_LOOKUP: the round's drafts from the block and the lookup's run (GlmLookup::choose)
+        GlmLookup::Choice lk_c;
+        lk_c.n = lk_c.n_drafter = (int) d.size();
+        const bool lk_round = LK != nullptr, lk_was_alone = lk_alone;
+        const int lk_first = lk_n > 0 ? lk_buf[0] : -1;
+        if (lk_n > 0) {
+            lk_c = GlmLookup::choose(d.data(), (int) d.size(), lk_buf, lk_n, lk_match, LK->trust, lk_win);
+            d.assign(lk_win, lk_win + lk_c.n);
         }
         const auto t_drafted = std::chrono::steady_clock::now();
         lap(t_draft);
@@ -1991,6 +2024,10 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
             for (const float c : conf) std::fprintf(stats, " %.4f", c);
             std::fprintf(stats, "\n");
         }
+        if (lk_round) {
+            if (lk_first >= 0) LK->score_first(lk_first == goes_out(0));
+            LK->observe(lk_c, acc, lk_was_alone);
+        }
         spec_steps_ += (uint64_t) (T - 1);
         spec_hits_ += (uint64_t) acc;
         ++rounds;
@@ -2003,7 +2040,9 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
             ++produced;
             // (the kept draft, through forced() as every emitted token: --spec-follow's continuation moves on and
             //  counts the model's own pick here)
-            more = emit(forced(out[(size_t) kept])) && produced < max_new;
+            const int e = forced(out[(size_t) kept]);
+            if (LK != nullptr) LK->wrote(e);
+            more = emit(e) && produced < max_new;
             if (!more || force_tok_ >= 0) {
                 ++kept;
                 break;
@@ -2011,6 +2050,10 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
         }
         const int keep = 1 + kept;
         const int y2 = forced(out[(size_t) keep - 1]);
+        if (LK != nullptr && more) {   // (the next anchor, emitted below: the next round's run is looked up from it)
+            LK->wrote(y2);
+            lk_next(N + keep);
+        }
         if (pipe && more && ahead_on) {   // the next round's injection and draft (see ahead)
             const int64_t N2 = N + keep;
             const int room2 = (int) std::min<int64_t>(n_max, max_ctx_ - N2 - 1);
@@ -2019,10 +2062,11 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
             const int dev_t = tail->dev_;
             const uint8_t* emb = pack_emb_src_;
             const int emb_type = pack_emb_type_;
-            ahead.kick([&D, &head, ts, dev_t, N, N2, room2, nd2, pm2, y2, emb, emb_type](std::string& e) {
+            const bool no_draft = lk_alone;   // (MAYA_GLM_LOOKUP=2: the lookup's run alone; the ring is fed all the same)
+            ahead.kick([&D, &head, ts, dev_t, N, N2, room2, nd2, pm2, y2, emb, emb_type, no_draft](std::string& e) {
                 cudaSetDevice(dev_t);
                 if (!D.inject(N, N2, ts, e)) return false;
-                return room2 <= 0 || D.draft_start(y2, N2, nd2, pm2, head, emb, emb_type, ts, e);
+                return room2 <= 0 || no_draft || D.draft_start(y2, N2, nd2, pm2, head, emb, emb_type, ts, e);
             });
             ahead_queued = true;
         }
@@ -2059,6 +2103,7 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
     if (stats != nullptr) std::fflush(stats);
     if (tl != nullptr) std::fflush(tl);
     win_prof_report();
+    if (LK != nullptr) LK->report(stderr);
     if (prof && rounds > 0)
         std::fprintf(stderr, "glm dflash prof (%lld rounds, %lld of them no draft: %.2f drafts, %.2f accepted a round): "
                              "draft %.2f ms | verify window (or the token) %.2f ms | commit + inject %.2f ms\n",

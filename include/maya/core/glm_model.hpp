@@ -806,6 +806,9 @@ public:
     void spec_plain_end(int64_t produced);
     bool spec_plain_live_ = false;
     uint64_t spec_steps_ = 0, spec_hits_ = 0;              // speculative positions, accepted
+    /// MAYA_GLM_LOOKUP (glm_lookup.hpp): the prompt lookup decode_dflash's pipelined rounds draft from beside the
+    /// drafter - the caller's, holding the prompt before the call (GlmLookup::begin); nullptr: none.
+    struct GlmLookup* dflash_lookup_ = nullptr;
     double spec_t_[4] = {0, 0, 0, 0};                      // MAYA_GLM_SPEC_PROF host phases of spec_head/tail
     int64_t spec_n_ = 0;
     cudaEvent_t spec_ev_[3] = {nullptr, nullptr, nullptr}; // ... and the device span of each token
