@@ -453,7 +453,10 @@ class Steps(unittest.TestCase):
         """tools/ik2_fit.py's drafter room (maya-ik2's draft_room): 24 GB cards hold it up to about 200K tokens with the
         FP8 cache, 32 GB at 262K; it grows 4 KiB a token (its attention's logits in shared memory, no scratch a token)."""
         self.assertTrue(F.draft_fits(24, 131072, "fp8"))
-        self.assertFalse(F.draft_fits(24, 262144, "fp8"))
+        self.assertFalse(F.draft_fits(24, 262144, "fp8"))         # (the engine measures: FP8 rows may still fit)
+        self.assertTrue(F.draft_fits(24, 524288, "fp8"))          # (the offload path: the tier's room)
+        self.assertTrue(F.draft_fits(32, 1048576, "fp8"))         # (... its drafts read the last positions)
+        self.assertFalse(F.draft_fits(16, 1048576, "fp8"))        # (the cache streams)
         self.assertTrue(F.draft_fits(32, 262144, "fp8"))
         self.assertTrue(F.draft_fits(0, 262144, "fp8"))          # (not known: the engine measures)
         self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4096 / 2**30, places=6)
@@ -462,12 +465,16 @@ class Steps(unittest.TestCase):
         """Volta / Turing and the offload path run with drafting off; sm_80+ with every expert in VRAM and AMD keep it."""
         self.assertIn("Volta", F.drafting_off_reason("70", 32, 65536, "fp8"))
         self.assertIn("Volta", F.drafting_off_reason("75", 24, 65536, "fp8"))
-        self.assertIn("offload", F.drafting_off_reason("86", 8, 65536, "fp8"))
+        self.assertIn("--drafting on", F.drafting_off_reason("86", 8, 65536, "fp8"))   # (NVIDIA offload: by hand)
+        self.assertIn("--drafting on", F.drafting_off_reason("86", 24, 524288, "fp8"))
+        self.assertIn("streams", F.drafting_off_reason("86", 16, 1048576, "fp8"))
         self.assertIsNone(F.drafting_off_reason("86", 24, 65536, "fp8"))
         self.assertIsNone(F.drafting_off_reason("120", 32, 262144, "fp8"))
         self.assertIsNone(F.drafting_off_reason("gfx1151", 150, 262144, "fp8", hip=True, apu=True))
         self.assertIsNone(F.drafting_off_reason(None, 24, 65536, "fp8", hip=True))         # (AMD, every expert in VRAM)
-        self.assertIn("offload", F.drafting_off_reason(None, 16, 65536, "fp8", hip=True))  # (AMD under 24 GB)
+        self.assertIsNone(F.drafting_off_reason(None, 16, 65536, "fp8", hip=True))         # (AMD under 24 GB: the tier's room)
+        self.assertIsNone(F.drafting_off_reason(None, 24, 524288, "fp8", hip=True))        # (AMD, a long context)
+        self.assertIn("streams", F.drafting_off_reason(None, 16, 1048576, "fp8", hip=True))
         self.assertIsNone(F.drafting_off_reason(None, 0, 65536, "fp8"))      # (not known)
 
     def run_setup(self, gpu, ram=64.0, backend="cuda", **kw):
