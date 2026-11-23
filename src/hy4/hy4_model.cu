@@ -449,6 +449,10 @@ struct Gpu {
     // sorted rows
     cublasHandle_t blas = nullptr;
     uint16_t *xh16 = nullptr, *wband = nullptr, *sh16 = nullptr;
+    // (HY4_LAT16: a prompt chunk's latent rows in F16, made once a layer for the experts' gate / up sets - lat16_cur
+    //  this layer's while its sets run, else nullptr)
+    uint16_t* lat16 = nullptr;
+    const uint16_t* lat16_cur = nullptr;
     size_t wband_n = 0;   // (values)
     int *bounds = nullptr, *stok = nullptr, *srow = nullptr;
     float* sy = nullptr;
@@ -1599,6 +1603,13 @@ struct Model::Impl {
     int sparse_frac = 75;
     const bool sparse_stat = std::getenv("HY4_SPARSE_STAT") != nullptr;
     std::atomic<long long> sp_st[4] = {};   // (sub-batches taken, their rows, not taken, the most rows)
+    // HY4_LAT16=1: a prompt chunk's latent rows rounded to F16 once a layer for the routed experts' gate / up sets
+    // (their tensor-core tiles then load 8 values at once instead of rounding the F32 rows themselves - the same
+    // bits), a Tc x n_lat F16 buffer more a GPU.  Not with tensor parallel.  Off by default
+    const bool lat16_on = [] {
+        const char* e = std::getenv("HY4_LAT16");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
     const bool ix_check = std::getenv("HY4_IX_CHECK") != nullptr;
     std::atomic<long long> ix_chk[4] = {};   // (tokens, tokens with another pick, picks, other picks)
     // Tensor parallel, the prompt path: every member scored and picked every token of a chunk for its own heads - the
@@ -1631,7 +1642,7 @@ struct Model::Impl {
         f += 16 * T * lat + W * E + (size_t) W * g.n_vocab;                                     // (the sets' y, head)
         f += W * E / 32;                                                                        // (the side stream's)
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
-        f16 = T * qk + kBand + 16 * T * ffe;
+        f16 = T * qk + kBand + 16 * T * ffe + (lat16_on ? T * lat : 0);
         ints = T * 16 + 3 * T + T * maxk + T + 2 * 16 * T + 1024 + 4 * 16 * W + W * qk / 4 + 2 * W * lat / 4 +
                16 * W * ffe / 4 + T * egc / 4 + W * E / 4;
         return f;
@@ -3557,6 +3568,7 @@ struct Model::Impl {
                take(gp.srow, 16 * T) && take(gp.sS, att) && take(gp.sP, att) &&
                take(gp.dmask, (size_t) kSub * dense_max) &&
                take(gp.kbuf, deq_rows() * g.kv_row()) &&
+               (!lat16_on || take(gp.lat16, T * lat)) &&
                (stage_b == 0 || take(gp.stage, stage_b));
         };
         // (the head GPU's: what its buffers lack of the largest picture's room - the plan's vis_keep - at their end)
@@ -6609,6 +6621,7 @@ struct Model::Impl {
         a.n_ff = l.ffe;
         a.limit = g.limit[(size_t) l.il];
         a.xf = gp.lat;
+        a.xh = gp.lat16_cur;   // (HY4_LAT16: the same rows in F16 for the tensor-core tiles; the other kernels read xf)
         a.idx = gp.stok;
         a.ldx = lat;
         a.h = gp.sh16;
@@ -6865,6 +6878,12 @@ struct Model::Impl {
             bool streamed = false, lat_pre = false;   // (lat_pre: the experts' sum wrote latout's int8 rows)
             const bool share = l.tpm >= 0 && !l.stream_e.empty() && T >= kTpStream;
             if (T > W) {
+                // (HY4_LAT16: the latent rows in F16 once for every set of the layer - VRAM's and the streamed passes')
+                gp.lat16_cur = nullptr;
+                if (gp.lat16 != nullptr && l.tpm < 0) {
+                    k::to_f16(gp.lat, lat, T, lat, gp.lat16, lat, s);
+                    gp.lat16_cur = gp.lat16;
+                }
                 ok = ok && experts_sets(l, gp, T, err, slot);
                 // a prompt chunk's experts not in VRAM: streamed to the GPU, or the CPU lane - by the rates this PC
                 // measured once (route_start: remembered, or measured now in turns), so the same prompt takes the
@@ -6905,6 +6924,7 @@ struct Model::Impl {
                         route_side = -1;
                     }
                 }
+                gp.lat16_cur = nullptr;
             } else if (fxl) {   // (the GPU's misses copied first)
                 CK(cudaStreamWaitEvent(s, gp.fx_ev1, 0));
                 ok = ok && routed_token(l, gp, T, nullptr, gp.latout, gp.fxs.eptr, fx.mode == 2 ? gp.fxs.who : nullptr);
