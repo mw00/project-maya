@@ -7769,7 +7769,8 @@ void Glm5Model::late_read(size_t free_b, size_t total_b, size_t floor_b, size_t 
     } else if (!file.empty()) {
         const std::string v = maya::vramlate::get(file, late_key_);
         late_kept_ = v.empty() ? 0 : (size_t) std::max(0LL, std::atoll(v.c_str())) << 20;
-        late_ = b.adapted ? 0 : maya::vramlate::kept_for(late_kept_, b.reserve, b.reserve_given);
+        late_ = b.adapted ? 0 : std::min(maya::vramlate::kept_for(late_kept_, b.reserve, b.reserve_given),
+                                         maya::vramlate::cap_of(total_b));
     }
     // (what the pool can give up above its floor: a pool already there keeps no more free, and its start is not said
     //  short - a restart would not help)
@@ -7781,9 +7782,8 @@ void Glm5Model::late_read(size_t free_b, size_t total_b, size_t floor_b, size_t 
         late_ = late_room_;
     }
     if (late_ > 0)
-        std::fprintf(stderr, "glm fast: CUDA%d keeps %zu MiB free beside the %zu MiB reserve: what this PC's start and "
-                             "requests allocate after the expert pool%s\n", dev_, late_ >> 20, b.reserve >> 20,
-                     fixed >= 0 ? " (MAYA_GLM_LATE_MB)" : " (measured before)");
+        std::fprintf(stderr, "glm fast: CUDA%d keeps %zu MiB free beside the %zu MiB reserve%s\n", dev_, late_ >> 20,
+                     b.reserve >> 20, maya::vramlate::why(fixed >= 0, b.reserve_given).c_str());
 }
 
 int Glm5Model::late_check_part(bool loaded) {

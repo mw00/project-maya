@@ -2414,6 +2414,10 @@ struct Model::Impl {
             }
             if (!kv_auto_set) o.kv_resident = 0;
         }
+        // (#1156) the measured figure never keeps a model out that the reserve alone lets in: where even no routed
+        // expert fits beside it, it is given up for this start (said once a GPU)
+        if (!place(0.0, false))
+            for (size_t i = 0; i < devs.size(); ++i) free_b[i] += (double) late.give_up(i, devs[i]);
         if (!place(rho, false)) {
             double lo = 0.0, hi = rho;
             if (!place(0.0, false)) {

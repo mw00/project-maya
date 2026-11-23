@@ -49,7 +49,19 @@ int main() {
         const vl::Step s = vl::check(g, 379 * MiB, tot, 700 * MiB, false);
         CHECK(s.moved && !s.short_ && s.want == (int64_t) 352 * MiB);
     }
-    // ... but a default reserve used up is (and the figure is capped at a quarter of the card)
+    // (#1156) the figure is capped at 1 GiB: another program's VRAM, or a plan with nothing left to give, never
+    // climbs past it (v1.1.73: a quarter of the card, start after start, until the dense weights no longer fit)
+    {
+        vl::Gpu g{3968 * MiB, 3968 * MiB};   // (a v1.1.74 file's figure, read back)
+        CHECK(vl::kept_for(3968 * MiB, 2048 * MiB, true) == 1024 * MiB);
+        vl::Gpu h;
+        const vl::Step s = vl::check(h, 100 * MiB, tot, 4096 * MiB, true);   // 4 GB "short": another program's
+        CHECK(s.moved && s.want == (int64_t) 1024 * MiB);
+        vl::Gpu k{1024 * MiB, 1024 * MiB};
+        CHECK(!vl::check(k, 100 * MiB, tot, 4096 * MiB, true).moved);        // at the cap: nothing more, no restart
+        (void) g;
+    }
+    // ... but a default reserve used up is (and the figure is capped at a quarter of a small card)
     {
         vl::Gpu g;
         const vl::Step s = vl::check(g, 40 * MiB, tot, 700 * MiB, false);
