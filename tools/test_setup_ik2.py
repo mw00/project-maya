@@ -462,9 +462,15 @@ class Steps(unittest.TestCase):
         self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4096 / 2**30, places=6)
 
     def test_drafting_off_reason(self):
-        """Volta / Turing and the offload path run with drafting off; sm_80+ with every expert in VRAM and AMD keep it."""
-        self.assertIn("Volta", F.drafting_off_reason("70", 32, 65536, "fp8"))
-        self.assertIn("Volta", F.drafting_off_reason("75", 24, 65536, "fp8"))
+        """One NVIDIA card's offload path runs with drafting off (auto); every class with every expert in VRAM (Volta
+        and Turing too, since v1.1.75), the two-card split and AMD keep it."""
+        self.assertIsNone(F.drafting_off_reason("70", 32, 65536, "fp8"))            # (a V100: its own window kernels)
+        self.assertIsNone(F.drafting_off_reason("75", 24, 65536, "fp8"))            # (an RTX 20)
+        self.assertIn("--drafting on", F.drafting_off_reason("70", 12, 65536, "fp8"))   # (one small card: as sm_80+)
+        self.assertIsNone(F.drafting_off_reason("70", 12, 65536, "fp8", gpus2=True))    # (two cards, the split: measured)
+        self.assertIsNone(F.drafting_off_reason("86", 12, 65536, "fp8", gpus2=True))
+        self.assertIsNone(F.drafting_off_reason("86", 24, 65536, "fp8", gpus2=True))    # (the first holds every expert)
+        self.assertIn("no room", F.drafting_off_reason("86", 16, 1048576, "fp8", gpus2=True))
         self.assertIn("--drafting on", F.drafting_off_reason("86", 8, 65536, "fp8"))   # (NVIDIA offload: by hand)
         self.assertIn("--drafting on", F.drafting_off_reason("86", 24, 524288, "fp8"))
         self.assertIn("streams", F.drafting_off_reason("86", 16, 1048576, "fp8"))
@@ -491,16 +497,19 @@ class Steps(unittest.TestCase):
         return seen, " ".join(said)
 
     def test_setup_drafting_off_where_it_does_not_run(self):
-        """Volta / Turing and offload layouts: no drafter downloaded, drafting off, one line saying why."""
-        for gpu in (card(32, arch="70", name="Tesla V100"), card(24, arch="75", name="RTX 2080 Ti"), card(8)):
+        """One NVIDIA card's offload layout: no drafter downloaded, drafting off, one line saying why."""
+        for gpu in (card(8), card(12, arch="70", name="Tesla V100")):
             seen, said = self.run_setup(gpu, drafting="on")
             self.assertEqual(seen["drafting"], "off", gpu)
             self.assertIsNone(seen["drafter"], gpu)
             self.assertIn("drafting off", said)
 
     def test_setup_drafting_kept_where_it_runs(self):
-        """NVIDIA sm_80+ holding every expert and AMD: the drafter is fetched and drafting stays auto."""
-        for gpu, backend in ((card(24), "cuda"), (card(32, arch="120"), "cuda"), (amd("gfx1100", 24), "hip")):
+        """NVIDIA cards holding every expert (Volta and Turing too) and AMD: the drafter is fetched and drafting stays
+        auto - the engine measures on the PC whether it is the faster one."""
+        for gpu, backend in ((card(24), "cuda"), (card(32, arch="120"), "cuda"), (amd("gfx1100", 24), "hip"),
+                             (card(32, arch="70", name="Tesla V100"), "cuda"),
+                             (card(24, arch="75", name="RTX 2080 Ti"), "cuda")):
             seen, said = self.run_setup(gpu, backend=backend)
             self.assertIsNone(seen["drafting"], gpu)
             self.assertEqual(seen["drafter"].name, "mtp.safetensors", gpu)

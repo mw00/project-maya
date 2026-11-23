@@ -444,7 +444,8 @@ def _choices(cfg: dict) -> dict:
         card = next((g for g in machine_gpus("cuda") if g.get("index") == (gpus_of(cfg) or [0])[0]), None)             if cfg.get("backend") != "hip" else None
         off = IK2F.drafting_off_reason((card or {}).get("arch"), ik2_vram_gb(cfg), ctx or IK2F.CONTEXTS[0],
                                        (cfg.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV,
-                                       cfg.get("backend") == "hip", ik2_apu(cfg))
+                                       cfg.get("backend") == "hip", ik2_apu(cfg),
+                                       len(gpus_of(cfg) or []) == 2)   # (two cards: the split drafts, measured)
         return {"draft": ["none"] if off else
                 ["auto"] + (["dspark"] if flag(cfg.get("args") or [], "--draft") else []) + ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off")), "kv": list(IK2F.KV_BYTES)}

@@ -131,8 +131,8 @@ take the compiler's list from sm_70 on. CUDA 12.x for a V100 (CUDA 13 has no sm_
 | GPU class | One token's attention | NVFP4 experts (one token) | Prompt attention | Verify window (drafting) |
 | --- | --- | --- | --- | --- |
 | Ampere and newer (sm_80+) | `mma.sync` m16n8k16 | `mma.sync` m16n8k16 | fused (`mma.sync`, `cp.async`; sm_90a: wgmma) | block path |
-| Turing (sm_75) | Ampere's, m16n8k16 as two m16n8k8 | Ampere's, the same | cuBLAS (the fused kernel needs `cp.async` and more shared memory) | block path; drafting off (a NOTE) until its window is checked against the token path on a Turing card |
-| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS; full layers from 64K keys deep its own `mma.m8n8k4` kernel (keys through shared memory, 8 queries a block; `IK2_PA70=0`: cuBLAS) | none: drafting off (a NOTE) |
+| Turing (sm_75) | Ampere's, m16n8k16 as two m16n8k8 | Ampere's, the same | cuBLAS (the fused kernel needs `cp.async` and more shared memory) | Ampere's window kernels on its `mma16816` (two `m16n8k8`): the token path's values to the bit (checked with Turing's code on an Ampere card); drafts, `--drafting auto` measures |
+| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS; full layers from 64K keys deep its own `mma.m8n8k4` kernel (keys through shared memory, 8 queries a block; `IK2_PA70=0`: cuBLAS) | its own: the window's NVFP4 experts on `mma.m8n8k4` (`experts_block_*`'s Volta kernels - the one-token kernel's rows, steps and sums, a group's members the B columns, an expert read once), the attention a token at a time through the one-token kernel; drafts, `--drafting auto` measures (a V100: the drafter's own step costs more than a token there, so auto may keep plain decoding) |
 
 Each class is exact within itself (the same greedy answers start after start); the classes differ from each other in
 their sums' order, as different kernels do. `IK2_ARCH=70` / `75` takes an older class's kernels on a newer GPU (tests;
@@ -374,9 +374,12 @@ context, the cache and the pictures' room stay as without it. Its context rows a
 else FP8, else FP8 rows of the last positions only (half the context, a quarter .. 65,536: the drafts read less far
 back, the model checks every token as ever; the start line says it). The window there is the token path's mode A
 (the resident kernels over the tier's, a lent or a staged expert's bytes - `off_fetch_plan_win` copies a window's
-missing experts once for all its tokens), so drafting on = off to the token there too. It runs on one GPU with the
-whole cache in VRAM: where part of the cache streams from RAM, on two GPUs and under lane parity (`IK2_LANE` by hand)
-drafting stays off with a NOTE. AMD: `--drafting auto` measures it as everywhere. NVIDIA: `--drafting on` takes it
+missing experts once for all its tokens), so drafting on = off to the token there too. It runs with the
+whole cache in VRAM: where part of the cache streams from RAM and under lane parity (`IK2_LANE` by hand) drafting
+stays off with a NOTE. On two GPUs (the split) GPU 1 runs its share of a window as it does a token's: the window's
+inputs and picks go over, are grouped there against GPU 1's table and run with the same window kernels, and its rows
+come back (`two_send_win` / `two_take_rows_g`) - every row the token path's wherever its expert sits, so drafting
+there gives the split's plain answers, and `--drafting auto` measures it (the split decodes in mode A anyway). AMD: `--drafting auto` measures it as everywhere. NVIDIA: `--drafting on` takes it
 (mode A instead of lane parity); `auto` keeps plain decoding on the offload path until the window is measured
 against lane parity on those cards.
 
