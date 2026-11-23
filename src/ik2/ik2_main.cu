@@ -1874,6 +1874,8 @@ bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at 
 // Drafting on the offload path (a long context on a card that then keeps a tier of the experts): the verify window
 // takes the token path's mode A arithmetic - the resident kernels over the tier's or staging's bytes - so it runs
 // where mode A decodes (not lane parity, whose sums are ik2_exact.h's), with the whole cache in VRAM, on one GPU.
+bool g_off_measure = false;        // the plan: --drafting auto there, not measured yet - plain decoding in its own mode
+                                   // (lane parity where it is the default) against drafting in mode A, once
 bool g_off_draft = false;          // the plan: drafting on the offload path (then mode A)
 constexpr int kOffWin = 64;        // a window's picks at most (8 tokens of 8)
 int g_draft_kv8 = -1;              // the plan's choice of the drafter's context rows there (1 FP8, 0 FP16; -1: the load's)
@@ -4319,9 +4321,6 @@ struct SpecCtl {
         if (best == 1 && plain_run >= look_every(bmax)) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
         return best;
     }
-    void took_plain(double t) {
-        if (fresh_plain > 0) c_plain = fresh_plain == kFreshPlain ? t : std::min(c_plain, t), --fresh_plain;
-        else c_plain = 0.9 * c_plain + 0.1 * t;
     // the plain tokens before a look: `probe`, and where a look's window is measured to cost more than the tokens it
     // gives would in plain, as many as keep the looks to a fiftieth of the time (the gate, below)
     int look_every(int bmax) const {
@@ -4330,10 +4329,11 @@ struct SpecCtl {
         const double over = c[pw] - expect(pw) * c_plain;
         return (int) std::clamp(over / (0.02 * c_plain), (double) probe, 4096.0);
     }
+    void took_plain(double t) {
+        if (fresh_plain > 0) c_plain = fresh_plain == kFreshPlain ? t : std::min(c_plain, t), --fresh_plain;
+        else c_plain = 0.9 * c_plain + 0.1 * t;
         ++plain, ++plain_run;
     }
-    void took_spec(int B, int acc, double t) {
-        took_width(B, t);
     // Drafting by its measured speed where the answer is (IK2_DRAFT_GATE=0: without): deep in a long context a
     // window can cost more than the plain tokens it gives (a Radeon 250,000 tokens deep: a window of 2 the time of 4
     // plain tokens), which the looks above then pay again every `probe` tokens.  So the answer's rounds are timed
@@ -4374,9 +4374,11 @@ struct SpecCtl {
             look = (int) std::clamp(over / (0.02 * c_plain), (double) (wide ? std::max(probe, kPause) : probe), 4096.0);
         }
     }
+    void took_spec(int B, int acc, double t) {
+        took_width(B, t);
+        measured(B, acc, t);
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
         for (int j = 0; j + 1 < B && j <= acc; ++j)   // (draft j was reached: the j before it were kept)
-        measured(B, acc, t);
             pn[j] = pos_decay * pn[j] + 1.0, pa[j] = pos_decay * pa[j] + (j < acc ? 1.0 : 0.0);
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
         plain_run = 0;
@@ -4415,9 +4417,9 @@ struct SpecCtl {
     }
     void took_lookup(int B, int acc, double t) {
         took_width(B, t);
+        measured(B, acc, t);
         SL = decay * SL + acc, FL = decay * FL + (acc < B - 1 ? 1 : 0);
         ++l_steps, l_drafted += B - 1, l_accepted += acc;
-        measured(B, acc, t);
         plain_run = 0;
     }
     uint64_t offered() const { return drafted + l_drafted; }
@@ -5493,9 +5495,9 @@ void decode_greedy(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, in
     const SampleCfg sc;
     std::vector<int> next;
     out.push_back(anchor);
+    ctl.begin(P);
     while ((int) out.size() < gen && P < ctx) {
         lk.append(anchor);
-    ctl.begin(P);
         const int room = std::min(gen - (int) out.size(), ctx - P);
         int32_t ld[kBlockMax];
         const int k = g_lookup && ctl.use_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
@@ -6297,9 +6299,12 @@ int main(int argc, char** argv) {
             else if (le && *le && !lane0)
                 off_why = "IK2_LANE asks for lane parity, and the verify window has mode A's arithmetic (plain decoding)";
 #ifndef MAYA_USE_HIP
-            else if (!lane0 && drafting != "on")
-                off_why = "with the experts in host memory the verify window is mode A's, not measured against lane "
-                          "parity on this GPU class yet - --drafting on takes it (plain decoding)";
+            // (NVIDIA: plain decoding there is lane parity where that is the faster mode, the window mode A's -
+            //  --drafting auto measures the two once on this PC, below; a remembered choice of a drafter: mode A)
+            else if (!lane0 && drafting == "auto" && draft_choice < 0)
+                g_off_measure = true;
+            else if (!lane0 && drafting != "on" && drafting != "auto")
+                off_why = "with the experts in host memory the verify window is mode A's (plain decoding)";
 #endif
             const size_t fixed = dense_b + kv_b + reserve + (size_t) 48 * c.H * (size_t) ctx;
             tier_room = fr0 > fixed ? fr0 - fixed : 0;
@@ -7412,8 +7417,10 @@ int main(int argc, char** argv) {
         const char* lane_def = "auto";
 #endif
         // (drafting on the offload path: mode A - the verify window's arithmetic)
-        const std::string lw = g_two.want || g_kv_streaming || g_off_draft ? "0" : le && *le ? le : lane_def;
-        if (g_off_draft && !(le && *le) && std::string(lane_def) != "0")
+        g_off_measure = g_off_measure && g_off_draft && !g_two.want && !g_kv_streaming;
+        const std::string lw = g_two.want || g_kv_streaming || (g_off_draft && !g_off_measure) ? "0"
+                               : le && *le ? le : lane_def;
+        if (g_off_draft && !g_off_measure && !(le && *le) && std::string(lane_def) != "0")
             std::printf("NOTE maya-ik2: drafting on the offload path decodes in mode A (the resident kernels; lane "
                         "parity off): the answers are mode A's with drafting or without (IK2_LANE=0), and can differ "
                         "from lane parity's where two tokens are nearly tied\n");
@@ -7445,6 +7452,7 @@ int main(int argc, char** argv) {
                         100.0 * h);
             if (!faster) g_lane = false, g_offs.lane.reset();
         }
+        g_off_measure = g_off_measure && g_lane;   // (mode A is this PC's plain decoding anyway: measured as everywhere)
         // two GPUs: GPU 1's experts - a token's launches on both devices one by one (2x V100, 2x 12 GB: 78.7 tok/s,
         // against 73.1 as one CUDA graph across them; IK2_TWO_GRAPH=1: the graph, where every copy is a peer one)
         if (g_two.want && two_setup(M, EC, off_value))
@@ -7617,7 +7625,16 @@ int main(int argc, char** argv) {
         // drafter, both - times greedy answers to IK2_DRAFT_IDS's requests (IK2_DRAFT_TOKENS each, 128), the
         // fastest kept (within IK2_DRAFT_TIE, 3%, of none: none) and remembered; the answers are the same whichever
         // (drafting on = off), so one load measures them all
-        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && spec_path()) {
+        // (the offload path where plain decoding is lane parity: that against drafting in mode A - set_lane - and the
+        //  mode of the fastest kept; the remembered choice gives every later start the same mode, so the same answers)
+        const bool lane_meas = g_off_measure && g_lane && g_block && !g_offs.wstage.empty();
+        auto set_lane = [&](bool on) {
+            if (g_lane == on) return;
+            for (auto& G : g_fgraph)   // (the tokens' graphs hold a mode's launches)
+                if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
+            g_lane = on;
+        };
+        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && (spec_path() || lane_meas)) {
             std::vector<std::vector<int>> reqs;
             if (const char* f = getenv("IK2_DRAFT_IDS")) {
                 std::ifstream in(f);
@@ -7628,7 +7645,11 @@ int main(int argc, char** argv) {
                         if (!v.empty() && (int) v.size() + 256 < ctx) reqs.push_back(std::move(v));
                     }
             }
-            if (reqs.empty()) {
+            if (reqs.empty() && lane_meas) {
+                std::printf("NOTE maya-ik2: drafting off, not measured against plain decoding here (no requests to time "
+                            "it on: IK2_DRAFT_IDS) - lane parity, as without a drafter; --drafting on drafts (mode A)\n");
+                drafter = nullptr, g_lookup = false;
+            } else if (reqs.empty()) {
                 std::printf("NOTE maya-ik2: drafting on, not measured (no requests to time it on: IK2_DRAFT_IDS)\n");
             } else {
                 const int gen_n = getenv("IK2_DRAFT_TOKENS") ? std::max(16, std::atoi(getenv("IK2_DRAFT_TOKENS"))) : 128;
@@ -7641,6 +7662,7 @@ int main(int argc, char** argv) {
                 auto trial = [&](int mode, int gen_t, double& secs) {
                     int made = 0;
                     secs = 0;
+                    if (lane_meas) set_lane(mode == 0);
                     for (const auto& ids : reqs) {
                         reset();
                         int first = 0;
@@ -7683,10 +7705,18 @@ int main(int argc, char** argv) {
                 if (best && tps[best] < tps[0] * (1.0 + tie)) best = 0;   // (no clear gain: no drafting)
                 draft_choice = best;
                 draft_remember(draft_key_s, tps, best);
+                if (lane_meas) {
+                    set_lane(best == 0);
+                    if (best) g_offs.lane.reset();
+                }
                 reset();
                 std::printf("NOTE maya-ik2: measured this PC once in %.0f s: drafting - %s (no drafting %.1f, the prompt "
-                            "lookup %.1f, the drafter %.1f, both %.1f tokens/s)\n", now() - tm0, kDraftNames[best],
-                            tps[0], tps[1], tps[2], tps[3]);
+                            "lookup %.1f, the drafter %.1f, both %.1f tokens/s)%s\n", now() - tm0, kDraftNames[best],
+                            tps[0], tps[1], tps[2], tps[3],
+                            !lane_meas ? "" : best ? "; plain decoding was timed in lane parity, drafting in mode A - "
+                                                     "this PC decodes in mode A, at every start"
+                                               : "; plain decoding was timed in lane parity, drafting in mode A - "
+                                                 "this PC keeps lane parity, at every start");
             }
             if (draft_choice >= 0) {   // (the sources not chosen: off - the drafter's room stays as it was planned)
                 if (draft_choice < 2) drafter = nullptr;
@@ -8256,6 +8286,7 @@ int main(int argc, char** argv) {
             if (req_spec) {
                 lk.reset();
                 lk.append(ids.data(), ids.size());
+                sctl.begin((int) ids.size());
             }
             int stat_n = 0;      // (the tokens and the time at the last STAT: its rate the interval's)
             double stat_t = 0;
@@ -8286,7 +8317,6 @@ int main(int argc, char** argv) {
                     if (snaps[i].pos >= 0 && snaps[i].pos <= (int) L && snaps[i].pos < (int) ids.size() &&
                         (best < 0 || snaps[i].pos > snaps[best].pos))
                         best = i;
-                sctl.begin((int) ids.size());
                 if (L == hist.size() && L == ids.size() && !last.empty()) {
                     // (the same tokens again: the last logits answer)
                 } else if (best >= 0) {
@@ -8702,6 +8732,7 @@ int main(int argc, char** argv) {
         lk.append(prompt.data(), prompt.size());
         int anchor = first_best, P = g_depth + (int) prompt.size();   // (IK2_DEPTH: the tests' deep points)
         out.push_back(anchor);
+        ctl.begin(P);
         const SampleCfg sc;
         std::vector<int> next;
         while ((int) out.size() < gen && P < ctx) {
@@ -8732,7 +8763,6 @@ int main(int argc, char** argv) {
             spec_step(M, drafter, anchor, P, B, sc, std::vector<int>{}, next, src == 2 ? given : nullptr, &t_draft);
             CU(cudaStreamSynchronize(g_s));
             if (src == 2) ctl.took_lookup(B, (int) next.size() - 1, now() - ts);
-        ctl.begin(P);
             else ctl.took_spec(B, (int) next.size() - 1, now() - ts);
             for (int j = 0; j + 1 < (int) next.size(); ++j) lk.append(next[j]);
             for (int j = 0; j < (int) next.size() && (int) out.size() < gen; ++j) out.push_back(next[j]);
