@@ -20013,12 +20013,29 @@ struct Model::Impl {
     static int pm_cls(int n) { return path_size_class(n); }
     // The flow factor is learned only within the prompt's own size class; an unmeasured class stays at one.
     double pm_k(int c) const { return pm.flow.factor_for_size_class(c); }
-    // n tokens through windows of 16, the last one's logits_rows rows of logits
+    // n tokens through windows of 16, the last one's logits_rows rows of logits.  logits_rows > kWin (only
+    // --dump-logits and --ppl ask for that) - every window's rows, gathered into chunk_logits as forward_chunks
+    // does, the last min(logits_rows, n) of them: the head projects rows it otherwise skips, the hidden states are
+    // the same
     bool feed_windows(const int* tokens, int n, int logits_rows, std::string& err) {
         logits_all = false;
+        const bool every = logits_rows > kWin;
+        std::vector<float> acc, row;
         for (int a = 0; a < n; a += kWin) {
             const int T = std::min(kWin, n - a);
-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, err)) return false;
+            if (!forward(tokens + a, T, every ? T : (a + T == n ? logits_rows : 0), err)) return false;
+            if (every) {
+                if (!logits(row)) {
+                    err = "feed_windows: the window's logits could not be read";
+                    return false;
+                }
+                acc.insert(acc.end(), row.begin(), row.end());
+            }
+        }
+        if (every) {
+            const size_t V = (size_t) g.vocab, rows = std::min<size_t>((size_t) logits_rows, (size_t) n);
+            chunk_logits.assign(acc.end() - (std::ptrdiff_t) (rows * V), acc.end());
+            logits_all = true;
         }
         return true;
     }
