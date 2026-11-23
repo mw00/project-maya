@@ -2435,11 +2435,17 @@ struct TwoGpu {
     const uint8_t** blob = nullptr;
     uint16_t* h16 = nullptr;
     float* y_in = nullptr;             // (on GPU 0: GPU 1's rows)
+    // (a verify window's share, on GPU 1: its tokens' x and limbs, the picks, group_route's arrays)
+    float* wx = nullptr;
+    uint16_t* wlimbs = nullptr;
+    int *wroute = nullptr, *wn = nullptr, *wtok = nullptr, *wrow = nullptr;
+    const uint8_t** wblob = nullptr;
     gpulink::Links link;
     int n_exp = 0;
     size_t bytes = 0;
 };
 TwoGpu g_two;
+constexpr int kTwoWin = 8;   // a verify window's tokens at most (kBlockMax)
 
 // GPU 1's share of a token's MoE (after GPU 0's router GEMV on g_s): x and the logits over, routed and run there
 void two_send(const Model& M, int l, Work& W, bool exp_tc) {
@@ -2939,6 +2945,9 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
     T.tok = dalloc<int>(S), T.inv = dalloc<int>(S), T.sg = dalloc<float>(S), T.su = dalloc<float>(S);
     T.wt = dalloc<float>(S), T.blob = dalloc<const uint8_t*>(S), T.gu32 = dalloc<float>((size_t) 2 * C);
     T.h16 = dalloc<uint16_t>((size_t) S * c.F), T.y32 = dalloc<float>((size_t) S * C);
+    T.wx = dalloc<float>((size_t) kTwoWin * C), T.wlimbs = dalloc<uint16_t>((size_t) kTwoWin * 2 * C);
+    T.wroute = dalloc<int>(2 * S), T.wn = dalloc<int>(S), T.wblob = dalloc<const uint8_t*>(S);
+    T.wtok = dalloc<int>((size_t) S * k::kGroupMax), T.wrow = dalloc<int>((size_t) S * k::kGroupMax);
     CU(cudaSetDevice(0));
     T.y_in = dalloc<float>((size_t) S * C);
     CU(cudaEventCreateWithFlags(&T.ev_x, cudaEventDisableTiming));
@@ -3458,6 +3467,58 @@ void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, fl
     for (int t = 0; t < T; ++t) mv1(part, x + (size_t) t * x_ld, y + (size_t) t * ldy);
 }
 
+// Two GPUs, a verify window: GPU 1's share of its MoE as two_send / two_take do a token's - the window's x and its
+// picks (GPU 0's route_rows) over, grouped there against GPU 1's table (a group it does not hold: a null block, left
+// alone), run with the window's kernels GPU 0 uses, its rows back in place of the groups GPU 0's table marks
+// k::kHeldElsewhere.  Every member's row is the window kernels' - the token path's to the bit - wherever its expert
+// sits: drafting on two GPUs gives plain decoding's answers there.
+static_assert(kTwoWin == kBlockMax, "the two-GPU window's buffers");
+void two_send_win(const Model& M, int l, Work& W, int T, bool tc) {
+    const Config& c = M.c;
+    const Layer& Ly = M.L[l];
+    TwoGpu& G = g_two;
+    const int C = c.C, S = T * c.K;
+    std::string err;
+    CU(cudaEventRecord(G.ev_x, g_s));
+    CU(cudaSetDevice(G.dev));
+    CU(cudaStreamWaitEvent(G.s, G.ev_x, 0));
+    if (G.link.all_peer) {
+        CU(cudaMemcpyAsync(G.wx, W.xq, (size_t) T * C * 4, cudaMemcpyDeviceToDevice, G.s));
+        CU(cudaMemcpyAsync(G.wroute, W.route_d, (size_t) 2 * S * 4, cudaMemcpyDeviceToDevice, G.s));
+    } else if (!G.link.copy(0, g_s, W.xq, 1, G.s, G.wx, (size_t) T * C * 4, G.s, err) ||
+               !G.link.copy(0, g_s, W.route_d, 1, G.s, G.wroute, (size_t) 2 * S * 4, G.s, err)) {
+        die(err);
+    }
+    k::group_route(G.wroute, (const float*) (G.wroute + S), S, c.K, G.tab[l], G.sc[0][l], G.sc[1][l], G.sc[2][l], G.wblob,
+                   G.wn, G.wtok, G.wrow, G.sg, G.su, G.wt, G.inv, G.s);
+    if (tc) {
+        k::f16_limbs_rows(G.wx, T, C, G.wlimbs, G.s);
+        k::experts_block_gu(G.wblob, G.wn, G.wtok, G.wrow, S, T, Ly.eb[0], C, c.F, G.wlimbs, G.sg, G.su, c.gate_cap,
+                            c.up_cap, G.h16, G.s);
+        k::experts_block_down(G.wblob, G.wn, G.wrow, S, Ly.eb[0] + Ly.eb[1], C, c.F, G.h16, G.y32, G.s);
+    } else {
+        k::experts_gate_up_swiglu_mem(G.wblob, G.wn, G.wtok, G.wrow, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], G.wx, C, c.F, G.sg,
+                                      G.su, c.gate_cap, c.up_cap, G.h16, G.s);
+        k::experts_down_mem(G.wblob, G.wn, G.wrow, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], G.h16, C, c.F, G.y32, G.s);
+    }
+    CU(cudaEventRecord(G.ev_y, G.s));
+#if defined(_WIN32)
+    if (!g_graph) (void) cudaStreamQuery(G.s);   // (Windows + AMD start queued work only at a host wait)
+#endif
+    CU(cudaSetDevice(0));
+}
+void two_take_win(const Model& M, Work& W, int T) {
+    const Config& c = M.c;
+    TwoGpu& G = g_two;
+    const int S = T * c.K;
+    std::string err;
+    CU(cudaStreamWaitEvent(g_s, G.ev_y, 0));
+    if (G.link.all_peer) CU(cudaMemcpyAsync(G.y_in, G.y32, (size_t) S * c.C * 4, cudaMemcpyDeviceToDevice, g_s));
+    else if (!G.link.copy(1, G.s, G.y32, 0, g_s, G.y_in, (size_t) S * c.C * 4, g_s, err)) die(err);
+    CU(cudaSetDevice(0));
+    k::two_take_rows_g(g_blk.blob, g_blk.n, g_blk.row, G.y_in, S, c.C, W.y32, g_s);
+}
+
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
@@ -3715,6 +3776,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
 #else
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
 #endif
+        // (two GPUs: GPU 1's groups there with the same kernels, beside GPU 0's - the exact window only: spec_path)
+        if (g_two.on) two_send_win(M, l, W, T, exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F));
         if (ex && !(exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F))) {
             k::experts_gate_up_swiglu_mem(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0],
                                           W.xq, C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
@@ -3738,6 +3801,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
+        if (g_two.on) two_take_win(M, W, T);
         // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
         //  tokens' picks - it took 9.4 us where the two take 7)
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
@@ -4371,8 +4435,10 @@ struct SpecCtl {
 
 bool g_lookup = false;   // the prompt lookup (src/spec/suffix_drafter): drafts copied from the text so far
 // where a verify window runs: the resident path, and the offload path's mode A with the window's staging (g_off_draft)
+// - on two GPUs too (GPU 1's share of the exact window: two_send_win)
 inline bool spec_path() {
-    return g_block && (g_fast || (g_off && g_off_draft && !g_lane && !g_kv_streaming && !g_two.on && !g_offs.wstage.empty()));
+    return g_block && (g_fast || (g_off && g_off_draft && !g_lane && !g_kv_streaming && (!g_two.on || g_block_exact) &&
+                                  !g_offs.wstage.empty()));
 }
 
 // VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
@@ -5495,7 +5561,14 @@ std::string draft_key(const std::string& model, const std::string& draft_path, i
     std::snprintf(buf, sizeof buf, "ik2 drafting v1|%s %.0f GB sm_%d%d|driver %d|%s %lld|drafter %lld|ctx %d %s",
                   p.name, p.totalGlobalMem / 1e9, p.major, p.minor, drv, base.c_str(), fsize(model),
                   draft_path.empty() ? -1LL : fsize(draft_path), ctx, g_kv_fp8 ? "fp8" : "f16");
-    return buf;
+    std::string key = buf;
+    if (g_two.want) {   // (two GPUs, the split: its own measurement - GPU 1 by name and size)
+        cudaDeviceProp p1{};
+        CU(cudaGetDeviceProperties(&p1, g_two.dev));
+        std::snprintf(buf, sizeof buf, "|gpu1 %s %.0f GB sm_%d%d", p1.name, p1.totalGlobalMem / 1e9, p1.major, p1.minor);
+        key += buf;
+    }
+    return key;
 }
 // the remembered choice (0 .. 3, kDraftNames), or -1; tps: its four figures
 int draft_remembered(const std::string& key, double* tps, std::string& date) {
@@ -6034,9 +6107,10 @@ int main(int argc, char** argv) {
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     // Older NVIDIA (docs/INKLING2.md 8): Volta (sm_70) and Turing (sm_75) take their own attention and expert kernels
     // (k::arch_class); a prompt's attention goes through cuBLAS there (the fused kernel is Ampere's: cp.async, and more
-    // shared memory than a Turing SM has), and Volta has no verify window (the block path's kernels are mma.sync's).
-    // Drafting needs a verify window with the token path's own arithmetic: proven on Ampere on and AMD only, so on
-    // Volta and Turing (their own token kernels, no window twins yet) it stays off - the answers stay plain decoding's.
+    // shared memory than a Turing SM has).  Drafting needs a verify window with the token path's own arithmetic: the
+    // window's experts and attention go through each class's token kernels (Volta: experts_block_*'s mma.m8n8k4 twins,
+    // the attention a token at a time; Turing: Ampere's window kernels on its mma16816), checked to the bit - so it
+    // drafts there as on Ampere, and --drafting auto measures whether it is the faster one.
     {
         int cls = 80;
         for (int d = 0; d < n_gpu; ++d) use_dev(d), cls = std::min(cls, k::arch_class());
@@ -6044,12 +6118,12 @@ int main(int argc, char** argv) {
         if (cls < 80) g_flash = false;
         g_pa70 = cls == 70 && !(getenv("IK2_PA70") && !std::atoi(getenv("IK2_PA70")));
         if (getenv("IK2_PA70_MIN")) g_pa70_min = std::max(0, std::atoi(getenv("IK2_PA70_MIN")));
-        if (cls < 75) g_block = false;
-        if (cls < 80 && (!draft_path.empty() || g_lookup)) {
-            std::printf("NOTE maya-ik2: drafting off - on this GPU (sm_%d class) the verify window does not have the "
-                        "one-token path's kernels yet, so it would change the answers; plain decoding\n", cls);
+        if (cls < 80 && !g_block_exact && (!draft_path.empty() || g_lookup)) {   // (the tiles' window: Ampere's)
+            std::printf("NOTE maya-ik2: drafting off - IK2_BLOCK_EXACT=0's verify window is Ampere's (this GPU: sm_%d "
+                        "class); plain decoding\n", cls);
             std::fflush(stdout);
             draft_path.clear(), g_lookup = false;
+            g_block = false;
         }
     }
     if (n_gpu == 1 && !g_pool) {
@@ -6234,7 +6308,8 @@ int main(int argc, char** argv) {
         size_t tier_room = 0, stage_b = 0;
         if (off_layout) {
             const char* le = getenv("IK2_LANE");
-            const bool lane0 = le && *le && std::string(le) == "0";
+            // (two GPUs: mode A whatever IK2_LANE says - the split's own arithmetic, with drafting or without)
+            const bool lane0 = g_two.want || (le && *le && std::string(le) == "0");
             if (g_kv_streaming)
                 off_why = "at this context part of the cache streams from RAM, and the verify window reads the "
                           "whole cache in VRAM (plain decoding)";
@@ -6254,8 +6329,7 @@ int main(int argc, char** argv) {
             }
         }
         auto room_ok = [&](size_t need, std::string& why) {
-            if (g_two.want) why = "on two GPUs it is not checked against plain decoding yet (plain decoding)";
-            else if (off_layout) {
+            if (off_layout) {
                 if (!off_why.empty()) why = off_why;
                 else if (need + stage_b > tier_room / 2) why = "its room does not fit beside the model at this context";
             } else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";

@@ -2668,7 +2668,9 @@ void test_experts_mma() {
 
 // The exact verify window (drafting on = off): each of T tokens' values from the window's kernels the one-token
 // path's to the bit - mv_q8p_cols vs mv_q8p, experts_*_mem vs experts_gate_up_swiglu / experts_down (NVFP4, Q8_0),
-// experts_block_gu / _down vs experts_gate_up_swiglu_mma / experts_down_mma (sm_80 on) - Inkling-2-Mini's sizes.
+// experts_block_gu / _down vs experts_gate_up_swiglu_mma / experts_down_mma (each class's kernels: Ampere on, Turing,
+// Volta's mma.m8n8k4) - Inkling-2-Mini's sizes.  And two GPUs: the groups the other GPU runs left alone on each, its
+// rows taken (two_take_rows_g) - the one-GPU window to the bit.
 void test_window_exact(bool mma) {
 #ifdef MAYA_USE_HIP
     mma = false;   // (AMD: the token path's experts are the row dots - IK2_EXPERT_MMA's default 0 there)
@@ -2799,6 +2801,38 @@ void test_window_exact(bool mma) {
                 one_token(t);
                 h_same &= !std::memcmp(host(h1, (size_t) K * F).data(), hw.data() + (size_t) t * K * F, (size_t) K * F * 2);
                 y_same &= !std::memcmp(host(y1, (size_t) K * C).data(), yw.data() + (size_t) t * K * C, (size_t) K * C * 4);
+            }
+            {   // two GPUs: GPU 0's table marks the even experts kHeldElsewhere, GPU 1's holds only those
+                std::vector<const uint8_t*> t0(tab), t1(tab);
+                for (int e = 0; e < E; ++e) (e % 2 ? t1[e] : t0[e]) = e % 2 ? nullptr : (const uint8_t*) k::kHeldElsewhere;
+                auto **dt0 = dev(t0), **dt1 = dev(t1);
+                const uint8_t** gb1 = dev_n<const uint8_t*>(S);
+                auto *h0 = dev_n<uint16_t>((size_t) S * F), *h1g = dev_n<uint16_t>((size_t) S * F);
+                auto *y0 = dev_n<float>((size_t) S * C), *y1g = dev_n<float>((size_t) S * C);
+                CU(cudaMemset(y0, 0xA5, (size_t) S * C * 4));
+                CU(cudaMemset(y1g, 0x5A, (size_t) S * C * 4));
+                auto run = [&](const uint8_t** tb, const uint8_t** gb, uint16_t* hh, float* yy) {
+                    k::group_route(dtop, dw, S, K, tb, dsg_t, dsu_t, nullptr, gb, gn, gtok, grow, gsg, gsu, gwt, ginv, 0);
+                    if (tc) {
+                        k::experts_block_gu(gb, gn, gtok, grow, S, T, mb, C, F, limbs, gsg, gsu, 20, 20, hh, 0);
+                        k::experts_block_down(gb, gn, grow, S, 2 * mb, C, F, hh, yy, 0);
+                    } else {
+                        k::experts_gate_up_swiglu_mem(gb, gn, gtok, grow, S, ty, ty, mb, dx, C, F, gsg, gsu, 20, 20, hh, 0);
+                        k::experts_down_mem(gb, gn, grow, S, ty, 2 * mb, hh, C, F, yy, 0);
+                    }
+                };
+                if (tc) k::f16_limbs_rows(dx, T, C, limbs, 0);
+                run(dt1, gb1, h1g, y1g);   // (GPU 1's share)
+                run(dt0, gblob, h0, y0);   // (GPU 0's, then GPU 1's rows taken)
+                k::two_take_rows_g(gblob, gn, grow, y1g, S, C, y0, 0);
+                const bool two_same = !std::memcmp(host(y0, (size_t) S * C).data(), yw.data(), (size_t) S * C * 4);
+                char nm[160];
+                std::snprintf(nm, sizeof nm, "window experts %s (%s), %d tokens, split over two GPUs: y the one-GPU "
+                              "window's to the bit", ty == k::kNVFP4 ? "NVFP4" : "Q8_0", tc ? "tensor cores" : "row dots", T);
+                expect_true(nm, two_same);
+                for (void* p : {(void*) dt0, (void*) dt1, (void*) gb1, (void*) h0, (void*) h1g, (void*) y0, (void*) y1g})
+                    CU(cudaFree(p));
+                k::group_route(dtop, dw, S, K, dtab, dsg_t, dsu_t, nullptr, gblob, gn, gtok, grow, gsg, gsu, gwt, ginv, 0);
             }
             if (getenv("IK2_TEST_WINDOW_TIME")) {   // (T tokens' experts one token at a time against the window's)
                 cudaEvent_t e0, e1;
@@ -3167,7 +3201,7 @@ int main() {
     CU(cudaGetDeviceProperties(&p, 0));
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
     if (getenv("IK2_TEST_WINDOW_ONLY")) {   // (the exact window's checks alone: a GPU without the tensor-core kernels)
-        test_window_exact(p.major >= 8);
+        test_window_exact(p.major >= 7);   // (Volta and Turing: their own tensor-core kernels)
         std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
         return g_fail ? 1 : 0;
     }
@@ -3200,7 +3234,7 @@ int main() {
 #ifdef MAYA_USE_HIP
     test_experts_rdna();
 #endif
-    test_window_exact(p.major >= 8);
+    test_window_exact(p.major >= 7);   // (Volta and Turing: their own tensor-core kernels)
     test_window_launches();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

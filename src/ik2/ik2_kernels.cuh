@@ -177,6 +177,11 @@ void moe_combine_conv(const float* y, const int* inv, const float* wt, int K, in
 /// picks marked kHeldElsewhere (blob [S]) taken from GPU 1's rows (other [S][C], copied over) into y [S][C].
 constexpr uintptr_t kHeldElsewhere = 1;
 void two_take_rows(const uint8_t* const* blob, const float* other, int S, int C, float* y, cudaStream_t s);
+/// ... for a verify window: group_route's groups (blob / n / row [G]) - the members' rows of the groups marked
+/// kHeldElsewhere from other [S][C] into y [S][C].  The window's expert kernels (experts_block_gu / _down,
+/// experts_*_mem) leave such a group, and one with a null block, alone.
+void two_take_rows_g(const uint8_t* const* blob, const int* n, const int* row, const float* other, int G, int C,
+                     float* y, cudaStream_t s);
 
 /// y = a + b, n values (y may alias either).
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
@@ -568,6 +573,7 @@ void group_route(const int* top, const float* w, int S, int K, const uint8_t* co
 /// group_route's groups of NVFP4 experts on the tensor cores: gate | up (the input as f16_limbs_rows' limbs) to
 /// h [slot][F] through the capped SwiGLU; down from h to y [slot][C].  G: the launch's groups (those past the last
 /// return at once); T: the window's tokens (a group's members).
+/// On Volta (sm_70) the same on mma.m8n8k4: the one-token Volta kernels' values to the bit.
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                       size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,
                       float ucap, uint16_t* h, cudaStream_t s);
