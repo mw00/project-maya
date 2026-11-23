@@ -344,6 +344,9 @@ cudaEvent_t g_ep_x, g_ep_cp[2], g_ep_done;
 // (gate/up/SwiGLU), the halves swapped (P2P), each GPU its half of the output rows (down), concatenated on GPU 0.
 // Attention, dense weights and the KV cache on GPU 0 as with IK2_EP.
 bool g_tp = false;
+bool g_heat_fresh = true;   // (IK2_HEAT_DUMP: the first request's captures truncate the files)
+std::vector<uint32_t> g_heat_prom;   // (IK2_HEAT_DUMP: the prompt path's per-(layer, expert) picks, host-side)
+
 cudaEvent_t g_tp_h[2];
 int g_tp_F = 0, g_tp_C = 0;
 inline bool dual() { return g_ep || g_tp; }
@@ -369,13 +372,13 @@ FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int
 // gaps (the idle between a visit's conv4_res and the next visit's first attention work).
 static bool g_events = false;
 static bool g_evx_fine = false;
-static cudaEvent_t g_evx_s[1024], g_evx_c[1024];
-static const char* g_evx_tag[1024];
+static cudaEvent_t g_evx_s[20000], g_evx_c[20000];
+static const char* g_evx_tag[20000];
 static int g_evx_n = 0;
 static cudaEvent_t g_t0_s = nullptr, g_t0_c = nullptr;
 static bool g_t0_ok = false;
 static void evx_rec(const char* tag) {
-    if (!g_events || g_evx_n >= 1024) return;
+    if (!g_events || g_evx_n >= 20000) return;
     if (!g_t0_ok) {
         cudaEventRecord(g_t0_s, g_s), cudaEventRecord(g_t0_c, g_cs);
         g_t0_ok = true;
@@ -1568,7 +1571,9 @@ void kv_swing(Model& M, bool to_host, int pos) {
 void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const float* h_in, const int* pos_p, int nb,
                     size_t blk_off, float* r_out, Work& W, const float* msg = nullptr) {
     const Config& c = M.c;
-    const bool evx_fine = g_evx_fine && T > 1;
+    static int an = 0;   // (diag: the fine kernel points for the first 96 visits only)
+    const bool evx_fine = g_evx_fine && T > 1 && an < 96;
+    if (evx_fine) ++an;
     const int C = c.C;
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + ((size_t) i * W.blk_ld + blk_off) * C; };
@@ -2095,10 +2100,21 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     for (int e = 0; e < c.E; ++e) {
         W.use[(size_t) l * c.E + e] += W.cnt[e];
         const int k = W.cnt[e];
+        if (k && !g_heat_prom.empty()) g_heat_prom[(size_t) l * c.E + e] += (uint32_t) k;
         if (k) ++g_cnt_hist[k == 1 ? 0 : k == 2 ? 1 : k < 8 ? 2 : 3];
         const bool pfd = pf_here && W.pf_bs[prl][e] >= 0;
         if (k) ++g_src_hist[pfd ? 1 : EC.has(l, e) ? 0 : 2];
         else if (pfd) ++g_src_hist[3];
+    }
+    if (!g_heat_prom.empty()) {   // (IK2_HEAT_DUMP: the per-visit counts for the offline analyzer)
+        static FILE* hv = nullptr;
+        if (!hv) hv = std::fopen("/tmp/heat_visits.bin", "ab");
+        if (hv) {
+            const int32_t vhdr[2] = {l, T};
+            std::fwrite(vhdr, 4, 2, hv);
+            std::fwrite(W.cnt.data(), 4, (size_t) c.E, hv);
+            std::fflush(hv);   // (the handler's marker fopen/fclose must interleave in order)
+        }
     }
     W.use_tot[l] += S;
     W.start[0] = 0;
@@ -2205,6 +2221,14 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             }
             if (cst != g_s) CU(cudaEventRecord(X.miss_ev[b], cst));
         }
+        if (g_evx_fine) {   // (diag: the visit's layer + miss/hit counts ride this point's tag)
+            static char mtags[20000][24];
+            static int mt_n = 0;
+            std::snprintf(mtags[mt_n], 24, "l%d_m%d.%d", l, (int) X.miss_exps.size(),
+                          (int) X.hit_exps.size());
+            evx_rec(mtags[mt_n]);
+            mt_n = (mt_n + 1) % 20000;
+        }
         XC.t_up += now() - tu;
         g_pf.lap(g_pf.upload, "upload");
 
@@ -2217,6 +2241,14 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         const bool grp = g_grp && grp_ok(Ly) && X.grp_cap >= (size_t) S;
         const bool nvl = grp && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4
             && C % 64 == 0 && c.F % 64 == 0;   // (the tensor-core block kernels' fit)
+        if (g_evx_fine) {   // (diag: the expert types' fit, the first 48 exec calls)
+            static int prn = 0;
+            if (prn < 48) {
+                ++prn;
+                std::printf("moe-types: l%d ty %d/%d/%d C %d F %d grp %d nvl %d\n", l, Ly.ty[0],
+                            Ly.ty[1], Ly.ty[2], C, F, grp, nvl);
+            }
+        }
         if (grp) {
             k::to_f32(xin, (size_t) T * C, X.xf32, g_s);
             if (nvl) k::f16_limbs_rows(X.xf32, (int) T, C, X.limbs, g_s);
@@ -6278,7 +6310,7 @@ int main(int argc, char** argv) {
     if (g_events) {
         CU(cudaEventCreate(&g_t0_s));
         CU(cudaEventCreate(&g_t0_c));
-        for (int i = 0; i < 1024; ++i) {
+        for (int i = 0; i < 20000; ++i) {
             CU(cudaEventCreate(&g_evx_s[i]));
             CU(cudaEventCreate(&g_evx_c[i]));
         }
@@ -7926,6 +7958,36 @@ int main(int argc, char** argv) {
             last.clear();
             last_greedy = -1;
         };
+
+        auto heat_snap = [&](const char* path, const char* tag) {
+            const size_t n = (size_t) M.c.n_layer * M.c.E;
+            if (g_heat_fresh) {
+                const ExpertCache& EC0 = dev_cache(0);
+                std::printf("POOLMAP: pools %d, layer_pool", (int) EC0.pools.size());
+                for (int l = 0; l < M.c.n_layer; ++l) std::printf(" %d", EC0.layer_pool[l]);
+                std::printf("\n");
+            }
+            static std::vector<uint32_t> hv;
+            hv.assign(n, 0);
+            CU(cudaMemcpy(hv.data(), g_offs.heat, n * 4, cudaMemcpyDeviceToHost));
+            if (FILE* f = std::fopen(path, g_heat_fresh ? "wb" : "ab")) {
+                std::fwrite(hv.data(), 4, n, f);
+                std::fclose(f);
+            }
+            g_heat_fresh = false;
+            unsigned long long sum = 0;
+            int distinct = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (hv[i]) { sum += hv[i]; ++distinct; }
+            std::vector<uint32_t> top(hv);
+            std::sort(top.begin(), top.end(), std::greater<uint32_t>());
+            unsigned long long acc = 0;
+            const size_t slots = std::min((size_t) 1225, top.size());
+            for (size_t i = 0; i < slots; ++i) acc += top[i];
+            std::printf("HEAT %s: picks %llu, distinct %d, top-1225 share %.1f%%\n", tag,
+                        sum, distinct, sum ? 100.0 * acc / sum : 0.0);
+            CU(cudaMemsetAsync(g_offs.heat, 0, n * 4, g_s));
+        };
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
             for (const char* p = t.c_str(); *p;) {
@@ -8643,6 +8705,15 @@ int main(int argc, char** argv) {
             const int cached = (int) L;
             const double t0 = now();
             const uint64_t miss0 = dev_cache(0).misses, bytes0 = dev_cache(0).bytes_up;
+            if (g_offs.heat && getenv("IK2_HEAT_DUMP")) {
+                CU(cudaMemsetAsync(g_offs.heat, 0, (size_t) M.c.n_layer * M.c.E * 4, g_s));
+                g_heat_prom.assign((size_t) M.c.n_layer * M.c.E, 0);
+                if (FILE* mk = std::fopen("/tmp/heat_visits.bin", "ab")) {
+                    const int32_t mkv[2] = {-1, (int32_t) ids.size()};
+                    std::fwrite(mkv, 4, 2, mk);
+                    std::fclose(mk);
+                }
+            }
             for (auto& v : g_cnt_hist) v = 0;
             for (auto& v : g_src_hist) v = 0;
             bool cancelled = false;
@@ -8718,6 +8789,12 @@ int main(int argc, char** argv) {
                 snap_next = (snap_next + 1) % (int) snaps.size();
                 sn.pos = (int) hist.size();
                 snap_copy(sn, true, max_new + kBlockMax);
+            }
+            if (g_offs.heat && getenv("IK2_HEAT_DUMP")) {
+                if (!g_heat_prom.empty())
+                    CU(cudaMemcpyAsync(g_offs.heat, g_heat_prom.data(), g_heat_prom.size() * 4,
+                                       cudaMemcpyHostToDevice, g_s));
+                heat_snap("/tmp/heat_prompt.bin", "prompt");
             }
             const double t1 = now();
             if (getenv("IK2_STATS"))
@@ -8879,6 +8956,8 @@ int main(int argc, char** argv) {
                              (unsigned long long) sctl.l_accepted, (unsigned long long) sctl.l_drafted,
                              (unsigned long long) sctl.plain);
             if (serve_maya) stat_line(n_out, now());
+            if (g_offs.heat && getenv("IK2_HEAT_DUMP"))
+                heat_snap("/tmp/heat_gen.bin", "gen");
             unsigned long long ph1 = 0, pn1 = 0;
             pick_counts(n_out, ph1, pn1);
             if (serve_maya)   // (DONE's 6th and 7th fields: this answer's drafts kept and offered; 9th, 10th its picks
@@ -8894,6 +8973,8 @@ int main(int argc, char** argv) {
             g_wd_busy = false;
         }
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
+        std::fflush(stdout);
+        evx_print(0.0);   // (diag: the serve's timeline printed at QUIT - the CLI's prompt path prints per prompt)
         std::fflush(stdout);
         std::_Exit(0);   // (QUIT / end of input: out at once, as maya-hy4 - the OS frees the pinned runs and the driver's state)
     }
