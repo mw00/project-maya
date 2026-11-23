@@ -96,6 +96,19 @@ inline int64_t fixed_of(const char* env) {
     return v == nullptr ? -1 : std::max<int64_t>(0, std::atoll(v));
 }
 
+/// (#1156) whether a reserve of `res` bytes is the SETUP's own: on an AMD GPU the setup writes a reserve by itself (the
+/// desktop allocates beside the engine) and says so in the config's environment (MAYA_VRAM_RESERVE_SETUP_MB=<MiB>).
+/// Such a reserve is the default one, not asked for: the default rule holds beside it (kept_for).  A reserve the user
+/// set - another figure, or the setup's line gone / 0 - is asked for
+inline bool setup_wrote(size_t res) {
+    const char* v = std::getenv("MAYA_VRAM_RESERVE_SETUP_MB");
+    if (v == nullptr || !v[0]) return false;
+    const long long m = std::atoll(v), d = (m << 20) - (long long) res;
+    return m > 0 && std::llabs(d) < ((long long) 2 << 20);
+}
+/// a reserve the USER asked for (`given`: set on the command line or in the environment, and not the setup's own)
+inline bool asked(bool given, size_t res) { return given && !setup_wrote(res); }
+
 /// what a start keeps free beside the reserve from the measured figure: all of it with a reserve asked for; with the
 /// default one, none (the last release's plan) while the default holds it with kSpare to spare
 inline size_t kept_for(size_t measured, size_t reserve_b, bool given) {

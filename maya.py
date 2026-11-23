@@ -1135,6 +1135,33 @@ def hip_reserve_mib(gpus) -> int:
     return 3072
 
 
+# (#1156) whose reserve a config's is, for the engines' measured extra beside it (src/core/vram_late.hpp): the MiB the
+# SETUP wrote by itself on an AMD GPU - the engines then keep the default rule (nothing extra kept unless that reserve
+# would be used up) - or "0": set by the user (--vram-reserve-mib), the measured extra is kept on top
+VRAM_RESERVE_SETUP = "MAYA_VRAM_RESERVE_SETUP_MB"
+
+
+def mark_reserve(env: dict, mib: int | None, hip: bool = True) -> None:
+    """A config's environment told whose its VRAM reserve is: `mib` the setup's own (AMD), None the user's ("0" on an
+    AMD GPU, where a later setup would else take a kept reserve equal to its own for its own; elsewhere no line)."""
+    for k in [k for k in env if N.shown(str(k)) == VRAM_RESERVE_SETUP]:
+        del env[k]
+    if mib is not None or hip:
+        env[VRAM_RESERVE_SETUP] = str(mib) if mib is not None else "0"
+
+
+def mark_kept_reserve(env: dict, kept, per_mib: float, own_mib: int) -> None:
+    """A reserve kept from the config before on an AMD GPU (`kept`: the argument's value, `per_mib` MiB a unit): one
+    equal to the setup's own that no setup has marked yet (a config of v1.1.75 or older, where the setup wrote it
+    unmarked) is the setup's."""
+    try:
+        kept_mib = float(kept) * per_mib
+    except (TypeError, ValueError):
+        return
+    if abs(kept_mib - own_mib) < 2 and not any(N.shown(str(k)) == VRAM_RESERVE_SETUP for k in env):
+        mark_reserve(env, own_mib)
+
+
 def hip_clang(root: Path) -> Path | None:
     """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), <root>/lib/llvm/bin (TheRock's wheels),
     <root>/lib/llvm/<version>/bin (a distribution's LLVM slot, e.g. Gentoo's), <root>/lib64/rocm/llvm/bin (a
@@ -4624,7 +4651,8 @@ def glm_config_path(pc: dict, quant: str) -> Path:
 
 # the environment settings the GLM setup itself writes (or leaves out) by the PC and GPUs chosen - a setup again works
 # them out anew instead of keeping the config before's
-GLM_SETUP_ENV = ("MAYA_GLM_RESERVE_MB", "MAYA_GLM_RAM_HEADROOM_GB", "MAYA_GLM_SPLIT", "MAYA_GLM_MTP_DECODE",
+GLM_SETUP_ENV = ("MAYA_GLM_RESERVE_MB", "MAYA_VRAM_RESERVE_SETUP_MB", "MAYA_GLM_RAM_HEADROOM_GB", "MAYA_GLM_SPLIT",
+                 "MAYA_GLM_MTP_DECODE",
                  "MAYA_GLM_PARALLEL_LOAD", "MAYA_GLM_PREFILL_SUB", "MAYA_GLM_PREFILL_MB", "MAYA_HIPBLASLT_TUNING")
 
 # the server's own settings, set in a config by hand (or with --port / --host / --api-key at a setup): every model's
@@ -4686,7 +4714,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["backend"] = "hip"
         # Leave space for the Linux desktop. The engine sizes its prompt chunk from
         # the available prompt-memory budget; forcing 256 here severely slows HIP.
-        hip_env = {"MAYA_GLM_RESERVE_MB": str(hip_reserve_mib(pc["gpus"])), "MAYA_GLM_RAM_HEADROOM_GB": "16"}
+        hip_env = {"MAYA_GLM_RESERVE_MB": str(hip_reserve_mib(pc["gpus"])), "MAYA_GLM_RAM_HEADROOM_GB": "16",
+                   VRAM_RESERVE_SETUP: str(hip_reserve_mib(pc["gpus"]))}   # (the reserve is the setup's own: #1156)
         gpus = pc["gpus"]
         if len(gpus) == 1:
             hip_env["MAYA_GLM_SPLIT"] = "0"   # two or more cards: the engine picks the split (and drafts with MTP)
@@ -4773,6 +4802,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         set_arg(cfg["args"], "--parallel", a.parallel)
     if getattr(a, "vram_reserve_mib", None) is not None and not metal:   # given now: written, and a later setup keeps it
         set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
+        if "env" in cfg:
+            mark_reserve(cfg["env"], None, False)   # (#1156: the user's, not the AMD setup's own)
         ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
     # (GLM-5.3-Flash's measurements: not said for GLM-5.3, whose prompt chunks are not measured that way yet)
     for line in ([] if dsa else prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"]))):
@@ -8397,12 +8428,17 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--vision", "off"]
     if "--dspark" not in args[:-1] and CDS.has_drafter({"args": args}):
         args += ["--dspark", "none"]                   # (until the speed calibration finds that drafting pays here)
+    rmark = None
     if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
         set_arg(args, "--reserve-mib", a.vram_reserve_mib)
+        rmark = (mark_reserve, None, bool(hip))
         ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
-    elif hip and "--reserve-mib" not in args[:-1]:
+    elif hip and "--reserve-mib" in args[:-1]:             # (kept from the config before)
+        rmark = (mark_kept_reserve, args[args.index("--reserve-mib") + 1], 1, hip_reserve_mib(pc["gpus"]))
+    elif hip:
         mib = hip_reserve_mib(pc["gpus"])
         set_arg(args, "--reserve-mib", mib)
+        rmark = (mark_reserve, mib)   # (#1156: the setup's own - the engine keeps the default rule beside it)
         ok(f"VRAM kept free on each GPU: {mib} MiB (the desktop and other programs on an AMD GPU allocate beside the "
            "engine; --vram-reserve-mib changes it)")
     cfg = {"exe": str(DS4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
@@ -8428,6 +8464,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
             say(f"  (this PC also has an NVIDIA card: with a CUDA build of maya-ds4 at {exe} (its build stopped above) "
                 "DeepSeek can run on both GPUs (`--mixed-gpus on`))")
     env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if rmark is not None:
+        rmark[0](env, *rmark[1:])
     if env:
         cfg["env"] = env
     if a.host:
@@ -9026,12 +9064,17 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         set_arg(args, "--vision", "off")
     elif mm3_pack_has_vision(pack):
         set_arg(args, "--vision", "on")
+    rmark = None
     if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
         put = set_vram_reserve(args, "minimax", a.vram_reserve_mib)
+        rmark = (mark_reserve, None, bool(hip))
         ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib: {put})")
-    elif hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
+    elif hip and "--reserve-gb" in args[:-1]:       # (kept from the config before)
+        rmark = (mark_kept_reserve, args[args.index("--reserve-gb") + 1], 1024, hip_reserve_mib(pc["gpus"]))
+    elif hip:                                       # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
         mib = hip_reserve_mib(pc["gpus"])
         set_arg(args, "--reserve-gb", f"{mib / 1024:.1f}")
+        rmark = (mark_reserve, mib)   # (#1156: the setup's own)
         ok(f"VRAM kept free on each GPU: {mib / 1024:.1f} GB (the desktop and other programs on an AMD GPU allocate "
            "beside the engine)")
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
@@ -9043,6 +9086,8 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
     kept += keep_server_settings(cfg, old, a)
     env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if rmark is not None:
+        rmark[0](env, *rmark[1:])
     if env:
         cfg["env"] = env
     if a.host:
@@ -10399,8 +10444,10 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     kept = keep_args(old.get("args") or [], args, ("--tp", "--main-gpu", "--cpu-threads", "--profile", "--draft",
                                                    "--draft-floor") +
                      (("--chunk", "--reserve-gb", "--vram-experts") if standard else ()))
+    rmark = None
     if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
         put = set_vram_reserve(args, "hy4", a.vram_reserve_mib)
+        rmark = (mark_reserve, None, False)
         ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib: {put})")
     inst = {"family": "hy4", "hy4_quant": quant, "quant": HY4_QUANTS.get(quant, HY4), "layout": fit["layout"],
             "drafting": "on" if drafting else "off"}
@@ -10429,6 +10476,8 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            **({"backend": "hip"} if pc.get("backend") == "hip" else {})}
     kept += keep_server_settings(cfg, old, a)
     env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if rmark is not None:
+        rmark[0](env, *rmark[1:])
     if env:
         cfg["env"] = env
     if a.host:
@@ -11989,6 +12038,8 @@ def main() -> int:
                 warn("--vram-reserve-mib: this model's engine has no VRAM reserve setting - the start keeps the config "
                      "as it is")
             else:
+                if cfg.get("backend") == "hip":   # (#1156: the user's, whatever a setup wrote before)
+                    mark_reserve(cfg.setdefault("env", {}), None)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
                 ok(f"{pick.name}: VRAM kept free on each GPU {a.vram_reserve_mib} MiB ({put})")
         if (a.calibrate or a.speed_calibration) and read_json(pick).get("backend") == "metal":

@@ -495,6 +495,23 @@ class Config(unittest.TestCase):
         p, c = self.write(args())                                     # (NVIDIA: the engine's own 600)
         self.assertNotIn("--reserve-mib", c["args"])
 
+    def test_hip_reserve_marked_as_the_setups(self):   # (#1156: the engine keeps the default rule beside the setup's own)
+        def env(old=None, **kw):
+            (self.root / "maya-ds4-hip.json").unlink(missing_ok=True)
+            if old is not None:
+                (self.root / "maya-ds4-hip.json").write_text(json.dumps(old))
+            pc = {"backend": "hip", "gpus": [{"arch": "gfx1100", "name": "Radeon RX 7900 XTX", "vram_gb": 24, "index": 0}]}
+            p = maya.write_config_ds4(args(**kw), pc, {}, Path("/m/G/maya-ds4"), 65536, Path("/models"), Path("/m/G"),
+                                      "maya-s")
+            return (json.loads(p.read_text()).get("env") or {}).get("MAYA_VRAM_RESERVE_SETUP_MB")
+        self.assertEqual(env(), "3072")                                            # (written by the setup: marked)
+        self.assertEqual(env(vram_reserve_mib=3072), "0")                          # (the user's, even the same figure)
+        self.assertEqual(env({"args": ["--reserve-mib", "3072"]}), "3072")         # (a v1.1.75 config: the setup's)
+        self.assertIsNone(env({"args": ["--reserve-mib", "1024"]}))                # (set by hand: the user's)
+        self.assertEqual(env({"args": ["--reserve-mib", "3072"], "env": {"MAYA_VRAM_RESERVE_SETUP_MB": "0"}}), "0")
+        p, c = self.write(args(vram_reserve_mib=900))                              # (NVIDIA: no line)
+        self.assertNotIn("MAYA_VRAM_RESERVE_SETUP_MB", c.get("env") or {})
+
 
 class Calibrate(unittest.TestCase):
     """./maya.sh --calibrate on a DeepSeek config: tools/calibrate_ds4_tp.py's result into the config and the store."""

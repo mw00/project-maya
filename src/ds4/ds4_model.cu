@@ -9018,11 +9018,12 @@ struct Model::Impl {
                 // (the default reserve, not asked for: v1.1.72's plan wherever it holds what the run takes after the
                 //  plan with 128 MiB to spare - only a PC whose default reserve it uses up keeps more free)
                 d.late = vramlate::kept_for(d.late_kept, (size_t) std::max<int64_t>(0, o.reserve_mib) << 20,
-                                            o.reserve_given);
+                                            vramlate::asked(o.reserve_given, (size_t) std::max<int64_t>(0, o.reserve_mib) << 20));
             }
             if (d.late > 0)
                 std::fprintf(stderr, "ds4: CUDA%d keeps %zu MiB free beside the %lld MiB reserve%s\n", d.id, d.late >> 20,
-                             (long long) o.reserve_mib, vramlate::why(fixed != nullptr, o.reserve_given).c_str());
+                             (long long) o.reserve_mib, vramlate::why(fixed != nullptr,
+                                           vramlate::asked(o.reserve_given, (size_t) std::max<int64_t>(0, o.reserve_mib) << 20)).c_str());
         }
     }
     // once loaded (`loaded`) and between requests: the least free VRAM this run has seen against the reserve - the
@@ -9047,7 +9048,8 @@ struct Model::Impl {
                              d.id, fr >> 20, (long long) (res >> 20),
                              d.late > 0 ? (", " + std::to_string(d.late >> 20) + " MiB more kept beside it").c_str() : "");
             vramlate::Gpu lg{d.late, d.late_kept, d.fr_min};   // (the engines' shared step: src/core/vram_late.hpp)
-            const vramlate::Step st = vramlate::check(lg, fr, tot, (size_t) res, o.reserve_given, d.late_room);
+            const bool asked = vramlate::asked(o.reserve_given, (size_t) std::max<int64_t>(0, o.reserve_mib) << 20);
+            const vramlate::Step st = vramlate::check(lg, fr, tot, (size_t) res, asked, d.late_room);
             d.fr_min = lg.fr_min, d.late_kept = lg.kept;
             if (!st.moved) continue;
             const int64_t want = st.want;

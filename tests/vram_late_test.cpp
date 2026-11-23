@@ -17,6 +17,30 @@ int main() {
     CHECK(vl::kept_for(576 * MiB, 700 * MiB, false) == 576 * MiB);
     CHECK(vl::kept_for(320 * MiB, 700 * MiB, true) == 320 * MiB);   // asked for: all of it
 
+    // (#1156) a reserve the SETUP wrote by itself (AMD: MAYA_VRAM_RESERVE_SETUP_MB=<MiB>) is the default one, not asked
+    // for: nothing extra kept unless it would be used up; the user's own (another figure, the line 0 or gone) is asked
+    {
+        auto set = [](const char* v) {
+#ifdef _WIN32
+            _putenv_s("MAYA_VRAM_RESERVE_SETUP_MB", v != nullptr ? v : "");
+#else
+            v != nullptr ? setenv("MAYA_VRAM_RESERVE_SETUP_MB", v, 1) : unsetenv("MAYA_VRAM_RESERVE_SETUP_MB");
+#endif
+        };
+        set(nullptr);
+        CHECK(vl::asked(true, 3072 * MiB) && !vl::asked(false, 3072 * MiB));
+        set("3072");
+        CHECK(!vl::asked(true, 3072 * MiB));                          // the setup's own
+        CHECK(!vl::asked(true, (size_t) 3221000000));                 // (maya-hy4's --reserve-gb 3.221: the same reserve)
+        CHECK(vl::asked(true, 1024 * MiB) && vl::asked(true, 4096 * MiB));   // changed by hand: the user's
+        CHECK(vl::kept_for(288 * MiB, 3072 * MiB, vl::asked(true, 3072 * MiB)) == 0);            // #1156's 288 MiB: not kept
+        CHECK(vl::kept_for(3000 * MiB, 3072 * MiB, vl::asked(true, 3072 * MiB)) == 1024 * MiB);  // used up: kept (capped)
+        CHECK(vl::kept_for(288 * MiB, 1024 * MiB, vl::asked(true, 1024 * MiB)) == 288 * MiB);    // the user's: on top
+        set("0");
+        CHECK(vl::asked(true, 3072 * MiB));                           // --vram-reserve-mib 3072 by the user
+        set(nullptr);
+    }
+
     // a 4096 MiB reserve asked for, 3587 MiB free at a request: 509 short -> 512 kept, the start said short
     {
         vl::Gpu g;

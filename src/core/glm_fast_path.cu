@@ -7760,7 +7760,9 @@ void Glm5Model::late_read(size_t free_b, size_t total_b, size_t floor_b, size_t 
                   pack_dir_.c_str(), (long long) max_ctx_, seq_count(), ec ? ec : "auto", b.reserve >> 20);
     late_key_ = buf;
     late_res_ = b.reserve;
-    late_given_ = b.reserve_given;
+    // (#1156: an AMD setup's own reserve is the default one - the default rule beside it)
+    const bool asked = maya::vramlate::asked(b.reserve_given, b.reserve);
+    late_given_ = asked;
     late_on_ = true;
     const std::string file = maya::vramlate::file_of(pack_dir_, "MAYA_GLM_LATE_FILE");
     const int64_t fixed = maya::vramlate::fixed_of("MAYA_GLM_LATE_MB");
@@ -7769,7 +7771,7 @@ void Glm5Model::late_read(size_t free_b, size_t total_b, size_t floor_b, size_t 
     } else if (!file.empty()) {
         const std::string v = maya::vramlate::get(file, late_key_);
         late_kept_ = v.empty() ? 0 : (size_t) std::max(0LL, std::atoll(v.c_str())) << 20;
-        late_ = b.adapted ? 0 : std::min(maya::vramlate::kept_for(late_kept_, b.reserve, b.reserve_given),
+        late_ = b.adapted ? 0 : std::min(maya::vramlate::kept_for(late_kept_, b.reserve, asked),
                                          maya::vramlate::cap_of(total_b));
     }
     // (what the pool can give up above its floor: a pool already there keeps no more free, and its start is not said
@@ -7783,7 +7785,7 @@ void Glm5Model::late_read(size_t free_b, size_t total_b, size_t floor_b, size_t 
     }
     if (late_ > 0)
         std::fprintf(stderr, "glm fast: CUDA%d keeps %zu MiB free beside the %zu MiB reserve%s\n", dev_, late_ >> 20,
-                     b.reserve >> 20, maya::vramlate::why(fixed >= 0, b.reserve_given).c_str());
+                     b.reserve >> 20, maya::vramlate::why(fixed >= 0, asked).c_str());
 }
 
 int Glm5Model::late_check_part(bool loaded) {
