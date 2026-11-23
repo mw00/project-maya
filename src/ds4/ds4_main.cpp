@@ -3613,6 +3613,34 @@ int check_marks(maya::ds4::Model& m, const std::vector<int>& ids, int n) {
     return same_last && same_again && same_toks ? 0 : 1;
 }
 
+// DeepSeek's shipped expert profile (data/expert-profile-ds4.bin, tools/ds4/profile.py), found from this program's own
+// path (build-*/maya-ds4 beside data/) or the working folder; "" where there is none
+std::string shipped_profile(const char* argv0) {
+    namespace fs = std::filesystem;
+    std::string self;
+#if defined(_WIN32)
+    char buf[MAX_PATH * 4];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, (DWORD) sizeof buf);
+    if (n > 0 && n < sizeof buf) self.assign(buf, n);
+#else
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) self.assign(buf, (size_t) n);
+#endif
+    if (self.empty() && argv0 != nullptr) self = argv0;
+    std::vector<fs::path> at;
+    std::error_code ec;
+    if (!self.empty()) {
+        const fs::path dir = fs::path(self).parent_path();
+        for (const fs::path& up : {dir, dir.parent_path(), dir.parent_path().parent_path()})
+            if (!up.empty()) at.push_back(up / "data" / "expert-profile-ds4.bin");
+    }
+    at.push_back(fs::path("data") / "expert-profile-ds4.bin");
+    for (const fs::path& p : at)
+        if (fs::is_regular_file(p, ec)) return p.string();
+    return "";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3844,7 +3872,10 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
-    if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
+    if (o.profile.empty()) {   // the pack's own ("none": no profile); while it has none, the shipped one is read
+        o.profile = o.pack + "/expert-profile.bin";
+        o.profile_seed = shipped_profile(argc > 0 ? argv[0] : "");
+    }
     if (o.profile == "none") o.profile.clear();
     o.profile_out = prof_out;
     if (!prof_run.empty()) {   // (a profile run: the pack's profile read only, the run's counts to their own file)
