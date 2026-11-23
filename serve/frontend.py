@@ -680,10 +680,30 @@ def _clear_thinking(req: dict) -> dict:
     return {}
 
 
+_JSON_KINDS = {str: "a string", bool: "a boolean", int: "a number", float: "a number", list: "a list",
+               type(None): "null"}
+
+
+def check_messages(req: dict, key: str = "messages") -> None:
+    """A request's list of messages (`messages`; the Responses API's `input`, which may also be one string) has the
+    right shape: a list of objects.  Else a ValueError with plain words - the server answers 400 with them, where
+    reading the list would stop at the first item with an AttributeError."""
+    msgs = req.get(key)
+    if msgs is None or (key == "input" and isinstance(msgs, str)):
+        return
+    if not isinstance(msgs, list):
+        raise ValueError(f"`{key}` must be a list of messages, not {_JSON_KINDS.get(type(msgs), 'an object')}")
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            raise ValueError(f"`{key}[{i}]` must be an object (a message with its role and content), not "
+                             f"{_JSON_KINDS.get(type(m), 'that')}")
+
+
 def openai_to_messages(req: dict, deepseek: bool = False,
                        glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  glm_dsa (GLM-5.3's template,
     ChatTemplate.glm_dsa): the tool call ids and clear_thinking go to the template too."""
+    check_messages(req)
     if deepseek:
         from serve.ds41_encoding import _tool_name_for_encoding, tools_from_openai_format
         messages = copy.deepcopy(req.get("messages", []))
@@ -789,6 +809,7 @@ def openai_to_messages(req: dict, deepseek: bool = False,
 def anthropic_to_messages(req: dict, deepseek: bool = False,
                           glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  glm_dsa: as openai_to_messages."""
+    check_messages(req)
     messages = []
     system = req.get("system")
     if system:

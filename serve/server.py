@@ -156,7 +156,8 @@ def hy4_tool_pictures_noted(messages: list) -> list:
         out.append(m)
     return out
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
+                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, check_messages, config_effort,
+                            deepseek_effort_kwargs,
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -6267,6 +6268,8 @@ def make_handler(svc: Service):
                 return
             if not self._mapi_target(req.get("model")):
                 return
+            if kind == "chat":
+                check_messages(req)   # (the wrong shape: a ValueError, do_POST's 400)
             ka = model_api.parse_keep_alive(req.get("keep_alive"))
             name = model_api.public_name(Path(svc.config_path)) + ":latest" if svc.config_path else svc.model
             empty = not (req.get("messages") if kind == "chat" else (req.get("prompt") or req.get("images")))
@@ -6880,6 +6883,8 @@ def make_handler(svc: Service):
                     self.wfile.write(body)
                     return
                 if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+                    # (a list of messages of the wrong shape: a 400 in plain words before anything reads it)
+                    check_messages(req, "input" if path == "/v1/responses" else "messages")
                     # file parts (OpenAI file / Responses input_file / Anthropic document): their text, or a
                     # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
                     attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
