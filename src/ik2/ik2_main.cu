@@ -5946,6 +5946,44 @@ static void prompt_attn_warm(Model& M) {
                          1.0f / std::sqrt((float) M.c.D), W0.relb, ext0,
                          L0.sliding ? M.c.window : (1 << 30), sink_w, out_w, HDw, fa_w, fa_n, 1, g_s);
     }
+    // (PF-1: the pf's per-shape cuBLAS kernels - the fused wqkvrg / wqrg / wk / wv / wo GEMM shapes and the
+    //  sc GEMM each select (and on this path JIT) their kernel on the first call, ~45 + 16 + 6 + 1 ms of the
+    //  timed pf's visit 0; the router's mv_f16_rows module ~2.5 ms. The chunk's T: 505 (the c512 cells) and
+    //  512 (the ctx4096 chunks). Dummy zeros in, a shared scratch out, discarded - no state touched.)
+    if (g_dense_q8 || M.L[0].wqkvrg.f16 || M.L[0].wqkvrg.raw) {
+        int lf = 0;
+        while (lf < M.c.n_layer && M.L[(size_t) lf].sliding) ++lf;
+        const Layer& Lf = M.L[(size_t) std::min(lf, M.c.n_layer - 1)];
+        const int Cw = M.c.C;
+        const Mat* const ms[5] = {&L0.wqkvrg, &Lf.wqrg, &Lf.wk, &Lf.wv, &L0.wo};
+        size_t nw = L0.wqkvrg.N;
+        for (int i = 0; i < 5; ++i)
+            if (ms[i]->N > 0) nw = std::max(nw, (size_t) ms[i]->N);
+        for (int tw : {505, 512}) {
+            uint16_t* x16w = dalloc<uint16_t>((size_t) tw * Cw);
+            float* x32w = dalloc<float>((size_t) tw * Cw);
+            float* yw = dalloc<float>((size_t) tw * nw);
+            float* ysc = dalloc<float>((size_t) tw * 4 * M.c.KV);
+            float* xrw = dalloc<float>((size_t) tw * Cw);
+            float* yrw = dalloc<float>((size_t) tw * M.c.E);
+            CU(cudaMemsetAsync(x16w, 0, (size_t) tw * Cw * 2, g_s));
+            CU(cudaMemsetAsync(x32w, 0, (size_t) tw * Cw * 4, g_s));
+            CU(cudaMemsetAsync(yw, 0, (size_t) tw * nw * 4, g_s));
+            CU(cudaMemsetAsync(xrw, 0, (size_t) tw * Cw * 4, g_s));
+            for (int i = 0; i < 5; ++i)
+                if (ms[i]->N > 0 && (ms[i]->f16 || ms[i]->q8 || ms[i]->raw))
+                    matmul(*ms[i], x32w, x16w, tw, yw, ms[i]->N);
+            if (Lf.sc_k_dyn16) gemm16(Lf.sc_k_dyn16, 4 * M.c.KV, Cw, x16w, tw, ysc, 4 * M.c.KV);
+            k::mv_f16_rows(Lf.router16, M.c.E, Cw, xrw, Cw, tw, yrw, M.c.E, g_s);
+            CU(cudaStreamSynchronize(g_s));
+            CU(cudaFree(x16w));
+            CU(cudaFree(x32w));
+            CU(cudaFree(yw));
+            CU(cudaFree(ysc));
+            CU(cudaFree(xrw));
+            CU(cudaFree(yrw));
+        }
+    }
     CU(cudaStreamSynchronize(g_s));
 }
 
