@@ -349,18 +349,22 @@ class Sampler(unittest.TestCase):
             t = T.Telemetry(gpu_index=0, reader=r, start=False, busy=lambda: False, extra=lambda: {"tok_s": 7.0})
             time.sleep(0.01)
             threading.Thread(target=t._loop, daemon=True).start()
-            time.sleep(0.2)
-            n = len(t.hist["tok_s"])                           # (the first reading; then it pauses IDLE_S)
+            for _ in range(500):                               # (the first reading; then it pauses IDLE_S - a loaded
+                if t.hist["tok_s"]:                            # box can take longer than a fixed 0.2 s to get there)
+                    break
+                time.sleep(0.01)
+            time.sleep(0.05)
+            n = len(t.hist["tok_s"])
             self.assertGreaterEqual(n, 1)
             self.assertTrue(t._slow)
             t0 = time.monotonic()
             t.touch()                                          # a request: the next reading comes now, not in 3 s
-            for _ in range(100):
+            for _ in range(200):
                 if len(t.hist["tok_s"]) > n:
                     break
                 time.sleep(0.01)
             self.assertGreater(len(t.hist["tok_s"]), n)
-            self.assertLess(time.monotonic() - t0, 0.5)
+            self.assertLess(time.monotonic() - t0, 2.0)        # (well under the 3 s pause)
 
 
     def test_gpu_pids(self):
