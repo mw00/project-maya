@@ -2663,11 +2663,9 @@ struct Model::Impl {
         // (a member with a small BAR1 - 256 MiB, no ReBAR - takes the copy engines' P2P but not the kernels' loads
         // and stores: ar2_kernel spun forever on a pair of them, whichever side held the buffers, even 64 KB of them)
         bool reach = true;
-#if defined(STRATA_USE_HIP)
-        // (#809: with the BAR read right, AMD cards engage the peer buffers and the first request hangs in ar2_kernel on
-        // a 2x RX 7900 XTX pair; until that is understood they stay host-mapped, as they did while the BAR read as 0)
-        reach = false;
-#endif
+        // (#809: on AMD the first request hung in ar2_kernel on a 2x RX 7900 XTX pair: hipMalloc VRAM is cached in the
+        // GPUs' L2, so a running kernel's flag and row stores to a peer stayed in its own L2 and the peer polled its
+        // cached copy - p2p_place maps the buffers uncached on HIP)
         for (int m : G.mem) {
             int can = 0;
             if (bar1_bytes(devs[(size_t) m].id) < ((size_t) 1 << 30)) reach = false;
@@ -2716,7 +2714,14 @@ struct Model::Impl {
             }
             void* v = nullptr;
             cudaSetDevice(b.home);
+#if defined(STRATA_USE_HIP)
+            // (uncached: RDNA3 keeps hipMalloc and fine-grained VRAM in L2, where a peer never sees a running kernel's
+            // stores)
+            if (ok && (hipExtMallocWithFlags(&v, b.bytes, hipDeviceMallocUncached) != hipSuccess ||
+                       cudaMemset(v, 0, b.bytes) != cudaSuccess)) {
+#else
             if (ok && (cudaMalloc(&v, b.bytes) != cudaSuccess || cudaMemset(v, 0, b.bytes) != cudaSuccess)) {
+#endif
                 (void) cudaGetLastError();
                 if (v != nullptr) cudaFree(v);
                 v = nullptr;
