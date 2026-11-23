@@ -3828,6 +3828,50 @@ static std::string cal_vals(double c, double p, double ps, double ref) {
     return v;
 }
 
+// THE SAVED TIMING BELONGS TO THE PC, NOT TO THE BUILD.  Its key's first field used to be the build stamp, so every
+// update timed the lane again; the timing wobbles with whatever else the PC does (one quiet V100 box: 0.13 ms an
+// expert one start, 0.24 another), the expert split follows it, and a user's greedy answers changed once after each
+// update.  Now the first field names the PC's CPU (kCalEpoch: raised by hand in a release whose lane kernels change
+// speed on purpose) and the rest of the key the model, card, link and pool as before - an update reads the values the
+// PC already plans with.  A line an older build saved (any other first field, the same rest) is taken over as it is:
+// the newest one, so the answers stay those of the build in use before the update.
+constexpr int kCalEpoch = 1;
+static std::string cal_pc() {
+    std::string cpu;
+#if defined(_WIN32)
+    if (const char* v = getenv("PROCESSOR_IDENTIFIER")) cpu = v;
+#else
+    if (FILE* f = std::fopen("/proc/cpuinfo", "r")) {
+        char line[512];
+        while (cpu.empty() && std::fgets(line, sizeof line, f))
+            if (std::strncmp(line, "model name", 10) == 0)
+                if (const char* c = std::strchr(line, ':')) cpu = c + 1;
+        std::fclose(f);
+    }
+#endif
+    std::string out;
+    for (char ch : cpu)   // (one line, no tab or '|': the key's separators)
+        if (ch != '\t' && ch != '\n' && ch != '\r' && ch != '|' && !(ch == ' ' && (out.empty() || out.back() == ' ')))
+            out += ch;
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return "cal" + std::to_string(kCalEpoch) + " cpu " + (out.empty() ? "?" : out) + " x" +
+           std::to_string(std::thread::hardware_concurrency());
+}
+// a key without its first field (the PC's, or an older build's stamp)
+static std::string cal_rest(const std::string& key) {
+    const size_t at = key.find(" | ");
+    return at == std::string::npos ? std::string() : key.substr(at + 3);
+}
+// A timing taken again (maya --speed-calibration marks the saved line "redo"; MAYA_GLM_CPU_CAL_REDO=1) replaces the
+// saved one only when it differs clearly - any of the three values by more than 25%: within that it is the same PC
+// measured at another moment, and the plans (so the answers) stay as they are
+constexpr double kCalKeep = 1.25;
+static bool cal_same(const double* was, const double* now) {
+    for (int i = 0; i < 3; ++i)
+        if (!(was[i] > 0.0) || now[i] > kCalKeep * was[i] || now[i] < was[i] / kCalKeep) return false;
+    return true;
+}
+
 // the CPU lane's lane-call overhead the split plans with (ms a call), and the split itself: of f RAM-tier experts,
 // the k the host computes so the slower lane finishes first - max(PCIe (f - k) p, overhead + k c); ties keep the PCIe
 // lane.  `tab`: the k's, one per f, for the log
@@ -4095,11 +4139,12 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                      "unpinned\n", dev_, F->cpu_pool->active(), tb);
         }
     }
-    // MAYA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
+    // MAYA_GLM_CPU_CAL=<file>: reuse the timed values across starts and builds, keyed by the PC's CPU, model, layer,
+    // card and pool (cal_pc)
     const char* calf = getenv("MAYA_GLM_CPU_CAL");
     std::string cal_key;
     double c_ms = 0.0, p_ms = 0.0, ps_ms = 0.0;
-    bool cached = false;
+    bool cached = false, redo = false, taken_over = false;
     if (calf != nullptr && *calf != '\0') {
         char bus[32] = "?";
         if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev_) != cudaSuccess) cudaGetLastError();
@@ -4110,25 +4155,42 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         }
         std::error_code ec;
         const std::filesystem::path pd = std::filesystem::weakly_canonical(pack_dir_, ec);
-        cal_key = std::string(MAYA_VERSION) + " " + __DATE__ + " " + __TIME__ + " | " + (ec ? pack_dir_ : pd.string()) + " | layer " + std::to_string(il_cal) +
+        cal_key = cal_pc() + " | " + (ec ? pack_dir_ : pd.string()) + " | layer " + std::to_string(il_cal) +
                   " | " + std::to_string(F->L[(size_t) il_cal].blob) + " B | " + bus + " " + prop.name + " | " +
                   std::to_string(threads) + (shared ? " threads shared" : " threads") + " | " + std::to_string(n_cal);
         if (FILE* cf = std::fopen(calf, "r")) {
+            // this PC's own line wins; else the newest line an older build saved for the same model, card and pool
+            const std::string rest = cal_rest(cal_key);
             char line[2048];
-            while (!cached && std::fgets(line, sizeof line, cf)) {
+            bool own = false;
+            while (!own && std::fgets(line, sizeof line, cf)) {
                 char* tab = std::strrchr(line, '\t');
                 if (tab == nullptr) continue;
                 *tab = 0;
-                double ref = 0.0;
-                cached = cal_key == line && std::sscanf(tab + 1, "%lf %lf %lf %lf", &c_ms, &p_ms, &ps_ms, &ref) >= 3 &&
-                         c_ms > 0.0 && p_ms > 0.0 && ps_ms > 0.0;
-                if (cached) F->cal_ref = ref;
+                const bool mine = cal_key == line;
+                if (!mine && (std::strncmp(line, "cal", 3) == 0 || cal_rest(line) != rest)) continue;
+                double c = 0.0, p = 0.0, ps = 0.0, ref = 0.0;
+                const int n = std::sscanf(tab + 1, "%lf %lf %lf %lf", &c, &p, &ps, &ref);
+                if (n < 3 || !(c > 0.0) || !(p > 0.0) || !(ps > 0.0)) continue;
+                c_ms = c, p_ms = p, ps_ms = ps;
+                F->cal_ref = n >= 4 ? ref : 0.0;
+                cached = true;
+                own = mine;
+                taken_over = !mine;
+                redo = mine && std::strstr(tab + 1, "redo") != nullptr;
             }
             std::fclose(cf);
         }
+        if (const char* rv = getenv("MAYA_GLM_CPU_CAL_REDO")) redo = redo || (cached && std::atoi(rv) != 0);
+        if (cached && taken_over) {
+            cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, F->cal_ref));
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane: the timing an earlier version saved on this PC is kept "
+                                 "(%.4f / %.4f / %.4f ms)\n", dev_, c_ms, p_ms, ps_ms);
+        }
     }
     const size_t blob = F->L[(size_t) il_cal].blob;
-    if (!cached) {
+    const double was[3] = {c_ms, p_ms, ps_ms};
+    if (!cached || redo) {
     // ---- calibration, each lane alone: the CPU after 100 ms of the same work (an idle CPU's clocks take tens of ms to
     //      ramp up - a decode keeps them up), then five rounds of 16 runs ~100 ms apart (the same work between them
     //      keeps the clocks up), and an expert's time is the fastest round's median.  One round takes ~40 ms, so a
@@ -4208,7 +4270,16 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // (and by default - glmfast::same_answers: the first start plans with the values every later start reads back)
     if (glmfast::repeatable(F->helper.linked()) || glmfast::same_answers())
         for (double* v : {&c_ms, &p_ms, &ps_ms}) *v = std::round(*v * 1e4) / 1e4;
-    if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, 0.0));
+    if (cached) {   // timed again on request: only a clear difference replaces what the PC plans with (cal_same)
+        const double now[3] = {c_ms, p_ms, ps_ms};
+        const bool same = cal_same(was, now);
+        std::fprintf(stderr, "glm fast: CUDA%d CPU lane timed again: %.4f / %.4f / %.4f ms, saved %.4f / %.4f / %.4f - "
+                             "%s\n", dev_, now[0], now[1], now[2], was[0], was[1], was[2],
+                     same ? "within 25%, the saved timing stays" : "the new timing is saved");
+        if (same) c_ms = was[0], p_ms = was[1], ps_ms = was[2];
+        else F->cal_ref = 0.0;
+    }
+    if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, cached ? F->cal_ref : 0.0));
     }
     // repeatable answers: every plan that splits experts between the CPU lane and PCIe (the decode's lane plan, the
     // prompts' staged split and prestage) sees the timing in coarse steps - powers of two - so two builds or installs
@@ -5006,7 +5077,10 @@ void Glm5Model::lane_drift_check() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
         if (F == nullptr || F->cpu_pool == nullptr || F->cal_key.empty()) continue;
-        if (glmfast::repeatable(F->helper.linked())) continue;   // (repeatable answers: the cached timing stays)
+        // (repeatable answers, and the same answers on every start: the saved timing stays - a decode that drifts
+        //  would drop it, the next start would time the lane at another moment and the answers would change;
+        //  maya --speed-calibration times it again)
+        if (glmfast::repeatable(F->helper.linked()) || glmfast::same_answers()) continue;
         const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load();
         if (e - F->drift_e0 < 2000) continue;
         const double ms = (double) (us - F->drift_us0) / 1000.0 / (double) (e - F->drift_e0);
