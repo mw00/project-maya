@@ -3013,6 +3013,99 @@ void test_q4_kv() {
     cudaFree(o_ref); cudaFree(o_q4); cudaFree(q16); cudaFree(o_mma); cudaFree(pos_d); cudaFree(dbias);
 }
 
+
+void test_q8_kv() {
+    // Test prep_qkv_r_q8, attn_decode_q8, attn_multi_q8, attn_decode_mma_q8, attn_block_q8 (including T=8 NC=32!),
+    // attn_flash_q8, AND host-mapped streaming split (vram_cap < kv_cap)!
+    const int H = 6, KV = 2, D = 128, d_rel = 16, ext = 32, T = 140, vram_cap = 80;
+    const int KD = KV * D, HD = H * D;
+    auto h_q = fvec((size_t) T * HD, 1.0f);
+    auto h_k = fvec((size_t) T * KD, 1.0f);
+    auto h_v = fvec((size_t) T * KD, 1.0f);
+    auto h_r = fvec((size_t) T * H * d_rel, 0.5f);
+    auto h_proj = fvec((size_t) ext * d_rel, 0.2f);
+    auto h_sink = fvec((size_t) T * H, 0.5f);
+
+    float *dq_f16 = dev(h_q), *dq_q8 = dev(h_q);
+    float *dk = dev(h_k), *dv = dev(h_v);
+    float *dr_f16 = dev(h_r), *dr_q8 = dev(h_r);
+    float *dproj = dev(h_proj), *dsink = dev(h_sink);
+    uint16_t *kc16 = dev_n<uint16_t>((size_t) T * KD), *vc16 = dev_n<uint16_t>((size_t) T * KD);
+
+    k::KvQ8 kc8{}, vc8{};
+    kc8.vram_cap = vc8.vram_cap = vram_cap;
+    kc8.q = dev_n<int8_t>((size_t) vram_cap * KV * 128);
+    kc8.s = dev_n<uint16_t>((size_t) vram_cap * KV * 4);
+    vc8.q = dev_n<int8_t>((size_t) vram_cap * KV * 128);
+    vc8.s = dev_n<uint16_t>((size_t) vram_cap * KV * 4);
+    void *hkq = nullptr, *hks = nullptr, *hvq = nullptr, *hvs = nullptr;
+    const int hslots = T - vram_cap;
+    CU(cudaHostAlloc(&hkq, (size_t) hslots * KV * 128, cudaHostAllocMapped));
+    CU(cudaHostAlloc(&hks, (size_t) hslots * KV * 8, cudaHostAllocMapped));
+    CU(cudaHostAlloc(&hvq, (size_t) hslots * KV * 128, cudaHostAllocMapped));
+    CU(cudaHostAlloc(&hvs, (size_t) hslots * KV * 8, cudaHostAllocMapped));
+    CU(cudaHostGetDevicePointer(&kc8.q_host, hkq, 0));
+    CU(cudaHostGetDevicePointer(&kc8.s_host, hks, 0));
+    CU(cudaHostGetDevicePointer(&vc8.q_host, hvq, 0));
+    CU(cudaHostGetDevicePointer(&vc8.s_host, hvs, 0));
+
+    k::prep_qkv_r_f16(dq_f16, nullptr, dk, kc16, dv, vc16, dr_f16, nullptr, T, H, KV, D, d_rel, 22.627f, 8.0f, 1e-6f,
+                      nullptr, 0.0f, 8192.0f, 0, 0, 0);
+    k::prep_qkv_r_q8(dq_q8, nullptr, dk, kc8, dv, vc8, dr_q8, nullptr, T, H, KV, D, d_rel, 22.627f, 8.0f, 1e-6f,
+                     nullptr, 0.0f, 8192.0f, 0, 0, 0);
+
+    const float sc = 1.0f / std::sqrt((float) D);
+    float *scratch = dev_n<float>((size_t) 128 * H * 130 * 8);
+    float *o_ref = dev_n<float>((size_t) 8 * HD), *o_q8 = dev_n<float>((size_t) 8 * HD);
+    k::attn_decode_f16(dq_f16 + (size_t) (T - 1) * HD, dr_f16 + (size_t) (T - 1) * H * d_rel,
+                       dsink + (size_t) (T - 1) * H, kc16, vc16, 0, H, KV, D, 0, T, T - 1, sc, dproj, d_rel, ext,
+                       1 << 30, scratch, o_ref, 0);
+    k::attn_decode_q8(dq_q8 + (size_t) (T - 1) * HD, dr_q8 + (size_t) (T - 1) * H * d_rel,
+                      dsink + (size_t) (T - 1) * H, kc8, vc8, 0, H, KV, D, 0, T, T - 1, sc, dproj, d_rel, ext,
+                      1 << 30, scratch, o_q8, 0);
+    auto vref = host(o_ref, HD), vq8 = host(o_q8, HD);
+    // Q8_32 error vs FP16 should be ~16x tighter than Q4!
+    expect("q8_kv attn_decode vs f16 (VRAM+host stream)", vq8, std::vector<double>(vref.begin(), vref.end()), 0.015, 0.015);
+
+    uint16_t* q16 = dev_n<uint16_t>((size_t) 8 * HD);
+    k::to_f16(dq_q8 + (size_t) (T - 8) * HD, (size_t) 8 * HD, q16, 0);
+    float* o_mma = dev_n<float>((size_t) 8 * HD);
+    k::attn_decode_mma_q8(q16 + (size_t) 7 * HD, dr_q8 + (size_t) (T - 1) * H * d_rel, dsink + (size_t) (T - 1) * H,
+                          kc8, vc8, 0, H, KV, nullptr, T - 1, 2, sc, dproj, d_rel, ext, 1 << 30, scratch, o_mma,
+                          nullptr, nullptr, 0);
+    expect("q8_kv attn_decode_mma vs scalar q8", host(o_mma, HD), std::vector<double>(vq8.begin(), vq8.end()), 3e-3, 3e-3);
+
+    int* pos_d = dev<int>({T - 8});
+    k::attn_multi_q8(dq_q8 + (size_t) (T - 8) * HD, dr_q8 + (size_t) (T - 8) * H * d_rel, dsink + (size_t) (T - 8) * H,
+                     kc8, vc8, 0, 8, H, KV, 0, T, T - 8, sc, dproj, d_rel, ext, 1 << 30, scratch, o_q8, 0);
+    k::attn_block_q8(q16, dr_q8 + (size_t) (T - 8) * H * d_rel, H * d_rel, dsink + (size_t) (T - 8) * H,
+                     kc8, vc8, 0, H, KV, pos_d, 8, 2, sc, dproj, d_rel, ext, 1 << 30, scratch, o_mma,
+                     nullptr, 0, nullptr, 0);
+    auto vmq8 = host(o_q8, 8 * HD);
+    expect("q8_kv attn_block_q8 (T=8) vs attn_multi_q8", host(o_mma, 8 * HD), std::vector<double>(vmq8.begin(), vmq8.end()), 3e-3, 3e-3);
+
+    std::vector<float> h_bias((size_t) 4 * H * ext);
+    for (int qi = 0; qi < 4; ++qi)
+        for (int h = 0; h < H; ++h)
+            for (int d = 0; d < ext; ++d) {
+                float acc = 0;
+                for (int e = 0; e < d_rel; ++e)
+                    acc += h_r[((size_t) (T - 4 + qi) * H + h) * d_rel + e] * h_proj[(size_t) d * d_rel + e];
+                h_bias[((size_t) qi * H + h) * ext + d] = acc;
+            }
+    float* dbias = dev(h_bias);
+    k::attn_flash_q8(q16 + (size_t) 4 * HD, HD, kc8, vc8, 0, H, KV, D, 4, T - 4, sc, dbias, ext, 1 << 30,
+                     dsink + (size_t) (T - 4) * H, o_mma, HD, scratch, (size_t) 128 * H * 130 * 8, 2, 0);
+    expect("q8_kv attn_flash_q8 vs attn_multi_q8", host(o_mma, 4 * HD),
+           std::vector<double>(vmq8.begin() + 4 * HD, vmq8.end()), 3e-3, 3e-3);
+
+    CU(cudaFreeHost(hkq)); CU(cudaFreeHost(hks)); CU(cudaFreeHost(hvq)); CU(cudaFreeHost(hvs));
+    cudaFree(kc8.q); cudaFree(kc8.s); cudaFree(vc8.q); cudaFree(vc8.s);
+    cudaFree(dq_f16); cudaFree(dq_q8); cudaFree(dk); cudaFree(dv); cudaFree(dr_f16); cudaFree(dr_q8);
+    cudaFree(dproj); cudaFree(dsink); cudaFree(kc16); cudaFree(vc16); cudaFree(scratch);
+    cudaFree(o_ref); cudaFree(o_q8); cudaFree(q16); cudaFree(o_mma); cudaFree(pos_d); cudaFree(dbias);
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3043,6 +3136,7 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_q4_kv();
+    test_q8_kv();
     test_round6();
     if (!k::attn_flash_available()) std::printf("skip attn_flash: not built for this GPU\n");
     else if (k::arch_class() >= 80) test_attn_flash();   // (last: its random data leaves the others' as they were)
