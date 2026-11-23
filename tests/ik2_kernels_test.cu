@@ -2892,7 +2892,7 @@ void test_window_exact(bool mma) {
 // own: draft_attn_fp8 and q8_tile against double references, argmax_gemv_i8 (with a sampled draft's noise too)
 // against the host's sums.
 void test_window_launches() {
-    const bool mma = k::arch_class() >= 80;
+    const bool mma = k::arch_class() >= 75;   // (Turing on: its window runs Ampere's kernels on its mma16816)
     {   // mv_q8p_cols: rows with their own inputs (one launch) against the ranges a launch each; K 3072
         for (int K : {2304, 3072}) {
             const int N = 4112, T = 5;
