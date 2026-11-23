@@ -83,8 +83,9 @@ int main() {
         t.fixed = -1;
         CHECK(t.read(0, "a|gpu 0", 4096 * MiB, true, 0) == 512 * MiB);
         CHECK(t.read(1, "a|gpu 1", 700 * MiB, false, 1) == 0);
-        t.check(0, 3000 * MiB, tot, true, 0);   // 1096 short beside the 512 kept -> 1632 written, the start short
-        CHECK(t.short_mib == 1632 && vl::get(f, "a|gpu 0") == "1632");
+        t.check(0, 3700 * MiB, tot, true, 0);   // 396 short beside the 512 kept -> 928 written, the start short
+        CHECK(t.short_mib == 928 && vl::get(f, "a|gpu 0") == "928");
+        CHECK(t.give_up(0, 0) == 512 * MiB && t.gpus[0].g.late == 0 && t.give_up(0, 0) == 0);   // (#1156)
         std::remove(f.c_str());
     }
     std::printf("vram_late_test: ok\n");
