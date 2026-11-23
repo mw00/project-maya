@@ -1,4 +1,4 @@
-# GLM-5.3-Flash Maya-M + Maya-L on 4x RTX 4090: official `--bench`, v1.1.74 (115.9 / 81.4 tok/s)
+# GLM-5.3-Flash Maya-M + Maya-L on 4x RTX 4090: standard `--bench` on a downstream v1.1.74 build (115.9 / 81.4 tok/s)
 
 2026-11-24. Host: 2x Xeon Platinum 8380 (80C/160T, two NUMA nodes), 251 GB RAM, 4x RTX 4090 24 GB at a 300 W
 power limit each, Ubuntu 24.04. Engine: v1.1.74 with the R-20 host-side patch set (64-thread shared CPU-expert
@@ -28,12 +28,16 @@ Same-host history for Maya-L through the same official benchmark (earlier v1.1.x
 | v1.1.58, 144-thread NUMA + DFlash2 | 69.5 tok/s | 647 tok/s | 1385 tok/s |
 | **v1.1.74 R-20 @ 300 W (this run)** | **81.4 tok/s (+17.1% vs v1.1.58)** | **806 tok/s (+24.6%)** | **1678 tok/s (+21.2%)** |
 
-This is the first official `--bench` entry we publish for Maya-M on this host; the Maya-L line updates our
-earlier runs. Notes on comparability: the v1.1.57/58 runs used `--prefill 5120` and a 144-thread CPU lane; the
-current config uses `--prefill 4096` and a 64-thread pool on physical cores 0-62 with SMT siblings masked, the
-host at `numa_balancing=0` + `performance` governor, and 300 W per GPU (a 15-minute soak at 300 W tripped the
-82 C thermal fuse on GPU0 after ~5 minutes under a continuous 32K-prefill/decode loop, so sustained mixed load
-thermals on this chassis are still being evaluated - the bench window itself peaks well below that).
+The 115.9 and 81.4 tokens/s are short, serial measurements, one run per pack. The earlier v1.1.57
+entry used 96 workers and v1.1.58 used 144. Engine version, CPU/NUMA tuning, prefill chunk and GPU
+power also differ across historical entries. The same-binary M/L comparison above holds the settings
+fixed. The individual R-20 changes and answer quality were not isolated by this benchmark.
+
+A separate sustained-load check on this chassis alternated cold 32K prefill and single-stream decode.
+The 300 W-per-GPU run reached our 82 C software guard on GPU0 after about five minutes. An already-warm
+300 W repeat reached it in about one minute. A five-minute warm 255 W run completed, peaking at 78 C.
+The short M/L results describe the benchmark window. The [community report](https://github.com/mw00/project-maya/discussions/1124#discussioncomment-19835844)
+contains the related deployment measurements.
 
 Evidence (SHA-256 of the raw `maya-bench.txt` the engine wrote, kept with our operator receipts):
 
