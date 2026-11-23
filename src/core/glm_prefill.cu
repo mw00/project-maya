@@ -5371,9 +5371,74 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             stop = true;
             cv.notify_all();
         };
+        // MAYA_GLM_PREFILL_P2P=1 (off unless set): a boundary between two NVLink peers (peer access and native atomics -
+        // GeForce reports those over NVLink only) hands the rows straight into the next part's R, one device-to-device
+        // copy once that part has read its chunk before (G.finished), not a D2H into the host slot and an H2D out of
+        // it.  The same bytes, so the same answers; the decode's counterpart is MAYA_GLM_P2P
+        static const bool pf_p2p = [] {
+            const char* v = getenv("MAYA_GLM_PREFILL_P2P");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        std::vector<char> peer((size_t) np, 0);   // peer[k]: boundary k -> k + 1 is a peer copy
+        for (int k = 0; pf_p2p && k + 1 < np; ++k) {
+            const int a = parts[(size_t) k]->dev_, b = parts[(size_t) k + 1]->dev_;
+#if defined(MAYA_USE_HIP)
+            (void) a, (void) b;   // (the hand-off needs NVLink's native atomics: an NVIDIA path, through the host on AMD)
+            continue;
+#else
+            int can = 0, atom = 0;
+            if (cudaDeviceCanAccessPeer(&can, b, a) != cudaSuccess || !can ||
+                cudaDeviceGetP2PAttribute(&atom, cudaDevP2PAttrNativeAtomicSupported, a, b) != cudaSuccess || !atom) {
+                cudaGetLastError();
+                continue;
+            }
+#endif
+            cudaSetDevice(b);
+            const cudaError_t pe = cudaDeviceEnablePeerAccess(a, 0);
+            if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) {
+                cudaGetLastError();
+                continue;
+            }
+            cudaGetLastError();
+            peer[(size_t) k] = 1;
+        }
+        cudaSetDevice(dev_);
+        {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::string b;
+                for (int k = 0; k + 1 < np; ++k)
+                    if (peer[(size_t) k])
+                        b += " CUDA" + std::to_string(parts[(size_t) k]->dev_) + "->CUDA" +
+                             std::to_string(parts[(size_t) k + 1]->dev_);
+                if (!b.empty()) std::fprintf(stderr, "glm prefill: peer hand-offs (NVLink):%s\n", b.c_str());
+            }
+        }
         // part k has read chunk c: its rows into its slot for part k + 1
         const auto hand_on = [&](int k, int c, int T) -> bool {
             Glm5Model* m = parts[(size_t) k];
+            if (peer[(size_t) k]) {
+                Glm5Model* nx = parts[(size_t) k + 1];
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return G.finished[(size_t) k + 1] >= c || stop; });
+                    if (stop) return false;
+                }
+                cudaMemcpyPeerAsync(nx->pf_->R, nx->dev_, m->pf_->R, m->dev_, (size_t) T * pf_hop_floats(m->g_) * sizeof(float),
+                                    m->fast_->cs);
+                std::string e;
+                if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt peer hop", e)) {
+                    fail(e);
+                    return false;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    produced[(size_t) k] = c + 1;
+                }
+                cv.notify_all();
+                return true;
+            }
             {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait(lk, [&] { return consumed[(size_t) k] >= c - 1 || stop; });
@@ -5410,9 +5475,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     const int64_t p0 = pos_start + (int64_t) c * Tc;
                     if (m->pf_->stages && m->pf_->sev_h0 != nullptr) cudaEventRecord(m->pf_->sev_h0, m->fast_->cs);
                     m->pf_->sev_hop = m->pf_->stages;   // (this chunk arrived over the hop: the line below reads it)
-                    cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
-                                    (size_t) T * pf_hop_floats(m->g_) * sizeof(float), cudaMemcpyHostToDevice,
-                                    m->fast_->cs);
+                    if (!peer[(size_t) k - 1])   // (a peer boundary: the rows are in R already)
+                        cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
+                                        (size_t) T * pf_hop_floats(m->g_) * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
                     if (m->pf_->stages && m->pf_->sev_h1 != nullptr) cudaEventRecord(m->pf_->sev_h1, m->fast_->cs);
                     std::string e2;
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop in", e2)) {
