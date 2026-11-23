@@ -153,6 +153,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
 // 4 x 16 bytes in flight a thread: the bus's latency (a microsecond or two) hidden by many reads at once
 __global__ void off_fetch_copy_kernel(const OffFetch* __restrict__ fl, size_t n16) {
     const int n = fl->n;
+    if (n <= 0) return;
     const size_t stride = (size_t) gridDim.x * blockDim.x;
     const size_t t0 = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     for (int j = 0; j < n; ++j) {

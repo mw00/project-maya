@@ -130,6 +130,160 @@ std::vector<uint16_t> st_bf16(const StFile& f, const std::string& name, const st
     return v;
 }
 
+// ---- GGUF support for DSpark (dspark-Inkling-2-Mini-BF16.gguf)
+struct GgufTensor {
+    uint32_t type = 0;   // 0 = F32, 30 = BF16
+    std::vector<int64_t> ne;
+    uint64_t offset = 0;
+};
+struct GgufFile {
+    std::string path;
+    uint64_t data0 = 0;
+    std::map<std::string, GgufTensor> t;
+};
+static bool is_gguf_file(const std::string& path) {
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return false;
+    char m[4] = {};
+    const bool ok = std::fread(m, 1, 4, fp) == 4 && std::memcmp(m, "GGUF", 4) == 0;
+    std::fclose(fp);
+    return ok;
+}
+static void gguf_skip_val(FILE* fp, uint32_t vt) {
+    auto skip = [&](size_t n) {
+        if (std::fseek(fp, (long) n, SEEK_CUR) != 0) throw std::runtime_error("drafter: gguf seek");
+    };
+    switch (vt) {
+        case 0: case 1: case 7: skip(1); break;
+        case 2: case 3: skip(2); break;
+        case 4: case 5: case 6: skip(4); break;
+        case 10: case 11: case 12: skip(8); break;
+        case 8: { uint64_t n = 0; if (std::fread(&n, 8, 1, fp) != 1) throw std::runtime_error("drafter: gguf str"); skip(n); break; }
+        case 9: {
+            uint32_t et = 0; uint64_t n = 0;
+            if (std::fread(&et, 4, 1, fp) != 1 || std::fread(&n, 8, 1, fp) != 1) throw std::runtime_error("drafter: gguf arr");
+            for (uint64_t i = 0; i < n; ++i) gguf_skip_val(fp, et);
+            break;
+        }
+        default: throw std::runtime_error("drafter: gguf unknown kv type " + std::to_string(vt));
+    }
+}
+static GgufFile gguf_open(const std::string& path) {
+    GgufFile g;
+    g.path = path;
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) throw std::runtime_error("drafter: cannot open " + path);
+    char magic[4]; uint32_t ver = 0; uint64_t nt = 0, nkv = 0;
+    if (std::fread(magic, 1, 4, fp) != 4 || std::memcmp(magic, "GGUF", 4) != 0 ||
+        std::fread(&ver, 4, 1, fp) != 1 || std::fread(&nt, 8, 1, fp) != 1 || std::fread(&nkv, 8, 1, fp) != 1) {
+        std::fclose(fp);
+        throw std::runtime_error("drafter: bad gguf header");
+    }
+    uint64_t align = 32;
+    for (uint64_t i = 0; i < nkv; ++i) {
+        uint64_t kl = 0;
+        if (std::fread(&kl, 8, 1, fp) != 1) throw std::runtime_error("drafter: gguf kv key");
+        std::string k(kl, '\0');
+        if (kl && std::fread(&k[0], 1, kl, fp) != kl) throw std::runtime_error("drafter: gguf kv key data");
+        uint32_t vt = 0;
+        if (std::fread(&vt, 4, 1, fp) != 1) throw std::runtime_error("drafter: gguf kv type");
+        if (k == "general.alignment" && vt == 4) {
+            uint32_t al = 32;
+            if (std::fread(&al, 4, 1, fp) != 1) throw std::runtime_error("drafter: gguf align");
+            align = al;
+        } else {
+            gguf_skip_val(fp, vt);
+        }
+    }
+    for (uint64_t i = 0; i < nt; ++i) {
+        uint64_t nl = 0; uint32_t nd = 0;
+        if (std::fread(&nl, 8, 1, fp) != 1) throw std::runtime_error("drafter: gguf tname");
+        std::string name(nl, '\0');
+        if (nl && std::fread(&name[0], 1, nl, fp) != nl) throw std::runtime_error("drafter: gguf tname data");
+        if (std::fread(&nd, 4, 1, fp) != 1) throw std::runtime_error("drafter: gguf nd");
+        GgufTensor gt;
+        gt.ne.resize(nd);
+        for (uint32_t d = 0; d < nd; ++d) {
+            int64_t v = 0;
+            if (std::fread(&v, 8, 1, fp) != 1) throw std::runtime_error("drafter: gguf ne");
+            gt.ne[d] = v;
+        }
+        if (std::fread(&gt.type, 4, 1, fp) != 1 || std::fread(&gt.offset, 8, 1, fp) != 1)
+            throw std::runtime_error("drafter: gguf toff");
+        g.t[name] = std::move(gt);
+    }
+    const uint64_t pos = (uint64_t) std::ftell(fp);
+    g.data0 = (pos + align - 1) / align * align;
+    std::fclose(fp);
+    return g;
+}
+static uint16_t f32_to_bf16(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, 4);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+static std::vector<uint16_t> gguf_bf16(const GgufFile& g, const std::string& name, size_t expected_elems) {
+    auto it = g.t.find(name);
+    if (it == g.t.end()) throw std::runtime_error("drafter(gguf): no tensor " + name);
+    size_t n = 1;
+    for (int64_t x : it->second.ne) n *= (size_t) x;
+    if (n != expected_elems)
+        throw std::runtime_error("drafter(gguf): " + name + " elems=" + std::to_string(n) + " != " + std::to_string(expected_elems));
+    const int fd = ::open(g.path.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("drafter(gguf): open failed");
+    const uint64_t off = g.data0 + it->second.offset;
+    if (it->second.type == 30) {   // BF16
+        std::vector<uint16_t> v(n);
+        size_t done = 0;
+        while (done < n * 2) {
+            const ssize_t r = ::pread(fd, (char*) v.data() + done, n * 2 - done, (off_t) (off + done));
+            if (r <= 0) { ::close(fd); throw std::runtime_error("drafter(gguf): read failed " + name); }
+            done += (size_t) r;
+        }
+        ::close(fd);
+        return v;
+    } else if (it->second.type == 0) {   // F32 -> BF16
+        std::vector<float> vf(n);
+        size_t done = 0;
+        while (done < n * 4) {
+            const ssize_t r = ::pread(fd, (char*) vf.data() + done, n * 4 - done, (off_t) (off + done));
+            if (r <= 0) { ::close(fd); throw std::runtime_error("drafter(gguf): read failed " + name); }
+            done += (size_t) r;
+        }
+        ::close(fd);
+        std::vector<uint16_t> v(n);
+        for (size_t i = 0; i < n; ++i) v[i] = f32_to_bf16(vf[i]);
+        return v;
+    }
+    ::close(fd);
+    throw std::runtime_error("drafter(gguf): unsupported type " + std::to_string(it->second.type) + " for " + name);
+}
+static std::vector<float> gguf_f32(const GgufFile& g, const std::string& name, size_t expected_elems) {
+    auto it = g.t.find(name);
+    if (it == g.t.end()) throw std::runtime_error("drafter(gguf): no tensor " + name);
+    size_t n = 1;
+    for (int64_t x : it->second.ne) n *= (size_t) x;
+    if (n != expected_elems)
+        throw std::runtime_error("drafter(gguf): " + name + " elems=" + std::to_string(n) + " != " + std::to_string(expected_elems));
+    if (it->second.type == 0) {
+        std::vector<float> vf(n);
+        const int fd = ::open(g.path.c_str(), O_RDONLY);
+        size_t done = 0;
+        while (done < n * 4) {
+            const ssize_t r = ::pread(fd, (char*) vf.data() + done, n * 4 - done, (off_t) (g.data0 + it->second.offset + done));
+            if (r <= 0) { ::close(fd); throw std::runtime_error("drafter(gguf): read failed " + name); }
+            done += (size_t) r;
+        }
+        ::close(fd);
+        return vf;
+    }
+    auto vb = gguf_bf16(g, name, expected_elems);
+    std::vector<float> vf(n);
+    for (size_t i = 0; i < n; ++i) vf[i] = bf(vb[i]);
+    return vf;
+}
+
 }  // namespace
 
 struct DLayer {
@@ -154,6 +308,8 @@ struct Drafter {
     int n_rows = 0;
     const int8_t* head_q8 = nullptr;      // the target's head as planar Q8_0 (set_head_q8): the base logits through it
     const uint16_t* head_q8d = nullptr;
+    const uint8_t* head_raw = nullptr;    // or quantized blocks (e.g. Q6_K) read directly by mv_blocks_cols
+    int head_raw_type = 0;
     bool head_tiles = true;               // its product on the tensor cores (q8_tile: sm_80 on), else mv_q8p_cols
     int* shortlist = nullptr;
     float* shortlist_scores = nullptr;
@@ -307,12 +463,16 @@ const std::vector<int>& tap_layers() {
 }
 
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s) {
-    const StFile f = st_open(path);
+    const bool gguf = is_gguf_file(path);
+    StFile f;
+    GgufFile gf;
+    if (gguf) gf = gguf_open(path);
+    else f = st_open(path);
     auto* d = new Drafter;
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
     {
-        // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default the whole context)
-        const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : ctx;
+        const int def_cap = ctx > 8192 ? 4096 : ctx;
+        const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : def_cap;
         d->cap = std::min(ctx, std::max(want, 2048));
     }
     const bool mini = C == 2304;
@@ -325,19 +485,44 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     }
     const int layers = mini ? 3 : 5;
     const int64_t H = d->H, KV = d->KV, F = d->F, R = d->R;
-    {
+    if (gguf) {
+        auto it = gf.t.find("markov_w1.weight");
+        if (it == gf.t.end() || it->second.ne.size() != 2) throw std::runtime_error("drafter(gguf): no markov_w1.weight");
+        d->V = (int) it->second.ne[1];
+    } else {
         auto it = f.t.find("markov_head.markov_w1.weight");
         if (it == f.t.end() || it->second.shape.size() != 2) throw std::runtime_error("drafter: no markov_w1");
         d->V = (int) it->second.shape[0];
     }
-    // fuse_weight [6][8] -> softmax over each row
+    auto load_bf = [&](const std::string& st_n, const std::string& g_n, const std::vector<int64_t>& shape) {
+        size_t n = 1;
+        for (int64_t x : shape) n *= (size_t) x;
+        return gguf ? gguf_bf16(gf, g_n, n) : st_bf16(f, st_n, shape);
+    };
+    auto load_up32 = [&](const std::string& st_n, const std::string& g_n, const std::vector<int64_t>& shape) -> float* {
+        if (!gguf) return up32(d, st_bf16(f, st_n, shape));
+        size_t n = 1;
+        for (int64_t x : shape) n *= (size_t) x;
+        auto vf = gguf_f32(gf, g_n, n);
+        float* p = dalloc<float>(vf.size());
+        cu(cudaMemcpy(p, vf.data(), vf.size() * 4, cudaMemcpyHostToDevice), "upload32");
+        d->vram += vf.size() * 4;
+        return p;
+    };
     {
-        const auto fw = st_bf16(f, "fuse_weight", {layers + 1, d->taps});
+        std::vector<float> fw;
+        if (gguf) {
+            fw = gguf_f32(gf, "dspark_fuse.weight", (size_t) (layers + 1) * d->taps);
+        } else {
+            const auto fb = st_bf16(f, "fuse_weight", {layers + 1, d->taps});
+            fw.resize(fb.size());
+            for (size_t i = 0; i < fb.size(); ++i) fw[i] = bf(fb[i]);
+        }
         std::vector<float> a(fw.size());
         for (int r = 0; r <= layers; ++r) {
             float m = -1e30f, sum = 0;
-            for (int t = 0; t < d->taps; ++t) m = std::max(m, bf(fw[r * d->taps + t]));
-            for (int t = 0; t < d->taps; ++t) sum += (a[r * d->taps + t] = std::exp(bf(fw[r * d->taps + t]) - m));
+            for (int t = 0; t < d->taps; ++t) m = std::max(m, fw[r * d->taps + t]);
+            for (int t = 0; t < d->taps; ++t) sum += (a[r * d->taps + t] = std::exp(fw[r * d->taps + t] - m));
             for (int t = 0; t < d->taps; ++t) a[r * d->taps + t] /= sum;
         }
         d->alpha = dalloc<float>(a.size());
@@ -348,46 +533,47 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     for (int i = 0; i < layers; ++i) {
         DLayer& l = d->L[i];
         const std::string b = "layers." + std::to_string(i) + ".";
+        const std::string gb = "blk." + std::to_string(i) + ".";
         l.local = mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
-        l.in_norm = up32(d, st_bf16(f, b + "input_layernorm.weight", {C}));
-        l.post_norm = up32(d, st_bf16(f, b + "post_attention_layernorm.weight", {C}));
-        l.dflare = up32(d, st_bf16(f, b + "dflare_norm.weight", {C}));
-        l.q_norm = up32(d, st_bf16(f, b + "self_attn.q_norm.weight", {128}));
-        l.k_norm = up32(d, st_bf16(f, b + "self_attn.k_norm.weight", {128}));
-        l.k_norm_ctx = up32(d, st_bf16(f, b + "self_attn.k_norm_ctx.weight", {128}));
-        l.wq = up16(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}));
-        l.wk = up16(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}));
-        l.wv = up16(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}));
-        l.wo = up16(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}));
-        l.wkc = up16(d, st_bf16(f, b + "self_attn.k_proj_ctx.weight", {KV * 128, C}));
-        l.wvc = up16(d, st_bf16(f, b + "self_attn.v_proj_ctx.weight", {KV * 128, C}));
+        l.in_norm = load_up32(b + "input_layernorm.weight", gb + "attn_norm.weight", {C});
+        l.post_norm = load_up32(b + "post_attention_layernorm.weight", gb + "ffn_norm.weight", {C});
+        l.dflare = load_up32(b + "dflare_norm.weight", gb + "dflare_norm.weight", {C});
+        l.q_norm = load_up32(b + "self_attn.q_norm.weight", gb + "attn_q_norm.weight", {128});
+        l.k_norm = load_up32(b + "self_attn.k_norm.weight", gb + "attn_k_norm.weight", {128});
+        l.k_norm_ctx = load_up32(b + "self_attn.k_norm_ctx.weight", gb + "attn_k_ctx_norm.weight", {128});
+        l.wq = up16(d, load_bf(b + "self_attn.q_proj.weight", gb + "attn_q.weight", {H * 128, C}));
+        l.wk = up16(d, load_bf(b + "self_attn.k_proj.weight", gb + "attn_k.weight", {KV * 128, C}));
+        l.wv = up16(d, load_bf(b + "self_attn.v_proj.weight", gb + "attn_v.weight", {KV * 128, C}));
+        l.wo = up16(d, load_bf(b + "self_attn.o_proj.weight", gb + "attn_output.weight", {C, H * 128}));
+        l.wkc = up16(d, load_bf(b + "self_attn.k_proj_ctx.weight", gb + "attn_k_ctx.weight", {KV * 128, C}));
+        l.wvc = up16(d, load_bf(b + "self_attn.v_proj_ctx.weight", gb + "attn_v_ctx.weight", {KV * 128, C}));
         {
-            auto g = st_bf16(f, b + "mlp.gate_proj.weight", {F, C});
-            const auto u = st_bf16(f, b + "mlp.up_proj.weight", {F, C});
-            g.insert(g.end(), u.begin(), u.end());   // gate's rows, then up's
+            auto g = load_bf(b + "mlp.gate_proj.weight", gb + "ffn_gate.weight", {F, C});
+            const auto u = load_bf(b + "mlp.up_proj.weight", gb + "ffn_up.weight", {F, C});
+            g.insert(g.end(), u.begin(), u.end());
             l.wgu = up16(d, g);
         }
-        l.wd = up16(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}));
-        if (l.local) {   // (a window of 1024: a ring of 2048 rows, F32)
+        l.wd = up16(d, load_bf(b + "mlp.down_proj.weight", gb + "ffn_down.weight", {C, F}));
+        if (l.local) {
             l.cap = std::min(ctx, 2048);
             l.kc = dalloc<float>((size_t) l.cap * KV * 128);
             l.vc = dalloc<float>((size_t) l.cap * KV * 128);
             d->vram += (size_t) l.cap * KV * 128 * 8;
-        } else {         // (the whole context, or IK2_DRAFT_CTX's last positions: FP16)
+        } else {
             l.cap = d->cap;
             l.kc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
             l.vc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
             d->vram += (size_t) l.cap * KV * 128 * 4;
         }
     }
-    d->norm = up32(d, st_bf16(f, "norm.weight", {C}));
-    d->mask = up32(d, st_bf16(f, "mask_embed", {C}));
-    d->mk_dflare = up32(d, st_bf16(f, "markov_head.dflare_norm.weight", {C}));
-    d->w1 = up16(d, st_bf16(f, "markov_head.markov_w1.weight", {d->V, R}));
-    d->rnn_w = up16(d, st_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
-    d->rnn_b = up32(d, st_bf16(f, "markov_head.rnn_proj.bias", {3 * R}));
-    d->hout_w = st_bf16(f, "markov_head.hidden_out.weight", {C, R});
-    d->hout_b = st_bf16(f, "markov_head.hidden_out.bias", {C});
+    d->norm = load_up32("norm.weight", "output_norm.weight", {C});
+    d->mask = load_up32("mask_embed", "mask_embd.weight", {C});
+    d->mk_dflare = load_up32("markov_head.dflare_norm.weight", "dspark_norm.weight", {C});
+    d->w1 = up16(d, load_bf("markov_head.markov_w1.weight", "markov_w1.weight", {d->V, R}));
+    d->rnn_w = up16(d, load_bf("markov_head.rnn_proj.weight", "joint_proj.weight", {3 * R, 2 * R + 2 * C}));
+    d->rnn_b = load_up32("markov_head.rnn_proj.bias", "joint_proj.bias", {3 * R});
+    d->hout_w = load_bf("markov_head.hidden_out.weight", "dspark_hidden_out.weight", {C, R});
+    d->hout_b = load_bf("markov_head.hidden_out.bias", "dspark_hidden_out.bias", {C});
     // work buffers
     const size_t T = kBlock;
     d->x = dalloc<float>(T * C), d->res = dalloc<float>(T * C), d->h = dalloc<float>(T * C);
@@ -453,6 +639,47 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
     d->vram += ((size_t) R + 1) * n_rows * 2 + (size_t) (kBlock - 1) * n_rows * 4;
 }
 
+void fold_raw(Drafter* d, const uint8_t* raw, int type, int n_rows) {
+    const int C = d->C, R = d->R;
+    d->n_rows = n_rows;
+    if (getenv("IK2_DRAFT_SHORTLIST") && atoi(getenv("IK2_DRAFT_SHORTLIST"))) {
+        const int stride = (n_rows + 31) / 32;
+        d->shortlist = dalloc<int>((kBlock - 1) * stride);
+        d->shortlist_scores = dalloc<float>(stride);
+    }
+    std::vector<float> ht((size_t) R * C), hb(C);
+    for (int c = 0; c < C; ++c)
+        for (int r = 0; r < R; ++r) ht[(size_t) r * C + c] = bf(d->hout_w[(size_t) c * R + r]);
+    for (int c = 0; c < C; ++c) hb[c] = bf(d->hout_b[c]);
+    float *dht = dalloc<float>(ht.size()), *dhb = dalloc<float>(hb.size());
+    cu(cudaMemcpy(dht, ht.data(), ht.size() * sizeof(float), cudaMemcpyHostToDevice), "fold_raw");
+    cu(cudaMemcpy(dhb, hb.data(), hb.size() * sizeof(float), cudaMemcpyHostToDevice), "fold_raw");
+    const int chunk = std::min(kFoldChunk, std::max(1, n_rows));
+    const size_t rb = (size_t) C / k::block_values(type) * k::block_bytes(type);
+    float* dlm = dalloc<float>((size_t) chunk * C);
+    float* dfw = dalloc<float>((size_t) R * chunk);
+    float* dfb = dalloc<float>(chunk);
+    d->fold_w = dalloc<uint16_t>((size_t) R * n_rows);
+    d->fold_b = dalloc<uint16_t>(n_rows);
+    d->base = dalloc<float>((size_t) (kBlock - 1) * n_rows);
+    const float one = 1.0f, zero = 0.0f;
+    for (int r0 = 0; r0 < n_rows; r0 += chunk) {
+        const int m = std::min(chunk, n_rows - r0);
+        k::decode_f32(type, raw + (size_t) r0 * rb, (size_t) m * C, dlm, d->s);
+        cb(cublasSgemm(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, m, R, C, &one, dlm, C, dht, C, &zero, dfw, m), "fold_raw w");
+        cb(cublasSgemv(d->blas, CUBLAS_OP_T, C, m, &one, dlm, C, dhb, 1, &zero, dfb, 1), "fold_raw b");
+        if (d->shortlist)
+            fold_vocab_rows<<<(m * R + 255) / 256, 256, 0, d->s>>>(dfw, m, r0, R, d->fold_w);
+        else
+            pack_f16_strided_kernel<<<dim3((unsigned) ((m + 255) / 256), (unsigned) R), 256, 0, d->s>>>(
+                dfw, m, n_rows, r0, d->fold_w);
+        k::to_f16(dfb, (size_t) m, d->fold_b + r0, d->s);
+    }
+    cu(cudaStreamSynchronize(d->s), "fold_raw");
+    cudaFree(dht), cudaFree(dhb), cudaFree(dlm), cudaFree(dfw), cudaFree(dfb);
+    d->vram += ((size_t) R + 1) * n_rows * 2 + (size_t) (kBlock - 1) * n_rows * 4;
+}
+
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
     const int C = d->C, KD = d->KV * 128;
     for (auto& l : d->L) {
@@ -505,13 +732,17 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::add(d->x, d->res, TC, d->res, d->s);
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
-    k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
-    if (d->head_q8 && !d->head_tiles)
-        k::mv_q8p_cols(d->head_q8, d->head_q8d, n_rows, C, d->h + C, C, proposals, d->base, n_rows, d->s);
-    else if (d->head_q8)
-        k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
-    else
-        gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
+    if (d->head_raw) {
+        k::mv_blocks_cols(d->head_raw_type, d->head_raw, n_rows, C, d->h + C, C, proposals, d->base, n_rows, d->s);
+    } else {
+        k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
+        if (d->head_q8 && !d->head_tiles)
+            k::mv_q8p_cols(d->head_q8, d->head_q8d, n_rows, C, d->h + C, C, proposals, d->base, n_rows, d->s);
+        else if (d->head_q8)
+            k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
+        else
+            gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
+    }
     const int shortlist_n = (n_vocab + 31) / 32;
     if (d->shortlist)
         draft_shortlist<<<dim3((n_vocab + 127) / 128, proposals), 128, 0, d->s>>>(
@@ -540,6 +771,9 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }
+void set_head_raw(Drafter* d, const uint8_t* raw, int type) {
+    d->head_raw = raw, d->head_raw_type = type;
+}
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) {
     d->head_q8 = q8, d->head_q8d = q8d;
     int dev = 0, major = 0;

@@ -4405,6 +4405,120 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
     out[((size_t) qi * H + h) * 128 + tid] = (o / den) * v_inv_scale;
 }
 
+
+template <int WARPS, int ROWS, int TT>
+__global__ void __launch_bounds__(WARPS * 32)
+mv_blocks_cols_kernel(int type, const uint8_t* __restrict__ W, int N, int K, size_t rb,
+                      const float* __restrict__ x, int x_ld, int T, float* __restrict__ y, int y_ld) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * WARPS + warp) * ROWS;
+    if (row0 >= N) return;
+    for (int j = 0; j < ROWS; ++j) {
+        const int row = row0 + j;
+        if (row >= N) break;
+        const uint8_t* w = W + (size_t) row * rb;
+        float acc[TT];
+#pragma unroll
+        for (int t = 0; t < TT; ++t) acc[t] = 0.0f;
+        if (type == kQ6_K) {
+            const int nb = K / 256;
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* b = w + (size_t) bi * 210;
+                const float d = half_bits_to_float((uint16_t) (__ldg(b + 208) | (__ldg(b + 209) << 8)));
+                const int8_t* sc = (const int8_t*) (b + 192);
+                const int x0 = bi * 256;
+                float a[TT];
+#pragma unroll
+                for (int t = 0; t < TT; ++t) a[t] = 0.0f;
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    const uint8_t* ql = b + n * 64;
+                    const uint8_t qh = __ldg(b + 128 + n * 32 + lane);
+                    const uint8_t l0 = __ldg(ql + lane), l1 = __ldg(ql + lane + 32);
+                    const int is = n * 8 + (lane >> 4);
+                    const int xn = x0 + n * 128 + lane;
+                    const float w0 = (float) __ldg(sc + is + 0) * (float) ((int) ((l0 & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
+                    const float w1 = (float) __ldg(sc + is + 2) * (float) ((int) ((l1 & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+                    const float w2 = (float) __ldg(sc + is + 4) * (float) ((int) ((l0 >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+                    const float w3 = (float) __ldg(sc + is + 6) * (float) ((int) ((l1 >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+#pragma unroll
+                    for (int t = 0; t < TT; ++t) {
+                        if (t >= T) break;
+                        const float* xt = x + (size_t) t * x_ld;
+                        a[t] += w0 * __ldg(xt + xn);
+                        a[t] += w1 * __ldg(xt + xn + 32);
+                        a[t] += w2 * __ldg(xt + xn + 64);
+                        a[t] += w3 * __ldg(xt + xn + 96);
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < TT; ++t) {
+                    if (t >= T) break;
+                    acc[t] += d * a[t];
+                }
+            }
+        } else if (type == kQ5_K) {
+            const int nb = K / 256;
+            const bool hdr4 = (((uintptr_t) w & 3) == 0);
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* b = w + (size_t) bi * 176;
+                float d, mn;
+                if (hdr4) {
+                    const uint32_t dm = __ldg((const uint32_t*) b);
+                    d = half_bits_to_float((uint16_t) (dm & 0xFFFFu));
+                    mn = half_bits_to_float((uint16_t) (dm >> 16));
+                } else {
+                    d = half_bits_to_float((uint16_t) (__ldg(b) | (__ldg(b + 1) << 8)));
+                    mn = half_bits_to_float((uint16_t) (__ldg(b + 2) | (__ldg(b + 3) << 8)));
+                }
+                const uint8_t* q = b + 4;
+                const uint8_t qh = __ldg(b + 16 + lane);
+                const int x0 = bi * 256 + lane;
+                float a[TT];
+#pragma unroll
+                for (int t = 0; t < TT; ++t) a[t] = 0.0f;
+#pragma unroll
+                for (int j64 = 0; j64 < 4; ++j64) {
+                    const uint8_t lo = __ldg(b + 48 + 32 * j64 + lane);
+#pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        const int is = 2 * j64 + half;
+                        int sc, m;
+                        if (is < 4) {
+                            sc = __ldg(q + is) & 63, m = __ldg(q + is + 4) & 63;
+                        } else {
+                            const uint8_t q_hi = __ldg(q + is + 4);
+                            sc = (q_hi & 0xF) | ((__ldg(q + is - 4) >> 6) << 4);
+                            m = (q_hi >> 4) | ((__ldg(q + is) >> 6) << 4);
+                        }
+                        const int val = (half ? (lo >> 4) : (lo & 0xF)) + (((qh >> is) & 1) ? 16 : 0);
+                        const float wv = d * (float) sc * (float) val - mn * (float) m;
+                        const int idx = x0 + 64 * j64 + 32 * half;
+#pragma unroll
+                        for (int t = 0; t < TT; ++t) {
+                            if (t >= T) break;
+                            a[t] += wv * __ldg(x + (size_t) t * x_ld + idx);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < TT; ++t) {
+                    if (t >= T) break;
+                    acc[t] += a[t];
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= T) break;
+            float v = acc[t];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) y[(size_t) t * y_ld + row] = v;
+        }
+    }
+}
+
 template <int WARPS, int ROWS>
 __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_t rb, const float* x, float* y) {
     extern __shared__ float xs[];
@@ -5574,12 +5688,16 @@ __global__ void f16_limbs_rows_kernel(const float* __restrict__ x, int T, int C,
 __global__ void group_route_kernel(const int* __restrict__ top, const float* __restrict__ w, int S, int K,
                                    const uint8_t* const* __restrict__ tab, const float* sg_t, const float* su_t,
                                    const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
-                                   float* su, float* wt, int* inv, const uint8_t* const* __restrict__ pp) {
+                                   float* su, float* wt, int* inv, const uint8_t* const* __restrict__ pp,
+                                   const int* __restrict__ cls, int* n_miss) {
     __shared__ int ex[64], lead[64], gid[64];
     const int i = threadIdx.x;
     const int e = i < S ? top[i] : -1;
     ex[i] = e;
-    if (i < S) n[i] = 0;
+    if (i < S) {
+        n[i] = 0;
+        if (n_miss) n_miss[i] = 0;
+    }
     __syncthreads();
     int first = i, m = 0, cnt = 0;
     if (i < S) {
@@ -5601,7 +5719,12 @@ __global__ void group_route_kernel(const int* __restrict__ top, const float* __r
     if (i >= S) return;
     const int g = gid[first];
     tok[g * kGroupMax + m] = i / K, row[g * kGroupMax + m] = i;
-    if (first == i) blob[g] = pp ? pp[i] : tab[e], n[g] = cnt;   // (pp: the offload window's per-pick resolved slots)
+    if (first == i) {
+        blob[g] = pp ? pp[i] : tab[e];
+        const bool is_miss = cls && cls[i] != 0;
+        n[g] = (n_miss && is_miss) ? 0 : cnt;
+        if (n_miss) n_miss[g] = is_miss ? cnt : 0;
+    }
     sg[i] = sg_t ? sg_t[e] : 1.0f, su[i] = su_t ? su_t[e] : 1.0f;
     wt[i] = w[i] * (sd_t ? sd_t[e] : 1.0f);
     inv[i] = i;
@@ -5654,6 +5777,7 @@ experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __re
         }
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
+            if (j == 1 && n <= 4) break;
             uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
             if (x_ok[j]) x0 = __ldg(xp[j] + k * 8), x1 = __ldg(xp[j] + k * 8 + 1);
             const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
@@ -6868,6 +6992,23 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
     check("mv_blocks");
 }
 
+void mv_blocks_cols(int type, const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                    cudaStream_t s) {
+    if (N <= 0 || T <= 0) return;
+    if (T == 1 || (type != kQ6_K && type != kQ5_K) || T > 8 || (K % 256) != 0) {
+        for (int t = 0; t < T; ++t) mv_blocks(type, W, N, K, x + (size_t) t * x_ld, y + (size_t) t * y_ld, s);
+        return;
+    }
+    const size_t rb = mv_row_bytes(type, K);
+    constexpr int WARPS = 4, ROWS = 2;
+    const unsigned g = (unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS));
+    if (T <= 2) mv_blocks_cols_kernel<WARPS, ROWS, 2><<<g, WARPS * 32, 0, s>>>(type, W, N, K, rb, x, x_ld, T, y, y_ld);
+    else if (T <= 4) mv_blocks_cols_kernel<WARPS, ROWS, 4><<<g, WARPS * 32, 0, s>>>(type, W, N, K, rb, x, x_ld, T, y, y_ld);
+    else if (T <= 6) mv_blocks_cols_kernel<WARPS, ROWS, 6><<<g, WARPS * 32, 0, s>>>(type, W, N, K, rb, x, x_ld, T, y, y_ld);
+    else mv_blocks_cols_kernel<WARPS, ROWS, 8><<<g, WARPS * 32, 0, s>>>(type, W, N, K, rb, x, x_ld, T, y, y_ld);
+    check("mv_blocks_cols");
+}
+
 template <class KV>
 void attn_decode_impl(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap, int H,
                       int Hkv, int D, int k0, int nk, int qpos, float qk_scale, float v_inv_scale, const float* proj,
@@ -7231,12 +7372,14 @@ void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s)
 }
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
                  const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
-                 float* su, float* wt, int* inv, cudaStream_t s, const uint8_t* const* pp) {
+                 float* su, float* wt, int* inv, cudaStream_t s, const uint8_t* const* pp,
+                 const int* cls, int* n_miss) {
     if (S <= 0 || S > 64) {
         std::fprintf(stderr, "ik2::k::group_route: %d slots (1 .. 64)\n", S);
         std::abort();
     }
-    group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv, pp);
+    group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv, pp,
+                                        cls, n_miss);
     check("group_route");
 }
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,

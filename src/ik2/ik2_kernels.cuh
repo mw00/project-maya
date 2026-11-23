@@ -252,6 +252,8 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
 /// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
 /// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
 void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+void mv_blocks_cols(int type, const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                    cudaStream_t s);
 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.
@@ -550,7 +552,8 @@ void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s)
 /// last group), tok / row [S][kGroupMax], and a slot's sg, su, wt (down's scale folded) and inv (the slot).
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
                  const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
-                 float* su, float* wt, int* inv, cudaStream_t s, const uint8_t* const* pp = nullptr);
+                 float* su, float* wt, int* inv, cudaStream_t s, const uint8_t* const* pp = nullptr,
+                 const int* cls = nullptr, int* n_miss = nullptr);
 // (pp: the offload window's per-pick resolved blobs - off_cache_plan's slots - take tab's place as the groups' source)
 /// group_route's groups of NVFP4 experts on the tensor cores: gate | up (the input as f16_limbs_rows' limbs) to
 /// h [slot][F] through the capped SwiGLU; down from h to y [slot][C].  G: the launch's groups (those past the last
