@@ -1,0 +1,393 @@
+{
+  "date": "2026-11-23",
+  "timezone": "Asia/Shanghai",
+  "run_id": "ik2-quant-fix-20261123-093932",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5060 Ti 16 GB",
+    "driver": "610.88",
+    "cpu": "Intel Core i7-12700",
+    "cpu_threads": 20,
+    "ram_gib": 127.7,
+    "os": "Windows 11 build 26200",
+    "pcie_under_load": "Gen 5 x8"
+  },
+  "engine": {
+    "version_base": "1.1.74",
+    "source_base": "fd601f2988aaacc0d3e39feec41a765912810a9c",
+    "source_fingerprint": "22a28636046c86d7fd3d001a45c79346e855b8387d7a067cce563271621d66ed",
+    "binary_sha256": "c649efac6242daa9d2a19ef0831ef22c605e88422be9e01adf3e98144602be75",
+    "patch": "Separately published measurement patch, outside the report-only PR",
+    "source_patch_sha256": "0a0a6f6c4375566ffba96805701bf37ed68041e215c4ccca8c0eb9167c040552",
+    "added_test_source_sha256": "7a81bf129ac80a24b3ef356a9ddf3fb16a26da6501693e2afe25b192ace3980d",
+    "architecture": "sm_120",
+    "cuda": "12.8.93",
+    "compiler": "MSVC 14.42.34433",
+    "python": "3.12.7",
+    "source_commit": "3e5876424b0f51b0b4358cc80cdf2876103f8cdc",
+    "source_commit_url": "https://github.com/Thymos2027/maya/commit/3e5876424b0f51b0b4358cc80cdf2876103f8cdc"
+  },
+  "method": {
+    "harness": "Unmodified maya.bench and maya.report",
+    "harness_commit": "2e475762615bc5d14b62def8fbfbc7cffaa7a005",
+    "rounds_per_quant": 3,
+    "context_tokens": 32768,
+    "kv": "FP8 E4M3",
+    "chunk_tokens": 1024,
+    "threads_argument": 8,
+    "q4_cpu_lane_threads_auto": 10,
+    "drafting": "off",
+    "thinking": "off",
+    "temperature": 0,
+    "warmup_decode_cap_tokens": 64,
+    "decode_answer_cap_tokens": 256,
+    "decode_topics": [
+      "CSV Python function",
+      "photosynthesis explanation",
+      "bouncing-ball HTML"
+    ],
+    "prefill_warmup_tokens": 2048,
+    "measured_prefill_tokens": [
+      2048,
+      8192
+    ],
+    "calibration": "Each process starts from an identical copy of the original Q4 calibration file",
+    "profile_sha256": "ac5ce5217de1211ba0f09d48fa0dfc374ff3efe99af2faad58b599981e3641ab",
+    "context_note": "32K cache reserved; longest measured prompt 8192 tokens",
+    "order": "Q3 rounds 1-3, Q4 rounds 1-3, Q8 rounds 1-3; no interleaving",
+    "frozen_requests_sha256": "4db42abc2d9998f7e3f4b76a4ecc6687773e23f3b795ec111228dbdb8812e44b",
+    "initial_calibration_sha256": "7f31347da3cd60fb5d6bcf935b1eda88903978f4ec0a61ec86253cb9ebd1a7ae",
+    "harness_maya_py_sha256": "a3414ac2d76efe35bbdab42441230387600494ac22c3932787dca85d045c045f",
+    "harness_note": "Local merge commit; maya.py, frontend, tokenizer and chat template match upstream fd601f29 byte for byte. Server has opt-in tracing outside native benchmark path. Exact native GEN inputs are included.",
+    "artifact_hash_newline_policy": "The frozen_requests_sha256 and initial_calibration_sha256 fields normalize CRLF to LF before hashing. Other hashes describe the original captured bytes."
+  },
+  "quants": [
+    {
+      "quant": "Q3",
+      "file": "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+      "file_bytes": 13631778016,
+      "file_sha256": "f72f396d1b479b14d76346df80baa449c8b1f399653bff38fa4764b359a40048",
+      "median_decode_tok_s": 34.2,
+      "prefill_medians_tok_s": {
+        "2048": 966.0,
+        "8192": 978.0
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "mean_decode_tok_s": 34.3,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 968.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 978.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            151,
+            256
+          ],
+          "request_stream_sha256": "6b29d1265a75eacef261b8fc176cc7e00c3f57995d336a55a25cd7b08c4e9a55",
+          "protocol_sha256": "e244b06454741b5987c61b20d6e5b1573d34cfdfe12acb64aa7ef1f4495343f0",
+          "generated_tokens_sha256": "e5ea1e1c8383bb174b3b54fedeae27fcba1fadf1a11bec6c38434e283d5f3e3b"
+        },
+        {
+          "round": 2,
+          "mean_decode_tok_s": 34.2,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 964.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 979.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            151,
+            256
+          ],
+          "request_stream_sha256": "c4d14ee4a5038569b1a979259730905b09204303b0514759a3b13cb3fc8db049",
+          "protocol_sha256": "218e117ad690c48d8defdd0eb93138e9d6248eb680c0a2e204cfc6a133703c72",
+          "generated_tokens_sha256": "e5ea1e1c8383bb174b3b54fedeae27fcba1fadf1a11bec6c38434e283d5f3e3b"
+        },
+        {
+          "round": 3,
+          "mean_decode_tok_s": 33.4,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 966.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 978.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            151,
+            256
+          ],
+          "request_stream_sha256": "981d8a6c4ab7408b9785593e0be4e11fb1a62b9e213aca1dd19315769bf4c657",
+          "protocol_sha256": "11a81e033a053d06bf56b327cccaaf92262427394df2cef9eda7acb1f4a3fbfb",
+          "generated_tokens_sha256": "e5ea1e1c8383bb174b3b54fedeae27fcba1fadf1a11bec6c38434e283d5f3e3b"
+        }
+      ],
+      "engine_mode": "All experts in VRAM; cache path; optimized resident path disabled",
+      "sampled_peak_process_working_set_gib": 13.711,
+      "sampled_peak_process_private_commit_gib": 15.666,
+      "sampled_peak_total_device_memory_mib": 15721.0,
+      "telemetry_samples": 145,
+      "same_generated_token_stream_across_three_rounds": true,
+      "sampled_gpu_temperature_c": [
+        39.0,
+        59.0
+      ],
+      "sampled_gpu_power_peak_w": 112.31
+    },
+    {
+      "quant": "Q4",
+      "file": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+      "file_bytes": 17629759456,
+      "file_sha256": "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15",
+      "median_decode_tok_s": 46.0,
+      "prefill_medians_tok_s": {
+        "2048": 1168.0,
+        "8192": 1196.0
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "mean_decode_tok_s": 46.0,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 1164.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 1196.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            153,
+            256
+          ],
+          "request_stream_sha256": "188dca1ba8b49031947964aa853218764698a2b3ca78f4529523e073748b36f7",
+          "protocol_sha256": "87a76e56dd4173f662d4c72acf753fd2b434e57f0547300d4e13c1b97086b1bb",
+          "generated_tokens_sha256": "b3d59895791b0e2dc5c5a9f077b2f76b81cc7f2544cef367b7137e8559d83f4f"
+        },
+        {
+          "round": 2,
+          "mean_decode_tok_s": 45.1,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 1168.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 1195.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            153,
+            256
+          ],
+          "request_stream_sha256": "c8fc7247be8e6828ddd58f39f60199f7fe2b372b54149f295bd9fb2e68ed011f",
+          "protocol_sha256": "bb68cef28f82b5aa74160c7f253a7499bd56385e2f77aaddb94ba8cffac214cf",
+          "generated_tokens_sha256": "b3d59895791b0e2dc5c5a9f077b2f76b81cc7f2544cef367b7137e8559d83f4f"
+        },
+        {
+          "round": 3,
+          "mean_decode_tok_s": 47.2,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 1171.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 1201.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            153,
+            256
+          ],
+          "request_stream_sha256": "d382cb5aad10428b022372ac923dcd6b19abbc416d173afc2aa3d7465da9b54a",
+          "protocol_sha256": "13ef65a2c471cf27655587a1698cebc40a757b6f03769d41edb05b8e62046e34",
+          "generated_tokens_sha256": "b3d59895791b0e2dc5c5a9f077b2f76b81cc7f2544cef367b7137e8559d83f4f"
+        }
+      ],
+      "engine_mode": "Offload with CPU lane parity",
+      "sampled_peak_process_working_set_gib": 17.228,
+      "sampled_peak_process_private_commit_gib": 19.399,
+      "sampled_peak_total_device_memory_mib": 15522.0,
+      "telemetry_samples": 123,
+      "same_generated_token_stream_across_three_rounds": true,
+      "sampled_gpu_temperature_c": [
+        37.0,
+        57.0
+      ],
+      "sampled_gpu_power_peak_w": 122.98
+    },
+    {
+      "quant": "Q8",
+      "file": "Inkling-2-Mini-UD-Q8_K_XL.gguf",
+      "file_bytes": 22867451616,
+      "file_sha256": "dfb04bf37bee457f98800989dedf93ec442ede8636dbea9433992f1e527e9a41",
+      "median_decode_tok_s": 12.6,
+      "prefill_medians_tok_s": {
+        "2048": 940.0,
+        "8192": 964.0
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "mean_decode_tok_s": 12.6,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 934.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 955.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            149,
+            256
+          ],
+          "request_stream_sha256": "3c5f27943a9a96adb9e7059293603e9867b664c2c06ba77b6e2e7fa196e74220",
+          "protocol_sha256": "530836f8f7d9c35e0e1fde6541fdc73fac30f947db29fba0497f3789a49bee64",
+          "generated_tokens_sha256": "61a14b1a3f1acf95387dc2064147766740ac0f4dc8b936ff3e18815b07b049ac"
+        },
+        {
+          "round": 2,
+          "mean_decode_tok_s": 12.8,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 940.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 964.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            149,
+            256
+          ],
+          "request_stream_sha256": "efbb8be23d027445e6305e97530ec6e6e6af3103862b8057b207c91b57b9be68",
+          "protocol_sha256": "7446390d65856fc2edd1dcbcdc13d5232e6b4eb95ff725ec8a90aeac44bf92f7",
+          "generated_tokens_sha256": "61a14b1a3f1acf95387dc2064147766740ac0f4dc8b936ff3e18815b07b049ac"
+        },
+        {
+          "round": 3,
+          "mean_decode_tok_s": 12.5,
+          "prefill": [
+            {
+              "tokens": 2048,
+              "tok_s": 943.0
+            },
+            {
+              "tokens": 8192,
+              "tok_s": 966.0
+            }
+          ],
+          "decode_generated_tokens": [
+            256,
+            149,
+            256
+          ],
+          "request_stream_sha256": "ce6c3a53ba022908497fc57029ed319757b41c235090ef7bdd21b04f252daa47",
+          "protocol_sha256": "e271f8b49b72fd60eed07784c384c00542e7c37b2eb86fbf077fc0929e29c989",
+          "generated_tokens_sha256": "61a14b1a3f1acf95387dc2064147766740ac0f4dc8b936ff3e18815b07b049ac"
+        }
+      ],
+      "engine_mode": "Offload via GPU fetch; BF16 CPU lane unavailable",
+      "sampled_peak_process_working_set_gib": 21.705,
+      "sampled_peak_process_private_commit_gib": 24.025,
+      "sampled_peak_total_device_memory_mib": 15672.0,
+      "telemetry_samples": 249,
+      "same_generated_token_stream_across_three_rounds": true,
+      "sampled_gpu_temperature_c": [
+        36.0,
+        59.0
+      ],
+      "sampled_gpu_power_peak_w": 106.98
+    }
+  ],
+  "validation": {
+    "gpu_tests": [
+      "ik2_kernels_test",
+      "ik2_off_test",
+      "ik2_quant_formats_test"
+    ],
+    "gpu_tests_passed": true,
+    "models_passed": [
+      "Q3",
+      "Q4",
+      "Q8"
+    ],
+    "arithmetic_prompt": "What is 17 + 25? Reply with only the integer.",
+    "arithmetic_answer": "42",
+    "q4_original_vs_fixed_smoke_token_parity": true,
+    "smoke_token_ids": [
+      68872,
+      200010,
+      200006
+    ],
+    "benchmark_requests_completed": 63
+  },
+  "previous_q4_original_binary": {
+    "median_decode_tok_s": 47.6,
+    "round_means_tok_s": [
+      47.6,
+      47.8,
+      45.8
+    ],
+    "context_tokens": 32768,
+    "note": "Earlier session, not interleaved with fixed build; no causal regression conclusion"
+  },
+  "limitations": [
+    "Throughput and arithmetic smoke checks do not establish relative model quality",
+    "Quant names describe mixed-format GGUFs, not uniform 3/4/8-bit weights",
+    "Results include automatic engine path choices, not just quantization-kernel speed",
+    "RAM is sampled process working set/private commit, including mapped files; not minimum required RAM",
+    "GPU memory is sampled total device use, including desktop and other processes",
+    "Sequential run order and 149-256-token answers limit conclusions about small speed differences"
+  ],
+  "related_work": [
+    {
+      "url": "https://github.com/mw00/project-maya/issues/1159",
+      "scope": "Windows, two RTX 5060 Ti GPUs, Q4"
+    },
+    {
+      "url": "https://github.com/mw00/project-maya/pull/1133",
+      "scope": "Overlapping Q3 block readers and row-width fix, broader offload changes; open when checked 2026-11-23"
+    },
+    {
+      "url": "https://github.com/mw00/project-maya/issues/1163",
+      "scope": "AMD 7900 XT Q4 measurements"
+    },
+    {
+      "url": "https://github.com/mw00/project-maya/issues/1116",
+      "scope": "AMD 7900 XTX, modified Q4 checkpoint"
+    }
+  ]
+}

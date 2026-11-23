@@ -1,0 +1,88 @@
+{
+  "complete": true,
+  "round": 3,
+  "mean_decode_tok_s": 47.2,
+  "answers_in_mean": 3,
+  "decode": [
+    {
+      "tok_s": 50.0,
+      "question": "Write a Python function that parses a CSV file into a list of dictionaries, with type hints and a docstring."
+    },
+    {
+      "tok_s": 43.3,
+      "question": "Explain how photosynthesis works, step by step, for a high-school student."
+    },
+    {
+      "tok_s": 48.2,
+      "question": "Write a complete HTML page with a canvas that draws a bouncing ball animation in JavaScript."
+    }
+  ],
+  "prefill": [
+    {
+      "tokens": 2048,
+      "tok_s": 1171.0
+    },
+    {
+      "tokens": 8192,
+      "tok_s": 1201.0
+    }
+  ],
+  "requests": [
+    {
+      "index": 0,
+      "label": "warmup-decode",
+      "start": 137364.984,
+      "first_token_s": 0.48399999999674037,
+      "reply": "DONE 43 21 480.3 956.9 stop 0 0 0 14194 16128",
+      "elapsed_s": 1.437000000005355
+    },
+    {
+      "index": 1,
+      "label": "decode-csv",
+      "start": 137366.421,
+      "first_token_s": 0.3289999999979045,
+      "reply": "DONE 256 41 329.9 5122.4 length 0 0 0 93717 97920",
+      "elapsed_s": 5.4539999999979045
+    },
+    {
+      "index": 2,
+      "label": "decode-photosynthesis",
+      "start": 137371.875,
+      "first_token_s": 0.35899999999674037,
+      "reply": "DONE 153 32 347.1 3531.5 stop 0 0 0 48807 58368",
+      "elapsed_s": 3.875
+    },
+    {
+      "index": 3,
+      "label": "decode-html",
+      "start": 137375.765,
+      "first_token_s": 0.34399999998277053,
+      "reply": "DONE 256 35 344.4 5316.1 length 0 0 0 87435 97920",
+      "elapsed_s": 5.655999999988126
+    },
+    {
+      "index": 4,
+      "label": "warmup-prefill",
+      "start": 137381.421,
+      "first_token_s": 1.7039999999979045,
+      "reply": "DONE 1 2048 1706.7 0.3 length 0 0 0 0 0",
+      "elapsed_s": 1.7039999999979045
+    },
+    {
+      "index": 5,
+      "label": "prefill-2048",
+      "start": 137383.125,
+      "first_token_s": 1.75,
+      "reply": "DONE 1 2048 1748.7 0.3 length 0 0 0 0 0",
+      "elapsed_s": 1.75
+    },
+    {
+      "index": 6,
+      "label": "prefill-8192",
+      "start": 137384.89,
+      "first_token_s": 6.812999999994645,
+      "reply": "DONE 1 8192 6819.5 0.3 length 0 0 0 0 0",
+      "elapsed_s": 6.812999999994645
+    }
+  ]
+}

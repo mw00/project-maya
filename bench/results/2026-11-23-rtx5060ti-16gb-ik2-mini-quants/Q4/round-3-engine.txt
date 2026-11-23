@@ -1,0 +1,52 @@
+maya-ik2: 24 layers (20 sliding), 128 experts (8 a token), width 2304, vocab 200058; 1 shards
+looped: layers 6 .. 17 run 3 times - 48 layer visits a token; message gates of rank 64
+experts 14.7 GiB, dense weights 1.1 GiB as blocks, K / V cache 0.7 GiB, 14.8 GiB free: the experts in host memory, a tier of them in VRAM, the rest fetched by the GPU
+layout: unsloth's GGUF_shard_rewrite (llama.cpp master)
+kv cache: FP8 E4M3 (0.66 GiB across 48 layer visits)
+dense weights in VRAM: 0.9 s; GPU 0: 12.8 GiB of 15.9 free
+experts: 14.7 GiB, pinned once the VRAM tier is planned (only the ones it does not hold)
+expert cache, GPU 0: 2371 slots across 2 pools (10.7 GiB); load 1.0 s in all
+  pool 0: 2150 slots of 4.3 MiB (9.0 GiB, 20 layers)
+  pool 1: 221 slots of 8.1 MiB (1.7 GiB, 4 layers)
+warm: 2371 experts (10.7 GiB) copied in 5.6 s
+experts in pinned memory: 4.0 GiB (the 10.7 GiB the tier holds not in RAM), read and pinned in 1.0 s; the engine's RAM 18.4 GiB in all
+kv lending: 16 buffers of 0.03 GiB lend their unused rows to experts (given back as the context grows)
+lane parity: the CPU lane on 10 threads (avx2 rows); an expert 78 / 113 us on the CPU, 394 / 811 us over the bus, 14 / 67 us on the GPU (NVFP4 / Q8_0)
+decode mode: lane parity (a visit ~113 us with the lane, ~178 us without; tier 96% of the profile's picks)
+offload: 2371 of 3072 experts in VRAM (10.7 GiB), the rest fetched by the GPU from pinned host memory through 2 staging pools (0.19 GiB); tokens take the resident path's launches, a CUDA graph each
+INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=fp8 ctx=32768 gpus=1 dspark=0 lookup=0 drafting=off experts=3072 parallel=1 watchdog_s=600 path=offload
+VRAM dev=0 pci=0000:01:00.0 total=17102864384 free=810438656 weights=1180283904 kv=704643072 pool=11499522048
+READY 32768 stop
+STAT tok_s=42.6 ms_tok=23.45 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8796 ram_fetch=1.41 cpu=44.81 disk=0 promo=0 kv_used=53 kv_cap=32768 kv_gb=0.70
+STAT tok_s=53.3 ms_tok=18.76 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8815 ram_fetch=0.45 cpu=40.91 disk=0 promo=0 kv_used=63 kv_cap=32768 kv_gb=0.70
+DONE 43 21 480.3 956.9 stop 0 0 0 14194 16128
+STAT tok_s=48.9 ms_tok=20.43 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9369 ram_fetch=0.22 cpu=24.00 disk=0 promo=0 kv_used=73 kv_cap=32768 kv_gb=0.70
+STAT tok_s=50.1 ms_tok=19.96 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9670 ram_fetch=0.09 cpu=12.59 disk=0 promo=0 kv_used=105 kv_cap=32768 kv_gb=0.70
+STAT tok_s=49.9 ms_tok=20.03 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9482 ram_fetch=0.22 cpu=19.69 disk=0 promo=0 kv_used=137 kv_cap=32768 kv_gb=0.70
+STAT tok_s=50.0 ms_tok=20.02 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9565 ram_fetch=0.03 cpu=16.69 disk=0 promo=0 kv_used=169 kv_cap=32768 kv_gb=0.70
+STAT tok_s=50.1 ms_tok=19.96 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9500 ram_fetch=0.19 cpu=19.00 disk=0 promo=0 kv_used=201 kv_cap=32768 kv_gb=0.70
+STAT tok_s=50.0 ms_tok=20.01 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9622 ram_fetch=0.12 cpu=14.38 disk=0 promo=0 kv_used=233 kv_cap=32768 kv_gb=0.70
+STAT tok_s=51.3 ms_tok=19.49 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9705 ram_fetch=0.00 cpu=11.31 disk=0 promo=0 kv_used=265 kv_cap=32768 kv_gb=0.70
+STAT tok_s=49.6 ms_tok=20.17 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9656 ram_fetch=0.41 cpu=12.41 disk=0 promo=0 kv_used=296 kv_cap=32768 kv_gb=0.70
+DONE 256 41 329.9 5122.4 length 0 0 0 93717 97920
+STAT tok_s=41.3 ms_tok=24.21 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8546 ram_fetch=4.28 cpu=51.56 disk=0 promo=0 kv_used=64 kv_cap=32768 kv_gb=0.70
+STAT tok_s=43.0 ms_tok=23.26 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8050 ram_fetch=3.38 cpu=71.50 disk=0 promo=0 kv_used=96 kv_cap=32768 kv_gb=0.70
+STAT tok_s=44.5 ms_tok=22.49 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8438 ram_fetch=1.72 cpu=58.28 disk=0 promo=0 kv_used=128 kv_cap=32768 kv_gb=0.70
+STAT tok_s=42.7 ms_tok=23.41 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8353 ram_fetch=1.84 cpu=61.41 disk=0 promo=0 kv_used=160 kv_cap=32768 kv_gb=0.70
+STAT tok_s=46.0 ms_tok=21.73 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8444 ram_fetch=1.56 cpu=55.80 disk=0 promo=0 kv_used=184 kv_cap=32768 kv_gb=0.70
+DONE 153 32 347.1 3531.5 stop 0 0 0 48807 58368
+STAT tok_s=48.8 ms_tok=20.51 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9040 ram_fetch=0.19 cpu=36.69 disk=0 promo=0 kv_used=67 kv_cap=32768 kv_gb=0.70
+STAT tok_s=47.5 ms_tok=21.07 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8652 ram_fetch=0.56 cpu=51.19 disk=0 promo=0 kv_used=99 kv_cap=32768 kv_gb=0.70
+STAT tok_s=47.5 ms_tok=21.04 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8859 ram_fetch=0.62 cpu=43.19 disk=0 promo=0 kv_used=131 kv_cap=32768 kv_gb=0.70
+STAT tok_s=49.5 ms_tok=20.21 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8787 ram_fetch=0.25 cpu=46.34 disk=0 promo=0 kv_used=163 kv_cap=32768 kv_gb=0.70
+STAT tok_s=45.9 ms_tok=21.80 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8701 ram_fetch=0.78 cpu=49.09 disk=0 promo=0 kv_used=195 kv_cap=32768 kv_gb=0.70
+STAT tok_s=48.1 ms_tok=20.80 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.8731 ram_fetch=0.28 cpu=48.44 disk=0 promo=0 kv_used=227 kv_cap=32768 kv_gb=0.70
+STAT tok_s=49.5 ms_tok=20.22 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9324 ram_fetch=0.25 cpu=25.72 disk=0 promo=0 kv_used=259 kv_cap=32768 kv_gb=0.70
+STAT tok_s=48.9 ms_tok=20.47 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=0.9353 ram_fetch=0.50 cpu=23.56 disk=0 promo=0 kv_used=290 kv_cap=32768 kv_gb=0.70
+DONE 256 35 344.4 5316.1 length 0 0 0 87435 97920
+STAT tok_s=4147.7 ms_tok=0.24 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=1.0000 ram_fetch=0.00 cpu=0.00 disk=0 promo=0 kv_used=2048 kv_cap=32768 kv_gb=0.70
+DONE 1 2048 1706.7 0.3 length 0 0 0 0 0
+STAT tok_s=4001.6 ms_tok=0.25 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=1.0000 ram_fetch=0.00 cpu=0.00 disk=0 promo=0 kv_used=2048 kv_cap=32768 kv_gb=0.70
+DONE 1 2048 1748.7 0.3 length 0 0 0 0 0
+STAT tok_s=4201.7 ms_tok=0.24 active=1 vram_used=2371 ram_used=701 vram_gb=11.50 ram_gb=4.30 vram_hit=1.0000 ram_fetch=0.00 cpu=0.00 disk=0 promo=0 kv_used=8192 kv_cap=32768 kv_gb=0.70
+DONE 1 8192 6819.5 0.3 length 0 0 0 0 0
