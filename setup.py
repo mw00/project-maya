@@ -484,10 +484,14 @@ def find_vcvars(cuda=True, nvcc=None):
     Given `nvcc` of CUDA 13.2 or newer - the release whose install guide first supports VS 2026's toolset - 2026
     is taken as well, but an installed older VS stays the pick: such a PC often has a CUDA 12.x toolkit next to
     the 13.2+ one, and 12.x takes only the older VS - the older one fits every toolkit the PC has.
-    ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first."""
+    ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first.  A standalone vswhere on PATH
+    is used when the Visual Studio Installer's copy is missing; both use the same component and version filters."""
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
-    if not vswhere.exists():
-        return None
+    if not vswhere.is_file():
+        located = shutil.which("vswhere.exe")
+        if not located:
+            return None
+        vswhere = Path(located)
     ranges = [["-version", "[16.0,18.0)"]]
     if not cuda or nvcc_takes_vs2026(nvcc):
         ranges.append(["-version", "[18.0,)"])
