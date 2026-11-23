@@ -104,18 +104,25 @@ class Manifest(unittest.TestCase):
                          "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")   # (the author's)
 
     def test_drafter_pinned(self):
-        """Drafting: thinkingmachines' own mtp.safetensors from the model's repo at a pinned revision, by size and
-        sha256 (the ones docs/INKLING2.md lists)."""
-        m = maya.ik2_drafter_model()
-        self.assertEqual((m["repo"], m["revision"], m["folder"]),
-                         ("thinkingmachines/Inkling-2-Mini", "ed40e7da625f594fc9c4990f5f66be24873c22d7", ""))
-        self.assertEqual(m["files"], {"mtp.safetensors": 635801416})
-        self.assertEqual(m["sha256"]["mtp.safetensors"],
-                         "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2")
-        self.assertIn("7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2",
-                      (maya.ROOT / "docs" / "INKLING2.md").read_text(encoding="utf-8"))
-        self.assertEqual(maya.file_url(m, "mtp.safetensors"), "https://huggingface.co/thinkingmachines/Inkling-2-Mini/"
-                         "resolve/ed40e7da625f594fc9c4990f5f66be24873c22d7/mtp.safetensors")
+        """Drafting: the model's own drafter from Maya's own repo at a pinned revision, folder drafter/, by size and
+        sha256 (the ones docs/INKLING2.md lists) - the GGUF (Q8_0) by default, thinkingmachines' mtp.safetensors on
+        AMD; each form one file."""
+        repo, rev = "peasantsmith/Inkling-2-Mini-Maya-GGUF", "37027719327de5f574684b525ad88fe50c4ff222"
+        doc = (maya.ROOT / "docs" / "INKLING2.md").read_text(encoding="utf-8")
+        for amd_pc, name, size, sha in (
+                (False, "dspark-Inkling-2-Mini-Q8_0.gguf", 402278560,
+                 "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773"),
+                (True, "mtp.safetensors", 635801416,
+                 "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2")):
+            m = maya.ik2_drafter_model(amd_pc)
+            self.assertEqual((m["repo"], m["revision"], m["folder"]), (repo, rev, "drafter"))
+            self.assertEqual(m["files"], {name: size})
+            self.assertEqual(m["sha256"], {name: sha})
+            self.assertAlmostEqual(m["download_gb"], size / 1e9)
+            self.assertIn(sha, doc)
+            self.assertEqual(maya.file_url(m, name), f"https://huggingface.co/{repo}/resolve/{rev}/drafter/{name}")
+            self.assertEqual(maya.ik2_drafter_model(not amd_pc, name), m)       # (a form by its name)
+        self.assertEqual(maya.ik2_drafter_model(), maya.ik2_drafter_model(False))
 
     def test_vision_pinned(self):
         """The pictures: the mmproj from Maya's own repo (vision/ at a pinned revision), by size and sha256 - unsloth's
@@ -443,11 +450,70 @@ class Steps(unittest.TestCase):
             self.assertIsNone(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"))
         with patch.object(maya, "file_incomplete", lambda *a: None), \
                 patch.object(maya, "sha256_checked", lambda *a: True):
-            self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"), d / "mtp.safetensors")
+            self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"), d / "dspark-Inkling-2-Mini-Q8_0.gguf")
+            self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8", True), d / "mtp.safetensors")   # (AMD)
             said = []
             with patch.object(maya, "warn", said.append):
-                self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 262144, "fp8"), d / "mtp.safetensors")
+                self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 262144, "fp8"),
+                                 d / "dspark-Inkling-2-Mini-Q8_0.gguf")
             self.assertIn("does not fit beside the model", " ".join(said))
+
+    def drafter_run(self, d, amd_pc=False, good=True, fetched=True):
+        """ik2_drafter_step with the download stubbed: (the file it names, the downloads it asked for as
+        (repo, revision, folder, names))."""
+        calls = []
+
+        def offer(a, what, dd, files, m):
+            calls.append((m["repo"], m["revision"], m["folder"], [f.name for f in files]))
+            for f in files if fetched else []:
+                with open(f, "wb") as fh:
+                    fh.truncate(m["files"][f.name])    # (a sparse file of the published size)
+            return fetched
+        with patch.object(maya, "offer_download", offer), patch.object(maya, "sha256_checked", lambda p, w: good), \
+                patch.object(maya, "ok", lambda *a: None), patch.object(maya, "warn", lambda *a: None):
+            return maya.ik2_drafter_step(self.va(), d, 24, 65536, "fp8", amd_pc), calls
+
+    def test_drafter_fresh_from_mayas_repo(self):
+        """A model folder without a drafter: one file from Maya's repo at the pinned revision, folder drafter/ - the
+        GGUF on NVIDIA, mtp.safetensors on AMD."""
+        ours = ("peasantsmith/Inkling-2-Mini-Maya-GGUF", "37027719327de5f574684b525ad88fe50c4ff222", "drafter")
+        for amd_pc, name in ((False, "dspark-Inkling-2-Mini-Q8_0.gguf"), (True, "mtp.safetensors")):
+            d, gguf = self.files()
+            for f in ("dspark-Inkling-2-Mini-Q8_0.gguf", "mtp.safetensors"):
+                (d / f).unlink(missing_ok=True)
+            got, calls = self.drafter_run(d, amd_pc)
+            self.assertEqual(calls, [ours + ([name],)])
+            self.assertEqual(got, d / name)
+
+    def test_drafter_from_an_earlier_setup(self):
+        """An earlier setup's mtp.safetensors beside the model: on NVIDIA the setup fetches the GGUF (the engine's
+        faster drafting path) and the old file stays on the disk; where the GGUF is not downloaded the engine drafts
+        with the old file (the same size and sha256 - another is not taken).  The PC's own form already here: no
+        download."""
+        d, gguf = self.files()
+        old, new = d / "mtp.safetensors", d / "dspark-Inkling-2-Mini-Q8_0.gguf"
+        new.unlink(missing_ok=True)
+        with open(old, "wb") as fh:
+            fh.truncate(635801416)
+        self.assertEqual(self.drafter_run(d, amd_pc=True), (old, []))    # (AMD: its own form, no download)
+        got, calls = self.drafter_run(d, fetched=False)                  # (NVIDIA, the download declined: the old file)
+        self.assertEqual((got, [c[3] for c in calls]), (old, [[new.name]]))
+        got, calls = self.drafter_run(d, good=False, fetched=False)      # (its size, another sha256: not taken)
+        self.assertEqual((got, [c[3] for c in calls]), (None, [[new.name]]))
+        got, calls = self.drafter_run(d)                                 # (NVIDIA: the GGUF fetched from Maya's repo)
+        self.assertEqual((got, [c[2:] for c in calls]), (new, [("drafter", [new.name])]))
+        self.assertEqual(old.stat().st_size, 635801416)                  # (the old file stays)
+        self.assertEqual(self.drafter_run(d), (new, []))                 # (again: nothing to download)
+        self.assertEqual(self.drafter_run(d, amd_pc=True), (old, []))
+        old.unlink()
+        got, calls = self.drafter_run(d, amd_pc=True, fetched=False)     # (AMD with the GGUF alone, declined: used)
+        self.assertEqual((got, [c[3] for c in calls]), (new, [["mtp.safetensors"]]))
+        new.unlink()
+        with open(old, "wb") as fh:
+            fh.truncate(1000)                                            # (another size: not the drafter)
+        got, calls = self.drafter_run(d, fetched=False)
+        self.assertEqual((got, [c[3] for c in calls]), (None, [[new.name]]))
+        self.assertTrue(old.exists())
 
     def test_drafter_room(self):
         """tools/ik2_fit.py's drafter room (maya-ik2's draft_room): 24 GB cards hold it up to about 200K tokens with the
@@ -483,7 +549,8 @@ class Steps(unittest.TestCase):
         pc = {"gpus": [gpu], "backend": backend}
         seen = {}
         stub = lambda name, ret: patch.object(maya, name, lambda *a, **k: ret)   # noqa: E731
-        drafter = patch.object(maya, "ik2_drafter_step", lambda *a, **k: seen.setdefault("drafter", d / "mtp.safetensors"))
+        drafter = patch.object(maya, "ik2_drafter_step",
+                               lambda *a, **k: seen.update(amd=a[-1]) or seen.setdefault("drafter", d / "mtp.safetensors"))
         cfg = patch.object(maya, "write_config_ik2", lambda a, *r: seen.update(drafting=a.drafting, drafter=r[-1]))
         said = []
         with patch.object(maya, "check_pc", return_value=pc), patch.object(maya, "mem_gb", return_value=(ram, 10.0)),                 patch.object(maya, "choose_context", lambda a, prev, opts, rec: 65536),                 stub("ik2_dir", d), stub("tools_step", d), stub("build_step", {}), stub("ik2_model_step", gguf),                 stub("ik2_tokenizer_step", d), stub("ik2_vision_step", None), drafter, cfg,                 patch.object(maya.IK2_EXE.__class__, "exists", lambda self: True),                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", lambda *a: None),                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "hip_unified_memory", lambda g: False), patch.object(maya, "WIN", False):
@@ -504,6 +571,7 @@ class Steps(unittest.TestCase):
             seen, said = self.run_setup(gpu, backend=backend)
             self.assertIsNone(seen["drafting"], gpu)
             self.assertEqual(seen["drafter"].name, "mtp.safetensors", gpu)
+            self.assertEqual(seen["amd"], backend == "hip", gpu)        # (the drafter step picks the form by it)
             self.assertNotIn("drafting off", said)
 
     def va(self, **kw):

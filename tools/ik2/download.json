@@ -1,5 +1,5 @@
 {
- "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8), an experimental preview: unsloth's UD-Q4_K_XL GGUF at the repo's top - Unsloth's looped layout (general.architecture inkling2: inkling2.num_loops, inkling2.loop.core_start), which maya-ik2 reads; the files in Mainline_Support/ (inkling2_loop, llama.cpp master's) are not offered. Experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. The drafter: \"drafter\" below (thinkingmachines' own, drafting auto by default). The file pinned by revision, size and sha256: the setup checks them.",
+ "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8), an experimental preview: unsloth's UD-Q4_K_XL GGUF at the repo's top - Unsloth's looped layout (general.architecture inkling2: inkling2.num_loops, inkling2.loop.core_start), which maya-ik2 reads; the files in Mainline_Support/ (inkling2_loop, llama.cpp master's) are not offered. Experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. The drafter: \"drafter\" below (the model's own, from Maya's repo; drafting auto by default). The file pinned by revision, size and sha256: the setup checks them.",
  "name": "Inkling-2-Mini-UD-Q4_K_XL",
  "repo": "unsloth/Inkling-2-Mini-GGUF",
  "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",
@@ -22,13 +22,16 @@
   "legacy_names": ["mmproj-BF16.gguf"]
  },
  "drafter": {
-  "_": "Drafting: thinkingmachines' own drafter of Inkling-2-Mini (mtp.safetensors, a DSpark-style draft model, BF16; Apache 2.0) from the model's repo at a pinned revision, read by maya-ik2 --draft; not with --drafting off. With --drafting auto the engine measures once on the PC whether it (or the prompt lookup) makes answers faster, and drafting never changes the answers.",
-  "repo": "thinkingmachines/Inkling-2-Mini",
-  "revision": "ed40e7da625f594fc9c4990f5f66be24873c22d7",
-  "folder": "",
+  "_": "Drafting: Inkling-2-Mini's own drafter (a DSpark-style draft model; Apache 2.0) from Maya's own repo at a pinned revision, in its two forms, the same drafter in each: unsloth's GGUF of it (llama.cpp's dflash architecture, Q8_0 matrices - their dspark-Inkling-2-Mini-Q8_0.gguf byte for byte), which maya-ik2 reads on its fastest drafting path (\"default\": what the setup fetches), and thinkingmachines' mtp.safetensors (BF16, byte for byte), the form measured on AMD (\"amd\": what the setup fetches there). A whole copy of the PC's form already beside the model (the same size and sha256) is not downloaded again; an earlier setup's mtp.safetensors on NVIDIA stays on the disk beside the GGUF the setup then fetches. Read by maya-ik2 --draft; not with --drafting off. With --drafting auto the engine measures once on the PC whether it (or the prompt lookup) makes answers faster, and drafting never changes the answers.",
+  "repo": "peasantsmith/Inkling-2-Mini-Maya-GGUF",
+  "revision": "37027719327de5f574684b525ad88fe50c4ff222",
+  "folder": "drafter",
   "license": "Apache 2.0",
   "files": {
+   "dspark-Inkling-2-Mini-Q8_0.gguf": [402278560, "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773"],
    "mtp.safetensors": [635801416, "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2"]
-  }
+  },
+  "default": "dspark-Inkling-2-Mini-Q8_0.gguf",
+  "amd": "mtp.safetensors"
  }
 }
