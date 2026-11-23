@@ -11394,9 +11394,8 @@ def ik2_drafter_model(amd: bool = False, name: str | None = None) -> dict | None
 
 def ik2_drafter_here(d: Path, amd: bool = False) -> tuple[Path, dict] | None:
     """A whole copy of the drafter already beside the model (in d), with its form's entry, or None: the form the setup
-    fetches on this PC first, else the other one - before Maya's own repo the setup fetched thinkingmachines'
-    mtp.safetensors, the same bytes as the repo's: a copy whose size and sha256 match is used as it is, not
-    downloaded again."""
+    fetches on this PC first, else the other one (its size and sha256 the published ones) - what the engine drafts
+    with where this PC's form was not downloaded (an earlier setup's mtp.safetensors on NVIDIA)."""
     man = read_json(IK2_MANIFEST).get("drafter") or {}
     first = ik2_drafter_model(amd)
     if first is None:
@@ -11419,9 +11418,9 @@ def ik2_drafting(a) -> str:
 
 
 def ik2_drafter_step(a, d: Path, vram: float, ctx: int, kv: str, amd: bool = False) -> Path | None:
-    """The drafter beside the GGUF (in d) - a whole copy of either of its forms already there, else the form this PC's
-    engine drafts with best (ik2_drafter_model) downloaded from Maya's repo - checked against its published sha256,
-    or None: drafting off (--drafting off), or not downloaded - the engine then drafts with the prompt lookup alone.
+    """The drafter beside the GGUF (in d) - the form this PC's engine drafts with best (ik2_drafter_model), downloaded
+    from Maya's repo when it is not there (an earlier setup's mtp.safetensors on NVIDIA stays on the disk, and is
+    what the engine drafts with where the GGUF was not downloaded) - checked against its published sha256, or None: drafting off (--drafting off), or not downloaded - the engine then drafts with the prompt lookup alone.
     Truthful about this card: where the drafter's room does not fit beside the model at this context, the engine
     leaves it out at its start (the plan as without it)."""
     how = ik2_drafting(a)
@@ -11432,15 +11431,15 @@ def ik2_drafter_step(a, d: Path, vram: float, ctx: int, kv: str, amd: bool = Fal
     if m is None:
         warn(f"{IK2_MANIFEST} names no drafter: drafting with the prompt lookup alone")
         return None
-    here = ik2_drafter_here(d, amd)
-    if here is not None:
-        m = here[1]
-        if here[0].name not in ik2_drafter_model(amd)["files"]:
-            ok(f"the drafter: {here[0].name} is already here (the same drafter, not downloaded again)")
     files = [d / n for n in m["files"]]
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the drafter", d, files, m):
-        warn(f"the drafter was not downloaded: drafting with the prompt lookup alone ({ME} --setup asks again)")
-        return None
+        here = ik2_drafter_here(d, amd)                # (the other form, from an earlier setup: the same drafter)
+        if here is None:
+            warn(f"the drafter was not downloaded: drafting with the prompt lookup alone ({ME} --setup asks again)")
+            return None
+        warn(f"{files[0].name} was not downloaded: drafting with {here[0].name}, which is already here "
+             f"({ME} --setup asks again)")
+        files, m = [here[0]], here[1]
     for f in files:
         if not sha256_checked(f, m["sha256"][f.name]):
             f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
