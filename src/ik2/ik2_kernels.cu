@@ -6145,7 +6145,7 @@ experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __re
     //  order - so that a member's h is the one-token kernel's to the bit with the same SPLIT)
     __shared__ float2 part[SPLIT][NT][32];
     const int grp = blockIdx.y, n = n_g[grp];
-    if (n <= 0) return;
+    if (n <= 0 || (uintptr_t) blob[grp] <= 1u) return;   // (two GPUs: a group the other GPU runs)
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, gr = lane >> 2, t = lane & 3;
     const int r = blockIdx.x * 8 + gr;
     const size_t rb = (size_t) (C / 64) * 36;
@@ -6215,7 +6215,7 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
                           float* y) {
     __shared__ float4 part[SPLIT][32];
     const int grp = blockIdx.y, n = n_g[grp];
-    if (n <= 0) return;
+    if (n <= 0 || (uintptr_t) blob[grp] <= 1u) return;   // (two GPUs: a group the other GPU runs)
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, gr = lane >> 2, t = lane & 3;
     const int r = blockIdx.x * 16 + gr;
     const size_t rb = (size_t) (F / 64) * 36;
@@ -6263,6 +6263,219 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
     }
 }
 
+
+// The two on Volta (sm_70): experts_v70_kernel for the tokens of a group - its rows, its steps and its sums on
+// mma.m8n8k4, the expert's rows read once.  A quad pair takes the sub-block q of every 64-value block, a lane (j, hi)
+// the A row j + 4 hi; the B columns are the group's members: gate | up - column c of tile i the member 4 i + c / 2's
+// limb c % 2 (experts_v70_kernel's columns 0 and 1, a member each pair); down - column c the member c's h row.  A
+// column's sums do not depend on the other columns, the quad pairs' sums meet in the same two shuffles and the
+// splits' in the same order: a member's h and y are the one-token kernel's to the bit with the same SPLIT.
+template <int SPLIT, int NT>
+__global__ void __launch_bounds__(SPLIT * 32)
+experts_block_gu_v70_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g,
+                            const int* __restrict__ tok_g, const int* __restrict__ row_g, size_t off_up, int C, int F,
+                            const uint16_t* __restrict__ limbs, const float* __restrict__ sg,
+                            const float* __restrict__ su, float gcap, float ucap, uint16_t* h) {
+    __shared__ float part[SPLIT][NT][8][8];   // [split][tile][j + 4 hi][gate: the four (row, member) sums | up]
+    const int grp = blockIdx.y, n = n_g[grp];
+    if (n <= 0 || (uintptr_t) blob[grp] <= 1u) return;   // (two GPUs: a group the other GPU runs)
+    const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, j = lane & 3, hi = lane >> 4, qp = (lane >> 2) & 3;
+    const int rr = j + 4 * hi, r0 = blockIdx.x * 8;
+    const size_t rb = (size_t) (C / 64) * 36;
+    const uint8_t* a = blob[grp] + (size_t) (r0 + rr) * rb;
+    const uint8_t* b = a + off_up;
+    const uint16_t* xr[NT];
+    bool x_ok[NT];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        const int mem = 4 * i + (rr >> 1);
+        x_ok[i] = mem < n;
+        const int tk = x_ok[i] ? tok_g[grp * kGroupMax + mem] : 0;
+        xr[i] = limbs + ((size_t) tk * 2 + (rr & 1)) * C + 16 * qp;
+    }
+    float ca[NT][8], cb[NT][8];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+#pragma unroll
+        for (int m = 0; m < 8; ++m) ca[i][m] = cb[i][m] = 0.0f;
+    }
+    const int nk = C / 64;
+    struct Step {
+        uint32_t sa, sb, wa0, wa1, wb0, wb1;
+    };
+    auto load = [&](int k) {
+        const uint32_t* ap = (const uint32_t*) (a + (size_t) k * 36);
+        const uint32_t* bp = (const uint32_t*) (b + (size_t) k * 36);
+        Step t;
+        t.sa = __ldg(ap), t.sb = __ldg(bp);
+        t.wa0 = __ldg(ap + 1 + 2 * qp), t.wa1 = __ldg(ap + 2 + 2 * qp);
+        t.wb0 = __ldg(bp + 1 + 2 * qp), t.wb1 = __ldg(bp + 2 + 2 * qp);
+        return t;
+    };
+    Step nx = load(min(split, nk - 1));
+    for (int k = split; k < nk; k += SPLIT) {
+        const Step cur = nx;
+        if (k + SPLIT < nk) nx = load(k + SPLIT);
+        const uint32_t sa = ue4m3_h2((cur.sa >> (8 * qp)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * qp)) & 0xFFu);
+        uint32_t w[4][4];
+        nv_word_h2(cur.wa0, sa, w[0][0], w[0][1], w[2][0], w[2][1]);
+        nv_word_h2(cur.wa1, sa, w[1][0], w[1][1], w[3][0], w[3][1]);
+        nv_word_h2(cur.wb0, sb, w[0][2], w[0][3], w[2][2], w[2][3]);
+        nv_word_h2(cur.wb1, sb, w[1][2], w[1][3], w[3][2], w[3][3]);
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            if (i && n <= 4 * i) continue;   // (a tile none of the group's members is in)
+            uint4 xa = make_uint4(0u, 0u, 0u, 0u), xb = xa;
+            if (x_ok[i]) {
+                xa = __ldg((const uint4*) (xr[i] + 64 * (size_t) k));
+                xb = __ldg((const uint4*) (xr[i] + 64 * (size_t) k + 8));
+            }
+            mma884(ca[i], w[0][0], w[0][1], xa.x, xa.y);
+            mma884(cb[i], w[0][2], w[0][3], xa.x, xa.y);
+            mma884(ca[i], w[1][0], w[1][1], xa.z, xa.w);
+            mma884(cb[i], w[1][2], w[1][3], xa.z, xa.w);
+            mma884(ca[i], w[2][0], w[2][1], xb.x, xb.y);
+            mma884(cb[i], w[2][2], w[2][3], xb.x, xb.y);
+            mma884(ca[i], w[3][0], w[3][1], xb.z, xb.w);
+            mma884(cb[i], w[3][2], w[3][3], xb.z, xb.w);
+        }
+    }
+    // c[2 p], c[2 p + 1]: the row (j & 1) + 2 (p & 1) + 4 hi against the member 4 i + (j >> 1) + 2 (p >> 1)'s limbs
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        float v[8];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) v[p] = ca[i][2 * p] + ca[i][2 * p + 1], v[4 + p] = cb[i][2 * p] + cb[i][2 * p + 1];
+#pragma unroll
+        for (int sh = 4; sh <= 8; sh <<= 1) {
+#pragma unroll
+            for (int p = 0; p < 8; ++p) v[p] += __shfl_xor_sync(0xffffffffu, v[p], sh);
+        }
+        if (qp == 0) {
+#pragma unroll
+            for (int p = 0; p < 8; ++p) part[split][i][rr][p] = v[p];
+        }
+    }
+    __syncthreads();
+    if (split || qp) return;
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        float tot[8];
+#pragma unroll
+        for (int p = 0; p < 8; ++p) tot[p] = part[0][i][rr][p];
+#pragma unroll
+        for (int s = 1; s < SPLIT; ++s) {
+#pragma unroll
+            for (int p = 0; p < 8; ++p) tot[p] += part[s][i][rr][p];
+        }
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int mem = 4 * i + (j >> 1) + 2 * (p >> 1);
+            if (mem >= n) continue;
+            const int r = r0 + (j & 1) + 2 * (p & 1) + 4 * hi;
+            const int slot = row_g[grp * kGroupMax + mem];
+            const float gg = tot[p] * (sg ? sg[slot] : 1.0f), u = tot[4 + p] * (su ? su[slot] : 1.0f);
+            h[(size_t) slot * F + r] = f2h(gcap * tanhf(gg / gcap) * (1.0f / (1.0f + expf(-gg))) * ucap * tanhf(u / ucap));
+        }
+    }
+}
+template <int SPLIT>
+__global__ void __launch_bounds__(SPLIT * 32)
+experts_block_down_v70_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g,
+                              const int* __restrict__ row_g, size_t off_down, int C, int F,
+                              const uint16_t* __restrict__ h, float* y) {
+    __shared__ float part[SPLIT][8][16];   // [split][j + 4 hi][rows r0 ..: the lane's 8 sums | rows r0 + 8 ..]
+    const int grp = blockIdx.y, n = n_g[grp];
+    if (n <= 0 || (uintptr_t) blob[grp] <= 1u) return;   // (two GPUs: a group the other GPU runs)
+    const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, j = lane & 3, hi = lane >> 4, qp = (lane >> 2) & 3;
+    const int rr = j + 4 * hi, r0 = blockIdx.x * 16;
+    const size_t rb = (size_t) (F / 64) * 36;
+    const uint8_t* a = blob[grp] + off_down + (size_t) (r0 + rr) * rb;
+    const uint8_t* b = a + 8 * rb;
+    const bool x_ok = rr < n;   // (column rr: the member rr's h)
+    const uint16_t* xr = h + (size_t) (x_ok ? row_g[grp * kGroupMax + rr] : 0) * F + 16 * qp;
+    float v[16];
+#pragma unroll
+    for (int m = 0; m < 16; ++m) v[m] = 0.0f;
+    const int nk = F / 64;
+    struct Step {
+        uint32_t sa, sb, wa0, wa1, wb0, wb1;
+        uint4 xa, xb;
+    };
+    auto load = [&](int k) {
+        const uint32_t* ap = (const uint32_t*) (a + (size_t) k * 36);
+        const uint32_t* bp = (const uint32_t*) (b + (size_t) k * 36);
+        Step t;
+        t.sa = __ldg(ap), t.sb = __ldg(bp);
+        t.wa0 = __ldg(ap + 1 + 2 * qp), t.wa1 = __ldg(ap + 2 + 2 * qp);
+        t.wb0 = __ldg(bp + 1 + 2 * qp), t.wb1 = __ldg(bp + 2 + 2 * qp);
+        t.xa = t.xb = make_uint4(0u, 0u, 0u, 0u);
+        if (x_ok) {
+            t.xa = __ldg((const uint4*) (xr + 64 * (size_t) k));
+            t.xb = __ldg((const uint4*) (xr + 64 * (size_t) k + 8));
+        }
+        return t;
+    };
+    Step nx = load(min(split, nk - 1));
+    for (int k = split; k < nk; k += SPLIT) {
+        const Step cur = nx;
+        if (k + SPLIT < nk) nx = load(k + SPLIT);
+        const uint32_t sa = ue4m3_h2((cur.sa >> (8 * qp)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * qp)) & 0xFFu);
+        const uint4 xa = cur.xa, xb = cur.xb;
+        uint32_t w[4][4];
+        nv_word_h2(cur.wa0, sa, w[0][0], w[0][1], w[2][0], w[2][1]);
+        nv_word_h2(cur.wa1, sa, w[1][0], w[1][1], w[3][0], w[3][1]);
+        nv_word_h2(cur.wb0, sb, w[0][2], w[0][3], w[2][2], w[2][3]);
+        nv_word_h2(cur.wb1, sb, w[1][2], w[1][3], w[3][2], w[3][3]);
+        mma884(v, w[0][0], w[0][1], xa.x, xa.y);
+        mma884(v + 8, w[0][2], w[0][3], xa.x, xa.y);
+        mma884(v, w[1][0], w[1][1], xa.z, xa.w);
+        mma884(v + 8, w[1][2], w[1][3], xa.z, xa.w);
+        mma884(v, w[2][0], w[2][1], xb.x, xb.y);
+        mma884(v + 8, w[2][2], w[2][3], xb.x, xb.y);
+        mma884(v, w[3][0], w[3][1], xb.z, xb.w);
+        mma884(v + 8, w[3][2], w[3][3], xb.z, xb.w);
+    }
+#pragma unroll
+    for (int sh = 4; sh <= 8; sh <<= 1) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) v[m] += __shfl_xor_sync(0xffffffffu, v[m], sh);
+    }
+    if (qp == 0) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) part[split][rr][m] = v[m];
+    }
+    __syncthreads();
+    if (split || qp) return;
+    float tot[16];
+#pragma unroll
+    for (int m = 0; m < 16; ++m) tot[m] = part[0][rr][m];
+#pragma unroll
+    for (int s = 1; s < SPLIT; ++s) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) tot[m] += part[s][rr][m];
+    }
+    // c[i]: the row (j & 1) + 2 ((i >> 1) & 1) + 4 hi against the member (i & 1) + 2 (j >> 1) + 4 (i >> 2)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int mem = (i & 1) + 2 * (j >> 1) + 4 * (i >> 2);
+        if (mem >= n) continue;
+        const int r = r0 + (j & 1) + 2 * ((i >> 1) & 1) + 4 * hi;
+        const int slot = row_g[grp * kGroupMax + mem];
+        y[(size_t) slot * C + r] = tot[i], y[(size_t) slot * C + r + 8] = tot[8 + i];
+    }
+}
+// two_take_rows for a window's groups: the rows of the groups GPU 0's table marks kHeldElsewhere from GPU 1's
+__global__ void two_take_rows_g_kernel(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* other,
+                                       int C, float* y) {
+    const int grp = blockIdx.y, n = n_g[grp];
+    if (n <= 0 || (uintptr_t) blob[grp] != kHeldElsewhere) return;
+    for (int m = 0; m < n; ++m) {
+        const size_t s = (size_t) row_g[grp * kGroupMax + m];
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
+            y[s * C + i] = other[s * C + i];
+    }
+}
 
 // ---- the exact window: a verify window's products with the one-token path's arithmetic for every token (drafting
 // on = drafting off, to the bit), the weights read once for the window
@@ -6452,7 +6665,7 @@ __global__ void experts_gate_up_swiglu_mem_kernel(const uint8_t* const* blob, co
                                                   const float* su, float gcap, float ucap, uint16_t* h) {
     extern __shared__ float xs[];
     const int grp = blockIdx.y, n = n_g[grp];
-    if (n <= 0) return;
+    if (n <= 0 || (uintptr_t) blob[grp] <= 1u) return;   // (two GPUs: a group the other GPU runs)
     const int warp = threadIdx.x >> 5;
     const uint8_t* bl = blob[grp];
     for (int m = 0; m < n; ++m) {
@@ -6485,7 +6698,7 @@ __global__ void experts_down_mem_kernel(const uint8_t* const* blob, const int* n
                                         size_t off_down, const uint16_t* h, int C, int F, size_t rb_down, float* y) {
     extern __shared__ float xs[];
     const int grp = blockIdx.y, n = n_g[grp];
-    if (n <= 0) return;
+    if (n <= 0 || (uintptr_t) blob[grp] <= 1u) return;   // (two GPUs: a group the other GPU runs)
     const int warp = threadIdx.x >> 5;
     const uint8_t* w = blob[grp] + off_down;
     for (int m = 0; m < n; ++m) {
@@ -7054,6 +7267,12 @@ void two_take_rows(const uint8_t* const* blob, const float* other, int S, int C,
     if (S <= 0) return;
     two_take_rows_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S), 256, 0, s>>>(blob, other, C, y);
     check("two_take_rows");
+}
+void two_take_rows_g(const uint8_t* const* blob, const int* n, const int* row, const float* other, int G, int C,
+                     float* y, cudaStream_t s) {
+    if (G <= 0) return;
+    two_take_rows_g_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) G), 256, 0, s>>>(blob, n, row, other, C, y);
+    check("two_take_rows_g");
 }
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s) {
     if (!n) return;
@@ -8054,6 +8273,13 @@ void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, 
                       size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,
                       float ucap, uint16_t* h, cudaStream_t s) {
     if (G <= 0) return;
+    if (arch_class() == 70) {   // (Volta: mma.m8n8k4, the one-token kernel's rows, splits and sums)
+        const dim3 gv((unsigned) (F / 8), (unsigned) G);
+        if (T <= 4) experts_block_gu_v70_kernel<8, 1><<<gv, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
+        else experts_block_gu_v70_kernel<8, 2><<<gv, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
+        check("experts_block_gu (Volta)");
+        return;
+    }
     need_class(75, "experts_block_gu");
     const dim3 g((unsigned) (F / 8), (unsigned) G);
     if (T <= 4) experts_block_gu_kernel<8, 1><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
@@ -8063,6 +8289,12 @@ void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, 
 void experts_block_down(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                         int F, const uint16_t* h, float* y, cudaStream_t s) {
     if (G <= 0) return;
+    if (arch_class() == 70) {
+        experts_block_down_v70_kernel<4><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down,
+                                                                                                 C, F, h, y);
+        check("experts_block_down (Volta)");
+        return;
+    }
     need_class(75, "experts_block_down");
     experts_block_down_kernel<4><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C, F,
                                                                                          h, y);

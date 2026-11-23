@@ -387,11 +387,12 @@ class Settings(unittest.TestCase):
                              (how, "/m/mtp.safetensors"), want)
             self.assertEqual(M.settings_of(new)["draft"], want)
 
-    def test_ik2_drafting_unavailable_on_volta_and_offload(self):
-        """Volta / Turing cards and the offload layout: the Drafting setting offers Off only."""
+    def test_ik2_drafting_unavailable_without_room(self):
+        """A card whose tier has no room for the drafter: the Drafting setting offers Off only; Volta / Turing draft
+        as the newer cards do."""
         path = self.ik2_cfg()
-        for gpu, want in (({"arch": "70", "vram_gb": 32.0}, ["none"]), ({"arch": "86", "vram_gb": 8.0}, ["none"]),
-                          ({"arch": "86", "vram_gb": 24.0}, ["auto", "none"])):
+        for gpu, want in (({"arch": "70", "vram_gb": 32.0}, ["auto", "none"]), ({"arch": "86", "vram_gb": 8.0}, ["none"]),
+                          ({"arch": "75", "vram_gb": 24.0}, ["auto", "none"]), ({"arch": "86", "vram_gb": 24.0}, ["auto", "none"])):
             with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "GPU", **gpu}]):
                 self.assertEqual(M.choices(M.read(path))["draft"], want, gpu)
 

@@ -169,13 +169,15 @@ def draft_fits(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> bool:
 
 
 def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hip: bool = False,
-                        apu: bool = False) -> str | None:
-    """Why drafting is off on this card (one line), or None: NVIDIA Volta / Turing (sm_70 / sm_75: the drafter's window
-    needs sm_80 or newer) run without it.  The offload path (the card does not hold every expert: a small card, or a
-    long context) drafts where its whole cache stays in VRAM and the experts' tier has the drafter's room, on AMD and
-    NVIDIA alike: --drafting auto measures it once on the PC (on NVIDIA against plain decoding in the PC's own mode -
-    lane parity where that is faster - and keeps the faster, the same at every start).  NVIDIA sm_80+ and AMD with
-    every expert in VRAM keep it (an AMD APU always).  An arch or VRAM not known counts as not a reason."""
+                        apu: bool = False, gpus2: bool = False) -> str | None:
+    """Why drafting is off on this card (one line), or None.  Every NVIDIA class the engine runs on drafts - Volta
+    and Turing (sm_70 / sm_75) have their own verify-window kernels since v1.1.75.  The offload path (the card does
+    not hold every expert: a small card, or a long context) drafts where its whole cache stays in VRAM and the experts'
+    tier has the drafter's room, on AMD and NVIDIA alike, and on two NVIDIA cards (gpus2: the split, plan_two's "gpus"
+    2 - its cache is whole in VRAM): --drafting auto measures it once on the PC (on NVIDIA against plain decoding in
+    the PC's own mode - lane parity where that is faster - and keeps the faster, the same at every start; on a V100
+    it may well keep plain decoding).  With every expert in VRAM it is kept (an AMD APU always).  A VRAM not known
+    counts as not a reason; arch is no reason any more (kept for the callers)."""
     off_cache = ("drafting off: at this context part of the cache streams from RAM, where drafting does not run - a "
                  "smaller context or a bigger card brings it back")
     off_room = ("drafting off: at this context the experts' tier has no room for the drafter - a smaller context or a "
@@ -186,13 +188,9 @@ def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hi
         if plan(vram_gb, ctx, kv)["kv_streamed"]:
             return off_cache
         return None if draft_fits(vram_gb, ctx, kv) else off_room
-    try:
-        cc = int(arch)
-    except (TypeError, ValueError):
-        cc = 0
-    if 0 < cc < 80:
-        return "drafting off: this GPU (Volta / Turing) has no drafting for this model - every token comes from a full model step"
     if vram_gb and not plan(vram_gb, ctx, kv)["resident"]:
+        if gpus2:           # (the two-card split: its cache whole in VRAM, mode A's arithmetic already)
+            return None if draft_fits(vram_gb, ctx, kv) else off_room
         if plan(vram_gb, ctx, kv)["kv_streamed"]:
             return off_cache
         if not draft_fits(vram_gb, ctx, kv):

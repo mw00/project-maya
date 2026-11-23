@@ -11664,10 +11664,9 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     gguf = ik2_model_step(a, d, models)               # 5
     if gguf is None:
         return None
-    off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd, apu)
-    if vram1 and IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 2:
-        off = "drafting off: on two GPUs it is not checked yet - every token comes from a full model step"
-    if off:                                            # (Volta / Turing, a streamed cache, no room: no drafter, drafting off)
+    off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd, apu,
+                                   bool(vram1) and IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 2)
+    if off:                                            # (a streamed cache, no room: no drafter, drafting off)
         ok(off)
         a.drafting = "off"
         drafter = None
