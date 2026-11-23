@@ -4316,17 +4316,67 @@ struct SpecCtl {
             const double v = expect(b) / c[b];
             if (v > vb) vb = v, best = b;
         }
-        if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
+        if (best == 1 && plain_run >= look_every(bmax)) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
         return best;
     }
     void took_plain(double t) {
-        c_plain = 0.9 * c_plain + 0.1 * t;
+        if (fresh_plain > 0) c_plain = fresh_plain == kFreshPlain ? t : std::min(c_plain, t), --fresh_plain;
+        else c_plain = 0.9 * c_plain + 0.1 * t;
+    // the plain tokens before a look: `probe`, and where a look's window is measured to cost more than the tokens it
+    // gives would in plain, as many as keep the looks to a fiftieth of the time (the gate, below)
+    int look_every(int bmax) const {
+        if (!gate || !adapt) return probe;
+        const int pw = std::min(probe_w, bmax);
+        const double over = c[pw] - expect(pw) * c_plain;
+        return (int) std::clamp(over / (0.02 * c_plain), (double) probe, 4096.0);
+    }
         ++plain, ++plain_run;
     }
     void took_spec(int B, int acc, double t) {
         took_width(B, t);
+    // Drafting by its measured speed where the answer is (IK2_DRAFT_GATE=0: without): deep in a long context a
+    // window can cost more than the plain tokens it gives (a Radeon 250,000 tokens deep: a window of 2 the time of 4
+    // plain tokens), which the looks above then pay again every `probe` tokens.  So the answer's rounds are timed
+    // against its plain tokens at this depth - begin(): an answer far from the depth the times were measured at
+    // takes them anew (the plain token's first) - and where the rounds give fewer tokens a second the answer goes on
+    // in plain tokens (lost), with a look again only as often as the looks cost a fiftieth of its time (kPause plain
+    // tokens at least where a window took longer than as many plain tokens as it is wide), half as often after each look that loses; a look that wins drafts again.  An answer at a new depth times the narrowest
+    // window first (calib: a window of 2, the cheapest look - the other widths follow its ratio).  The decision
+    // only: the tokens are the same.
+    static constexpr int kFreshPlain = 2, kPause = 128;
+    bool gate = !(getenv("IK2_DRAFT_GATE") && !atoi(getenv("IK2_DRAFT_GATE")));
+    int depth0 = -1, fresh_plain = 0, look = 0;
+    bool lost = false, calib = false;
+    double mt = 0, mT = 0, mn = 0;   // (this answer's rounds: tokens, seconds, rounds - decayed)
+    uint64_t pauses = 0;
+    void begin(int P) {
+        lost = false, mt = mT = mn = 0, look = probe;
+        if (!gate || !adapt) return;
+        if (depth0 >= 0 && P <= depth0 + depth0 / 4 + 4096 && P >= depth0 - depth0 / 5 - 4096) return;
+        depth0 = P, fresh_plain = kFreshPlain, calib = true;
+        for (int b = 2; b <= kBlockMax; ++b)
+            if (seen[b] >= 2) seen[b] = 1;   // (the next window of the width: its time as it is here)
+    }
+    bool held() const { return gate && adapt && (fresh_plain > 0 || (lost && plain_run < look)); }
+    void measured(int B, int acc, double t) {
+        if (!gate || !adapt || seen[B] < 2 || t <= 0) return;   // (a width's first step is not its time)
+        calib = false;
+        if (lost) {
+            if ((acc + 1) / t > 1.0 / c_plain) lost = false, mt = acc + 1, mT = t, mn = 1, look = probe;
+            else look = std::min(look * 2, 4096);
+            return;
+        }
+        mt = 0.9 * mt + acc + 1, mT = 0.9 * mT + t, mn = 0.9 * mn + 1;
+        const bool wide = c[B] >= B * c_plain;   // (a window of B longer than B plain tokens: no acceptance wins)
+        if (wide || (mn >= 2.7 && mt / mT < 1.0 / c_plain)) {
+            const double over = std::max(mT / mn, c[B]) - mt / mn * c_plain;   // (a look's seconds over its tokens' in plain)
+            lost = true, ++pauses;
+            look = (int) std::clamp(over / (0.02 * c_plain), (double) (wide ? std::max(probe, kPause) : probe), 4096.0);
+        }
+    }
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
         for (int j = 0; j + 1 < B && j <= acc; ++j)   // (draft j was reached: the j before it were kept)
+        measured(B, acc, t);
             pn[j] = pos_decay * pn[j] + 1.0, pa[j] = pos_decay * pa[j] + (j < acc ? 1.0 : 0.0);
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
         plain_run = 0;
@@ -4340,7 +4390,11 @@ struct SpecCtl {
     int pick(int room, int k, int& B) {
         const int bmax = std::min(wmax, room);
         B = 1;
-        if (bmax < 2) return 0;
+        if (bmax < 2 || held()) return 0;
+        if (gate && adapt && calib) {   // (this depth's first window: the narrowest)
+            B = 2;
+            return use_model ? 1 : use_lookup && k > 0 ? 2 : (B = 1, 0);
+        }
         int src = 0;
         double vb = 1.0 / c_plain;
         if (use_lookup && k > 0) {
@@ -4354,7 +4408,7 @@ struct SpecCtl {
             const int bm = choose(room);
             if (bm >= 2) {
                 const double v = expect(bm) / c[bm];
-                if (src == 0 || v > vb || plain_run >= probe) vb = v, B = bm, src = 1;
+                if (src == 0 || v > vb || plain_run >= look_every(bmax)) vb = v, B = bm, src = 1;
             }
         }
         return src;
@@ -4363,6 +4417,7 @@ struct SpecCtl {
         took_width(B, t);
         SL = decay * SL + acc, FL = decay * FL + (acc < B - 1 ? 1 : 0);
         ++l_steps, l_drafted += B - 1, l_accepted += acc;
+        measured(B, acc, t);
         plain_run = 0;
     }
     uint64_t offered() const { return drafted + l_drafted; }
@@ -5440,6 +5495,7 @@ void decode_greedy(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, in
     out.push_back(anchor);
     while ((int) out.size() < gen && P < ctx) {
         lk.append(anchor);
+    ctl.begin(P);
         const int room = std::min(gen - (int) out.size(), ctx - P);
         int32_t ld[kBlockMax];
         const int k = g_lookup && ctl.use_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
@@ -8230,6 +8286,7 @@ int main(int argc, char** argv) {
                     if (snaps[i].pos >= 0 && snaps[i].pos <= (int) L && snaps[i].pos < (int) ids.size() &&
                         (best < 0 || snaps[i].pos > snaps[best].pos))
                         best = i;
+                sctl.begin((int) ids.size());
                 if (L == hist.size() && L == ids.size() && !last.empty()) {
                     // (the same tokens again: the last logits answer)
                 } else if (best >= 0) {
@@ -8675,6 +8732,7 @@ int main(int argc, char** argv) {
             spec_step(M, drafter, anchor, P, B, sc, std::vector<int>{}, next, src == 2 ? given : nullptr, &t_draft);
             CU(cudaStreamSynchronize(g_s));
             if (src == 2) ctl.took_lookup(B, (int) next.size() - 1, now() - ts);
+        ctl.begin(P);
             else ctl.took_spec(B, (int) next.size() - 1, now() - ts);
             for (int j = 0; j + 1 < (int) next.size(); ++j) lk.append(next[j]);
             for (int j = 0; j < (int) next.size() && (int) out.size() < gen; ++j) out.push_back(next[j]);
@@ -8817,7 +8875,11 @@ int main(int argc, char** argv) {
         std::printf("), %llu plain tokens; a window %.1f ms (widths 2 .. 6:", (unsigned long long) ctl.plain,
                     ctl.c[std::min(ctl.wmax, kBlockMax)] * 1e3);
         for (int b = 2; b <= 6; ++b) std::printf(" %.1f", ctl.c[b] * 1e3);
-        std::printf("), a plain token %.1f ms\n", ctl.c_plain * 1e3);
+        std::printf("), a plain token %.1f ms", ctl.c_plain * 1e3);
+        if (ctl.pauses)
+            std::printf("; drafting paused %llu time%s (its rounds measured slower than plain tokens at this depth)",
+                        (unsigned long long) ctl.pauses, ctl.pauses == 1 ? "" : "s");
+        std::printf("\n");
     }
     if (g_sp_n)
         std::printf("steps: %llu, a step's drafting %.2f ms, its window %.2f ms, the rest %.2f ms\n",
