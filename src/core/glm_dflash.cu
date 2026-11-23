@@ -1936,9 +1936,14 @@ bool Glm5Model::decode_dflash(maya::kernels::SamplerParams& sp, int64_t max_new,
         for (int i = 1; i < T; ++i) tok[(size_t) i] = d[(size_t) i - 1];
         // row t's token as it will go out: the window's pick, or --spec-follow's continuation there (forced() takes
         // one a token as they are emitted below; a draft stands while it is the token that goes out)
+        // (a token the caller forced while the anchor went out - the reasoning's budget, the loop guard: force_next
+        //  during the last round's closing emit - is what row 0 gives, not its pick: a first draft that repeated the
+        //  pick was kept, so the state took the draft while forced() sent the forced token, and the drafts after it
+        //  went on from a text the client never got.  glm_mtp.cu's window has the same rule)
+        const int32_t force0 = force_tok_;
         const auto goes_out = [&](int t) {
             const int32_t f = follow_peek((size_t) t);   // (forced() returns it whatever else is forced)
-            return f >= 0 ? f : out[(size_t) t];
+            return f >= 0 ? f : (t == 0 && force0 >= 0) ? force0 : out[(size_t) t];
         };
         if (pipe) {
             const auto hq0 = std::chrono::steady_clock::now();
