@@ -9092,6 +9092,8 @@ int main(int argc, char** argv) {
                 }
                 waiting.push_back(std::move(r));
             };
+            const int par_decode_pct = getenv("IK2_PAR_DECODE_PCT")
+                ? std::clamp(std::atoi(getenv("IK2_PAR_DECODE_PCT")), 0, 90) : 0;
             uint64_t steps = 0;
             int stat_tok = 0;
             double stat_t = now();
@@ -9134,6 +9136,8 @@ int main(int argc, char** argv) {
                     }
                 }
                 // one prompt pass: the earliest reader's (act is in arrival order)
+                bool did_prefill = false;
+                double prefill_s = 0.0;
                 for (auto& r : act) {
                     if (r.phase != 1) continue;
                     bind_slot(M, r.slot);
@@ -9141,10 +9145,13 @@ int main(int argc, char** argv) {
                     const bool last_c = r.p0 + n == r.ids.size();
                     std::vector<float> lo;
                     beat("a prompt pass (--parallel)");
+                    const double pf_t0 = now();
                     std::swap(g_img, r.img);
                     forward(M, r.ids.data() + r.p0, n, (int) r.p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
                             std::string(), lo, nullptr, t_exp);
                     std::swap(g_img, r.img);
+                    prefill_s = now() - pf_t0;
+                    did_prefill = true;
                     if (last_c) sh[r.slot].last = std::move(lo);
                     r.p0 += n;
                     const double ms = (now() - r.t0) * 1e3;
@@ -9153,73 +9160,104 @@ int main(int argc, char** argv) {
                     if (last_c) prompt_done(r);
                     break;
                 }
-                // the writers: each one's token out, then the next of those going on in one step
-                std::vector<Req*> rows;
-                for (auto& r : act)
-                    if (r.phase == 2) rows.push_back(&r);
-                std::sort(rows.begin(), rows.end(), [](const Req* a, const Req* b) { return a->slot < b->slot; });
-                std::vector<Req*> go;
-                for (Req* r : rows) {
-                    if (r->cancel || r->max_new <= 0) {
-                        done_line(*r, r->cancel ? "cancel" : "length");
-                        r->phase = 3;
-                        continue;
-                    }
-                    ++r->n_out;
-                    std::printf("T %d %d\n", r->rid, r->tok);
-                    if (r->tc.saw(r->tok)) r->tc.close(r->starts);   // (the thinking budget: forced on from here)
-                    if (std::find(eos_ids.begin(), eos_ids.end(), r->tok) != eos_ids.end()) {
-                        done_line(*r, "stop");
-                        r->phase = 3;
-                    } else if (r->n_out >= r->max_new) {
-                        done_line(*r, "length");
-                        r->phase = 3;
-                    } else {
-                        go.push_back(r);
-                    }
-                }
-                if (!go.empty()) {
-                    const int T = (int) go.size();
-                    int tk[kParMax], ps[kParMax], sl[kParMax], am[kParMax];
-                    bool cand = false;
-                    for (int t = 0; t < T; ++t) {
-                        tk[t] = go[t]->tok, ps[t] = (int) sh[go[t]->slot].hist.size(), sl[t] = go[t]->slot;
-                        cand = cand || go[t]->temp > 0 || (go[t]->starts.on() && go[t]->starts.opts().size() > 1);
-                    }
-                    beat("a decode step (--parallel, the conversations' tokens together)");
-                    par_step(M, T, tk, ps, sl, cand, am);
-                    for (int t = 0; t < T; ++t) {
-                        Req& r = *go[t];
-                        sh[r.slot].hist.push_back(r.tok);
-                        if (r.starts.on()) {   // (an opening: among its tokens, from this step's candidates)
-                            const std::vector<int> o = r.starts.opts();
-                            std::vector<std::pair<float, int>> cd;
-                            if (o.size() > 1) par_cands(M, t, cd);
-                            r.tok = pick_among(o, cd, r.temp,
-                                               [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
-                        } else if (r.temp <= 0) {
-                            r.tok = am[t];
-                        } else {
-                            std::vector<std::pair<float, int>> cd;
-                            par_cands(M, t, cd);
-                            r.tok = sample(r, cd);
+                bool still_reading = false;
+                if (did_prefill) {
+                    for (const auto& r : act)
+                        if (r.phase == 1) {
+                            still_reading = true;
+                            break;
                         }
-                        r.starts.took(r.tok);
+                }
+                // IK2_PAR_DECODE_PCT: give the active writers a time-budgeted share of the GPU after each prompt pass
+                // so a long prompt read does not starve decoding to 1 token per pass (0: one step per pass, as before)
+                const double decode_budget = (did_prefill && par_decode_pct > 0 && still_reading)
+                    ? prefill_s * (double) par_decode_pct / (double) (100 - par_decode_pct)
+                    : 0.0;
+                const double decode_t0 = now();
+                // the writers: each one's token out, then the next of those going on in one step
+                for (;;) {
+                    std::vector<Req*> rows;
+                    for (auto& r : act)
+                        if (r.phase == 2) rows.push_back(&r);
+                    std::sort(rows.begin(), rows.end(), [](const Req* a, const Req* b) { return a->slot < b->slot; });
+                    std::vector<Req*> go;
+                    for (Req* r : rows) {
+                        if (r->cancel || r->max_new <= 0) {
+                            done_line(*r, r->cancel ? "cancel" : "length");
+                            r->phase = 3;
+                            continue;
+                        }
+                        ++r->n_out;
+                        std::printf("T %d %d\n", r->rid, r->tok);
+                        if (r->tc.saw(r->tok)) r->tc.close(r->starts);   // (the thinking budget: forced on from here)
+                        if (std::find(eos_ids.begin(), eos_ids.end(), r->tok) != eos_ids.end()) {
+                            done_line(*r, "stop");
+                            r->phase = 3;
+                        } else if (r->n_out >= r->max_new) {
+                            done_line(*r, "length");
+                            r->phase = 3;
+                        } else {
+                            go.push_back(r);
+                        }
                     }
-                    stat_tok += T;
-                    if (++steps % 16 == 0) {
-                        long long held = 0;
-                        for (const auto& S : sh) held += (long long) S.hist.size();
-                        const double tn = now();
-                        std::printf("STAT tok_s=%.1f ms_tok=%.2f active=%d %s\n", stat_tok / std::max(1e-9, tn - stat_t),
-                                    stat_tok ? (tn - stat_t) * 1e3 / stat_tok * T : 0.0, T,
-                                    tier_kv(stat_tok, held).c_str());
-                        stat_tok = 0, stat_t = tn;
+                    if (!go.empty()) {
+                        const int T = (int) go.size();
+                        int tk[kParMax], ps[kParMax], sl[kParMax], am[kParMax];
+                        bool cand = false;
+                        for (int t = 0; t < T; ++t) {
+                            tk[t] = go[t]->tok, ps[t] = (int) sh[go[t]->slot].hist.size(), sl[t] = go[t]->slot;
+                            cand = cand || go[t]->temp > 0 || (go[t]->starts.on() && go[t]->starts.opts().size() > 1);
+                        }
+                        beat("a decode step (--parallel, the conversations' tokens together)");
+                        par_step(M, T, tk, ps, sl, cand, am);
+                        for (int t = 0; t < T; ++t) {
+                            Req& r = *go[t];
+                            sh[r.slot].hist.push_back(r.tok);
+                            if (r.starts.on()) {   // (an opening: among its tokens, from this step's candidates)
+                                const std::vector<int> o = r.starts.opts();
+                                std::vector<std::pair<float, int>> cd;
+                                if (o.size() > 1) par_cands(M, t, cd);
+                                r.tok = pick_among(o, cd, r.temp,
+                                                   [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
+                            } else if (r.temp <= 0) {
+                                r.tok = am[t];
+                            } else {
+                                std::vector<std::pair<float, int>> cd;
+                                par_cands(M, t, cd);
+                                r.tok = sample(r, cd);
+                            }
+                            r.starts.took(r.tok);
+                        }
+                        stat_tok += T;
+                        if (++steps % 16 == 0) {
+                            long long held = 0;
+                            for (const auto& S : sh) held += (long long) S.hist.size();
+                            const double tn = now();
+                            std::printf("STAT tok_s=%.1f ms_tok=%.2f active=%d %s\n", stat_tok / std::max(1e-9, tn - stat_t),
+                                        stat_tok ? (tn - stat_t) * 1e3 / stat_tok * T : 0.0, T,
+                                        tier_kv(stat_tok, held).c_str());
+                            stat_tok = 0, stat_t = tn;
+                        }
+                    }
+                    act.remove_if([](const Req& r) { return r.phase == 3; });
+                    std::fflush(stdout);
+                    if (decode_budget <= 0.0 || go.empty() || now() - decode_t0 >= decode_budget) break;
+                    {
+                        std::unique_lock<std::mutex> lk(in_m);
+                        if (!in_q.empty()) {
+                            std::vector<std::string> got(in_q.begin(), in_q.end());
+                            in_q.clear();
+                            lk.unlock();
+                            for (const auto& l : got)
+                                if (!quit) take(l);
+                        }
+                    }
+                    if (quit) {
+                        pop_dump();
+                        break;
                     }
                 }
-                act.remove_if([](const Req& r) { return r.phase == 3; });
                 g_wd_busy = !act.empty();
-                std::fflush(stdout);
             }
             g_cpu.reset();
             g_offs.lane.reset();
