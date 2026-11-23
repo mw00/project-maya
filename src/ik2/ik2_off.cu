@@ -412,7 +412,7 @@ void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const
 
 void off_cache_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
                     OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls, cudaStream_t s) {
-    off_cache_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, dc, fl, cnt, heat, cls);
+    off_cache_plan_kernel<<<1, kOffMaxK, 0, s>>>(blob, top, K, key0, host, hstride, dc, fl, cnt, heat, cls);
 }
 
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s) {

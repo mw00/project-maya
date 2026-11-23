@@ -5574,7 +5574,7 @@ __global__ void f16_limbs_rows_kernel(const float* __restrict__ x, int T, int C,
 __global__ void group_route_kernel(const int* __restrict__ top, const float* __restrict__ w, int S, int K,
                                    const uint8_t* const* __restrict__ tab, const float* sg_t, const float* su_t,
                                    const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
-                                   float* su, float* wt, int* inv) {
+                                   float* su, float* wt, int* inv, const uint8_t* const* __restrict__ pp) {
     __shared__ int ex[64], lead[64], gid[64];
     const int i = threadIdx.x;
     const int e = i < S ? top[i] : -1;
@@ -5601,7 +5601,7 @@ __global__ void group_route_kernel(const int* __restrict__ top, const float* __r
     if (i >= S) return;
     const int g = gid[first];
     tok[g * kGroupMax + m] = i / K, row[g * kGroupMax + m] = i;
-    if (first == i) blob[g] = tab[e], n[g] = cnt;
+    if (first == i) blob[g] = pp ? pp[i] : tab[e], n[g] = cnt;   // (pp: the offload window's per-pick resolved slots)
     sg[i] = sg_t ? sg_t[e] : 1.0f, su[i] = su_t ? su_t[e] : 1.0f;
     wt[i] = w[i] * (sd_t ? sd_t[e] : 1.0f);
     inv[i] = i;
@@ -7231,12 +7231,12 @@ void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s)
 }
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
                  const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
-                 float* su, float* wt, int* inv, cudaStream_t s) {
+                 float* su, float* wt, int* inv, cudaStream_t s, const uint8_t* const* pp) {
     if (S <= 0 || S > 64) {
         std::fprintf(stderr, "ik2::k::group_route: %d slots (1 .. 64)\n", S);
         std::abort();
     }
-    group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv);
+    group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv, pp);
     check("group_route");
 }
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,

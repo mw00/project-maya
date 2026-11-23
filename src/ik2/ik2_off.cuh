@@ -14,7 +14,7 @@
 
 namespace ik2::k {
 
-constexpr int kOffMaxK = 16;   // routed experts a token (Mini: 8)
+constexpr int kOffMaxK = 64;   // routed experts a token (Mini: 8); the verify window's S = T K picks too (B4)
 
 /// A staging pool (one a slot size): n slots of sb bytes, a tag a slot (layer * E + expert, -1 free), the visit that
 /// last used it (a slot of the running visit is never the victim), and the clock hand.  Device memory throughout.

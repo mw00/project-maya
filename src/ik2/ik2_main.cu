@@ -3553,6 +3553,7 @@ struct BlockBufs {
     int* pos_h = nullptr;        // pinned [kBlockMax]: its positions
     float* logits_h = nullptr;   // pinned [kBlockMax][n_vocab] (kLogits)
     const uint8_t** blob = nullptr;   // group_route's arrays, device
+    const uint8_t** blob_pp = nullptr;   // (B4: off_cache_plan's per-pick resolved blobs - the groups' source on offload)
     int *n = nullptr, *tok = nullptr, *row = nullptr, *inv = nullptr;
     float *sg = nullptr, *su = nullptr, *wt = nullptr;
     float* lp_msg = nullptr;     // a pass's messages, [n_core][4][kBlockMax][C]
@@ -3573,6 +3574,7 @@ void block_init(Model& M) {
     CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
     g_blk.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
     g_blk.blob = dalloc<const uint8_t*>(S);
+    g_blk.blob_pp = dalloc<const uint8_t*>(S);   // (B4: the window's picks, S = kBlockMax * K)
     g_blk.n = dalloc<int>(S), g_blk.inv = dalloc<int>(S);
     g_blk.tok = dalloc<int>((size_t) S * k::kGroupMax), g_blk.row = dalloc<int>((size_t) S * k::kGroupMax);
     g_blk.sg = dalloc<float>(S), g_blk.su = dalloc<float>(S), g_blk.wt = dalloc<float>(S);
@@ -3683,21 +3685,39 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         const bool ex = g_block_exact;
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
-            const int N = m.N;
-            if (ex && !sep) {
-                exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
-            } else if (ex) {   // (q, k and v each with its input, as mv_q8p_conv's alternative inputs)
-                exact_rows(m, 0, HD, W.xq, C, T, W.qkv, N);
-                exact_rows(m, HD, KD, W.xk, C, T, W.qkv + HD, N);
-                exact_rows(m, HD + KD, KD, W.xv, C, T, W.qkv + HD + KD, N);
-                exact_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.xq, C, T, W.qkv + HD + 2 * KD, N);
-            } else if (!sep) {
-                tile_rows(m, 0, N, W.x16, T, W.qkv, N);
+            const int N = m.N > 0 ? m.N : 2 * HD + 2 * KD + HR;   // (the fused form declined - mixed quant types: the
+            // separate Mats hold the weights, the token path's products, to the fused layout's rows)
+            if (m.N > 0) {
+                if (ex && !sep) {
+                    exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+                } else if (ex) {   // (q, k and v each with its input, as mv_q8p_conv's alternative inputs)
+                    exact_rows(m, 0, HD, W.xq, C, T, W.qkv, N);
+                    exact_rows(m, HD, KD, W.xk, C, T, W.qkv + HD, N);
+                    exact_rows(m, HD + KD, KD, W.xv, C, T, W.qkv + HD + KD, N);
+                    exact_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.xq, C, T, W.qkv + HD + 2 * KD, N);
+                } else if (!sep) {
+                    tile_rows(m, 0, N, W.x16, T, W.qkv, N);
+                } else {
+                    tile_rows(m, 0, HD, W.x16, T, W.qkv, N);
+                    tile_rows(m, HD, KD, W.xk16, T, W.qkv + HD, N);
+                    tile_rows(m, HD + KD, KD, W.xv16, T, W.qkv + HD + KD, N);
+                    tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N);
+                }
+            } else if (ex) {
+                for (int t = 0; t < T; ++t) {
+                    float* row = W.qkv + (size_t) t * N;
+                    mv1(Ly.wq, W.xq + (size_t) t * C, row);
+                    mv1(Ly.wk, (sep ? W.xk : W.xq) + (size_t) t * C, row + HD);
+                    mv1(Ly.wv, (sep ? W.xv : W.xq) + (size_t) t * C, row + HD + KD);
+                    mv1(Ly.wr, W.xq + (size_t) t * C, row + HD + 2 * KD);
+                    mv1(Ly.wgate, W.xq + (size_t) t * C, row + HD + 2 * KD + HR);
+                }
             } else {
-                tile_rows(m, 0, HD, W.x16, T, W.qkv, N);
-                tile_rows(m, HD, KD, W.xk16, T, W.qkv + HD, N);
-                tile_rows(m, HD + KD, KD, W.xv16, T, W.qkv + HD + KD, N);
-                tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N);
+                tile_rows(Ly.wq, 0, HD, W.x16, T, W.qkv, N);
+                tile_rows(Ly.wk, 0, KD, sep ? W.xk16 : W.x16, T, W.qkv + HD, N);
+                tile_rows(Ly.wv, 0, KD, sep ? W.xv16 : W.x16, T, W.qkv + HD + KD, N);
+                tile_rows(Ly.wr, 0, HR, W.x16, T, W.qkv + HD + 2 * KD, N);
+                tile_rows(Ly.wgate, 0, HD, W.x16, T, W.qkv + HD + 2 * KD + HR, N);
             }
             q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
             q_ld = r_ld = gate_ld = N;
@@ -3707,9 +3727,22 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                           Ly.rec_old[1], Ly.rec_x[1], g_s);
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
-            const int N = m.N;
-            if (ex) exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
-            else tile_rows(m, 0, N, W.x16, T, W.qkv, N);
+            const int N = m.N > 0 ? m.N : 2 * HD + HR;   // (the fused form declined - the separate Mats)
+            if (m.N > 0) {
+                if (ex) exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+                else tile_rows(m, 0, N, W.x16, T, W.qkv, N);
+            } else if (ex) {
+                for (int t = 0; t < T; ++t) {
+                    float* row = W.qkv + (size_t) t * N;
+                    mv1(Ly.wq, W.xq + (size_t) t * C, row);
+                    mv1(Ly.wr, W.xq + (size_t) t * C, row + HD);
+                    mv1(Ly.wgate, W.xq + (size_t) t * C, row + HD + HR);
+                }
+            } else {
+                tile_rows(Ly.wq, 0, HD, W.x16, T, W.qkv, N);
+                tile_rows(Ly.wr, 0, HR, W.x16, T, W.qkv + HD, N);
+                tile_rows(Ly.wgate, 0, HD, W.x16, T, W.qkv + HD + HR, N);
+            }
             q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + HR;
             q_ld = r_ld = gate_ld = N;
             const int DL = c.KV * 4;
@@ -3831,8 +3864,18 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        const uint8_t* const* pp = nullptr;
+        if (g_off_dynamic) {   // (B4: the window's picks through the tier - the plan resolves every pick's blob (the
+            // tier's slot for a hit, an admission slot for a miss) and lists the misses for one fetch copy; the
+            // group table then points each group at its leader pick's resolved slot)
+            const auto& dc = g_offs.dcache[g_dev[0].EC.layer_pool[l]];
+            k::off_cache_plan(g_blk.blob_pp, rtop, S, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl,
+                              g_offs.cnt, g_offs.heat, nullptr, g_s);
+            k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
+            pp = g_blk.blob_pp;
+        }
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
-                       g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
+                       g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s, pp);
         // (exact: the token path's choice - NVFP4 on the tensor cores unless IK2_EXPERT_MMA=0, else the row dots)
 #ifdef STRATA_USE_HIP   // (AMD: the token path's default is the row dots - so is the window's)
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
@@ -4459,6 +4502,7 @@ struct SpecCtl {
 };
 
 bool g_lookup = false;   // the prompt lookup (src/spec/suffix_drafter): drafts copied from the text so far
+size_t g_lookup_room = 0;   // (B4: its window records on the dynamic offload - the tier's budget yields the room)
 
 // VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
 // visit's four convs, for rollback_block) and buffers, whichever drafts; with the drafter (path) its weights (the
@@ -6245,10 +6289,12 @@ int main(int argc, char** argv) {
         const size_t used = exp_b + dense_b + kv_b + reserve;
         const double vis = getenv("IK2_VISION_GIB") ? std::atof(getenv("IK2_VISION_GIB")) * 1073741824.0 : 0.0;
         const double left = fr0 > used ? (double) (fr0 - used) : 0.0;
-        auto room_ok = [&](size_t need, std::string& why) {
+        auto room_ok = [&](size_t need, std::string& why, bool lookup) {
+            const size_t use_v = g_off_want ? dense_b + kv_b + reserve : used;   // (offload: the experts are host memory)
             if (g_two.want) why = "on two GPUs it is not checked against plain decoding yet (plain decoding)";
-            else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
-            else if (used + need > fr0) why = "its room does not fit beside the model at this context";
+            else if (!g_fast_want && !(lookup && g_off_dynamic))
+                why = "it runs where every expert stays in VRAM (the resident path), not here";
+            else if (use_v + need > fr0) why = "its room does not fit beside the model at this context";
             else if (vis > 0 && left >= vis && left - (double) need < vis)
                 why = "its room would move the pictures' encoder from the GPU to the CPU";
             return why.empty();
@@ -6260,10 +6306,13 @@ int main(int argc, char** argv) {
             const int head_rows = head ? (int) (head->elements() / c.C) : 201024;
             const size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows);
             std::string why;
-            if (room_ok(need, why)) {
-                std::printf("drafting: %s, %.2f GiB of VRAM beside the model (the plan as without it)\n",
+            if (room_ok(need, why, !model_drafter)) {
+                std::printf("drafting: %s, %.2f GiB of VRAM beside the model%s\n",
                             model_drafter ? (g_lookup ? "the drafter and the prompt lookup" : "the drafter")
-                                          : "the prompt lookup", need / 1073741824.0);
+                                          : "the prompt lookup", need / 1073741824.0,
+                            g_off_dynamic && !model_drafter ? " (the tier's budget yields it)"
+                                                            : " (the plan as without it)");
+                if (g_off_dynamic && !model_drafter) g_lookup_room = need;
                 break;
             }
             std::printf("NOTE maya-ik2: %s left out (%.2f GiB): %s\n", model_drafter ? "the drafter" : "the prompt lookup",
@@ -7035,7 +7084,7 @@ int main(int argc, char** argv) {
     W.gi_stamp.assign(c.E, 0);
     W.seen_late.assign(c.E, 0);
     W.gi_idx.assign(c.E, 0);
-    W.logits_rows = compact_work ? (draft_path.empty() ? 1 : 8) : 16;
+    W.logits_rows = compact_work ? (draft_path.empty() ? kBlockMax : 8) : 16;   // (B4 fix: the window's logits need kBlockMax rows - the prompt lookup's windows too)
     W.logits = dalloc<float>((size_t) W.logits_rows * c.n_rows);
     if (c.n_pass > 1) {
         W.lp_pre = dalloc<float>(Tm * C);
@@ -7114,7 +7163,8 @@ int main(int argc, char** argv) {
     const size_t room = g_fast_want ? (size_t) 256 << 20
                       : g_off_want ? (size_t) (getenv("IK2_ROOM_MB") ? std::atof(getenv("IK2_ROOM_MB")) : 1024.0) << 20
                                    : (size_t) 2 << 30;
-    const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
+    const size_t budget = std::min((size_t) (cache_gb * 1073741824.0),
+                                   fr > room + g_lookup_room ? fr - room - g_lookup_room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.tier_only = g_off_want && d == 0 && !(getenv("IK2_TIER_MIN") && std::atoi(getenv("IK2_TIER_MIN")));
     std::vector<double> off_value;   // (the offload path: the profile's picks an expert, the tier's pools sized by them)
@@ -7701,7 +7751,7 @@ int main(int argc, char** argv) {
         for (const auto& Vi : M.V) kv_total += (size_t) Vi.kv_cap * KD * kv_elem_b * 2;
         if (serve_maya) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
-            const bool sp = (drafter || g_lookup) && g_fast && g_block;
+            const bool sp = (drafter || g_lookup) && (g_fast || g_off_dynamic) && g_block;   // (B4)
             const char* wd = getenv("IK2_WATCHDOG_S");
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
                         "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s\n",
@@ -8155,7 +8205,7 @@ int main(int argc, char** argv) {
         // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
         // widest window, IK2_DRAFT_ADAPT=0 always that wide
         SpecCtl sctl;
-        const bool spec_on = (drafter || g_lookup) && g_fast && g_block;
+        const bool spec_on = (drafter || g_lookup) && (g_fast || g_off_dynamic) && g_block;   // (B4: the window on offload)
         sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         sctl.use_model = drafter != nullptr, sctl.use_lookup = g_lookup;
@@ -8658,7 +8708,7 @@ int main(int argc, char** argv) {
     // IK2_LOGITS_OUT=FILE: every generated token's logits [n_vocab] F32 appended there (with IK2_FORCE: two builds'
     // logits over the same tokens, to compare)
     FILE* lo = getenv("IK2_LOGITS_OUT") ? std::fopen(getenv("IK2_LOGITS_OUT"), "wb") : nullptr;
-    const bool lookup_only = !drafter && g_lookup && g_fast && g_block;   // (then the drafting loop below)
+    const bool lookup_only = !drafter && g_lookup && (g_fast || g_off_dynamic) && g_block;   // (then the drafting loop below)
     for (int i = 0, best = first_best; i < gen && !drafter && !lookup_only; ++i) {
         const int tok = i < (int) force.size() ? force[i] : best;
         if (i < (int) force.size()) agree += best == force[i];
@@ -8684,7 +8734,7 @@ int main(int argc, char** argv) {
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
 
     SpecCtl ctl;
-    if ((drafter || g_lookup) && g_fast && g_block) {
+    if ((drafter || g_lookup) && (g_fast || g_off_dynamic) && g_block) {   // (B4: the drafting loop on offload)
         // (the resident path: the controller picks plain tokens or a window of the drafter's or the prompt lookup's
         //  drafts; greedy, as the CLI's generation is)
         ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
@@ -8755,7 +8805,7 @@ int main(int argc, char** argv) {
             logits.clear();
             std::vector<int> ag;
             const bool need_logits = n_steps < verify_check || margin_check;
-            const bool use_block = g_fast && g_block && !need_logits;
+            const bool use_block = (g_fast || g_off_dynamic) && g_block && !need_logits;   // (B4)
             if (use_block && n_steps < block_check) {
                 // (IK2_BLOCK_CHECK=n: the first n windows through both paths, their logits compared; forward()'s
                 //  then taken)

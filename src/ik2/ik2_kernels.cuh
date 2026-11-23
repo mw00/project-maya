@@ -550,7 +550,8 @@ void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s)
 /// last group), tok / row [S][kGroupMax], and a slot's sg, su, wt (down's scale folded) and inv (the slot).
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
                  const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
-                 float* su, float* wt, int* inv, cudaStream_t s);
+                 float* su, float* wt, int* inv, cudaStream_t s, const uint8_t* const* pp = nullptr);
+// (pp: the offload window's per-pick resolved blobs - off_cache_plan's slots - take tab's place as the groups' source)
 /// group_route's groups of NVFP4 experts on the tensor cores: gate | up (the input as f16_limbs_rows' limbs) to
 /// h [slot][F] through the capped SwiGLU; down from h to y [slot][C].  G: the launch's groups (those past the last
 /// return at once); T: the window's tokens (a group's members).
