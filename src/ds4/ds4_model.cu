@@ -1071,6 +1071,9 @@ struct Group {
 #if defined(MAYA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
     std::array<PeerAr, 2> peer_arb{};
     bool peer_arb_on = false;
+    // a decode window's exact peer transport (DS4_HIP_PEER_AR_DECODE): two slots of kWin rows a rank
+    std::array<PeerAr, 2> peer_ar{};
+    bool peer_ar_on = false;
 #endif
     // the head group: the members' logits shares on their way to the lead, two slots (by seq), their flags and the
     // lead's acknowledgements (host-mapped)
@@ -5100,6 +5103,7 @@ struct Model::Impl {
         if (cp_pin_last()) cp_pin();   // (#589: after every pinned buffer above, before the paths are timed)
 #if defined(MAYA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (!init_peer_ar(err)) return false; // after expert placement: optional scratch does not shrink the expert cache
+        if (!init_peer_window(err)) return false; // the decode windows' peer pool (DS4_HIP_PEER_AR_DECODE)
 #endif
         // Opt-in startup work only: a calibration of one representative layer does not prepare every
         // CPU format, nor both one-token and multi-token backends. Never defer their parity checks to a
@@ -18090,6 +18094,18 @@ struct Model::Impl {
         spec_win = false;
         if (!ok) return false;
         pp_mark(2);
+#if defined(MAYA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+        // (DS4_HIP_PEER_AR_DECODE) a timed-out window peer poisons the sums: it is looked for at the verify's sync point,
+        // once the sampler and its copy back are queued on the head's stream and before any token of the window is
+        // read, so a bad token never enters the answer
+        const auto peer_ok = [&]() -> bool {
+            if (any_window_peer() && !check_peer_ar(err, true)) return false;
+            cudaSetDevice(devs[(size_t) head_dev].id);
+            return true;
+        };
+#else
+        const auto peer_ok = [] { return true; };
+#endif
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
@@ -18103,6 +18119,7 @@ struct Model::Impl {
             const int* hr = pen_rows(p0 + 1, T, sp, h);
             maya::kernels::sample_tokens(hd.logits, T, V, hr, h, sp, d_ints + 16, hd.st);   // (the T rows at once)
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
+            if (!peer_ok()) return false;
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             next = h_idx[m];
@@ -18137,6 +18154,7 @@ struct Model::Impl {
             const int* hr = pen_rows(p0 + 1, n, sp, h);
             maya::kernels::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st, hr, h);
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) n * 4, cudaMemcpyDeviceToHost, hd.st));
+            if (!peer_ok()) return false;
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             next = m < n ? h_idx[m]
@@ -18435,36 +18453,165 @@ struct Model::Impl {
         cudaSetDevice(original_device);
         return true;
     }
-    bool check_peer_ar(std::string& err) {
-        for (Group& G : groups) if (G.peer_arb_on) {
+    bool any_window_peer() const {
+        for (const Group& G : groups) if (G.peer_ar_on) return true;
+        return false;
+    }
+    // (window_only: a verify's check - the decode windows' transport alone; the prompt's chunk transport is checked after
+    // each run of chunks, and a decode runs none)
+    bool check_peer_ar(std::string& err, bool window_only = false) {
+        auto check = [&](Group& G, const std::array<PeerAr, 2>& pa, const char* kind) {
             for (int m = 0; m < 2; ++m) {
                 Dev& d = devs[(size_t) G.mem[m]];
                 cudaSetDevice(d.id);
                 unsigned error = 0;
+                const unsigned last_seq = pa.data() == G.peer_arb.data() ? chunks[(size_t) G.mem[m]]->arb_seq : d.ar_seq;
                 const auto sync_status = cudaStreamSynchronize(d.st);
-                const auto copy_status = hipMemcpy(&error, G.peer_arb[m].error, sizeof(error), hipMemcpyDeviceToHost);
+                const auto copy_status = hipMemcpy(&error, pa[m].error, sizeof(error), hipMemcpyDeviceToHost);
                 if (sync_status != cudaSuccess || copy_status != hipSuccess || error) {
-                    std::fprintf(stderr, "PEER_AR_FAILURE gpu=%d rank=%d stream_status=%d copy_status=%d error=%u sequence=%u\n",
-                                 d.id, m, int(sync_status), int(copy_status), error, chunks[(size_t) G.mem[m]]->arb_seq);
+                    std::fprintf(stderr, "PEER_AR_FAILURE kind=%s gpu=%d rank=%d stream_status=%d copy_status=%d error=%u sequence=%u\n",
+                                 kind, d.id, m, int(sync_status), int(copy_status), error, last_seq);
                     if (error & 1u) {
                         PeerArFailure detail{};
-                        const auto detail_status = hipMemcpy(&detail, G.peer_arb[m].failure, sizeof(detail), hipMemcpyDeviceToHost);
-                        std::fprintf(stderr, "PEER_AR_TIMEOUT_DETAIL gpu=%d rank=%d copy_status=%d captured=%u "
+                        const auto detail_status = hipMemcpy(&detail, pa[m].failure, sizeof(detail), hipMemcpyDeviceToHost);
+                        std::fprintf(stderr, "PEER_AR_TIMEOUT_DETAIL kind=%s gpu=%d rank=%d copy_status=%d captured=%u "
                                      "failed_sequence=%u observed=%u block=%u n4=%u elapsed_ticks=%llu timeout_ticks=%llu "
-                                     "last_submitted_sequence=%u\n", d.id, m, int(detail_status), detail.captured,
+                                     "last_submitted_sequence=%u\n", kind, d.id, m, int(detail_status), detail.captured,
                                      detail.sequence, detail.observed, detail.block, detail.n4,
                                      (unsigned long long) detail.elapsed_ticks, (unsigned long long) detail.timeout_ticks,
-                                     chunks[(size_t) G.mem[m]]->arb_seq);
+                                     last_seq);
                     }
                     peer_ar_failed = true;
                 }
             }
+        };
+        for (Group& G : groups) {
+            if (G.peer_arb_on && !window_only) check(G, G.peer_arb, "chunk");
+            if (G.peer_ar_on) check(G, G.peer_ar, "window");
         }
         if (peer_ar_failed) err = "peer all-reduce failed; model state invalid, reload required";
         return !peer_ar_failed;
     }
+
+    // A decode window's peer pool: two slots of kWin rows a rank (T = 1 + the drafts, at most kWin) - 640 KiB a rank
+    // for a 5120-wide model.  MAYA_DS4_HIP_PEER_AR_DECODE: 1 = windows of two rows or more, 2 = every window, a single
+    // token's too; unset / 0: the windows' transport as before (AR2 with DS4_AR2_DECODE, else the host's).
+    static int peer_window_mode() {
+        static const int v = [] {
+            const char* e = ds4_env("DS4_HIP_PEER_AR_DECODE");
+            return e != nullptr ? std::atoi(e) : 0;
+        }();
+        return v;
+    }
+    bool init_peer_window(std::string& err) {
+        (void) err;
+        if (peer_window_mode() <= 0) return true;
+        const size_t stride = (size_t) kWin * (size_t) g.dim;   // floats a slot
+        int original_device = 0;
+        cudaGetDevice(&original_device);
+        for (Group& G : groups) {
+            if (G.mem.size() != 2 || G.ar.nm != 2) continue;
+            std::array<PeerAr, 2> a{};
+            auto release = [&] {
+                for (int m = 0; m < 2; ++m) {
+                    cudaSetDevice(devs[(size_t) G.mem[m]].id);
+                    if (a[m].recv) hipFree(a[m].recv);
+                    if (a[m].flags) hipFree(a[m].flags);
+                    if (a[m].error) hipFree(a[m].error);
+                    if (a[m].failure) hipFree(a[m].failure);
+                    hipGetLastError();
+                }
+            };
+            bool ok = stride <= size_t(INT_MAX);
+            std::string why = ok ? "" : "window too large";
+            for (int m = 0; m < 2 && ok; ++m) {
+                Dev& d = devs[(size_t) G.mem[m]];
+                const int peer = devs[(size_t) G.mem[1-m]].id;
+                if (cudaSetDevice(d.id) != cudaSuccess) { ok = false; break; }
+                int capable = 0;
+                ok = hipDeviceCanAccessPeer(&capable, d.id, peer) == hipSuccess && capable;
+                if (!ok) { why = "no peer access"; break; }
+                auto status = hipDeviceEnablePeerAccess(peer, 0);
+                ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
+                if (!ok) { why = "peer access not enabled"; break; }
+                hipGetLastError(); // consume already-enabled status, if any
+                peer_ar_preload();  // (CUDA lazy loading: load before the first spinning launch)
+                int wall_clock_khz = 0;
+                ok = hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, d.id) == hipSuccess &&
+                     wall_clock_khz > 0;
+                if (!ok) break;
+                size_t available = 0, total = 0;
+                // the pool is small: 16 MiB of headroom beside the experts is plenty
+                const size_t need = 2 * stride * sizeof(float) + (16ull << 20) +
+                                    2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned);
+                if (hipMemGetInfo(&available, &total) != hipSuccess || available < need) {
+                    why = "GPU" + std::to_string(d.id) + " has " + std::to_string(available >> 20) + " MiB free, needs " +
+                          std::to_string(need >> 20);
+                    ok = false; break;
+                }
+                a[m].stride = stride;
+                static const double peer_timeout_s = [] {   // (the chunk pool's bound: DS4_PEER_AR_TIMEOUT_S, 60 s)
+                    const char* e = ds4_env("DS4_PEER_AR_TIMEOUT_S");
+                    const double v = e ? std::atof(e) : 60.0;
+                    return v > 0 ? v : 60.0;
+                }();
+                a[m].timeout_ticks = uint64_t(double(wall_clock_khz) * 1000.0 * peer_timeout_s);
+                ok = hipExtMallocWithFlags((void**) &a[m].recv, 2 * a[m].stride * sizeof(float),
+                                           hipDeviceMallocUncached) == hipSuccess &&
+                     hipExtMallocWithFlags((void**) &a[m].flags,
+                                           2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned),
+                                           hipDeviceMallocUncached) == hipSuccess &&
+                     hipMalloc((void**) &a[m].error, sizeof(unsigned)) == hipSuccess &&
+                     hipMalloc((void**) &a[m].failure, sizeof(PeerArFailure)) == hipSuccess;
+                if (ok) ok = hipMemset(a[m].flags, 0, 2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned)) == hipSuccess &&
+                             hipMemset(a[m].error, 0, sizeof(unsigned)) == hipSuccess &&
+                             hipMemset(a[m].failure, 0, sizeof(PeerArFailure)) == hipSuccess &&
+                             hipDeviceSynchronize() == hipSuccess;
+            }
+            if (!ok) {
+                release();
+                std::fprintf(stderr, "ds4: peer decode all-reduce unavailable on GPU%d/GPU%d (%s); the windows keep their "
+                                     "transport\n", devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id,
+                             why.empty() ? "setup failed" : why.c_str());
+                continue;
+            }
+            for (int m = 0; m < 2; ++m) {
+                a[m].peer_recv = a[1-m].recv;
+                a[m].peer_flags = a[1-m].flags;
+                Dev& d = devs[(size_t) G.mem[m]];
+                d.allocs.push_back(a[m].recv);
+                d.allocs.push_back(a[m].flags);
+                d.allocs.push_back(a[m].error);
+                d.allocs.push_back(a[m].failure);
+                d.scratch += 2 * a[m].stride * sizeof(float) +
+                             (2 * kPeerArBlocks * kPeerArFlagStride + 1) * sizeof(unsigned) + sizeof(PeerArFailure);
+            }
+            G.peer_ar = a;
+            G.peer_ar_on = true;
+            std::fprintf(stderr, "ds4: exact peer decode all-reduce enabled on GPU%d/GPU%d (%zu KiB/rank%s)\n",
+                         devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id, (2 * a[0].stride * sizeof(float)) >> 10,
+                         peer_window_mode() >= 2 ? ", single tokens too" : "");
+        }
+        cudaSetDevice(original_device);
+        return true;
+    }
 #endif
 
+    // A window's all-reduce: the pair's VRAM (DS4_HIP_PEER_AR_DECODE) where the group has the window pool - windows of
+    // two rows or more, with =2 a single token's too - else the window's ArGroup (AR2 with DS4_AR2_DECODE, the host's
+    // otherwise).  The same exact two-rank sums either way.
+    void window_allreduce(Dev& d, float* buf, int n, int mi, const ArGroup& ag, cudaStream_t s) {
+#if defined(MAYA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+        Group& G = groups[(size_t) d.grp];
+        if (G.peer_ar_on && (n > g.dim || peer_window_mode() >= 2)) {
+            // A failed launch cannot silently switch a single rank to another transport.
+            if (!allreduce_peer(buf, n, G.peer_ar[(size_t) mi], mi, ++d.ar_seq, s))
+                peer_ar_failed.store(true, std::memory_order_relaxed);
+            return;
+        }
+#endif
+        allreduce(buf, n, ag, mi, ++d.ar_seq, d.xcnt, s);
+    }
     // a chunk's sum over its group: three members or more through the copy engines (allreduce_dma, c.y its scratch:
     // free between the MoE's sets), or (Group::hred) summed on the host; unless DS4_AR_DMA=0
     void chunk_allreduce(Dev& d, Chunk& c, const ArGroup& ab, int mi, int n, cudaStream_t s) {
@@ -22692,7 +22839,7 @@ struct Model::Impl {
             if (!mv_n(d, j, OG, err)) return false;
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
-        if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        if (nm > 1) window_allreduce(d, d.ao, T * D, mi, ag, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         ablate(d, d.ao, T, wp, s);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
@@ -22924,7 +23071,7 @@ struct Model::Impl {
             }
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
-            if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (nm > 1) window_allreduce(d, d.moe_out, T * D, mi, ag, s);
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             ablate(d, d.moe_out, T, wp, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
