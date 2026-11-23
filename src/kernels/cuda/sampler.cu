@@ -14,12 +14,18 @@
 // `sampler_kernel` runs the sampled chain as `top_k` block-argmax rounds followed by the top_p / temperature /
 // draw chain (its header says why the selection must be parallel and why the tie rule keeps the semantics).
 #include "maya/kernels/sampler.hpp"
+#ifndef SAMPLER_HIST_MATCH
+#define SAMPLER_HIST_MATCH 0
+#endif
 
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <utility>
 
 namespace maya::kernels {
 namespace {
@@ -178,10 +184,119 @@ constexpr uint64_t kSpecDraftKey = 0x5bd1e9955bd1e995ull, kSpecAcceptKey = 0x9e3
 // one block of 1024 threads per row (the launches below): the bound keeps every mode at 64 registers a thread, so a
 // block fits the 64K-register file - unbounded, sm_75 (Turing) compiled the draft mode to 68 and its launch failed
 // ("too many resources requested for launch") wherever the NextN block sat on a Turing card
+// ---- THE SELECTION'S TWO PASSES OVER THE VOCABULARY, SPREAD OVER SEVERAL BLOCKS (sample_pre below).
+// sampler_kernel is a block a row, and a block is one SM: of a row's ~95 us on an RTX 3090, ~70 are its two passes
+// over the vocabulary (the coarse histogram, the candidates), one SM's work while the others idle.  For a row without
+// penalties these two kernels do the passes with kPreBlocks blocks a row and leave the candidates in device memory;
+// sampler_kernel then starts at the ranking.  A block cannot wait for another, so each pass is a launch:
+//   sampler_count_kernel    grid (blocks, rows): a block's slice of the row into the row's coarse histogram
+//   sampler_collect_kernel  grid (blocks, rows): the bin that holds the k-th largest (every block finds it, from the
+//                           same counts), then its slice's tokens in that bin or above appended to the row's list
+// The same counts and the same candidate set as the one-block passes (the ranking orders them by score and index,
+// so the order they arrive in does not matter): the same tokens and lists, bit for bit.  More than kPreCap
+// candidates (a flat row): sampler_kernel does its own selection, as before.
+constexpr int kPreBins = 2048, kPreCap = 1024, kPreThreads = 256;
+struct SamplerPre {
+    unsigned int* hist = nullptr;    // [rows][kPreBins], zero between uses (sampler_kernel clears its row)
+    unsigned int* count = nullptr;   // [rows], zero between uses
+    unsigned int* cand_u = nullptr;  // [rows][kPreCap]
+    int* cand_i = nullptr;           // [rows][kPreCap]
+    int blocks = 0;
+};
+// a score's ordered bits: larger float -> larger unsigned; NaN below everything (never kept before a number)
+__device__ __forceinline__ unsigned int ordered_bits(float x) {
+    unsigned int b = __float_as_uint(x);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return 0u;
+    if (b == 0x80000000u) b = 0u;   // -0 ties with +0, as the float comparison it replaces
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+// a block's slice of the row, 16 values ahead of their use: f(ordered score, index).  The row is 16-byte aligned and
+// its length a multiple of 4 (sample_pre checks); no penalties (count 0), the request's logit_bias as sampler_kernel
+template <class F>
+__device__ __forceinline__ void pre_slice(const float* __restrict__ l, int n_vocab, int blocks, const SamplerParams& p,
+                                          F&& f) {
+    const int slice = (((n_vocab + blocks - 1) / blocks) + 3) & ~3;
+    const int s0 = (int) blockIdx.x * slice, s1 = min(n_vocab, s0 + slice);
+    const int run = ((((s1 - s0) + (int) blockDim.x - 1) / (int) blockDim.x) + 3) & ~3;
+    const int lo = s0 + (int) threadIdx.x * run, hi = min(s1, lo + run);
+    for (int v = lo; v < hi; v += 16) {
+        float4 x[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (v + 4 * j < hi) x[j] = *reinterpret_cast<const float4*>(l + v + 4 * j);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (v + 4 * j < hi) {
+                const float e[4] = {x[j].x, x[j].y, x[j].z, x[j].w};
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int id = v + 4 * j + c;
+                    f(ordered_bits(apply_penalties(p.logit_bias ? e[c] + p.logit_bias[id] : e[c], 0, p)), id);
+                }
+            }
+    }
+}
+__global__ void __launch_bounds__(kPreThreads) sampler_count_kernel(const float* __restrict__ logits, int n_vocab,
+                                                                    const SamplerParams p, const SamplerPre pre) {
+    __shared__ unsigned int coarse[kPreBins];
+    const int t = blockIdx.y;
+    for (int b = threadIdx.x; b < kPreBins; b += blockDim.x) coarse[b] = 0u;
+    __syncthreads();
+    pre_slice(logits + (size_t) t * n_vocab, n_vocab, pre.blocks, p,
+              [&](unsigned int u, int) { atomicAdd(&coarse[u >> 21], 1u); });
+    __syncthreads();
+    unsigned int* h = pre.hist + (size_t) t * kPreBins;
+    for (int b = threadIdx.x; b < kPreBins; b += blockDim.x)
+        if (coarse[b] != 0u) atomicAdd(&h[b], coarse[b]);
+}
+__global__ void __launch_bounds__(kPreThreads) sampler_collect_kernel(const float* __restrict__ logits, int n_vocab,
+                                                                      const SamplerParams p, const SamplerPre pre) {
+    __shared__ unsigned int wtot[kPreThreads / 32];
+    __shared__ int sh_bin;
+    const int t = blockIdx.y;
+    int k = (p.top_k > 0 && p.top_k < 64) ? p.top_k : 64;
+    if (k > n_vocab) k = n_vocab;
+    const unsigned int* h = pre.hist + (size_t) t * kPreBins;
+    {   // the bin holding the k-th largest (sampler_kernel's scan, 8 bins a thread)
+        const int per = kPreBins / kPreThreads;
+        const int b_hi = kPreBins - 1 - (int) threadIdx.x * per;
+        unsigned int mine = 0u;
+        for (int j = 0; j < per; ++j) mine += h[b_hi - j];
+        unsigned int incl = mine;
+        const int lane = (int) threadIdx.x & 31, wp = (int) threadIdx.x >> 5;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const unsigned int up = __shfl_up_sync(0xffffffffu, incl, off);
+            if (lane >= off) incl += up;
+        }
+        if (lane == 31) wtot[wp] = incl;
+        __syncthreads();
+        unsigned int above = incl - mine;
+        for (int j = 0; j < wp; ++j) above += wtot[j];
+        if (above < (unsigned int) k && above + mine >= (unsigned int) k) {
+            for (int j = 0; j < per; ++j) {
+                above += h[b_hi - j];
+                if (above >= (unsigned int) k) { sh_bin = b_hi - j; break; }
+            }
+        }
+        __syncthreads();
+    }
+    const int bin = sh_bin;
+    unsigned int* cu = pre.cand_u + (size_t) t * kPreCap;
+    int* ci = pre.cand_i + (size_t) t * kPreCap;
+    pre_slice(logits + (size_t) t * n_vocab, n_vocab, pre.blocks, p, [&](unsigned int u, int v) {
+        if ((int) (u >> 21) >= bin) {
+            const unsigned int at = atomicAdd(&pre.count[t], 1u);
+            if (at < (unsigned int) kPreCap) { cu[at] = u; ci[at] = v; }
+        }
+    });
+}
+
 template <int MODE>
 __global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
-                               int* __restrict__ out, SpecList* __restrict__ ql, const int* __restrict__ draft) {
+                               int* __restrict__ out, SpecList* __restrict__ ql, const int* __restrict__ draft,
+                               const SamplerPre pre) {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
     const float* l = logits + (size_t) t * n_vocab;
@@ -264,25 +379,78 @@ __global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__
     auto score = [&](int v) -> float {
         return apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
     };
+    // every token once, f(ordered score, index): a thread takes a contiguous run of the row and reads it 16 values
+    // ahead of their use (four 16-byte loads issued together) - the one-value-a-step walk waited for each load
+    // before asking for the next, which was most of the two passes below.  The visiting order differs from that
+    // walk's; both passes are order-free (counts; a candidate set that is ranked afterwards).  A row that is not
+    // 16-byte aligned or whose length is not a multiple of 4: the old walk
+    const bool walk16 = (((size_t) l) & 15) == 0 && (n_vocab & 3) == 0;
+    auto raw_score = [&](float x, int v) -> float {
+        return apply_penalties(p.logit_bias ? x + p.logit_bias[v] : x, hit_count(v), p);
+    };
+    auto for_each_token = [&](auto&& f) {
+        if (!walk16) {
+            for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) f(ordered(score(v)), v);
+            return;
+        }
+        const int run = (((n_vocab + (int) blockDim.x - 1) / (int) blockDim.x) + 3) & ~3;
+        const int lo = (int) threadIdx.x * run, hi = min(n_vocab, lo + run);
+        for (int v = lo; v < hi; v += 16) {
+            float4 x[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                if (v + 4 * j < hi) x[j] = *reinterpret_cast<const float4*>(l + v + 4 * j);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                if (v + 4 * j < hi) {
+                    f(ordered(raw_score(x[j].x, v + 4 * j)), v + 4 * j);
+                    f(ordered(raw_score(x[j].y, v + 4 * j + 1)), v + 4 * j + 1);
+                    f(ordered(raw_score(x[j].z, v + 4 * j + 2)), v + 4 * j + 2);
+                    f(ordered(raw_score(x[j].w, v + 4 * j + 3)), v + 4 * j + 3);
+                }
+        }
+    };
+    // the row's candidates from the pre-pass (sample_pre: the two passes below, done by several blocks): taken when
+    // they fit; either way its histogram row and count are cleared for the next use
+    int pre_n = -1;
+    if (pre.count != nullptr) {
+        const unsigned int n = pre.count[t];
+        __syncthreads();   // (every thread has read the count)
+        unsigned int* h = pre.hist + (size_t) t * kPreBins;
+        for (int b = threadIdx.x; b < kPreBins; b += blockDim.x) h[b] = 0u;
+        if (threadIdx.x == 0) pre.count[t] = 0u;
+        if (n <= (unsigned int) kCap) {
+            pre_n = (int) n;
+            for (int i = threadIdx.x; i < pre_n; i += blockDim.x) {
+                ccand_u[i] = pre.cand_u[(size_t) t * kPreCap + i];
+                ccand_i[i] = pre.cand_i[(size_t) t * kPreCap + i];
+            }
+        }
+    }
+    if (pre_n < 0) {
     for (int b = threadIdx.x; b < kBins; b += blockDim.x) coarse[b] = 0u;
     if (threadIdx.x == 0) sh_ncoarse = 0u;
     __syncthreads();
-    for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) atomicAdd(&coarse[ordered(score(v)) >> 21], 1u);
+    for_each_token([&](unsigned int u, int) { atomicAdd(&coarse[u >> 21], 1u); });
     __syncthreads();
     {   // the bin holding the k-th largest: suffix counts over the bins (2 bins a thread, a block scan)
         const int nt = (int) blockDim.x, per = (kBins + nt - 1) / nt;
         const int b_hi = kBins - 1 - (int) threadIdx.x * per;   // this thread's bins, from the top down
         unsigned int mine = 0u;
         for (int j = 0; j < per && b_hi - j >= 0; ++j) mine += coarse[b_hi - j];
-        scan[threadIdx.x] = mine;
-        __syncthreads();
-        for (int off = 1; off < nt; off <<= 1) {
-            const unsigned int add = (int) threadIdx.x >= off ? scan[threadIdx.x - off] : 0u;
-            __syncthreads();
-            scan[threadIdx.x] += add;
-            __syncthreads();
+        // the counts above each thread's bins: a scan inside the warp by shuffles, then the warps' totals (32 of
+        // them) added up from shared memory - two block barriers where the block-wide scan took twenty-one
+        unsigned int incl = mine;
+        const int lane = (int) threadIdx.x & 31, wp = (int) threadIdx.x >> 5;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const unsigned int up = __shfl_up_sync(0xffffffffu, incl, off);
+            if (lane >= off) incl += up;
         }
-        unsigned int above = scan[threadIdx.x] - mine;   // tokens in the bins above this thread's
+        if (lane == 31) scan[wp] = incl;
+        __syncthreads();
+        unsigned int above = incl - mine;   // tokens in the bins above this thread's
+        for (int j = 0; j < wp; ++j) above += scan[j];
         if (above < (unsigned int) k && above + mine >= (unsigned int) k) {
             for (int j = 0; j < per && b_hi - j >= 0; ++j) {
                 above += coarse[b_hi - j];
@@ -291,18 +459,20 @@ __global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__
         }
         __syncthreads();
     }
-    const int bin = sh_bin;
-    const bool coarse_ok = sh_tie_base <= (unsigned int) kCap;   // the tokens in that bin and above fit
+    }
+    const bool coarse_ok = pre_n >= 0 || sh_tie_base <= (unsigned int) kCap;   // the tokens in that bin and above fit
     if (coarse_ok) {
-        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-            const unsigned int u = ordered(score(v));
-            if ((int) (u >> 21) >= bin) {
-                const unsigned int at = atomicAdd(&sh_ncoarse, 1u);
-                if (at < (unsigned int) kCap) { ccand_u[at] = u; ccand_i[at] = v; }
-            }
+        if (pre_n < 0) {
+            const int bin = sh_bin;
+            for_each_token([&](unsigned int u, int v) {
+                if ((int) (u >> 21) >= bin) {
+                    const unsigned int at = atomicAdd(&sh_ncoarse, 1u);
+                    if (at < (unsigned int) kCap) { ccand_u[at] = u; ccand_i[at] = v; }
+                }
+            });
         }
         __syncthreads();
-        const int nc = (int) min(sh_ncoarse, (unsigned int) kCap);
+        const int nc = pre_n >= 0 ? pre_n : (int) min(sh_ncoarse, (unsigned int) kCap);
         for (int i = threadIdx.x; i < nc; i += blockDim.x) {
             const unsigned int ui = ccand_u[i];
             const int ii = ccand_i[i];
@@ -399,114 +569,192 @@ __global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__
     }
 
     // ---- top_p over the top_k list (penalised logits, descending as the selection produced them), then min_p,
-    // then temperature and one Philox draw - llama.cpp's order (issue #53).  Every thread computes the same chain
-    // redundantly over `sel_*` - the arithmetic is the serial kernel's, instruction for instruction - so they
-    // agree on `pick` and thread 0 writes it.
-    // (one thread: the chain is serial and in double precision, which consumer cards run at 1/64 rate - 1024
-    // threads computing it redundantly cost more than the whole selection above)
-    if (threadIdx.x != 0) return;
-    int n_keep = k;
-    float mx = sel_logit[0];
-    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
-    if (p.top_p < 1.0f) {
-        double sum = 0.0;
-        for (int i = 0; i < k; ++i) sum += exp((double) sel_logit[i] - (double) mx);
-        double cum = 0.0;
-        int cut = k;
-        for (int i = 0; i < k; ++i) {
-            cum += exp((double) sel_logit[i] - (double) mx) / sum;
-            if (cum >= (double) p.top_p) { cut = i + 1; break; }
-        }
-        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
-        n_keep = cut;
+    // then temperature and one Philox draw - llama.cpp's order (issue #53).
+    // The chain's arithmetic is the serial kernel's, value for value, in double precision.  It used to run on thread 0
+    // alone - every exp, division and list write one after another, ~200 us a row on an RTX 3090 (a lone thread's
+    // dependent double-precision chain), five rows a round for sampled drafts.  Now the per-entry values (each exp,
+    // each quotient, each list entry: independent of one another) are computed by thread i for entry i, and thread 0
+    // keeps only what is serial by definition - the sums in index order, the cuts and the draw.  The same operations
+    // on the same operands in the same order wherever order matters: the same bits (sampler_parity).
+    __shared__ double sh_e[KMAX], sh_w[KMAX];
+    __shared__ double sh_sum;
+    __shared__ int sh_keep;
+    __shared__ float sh_smx;
+    const int ti = (int) threadIdx.x;
+    if (ti == 0) {
+        float mx = sel_logit[0];
+        for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
+        sh_smx = mx;
+        sh_keep = k;
     }
-    // ---- min_p on top_p's survivors: the descending prefix whose probability is at least `min_p` of the top
-    // token's.  In logit space the threshold is `sel_logit[0] + logf(min_p)` - equivalent to `p >= min_p * p_max`
-    // without the overflow an exp of raw logits risks.  0 disables, and the head itself always survives
-    // (`expf(0) == 1 >= min_p` for min_p in 0..1), so the count never reaches zero.
-    if (p.min_p > 0.0f) {
-        const float thresh = sel_logit[0] + logf(p.min_p);
-        for (int i = 0; i < n_keep; ++i)
-            if (sel_logit[i] < thresh) { n_keep = i; break; }
+    __syncthreads();
+    if (p.top_p < 1.0f) {
+        if (ti < k) sh_e[ti] = exp((double) sel_logit[ti] - (double) sh_smx);
+        __syncthreads();
+        if (ti == 0) {
+            double sum = 0.0;
+            for (int i = 0; i < k; ++i) sum += sh_e[i];
+            double cum = 0.0;
+            int cut = k;
+            for (int i = 0; i < k; ++i) {
+                cum += sh_e[i] / sum;
+                if (cum >= (double) p.top_p) { cut = i + 1; break; }
+            }
+            if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+            sh_keep = cut;
+        }
+        __syncthreads();
     }
     // temperature only: the penalties were applied once, before the selection (issue #53: they were applied a
     // second time here, after the temperature scaling - llama.cpp's chain has one penalties stage)
     auto scaled = [&](int i) { return sel_logit[i] * inv_t; };
-    float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, scaled(i));
-    double sum = 0.0;
-    for (int i = 0; i < n_keep; ++i) sum += exp((double) scaled(i) - (double) smx);
-    if constexpr (MODE == 0) {
-        const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+    if (ti == 0) {
+        int n_keep = sh_keep;
+        // ---- min_p on top_p's survivors: the descending prefix whose probability is at least `min_p` of the top
+        // token's.  In logit space the threshold is `sel_logit[0] + logf(min_p)` - equivalent to `p >= min_p * p_max`
+        // without the overflow an exp of raw logits risks.  0 disables, and the head itself always survives
+        // (`expf(0) == 1 >= min_p` for min_p in 0..1), so the count never reaches zero.
+        if (p.min_p > 0.0f) {
+            const float thresh = sel_logit[0] + logf(p.min_p);
+            for (int i = 0; i < n_keep; ++i)
+                if (sel_logit[i] < thresh) { n_keep = i; break; }
+        }
+        float smx = scaled(0);
+        for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, scaled(i));
+        sh_smx = smx;
+        sh_keep = n_keep;
+    }
+    __syncthreads();
+    const int n_keep = sh_keep;
+    if (ti < n_keep) sh_e[ti] = exp((double) scaled(ti) - (double) sh_smx);
+    __syncthreads();
+    if (ti == 0) {
+        double sum = 0.0;
+        for (int i = 0; i < n_keep; ++i) sum += sh_e[i];
+        sh_sum = sum;
+    }
+    __syncthreads();
+    if (ti < n_keep) sh_w[ti] = sh_e[ti] / sh_sum;   // the kept list's probabilities, as the plain draw computes them
+    __syncthreads();
+    // the plain draw over the kept list with a given uniform
+    auto draw = [&](float u) -> int {
         double cum = 0.0;
         int pick = sel_ids[n_keep - 1];
         for (int i = 0; i < n_keep; ++i) {
-            cum += exp((double) scaled(i) - (double) smx) / sum;
+            cum += sh_w[i];
             if ((double) u < cum) { pick = sel_ids[i]; break; }
         }
-        if (threadIdx.x == 0) out[t] = pick;
-    } else {
-        double w[KMAX];   // the kept list's probabilities, as the plain draw computes them
-        for (int i = 0; i < n_keep; ++i) w[i] = exp((double) scaled(i) - (double) smx) / sum;
-        // the plain draw over w with a given uniform (MODE 0's loop)
-        auto draw = [&](float u) -> int {
-            double cum = 0.0;
-            int pick = sel_ids[n_keep - 1];
-            for (int i = 0; i < n_keep; ++i) {
-                cum += w[i];
-                if ((double) u < cum) { pick = sel_ids[i]; break; }
-            }
-            return pick;
-        };
-        if constexpr (MODE == 1) {
-            SpecList* q = ql + t;
+        return pick;
+    };
+    if constexpr (MODE == 0) {
+        if (ti == 0) out[t] = draw(philox_uniform(p.seed, p.counter + (uint64_t) t));
+    } else if constexpr (MODE == 1) {
+        // the kept list (sample_draft: q, and the draw from it on a Philox stream of its own)
+        SpecList* q = ql + t;
+        if (ti < n_keep) { q->ids[ti] = sel_ids[ti]; q->p[ti] = sh_w[ti]; }
+        if (ti == 0) {
             q->n = n_keep;
-            for (int i = 0; i < n_keep; ++i) { q->ids[i] = sel_ids[i]; q->p[i] = w[i]; }
             out[t] = draw(philox_uniform(p.seed ^ kSpecDraftKey, p.counter + (uint64_t) t));
-        } else {
-            const SpecList* q = ql + t;
-            const int d = draft[t];
-            const int qn = q->n < KMAX ? q->n : KMAX;
-            auto qof = [&](int id) -> double {
-                for (int j = 0; j < qn; ++j)
-                    if (q->ids[j] == id) return q->p[j];
-                return 0.0;
-            };
-            double pd = 0.0;
-            for (int i = 0; i < n_keep; ++i)
-                if (sel_ids[i] == d) { pd = w[i]; break; }
-            const double qd = qof(d);
-            int pick = -1;
-            if (qd <= 0.0) {
-                pick = draw(philox_uniform(p.seed, p.counter + (uint64_t) t));   // not a draft from q: the plain draw
-            } else if ((double) philox_uniform(p.seed ^ kSpecAcceptKey, p.counter + (uint64_t) t) * qd < pd) {
-                pick = d;                                                        // kept: probability min(1, p(d)/q(d))
-            } else {
-                // rejected: a draw from max(0, p - q), renormalised - over p's kept list (p is 0 outside it)
-                double r[KMAX], z = 0.0;
-                for (int i = 0; i < n_keep; ++i) {
-                    const double x = w[i] - qof(sel_ids[i]);
-                    r[i] = x > 0.0 ? x : 0.0;
-                    z += r[i];
-                }
-                const float u = philox_uniform(p.seed ^ kSpecResidKey, p.counter + (uint64_t) t);
-                if (z > 0.0) {
-                    double cum = 0.0;
-                    for (int i = 0; i < n_keep; ++i) {
-                        if (r[i] <= 0.0) continue;
-                        pick = sel_ids[i];   // the last one with residual mass, if rounding leaves cum below u
-                        cum += r[i] / z;
-                        if ((double) u < cum) break;
-                    }
-                } else {
-                    pick = draw(u);   // p == q to the last bit: a rejection had probability 0 - never in practice
-                }
-            }
-            out[t] = pick;
         }
+    } else {
+        if (ti != 0) return;
+        const double* w = sh_w;
+        const SpecList* q = ql + t;
+        const int d = draft[t];
+        const int qn = q->n < KMAX ? q->n : KMAX;
+        auto qof = [&](int id) -> double {
+            for (int j = 0; j < qn; ++j)
+                if (q->ids[j] == id) return q->p[j];
+            return 0.0;
+        };
+        double pd = 0.0;
+        for (int i = 0; i < n_keep; ++i)
+            if (sel_ids[i] == d) { pd = w[i]; break; }
+        const double qd = qof(d);
+        int pick = -1;
+        if (qd <= 0.0) {
+            pick = draw(philox_uniform(p.seed, p.counter + (uint64_t) t));   // not a draft from q: the plain draw
+        } else if ((double) philox_uniform(p.seed ^ kSpecAcceptKey, p.counter + (uint64_t) t) * qd < pd) {
+            pick = d;                                                        // kept: probability min(1, p(d)/q(d))
+        } else {
+            // rejected: a draw from max(0, p - q), renormalised - over p's kept list (p is 0 outside it)
+            double r[KMAX], z = 0.0;
+            for (int i = 0; i < n_keep; ++i) {
+                const double x = w[i] - qof(sel_ids[i]);
+                r[i] = x > 0.0 ? x : 0.0;
+                z += r[i];
+            }
+            const float u = philox_uniform(p.seed ^ kSpecResidKey, p.counter + (uint64_t) t);
+            if (z > 0.0) {
+                double cum = 0.0;
+                for (int i = 0; i < n_keep; ++i) {
+                    if (r[i] <= 0.0) continue;
+                    pick = sel_ids[i];   // the last one with residual mass, if rounding leaves cum below u
+                    cum += r[i] / z;
+                    if ((double) u < cum) break;
+                }
+            } else {
+                pick = draw(u);   // p == q to the last bit: a rejection had probability 0 - never in practice
+            }
+        }
+        out[t] = pick;
     }
 }
 
+}  // namespace
+
+namespace {
+// The pre-pass (sampler_count_kernel / sampler_collect_kernel) and its buffers: a set for each (device, stream) that
+// samples, kPreRows rows.  MAYA_SAMPLER_BLOCKS=n: the blocks a row's two passes are spread over (16; 0 or 1: the
+// one-block kernel alone, as before).  The buffer's lock is held from the pre-pass's launches to sampler_kernel's,
+// so the three stay together on their stream.
+constexpr int kPreRows = 64;
+struct PreUse {
+    SamplerPre pre;
+    std::unique_lock<std::mutex> lk;
+};
+int pre_blocks() {
+    static const int n = [] {
+        const char* v = std::getenv("MAYA_SAMPLER_BLOCKS");
+        const int b = v != nullptr ? std::atoi(v) : 16;
+        return b < 2 ? 0 : (b > 64 ? 64 : b);
+    }();
+    return n;
+}
+PreUse sample_pre(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, void* stream, bool pen) {
+    static std::mutex mu;
+    static std::map<std::pair<int, void*>, SamplerPre> bufs;
+    PreUse u;
+    const int nb = pre_blocks();
+    // (a row with penalties keeps the one-block kernel: its bitmap is a block's; a small or unaligned row too)
+    if (nb == 0 || pen || n_tokens > kPreRows || n_vocab < 16384 || (n_vocab & 3) != 0 || (((size_t) logits) & 15) != 0)
+        return u;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return u;
+    std::unique_lock<std::mutex> lk(mu);
+    auto it = bufs.find({dev, stream});
+    if (it == bufs.end()) {
+        SamplerPre b;
+        const size_t hb = (size_t) kPreRows * kPreBins * sizeof(unsigned int), cb = (size_t) kPreRows * kPreCap * 4;
+        if (cudaMalloc(&b.hist, hb) != cudaSuccess || cudaMalloc(&b.count, (size_t) kPreRows * sizeof(unsigned int)) != cudaSuccess ||
+            cudaMalloc(&b.cand_u, cb) != cudaSuccess || cudaMalloc(&b.cand_i, cb) != cudaSuccess ||
+            cudaMemset(b.hist, 0, hb) != cudaSuccess ||
+            cudaMemset(b.count, 0, (size_t) kPreRows * sizeof(unsigned int)) != cudaSuccess) {
+            (void) cudaGetLastError();   // (no room: the one-block kernel)
+            b = SamplerPre{};
+        }
+        it = bufs.emplace(std::make_pair(dev, stream), b).first;
+    }
+    if (it->second.hist == nullptr) return u;
+    u.pre = it->second;
+    u.pre.blocks = nb;
+    u.lk = std::move(lk);
+    sampler_count_kernel<<<dim3((unsigned) nb, (unsigned) n_tokens), kPreThreads, 0, (cudaStream_t) stream>>>(
+        logits, n_vocab, p, u.pre);
+    sampler_collect_kernel<<<dim3((unsigned) nb, (unsigned) n_tokens), kPreThreads, 0, (cudaStream_t) stream>>>(
+        logits, n_vocab, p, u.pre);
+    return u;
+}
 }  // namespace
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
@@ -528,8 +776,9 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     } else {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
+        const PreUse u = sample_pre(logits, n_tokens, n_vocab, p, stream, shmem != 0);
         sampler_kernel<0><<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out, nullptr, nullptr);
+            logits, n_vocab, n_tokens, history, history_len, p, out, nullptr, nullptr, u.pre);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -563,8 +812,9 @@ void sample_draft(const float* logits, int n_tokens, int n_vocab, const SamplerP
                   void* stream) {
     if (n_tokens <= 0) return;
     spec_check("sample_draft", n_tokens, n_vocab, p);
+    const PreUse u = sample_pre(logits, n_tokens, n_vocab, p, stream, false);
     sampler_kernel<1><<<(unsigned) n_tokens, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, n_tokens, nullptr, 0,
-                                                                                p, out, q, nullptr);
+                                                                                p, out, q, nullptr, u.pre);
     spec_launched("sample_draft", stream);
 }
 
@@ -574,9 +824,10 @@ void sample_verify(const float* logits, int n_tokens, int n_vocab, const Sampler
     const bool pen = p.penalty_last_n > 0 && history != nullptr && history_len > 0;
     spec_check("sample_verify", n_tokens, n_vocab, p, pen);
     const unsigned shmem = pen ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned) : 0;   // the penalty bitmap
+    const PreUse u = sample_pre(logits, n_tokens, n_vocab, p, stream, pen);
     sampler_kernel<2><<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
         logits, n_vocab, n_tokens, pen ? history : nullptr, pen ? history_len : 0, p, out, const_cast<SpecList*>(q),
-        draft);
+        draft, u.pre);
     spec_launched("sample_verify", stream);
 }
 
