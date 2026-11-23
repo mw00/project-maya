@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import struct
@@ -33,7 +34,7 @@ import numpy as np
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import engram_hash as EH  # noqa: E402
-from st import SafeTensors  # noqa: E402
+from st import DTYPE_BYTES, SafeTensors  # noqa: E402
 
 TEMPLATE = HERE / "chat_template.jinja"   # (a model repo without its own chat_template.jinja)
 MUL1 = 0x83DCD12D                          # the engine's mul1 codebook multiplier
@@ -254,15 +255,93 @@ def check_k_map(model: pathlib.Path, st: SafeTensors) -> int | None:
     return n
 
 
+def use_drafter_experts(st: SafeTensors, model: pathlib.Path, donor: pathlib.Path, t: dict) -> int:
+    """Reference one expert-major Safetensors file of 3-bit DSpark routed experts in place."""
+    blocks = len(t["compress_ratios"]) - t["num_hidden_layers"]
+    experts = t.get("dspark_n_routed_experts", 0)
+    if not t.get("dspark_block_size") or blocks <= 0 or experts <= 0:
+        raise ValueError("the base model has no DSpark routed experts")
+    ref = os.path.relpath(donor, model)
+    if any(c.isspace() for c in ref):
+        raise ValueError("the donor's path relative to the base model must contain no whitespace")
+    if ref in st.files:
+        raise ValueError("put the donor outside the base model's top-level shards")
+
+    parts = [f"{w}.{p}" for w in ("w1", "w2", "w3") for p in ("trellis", "suh", "svh", "mul1")]
+    names = {f"mtp.{layer}.ffn.experts.{e}.{part}"
+             for layer in range(blocks) for e in range(experts) for part in parts}
+    missing = names - st.t.keys()
+    if missing:
+        raise ValueError(f"the base model lacks DSpark EXL3 tensor {min(missing)}")
+
+    replacements = {}
+    with donor.open("rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        header_size, = struct.unpack("<Q", f.read(8))
+        base = 8 + header_size
+        if header_size > 100_000_000 or base > size:
+            raise ValueError("invalid Safetensors header size")
+        header = json.loads(f.read(header_size))
+        header.pop("__metadata__", None)
+        if missing := names - header.keys():
+            raise ValueError(f"missing donor tensor {min(missing)}")
+        if extra := header.keys() - names:
+            raise ValueError(f"unexpected donor tensor {min(extra)}")
+        for name, entry in header.items():
+            _, dtype, shape, _, _ = st.t[name]
+            part = name.rsplit(".", 1)[1]
+            if part == "trellis":
+                if len(shape) != 3 or dtype != "I16":
+                    raise ValueError(f"{name}: invalid base EXL3 trellis")
+                shape = shape[:-1] + (48,)  # (16 int16s per bit)
+            a, b = entry["data_offsets"]
+            if (entry["dtype"] != dtype or tuple(entry["shape"]) != shape or
+                    type(a) is not int or type(b) is not int or
+                    not 0 <= a < b <= size - base or b - a != math.prod(shape) * DTYPE_BYTES[dtype]):
+                raise ValueError(f"{name}: incompatible dtype, shape or byte range")
+            if part == "mul1":
+                f.seek(base + a)
+                if b - a != 4 or f.read(4) != struct.pack("<I", MUL1):
+                    raise ValueError(f"{name}: expected the EXL3 mul1 codebook")
+            replacements[name] = (ref, dtype, shape, base + a, b - a)
+
+    ordered = sorted(replacements, key=lambda name: replacements[name][3])
+    cursor = base
+    for name in ordered:
+        _, _, _, offset, length = replacements[name]
+        if offset != cursor:
+            raise ValueError(f"{name}: Safetensors data ranges have a gap or overlap")
+        cursor += length
+    if cursor != size:
+        raise ValueError("Safetensors data ranges do not cover the donor file")
+    layouts = {}
+    for start in range(0, len(ordered), len(parts)):
+        group = ordered[start:start + len(parts)]
+        expert = group[0].rsplit(".", 2)[0]
+        layer = expert.rsplit(".", 1)[0]
+        layout = tuple((name[len(expert) + 1:], replacements[name][4]) for name in group)
+        if (any(name.rsplit(".", 2)[0] != expert for name in group) or
+                layout != layouts.setdefault(layer, layout)):
+            raise ValueError(f"{expert}: repack the donor with each expert's tensors together in the same order")
+
+    st.files.append(ref)
+    st.t.update(replacements)
+    return len(replacements)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", help="default: <model>/maya-ds4")
     ap.add_argument("--vision", help="vision_pack.py's folder, the BF16 vision tower for a quant whose own is not BF16 "
                                      "and without DeepSeek's shard 1 beside it (default: <model>/../vision)")
+    ap.add_argument("--drafter-experts", type=pathlib.Path,
+                    help="expert-major Safetensors file of 3-bit EXL3 DSpark routed experts (requires a separate --out)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
+    if a.drafter_experts and (not a.out or out.resolve() == (model / "maya-ds4").resolve()):
+        ap.error("--drafter-experts requires --out separate from <model>/maya-ds4")
     cfg = json.loads((model / "config.json").read_text())
     t = cfg["text_config"]
     q = cfg.get("quantization_config", {})
@@ -292,6 +371,13 @@ def main() -> int:
     apart = type_ordered(st)
     if apart:
         raise SystemExit(apart)
+    nk = check_k_map(model, st)
+    if a.drafter_experts:
+        donor = a.drafter_experts.expanduser().resolve()
+        try:
+            count = use_drafter_experts(st, model, donor, t)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, struct.error) as exc:
+            raise SystemExit(f"--drafter-experts {donor}: {exc}") from exc
     out.mkdir(parents=True, exist_ok=True)
 
     with (out / "ds4.txt").open("w") as f:
@@ -318,7 +404,6 @@ def main() -> int:
             f.write("file %d %s\n" % (i, fn))
         for name, (fn, dt, shape, off, nb) in st.t.items():
             f.write("t %s %s %d %d %d %s\n" % (name, dt, st.files.index(fn), off, nb, " ".join(map(str, shape))))
-    nk = check_k_map(model, st)
     nl, cols = write_engram(out / "engram.bin", model, t)
     tpl = write_tokenizer(out / "tokenizer", model)
     print("%s: %d tensors in %d files, Engram %d layers x %d hash columns -> %s" %
@@ -328,6 +413,8 @@ def main() -> int:
         print(vis)
     if nk is not None:
         print("  exl3_k_map.json: every one of %d EXL3 matrices' K agrees" % nk)
+    if a.drafter_experts:
+        print(f"  DSpark: using {count} routed expert tensors from {donor}")
     return 0
 
 
