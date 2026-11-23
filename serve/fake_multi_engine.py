@@ -38,7 +38,7 @@ def reader():
         if f[0] == "QUIT":
             quit_.set()
             return
-        if f[0] == "STOP" and len(f) > 1:
+        if f[0] in ("STOP", "PAUSE") and len(f) > 1:
             with lock:
                 stops.add(int(f[1]))
             continue

@@ -11,6 +11,8 @@
 #include "glm_metal.hpp"
 #include "sampler.hpp"
 #include "spec.hpp"
+#include "glm_prefix_snapshot.hpp"
+#include "slot_index.hpp"
 #include "../../include/strata/platform/env_switch.hpp"   // (header only; maya-metal's include path is src/metal)
 
 #include <algorithm>
@@ -52,7 +54,7 @@ struct Input {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<std::string> q;
-    std::atomic<bool> stop{false}, wrap{false}, pause{false};
+    std::atomic<bool> stop{false}, wrap{false}, pause{false}, pause_keep{false};
     bool eof = false;
 
     void run() {
@@ -63,7 +65,10 @@ struct Input {
             if (line == "STOP" || line.rfind("STOP ", 0) == 0 || line == "PAUSE" || line.rfind("PAUSE ", 0) == 0) {
                 // PAUSE: a STOP that keeps the state with what was written, so the server's follow-up GEN (the
                 // prompt + those tokens) reads none of it again (generate.cpp's pause_snapshot)
-                if (line.rfind("PAUSE", 0) == 0) pause.store(true);
+                if (line.rfind("PAUSE", 0) == 0) {
+                    pause_keep.store(line == "PAUSE keep");
+                    pause.store(true);
+                }
                 stop.store(true);
                 continue;
             }
@@ -77,6 +82,7 @@ struct Input {
             if (line.rfind("GEN", 0) == 0) {
                 stop.store(false);
                 pause.store(false);
+                pause_keep.store(false);
                 wrap.store(false);
             }
             std::lock_guard<std::mutex> lk(mu);
@@ -110,6 +116,26 @@ struct Server {
     Input in;
     std::vector<int32_t> cached;      // the previous prompt less its last token: what the snapshot holds
     uint64_t cached_img = 0;          // the images inside it (positions and rows, hashed)
+    std::unique_ptr<SlotIndex> slots;
+    bool slots_ready = false;
+    size_t slot_min = 1024;
+    uint64_t slot_budget = 0;
+
+    void init_slots() {
+        if (slots_ready) return;
+        slots_ready = true;
+        int count = std::max(0, env_int("MAYA_METAL_SLOTS", 0));
+        if (!count || !std::getenv("MAYA_METAL_SLOT_DIR") || model.has_dflash()) return; // DFlash's extra state is not serialized.
+        slot_min = (size_t)std::max(1, env_int("MAYA_METAL_SLOT_MIN", 1024));
+        const char* gb_env = std::getenv("MAYA_METAL_SLOT_GB");
+        char* end = nullptr;
+        const double gb = gb_env ? std::strtod(gb_env, &end) : 16.0;
+        if ((gb_env && (end == gb_env || *end)) || !std::isfinite(gb) || gb <= 0 || gb > 1048576) return;
+        slot_budget = (uint64_t)(gb * 1073741824.0);
+        const char* dir = std::getenv("MAYA_METAL_SLOT_DIR");
+        slots = std::make_unique<SlotIndex>(dir, (size_t)count, slot_budget);
+    }
+
     const int loop_w_think = env_int("MAYA_GLM_LOOP_THINK", 256);
     const int loop_w_answer = env_int("MAYA_GLM_LOOP_ANSWER", 1024);
     int chunk = 512;                            // prompt tokens a forward() takes: the engine's slice (serve())
@@ -281,16 +307,29 @@ struct Server {
         const char* finish = "length";
         const auto t0 = std::chrono::steady_clock::now();
         const size_t n = prompt.size();
+        const size_t target = glm_snapshot_target(prompt);
 
         // the prefix the snapshot holds, when the new prompt starts with all of it
         size_t reuse = 0;
         const int64_t snap = model.snapshot_position();
-        if (snap > 0 && (size_t) snap == cached.size() && (size_t) snap <= n - 1 &&
+        if (snap > 0 && (size_t) snap == cached.size() && (size_t) snap <= target &&
             std::equal(cached.begin(), cached.end(), prompt.begin()) && cached_img == img_prefix_hash(snap) &&
             model.snapshot_restore())
             reuse = (size_t) snap;
-        else
-            model.reset();
+        else {
+            init_slots();
+            if (slots && snap > 0 && (size_t)snap == cached.size() && cached.size() >= slot_min) {
+                const uint64_t bytes = model.slot_snapshot_size();
+                if (bytes && bytes <= slot_budget)
+                    slots->put(cached, cached_img, bytes, [&](const auto& path) {
+                        return model.slot_snapshot_save(path.string(), bytes);
+                    });
+            }
+            if (slots) reuse = slots->restore(prompt, target,
+                [&](size_t len) { return img_prefix_hash((int64_t)len); },
+                [&](const auto& path, size_t len) { return model.slot_snapshot_load(path.string(), (int64_t)len, slot_budget); });
+            if (!reuse) model.reset();
+        }
         cached.clear();
 
         std::vector<float> logits;
@@ -299,12 +338,12 @@ struct Server {
             std::printf("PP %zu %zu %.1f %.1f %zu\n", read, n, ms, ms > 0 ? (read - reuse) * 1000.0 / ms : 0.0, reuse);
             std::fflush(stdout);
         };
-        for (size_t at = reuse; at + 1 < n; at += (size_t) chunk) {   // every prompt token but the last
+        for (size_t at = reuse; at < target; at += (size_t) chunk) {   // stop before the generation suffix
             if (in.stop.load()) {
                 finish = "cancel";
                 break;
             }
-            const size_t k = std::min((size_t) chunk, n - 1 - at);
+            const size_t k = std::min((size_t) chunk, target - at);
             if (!model.forward(std::vector<int32_t>(prompt.begin() + (long) at, prompt.begin() + (long) (at + k)),
                                logits, e)) {
                 model.reset();
@@ -316,9 +355,9 @@ struct Server {
         auto t1 = std::chrono::steady_clock::now();
         if (std::strcmp(finish, "cancel") != 0) {
             model.snapshot_save();
-            cached.assign(prompt.begin(), prompt.end() - 1);
+            cached.assign(prompt.begin(), prompt.begin() + (long) target);
             cached_img = img_prefix_hash((int64_t) cached.size());
-            if (!model.forward({prompt.back()}, logits, e)) {
+            if (!model.forward(std::vector<int32_t>(prompt.begin() + (long) target, prompt.end()), logits, e)) {
                 model.reset();
                 cached.clear();
                 return err(e);
@@ -489,7 +528,7 @@ struct Server {
         const auto t2 = std::chrono::steady_clock::now();
         // PAUSE: every token written but the last was fed, so the state is the follow-up prompt's less its last
         // token - exactly what the prefix reuse restores
-        if (in.pause.load() && std::strcmp(finish, "cancel") == 0 && !emitted.empty() &&
+        if (in.pause.load() && !in.pause_keep.load() && std::strcmp(finish, "cancel") == 0 && !emitted.empty() &&
             model.position() == (int64_t) (n + emitted.size() - 1)) {
             model.snapshot_save();
             cached.assign(prompt.begin(), prompt.end());
