@@ -1849,6 +1849,10 @@ struct OffState {
     std::vector<std::vector<cudaEvent_t>> ring_free, ring_full;
     std::vector<int> ring_hand;
     k::OffFetch* fl = nullptr;
+    // (drafting on the offload path: a verify window's staging - a pool a slot size of kOffWin slots, its own so
+    //  that the tokens' and the prompts' ring stay as they are - and its copies' lists)
+    std::vector<k::OffStage> wstage;
+    k::OffFetch* flw = nullptr;
     k::OffCount* cnt = nullptr;         // (device)
     uint32_t* heat = nullptr;           // [n_layer * E] (device): picks since load
     int blocks = 0;                     // off_fetch_copy's grid
@@ -1867,6 +1871,12 @@ struct OffState {
 };
 OffState g_offs;
 bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at load)
+// Drafting on the offload path (a long context on a card that then keeps a tier of the experts): the verify window
+// takes the token path's mode A arithmetic - the resident kernels over the tier's or staging's bytes - so it runs
+// where mode A decodes (not lane parity, whose sums are ik2_exact.h's), with the whole cache in VRAM, on one GPU.
+bool g_off_draft = false;          // the plan: drafting on the offload path (then mode A)
+constexpr int kOffWin = 64;        // a window's picks at most (8 tokens of 8)
+int g_draft_kv8 = -1;              // the plan's choice of the drafter's context rows there (1 FP8, 0 FP16; -1: the load's)
 
 // A layer-major prefill pass of many tokens uses nearly every expert of a layer, so the ones not in VRAM can be
 // copied in before the layer's routing is known: while the previous layer's experts and this layer's attention run.
@@ -3692,6 +3702,13 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
                        g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
+        if (g_off) {   // (the offload path: the groups the tier does not hold copied into the window's staging)
+            const int n_fl = (S + k::kOffMaxK - 1) / k::kOffMaxK;
+            k::off_fetch_plan_win(g_blk.blob, g_blk.n, g_blk.row, k::kGroupMax, rtop, S, l * c.E, g_offs.host[l],
+                                  g_offs.tab ? 0 : Ly.slot_bytes, g_offs.wstage[g_offs.pool[l]], g_offs.flw, n_fl,
+                                  g_offs.cnt, g_offs.heat, g_s);
+            for (int j = 0; j < n_fl; ++j) k::off_fetch_copy(g_offs.flw + j, Ly.slot_bytes, g_offs.blocks, g_s);
+        }
         // (exact: the token path's choice - NVFP4 on the tensor cores unless IK2_EXPERT_MMA=0, else the row dots)
 #ifdef MAYA_USE_HIP   // (AMD: the token path's default is the row dots - so is the window's)
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
@@ -3765,6 +3782,7 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     const Config& c = M.c;
     if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
     lend_check(M, pos0 + T, true);
+    if (g_off) off_tables(M);
     if (!g_blk.ready) block_init(M);
     Work& W = dev_work(0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
@@ -4352,6 +4370,10 @@ struct SpecCtl {
 };
 
 bool g_lookup = false;   // the prompt lookup (src/spec/suffix_drafter): drafts copied from the text so far
+// where a verify window runs: the resident path, and the offload path's mode A with the window's staging (g_off_draft)
+inline bool spec_path() {
+    return g_block && (g_fast || (g_off && g_off_draft && !g_lane && !g_kv_streaming && !g_two.on && !g_offs.wstage.empty()));
+}
 
 // VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
 // visit's four convs, for rollback_block) and buffers, whichever drafts; with the drafter (path) its weights (the
@@ -6032,10 +6054,12 @@ int main(int argc, char** argv) {
     }
     if (n_gpu == 1 && !g_pool) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
+        std::map<std::string, size_t> exp_layer;   // (a layer's experts: "blk.N" -> bytes)
         for (const auto& kv : S.by_name) {
             const auto& t = *kv.second.second;
             if (!k::block_values((int) t.type)) continue;
-            if (t.name.find("_exps.weight") != std::string::npos) exp_b += tensor_bytes(t);
+            if (t.name.find("_exps.weight") != std::string::npos)
+                exp_b += tensor_bytes(t), exp_layer[t.name.substr(0, t.name.find('.', 4))] += tensor_bytes(t);
             else if (t.name != "token_embd.weight") dense_b += tensor_bytes(t);
         }
         for (int l = 0; l < c.n_layer; ++l) {
@@ -6192,16 +6216,49 @@ int main(int argc, char** argv) {
                     fits && !g_off_want ? "every expert stays in VRAM"
                     : g_off_want ? "the experts in host memory, a tier of them in VRAM, the rest fetched by the GPU"
                                  : "the experts in host memory, a cache of them in VRAM");
-        // Drafting never changes this plan (a loaded drafter takes room only where everything above stays as it is):
-        // it runs on the resident path, its room - the drafter's, or the prompt lookup's window records alone - beside
-        // the model at this context, and not the room the pictures' encoder would have had on the GPU (IK2_VISION_GIB,
-        // the server's: the encoder starts on the GPU when the free VRAM holds it).  Else it is left out, said why.
+        // Drafting never changes the context, the cache or the pictures' room of this plan.  Where every expert stays
+        // in VRAM (the resident path) a loaded drafter takes room only where everything above stays as it is: its
+        // room - the drafter's, or the prompt lookup's window records alone - beside the model at this context, and
+        // not the room the pictures' encoder would have had on the GPU (IK2_VISION_GIB, the server's: the encoder
+        // starts on the GPU when the free VRAM holds it).  Where the experts already left VRAM for the cache (the
+        // offload path: a long context) the drafter's room is the experts' too - the tier gives it, at most half of
+        // what it had, with the verify window's staging; the drafter's context rows FP16, else FP8, else FP8 rows of
+        // the last positions only (half the context, a quarter .. 65,536: its drafts read less far back, the model
+        // checks every token as ever).  The window there is mode A's (the resident kernels over the tier's bytes):
+        // one GPU, the whole cache in VRAM, no lane parity.  Else it is left out, said why.
         const size_t used = exp_b + dense_b + kv_b + reserve;
         const double vis = getenv("IK2_VISION_GIB") ? std::atof(getenv("IK2_VISION_GIB")) * 1073741824.0 : 0.0;
         const double left = fr0 > used ? (double) (fr0 - used) : 0.0;
+        const bool off_layout = g_off_want && !g_fast_want;
+        std::string off_why;
+        size_t tier_room = 0, stage_b = 0;
+        if (off_layout) {
+            const char* le = getenv("IK2_LANE");
+            const bool lane0 = le && *le && std::string(le) == "0";
+            if (g_kv_streaming)
+                off_why = "at this context part of the cache streams from RAM, and the verify window reads the "
+                          "whole cache in VRAM (plain decoding)";
+            else if (le && *le && !lane0)
+                off_why = "IK2_LANE asks for lane parity, and the verify window has mode A's arithmetic (plain decoding)";
+#ifndef MAYA_USE_HIP
+            else if (!lane0 && drafting != "on")
+                off_why = "with the experts in host memory the verify window is mode A's, not measured against lane "
+                          "parity on this GPU class yet - --drafting on takes it (plain decoding)";
+#endif
+            const size_t fixed = dense_b + kv_b + reserve + (size_t) 48 * c.H * (size_t) ctx;
+            tier_room = fr0 > fixed ? fr0 - fixed : 0;
+            std::vector<size_t> sizes;   // (the window's staging: kOffWin slots a slot size)
+            for (const auto& e : exp_layer) {
+                const size_t sb = (e.second / c.E + 255) / 256 * 256;
+                if (std::find(sizes.begin(), sizes.end(), sb) == sizes.end()) sizes.push_back(sb), stage_b += kOffWin * sb;
+            }
+        }
         auto room_ok = [&](size_t need, std::string& why) {
             if (g_two.want) why = "on two GPUs it is not checked against plain decoding yet (plain decoding)";
-            else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
+            else if (off_layout) {
+                if (!off_why.empty()) why = off_why;
+                else if (need + stage_b > tier_room / 2) why = "its room does not fit beside the model at this context";
+            } else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
             else if (used + need > fr0) why = "its room does not fit beside the model at this context";
             else if (vis > 0 && left >= vis && left - (double) need < vis)
                 why = "its room would move the pictures' encoder from the GPU to the CPU";
@@ -6217,18 +6274,50 @@ int main(int argc, char** argv) {
             const bool only16 = kv_env && std::string(kv_env) == "f16", only8 = kv_env && std::string(kv_env) == "fp8";
             size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8);
             std::string why;
-            if (model_drafter && !only8 && !only16 && !room_ok(need, why)) {
+            if (off_layout && model_drafter && off_why.empty()) {
+                std::vector<std::pair<int, bool>> tries;   // (rows, FP8)
+                if (!only8) tries.push_back({ctx, false});
+                if (!only16)
+                    for (int r = ctx; r >= std::min(ctx, 65536); r /= 2) {
+                        tries.push_back({r, true});
+                        if (getenv("IK2_DRAFT_CTX")) break;   // (the rows by hand)
+                    }
+                bool ok = false;
+                for (const auto& t : tries) {
+                    ik2::draft::plan_context_rows(t.first == ctx ? 0 : t.first);
+                    need = draft_room(draft_path, ctx, chunk, c, head_rows, t.second);
+                    why.clear();
+                    if ((ok = room_ok(need, why))) {
+                        g_draft_kv8 = t.second ? 1 : 0;
+                        break;
+                    }
+                }
+                if (!ok) ik2::draft::plan_context_rows(0);
+            } else if (model_drafter && !only8 && !only16 && !room_ok(need, why)) {
                 why.clear();
                 need = draft_room(draft_path, ctx, chunk, c, head_rows, true);
             }
+            why.clear();
             if (room_ok(need, why)) {
-                std::printf("drafting: %s, %.2f GiB of VRAM beside the model (the plan as without it)\n",
-                            model_drafter ? (g_lookup ? "the drafter and the prompt lookup" : "the drafter")
-                                          : "the prompt lookup", need / 1073741824.0);
+                if (off_layout) {
+                    const int rows = ik2::draft::context_rows(ctx);
+                    char back[96] = "";
+                    if (model_drafter && rows < ctx)
+                        std::snprintf(back, sizeof back, "; its drafts read the last %d tokens", rows);
+                    std::printf("drafting: %s, %.2f GiB of VRAM from the experts' tier with the window's staging (the "
+                                "context and the cache as without it%s)\n",
+                                model_drafter ? (g_lookup ? "the drafter and the prompt lookup" : "the drafter")
+                                              : "the prompt lookup", (need + stage_b) / 1073741824.0, back);
+                    g_off_draft = true;
+                } else {
+                    std::printf("drafting: %s, %.2f GiB of VRAM beside the model (the plan as without it)\n",
+                                model_drafter ? (g_lookup ? "the drafter and the prompt lookup" : "the drafter")
+                                              : "the prompt lookup", need / 1073741824.0);
+                }
                 break;
             }
             std::printf("NOTE maya-ik2: %s left out (%.2f GiB): %s\n", model_drafter ? "the drafter" : "the prompt lookup",
-                        need / 1073741824.0, why.c_str());
+                        (need + (off_layout ? stage_b : 0)) / 1073741824.0, why.c_str());
             if (model_drafter) draft_path.clear();
             else g_lookup = false;
         }
@@ -6936,6 +7025,23 @@ int main(int argc, char** argv) {
             g_offs.ring_free.push_back(a), g_offs.ring_full.push_back(b), g_offs.ring_hand.push_back(0);
         }
         g_offs.fl = dalloc<k::OffFetch>(1);
+        if (g_off_draft) {   // (the verify window's staging and lists)
+            if (c.K * ik2::draft::kBlock > kOffWin) die("the offload path's window: more picks than its staging");
+            for (size_t sb : sizes) {
+                k::OffStage st;
+                st.sb = sb, st.n = kOffWin;
+                st.data = dalloc<uint8_t>((size_t) kOffWin * sb);
+                st.tag = dalloc<int>(kOffWin);
+                st.used = dalloc<uint32_t>(kOffWin);
+                st.hand = dalloc<int>(1);
+                CU(cudaMemsetAsync(st.tag, 0xff, (size_t) kOffWin * 4, g_s));
+                CU(cudaMemsetAsync(st.used, 0, (size_t) kOffWin * 4, g_s));
+                CU(cudaMemsetAsync(st.hand, 0, 4, g_s));
+                g_offs.wstage.push_back(st);
+            }
+            g_offs.flw = dalloc<k::OffFetch>(kOffWin / k::kOffMaxK);
+            CU(cudaMemsetAsync(g_offs.flw, 0, sizeof(k::OffFetch) * (kOffWin / k::kOffMaxK), g_s));
+        }
         g_offs.cnt = dalloc<k::OffCount>(1);
         g_offs.heat = dalloc<uint32_t>((size_t) c.n_layer * c.E);
         CU(cudaMemsetAsync(g_offs.cnt, 0, sizeof(k::OffCount), g_s));
@@ -6962,7 +7068,11 @@ int main(int argc, char** argv) {
             die("unknown IK2_DRAFT_KV=" + kv_want + " (expected f16 or fp8)");
         const double t0 = now();
         size_t short_b = 0;
-        for (int kv8 = kv_want == "fp8" ? 1 : 0; kv8 <= (kv_want == "f16" ? 0 : 1) && !drafter; ++kv8) {
+        // (the offload path: the plan's rows; it keeps the tier half a GiB beside the 1 GiB left free there)
+        const bool off_dr = g_off_want && !g_fast_want;
+        const size_t off_keep = (size_t) 3 << 29;
+        for (int kv8 = kv_want == "fp8" || (off_dr && g_draft_kv8 == 1) ? 1 : 0;
+             kv8 <= (kv_want == "f16" || (off_dr && g_draft_kv8 == 0) ? 0 : 1) && !drafter; ++kv8) {
             ik2::draft::Drafter* dr = nullptr;
             try {
                 dr = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, kv8 != 0);
@@ -6979,11 +7089,11 @@ int main(int argc, char** argv) {
             CU(cudaStreamSynchronize(g_s));
             size_t fr_now = 0, tot_now = 0;
             CU(mem_info(&fr_now, &tot_now));
-            if (!g_fast_want || fr_now >= keep) {
+            if (off_dr ? fr_now >= off_keep : (!g_fast_want || fr_now >= keep)) {
                 drafter = dr;
                 break;
             }
-            short_b = keep - fr_now;
+            short_b = (off_dr ? off_keep : keep) - fr_now;
             ik2::draft::destroy(dr);
             CU(cudaFree(g_taps));
             g_taps = nullptr;
@@ -6992,14 +7102,23 @@ int main(int argc, char** argv) {
             std::printf("drafter: %s, %s matrices, its context rows %s%s, %.2f GiB of VRAM, %.1f s\n",
                         draft_path.c_str(), ik2::draft::matrices_q8(drafter) ? "Q8_0" : "BF16",
                         ik2::draft::context_fp8(drafter) ? "FP8" : "FP16",
-                        ik2::draft::context_fp8(drafter) && kv_want == "auto" ? " (FP16's do not fit beside every expert)"
+                        ik2::draft::context_fp8(drafter) && kv_want == "auto" ? (off_dr ? " (the plan's)" : " (FP16's do not fit beside every expert)")
                                                                                : "",
                         ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
         } else {
-            std::printf("NOTE maya-ik2: the drafter left out: beside it the cache would not hold every expert (%.2f "
-                        "GiB short%s) - a smaller --max-context leaves it room\n", short_b / 1073741824.0,
-                        kv_want == "f16" ? " with FP16 context rows" : "");
+            if (off_dr)
+                std::printf("NOTE maya-ik2: the drafter left out: beside it the experts' tier would have no room (%.2f "
+                            "GiB short) - a smaller --max-context leaves it room\n", short_b / 1073741824.0);
+            else
+                std::printf("NOTE maya-ik2: the drafter left out: beside it the cache would not hold every expert (%.2f "
+                            "GiB short%s) - a smaller --max-context leaves it room\n", short_b / 1073741824.0,
+                            kv_want == "f16" ? " with FP16 context rows" : "");
             draft_path.clear();
+            if (off_dr && !g_lookup) {   // (no window then: its staging back to the tier)
+                for (auto& st : g_offs.wstage) cudaFree(st.data), cudaFree(st.tag), cudaFree(st.used), cudaFree(st.hand);
+                g_offs.wstage.clear();
+                g_off_draft = false;
+            }
         }
         std::fflush(stdout);
     }
@@ -7236,7 +7355,12 @@ int main(int argc, char** argv) {
 #else
         const char* lane_def = "auto";
 #endif
-        const std::string lw = g_two.want || g_kv_streaming ? "0" : le && *le ? le : lane_def;
+        // (drafting on the offload path: mode A - the verify window's arithmetic)
+        const std::string lw = g_two.want || g_kv_streaming || g_off_draft ? "0" : le && *le ? le : lane_def;
+        if (g_off_draft && !(le && *le) && std::string(lane_def) != "0")
+            std::printf("NOTE maya-ik2: drafting on the offload path decodes in mode A (the resident kernels; lane "
+                        "parity off): the answers are mode A's with drafting or without (IK2_LANE=0), and can differ "
+                        "from lane parity's where two tokens are nearly tied\n");
         if (lw != "0") {
             g_lane = lane_init(M, lw, getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1);
             if (!g_lane) std::printf("lane parity: off - an expert format the exact lane does not have\n");
@@ -7437,7 +7561,7 @@ int main(int argc, char** argv) {
         // drafter, both - times greedy answers to IK2_DRAFT_IDS's requests (IK2_DRAFT_TOKENS each, 128), the
         // fastest kept (within IK2_DRAFT_TIE, 3%, of none: none) and remembered; the answers are the same whichever
         // (drafting on = off), so one load measures them all
-        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && g_fast && g_block) {
+        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && spec_path()) {
             std::vector<std::vector<int>> reqs;
             if (const char* f = getenv("IK2_DRAFT_IDS")) {
                 std::ifstream in(f);
@@ -7533,7 +7657,7 @@ int main(int argc, char** argv) {
         for (const auto& Vi : M.V) kv_total += (size_t) Vi.kv_cap * KD * kv_elem_b * 2;
         if (serve_maya) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
-            const bool sp = (drafter || g_lookup) && g_fast && g_block;
+            const bool sp = (drafter || g_lookup) && spec_path();
             const char* wd = getenv("IK2_WATCHDOG_S");
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
                         "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx,
@@ -7986,7 +8110,7 @@ int main(int argc, char** argv) {
         // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
         // widest window, IK2_DRAFT_ADAPT=0 always that wide
         SpecCtl sctl;
-        const bool spec_on = (drafter || g_lookup) && g_fast && g_block;
+        const bool spec_on = (drafter || g_lookup) && spec_path();
         sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         sctl.use_model = drafter != nullptr, sctl.use_lookup = g_lookup;
@@ -8369,7 +8493,7 @@ int main(int argc, char** argv) {
         std::_Exit(0);   // (QUIT / end of input: out at once, as maya-hy4 - the OS frees the pinned runs and the driver's state)
     }
     if (g_depth + (int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
-    if (g_depth > 0 && (serve || drafter || g_lookup || g_dev[0].W.T_sup > 0)) die("IK2_DEPTH: the CLI's plain path only (no drafting)");
+    if (g_depth > 0 && (serve || g_dev[0].W.T_sup > 0)) die("IK2_DEPTH: the CLI only (its plain and drafting loops)");
     // the prompt
     std::vector<float> logits;
     double t_exp = 0;
@@ -8404,7 +8528,7 @@ int main(int argc, char** argv) {
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
-                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, p0);
+                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, g_depth + p0);
                 if (last) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
             }
         }
@@ -8445,7 +8569,7 @@ int main(int argc, char** argv) {
     }
     // (IK2_BLOCK_WARM=1: the windows' CUDA graphs recorded before the generation is timed - a width's first window
     //  records its graph, tens of ms once a process)
-    if (getenv("IK2_BLOCK_WARM") && std::atoi(getenv("IK2_BLOCK_WARM")) && (drafter || g_lookup) && g_fast && g_block &&
+    if (getenv("IK2_BLOCK_WARM") && std::atoi(getenv("IK2_BLOCK_WARM")) && (drafter || g_lookup) && spec_path() &&
         (int) prompt.size() + kBlockMax <= ctx) {
         const double tw = now();
         int tk[kBlockMax];
@@ -8485,7 +8609,7 @@ int main(int argc, char** argv) {
     // IK2_LOGITS_OUT=FILE: every generated token's logits [n_vocab] F32 appended there (with IK2_FORCE: two builds'
     // logits over the same tokens, to compare)
     FILE* lo = getenv("IK2_LOGITS_OUT") ? std::fopen(getenv("IK2_LOGITS_OUT"), "wb") : nullptr;
-    const bool lookup_only = !drafter && g_lookup && g_fast && g_block;   // (then the drafting loop below)
+    const bool lookup_only = !drafter && g_lookup && spec_path();   // (then the drafting loop below)
     for (int i = 0, best = first_best; i < gen && !drafter && !lookup_only; ++i) {
         const int tok = i < (int) force.size() ? force[i] : best;
         if (i < (int) force.size()) agree += best == force[i];
@@ -8511,7 +8635,7 @@ int main(int argc, char** argv) {
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
 
     SpecCtl ctl;
-    if ((drafter || g_lookup) && g_fast && g_block) {
+    if ((drafter || g_lookup) && spec_path()) {
         // (the resident path: the controller picks plain tokens or a window of the drafter's or the prompt lookup's
         //  drafts; greedy, as the CLI's generation is)
         ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : kBlockMax;
@@ -8519,7 +8643,7 @@ int main(int argc, char** argv) {
         ctl.use_model = drafter != nullptr, ctl.use_lookup = g_lookup;
         maya::spec::SuffixDrafter lk;
         lk.append(prompt.data(), prompt.size());
-        int anchor = first_best, P = (int) prompt.size();
+        int anchor = first_best, P = g_depth + (int) prompt.size();   // (IK2_DEPTH: the tests' deep points)
         out.push_back(anchor);
         const SampleCfg sc;
         std::vector<int> next;

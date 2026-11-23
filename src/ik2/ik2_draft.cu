@@ -630,9 +630,14 @@ const std::vector<int>& tap_layers() {
     return v;
 }
 
+// (the engine's plan: the rows a long context's layout leaves room for - the last positions; 0: the whole context)
+static int g_plan_rows = 0;
+void plan_context_rows(int rows) { g_plan_rows = rows; }
+
 int context_rows(int ctx) {
-    // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default the whole context)
-    const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : ctx;
+    // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default the plan's, else the
+    //  whole context)
+    const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : g_plan_rows > 0 ? g_plan_rows : ctx;
     return std::min(ctx, std::max(want, 2048));
 }
 
