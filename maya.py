@@ -11376,7 +11376,7 @@ def ik2_drafter_model(amd: bool = False, name: str | None = None) -> dict | None
     """The model's drafter as offer_download's form (tools/ik2/download.json's "drafter": Inkling-2-Mini's own drafter
     from Maya's own repo at a pinned revision), or None when the manifest names none.  One file of the manifest's two
     forms of it: `name`, else the one the setup fetches - the GGUF (Q8_0, unsloth's conversion: the engine's fastest
-    drafting path, "default"), on AMD thinkingmachines' mtp.safetensors (the form measured there, "amd")."""
+    drafting path, "default"; on AMD the manifest's "amd" - the GGUF too, measured there as well)."""
     man = read_json(IK2_MANIFEST).get("drafter") or {}
     if not man.get("files") or not man.get("repo") or not man.get("revision"):
         return None
@@ -11395,7 +11395,7 @@ def ik2_drafter_model(amd: bool = False, name: str | None = None) -> dict | None
 def ik2_drafter_here(d: Path, amd: bool = False) -> tuple[Path, dict] | None:
     """A whole copy of the drafter already beside the model (in d), with its form's entry, or None: the form the setup
     fetches on this PC first, else the other one (its size and sha256 the published ones) - what the engine drafts
-    with where this PC's form was not downloaded (an earlier setup's mtp.safetensors on NVIDIA)."""
+    with where this PC's form was not downloaded (an earlier setup's mtp.safetensors)."""
     man = read_json(IK2_MANIFEST).get("drafter") or {}
     first = ik2_drafter_model(amd)
     if first is None:
@@ -11419,7 +11419,7 @@ def ik2_drafting(a) -> str:
 
 def ik2_drafter_step(a, d: Path, vram: float, ctx: int, kv: str, amd: bool = False) -> Path | None:
     """The drafter beside the GGUF (in d) - the form this PC's engine drafts with best (ik2_drafter_model), downloaded
-    from Maya's repo when it is not there (an earlier setup's mtp.safetensors on NVIDIA stays on the disk, and is
+    from Maya's repo when it is not there (an earlier setup's mtp.safetensors stays on the disk, and is
     what the engine drafts with where the GGUF was not downloaded) - checked against its published sha256, or None: drafting off (--drafting off), or not downloaded - the engine then drafts with the prompt lookup alone.
     Truthful about this card: where the drafter's room does not fit beside the model at this context, the engine
     leaves it out at its start (the plan as without it)."""
@@ -11667,7 +11667,7 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd, apu)
     if vram1 and IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 2:
         off = "drafting off: on two GPUs it is not checked yet - every token comes from a full model step"
-    if off:                                            # (Volta / Turing, the offload path: no drafter, drafting off)
+    if off:                                            # (Volta / Turing, a streamed cache, no room: no drafter, drafting off)
         ok(off)
         a.drafting = "off"
         drafter = None

@@ -105,16 +105,18 @@ class Manifest(unittest.TestCase):
 
     def test_drafter_pinned(self):
         """Drafting: the model's own drafter from Maya's own repo at a pinned revision, folder drafter/, by size and
-        sha256 (the ones docs/INKLING2.md lists) - the GGUF (Q8_0) by default, thinkingmachines' mtp.safetensors on
-        AMD; each form one file."""
+        sha256 (the ones docs/INKLING2.md lists) - the GGUF (Q8_0), on NVIDIA and on AMD; thinkingmachines'
+        mtp.safetensors by name (an earlier setup's); each form one file."""
         repo, rev = "peasantsmith/Inkling-2-Mini-Maya-GGUF", "37027719327de5f574684b525ad88fe50c4ff222"
         doc = (maya.ROOT / "docs" / "INKLING2.md").read_text(encoding="utf-8")
-        for amd_pc, name, size, sha in (
-                (False, "dspark-Inkling-2-Mini-Q8_0.gguf", 402278560,
+        for amd_pc, by_name, name, size, sha in (
+                (False, None, "dspark-Inkling-2-Mini-Q8_0.gguf", 402278560,
                  "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773"),
-                (True, "mtp.safetensors", 635801416,
+                (True, None, "dspark-Inkling-2-Mini-Q8_0.gguf", 402278560,
+                 "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773"),
+                (True, "mtp.safetensors", "mtp.safetensors", 635801416,
                  "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2")):
-            m = maya.ik2_drafter_model(amd_pc)
+            m = maya.ik2_drafter_model(amd_pc, by_name)
             self.assertEqual((m["repo"], m["revision"], m["folder"]), (repo, rev, "drafter"))
             self.assertEqual(m["files"], {name: size})
             self.assertEqual(m["sha256"], {name: sha})
@@ -451,10 +453,14 @@ class Steps(unittest.TestCase):
         with patch.object(maya, "file_incomplete", lambda *a: None), \
                 patch.object(maya, "sha256_checked", lambda *a: True):
             self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"), d / "dspark-Inkling-2-Mini-Q8_0.gguf")
-            self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8", True), d / "mtp.safetensors")   # (AMD)
+            self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8", True),
+                             d / "dspark-Inkling-2-Mini-Q8_0.gguf")                                  # (AMD: the GGUF too)
             said = []
             with patch.object(maya, "warn", said.append):
                 self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 262144, "fp8"),
+                                 d / "dspark-Inkling-2-Mini-Q8_0.gguf")
+                self.assertEqual(said, [])                 # (a 24 GB card at 262,144: the engine fits it, FP8 rows)
+                self.assertEqual(maya.ik2_drafter_step(va(), d, 16, 1048576, "fp8"),
                                  d / "dspark-Inkling-2-Mini-Q8_0.gguf")
             self.assertIn("does not fit beside the model", " ".join(said))
 
@@ -475,9 +481,9 @@ class Steps(unittest.TestCase):
 
     def test_drafter_fresh_from_mayas_repo(self):
         """A model folder without a drafter: one file from Maya's repo at the pinned revision, folder drafter/ - the
-        GGUF on NVIDIA, mtp.safetensors on AMD."""
+        GGUF, on NVIDIA and on AMD."""
         ours = ("peasantsmith/Inkling-2-Mini-Maya-GGUF", "37027719327de5f574684b525ad88fe50c4ff222", "drafter")
-        for amd_pc, name in ((False, "dspark-Inkling-2-Mini-Q8_0.gguf"), (True, "mtp.safetensors")):
+        for amd_pc, name in ((False, "dspark-Inkling-2-Mini-Q8_0.gguf"), (True, "dspark-Inkling-2-Mini-Q8_0.gguf")):
             d, gguf = self.files()
             for f in ("dspark-Inkling-2-Mini-Q8_0.gguf", "mtp.safetensors"):
                 (d / f).unlink(missing_ok=True)
@@ -486,28 +492,27 @@ class Steps(unittest.TestCase):
             self.assertEqual(got, d / name)
 
     def test_drafter_from_an_earlier_setup(self):
-        """An earlier setup's mtp.safetensors beside the model: on NVIDIA the setup fetches the GGUF (the engine's
-        faster drafting path) and the old file stays on the disk; where the GGUF is not downloaded the engine drafts
-        with the old file (the same size and sha256 - another is not taken).  The PC's own form already here: no
-        download."""
+        """An earlier setup's mtp.safetensors beside the model: the setup fetches the GGUF (the engine's faster
+        drafting path; NVIDIA and AMD alike) and the old file stays on the disk; where the GGUF is not downloaded the
+        engine drafts with the old file (the same size and sha256 - another is not taken).  The GGUF already here:
+        no download."""
         d, gguf = self.files()
         old, new = d / "mtp.safetensors", d / "dspark-Inkling-2-Mini-Q8_0.gguf"
         new.unlink(missing_ok=True)
         with open(old, "wb") as fh:
             fh.truncate(635801416)
-        self.assertEqual(self.drafter_run(d, amd_pc=True), (old, []))    # (AMD: its own form, no download)
-        got, calls = self.drafter_run(d, fetched=False)                  # (NVIDIA, the download declined: the old file)
-        self.assertEqual((got, [c[3] for c in calls]), (old, [[new.name]]))
+        for amd_pc in (False, True):                                     # (the download declined: the old file)
+            got, calls = self.drafter_run(d, amd_pc=amd_pc, fetched=False)
+            self.assertEqual((got, [c[3] for c in calls]), (old, [[new.name]]))
         got, calls = self.drafter_run(d, good=False, fetched=False)      # (its size, another sha256: not taken)
         self.assertEqual((got, [c[3] for c in calls]), (None, [[new.name]]))
-        got, calls = self.drafter_run(d)                                 # (NVIDIA: the GGUF fetched from Maya's repo)
+        got, calls = self.drafter_run(d)                                 # (the GGUF fetched from Maya's repo)
         self.assertEqual((got, [c[2:] for c in calls]), (new, [("drafter", [new.name])]))
         self.assertEqual(old.stat().st_size, 635801416)                  # (the old file stays)
         self.assertEqual(self.drafter_run(d), (new, []))                 # (again: nothing to download)
-        self.assertEqual(self.drafter_run(d, amd_pc=True), (old, []))
+        self.assertEqual(self.drafter_run(d, amd_pc=True), (new, []))    # (AMD: the GGUF too)
         old.unlink()
-        got, calls = self.drafter_run(d, amd_pc=True, fetched=False)     # (AMD with the GGUF alone, declined: used)
-        self.assertEqual((got, [c[3] for c in calls]), (new, [["mtp.safetensors"]]))
+        self.assertEqual(self.drafter_run(d, amd_pc=True), (new, []))
         new.unlink()
         with open(old, "wb") as fh:
             fh.truncate(1000)                                            # (another size: not the drafter)
@@ -519,7 +524,8 @@ class Steps(unittest.TestCase):
         """tools/ik2_fit.py's drafter room (maya-ik2's draft_room): 24 GB cards hold it up to about 200K tokens with the
         FP8 cache, 32 GB at 262K; it grows 4 KiB a token (its attention's logits in shared memory, no scratch a token)."""
         self.assertTrue(F.draft_fits(24, 131072, "fp8"))
-        self.assertFalse(F.draft_fits(24, 262144, "fp8"))         # (the engine measures: FP8 rows may still fit)
+        self.assertTrue(F.draft_fits(24, 262144, "fp8"))          # (as the engine: its plan's sum, FP8 rows)
+        self.assertTrue(F.draft_fits(12, 32768, "fp8"))           # (a small card: the tier's room)
         self.assertTrue(F.draft_fits(24, 524288, "fp8"))          # (the offload path: the tier's room)
         self.assertTrue(F.draft_fits(32, 1048576, "fp8"))         # (... its drafts read the last positions)
         self.assertFalse(F.draft_fits(16, 1048576, "fp8"))        # (the cache streams)
@@ -531,8 +537,8 @@ class Steps(unittest.TestCase):
         """Volta / Turing and the offload path run with drafting off; sm_80+ with every expert in VRAM and AMD keep it."""
         self.assertIn("Volta", F.drafting_off_reason("70", 32, 65536, "fp8"))
         self.assertIn("Volta", F.drafting_off_reason("75", 24, 65536, "fp8"))
-        self.assertIn("--drafting on", F.drafting_off_reason("86", 8, 65536, "fp8"))   # (NVIDIA offload: by hand)
-        self.assertIn("--drafting on", F.drafting_off_reason("86", 24, 524288, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("86", 8, 32768, "fp8"))      # (NVIDIA offload: auto measures it)
+        self.assertIsNone(F.drafting_off_reason("86", 24, 524288, "fp8"))
         self.assertIn("streams", F.drafting_off_reason("86", 16, 1048576, "fp8"))
         self.assertIsNone(F.drafting_off_reason("86", 24, 65536, "fp8"))
         self.assertIsNone(F.drafting_off_reason("120", 32, 262144, "fp8"))
@@ -558,16 +564,18 @@ class Steps(unittest.TestCase):
         return seen, " ".join(said)
 
     def test_setup_drafting_off_where_it_does_not_run(self):
-        """Volta / Turing and offload layouts: no drafter downloaded, drafting off, one line saying why."""
-        for gpu in (card(32, arch="70", name="Tesla V100"), card(24, arch="75", name="RTX 2080 Ti"), card(8)):
+        """Volta / Turing: no drafter downloaded, drafting off, one line saying why."""
+        for gpu in (card(32, arch="70", name="Tesla V100"), card(24, arch="75", name="RTX 2080 Ti")):
             seen, said = self.run_setup(gpu, drafting="on")
             self.assertEqual(seen["drafting"], "off", gpu)
             self.assertIsNone(seen["drafter"], gpu)
             self.assertIn("drafting off", said)
 
     def test_setup_drafting_kept_where_it_runs(self):
-        """NVIDIA sm_80+ holding every expert and AMD: the drafter is fetched and drafting stays auto."""
-        for gpu, backend in ((card(24), "cuda"), (card(32, arch="120"), "cuda"), (amd("gfx1100", 24), "hip")):
+        """NVIDIA sm_80+ (every expert in VRAM, or the offload layout: auto measures it there) and AMD: the drafter is
+        fetched and drafting stays auto."""
+        for gpu, backend in ((card(24), "cuda"), (card(32, arch="120"), "cuda"), (card(8), "cuda"),
+                             (amd("gfx1100", 24), "hip")):
             seen, said = self.run_setup(gpu, backend=backend)
             self.assertIsNone(seen["drafting"], gpu)
             self.assertEqual(seen["drafter"].name, "mtp.safetensors", gpu)

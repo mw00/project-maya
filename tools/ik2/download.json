@@ -22,7 +22,7 @@
   "legacy_names": ["mmproj-BF16.gguf"]
  },
  "drafter": {
-  "_": "Drafting: Inkling-2-Mini's own drafter (a DSpark-style draft model; Apache 2.0) from Maya's own repo at a pinned revision, in its two forms, the same drafter in each: unsloth's GGUF of it (llama.cpp's dflash architecture, Q8_0 matrices - their dspark-Inkling-2-Mini-Q8_0.gguf byte for byte), which maya-ik2 reads on its fastest drafting path (\"default\": what the setup fetches), and thinkingmachines' mtp.safetensors (BF16, byte for byte), the form measured on AMD (\"amd\": what the setup fetches there). A whole copy of the PC's form already beside the model (the same size and sha256) is not downloaded again; an earlier setup's mtp.safetensors on NVIDIA stays on the disk beside the GGUF the setup then fetches. Read by maya-ik2 --draft; not with --drafting off. With --drafting auto the engine measures once on the PC whether it (or the prompt lookup) makes answers faster, and drafting never changes the answers.",
+  "_": "Drafting: Inkling-2-Mini's own drafter (a DSpark-style draft model; Apache 2.0) from Maya's own repo at a pinned revision, in its two forms, the same drafter in each: unsloth's GGUF of it (llama.cpp's dflash architecture, Q8_0 matrices - their dspark-Inkling-2-Mini-Q8_0.gguf byte for byte), which maya-ik2 reads on its fastest drafting path (\"default\" and \"amd\": what the setup fetches, on NVIDIA and on AMD - measured on both), and thinkingmachines' mtp.safetensors (BF16, byte for byte), which earlier setups fetched. A whole copy of the GGUF already beside the model (the same size and sha256) is not downloaded again; an earlier setup's mtp.safetensors stays on the disk beside the GGUF the setup then fetches. Read by maya-ik2 --draft; not with --drafting off. With --drafting auto the engine measures once on the PC whether it (or the prompt lookup) makes answers faster, and drafting never changes the answers.",
   "repo": "peasantsmith/Inkling-2-Mini-Maya-GGUF",
   "revision": "37027719327de5f574684b525ad88fe50c4ff222",
   "folder": "drafter",
@@ -32,6 +32,6 @@
    "mtp.safetensors": [635801416, "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2"]
   },
   "default": "dspark-Inkling-2-Mini-Q8_0.gguf",
-  "amd": "mtp.safetensors"
+  "amd": "dspark-Inkling-2-Mini-Q8_0.gguf"
  }
 }

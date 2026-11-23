@@ -376,9 +376,16 @@ back, the model checks every token as ever; the start line says it). The window 
 (the resident kernels over the tier's, a lent or a staged expert's bytes - `off_fetch_plan_win` copies a window's
 missing experts once for all its tokens), so drafting on = off to the token there too. It runs on one GPU with the
 whole cache in VRAM: where part of the cache streams from RAM, on two GPUs and under lane parity (`IK2_LANE` by hand)
-drafting stays off with a NOTE. AMD: `--drafting auto` measures it as everywhere. NVIDIA: `--drafting on` takes it
-(mode A instead of lane parity); `auto` keeps plain decoding on the offload path until the window is measured
-against lane parity on those cards.
+drafting stays off with a NOTE. `--drafting auto` measures it once on the PC as everywhere. On NVIDIA, where plain
+decoding on the offload path is lane parity wherever that is the faster mode, the measurement times plain decoding in
+that mode against drafting in mode A and keeps the faster; the choice is remembered with the drafting calibration, so
+every start decodes in the same mode (the start line says which, and the figures), and `--drafting on` / `off` still
+decide by hand (mode A with drafting / plain decoding).
+
+Deep in a long context a window can cost more than the plain tokens it gives. The controller times an answer's
+drafting rounds against its plain tokens at the depth the answer is at, and where the rounds give fewer tokens a
+second the answer goes on in plain tokens, with a rare look again (`IK2_DRAFT_GATE=0`: without). Only the speed
+changes: the tokens are the same with drafting or without.
 
 Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
 document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens - the recent share of
@@ -481,8 +488,8 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 |---|---|---|
 | `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
 | `mmproj-Inkling-2-Mini-BF16.gguf` (0.6 GB, pictures; unsloth's `mmproj-BF16.gguf` byte for byte, an existing copy is kept) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`vision/`) | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
-| `dspark-Inkling-2-Mini-Q8_0.gguf` (0.4 GB, the drafter as a GGUF, Q8_0: the setup fetches it on NVIDIA, not with `--drafting off`; unsloth's file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773` |
-| `mtp.safetensors` (0.6 GB, the same drafter as published, BF16: the setup fetches it on AMD; thinkingmachines' file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
+| `dspark-Inkling-2-Mini-Q8_0.gguf` (0.4 GB, the drafter as a GGUF, Q8_0: the setup fetches it, on NVIDIA and on AMD, not with `--drafting off`; unsloth's file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773` |
+| `mtp.safetensors` (0.6 GB, the same drafter as published, BF16: what earlier setups fetched, still read where it is; thinkingmachines' file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
 Outside the preview, the older two-GPU mode with a loop runs as expert parallel (`IK2_EP=1`, its caches filled at the
 start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; refused where the copies between the cards would have to go

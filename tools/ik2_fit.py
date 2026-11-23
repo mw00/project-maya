@@ -138,6 +138,9 @@ DRAFT_TOKEN_BYTES = 4096                            # its 2 rings, its attention
                                                     # (its attention's logits in shared memory: no scratch a token)
 
 
+PLAN_DENSE_GIB = 1.1                                # the engine's own sum for the drafter's room (maya-ik2's fit block):
+PLAN_RESERVE_GIB = 1.5                              # the experts, the dense weights as blocks, the cache and its
+                                                    # reserve (work buffers, room) - less than BASE_GIB's measured use
 OFF_WIN_STAGE_GIB = 0.7                             # the offload path's verify window: 64 staging slots a slot size
 DRAFT_MIN_ROWS = 65536                              # the fewest context rows the engine plans for the drafter there
 
@@ -148,14 +151,17 @@ def draft_gib(ctx: int) -> float:
 
 
 def draft_fits(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> bool:
-    """Whether the drafter's room fits beside the model at `ctx` on this card with every expert in VRAM - where it
-    does not, the engine leaves it out at its start (the plan stays as without it; the prompt lookup still drafts).
-    A card whose VRAM is not known: True (the engine measures)."""
+    """Whether the drafter's room fits beside the model at `ctx` on this card - where it does not, the engine leaves
+    it out at its start (the plan stays as without it; the prompt lookup still drafts).  With every expert in VRAM
+    the engine's own check: its plan's sum (the experts, the dense weights, the cache, its reserve) and the drafter
+    with FP16 context rows, else FP8 ones - so a 24 GB card drafts at 262,144 as the engine does.  A card whose VRAM
+    is not known: True (the engine measures)."""
     if not vram_gb:
         return True
     p = plan(vram_gb, ctx, kv)
     if p["resident"]:    # (its context rows FP16, else FP8: half of them)
-        return float(vram_gb) - MARGIN_GIB >= need_gib(ctx, kv) + draft_gib(ctx) - ctx * DRAFT_TOKEN_BYTES / GIB / 2
+        used = EXPERTS_GIB + PLAN_DENSE_GIB + ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB + PLAN_RESERVE_GIB
+        return float(vram_gb) - MARGIN_GIB >= used + draft_gib(ctx) - ctx * DRAFT_TOKEN_BYTES / GIB / 2
     # the offload path with the whole cache in VRAM: the tier gives the drafter's room, at most half of its own - the
     # verify window's staging and at least DRAFT_MIN_ROWS of FP8 context rows (the last positions) with it
     least = DRAFT_BASE_GIB + OFF_WIN_STAGE_GIB + min(ctx, DRAFT_MIN_ROWS) * DRAFT_TOKEN_BYTES / GIB / 2
@@ -166,10 +172,10 @@ def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hi
                         apu: bool = False) -> str | None:
     """Why drafting is off on this card (one line), or None: NVIDIA Volta / Turing (sm_70 / sm_75: the drafter's window
     needs sm_80 or newer) run without it.  The offload path (the card does not hold every expert: a small card, or a
-    long context) drafts where its whole cache stays in VRAM and the experts' tier has the drafter's room: on AMD as
-    everywhere (--drafting auto measures it), on NVIDIA with --drafting on only (auto keeps plain decoding there - its
-    window is not measured against lane parity yet).  NVIDIA sm_80+ and AMD with every expert in VRAM keep it (an AMD
-    APU always).  An arch or VRAM not known counts as not a reason."""
+    long context) drafts where its whole cache stays in VRAM and the experts' tier has the drafter's room, on AMD and
+    NVIDIA alike: --drafting auto measures it once on the PC (on NVIDIA against plain decoding in the PC's own mode -
+    lane parity where that is faster - and keeps the faster, the same at every start).  NVIDIA sm_80+ and AMD with
+    every expert in VRAM keep it (an AMD APU always).  An arch or VRAM not known counts as not a reason."""
     off_cache = ("drafting off: at this context part of the cache streams from RAM, where drafting does not run - a "
                  "smaller context or a bigger card brings it back")
     off_room = ("drafting off: at this context the experts' tier has no room for the drafter - a smaller context or a "
@@ -191,8 +197,6 @@ def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hi
             return off_cache
         if not draft_fits(vram_gb, ctx, kv):
             return off_room
-        return ("drafting off with --drafting auto: the card does not hold every expert at this context (the offload "
-                "path) - --drafting on drafts there (the same answers; not measured against plain decoding by auto yet)")
     return None
 
 
