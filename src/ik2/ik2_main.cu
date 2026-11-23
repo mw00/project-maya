@@ -7843,6 +7843,9 @@ int main(int argc, char** argv) {
                             g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes());
             }
             use_dev(0);
+            // (the split's GPU 1 was made current above without use_dev: back to GPU 0 - else the first request's
+            //  launches met GPU 1's context, "invalid resource handle": two GPUs through the server since v1.1.74)
+            if (g_two.on) CU(cudaSetDevice(0));
             if (g_par > 1) std::printf("READY %d stop multi=%d\n", ctx_s, g_par);
             else std::printf("READY %d stop\n", ctx);
         } else {
