@@ -2425,6 +2425,14 @@ class VisionRoomOnDemand(unittest.TestCase):
             v._start()
         return v, proc, popen.call_args
 
+    def test_pictures_reserve_nothing_in_the_engine(self):
+        """(the start plan - context, cache, drafter - is the same with pictures on or off: the server hands maya-ik2
+        no room figure for the encoder, and the engine's drafter check reads none; a 24 GB card at 262,144 lost its
+        drafter to that figure)"""
+        root = Path(__file__).resolve().parent.parent
+        for f in ("serve/server.py", "src/ik2/ik2_main.cu"):
+            self.assertNotIn("IK2_VISION_GIB", (root / f).read_text(encoding="utf-8"), f)
+
     def test_on_the_gpu_when_it_has_room(self):
         v, proc, call = self.start(True)
         self.assertEqual(call[0][0], ["maya-vision", "--mmproj", "mmproj-BF16.gguf", "--gpu", "--max-tokens", "1024",
