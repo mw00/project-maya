@@ -103,6 +103,24 @@ class Manifest(unittest.TestCase):
         self.assertEqual(man["files"][man["gguf"]][1],
                          "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")   # (the author's)
 
+    def test_ablate_direction_entry(self):
+        """The refusal direction: Maya's repo, folder refusal-directions/; its revision and sha256 stay PLACEHOLDERs until
+        the file is uploaded (then the setup reads main and checks the file's shape), a real pin is used as pinned."""
+        man = json.loads(maya.IK2_MANIFEST.read_text(encoding="utf-8"))["ablate"]
+        name = "Inkling-2-Mini-refusal-direction.gguf"
+        self.assertEqual((man["repo"], man["folder"]), ("peasantsmith/Inkling-2-Mini-Maya-GGUF", "refusal-directions"))
+        self.assertEqual(list(man["files"]), [name])
+        self.assertEqual(maya.ABLATE_DIRECTIONS["ik2"], ("Inkling-2-Mini", man["repo"]))
+        if man["revision"] == "PLACEHOLDER":
+            self.assertIsNone(maya.ablate_pin("ik2", name))
+        pinned = {"ablate": {"revision": "a" * 40, "files": {name: [9760, "b" * 64]}}}
+        with patch.object(maya, "read_json", lambda p: pinned):
+            self.assertEqual(maya.ablate_pin("ik2", name), ("a" * 40, 9760, "b" * 64))
+            self.assertIsNone(maya.ablate_pin("glm", name))
+        pinned["ablate"]["files"][name][1] = "PLACEHOLDER"
+        with patch.object(maya, "read_json", lambda p: pinned):
+            self.assertIsNone(maya.ablate_pin("ik2", name))
+
     def test_drafter_pinned(self):
         """Drafting: the model's own drafter from Maya's own repo at a pinned revision, folder drafter/, by size and
         sha256 (the ones docs/INKLING2.md lists) - the GGUF (Q8_0), on NVIDIA and on AMD; thinkingmachines'
@@ -571,7 +589,7 @@ class Steps(unittest.TestCase):
                                lambda *a, **k: seen.update(amd=a[-1]) or seen.setdefault("drafter", d / "mtp.safetensors"))
         cfg = patch.object(maya, "write_config_ik2", lambda a, *r: seen.update(drafting=a.drafting, drafter=r[-1]))
         said = []
-        with patch.object(maya, "check_pc", return_value=pc), patch.object(maya, "mem_gb", return_value=(ram, 10.0)),                 patch.object(maya, "choose_context", lambda a, prev, opts, rec: 65536),                 stub("ik2_dir", d), stub("tools_step", d), stub("build_step", {}), stub("ik2_model_step", gguf),                 stub("ik2_tokenizer_step", d), stub("ik2_vision_step", None), drafter, cfg,                 patch.object(maya.IK2_EXE.__class__, "exists", lambda self: True),                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", lambda *a: None),                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "hip_unified_memory", lambda g: False), patch.object(maya, "WIN", False):
+        with patch.object(maya, "check_pc", return_value=pc), patch.object(maya, "mem_gb", return_value=(ram, 10.0)),                 patch.object(maya, "choose_context", lambda a, prev, opts, rec: 65536),                 stub("ik2_dir", d), stub("tools_step", d), stub("build_step", {}), stub("ik2_model_step", gguf),                 stub("ik2_tokenizer_step", d), stub("ik2_vision_step", None), stub("ablate_step", None), drafter, cfg,                 patch.object(maya.IK2_EXE.__class__, "exists", lambda self: True),                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", lambda *a: None),                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "hip_unified_memory", lambda g: False), patch.object(maya, "WIN", False):
             maya.set_up_ik2(self.va(**kw), {})
         return seen, " ".join(said)
 
