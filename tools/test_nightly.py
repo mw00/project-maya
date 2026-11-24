@@ -153,6 +153,33 @@ class Night(unittest.TestCase):
         self.assertEqual(self.night(busy=lambda cfg, m: N.extra_locks_held(N.extra_locks(cfg, m))), 3)
         self.assertEqual((self.root / "lock-v100").read_text(), "another helper\n")
 
+    def slow_then(self, second_line):
+        """A night whose first compare run reads slow (answers equal) and whose second reads `second_line`."""
+        self.capture()
+        lines, calls = [LINE.replace("+0.3%", "-28.0%").replace("-8.6%", "-0.6%"), second_line], []
+
+        def bench(root, m, cfg_path, base, st, tokens_file, log):
+            calls.append(1)
+            Path(log).write_text("bench output\n")
+            tokens_file.write_text(json.dumps(dict(self.tok, records=[lines[len(calls) - 1]])))
+            return 0
+        run = lambda root, m, base, st, say: N.run_model(root, m, base, st, say, bench=bench,  # noqa: E731
+                                                         busy=lambda c, m: [])
+        code = N.night(self.root, self.doc, self.said.append, run=run)
+        return code, len(calls), (self.root / N.STATUS).read_text()
+
+    def test_a_slow_run_is_run_again_before_it_is_called_slow(self):
+        code, calls, status = self.slow_then(LINE.replace("-8.6%", "-0.6%"))
+        self.assertEqual((code, calls), (0, 2))
+        self.assertIn("PASS    A (one)", status)
+        self.assertIn("first try decode -28.0%, not on the second try (a disturbed run)", status)
+
+    def test_slow_twice_is_slow(self):
+        code, calls, status = self.slow_then(LINE.replace("+0.3%", "-27.0%").replace("-8.6%", "-0.6%"))
+        self.assertEqual((code, calls), (1, 2))
+        self.assertIn("SLOW    A (one)", status)
+        self.assertIn("first try decode -28.0% - run again; slower than the previous release: decode -27.0%", status)
+
     def test_a_failed_bench_is_an_error_line(self):
         def bench(root, m, cfg_path, base, st, tokens_file, log):
             Path(log).write_text("the engine stopped while loading\n")

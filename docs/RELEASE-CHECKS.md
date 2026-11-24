@@ -118,8 +118,11 @@ PASS | 2026-11-24 | Jupiter | 8c618a59 vs v1.1.76 | 2 of 2 model(s) ran | 9.4 mi
 ```
 
 - `DIFF`: the answers differ from the previous release, or from the saved ones (the line says which request, which
-  token). `SLOW`: decode or a prompt size is `slow_pct` or more below the previous release. `ERROR`: the run stopped
-  (its output: `maya-nightly-<model>.log`).
+  token). `SLOW`: decode or a prompt size is `slow_pct` or more below the previous release - on two runs in a row: a
+  slow run with equal answers is run again once (`"retry_slow": false` turns that off), because a job that starts
+  beside the run, or model files gone cold in the page cache, slow one build's first round only (seen on the first
+  night: -28% on identical code, gone on the next run). `ERROR`: the run stopped (its output:
+  `maya-nightly-<model>.log`).
 - `BUSY`: the machine was not free for `wait_min` minutes (another job on the GPU, a held lock, CPU load 2 or more,
   the heat flag); the model is skipped and nothing was started. `SKIPPED`: it no longer fits the night's budget. The
   budget is printed first, from each model's last run time.

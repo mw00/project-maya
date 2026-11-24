@@ -252,20 +252,30 @@ def run_model(root: Path, m: dict, base: str, st: dict, say, bench=run_bench, bu
         # (the run's tokens are kept beside its log: maya_golden --from-tokens can check or capture from them later)
         tokens_file = root / f"maya-nightly-{MG.slug(m['name'])}.tokens.json"
         log = root / f"maya-nightly-{MG.slug(m['name'])}.log"
-        tokens_file.unlink(missing_ok=True)
-        code = bench(root, m, cfg_path, base, st, tokens_file, log)
-        if code or not tokens_file.exists():
-            tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-2:] \
-                if log.exists() else []
-            quiet = any("not quiet enough" in x for x in tail)
-            return dict(out, status="BUSY" if quiet else "ERROR", secs=time.time() - t,
-                        why=[f"--bench stopped (exit {code}, {log.name}): " + " / ".join(x.strip() for x in tail)])
-        tokens = json.loads(tokens_file.read_text(encoding="utf-8"))
-        exact, speeds = compare_parts((tokens.get("records") or [""])[-1])
-        res, _ = MG.check(tokens, cfg, MG.golden_dir(root), m.get("layout", ""))
-        status, why = verdict(exact, speeds, res, float(st["slow_pct"]))
-        return {"status": status, "why": why, "exact": exact, "speeds": speeds, "secs": time.time() - t,
-                "golden": MG.verdict_line(res) if res else "none saved"}
+        first_try = []
+        for attempt in (1, 2):
+            tokens_file.unlink(missing_ok=True)
+            code = bench(root, m, cfg_path, base, st, tokens_file, log)
+            if code or not tokens_file.exists():
+                tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-2:] \
+                    if log.exists() else []
+                quiet = any("not quiet enough" in x for x in tail)
+                return dict(out, status="BUSY" if quiet else "ERROR", secs=time.time() - t, why=first_try + [
+                    f"--bench stopped (exit {code}, {log.name}): " + " / ".join(x.strip() for x in tail)])
+            tokens = json.loads(tokens_file.read_text(encoding="utf-8"))
+            exact, speeds = compare_parts((tokens.get("records") or [""])[-1])
+            res, _ = MG.check(tokens, cfg, MG.golden_dir(root), m.get("layout", ""))
+            status, why = verdict(exact, speeds, res, float(st["slow_pct"]))
+            # (slow with equal answers: once more before it is called SLOW - a job that started beside the run, or
+            #  the model's files gone cold in the page cache, slows one build's first round only)
+            if status != "SLOW" or attempt == 2 or not st.get("retry_slow", True):
+                break
+            first_try = ["first try " + why[-1].split(": ", 1)[-1] + " - run again"]
+            say(f"{m['name']}: {first_try[0]}")
+        if first_try and status == "PASS":
+            first_try = [first_try[0].replace(" - run again", ", not on the second try (a disturbed run)")]
+        return {"status": status, "why": first_try + why, "exact": exact, "speeds": speeds,
+                "secs": time.time() - t, "golden": MG.verdict_line(res) if res else "none saved"}
     except (OSError, ValueError, KeyError) as e:
         return dict(out, why=[f"{type(e).__name__}: {e}"], secs=time.time() - t)
     finally:
