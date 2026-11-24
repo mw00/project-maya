@@ -381,13 +381,19 @@ def wait_quiet(backend, gpus, wait_min: float, say, lock_note="") -> list:
 
 
 def take_locks(backend, gpus, note) -> list:
+    """Create our lock files - each only if nobody has it (created in one step: of two runs that found the machine
+    quiet in the same second, one gets the file).  Returns the ones taken; held_locks(names, note) then lists any
+    that went to the other run."""
     taken = []
     for d in lock_dirs():
         for n in lock_names(backend, gpus):
             p = d / n
-            if not p.exists():
-                p.write_text(note + "\n")
+            try:
+                with open(p, "x", encoding="utf-8") as f:
+                    f.write(note + "\n")
                 taken.append(p)
+            except OSError:                      # (somebody's already: theirs)
+                pass
     return taken
 
 

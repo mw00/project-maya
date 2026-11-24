@@ -7084,6 +7084,11 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
              f"wait for it (or give it longer: {ME} --bench --bench-wait <minutes>), then run --bench again")
     t_quiet = time.time() - t_all
     locks = MB.take_locks(backend, gpus, note)
+    lost = MB.held_locks(MB.lock_names(backend, gpus), note)   # (another run that found it quiet in the same second)
+    if lost:
+        MB.release_locks(locks, note)
+        fail("this machine is not quiet enough for a speed number: another run took " +
+             ", ".join(f"{p} ({who or 'no note'})" for p, who in lost) + " first", "run --bench again")
     try:
         tok = ST.Tokenizer.from_dir(tp)
         ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768

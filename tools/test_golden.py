@@ -66,6 +66,23 @@ class BenchParts(unittest.TestCase):
             self.assertNotEqual(MB.choice_files(r, {}), c)
 
 
+class Locks(unittest.TestCase):
+    def test_two_runs_that_found_it_quiet_together_do_not_both_get_a_gpu(self):
+        import os
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"MAYA_GPU_LOCKS": d}), \
+                patch.object(MB, "LOCK_DIRS", ()):
+            a = MB.take_locks("cuda", [0, 1, 2], "run A")
+            b = MB.take_locks("cuda", [2], "run B")           # (the file is A's already: not taken, not rewritten)
+            self.assertEqual(([p.name for p in a], b), (["gpu0", "gpu1", "gpu2"], []))
+            self.assertEqual(MB.held_locks(["gpu2"], "run B"), [(str(Path(d) / "gpu2"), "run A")])
+            self.assertEqual(MB.held_locks(["gpu0", "gpu1", "gpu2"], "run A"), [])
+            MB.release_locks(b, "run B")
+            self.assertTrue((Path(d) / "gpu2").exists())
+            MB.release_locks(a, "run A")
+            self.assertEqual(os.listdir(d), [])
+
+
 class Sets(unittest.TestCase):
     def test_same_run_passes(self):
         s = G.make_set(tokens(), CFG)
