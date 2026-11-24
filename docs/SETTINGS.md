@@ -1538,14 +1538,20 @@ the sampling settings), which starts at the model's default. Off by default ever
 
 The switch is there only when the model has a direction file and its engine projects one: DeepSeek (`maya-ds4`),
 MiniMax (`maya-mm3`, not with `--tp`: the tensor-parallel path does not project), and GLM-5.3-Flash and GLM-5.3
-(`maya --glm-pack ... --ablate FILE`, a control vector of the model's hidden size; not on the Mac engine). Qwen has
-none. Maya's own direction files are published for DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash, GLM-5.3-Flash and GLM-5.3 (the setup
-downloads them, see below); for another model `tools/ablate_fit.py` fits one. On GLM the projection covers every write of the
+(`maya --glm-pack ... --ablate FILE`, a control vector of the model's hidden size; not on the Mac engine) and
+Inkling-2-Mini (`maya-ik2`, not with `IK2_EP` / `IK2_TP`, which sum the residual on the other card). Qwen has
+none. Maya's own direction files are published for DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash, GLM-5.3-Flash, GLM-5.3 and
+Inkling-2-Mini (the setup downloads them, see below); for another model `tools/ablate_fit.py` fits one. On GLM the projection covers every write of the
 main layers on every path - the decode token, the verify windows, the batched rows of `--parallel` (each row by its
 own conversation), the prompt chunks, every card of a split and the experts the CPU lane computes (they join the FFN
 output before it is projected; the lossy `MAYA_GLM_DEFER_CPU` deferral is skipped for a projecting conversation). The
 draft heads (the MTP block, DFlash) only propose tokens and are left as they are: the main layers check every draft,
-so the tokens kept are the ablated model's. Without a file, the Models page
+so the tokens kept are the ablated model's. On Inkling-2-Mini the projection covers the two writes of every layer
+visit - the attention's (the short conv's output, before it joins the stream or starts a block) and the MoE's - so the
+three passes of the looped core each project their own: the token path, the verify windows, the prompt chunks, the
+batched rows of `--parallel` (each row by its own conversation), two GPUs and the offload path with the experts in RAM.
+The drafter (the DSpark model and the prompt lookup) only proposes: the main layers check every draft, so drafting
+on and off give the same tokens with the direction on. Without a file, the Models page
 and the Chat show no switch, `/health` and `/props` say `"ablate": {"available":
 false, ...}`, and a request with `"ablate": true` gets a 400 (an answer that came back unchanged could not be told from
 one that was ablated).
@@ -1572,7 +1578,7 @@ at), `maya.ablate.model`, `maya.ablate.fitted_on` (the quant it was fitted on) a
 names it as `"ablate": {"file": "<path>", "fitted_on": "<quant>"}` (optional `"scale"`), with `--ablate FILE
 --ablate-default off` in its engine `args`. The setup downloads the file from the `refusal-directions/` folder of the
 model's own Maya repo, or from the repo's top when that folder has none (`GLM-5.3-Flash`, `GLM-5.3`,
-`DeepSeek-V4.1-Flash` and `MiniMax-M3.1-Flash-refusal-direction.gguf`, a few KB, into
+`DeepSeek-V4.1-Flash`, `MiniMax-M3.1-Flash` and `Inkling-2-Mini-refusal-direction.gguf`, a few KB, into
 `<models folder>/refusal-directions/`), and writes both; when the repo has none yet, there is no connection or the file
 is not a direction for that model, the setup goes on without it and the switch stays off. A file named by hand (outside
 that folder) is kept as it is.
@@ -1585,6 +1591,13 @@ residual write of the prompt's last token into the file instead of projecting - 
 two sets' mean residual at each layer, ranks the layers on the held-out prompts and writes the best one's direction
 with its `maya.ablate.*` metadata. `eval` measures a direction against a normal server: the refusal rate on the
 held-out prompts with ablation off and on, and loops, empty answers and length on the everyday prompts.
+
+On a looped model (Inkling-2-Mini) a "layer" of the fit is a layer **visit**: the engine reads out the two writes of each
+of the 48 visits in the order they run, so `fit` ranks the 48 visits (those from 20% to 80% of the depth are
+candidates) and the direction of the best one is written (`maya.ablate.fit_layer` is that visit's index, 1-48) - the
+sum of the writes up to a visit stands in for the stream there, as the streams' mean does on DeepSeek. The file's one
+direction is then projected out at every visit's writes, as on the other models. A prompt is read in one chunk for the
+fit (up to 512 tokens: the fitting sets' prompts are well below that).
 
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 

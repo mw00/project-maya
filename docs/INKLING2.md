@@ -499,6 +499,22 @@ VRAM; lane parity (`IK2_LANE=1`) sums in other bits there and is a test option. 
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`
 0.2, `medium` 0.7, `high` 0.9 (the template's default), `xhigh` and `max` 0.99.
 
+**Refusal ablation** (`--ablate FILE --ablate-default off`, a request's `"ablate": true`; docs/SETTINGS.md "Refusal
+ablation per request"). The setup downloads `Inkling-2-Mini-refusal-direction.gguf` (a few KB, a control vector of the
+model's hidden size, `refusal-directions/` of Maya's repo) and loads it off by default; the Models page's **Refusal
+ablation** switch and each request's `ablate` field turn it on, as on every other model. The engine projects the unit
+direction r out of every residual write of every layer visit, y <- y - s r (r . y): the short conv's output after the
+attention and the one after the MoE, before either joins the stream (a block's first write starts the stream again).
+The looped core's three passes each project their own writes (48 visits, 96 writes a token). The same `project_res`
+launch does it on every path (the token path and its graph, the verify windows, the prompt chunks, `--parallel`'s
+rows, two GPUs, the offload path); a conversation that does not ask runs the launches it always did, so the answers
+and the speed with the option off are the release's. The drafter only proposes and the main layers check every draft,
+so drafting stays exact with the direction on. A conversation's kept state was read with one setting: a request with
+the other one starts it over. `IK2_EP` / `IK2_TP` (the experts split over two cards, the residual summed on the other
+one) do not project: the engine says so and loads no direction there. Fitting a direction: `MAYA_ABLATE_CAPTURE=<file>`
+makes the engine read out each visit's two writes (the last prompt token's row, as on the other engines) instead of
+projecting, and `tools/ablate_fit.py` takes it from there; the visit index plays the layer's part.
+
 **Files** (Apache 2.0, the model and unsloth's GGUF alike):
 
 | File | Repository | sha256 |

@@ -6540,8 +6540,7 @@ int main(int argc, char** argv) {
     if (abl::path.empty() && (abl::layer != 0 || abl::want_scale != 0.0f))
         die(std::string(abl::layer != 0 ? "--ablate-layer" : "--ablate-scale") + " without --ablate FILE: nothing to project out");
     if (!abl::path.empty() && dual()) {   // (the expert-parallel / tensor-parallel modes sum the residual on the other GPU)
-        std::fprintf(stderr, "NOTE: IK2_EP / IK2_TP: no --ablate (those modes do not project; the layer split does)
-");
+        std::fprintf(stderr, "NOTE: IK2_EP / IK2_TP: no --ablate (those modes do not project; the layer split does)\n");
     } else if (!abl::path.empty()) {   // (the direction read once, a copy on every GPU)
         abl::scale = abl::want_scale;
         std::string err;
@@ -6555,8 +6554,7 @@ int main(int argc, char** argv) {
         CU(cudaSetDevice(0));
         abl::loaded = true;
         for (bool& o : abl::on) o = abl::dflt;
-        std::fprintf(stderr, "%s (default %s)
-", abl::what.c_str(), abl::dflt ? "on" : "off");
+        std::fprintf(stderr, "%s (default %s)\n", abl::what.c_str(), abl::dflt ? "on" : "off");
     }
     if (dual()) {
         // (their copies are the runtime's peer copies: peer access only where mm3_link.cuh's test copy passes, and
@@ -8326,8 +8324,7 @@ int main(int argc, char** argv) {
             }
             use_dev(0);
             if (abl::loaded)   // (--ablate: GEN ablate=0|1 turns its projection off / on for a request)
-                std::printf("INFO ablate=1 ablate_default=%d
-", abl::dflt ? 1 : 0);
+                std::printf("INFO ablate=1 ablate_default=%d\n", abl::dflt ? 1 : 0);
             // (the split's GPU 1 was made current above without use_dev: back to GPU 0 - else the first request's
             //  launches met GPU 1's context, "invalid resource handle": two GPUs through the server since v1.1.74)
             if (g_two.on) CU(cudaSetDevice(0));
