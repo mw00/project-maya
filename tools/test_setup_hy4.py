@@ -895,7 +895,9 @@ class Fit(unittest.TestCase):
     def test_the_step(self):
         said = []
         note = lambda *a: said.append(" ".join(map(str, a)))   # noqa: E731
-        quiet = [patch.object(maya, "fail", fail), patch.object(maya, "ok", note),
+        # This case exercises VRAM-only fitting; host RAM must not enable KV streaming.
+        quiet = [patch.object(maya, "mem_gb", return_value=(0, 0)),
+                 patch.object(maya, "fail", fail), patch.object(maya, "ok", note),
                  patch.object(maya, "warn", note), patch.object(maya, "say", note)]
         with contextlib.ExitStack() as st:
             for p in quiet:
@@ -923,6 +925,22 @@ class Fit(unittest.TestCase):
                 maya.hy4_fit_step(args(context=131072), {"gpus": [card(8)]}, "maya-xs")
             with with_manifest(manifest()), self.assertRaisesRegex(Failed, "not available yet"):
                 maya.hy4_fit_step(args(), {"gpus": [card(24)]}, "maya-s")
+
+    def test_the_step_with_ram_backed_kv(self):
+        for ram in (64, 768):
+            with self.subTest(ram_gb=ram):
+                said = []
+                note = lambda *a: said.append(" ".join(map(str, a)))  # noqa: E731
+                with patch.object(maya, "mem_gb", return_value=(ram, ram)), \
+                        patch.object(maya, "gpu_used_mib", return_value={0: 400}), \
+                        patch.object(maya, "fail", fail), patch.object(maya, "ok", note), \
+                        patch.object(maya, "warn", note), patch.object(maya, "say", note):
+                    f = maya.hy4_fit_step(args(context=262144), {"gpus": [card(8)]}, "maya-xs")
+                self.assertEqual(f["context"], 262144)
+                self.assertTrue(f["kv_streaming"])
+                self.assertIn("--kv-streaming", f["args"])
+                self.assertTrue(any("attention cache's older rows live in RAM" in line for line in said))
+                self.assertFalse(any("a context above 32K" in line for line in said))
 
     def test_a_size_too_big_names_itself_and_the_smaller_one(self):
         """A size the card does not hold even at 4K: the line names the size, and the hint the largest smaller size
