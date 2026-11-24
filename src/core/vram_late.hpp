@@ -25,6 +25,19 @@ namespace maya::vramlate {
 
 constexpr int64_t kStep = (int64_t) 32 << 20;      // the figure moves in steps of 32 MiB
 constexpr size_t kSpare = (size_t) 128 << 20;      // the default reserve keeps the plan while it holds this beyond it
+// (#1156) the most a GPU's figure can be: what an engine allocates after its plan is some hundred MiB.  A reading far
+// beyond that is another program's VRAM (a desktop, a browser, a game beside the engine) or a plan that had nothing
+// left to give - neither is a reason to keep experts out of VRAM, and v1.1.73's cap (a quarter of the card) let the
+// figure climb start after start until the dense weights no longer fit beside it (the model refused to load)
+constexpr size_t kCap = (size_t) 1024 << 20;
+inline size_t cap_of(size_t tot) { return std::min(kCap, tot / 4); }
+/// the line every engine prints once a GPU when it keeps more than the reserve free: the reason and the switch
+inline std::string why(bool fixed, bool given) {
+    return fixed ? std::string(" (MAYA_VRAM_LATE_MB)")
+                 : std::string(" (measured on this PC: the start and the requests allocate that much after the memory "
+                               "plan") + (given ? ", so the reserve itself stays free" : ", more than the default reserve holds") +
+                       "; MAYA_VRAM_LATE_MB=0 turns this off)";
+}
 
 /// the file's figure for `key` ("": none); the file: a line a key, "key<TAB>value"
 inline std::string get(const std::string& file, const std::string& key) {
@@ -83,10 +96,23 @@ inline int64_t fixed_of(const char* env) {
     return v == nullptr ? -1 : std::max<int64_t>(0, std::atoll(v));
 }
 
+/// (#1156) whether a reserve of `res` bytes is the SETUP's own: on an AMD GPU the setup writes a reserve by itself (the
+/// desktop allocates beside the engine) and says so in the config's environment (MAYA_VRAM_RESERVE_SETUP_MB=<MiB>).
+/// Such a reserve is the default one, not asked for: the default rule holds beside it (kept_for).  A reserve the user
+/// set - another figure, or the setup's line gone / 0 - is asked for
+inline bool setup_wrote(size_t res) {
+    const char* v = std::getenv("MAYA_VRAM_RESERVE_SETUP_MB");
+    if (v == nullptr || !v[0]) return false;
+    const long long m = std::atoll(v), d = (m << 20) - (long long) res;
+    return m > 0 && std::llabs(d) < ((long long) 2 << 20);
+}
+/// a reserve the USER asked for (`given`: set on the command line or in the environment, and not the setup's own)
+inline bool asked(bool given, size_t res) { return given && !setup_wrote(res); }
+
 /// what a start keeps free beside the reserve from the measured figure: all of it with a reserve asked for; with the
 /// default one, none (the last release's plan) while the default holds it with kSpare to spare
 inline size_t kept_for(size_t measured, size_t reserve_b, bool given) {
-    return !given && measured + kSpare <= reserve_b ? 0 : measured;
+    return !given && measured + kSpare <= reserve_b ? 0 : std::min(measured, kCap);
 }
 
 struct Gpu {
@@ -96,8 +122,8 @@ struct Gpu {
 };
 
 /// one reading of the free VRAM (`fr` of `tot`) against the reserve `res`: whether the figure moved (then `want`,
-/// what the next start keeps beside the reserve: this start's plus what is short, less what is over, at most a
-/// quarter of the card - not another program's - in steps of kStep) and whether the reserve was found short
+/// what the next start keeps beside the reserve: this start's plus what is short, less what is over, at most
+/// cap_of - not another program's - in steps of kStep) and whether the reserve was found short
 struct Step {
     bool moved = false, short_ = false;
     int64_t want = 0;
@@ -109,7 +135,7 @@ inline Step check(Gpu& g, size_t fr, size_t tot, size_t res, bool given, size_t 
     if (fr >= g.fr_min) return s;
     g.fr_min = fr;
     int64_t want = (int64_t) g.late + (int64_t) res - (int64_t) fr;
-    want = std::min<int64_t>(std::max<int64_t>(0, want), (int64_t) tot / 4);
+    want = std::min<int64_t>(std::max<int64_t>(0, want), (int64_t) cap_of(tot));
     want = (want + kStep - 1) / kStep * kStep;
     const int64_t lim = std::max<int64_t>((int64_t) g.late, ((int64_t) g.late + (int64_t) std::min(room, tot)) / kStep * kStep);
     want = std::min(want, lim);
@@ -156,10 +182,19 @@ struct Tracker {
             x.g.late = kept_for(x.g.kept, res, given);
         }
         if (x.g.late > 0)
-            std::fprintf(stderr, "%s: CUDA%d keeps %zu MiB free beside the %zu MiB reserve: what this PC's start and "
-                                 "requests allocate after the memory plan%s\n", tag.c_str(), dev, x.g.late >> 20,
-                         res >> 20, fixed >= 0 ? " (MAYA_VRAM_LATE_MB)" : " (measured before)");
+            std::fprintf(stderr, "%s: CUDA%d keeps %zu MiB free beside the %zu MiB reserve%s\n", tag.c_str(), dev,
+                         x.g.late >> 20, res >> 20, why(fixed >= 0, given).c_str());
         return x.g.late;
+    }
+    /// (#1156) GPU i's plan does not fit with the figure kept free: it is given up for this start (said once) - the
+    /// figure never makes an engine refuse a model the reserve alone lets in.  Returns the bytes given back
+    size_t give_up(size_t i, int dev) {
+        if (i >= gpus.size() || gpus[i].g.late == 0) return 0;
+        const size_t was = gpus[i].g.late;
+        std::fprintf(stderr, "%s: CUDA%d cannot keep the %zu MiB beside the reserve free: the model's fixed parts need "
+                             "the room - the reserve alone is kept\n", tag.c_str(), dev, was >> 20);
+        gpus[i].g.late = 0, gpus[i].room = 0;
+        return was;
     }
     /// the reserve GPU i's plan ended up keeping (a start that lowered it on a small card)
     void set_reserve(size_t i, size_t res) {

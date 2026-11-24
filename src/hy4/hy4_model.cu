@@ -1954,7 +1954,8 @@ struct Model::Impl {
                 if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, devs[i]) != cudaSuccess) cudaGetLastError();
                 if (integrated == 0)
                     (void) late.read(i, key + "|gpu " + std::to_string(i), (size_t) std::max(0.0, o.reserve_gb * 1e9),
-                                     o.reserve_given, devs[i]);
+                                     maya::vramlate::asked(o.reserve_given, (size_t) std::max(0.0, o.reserve_gb * 1e9)),
+                                     devs[i]);
             }
         }
         for (size_t i = 0; i < devs.size(); ++i) free_b[i] = free0[i] - o.reserve_gb * 1e9 - (double) scratch_bytes() -

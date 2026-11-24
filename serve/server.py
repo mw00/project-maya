@@ -48,6 +48,7 @@ import time
 import traceback
 import urllib.request
 import uuid
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -7343,6 +7344,12 @@ class Server(ThreadingHTTPServer):
     # "connection reset by peer" on the first ones (Strata 0.1.41); the requests wait in the server's queue instead
     # (MAYA_HTTP_BACKLOG overrides it)
     request_queue_size = _backlog()
+
+    def server_bind(self):
+        # http.server's own bind asks the resolver for the bound address's host name (socket.getfqdn) - nothing here uses
+        # it, and on a PC whose resolver is slow or down every start (and every test server) waited for it, tens of seconds
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
 
     def server_close(self):
         service = getattr(self, "response_service", None)

@@ -17,6 +17,30 @@ int main() {
     CHECK(vl::kept_for(576 * MiB, 700 * MiB, false) == 576 * MiB);
     CHECK(vl::kept_for(320 * MiB, 700 * MiB, true) == 320 * MiB);   // asked for: all of it
 
+    // (#1156) a reserve the SETUP wrote by itself (AMD: MAYA_VRAM_RESERVE_SETUP_MB=<MiB>) is the default one, not asked
+    // for: nothing extra kept unless it would be used up; the user's own (another figure, the line 0 or gone) is asked
+    {
+        auto set = [](const char* v) {
+#ifdef _WIN32
+            _putenv_s("MAYA_VRAM_RESERVE_SETUP_MB", v != nullptr ? v : "");
+#else
+            v != nullptr ? setenv("MAYA_VRAM_RESERVE_SETUP_MB", v, 1) : unsetenv("MAYA_VRAM_RESERVE_SETUP_MB");
+#endif
+        };
+        set(nullptr);
+        CHECK(vl::asked(true, 3072 * MiB) && !vl::asked(false, 3072 * MiB));
+        set("3072");
+        CHECK(!vl::asked(true, 3072 * MiB));                          // the setup's own
+        CHECK(!vl::asked(true, (size_t) 3221000000));                 // (maya-hy4's --reserve-gb 3.221: the same reserve)
+        CHECK(vl::asked(true, 1024 * MiB) && vl::asked(true, 4096 * MiB));   // changed by hand: the user's
+        CHECK(vl::kept_for(288 * MiB, 3072 * MiB, vl::asked(true, 3072 * MiB)) == 0);            // #1156's 288 MiB: not kept
+        CHECK(vl::kept_for(3000 * MiB, 3072 * MiB, vl::asked(true, 3072 * MiB)) == 1024 * MiB);  // used up: kept (capped)
+        CHECK(vl::kept_for(288 * MiB, 1024 * MiB, vl::asked(true, 1024 * MiB)) == 288 * MiB);    // the user's: on top
+        set("0");
+        CHECK(vl::asked(true, 3072 * MiB));                           // --vram-reserve-mib 3072 by the user
+        set(nullptr);
+    }
+
     // a 4096 MiB reserve asked for, 3587 MiB free at a request: 509 short -> 512 kept, the start said short
     {
         vl::Gpu g;
@@ -49,7 +73,19 @@ int main() {
         const vl::Step s = vl::check(g, 379 * MiB, tot, 700 * MiB, false);
         CHECK(s.moved && !s.short_ && s.want == (int64_t) 352 * MiB);
     }
-    // ... but a default reserve used up is (and the figure is capped at a quarter of the card)
+    // (#1156) the figure is capped at 1 GiB: another program's VRAM, or a plan with nothing left to give, never
+    // climbs past it (v1.1.73: a quarter of the card, start after start, until the dense weights no longer fit)
+    {
+        vl::Gpu g{3968 * MiB, 3968 * MiB};   // (a v1.1.74 file's figure, read back)
+        CHECK(vl::kept_for(3968 * MiB, 2048 * MiB, true) == 1024 * MiB);
+        vl::Gpu h;
+        const vl::Step s = vl::check(h, 100 * MiB, tot, 4096 * MiB, true);   // 4 GB "short": another program's
+        CHECK(s.moved && s.want == (int64_t) 1024 * MiB);
+        vl::Gpu k{1024 * MiB, 1024 * MiB};
+        CHECK(!vl::check(k, 100 * MiB, tot, 4096 * MiB, true).moved);        // at the cap: nothing more, no restart
+        (void) g;
+    }
+    // ... but a default reserve used up is (and the figure is capped at a quarter of a small card)
     {
         vl::Gpu g;
         const vl::Step s = vl::check(g, 40 * MiB, tot, 700 * MiB, false);
@@ -71,8 +107,9 @@ int main() {
         t.fixed = -1;
         CHECK(t.read(0, "a|gpu 0", 4096 * MiB, true, 0) == 512 * MiB);
         CHECK(t.read(1, "a|gpu 1", 700 * MiB, false, 1) == 0);
-        t.check(0, 3000 * MiB, tot, true, 0);   // 1096 short beside the 512 kept -> 1632 written, the start short
-        CHECK(t.short_mib == 1632 && vl::get(f, "a|gpu 0") == "1632");
+        t.check(0, 3700 * MiB, tot, true, 0);   // 396 short beside the 512 kept -> 928 written, the start short
+        CHECK(t.short_mib == 928 && vl::get(f, "a|gpu 0") == "928");
+        CHECK(t.give_up(0, 0) == 512 * MiB && t.gpus[0].g.late == 0 && t.give_up(0, 0) == 0);   // (#1156)
         std::remove(f.c_str());
     }
     std::printf("vram_late_test: ok\n");

@@ -4,6 +4,16 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.76 - 2026-11-23
+
+A fix release: since v1.1.73 some PCs could no longer load a model when a VRAM reserve was set. That is fixed, and the VRAM Maya keeps free is now always shown.
+
+- **Fix: a model that no longer loaded with a VRAM reserve (#1026).** Since v1.1.73 Maya keeps a measured amount of VRAM free on top of your reserve, so the reserve stays free while it runs. On cards with little room that amount could keep growing (up to a quarter of the card), and DeepSeek then refused to load a model that loaded before. It is now capped at 1 GB, DeepSeek lowers it instead of refusing, and amounts saved by earlier versions shrink by themselves.
+- **Nothing kept free silently (#1156).** Every engine now says at the start how much VRAM it keeps free beside the reserve and why, and `MAYA_VRAM_LATE_MB=0` turns it off (DeepSeek honours it too). When a model truly cannot fit, the message names `--vram-reserve-mib` where lowering it helps.
+- **AMD:** the reserve the setup writes by itself is treated as the default, so nothing extra is kept on top of it; a reserve you set keeps the measured extra as above. Existing configs get this at the next setup.
+- **Fix: a slow server start where the network's name lookups are slow or down.** The server looked up its own address's host name at every start (nothing used the answer); it no longer does.
+- **Without a reserve setting nothing changes:** the same placement, answers and speed as v1.1.75.
+
 ## v1.1.75 - 2026-11-23
 
 Inkling 2 Mini drafting is the star of this release: on an RTX 3090 new code goes from 140 to about 200 tok/s with the same tokens, drafting now works at every context up to 1M, and Maya turns it on wherever your PC measures it faster. GLM-5.3-Flash gives the same answers on every start, and a standard benchmark compares two builds in minutes.

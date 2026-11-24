@@ -211,6 +211,20 @@ class WatchParent(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 2.0)
 
 
+class NoReverseLookup(unittest.TestCase):
+    """A server start never waits for the resolver: http.server's bind asks it for the address's host name
+    (socket.getfqdn), which stalled every start - and every test server - by tens of seconds where DNS was slow or
+    down (the CI runner's server tests then ran into their 20 minutes)."""
+
+    def test_bind_does_not_resolve(self):
+        from unittest import mock
+        with mock.patch("socket.getfqdn", side_effect=AssertionError("the resolver was asked")),                 mock.patch("socket.gethostbyaddr", side_effect=AssertionError("the resolver was asked")):
+            httpd = SV.Server(("127.0.0.1", 0), SV.BaseHTTPRequestHandler)
+            self.addCleanup(httpd.server_close)
+            self.assertEqual(httpd.server_name, "127.0.0.1")
+            self.assertEqual(httpd.server_port, httpd.server_address[1])
+
+
 @unittest.skipIf(psutil is None, "psutil is not installed")
 class ServerStops(unittest.TestCase):
     """The real server with the fake engine: each way of stopping it ends it and its engine, after QUIT."""
