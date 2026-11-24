@@ -48,7 +48,7 @@ def fixture(block: str, cli_tail: str) -> str:
 #include <string>
 #include <thread>
 #include <vector>
-#define STRATA_VERSION "host-fixture"
+#define MAYA_VERSION "host-fixture"
 static void set_env(const char* name, const char* value) {
 #ifdef _WIN32
   _putenv_s(name, value);
@@ -56,7 +56,7 @@ static void set_env(const char* name, const char* value) {
   if (*value) setenv(name, value, 1); else unsetenv(name);
 #endif
 }
-namespace strata { namespace core {
+namespace maya { namespace core {
 inline bool is_system_prefix(const std::vector<int32_t>&, int) { return false; }
 namespace glmpc { template<class T> bool engine_on(const T&) { return false; } }
 }}
