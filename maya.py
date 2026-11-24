@@ -867,7 +867,7 @@ HY4_KV_RESIDENT = 32768                            # (KV streaming: the global l
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
-# Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
+# Inkling-2-Mini (PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
 # docs/INKLING2.md section 8) - NVIDIA only, Linux only, V100 / RTX 20 and newer with 8 GB or more (the engine's
 # kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); the experts the card does not hold
 # stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 from 12 GB (the same
@@ -1745,7 +1745,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     ik2 = family == "ik2"
-    if ik2:   # (Inkling-2-Mini, an experimental preview: NVIDIA, Linux, one GPU - refused in one line before anything)
+    if ik2:   # (Inkling-2-Mini: NVIDIA, Linux, one GPU - refused in one line before anything)
         why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [])
         if why:
             fail(why)
@@ -2172,8 +2172,8 @@ def choose_family(a, prev: dict) -> str:
                       "and newer, Linux." if q4 else "")))
     else:
         keys = tuple(k for k in keys if k != "hy4")
-    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 12 GB
-    rows.append((f"{IK2_SHOWN} (experimental)", None, ik2_about()))
+    # Inkling-2-Mini, after it (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 12 GB
+    rows.append((f"{IK2_SHOWN}", None, ik2_about()))
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
     if pick in ("glm", "glm53"):
@@ -6674,7 +6674,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         for line in hy4_first_start_said(cfg):
             say("  " + line)
     elif config_family(cfg) == "ik2":
-        say(f"  {IK2_SHOWN} is an experimental preview: loading takes a few seconds to a minute (every expert is")
+        say(f"  {IK2_SHOWN}: loading takes a few seconds to a minute (every expert is")
         say("  copied into VRAM); one answer at a time" + (", pictures read by the image encoder when one arrives."
                                                           if cfg.get("vision") else ", text only."))
     elif config_family(cfg) == "qwen":
@@ -11490,7 +11490,7 @@ def ik2_about() -> str:
     """The setup's model row for Inkling-2-Mini."""
     files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
     gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
-    return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
+    return ("thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
             f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA V100 / "
             "RTX 20 and newer with 8 GB or more (experts that do not fit in VRAM stay in RAM: about 13 GB of RAM with an 8 GB card), or "
             "AMD RDNA 3 / 3.5 / 4 with 12 GB or more (the same: experts that do not fit stay in RAM) or a Halo / APU "
@@ -11783,7 +11783,7 @@ def ik2_engine_vram(pc: dict, probe=None, saved: dict | None = None, busy: dict 
 
 
 def set_up_ik2(a, prev: dict) -> Path | None:
-    """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
+    """Inkling-2-Mini's steps 1-8: the PC (refused in one line where it does not
     run: a Mac, AMD on Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
     GPU older than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
     (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
@@ -11814,10 +11814,10 @@ def set_up_ik2(a, prev: dict) -> Path | None:
                "Windows keeps the rest for the display)")
             vram = pc["gpus"][0]["ik2_vram_gb"] = round(room, 2)
     step(2, "your choices")                            # 2
-    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux) and by Maya's "
+    warn(f"{IK2_SHOWN} is run by its contributor on RTX 3090 cards (Linux) and by Maya's "
          "team on V100s (Linux) and an RTX 3050 8 GB (Windows), not yet on every card - tell us how it goes in "
          "an issue" if not amd else
-         f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
+         f"{IK2_SHOWN} on AMD is run by Maya's team on a Radeon 8065S (Gorgon Halo, "
          "Linux, also set as a 12 and a 16 GB card), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes "
          "in an issue")
     m = ik2_entry()
@@ -11905,7 +11905,7 @@ def model_option(a) -> str | None:
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (experimental), or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
         a.model = key
@@ -11962,7 +11962,7 @@ def main() -> int:
                     help="which model and files (default: asked): a Maya quant - "
                          + ", ".join(i for _, _, _, i in Q.QUANTS) +
                          f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
-                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (an experimental preview),"
+                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN},"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
     ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4} or {QWEN_SHOWN}: their "

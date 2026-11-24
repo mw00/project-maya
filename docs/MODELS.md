@@ -9,7 +9,7 @@ special about it. Back to the [README](../README.md).
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Hy4-Flash](#hy4-flash)
-- [Inkling-2-Mini (experimental preview)](#inkling-2-mini-experimental-preview)
+- [Inkling-2-Mini](#inkling-2-mini)
 - [Inkling-2-Small (by hand, for now)](#inkling-2-small-by-hand-for-now)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
@@ -296,11 +296,11 @@ Other GGUF sets of the model are not offered by the setup; `tools/hy4/pack_gguf.
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
 
-## Inkling-2-Mini (experimental preview)
+## Inkling-2-Mini
 
 **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (thinkingmachines; 26 B, a looped model:
 layers 6-17 run three times, 8 of 128 experts a token; Apache 2.0) runs on its own engine, `maya-ik2`, from unsloth's
-GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-mini`, or the Models page's list.
+GGUF as it is: `maya.py --setup --model inkling-2-mini`, or the Models page's list.
 
 | Files | Size | Runs on |
 | --- | ---: | --- |

@@ -425,8 +425,8 @@ class OtherQuantsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_pull.Puller(self.root, lambda i, c: []).start("deepseek-gguf-q4", None)
 
-    def test_inkling_2_mini_preview(self):
-        """Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
+    def test_inkling_2_mini_note(self):
+        """Inkling-2-Mini (maya-ik2): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
         said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux or Windows (never AMD or
         a Mac); its setup id on the command line; the size the setup's manifest says."""
         with mock.patch.object(model_pull.sys, "platform", "linux"):
@@ -434,8 +434,8 @@ class OtherQuantsTest(unittest.TestCase):
             ik = c["inkling-2-mini"]
             self.assertEqual((ik["family"], ik["group"], ik["by"]), ("ik2", "other", "unsloth"))
             self.assertEqual(ik["name"], "Inkling 2 Mini · unsloth UD-Q4_K_XL")
-            self.assertIn("experimental preview", ik["note"])
-            self.assertIn("24 GB", ik["note"])
+            self.assertIn("an NVIDIA GPU of 8 GB or more", ik["note"])
+            self.assertIn("8 GB or more", ik["note"])
             self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
             self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
             self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70, 89))})

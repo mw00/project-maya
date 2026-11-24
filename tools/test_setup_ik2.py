@@ -1,4 +1,4 @@
-"""tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2, an experimental preview) in the setup: its names and setup ids,
+"""tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2) in the setup: its names and setup ids,
 its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
 does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 24 GB), the
 one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
@@ -355,9 +355,9 @@ class Picker(unittest.TestCase):
             return len(opts) - 1
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             fam = maya.choose_family(args(model=None, model_dir=None, gguf_dir=None, draft=None), {})
-        self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini (experimental)", "ik2"))
-        about = got["about"]["Inkling 2 Mini (experimental)"]
-        for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
+        self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini", "ik2"))
+        about = got["about"]["Inkling 2 Mini"]
+        for part in ("thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
                      "V100 / RTX 20", "Linux", "8 GB or more", "Halo / APU with 24 GB", "pictures"):
             self.assertIn(part, about)
 

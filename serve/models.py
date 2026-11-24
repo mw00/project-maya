@@ -15,7 +15,7 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              prefill_chunk, cpu_threads, kv ("auto" | "q8": the latent cache's rows, --kv - 8-bit rows are the setup's
              opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
              file: --vision off when off); one answer at a time
-  Inkling-2-Mini (maya-ik2, an experimental preview - it stops at a flag it does not know, only its own are written):
+  Inkling-2-Mini (maya-ik2, it stops at a flag it does not know, only its own are written):
              kv ("fp8" | "f16": IK2_KV); one GPU, one answer at a time, text only, no drafting offered for now; whether
              a context keeps every expert in VRAM: tools/ik2_fit.py, the setup's
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
@@ -87,7 +87,7 @@ HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a 
                "kv_cache": "KV cache: Hy4-Flash's cache rows are auto or 8-bit (its setting kv)",
                "kv_streaming": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it",
                "kv_resident": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it"}
-# Inkling-2-Mini (maya-ik2, an experimental preview): its settings, and what its engine does not have yet - said in
+# Inkling-2-Mini (maya-ik2): its settings, and what its engine does not have yet - said in
 # plain words when a client asks for it (each one's "off": IK2_OFF)
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on its card: the setup's own figures
 IK2_KEYS = ("context", "images", "gpus", "env", "kv", "draft", "parallel")

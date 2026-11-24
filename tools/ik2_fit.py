@@ -1,4 +1,4 @@
-"""tools/ik2_fit.py - Inkling-2-Mini on maya-ik2 (an experimental preview): what fits on one card, for the setup
+"""tools/ik2_fit.py - Inkling-2-Mini on maya-ik2 : what fits on one card, for the setup
 (maya.py) and the Models page (serve/models.py) alike.
 
 maya-ik2 keeps every expert of Inkling-2-Mini in VRAM where they fit (the resident token path, docs/INKLING2.md 8);
@@ -273,7 +273,7 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
     nvidia-smi's; AMD: amd_unsupported's) - empty when they are not read yet; ram_gb: the PC's RAM (0: not read yet;
     the offload path's)."""
     if backend == "metal":
-        return ("Inkling 2 Mini is an experimental preview that runs on NVIDIA and AMD GPUs only for now (no Mac "
+        return ("Inkling 2 Mini runs on NVIDIA and AMD GPUs only for now (no Mac "
                 "engine yet)")
     if backend == "hip":
         if windows:
