@@ -531,6 +531,12 @@ class Steps(unittest.TestCase):
         self.assertFalse(F.draft_fits(16, 1048576, "fp8"))        # (the cache streams)
         self.assertTrue(F.draft_fits(32, 262144, "fp8"))
         self.assertTrue(F.draft_fits(0, 262144, "fp8"))          # (not known: the engine measures)
+        # (the engine's measured room: the scratch of 1152 B a token and its 288 MiB beside every expert - 32 GB at
+        #  720,896 tokens: "the drafter left out ... 0.03 GiB short"; the tool said it fits)
+        self.assertFalse(F.draft_fits(32, 720896, "fp8"))
+        self.assertFalse(F.draft_fits(31.73, 720896, "fp8"))
+        self.assertTrue(F.draft_fits(32, 524288, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("70", 32, 262144, "fp8"))
         self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4096 / 2**30, places=6)
 
     def test_drafting_off_reason(self):

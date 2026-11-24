@@ -141,6 +141,7 @@ DRAFT_TOKEN_BYTES = 4096                            # its 2 rings, its attention
 PLAN_DENSE_GIB = 1.1                                # the engine's own sum for the drafter's room (maya-ik2's fit block):
 PLAN_RESERVE_GIB = 1.5                              # the experts, the dense weights as blocks, the cache and its
                                                     # reserve (work buffers, room) - less than BASE_GIB's measured use
+DRAFT_KEEP_GIB = 0.28125                            # + what the engine keeps free beside every expert at the drafter (256 + 32 MiB)
 OFF_WIN_STAGE_GIB = 0.7                             # the offload path's verify window: 64 staging slots a slot size
 DRAFT_MIN_ROWS = 65536                              # the fewest context rows the engine plans for the drafter there
 
@@ -160,7 +161,12 @@ def draft_fits(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> bool:
         return True
     p = plan(vram_gb, ctx, kv)
     if p["resident"]:    # (its context rows FP16, else FP8: half of them)
-        used = EXPERTS_GIB + PLAN_DENSE_GIB + ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB + PLAN_RESERVE_GIB
+        # (the engine measures the free VRAM after its work buffers and the drafter: the attention's scratch grows with
+        #  the context beyond the fixed reserve - SCRATCH_TOKEN_BYTES a token - and it keeps DRAFT_KEEP_GIB of room
+        #  beside every expert: 256 MiB of the cache's and 32 MiB of slack.  Without both the tool said "fits" where
+        #  the engine left the drafter out: 32 GB at 720,896 tokens, 0.03 GiB short.)
+        used = (EXPERTS_GIB + PLAN_DENSE_GIB + ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB + PLAN_RESERVE_GIB
+                + ctx * SCRATCH_TOKEN_BYTES / GIB + DRAFT_KEEP_GIB)
         return float(vram_gb) - MARGIN_GIB >= used + draft_gib(ctx) - ctx * DRAFT_TOKEN_BYTES / GIB / 2
     # the offload path with the whole cache in VRAM: the tier gives the drafter's room, at most half of its own - the
     # verify window's staging and at least DRAFT_MIN_ROWS of FP8 context rows (the last positions) with it
