@@ -97,6 +97,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -4358,6 +4359,84 @@ struct Starts {
             }
     }
 };
+// GEN's think_open=<id> think_end=<id> think_soft=<n> think_hard=<n> think_stop=<ids> think_weak=<ids> think_dig=<ids>
+// think_after=<ids>;<ids>..: the thinking budget.  Inkling's reasoning is a segment (think_open, the model's
+// <|content_thinking|>, to think_end, its <|end_message|>), its tokens counted from the request's start: past
+// think_soft the first token that ends a sentence or line (think_stop; think_weak: a bare . ! ? that does not follow a
+// token ending in a digit or a dot, think_dig), at think_hard whatever the token, closes the segment IN THE DECODE - the
+// tokens that follow are forced through Starts: think_end, then one of think_after (the next message's opening: its
+// text segment, or a call to one of the request's tools - the model's pick among them) - and the thinking is closed
+// once (`done`).  The state is never cut: no stop and restart, which this engine could not take back past a
+// token or two.  A window of drafts is cut short of think_soft and single steps follow, so a close lands on its token.
+struct ThinkCut {
+    int open = -1, end = -1, soft = 0, hard = 0, prev = -1;
+    std::unordered_set<int> stop, weak, dig;
+    std::vector<std::vector<int>> after;
+    bool in = false, done = false;
+    int n = 0;
+    bool on() const { return soft > 0 && open >= 0 && end >= 0 && !after.empty() && !done; }
+    void parse_set(std::unordered_set<int>& o, const std::string& v, int vocab) {
+        o.clear();
+        for (size_t a = 0; a < v.size();) {
+            const long t = std::strtol(v.c_str() + a, nullptr, 10);
+            if (t >= 0 && t < vocab) o.insert((int) t);
+            const size_t b = v.find(',', a);
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+    }
+    // a token written (every one, in order): true when the segment must close now
+    bool saw(int t) {
+        if (!on()) return false;
+        const int before = prev;
+        prev = t;
+        if (!in) {
+            in = t == open;
+            return false;
+        }
+        if (t == end) {
+            in = false;
+            return false;
+        }
+        ++n;
+        if (n >= hard || (n >= soft && (stop.count(t) || (weak.count(t) && !dig.count(before))))) {
+            done = true, in = false;
+            return true;
+        }
+        return false;
+    }
+    // the room a window of drafts may take: none may carry the count to think_soft (a close lands on a single step)
+    int room(int r) const {
+        if (!on() || !in) return r;
+        return std::min(r, std::max(1, soft - n - 1));
+    }
+    void close(Starts& st) const {   // the forced close: think_end, then the next message's opening
+        st.seqs.clear(), st.alive.clear(), st.sd = 0;
+        for (const auto& a : after) {
+            std::vector<int> q{end};
+            q.insert(q.end(), a.begin(), a.end());
+            st.alive.push_back((int) st.seqs.size());
+            st.seqs.push_back(q);
+        }
+    }
+};
+// one GEN key of the thinking budget into tc: true when it is one
+inline bool think_key(ThinkCut& tc, const std::string& k, const std::string& v, int vocab) {
+    if (k == "think_open") tc.open = std::atoi(v.c_str());
+    else if (k == "think_end") tc.end = std::atoi(v.c_str());
+    else if (k == "think_soft") tc.soft = std::atoi(v.c_str());
+    else if (k == "think_hard") tc.hard = std::atoi(v.c_str());
+    else if (k == "think_stop") tc.parse_set(tc.stop, v, vocab);
+    else if (k == "think_weak") tc.parse_set(tc.weak, v, vocab);
+    else if (k == "think_dig") tc.parse_set(tc.dig, v, vocab);
+    else if (k == "think_after") {
+        Starts st;
+        st.parse(v, vocab);
+        tc.after = st.seqs;
+    } else return false;
+    if (tc.hard < tc.soft) tc.hard = tc.soft;
+    return true;
+}
 // the pick among opts o from (logit, token) candidates: greedy the largest (ties: the lower token), else `sample` of
 // them; a token missing from cd (outside the candidates a step keeps) is none of it, and with none there, o's first
 template <class F>
@@ -8110,7 +8189,7 @@ int main(int argc, char** argv) {
             const char* wd = getenv("IK2_WATCHDOG_S");
             // (starts=1: GEN's starts= is read - the server's required tool call, Service.prepare)
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
-                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s starts=1\n",
+                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s starts=1 think=1\n",
                         g_kv_fp8 ? "fp8" : "f16", ctx,
                         g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0, drafting.c_str(),
                         c.n_layer * c.E, g_par, wd && *wd ? std::max(0, std::atoi(wd)) : 600,
@@ -8244,6 +8323,7 @@ int main(int argc, char** argv) {
                 double t0 = 0, t1 = 0;
                 bool cancel = false;
                 Starts starts;   // (GEN's starts=: the answer's opening)
+                ThinkCut tc;     // (GEN's think_*: the thinking budget)
             };
             struct SlotH {
                 std::vector<int> hist;
@@ -8425,6 +8505,7 @@ int main(int argc, char** argv) {
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "rid") r.rid = std::atoi(v.c_str());
                     else if (k == "starts") r.starts.parse(v, c.n_vocab);
+                    else if (think_key(r.tc, k, v, c.n_vocab)) {}
                 }
                 r.ids = parse_ints(ids_s);
                 r.rng.seed(seed >= 0 ? (uint64_t) seed : rng_g());
@@ -8521,6 +8602,7 @@ int main(int argc, char** argv) {
                     }
                     ++r->n_out;
                     std::printf("T %d %d\n", r->rid, r->tok);
+                    if (r->tc.saw(r->tok)) r->tc.close(r->starts);   // (the thinking budget: forced on from here)
                     if (std::find(eos_ids.begin(), eos_ids.end(), r->tok) != eos_ids.end()) {
                         done_line(*r, "stop");
                         r->phase = 3;
@@ -8611,6 +8693,7 @@ int main(int argc, char** argv) {
             }
             std::vector<int> stops;
             Starts starts;   // (GEN's starts=: the answer's opening, one of these sequences)
+            ThinkCut tc;     // (GEN's think_*: the thinking budget, closed in the decode)
             if (serve_maya) {
                 in >> max_new;
                 std::string w;
@@ -8630,6 +8713,7 @@ int main(int argc, char** argv) {
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "spec") spec_key = std::atoi(v.c_str());   // (1: no drafting; 2 .. 8: the widest window)
                     else if (k == "starts") starts.parse(v, c.n_vocab);
+                    else if (think_key(tc, k, v, c.n_vocab)) {}
                 }
                 stops = eos_ids;
             } else {
@@ -8878,6 +8962,7 @@ int main(int argc, char** argv) {
                                                       : pick(last.data());
                 pending_sample = -1;
                 starts.took(tok);
+                if (tc.saw(tok)) tc.close(starts);   // (the thinking budget: the segment ends here, forced on)
                 // the next token is a choice among the opening's: this step gives the whole logits
                 const bool choice = starts.on() && starts.opts().size() > 1;
                 ++n_out;
@@ -8893,7 +8978,7 @@ int main(int argc, char** argv) {
                 int B = 1, src = 0;
                 int32_t ld[kBlockMax];
                 if (req_spec && !starts.on()) {
-                    const int room = std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax});
+                    const int room = tc.room(std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax}));
                     const int k = g_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
                     src = sctl.pick(room, k, B);
                     if (src == 1 && !drafter) src = 0, B = 1;
@@ -8915,6 +9000,7 @@ int main(int argc, char** argv) {
                     hist.push_back(tok);
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
                         std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
+                        tc.saw(next[j]);   // (a window stops short of the budget: this never closes)
                         hist.push_back(next[j]);
                         lk.append(next[j]);
                     }
