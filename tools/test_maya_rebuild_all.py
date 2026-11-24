@@ -227,6 +227,7 @@ class RebuildAll(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0)
         with patch.object(maya, "cmake_steps", REAL_CMAKE_STEPS), patch.object(maya, "WIN", True), \
                 patch.object(maya.S, "find_vcvars", return_value=Path(r"C:\VS\vcvars64.bat")), \
+                patch.object(maya.S, "full_build_output", return_value=True), \
                 patch.object(maya, "run", side_effect=fake_run), patch.object(maya, "mem_gb", return_value=(64, 60)):
             self.updated_pc()
             maya.build_step(self.a(True), self.pc, self.llama, "maya")

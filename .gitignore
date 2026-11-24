@@ -49,6 +49,8 @@ td.log
 /.bench-builds/
 /build-strata.bat
 /build-maya*.bat
+/build-engine.log
+/build-vision.log
 
 # image encoder (setup.py --vision): build output and the generated build script
 build-vision*/

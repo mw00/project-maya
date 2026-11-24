@@ -2904,12 +2904,33 @@ def vs_env(env=None) -> dict:
     return env
 
 
-def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None) -> str | None:
+def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None, what="the engine",
+                log="build-engine.log") -> str | None:
     """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
     worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
     compiler's environment - the way Strata's setup.py builds there (cmake_build).  `nvcc` says which toolkit the
-    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars)."""
-    if not WIN:
+    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars).
+    The screen gets ONE line for the step (`what`: files done, time so far); the tools' own output goes to `log` in
+    the install folder, whose last lines are printed when the step stops (S.BuildLog).  MAYA_BUILD_OUTPUT=full, or
+    --full-build-output: every line on the screen as it comes, no log."""
+    full = S.full_build_output()
+    bat = None
+    if WIN:
+        vcvars = vcvars or S.find_vcvars(nvcc=nvcc)
+        if vcvars is None:
+            return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
+        bat = ROOT / bat_name
+        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(conf)} || exit /b 3\r\n{cmdline(build)} && exit /b 0'
+                       '\r\necho   (the build stopped - trying it once more: it continues where it stopped)\r\n'
+                       f'{cmdline(build)} || exit /b 4\r\n', encoding="utf-8")
+        env = vs_env(env)
+        if full:
+            say(f"  > {bat}   (Visual Studio's environment, then:)")
+            say("  > " + cmdline(conf))
+            say("  > " + cmdline(build))
+            rc = run(["cmd", "/c", str(bat)], env=env, check=False, echo=False).returncode
+            return None if rc == 0 else "compiling" if rc == 4 else "configuring"
+    if full:
         if run(conf, env=env, check=False).returncode != 0:
             return "configuring"
         if run(build, env=env, check=False).returncode != 0:
@@ -2917,18 +2938,24 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None) -> str 
             if run(build, env=env, check=False).returncode != 0:
                 return "compiling"
         return None
-    vcvars = vcvars or S.find_vcvars(nvcc=nvcc)
-    if vcvars is None:
-        return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
-    bat = ROOT / bat_name
-    bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(conf)} || exit /b 3\r\n{cmdline(build)} && exit /b 0'
-                   '\r\necho   (the build stopped - trying it once more: it continues where it stopped)\r\n'
-                   f'{cmdline(build)} || exit /b 4\r\n', encoding="utf-8")
-    say(f"  > {bat}   (Visual Studio's environment, then:)")
-    say("  > " + cmdline(conf))
-    say("  > " + cmdline(build))
-    rc = run(["cmd", "/c", str(bat)], env=vs_env(env), check=False, echo=False).returncode
-    return None if rc == 0 else "compiling" if rc == 4 else "configuring"
+    steps = S.BuildLog(ROOT / log, what)
+    stopped = "compiling"
+    try:
+        if bat is not None:
+            steps.file.write(f"> {bat}   (Visual Studio's environment, then:)\n> {cmdline(conf)}\n> {cmdline(build)}\n")
+            rc = steps.run(["cmd", "/c", str(bat)], env=env)
+            stopped = None if rc == 0 else "compiling" if rc == 4 else "configuring"
+        elif steps.run(conf, env=env) != 0:
+            stopped = "configuring"
+        elif steps.run(build, env=env) == 0:
+            stopped = None
+        else:
+            steps.line("  (the build stopped - trying it once more: it continues where it stopped)")
+            if steps.run(build, env=env) == 0:
+                stopped = None
+    finally:
+        steps.close(stopped)
+    return stopped
 
 
 PROBE_CU ="""#include <cmath>
@@ -4486,10 +4513,21 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
         ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") +
         ", once) ...")
-    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
-                   dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat", vcvars=vcvars,
-                   nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"]):
-        return False
+    def steps(more=()) -> bool:
+        return not cmake_steps(conf + list(more), [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j",
+                                                   str(jobs)],
+                               dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat",
+                               vcvars=vcvars, nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"],
+                               what="the picture reader", log="build-vision.log")
+
+    # only the towers and kernels Maya's pictures use are compiled (tools/vision/lean.cmake); should that stop on
+    # some toolchain, all of llama.cpp's image library is, as before v1.1.78 (the build folder then keeps that choice)
+    if not steps():
+        if metal:
+            return False
+        say("  (once more, with all of llama.cpp's image library: -DMAYA_VISION_FULL=ON)")
+        if not steps(["-DMAYA_VISION_FULL=ON"]):
+            return False
     if bindir is not None and VEXE.exists():
         copy_hip_dlls(bindir, VEXE.parent)
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
@@ -12009,6 +12047,9 @@ def main() -> int:
                                             "than your CUDA accepts)")
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
+    ap.add_argument("--full-build-output", action="store_true",
+                    help="every line of the compilers on the screen (default: one progress line per compile step, "
+                         "the rest in build-engine.log / build-vision.log; MAYA_BUILD_OUTPUT=full does the same)")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
     ap.add_argument("--report", action="store_true", help="write maya-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "
@@ -12063,6 +12104,8 @@ def main() -> int:
                                               "--port, --host, --api-key, --gpus, and the few written into the config, "
                                               "such as --parallel); add --setup to set up again with them")
     a = ap.parse_args()
+    if a.full_build_output:
+        os.environ["MAYA_BUILD_OUTPUT"] = "full"
     why = model_option(a)
     if why:
         ap.error(why)
