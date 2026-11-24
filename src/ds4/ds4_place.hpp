@@ -14,6 +14,7 @@
 //      recent_n + 1 of a layer's slots for the cache, so its k-th slot is static k - 1 - recent_n), not the k-th
 //      expert's share.
 // Only where the slots go changes: the CPU lane and the GPU compute the same experts (rounding-level, as #644).
+// Also the chunked prompt path's layer split by group (stream_split, link_weights) and DS4_SPLIT's (layer_groups).
 #pragma once
 
 #include <algorithm>
@@ -198,6 +199,61 @@ inline bool layers_back(const std::vector<int>& grp, int n_groups, int& at, std:
             return false;
         }
     return true;
+}
+
+// ---- the chunked prompt path's layer split (#733): contiguous layer ranges, each group at least one layer, the one whose
+// busiest group takes the longest to stream its layers' experts the least - a chunk's groups run as a pipeline, its
+// slowest stage sets the pace.  A group's time: its layers' experts short of its VRAM room (cap: bytes, its members'
+// together, less the dense weights - 1.3x on a tensor-parallel group) per member, over its link's weight.  pe / pd:
+// prefix sums of each layer's expert / dense bytes (n_layers + 1 each); members: each group's devices; weight: each
+// group's link relative to the fastest (link_weights) - all 1 is the split by bytes alone, the rule before.
+// -> each layer's group (empty: fewer layers than groups)
+inline std::vector<int> stream_split(const std::vector<double>& cap, const std::vector<double>& pe,
+                                     const std::vector<double>& pd, const std::vector<int>& members,
+                                     const std::vector<double>& weight) {
+    const int G = (int) cap.size(), NL = (int) pe.size() - 1;
+    if (G < 1 || NL < G || (int) pd.size() != NL + 1 || (int) members.size() != G || (int) weight.size() != G) return {};
+    auto cost = [&](int gi, int a, int b) {   // the time to stream layers [a, b) on group gi, in bytes at the fastest link
+        const int nm = std::max(1, members[(size_t) gi]);
+        const double dense = (pd[(size_t) b] - pd[(size_t) a]) * (nm > 1 ? 1.3 : 1.0);
+        return std::max(0.0, pe[(size_t) b] - pe[(size_t) a] - (cap[(size_t) gi] - dense)) / nm / weight[(size_t) gi];
+    };
+    // best[gi][b]: the least max cost of layers [0, b) over groups 0..gi (each at least one layer)
+    std::vector<std::vector<double>> best((size_t) G, std::vector<double>((size_t) NL + 1, 1e300));
+    std::vector<std::vector<int>> cut((size_t) G, std::vector<int>((size_t) NL + 1, 0));
+    for (int b = 1; b <= NL; ++b) best[0][(size_t) b] = cost(0, 0, b);
+    for (int gi = 1; gi < G; ++gi)
+        for (int b = gi + 1; b <= NL; ++b)
+            for (int a = gi; a < b; ++a) {
+                const double v = std::max(best[(size_t) gi - 1][(size_t) a], cost(gi, a, b));
+                if (v < best[(size_t) gi][(size_t) b]) {
+                    best[(size_t) gi][(size_t) b] = v;
+                    cut[(size_t) gi][(size_t) b] = a;
+                }
+            }
+    std::vector<int> grp((size_t) NL, 0);
+    int b = NL;
+    for (int gi = G - 1; gi >= 0; --gi) {
+        const int a = gi > 0 ? cut[(size_t) gi][(size_t) b] : 0;
+        for (int il = a; il < b; ++il) grp[(size_t) il] = gi;
+        b = a;
+    }
+    return grp;
+}
+
+// ---- each group's link weight for stream_split: its slowest member's host-to-device link (bytes a second) over the
+// fastest group's, rounded to eighths and at least 1/8 - the link is measured at each start and reads 0.1-0.2 GB/s
+// apart from one start to the next (#1143), so the rounding keeps a box on one split.  Any link not measured (0):
+// all 1, the split by bytes alone.
+inline std::vector<double> link_weights(const std::vector<double>& link) {
+    std::vector<double> w(link.size(), 1.0);
+    double top = 0;
+    for (double l : link) {
+        if (!(l > 0)) return w;
+        top = std::max(top, l);
+    }
+    for (size_t i = 0; i < link.size(); ++i) w[i] = std::max(1.0, std::round(link[i] / top * 8.0)) / 8.0;
+    return w;
 }
 
 }  // namespace maya::ds4::place

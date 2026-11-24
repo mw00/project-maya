@@ -1,6 +1,6 @@
 // tests/ds4_place_test.cpp - the trunk's expert placement (src/ds4/ds4_place.hpp): the per-byte queue, the even
 // split and each layer's statics / recent slots / spare, today's rule and DS4_RECENT_FIT's; DS4_SPLIT's layers by
-// group (no GPU, no model).
+// group and the chunked prompt path's split by bytes and by link (#733) (no GPU, no model).
 //
 //   ds4_place_test [expert-profile.bin] [--table]
 //
@@ -442,6 +442,90 @@ static void test_edges() {
            "switch: past 2 = 2, below 0 or not a number = off");
 }
 
+// The chunked prompt path's split (#733): stream_split with every weight 1 against a transcription of the engine's
+// inline DP at v1.1.78 (ds4_model.cu, the split by bytes alone) on random layers, caps and groups; the 3x 7900 XTX box
+// (PCIe 3 x16 + two x8: 13.7 / 6.8 / 6.9 GB/s, its IQ2 GGUF's layers as its load printed them) by bytes and by link;
+// link_weights' rounding.
+static std::vector<int> split_v1178(const std::vector<double>& cap, const std::vector<double>& pe,
+                                    const std::vector<double>& pd, const std::vector<int>& mem) {
+    const int G = (int) cap.size(), NL = (int) pe.size() - 1;
+    auto cost = [&](int gi, int a, int b) {
+        const int nm = mem[(size_t) gi];
+        const double dense = (pd[(size_t) b] - pd[(size_t) a]) * (nm > 1 ? 1.3 : 1.0);
+        return std::max(0.0, pe[(size_t) b] - pe[(size_t) a] - (cap[(size_t) gi] - dense)) / nm;
+    };
+    std::vector<std::vector<double>> best((size_t) G, std::vector<double>((size_t) NL + 1, 1e300));
+    std::vector<std::vector<int>> cut((size_t) G, std::vector<int>((size_t) NL + 1, 0));
+    for (int b = 1; b <= NL; ++b) best[0][(size_t) b] = cost(0, 0, b);
+    for (int gi = 1; gi < G; ++gi)
+        for (int b = gi + 1; b <= NL; ++b)
+            for (int a = gi; a < b; ++a) {
+                const double v = std::max(best[(size_t) gi - 1][(size_t) a], cost(gi, a, b));
+                if (v < best[(size_t) gi][(size_t) b]) {
+                    best[(size_t) gi][(size_t) b] = v;
+                    cut[(size_t) gi][(size_t) b] = a;
+                }
+            }
+    std::vector<int> grp((size_t) NL, 0);
+    int b = NL;
+    for (int gi = G - 1; gi >= 0; --gi) {
+        const int a = gi > 0 ? cut[(size_t) gi][(size_t) b] : 0;
+        for (int il = a; il < b; ++il) grp[(size_t) il] = gi;
+        b = a;
+    }
+    return grp;
+}
+
+static void test_stream_split() {
+    std::mt19937 rng(733);
+    int same = 0;
+    for (int t = 0; t < 2000; ++t) {
+        const int G = 2 + (int) (rng() % 5), NL = G + (int) (rng() % 60);
+        std::vector<double> pe((size_t) NL + 1, 0.0), pd((size_t) NL + 1, 0.0), cap((size_t) G);
+        std::vector<int> mem((size_t) G);
+        for (int il = 0; il < NL; ++il) {
+            pe[(size_t) il + 1] = pe[(size_t) il] + (1.0 + (double) (rng() % 8)) * 1e9;
+            pd[(size_t) il + 1] = pd[(size_t) il] + (double) (rng() % 300) * 1e6;
+        }
+        for (int gi = 0; gi < G; ++gi) {
+            cap[(size_t) gi] = (double) (rng() % 40) * 1e9;
+            mem[(size_t) gi] = 1 + (int) (rng() % 2);
+        }
+        same += place::stream_split(cap, pe, pd, mem, std::vector<double>((size_t) G, 1.0)) == split_v1178(cap, pe, pd, mem);
+    }
+    expect(same == 2000, "stream_split: every weight 1 is v1.1.78's split (" + std::to_string(same) + " of 2000)");
+
+    // the box: layers 0-13 3.63 GB of experts, 14-26 3.83, 27-39 3.74 (its load: 19.79 GB for 2096 of 5376, ...), dense
+    // ~0.135 GB a layer, the head ~0.45 GB on the last card; the room for experts and dense 20-24 GB a card
+    std::vector<double> pe(41, 0.0), pd(41, 0.0);
+    for (int il = 0; il < 40; ++il) {
+        pe[(size_t) il + 1] = pe[(size_t) il] + (il < 14 ? 3.63e9 : il < 27 ? 3.83e9 : 3.74e9);
+        pd[(size_t) il + 1] = pd[(size_t) il] + 0.135e9;
+    }
+    const std::vector<int> mem{1, 1, 1};
+    const auto counts = [](const std::vector<int>& g) {
+        return std::to_string(std::count(g.begin(), g.end(), 0)) + "," + std::to_string(std::count(g.begin(), g.end(), 1)) +
+               "," + std::to_string(std::count(g.begin(), g.end(), 2));
+    };
+    for (double room = 20e9; room <= 23e9; room += 1e9) {
+        const std::vector<double> cap{room, room, room - 0.45e9};
+        const std::string bytes = counts(place::stream_split(cap, pe, pd, mem, {1, 1, 1}));
+        const std::string link = counts(place::stream_split(cap, pe, pd, mem, place::link_weights({13.7e9, 6.8e9, 6.9e9})));
+        expect(bytes == "14,13,13", "stream_split: the box by bytes is its load's 14,13,13 (" + bytes + ")");
+        expect(link == "18,11,11", "stream_split: the box by link is the measured best 18,11,11 (" + link + ")");
+    }
+
+    const auto w = place::link_weights({13.7e9, 6.8e9, 6.9e9});
+    expect(w == std::vector<double>{1.0, 0.5, 0.5}, "link_weights: x16 / x8 / x8 -> 1, 1/2, 1/2");
+    expect(place::link_weights({13.5e9, 6.6e9, 7.1e9}) == w, "link_weights: a start's 0.1-0.2 GB/s apart keeps the weights");
+    expect(place::link_weights({12e9, 12.4e9}) == std::vector<double>{1.0, 1.0}, "link_weights: like links -> 1, 1");
+    expect(place::link_weights({13.7e9, 0.0}) == std::vector<double>{1.0, 1.0}, "link_weights: one not measured -> all 1");
+    expect(place::link_weights({20e9, 1e9}) == std::vector<double>{1.0, 0.125}, "link_weights: at least 1/8");
+    expect(place::stream_split({1e9}, {0, 1e9}, {0, 0}, {1}, {1}).size() == 1 &&
+               place::stream_split({1e9, 1e9}, {0, 1e9}, {0, 0}, {1, 1}, {1, 1}).empty(),
+           "stream_split: fewer layers than groups -> empty");
+}
+
 int main(int argc, char** argv) {
     std::string path = "data/expert-profile-ds4.bin";
     bool table = false;
@@ -460,6 +544,7 @@ int main(int argc, char** argv) {
     }
     test_edges();
     test_split();
+    test_stream_split();
     test_engine_parity();
     test_box(prof, table);
     test_sweep(prof);
