@@ -13,6 +13,7 @@ engine dependency: tools/test_bench.py tests them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,8 @@ WARM_TOKENS = 32
 MIN_ANSWER = 64          # an answer shorter than this (the model stopped early) is listed, not in the decode median
 RESULTS_FILE = "maya-bench-results.txt"
 LEARNED_MAX = 64 << 20   # a learned file named in the config (an expert profile ...): at most this; a model is larger
+GOLDEN_DIR = "golden"    # data/golden/<machine>/: this PC's saved answers (tools/maya_golden.py), never a learned file
+HEAD_TOKENS = 48         # --bench-tokens: the first tokens of each answer kept as text too (for a person to read)
 # the GPU-lock folders a test box keeps (a file a GPU: gpu0, gpu1 ... or radeon / v100) and the "too hot" flags;
 # MAYA_GPU_LOCKS / MAYA_HOT_FLAG add one each
 LOCK_DIRS = ("~/.maya/locks", "~/hy4/locks")
@@ -392,14 +395,29 @@ def wait_quiet(backend, gpus, wait_min: float, say, lock_note="", lock_ok: bool 
         time.sleep(15)
 
 
-def take_locks(backend, gpus, note) -> list:
-    taken = []
+def take_locks(backend, gpus, note, held_ok: bool = False) -> list:
+    """Create our lock files, each in one step and only if nobody has it: of two runs that found the machine quiet
+    in the same second, one gets the file.  The run that lost one gives back what it took and raises RuntimeError
+    (it must not start beside the other).  held_ok (--bench-lock-ok: a lock taken by hand for this run): a lock
+    that is already there is left as it is and is not a loss.  Returns the files taken."""
+    taken, lost = [], []
     for d in lock_dirs():
         for n in lock_names(backend, gpus):
             p = d / n
-            if not p.exists():
-                p.write_text(note + "\n")
+            try:
+                with open(p, "x", encoding="utf-8") as f:
+                    f.write(note + "\n")
                 taken.append(p)
+            except FileExistsError:              # (somebody's already)
+                if held_ok:
+                    continue
+                who = p.read_text(errors="replace").strip().splitlines()[:1] if p.is_file() else []
+                lost.append(f"{p} ({who[0] if who else 'no note'})")
+            except OSError:                      # (a folder we cannot write: no lock there, as before)
+                pass
+    if lost:
+        release_locks(taken, note)
+        raise RuntimeError("another run took " + ", ".join(lost) + " first")
     return taken
 
 
@@ -511,6 +529,24 @@ def plan_prompts(doc, ctx: int, sizes=PROMPT_SIZES, repeats=REPEATS):
     return out, warm
 
 
+def prompt_text_files(names) -> list:
+    """Of a commit's file names, the ones --bench cuts its prompts from, in order: README.md, docs/*.md,
+    bench/results/*.md (each folder's own files, sorted by name)."""
+    pick = lambda d: sorted(n for n in names if n.startswith(d) and n.endswith(".md") and "/" not in n[len(d):])  # noqa
+    return [n for n in names if n == "README.md"] + pick("docs/") + pick("bench/results/")
+
+
+def input_hashes(chats, prompts, warm) -> dict:
+    """{request name (run_session's): a hash of its input tokens} - two runs asked the same thing when these are
+    equal (the 2K / 8K prompts are cut from the docs, which change)."""
+    h = lambda ids: hashlib.sha256(",".join(map(str, ids)).encode()).hexdigest()[:16]  # noqa: E731
+    out = {"warm-up": h(warm)}
+    out.update({f"decode {i + 1}": h(ids) for i, ids in enumerate(chats)})
+    out.update({f"prompt {n // 1024}K #{k + 1}": h(ids) for n, slices in prompts.items()
+                for k, ids in enumerate(slices)})
+    return out
+
+
 def run_session(start, chats, prompts, warm, label, say) -> dict:
     """Everything one round measures, in one engine session: the warm-up answer, the decode answers and the prompts.
     Returns the samples, the greedy tokens of every request (exactness) and the wall time of each phase."""
@@ -552,8 +588,10 @@ def run_session(start, chats, prompts, warm, label, say) -> dict:
 def learned_files(root: Path, cfg: dict) -> list:
     """The files an engine start reads and may rewrite (expert profiles, drafting and route choices, hot-expert
     scores): this build's data folder, and the files the config names that are small enough not to be a model."""
-    out = [p for p in (root / "data").rglob("*") if p.is_file()] if (root / "data").is_dir() else []
-    vals = [str(x) for x in cfg.get("args") or []] + [str(v) for v in (cfg.get("env") or {}).values()]
+    gold = root / "data" / GOLDEN_DIR            # (the saved answers, tools/maya_golden.py: no engine reads them)
+    out = [p for p in (root / "data").rglob("*") if p.is_file() and gold not in p.parents] \
+        if (root / "data").is_dir() else []
+    vals =[str(x) for x in cfg.get("args") or []] + [str(v) for v in (cfg.get("env") or {}).values()]
     for v in vals:
         try:
             p = Path(v)
@@ -562,6 +600,22 @@ def learned_files(root: Path, cfg: dict) -> list:
         except (OSError, ValueError):
             pass
     return out
+
+
+def choice_files(root: Path, cfg: dict) -> dict:
+    """{file: a hash of its bytes} of the saved per-PC choices an engine start reads (what greedy answers may
+    legitimately depend on): the learned files, without the test fixtures git tracks in data/'s sub-folders."""
+    tracked = {(root / x).resolve() for x in _out(["git", "-C", str(root), "ls-files", "data"]).splitlines()}
+    out = {}
+    for p in learned_files(root, cfg):
+        if p.parent != root / "data" and p.resolve() in tracked:
+            continue
+        try:
+            name = p.relative_to(root).as_posix() if LearnedState._under(p, root) else str(p)
+            out[name] = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        except OSError:
+            pass
+    return dict(sorted(out.items()))
 
 
 def learned_listing(root: Path, cfg: dict) -> list:
@@ -593,7 +647,10 @@ class LearnedState:
 
     @staticmethod
     def _files(d: Path) -> set:
-        return {p for p in d.rglob("*") if p.is_file()} if d.is_dir() else set()
+        """A data folder's files - never the saved answers (data/golden): a restore must not sweep them away as
+        'written by the run'."""
+        return {p for p in d.rglob("*") if p.is_file() and GOLDEN_DIR not in p.relative_to(d).parts[:1]} \
+            if d.is_dir() else set()
 
     def _drop_new(self, d: Path, keep: set):
         """A file a run wrote that was not there at the start (a first start's measurement) goes too."""

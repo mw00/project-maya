@@ -287,7 +287,8 @@ class BenchStandard(unittest.TestCase):
             with patch.dict(MB.os.environ, {"MAYA_BENCH_LOCK_OK": "0"}):
                 self.assertFalse(MB.lock_ok_asked())
             # (the run takes no lock that is there and releases only its own: the hand-made one stays)
-            taken = MB.take_locks("cuda", [0, 1], "bench note")
+            taken = MB.take_locks("cuda", [0, 1], "bench note", held_ok=True)
+            self.assertRaises(RuntimeError, MB.take_locks, "cuda", [0, 1], "bench note")   # (without it: a loss)
             self.assertEqual([p.name for p in taken], ["gpu1"])
             MB.release_locks(taken + [lock], "bench note")
             self.assertEqual(sorted(p.name for p in Path(td).iterdir()), ["gpu0"])
