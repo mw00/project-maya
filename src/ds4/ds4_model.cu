@@ -28,6 +28,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_lane_parity.hpp"
 #include "ds4_peer_cuda_compat.cuh"  // (the HIP names the peer all-reduce uses, on CUDA)
+#include "ds4_peer_vmm.hpp"          // (MAYA_DS4_PEER_VMM: peer access per allocation, not per context)
 #include "ds4_lt.hpp"
 #include "ds4_marks.hpp"
 #include "ds4_markov_q8.hpp"
@@ -2699,36 +2700,79 @@ struct Model::Impl {
         size_t bytes;
     };
     std::vector<P2pBuf> p2p_todo;
+#if !defined(MAYA_USE_HIP)
+    // (MAYA_DS4_PEER_VMM) the buffers granted to peers per allocation: never in Dev::allocs (cudaFree does not take
+    // them), released with the process
+    std::vector<vmm::Buf> vmm_bufs;
+#endif
     // DS4_AR_P2P: the buffers gmap noted moved into their home GPU's memory, the members given peer access to it;
-    // where the room is short a buffer stays host-mapped (the kernels take either)
+    // where the room is short a buffer stays host-mapped (the kernels take either).  MAYA_DS4_PEER_VMM=1 (CUDA): each
+    // buffer granted to the members alone (cuMemSetAccess), no cudaDeviceEnablePeerAccess - which maps the home GPU's
+    // whole context for its peers and fails where that is more than their BAR1 (RTX 4090 D: 32 GiB)
     void p2p_place() {
         if (p2p_todo.empty()) return;
         int cur = 0;
         cudaGetDevice(&cur);
         size_t moved = 0, kept = 0;
+#if !defined(MAYA_USE_HIP)
+        const bool use_vmm = vmm::wanted();
+#else
+        const bool use_vmm = false;
+#endif
+        std::string vmm_why;
+        size_t unused = 0;
         for (const P2pBuf& b : p2p_todo) {
             bool ok = true;
-            for (int id : b.members) {
-                if (id == b.home) continue;
-                cudaSetDevice(id);
-                const cudaError_t pe = cudaDeviceEnablePeerAccess(b.home, 0);
-                if (pe != cudaSuccess) (void) cudaGetLastError();   // (AlreadyEnabled: not left for a later check)
-                if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) ok = false;
-            }
             void* v = nullptr;
-            cudaSetDevice(b.home);
-            if (ok && (cudaMalloc(&v, b.bytes) != cudaSuccess || cudaMemset(v, 0, b.bytes) != cudaSuccess)) {
-                (void) cudaGetLastError();
-                if (v != nullptr) cudaFree(v);
-                v = nullptr;
+#if defined(DS4_CUDA_PEER_AR) && !defined(MAYA_USE_HIP)
+            // (a group whose prompt all-reduces go peer to peer, init_peer_ar: its chunk rows and flags are never read -
+            //  left host-mapped, not 640 MB of its first GPU's VRAM at chunks of 8192)
+            bool idle = false;
+            for (const Group& G : groups)
+                if (G.peer_arb_on && *b.where != nullptr &&
+                    (*b.where == (void*) G.arb.data || *b.where == (void*) G.arb.flags ||
+                     *b.where == (void*) G.arb.pflags) &&
+                    *b.where != (void*) G.ar.data && *b.where != (void*) G.ar.flags && *b.where != (void*) G.ar.pflags)
+                    idle = true;
+            if (use_vmm && idle) {
+                unused += b.bytes;
+                continue;
+            }
+#endif
+            if (use_vmm) {
+#if !defined(MAYA_USE_HIP)
+                std::vector<int> peers;
+                for (int id : b.members)
+                    if (id != b.home) peers.push_back(id);
+                vmm::Buf vb;
+                if (vmm::alloc(b.home, peers, b.bytes, vb, vmm_why)) {
+                    v = vb.ptr;
+                    vmm_bufs.push_back(vb);
+                }
+#endif
+            } else {
+                for (int id : b.members) {
+                    if (id == b.home) continue;
+                    cudaSetDevice(id);
+                    const cudaError_t pe = cudaDeviceEnablePeerAccess(b.home, 0);
+                    if (pe != cudaSuccess) (void) cudaGetLastError();   // (AlreadyEnabled: not left for a later check)
+                    if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) ok = false;
+                }
+                cudaSetDevice(b.home);
+                if (ok && (cudaMalloc(&v, b.bytes) != cudaSuccess || cudaMemset(v, 0, b.bytes) != cudaSuccess)) {
+                    (void) cudaGetLastError();
+                    if (v != nullptr) cudaFree(v);
+                    v = nullptr;
+                }
             }
             if (v == nullptr) {
                 kept += b.bytes;
                 continue;
             }
+            cudaSetDevice(b.home);
             cudaDeviceSynchronize();
             for (Dev& d : devs)
-                if (d.id == b.home) d.allocs.push_back(v);   // (freed with the GPU's others)
+                if (d.id == b.home && !use_vmm) d.allocs.push_back(v);   // (freed with the GPU's others)
             void* old = *b.where;
             for (Group& G : groups)   // (G.arb = G.ar copies: every field that held the host rows now holds these)
                 for (ArGroup* a : {&G.ar, &G.arb})
@@ -2741,9 +2785,14 @@ struct Model::Impl {
             moved += b.bytes;
         }
         cudaSetDevice(cur);
+        if (unused > 0)
+            std::fprintf(stderr, "ds4: DS4_AR_P2P: %.1f MB of prompt all-reduce rows left host-mapped and unused (the peer "
+                                 "prompt all-reduce replaces them)\n", unused / 1e6);
         std::fprintf(stderr, "ds4: DS4_AR_P2P: %.1f MB of all-reduce buffers in their group's first GPU, peers reaching "
-                             "them directly%s\n", moved / 1e6,
-                     kept > 0 ? (", " + std::to_string(kept >> 20) + " MiB left host-mapped (no room)").c_str() : "");
+                             "them directly%s%s\n", moved / 1e6,
+                     use_vmm ? " (MAYA_DS4_PEER_VMM: granted per allocation, no context-wide peer access)" : "",
+                     kept > 0 ? (", " + std::to_string(kept >> 20) + " MiB left host-mapped (" +
+                                 (vmm_why.empty() ? std::string("no room") : vmm_why) + ")").c_str() : "");
         p2p_todo.clear();
     }
     template <class T>
@@ -18333,6 +18382,14 @@ struct Model::Impl {
             return v > 0 ? v : 3000.0;
         }();
 
+        // MAYA_DS4_PEER_VMM=1 (CUDA): each rank's receive rows and flags granted to its partner per allocation
+        // (cuMemSetAccess) - cudaDeviceEnablePeerAccess maps the partner's whole context, which fails where that is more
+        // than the BAR1 aperture (RTX 4090 D: 32 GiB against 45-48 GB a GPU); the transport and its sums are the same
+#if !defined(MAYA_USE_HIP)
+        const bool use_vmm = vmm::wanted();
+#else
+        const bool use_vmm = false;
+#endif
         for (Group& G : groups) {
             if (G.mem.size() != 2 || G.arb.nm != 2) continue;
             // Keep upstream's opt-in AR2 and the flow loader on their existing transports.
@@ -18341,11 +18398,21 @@ struct Model::Impl {
                 continue;
             }
             std::array<PeerAr, 2> a{};
+#if !defined(MAYA_USE_HIP)
+            std::array<vmm::Buf, 2> vrecv{}, vflags{};
+#endif
             auto release = [&] {
                 for (int m = 0; m < 2; ++m) {
                     cudaSetDevice(devs[(size_t) G.mem[m]].id);
-                    if (a[m].recv) hipFree(a[m].recv);
-                    if (a[m].flags) hipFree(a[m].flags);
+                    if (use_vmm) {
+#if !defined(MAYA_USE_HIP)
+                        vmm::release(vrecv[(size_t) m]);
+                        vmm::release(vflags[(size_t) m]);
+#endif
+                    } else {
+                        if (a[m].recv) hipFree(a[m].recv);
+                        if (a[m].flags) hipFree(a[m].flags);
+                    }
                     if (a[m].error) hipFree(a[m].error);
                     if (a[m].failure) hipFree(a[m].failure);
                     hipGetLastError();
@@ -18360,10 +18427,12 @@ struct Model::Impl {
                 int capable = 0;
                 ok = hipDeviceCanAccessPeer(&capable, d.id, peer) == hipSuccess && capable;
                 if (!ok) { why = "no peer access"; break; }
-                auto status = hipDeviceEnablePeerAccess(peer, 0);
-                ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
-                if (!ok) { why = "peer access not enabled"; break; }
-                hipGetLastError(); // consume already-enabled status, if any
+                if (!use_vmm) {   // (VMM: the partner reaches only the two buffers granted below)
+                    auto status = hipDeviceEnablePeerAccess(peer, 0);
+                    ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
+                    if (!ok) { why = "peer access not enabled"; break; }
+                    hipGetLastError(); // consume already-enabled status, if any
+                }
                 peer_ar_preload();  // (CUDA lazy loading: load before the first spinning launch)
                 int wall_clock_khz = 0;
                 ok = hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, d.id) == hipSuccess &&
@@ -18390,12 +18459,25 @@ struct Model::Impl {
                     return v > 0 ? v : 60.0;
                 }();
                 a[m].timeout_ticks = uint64_t(double(wall_clock_khz) * 1000.0 * peer_timeout_s);
-                ok = hipExtMallocWithFlags((void**) &a[m].recv, 2 * a[m].stride * sizeof(float),
-                                           hipDeviceMallocUncached) == hipSuccess &&
-                     hipExtMallocWithFlags((void**) &a[m].flags,
-                                           2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned),
-                                           hipDeviceMallocUncached) == hipSuccess &&
-                     hipMalloc((void**) &a[m].error, sizeof(unsigned)) == hipSuccess &&
+                if (use_vmm) {
+#if !defined(MAYA_USE_HIP)
+                    std::string vw;
+                    ok = vmm::alloc(d.id, {peer}, 2 * a[m].stride * sizeof(float), vrecv[(size_t) m], vw) &&
+                         vmm::alloc(d.id, {peer}, 2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned),
+                                    vflags[(size_t) m], vw);
+                    if (!ok) { why = "MAYA_DS4_PEER_VMM: " + vw; break; }
+                    a[m].recv = (float*) vrecv[(size_t) m].ptr;
+                    a[m].flags = (unsigned*) vflags[(size_t) m].ptr;
+                    cudaSetDevice(d.id);
+#endif
+                } else {
+                    ok = hipExtMallocWithFlags((void**) &a[m].recv, 2 * a[m].stride * sizeof(float),
+                                               hipDeviceMallocUncached) == hipSuccess &&
+                         hipExtMallocWithFlags((void**) &a[m].flags,
+                                               2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned),
+                                               hipDeviceMallocUncached) == hipSuccess;
+                }
+                ok = ok && hipMalloc((void**) &a[m].error, sizeof(unsigned)) == hipSuccess &&
                      hipMalloc((void**) &a[m].failure, sizeof(PeerArFailure)) == hipSuccess;
                 if (ok) ok = hipMemset(a[m].flags, 0, 2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned)) == hipSuccess &&
                              hipMemset(a[m].error, 0, sizeof(unsigned)) == hipSuccess &&
@@ -18459,8 +18541,15 @@ struct Model::Impl {
             }
             for (int m = 0; m < 2; ++m) {
                 Dev& d = devs[(size_t) G.mem[m]];
-                d.allocs.push_back(a[m].recv);
-                d.allocs.push_back(a[m].flags);
+                if (use_vmm) {
+#if !defined(MAYA_USE_HIP)
+                    vmm_bufs.push_back(vrecv[(size_t) m]);   // (not cudaFree's: released with the process)
+                    vmm_bufs.push_back(vflags[(size_t) m]);
+#endif
+                } else {
+                    d.allocs.push_back(a[m].recv);
+                    d.allocs.push_back(a[m].flags);
+                }
                 d.allocs.push_back(a[m].error);
                 d.allocs.push_back(a[m].failure);
                 d.scratch += 2 * a[m].stride * sizeof(float) +
@@ -18468,9 +18557,10 @@ struct Model::Impl {
             }
             G.peer_arb = a;
             G.peer_arb_on = true;
-            std::fprintf(stderr, "ds4: exact peer prefill all-reduce enabled on GPU%d/GPU%d (%zu MiB/rank)\n",
+            std::fprintf(stderr, "ds4: exact peer prefill all-reduce enabled on GPU%d/GPU%d (%zu MiB/rank)%s\n",
                          devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id,
-                         (2 * a[0].stride * sizeof(float)) >> 20);
+                         (2 * a[0].stride * sizeof(float)) >> 20,
+                         use_vmm ? " - MAYA_DS4_PEER_VMM: granted per allocation, no context-wide peer access" : "");
         }
         cudaSetDevice(original_device);
         return true;
