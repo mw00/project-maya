@@ -19,6 +19,7 @@
 #include "hy4_tp.hpp"
 #include "hy4_pack.hpp"
 #include "hy4_plan.hpp"
+#include "hy4_pstream.hpp"
 #include "hy4_ring.hpp"
 #include "hy4_spill.hpp"
 #include "../ds4/ds4_iq.cuh"
@@ -345,6 +346,14 @@ struct Layer {
     int tpm = -1;                // the tensor-parallel member whose slice this is (-1: the whole layer)
     std::vector<char> lane_e;    // (tensor parallel, member 0's: the experts no member holds, the CPU lane's; else empty)
     std::vector<char> stream_e;  // (... any member's: the ones of them it sends to its own GPU for a prompt chunk)
+    // (HY4_PSTREAM: the experts outside VRAM in pinned RAM - ps_mem, ps_m blobs, expert ps_ex[slot], slot ps_of[e] (-1:
+    //  in VRAM); a prompt's passes: ps_np of ps_pass experts, each pass's expert -> slot map on the GPU)
+    uint8_t* ps_mem = nullptr;
+    size_t ps_bytes = 0;
+    int ps_m = 0, ps_pass = 0, ps_np = 0;
+    std::vector<int> ps_of, ps_ex;
+    std::vector<int*> ps_map;
+    std::vector<const uint8_t*> ps_ptr;   // (each expert's pinned blob, null: in VRAM - the CPU lane's too)
     bool partial() const {
         return !dense && !mtp && (tpm < 0 ? n_res < (int) slot_of.size() : !lane_e.empty());
     }
@@ -952,6 +961,10 @@ struct Model::Impl {
     int* h_pos = nullptr;                // pinned [3][Tc]: pos, lo, nk
 
     ~Impl() {
+        if (ps.on) {
+            const char* v = std::getenv("HY4_PSTREAM_VERIFY");
+            if (v && std::atoi(v) != 0) ps_verify();
+        }
         if (mtp_crew) mtp_crew->wait();
         mtp_crew.reset();
         if (hm.s) {
@@ -984,6 +997,7 @@ struct Model::Impl {
             if (fx.pinned[i]) cudaHostUnregister(fx.mem[i]);
             ram_free(fx.mem[i], fx.bytes[i]);
         }
+        ps_release();
         for (auto& gp : G) {
             cudaSetDevice(gp.dev);
             if (gp.fx_ev0) cudaEventDestroy(gp.fx_ev0);
@@ -1637,6 +1651,10 @@ struct Model::Impl {
     static constexpr int kChunkBase = 1024;
     static constexpr int kChunks[2] = {4096, 2048};
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
+    static constexpr int kPs = 96;       // (HY4_PSTREAM: experts a pass, at most - its second buffer's slots)
+    char ps_route[160] = {0};           // (its INFO line about the route)
+    bool ps_want = [] { const char* v = std::getenv("HY4_PSTREAM"); return v && std::atoi(v) != 0; }();
+    int stage_slots() const { return kStage + (ps_want ? kPs : 0); }
     // tensor parallel with the CPU lane: a prompt chunk of this many rows or more has every member send its share of
     // the experts no member holds to its own GPU (kShareThreads copy a member's pass into its bounce); a shorter one
     // is member 0's alone, the CPU lane or its GPU as on the layer split
@@ -2253,10 +2271,10 @@ struct Model::Impl {
         if (cap < 1.0 || !place(1.0, false)) {   // (some experts on the CPU lane: room for the prompts' staging)
             double eb = 0;
             for (int il = 0; il < g.n_layer; ++il) eb = std::max(eb, (double) expert_bytes(il));
-            for (double& f : free_b) f -= eb * kStage;
+            for (double& f : free_b) f -= eb * stage_slots();
             // (one GPU: its staging slots are its scratch's end - a picture's room is lent from both)
             if (vis_lend > 0 && devs.size() == 1 && eb > 768) {
-                vis_lend += (eb - 768) * kStage;
+                vis_lend += (eb - 768) * stage_slots();
                 const double keep = vision_keep(vis_room, vis_lend);
                 free_b[(size_t) main_gi] += vis_keep - keep;
                 vis_keep = keep;
@@ -4205,7 +4223,7 @@ struct Model::Impl {
                     used |= l.gpu == (int) gi;
                     part |= l.gpu == (int) gi && l.partial();
                 }
-                if (used && !scratch(G[gi], err, nullptr, part ? blob * kStage : 0)) return false;
+                if (used && !scratch(G[gi], err, nullptr, part ? blob * stage_slots() : 0)) return false;
             }
         }
         // the head
@@ -4343,7 +4361,7 @@ struct Model::Impl {
                 for (const Layer& l : lane_layers()) any |= l.gpu == (int) gi && l.partial();
                 if (!any) continue;
                 CK(cudaSetDevice(G[gi].dev));
-                if ((!G[gi].stage && !G[gi].alloc(G[gi].stage, blob * kStage, err)) ||
+                if ((!G[gi].stage && !G[gi].alloc(G[gi].stage, blob * stage_slots(), err)) ||
                     !G[gi].alloc(G[gi].pmap, (size_t) g.n_expert, err))
                     return false;
                 // the GPU's PCIe as streaming sees it: the pinned bounce to the staging slots
@@ -4436,6 +4454,7 @@ struct Model::Impl {
         // (Model::load starts them then)
         //  (a drafting trial: the lane as a start finds it before its copies are made - neither, and no files)
         if (lane && !o.trial && !fetch_setup(err)) return false;
+        if (lane && !o.trial && !ps_init(err)) return false;
         if (lane && !o.trial && fx.mode != 1 && !fetch_pending()) q4x_start();
         if (lane && !fetch_pending()) route_start();
         st.experts_vram = n_res;
@@ -5885,6 +5904,12 @@ struct Model::Impl {
         r.mb_str.assign(G.size(), 0.0);
         r.prev_str.assign(G.size(), 0.0);
         r.prev_be.assign(G.size(), 0.0);
+        if (ps.on) {   // (HY4_PSTREAM: a chunk of min_T tokens or more is streamed, a shorter one computed on the CPU lane)
+            r.mode = 3;
+            std::snprintf(ps_route, sizeof ps_route, "INFO prompt route: chunks under %d tokens on the CPU lane, longer ones streamed (HY4_PSTREAM)", ps.min_T);
+            info.push_back(ps_route);
+            return;
+        }
         const char* pin = std::getenv("HY4_ROUTE");
         const char* fs = std::getenv("HY4_STREAM");
         if ((pin && (pin[0] == 's' || pin[0] == 'l')) || (fs && (fs[0] == '1' || fs[0] == '0'))) {
@@ -6063,6 +6088,235 @@ struct Model::Impl {
     }
     static const char* fetch_name(int mode) { return mode == 1 ? "gpu" : mode == 2 ? "mix" : "lane"; }
     // auto with copies and no verdict: Model::load measures after the warm-up
+    // HY4_PSTREAM (off by default): a prompt chunk's experts outside VRAM streamed from pinned RAM copies in
+    // passes, two staging buffers: a pass is copied (a stream of its own) while the pass before it runs, and the next
+    // layer's first pass while this layer's last one and its attention do
+    struct PStream {
+        bool on = false;
+        int min_T = 1024;
+        cudaStream_t st = nullptr;
+        cudaEvent_t dma[2] = {nullptr, nullptr}, done[2] = {nullptr, nullptr};
+        bool done_rec[2] = {false, false};
+        uint8_t* buf[2] = {nullptr, nullptr};
+        std::vector<std::pair<int, int>> pass;   // (layer index, pass) in order, every pass of a chunk
+        std::vector<int> first;                  // (layer index -> its first pass's place in `pass`, -1)
+        size_t issued = 0, comp = 0;             // (passes copied ahead, passes run; a chunk's)
+        bool chunk = false;                      // (a chunk's passes are under way)
+        double gb = 0, fill_s = 0, pin_s = 0;
+        long long passes = 0;
+    } ps;
+    bool ps_issue(std::string& err) {   // the copies a pass ahead (the second buffer free: its pass has run)
+        while (ps.issued < ps.pass.size() && ps_may_copy(ps.issued, ps.comp)) {
+            const auto [li, p] = ps.pass[ps.issued];
+            const Layer& l = L[(size_t) li];
+            const int b = (int) (ps.issued & 1), n = std::min(l.ps_pass, l.ps_m - p * l.ps_pass);
+            if (ps.done_rec[b]) CK(cudaStreamWaitEvent(ps.st, ps.done[b], 0));
+            CK(cudaMemcpyAsync(ps.buf[b], l.ps_mem + (size_t) p * (size_t) l.ps_pass * l.blob, (size_t) n * l.blob,
+                               cudaMemcpyHostToDevice, ps.st));
+            CK(cudaEventRecord(ps.dma[b], ps.st));
+            ++ps.issued;
+        }
+        return true;
+    }
+    bool ps_chunk(std::string& err) {   // (a prompt chunk starts)
+        CK(cudaSetDevice(G[0].dev));
+        ps.issued = ps.comp = 0;
+        ps.chunk = true;
+        return ps_issue(err);
+    }
+    // layer l's experts outside VRAM: its passes in order (the VRAM experts' sum first, gp.latout holds it)
+    bool ps_run(Layer& l, Gpu& gp, int T, std::string& err) {
+        const int li = (int) (&l - L.data());
+        const size_t k0 = (size_t) ps.first[(size_t) li];
+        if (!ps.chunk || ps.comp != k0) {
+            err = "HY4_PSTREAM: the passes out of order at layer " + std::to_string(l.il);
+            return false;
+        }
+        for (int p = 0; p < l.ps_np; ++p) {
+            const int n = std::min(l.ps_pass, l.ps_m - p * l.ps_pass);
+            const size_t k = ps.comp;
+            const int b = (int) (k & 1);
+            if (!ps_issue(err)) return false;
+            CK(cudaStreamWaitEvent(gp.s, ps.dma[b], 0));
+            if (!experts_sets(l, gp, T, err, l.ps_map[(size_t) p], ps.buf[b], n, true)) return false;
+            CK(cudaEventRecord(ps.done[b], gp.s));
+            ps.done_rec[b] = true;
+            ++ps.comp;
+            ++ps.passes;
+            if (!ps_issue(err)) return false;
+        }
+        if (ps.comp == ps.pass.size()) ps.chunk = false;
+        return true;
+    }
+    void ps_fill(const Layer& l, int q, int e) {   // expert e's blob into the pinned slot q
+        uint8_t* d = l.ps_mem + (size_t) q * l.blob;
+        std::memcpy(d + l.tr[0], l.cex.G((size_t) e), l.cex.g_stride);
+        std::memcpy(d + l.tr[1], l.cex.U((size_t) e), l.cex.g_stride);
+        std::memcpy(d + l.tr[2], l.cex.D((size_t) e), l.cex.d_stride);
+    }
+    bool ps_upload(Layer& l, Gpu& gp, std::string& err) {   // each pass's expert -> slot map
+        std::vector<int> h((size_t) g.n_expert);
+        for (int p = 0; p < l.ps_np; ++p) {
+            std::fill(h.begin(), h.end(), -1);
+            const int n = std::min(l.ps_pass, l.ps_m - p * l.ps_pass);
+            for (int i = 0; i < n; ++i) h[(size_t) l.ps_ex[(size_t) (p * l.ps_pass + i)]] = i;
+            CK(cudaMemcpy(l.ps_map[(size_t) p], h.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice));
+        }
+        (void) gp;
+        return true;
+    }
+    // the copies given back (and their streams and events); the layers read the file again
+    void ps_release() {
+        ps.on = false;
+        if (!G.empty()) cudaSetDevice(G[0].dev);
+        for (Layer& l : L) {
+            l.cex.blobp = nullptr;
+            if (l.ps_mem) {
+                (void) cudaHostUnregister(l.ps_mem);
+                (void) cudaGetLastError();
+                ram_free(l.ps_mem, l.ps_bytes);
+                l.ps_mem = nullptr;
+            }
+            l.ps_np = 0;
+            l.ps_ptr.clear();
+        }
+        for (int b = 0; b < 2; ++b) {
+            if (ps.dma[b]) cudaEventDestroy(ps.dma[b]);
+            if (ps.done[b]) cudaEventDestroy(ps.done[b]);
+            ps.dma[b] = ps.done[b] = nullptr;
+            ps.done_rec[b] = false;
+        }
+        if (ps.st) cudaStreamDestroy(ps.st);
+        ps.st = nullptr;
+    }
+    // every pinned copy against the model's file (HY4_PSTREAM_VERIFY=1: at the engine's end): the swaps kept them right
+    void ps_verify() const {
+        long long n = 0, bad = 0;
+        for (const Layer& l : L) {
+            if (l.ps_np == 0) continue;
+            const CpuExperts& cx = l.cex;
+            const size_t gs = cx.step ? cx.step : cx.g_stride, ds = cx.step ? cx.step : cx.d_stride;
+            for (int q = 0; q < l.ps_m; ++q) {
+                const size_t e = (size_t) l.ps_ex[(size_t) q];
+                const uint8_t* b = l.ps_mem + (size_t) q * l.blob;
+                ++n;
+                if (l.slot_of[e] >= 0 || l.ps_of[e] != q || std::memcmp(b + l.tr[0], cx.gate + e * gs, cx.g_stride) != 0 ||
+                    std::memcmp(b + l.tr[1], cx.up + e * gs, cx.g_stride) != 0 || std::memcmp(b + l.tr[2], cx.down + e * ds, cx.d_stride) != 0)
+                    ++bad;
+            }
+        }
+        std::fprintf(stderr, "maya-hy4: HY4_PSTREAM: %lld pinned copies, %lld wrong, %lld passes run\n", n, bad, ps.passes);
+    }
+    bool ps_init(std::string& err) {
+        char buf[300];
+        if (!ps_want) return true;
+        if (!lane || tp > 1 || G.size() != 1 || fx.want != 0 || !o.profile_out.empty()) {
+            info.push_back("INFO HY4_PSTREAM: off (one GPU, the CPU lane, no GPU fetch, no expert profile)");
+            return true;
+        }
+        if (const char* m = std::getenv("HY4_PSTREAM_MIN_T")) ps.min_T = std::max(64, std::atoi(m));
+        Gpu& gp = G[0];
+        {   // (the copies in RAM, as the GPU fetch's: never at the cost of the rest)
+            double need = 0;
+            for (Layer& l : L)
+                if (!l.dense && !l.mtp && l.partial() && l.tpm < 0 && l.gpu == 0 && l.il < g.n_layer) need += (double) l.n_lane() * (double) l.blob;
+            const double tot = (double) ram_total(), avail = (double) ram_available();
+            double head = std::max(4.0 * 1073741824.0, 0.1 * tot);
+            if (const char* hg = std::getenv("HY4_PSTREAM_HEAD_GB")) head = std::max(head, std::atof(hg) * 1e9);
+            if (need > avail - head) {
+                std::snprintf(buf, sizeof buf, "INFO HY4_PSTREAM: off (the copies take %.1f GB of RAM, %.1f GB is free beyond a headroom of %.1f GB)",
+                              need / 1e9, std::max(0.0, avail - head) / 1e9, head / 1e9);
+                info.push_back(buf);
+                return true;
+            }
+        }
+        std::vector<Layer*> ls;
+        for (Layer& l : L)
+            if (!l.dense && !l.mtp && l.partial() && l.tpm < 0 && l.gpu == 0 && l.il < g.n_layer && l.n_lane() > 0) ls.push_back(&l);
+        if (ls.empty() || !gp.stage) {
+            info.push_back("INFO HY4_PSTREAM: off (no expert outside VRAM)");
+            return true;
+        }
+        size_t blob = 0;
+        for (Layer* l : ls) blob = std::max(blob, l->blob);
+        CK(cudaSetDevice(gp.dev));
+        ps.buf[0] = gp.stage;
+        ps.buf[1] = gp.stage + (size_t) kStage * stage_blob;
+        (void) blob;
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaEventCreateWithFlags(&ps.dma[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ps.done[b], cudaEventDisableTiming));
+        }
+        CK(cudaStreamCreateWithFlags(&ps.st, cudaStreamNonBlocking));
+        ps.first.assign(L.size(), -1);
+        for (Layer* lp : ls) {
+            Layer& l = *lp;
+            l.ps_of.assign((size_t) g.n_expert, -1);
+            l.ps_ex.clear();
+            for (int e = 0; e < g.n_expert; ++e)
+                if (l.slot_of[(size_t) e] < 0) {
+                    l.ps_of[(size_t) e] = (int) l.ps_ex.size();
+                    l.ps_ex.push_back(e);
+                }
+            l.ps_m = (int) l.ps_ex.size();
+            const PsPlan pl = ps_plan(l.ps_m, kPs);
+            l.ps_np = pl.passes;
+            l.ps_pass = pl.per;
+            l.ps_bytes = (size_t) l.ps_m * l.blob;
+            l.ps_mem = (uint8_t*) ram_alloc(l.ps_bytes);
+            if (!l.ps_mem) {   // (the copies so far given back: the prompt's path as before)
+                info.push_back("INFO HY4_PSTREAM: off (no RAM for the copies)");
+                ps_release();
+                return true;
+            }
+            ps.gb += (double) l.ps_bytes / 1e9;
+            const double tf = now_s();
+            lane->parallel_for(l.ps_m, [&](int q) { ps_fill(l, q, l.ps_ex[(size_t) q]); });
+            ps.fill_s += now_s() - tf;
+        }
+        {   // (registered from several threads: page by page work in the driver)
+            const double tp0 = now_s();
+            std::atomic<size_t> next{0};
+            std::atomic<bool> ok{true};
+            std::vector<std::thread> th;
+            for (int w = 0; w < 8; ++w)
+                th.emplace_back([&] {
+                    (void) cudaSetDevice(gp.dev);
+                    for (size_t i; (i = next.fetch_add(1)) < ls.size();)
+                        if (cudaHostRegister(ls[i]->ps_mem, ls[i]->ps_bytes, cudaHostRegisterPortable) != cudaSuccess) ok.store(false);
+                });
+            for (auto& t : th) t.join();
+            ps.pin_s = now_s() - tp0;
+            if (!ok.load()) {
+                (void) cudaGetLastError();
+                info.push_back("INFO HY4_PSTREAM: off (the copies could not be pinned)");
+                ps_release();
+                return true;
+            }
+        }
+        for (Layer* lp : ls) {
+            Layer& l = *lp;
+            l.ps_map.assign((size_t) l.ps_np, nullptr);
+            for (int p = 0; p < l.ps_np; ++p)
+                if (!gp.alloc(l.ps_map[(size_t) p], (size_t) g.n_expert, err)) return false;
+            if (!ps_upload(l, gp, err)) return false;
+            const int li = (int) (&l - L.data());
+            ps.first[(size_t) li] = (int) ps.pass.size();
+            for (int p = 0; p < l.ps_np; ++p) ps.pass.push_back({li, p});
+            l.ps_ptr.assign((size_t) g.n_expert, nullptr);
+            for (int q = 0; q < l.ps_m; ++q) l.ps_ptr[(size_t) l.ps_ex[(size_t) q]] = l.ps_mem + (size_t) q * l.blob;
+            l.cex.off_g = l.tr[0];   // (the CPU lane reads the copies: the model's file is not read for them again)
+            l.cex.off_u = l.tr[1];
+            l.cex.off_d = l.tr[2];
+            l.cex.blobp = l.ps_ptr.data();
+        }
+        ps.on = true;
+        std::snprintf(buf, sizeof buf, "INFO HY4_PSTREAM: %zu layers' experts outside VRAM (%.1f GB) copied into RAM in %.1f s, pinned in %.1f s; a prompt chunk of "
+                      "%d tokens or more streams them in %zu passes, two buffers", ls.size(), ps.gb, ps.fill_s,
+                      ps.pin_s, ps.min_T, ps.pass.size());
+        info.push_back(buf);
+        return true;
+    }
     bool fetch_pending() const { return fx.want == 1 && fx.layers > 0 && !fx.memo; }
     std::string fetch_file() const {
         if (const char* f = std::getenv("HY4_FETCH_FILE")) return f;
@@ -6604,6 +6858,7 @@ struct Model::Impl {
                 plan.push_back({sc[cpu[i]] - sc[res[i]], l.il, res[i], cpu[i]});
             }
         }
+        if (ps.on && ps.st && !plan.empty()) CK(cudaStreamSynchronize(ps.st));   // (HY4_PSTREAM: no copy under way)
         wanted = plan.size();
         std::stable_sort(plan.begin(), plan.end(), [](const Sw& a, const Sw& b) { return a.gain > b.gain; });
         if ((int) plan.size() > max_swaps) plan.resize((size_t) std::max(0, max_swaps));
@@ -6640,12 +6895,21 @@ struct Model::Impl {
                         const int slot = l.slot_of[(size_t) s.out];
                         l.slot_of[(size_t) s.out] = -1;
                         l.slot_of[e] = slot;
+                        if (ps.on && l.ps_np > 0 && l.ps_of[e] >= 0) {   // (HY4_PSTREAM: e's pinned slot takes the one leaving VRAM,
+                            //  copied back before the stage's blob goes in)
+                            const int q = ps_swap(l.ps_of, l.ps_ex, (int) s.out, (int) e);
+                            CK(cudaMemcpyAsync(l.ps_mem + (size_t) q * l.blob, l.experts + (size_t) slot * l.blob, l.blob,
+                                               cudaMemcpyDeviceToHost, gp.s));
+                            l.ps_ptr[e] = nullptr;
+                            l.ps_ptr[(size_t) s.out] = l.ps_mem + (size_t) q * l.blob;
+                        }
                         CK(cudaMemcpyAsync(l.experts + (size_t) slot * l.blob, b, l.tr[2] + l.cex.d_stride,
                                            cudaMemcpyHostToDevice, gp.s));
                         if (std::find(touched.begin(), touched.end(), s.il) == touched.end()) touched.push_back(s.il);
                     }
                     for (int il : touched) {
                         Layer& l = L[(size_t) il];
+                        if (ps.on && l.ps_np > 0 && !ps_upload(l, gp, err)) return false;
                         CK(cudaMemcpyAsync(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice,
                                            gp.s));
                     }
@@ -6948,7 +7212,8 @@ struct Model::Impl {
                                                                             (size_t) sf}}, gp.xf, E, T, xf_pre);
             }
             bool sh_early = false;   // (the shared expert's down already queued - one GPU's token windows, below)
-            if (lane_on) {
+            const bool ps_use = ps.on && ps.chunk && T > W && T >= ps.min_T && l.ps_np > 0 && l.tpm < 0;
+            if (lane_on && !ps_use) {
                 CK(cudaMemcpyAsync(h_ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaMemcpyAsync(h_w, gp.rw, sizeof(float) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaMemcpyAsync(h_lat, gp.lat, sizeof(float) * T * lat, cudaMemcpyDeviceToHost, s));
@@ -6987,7 +7252,10 @@ struct Model::Impl {
                 // a prompt chunk's experts not in VRAM: streamed to the GPU, or the CPU lane - by the rates this PC
                 // measured once (route_start: remembered, or measured now in turns), so the same prompt takes the
                 // same routes from start to start (the two sum a token's experts in another order)
-                if (share) {   // (tensor parallel with the CPU lane: every member its share, to its own GPU)
+                if (ps_use) {   // (HY4_PSTREAM: from pinned RAM, copied ahead)
+                    ok = ok && ps_run(l, gp, T, err);
+                    streamed = true;
+                } else if (share) {   // (tensor parallel with the CPU lane: every member its share, to its own GPU)
                     ok = ok && experts_streamed(l, gp, T, err, true);
                     streamed = true;
                 } else if (lane_on && route.any) {
@@ -8112,6 +8380,11 @@ struct Model::Impl {
         const int E = g.n_embd, hc = g.hc;
         win_t0 = now_s();
         cur_p0 = p0;
+        if (T > W && ps.on && T >= ps.min_T) {   // (HY4_PSTREAM: the first passes copied ahead)
+            if (!ps_chunk(err)) return false;
+        } else {
+            ps.chunk = false;
+        }
         if (T > W && !fetch_sync_slots(err)) return false;   // (the GPU fetch's cache moved slots: the prompt path reads the host's tables)
         // the embeddings, every stream a copy
         for (int t = 0; t < T; ++t) {
