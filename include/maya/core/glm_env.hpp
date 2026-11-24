@@ -55,7 +55,7 @@ inline int switch_value(const char* name, const char* v, int dflt, bool allow_au
     int r = parse(v);
     if (r == kAuto && !allow_auto) r = kInvalid;
     if (r == kInvalid) {
-        std::fprintf(stderr, "strata: %s=\"%s\" is not a switch value (1/0, on/off, true/false, yes/no%s): %s (the "
+        std::fprintf(stderr, "maya: %s=\"%s\" is not a switch value (1/0, on/off, true/false, yes/no%s): %s (the "
                              "default)\n", name, v, allow_auto ? ", auto" : "",
                      dflt == kAuto ? "auto" : dflt == kOff ? "off" : "on");
         return dflt;
@@ -82,7 +82,7 @@ inline long long int_value(const char* name, const char* v, long long dflt) {
     errno = 0;
     const long long x = std::strtoll(v, &end, 10);
     if (end == v || *end != '\0' || errno == ERANGE) {
-        std::fprintf(stderr, "strata: %s=\"%s\" is not an integer: %lld (the default)\n", name, v, dflt);
+        std::fprintf(stderr, "maya: %s=\"%s\" is not an integer: %lld (the default)\n", name, v, dflt);
         return dflt;
     }
     return x;
@@ -95,7 +95,7 @@ inline double num_value(const char* name, const char* v, double dflt) {
     char* end = nullptr;
     const double x = std::strtod(v, &end);
     if (end == v || *end != '\0' || !std::isfinite(x)) {
-        std::fprintf(stderr, "strata: %s=\"%s\" is not a number: %g (the default)\n", name, v, dflt);
+        std::fprintf(stderr, "maya: %s=\"%s\" is not a number: %g (the default)\n", name, v, dflt);
         return dflt;
     }
     return x;
