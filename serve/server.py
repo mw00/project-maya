@@ -2306,6 +2306,37 @@ def amd_gpu_free_bytes(gpu: int, sysfs: str | None = None, meminfo: str = "/proc
     return total - used if total is not None and used is not None else None
 
 
+def vision_plan(cfg: dict, env: dict, cache_file: Path):
+    """(vision config, the encoder's environment, on demand?, footprint, the ENGINE's environment) for a config with
+    pictures.  The one place the engine's environment gets its picture-related keys (the GLM engine's lend size; the
+    server and the bench both start the engine from it).  maya-ik2 lends no memory and plans none for pictures: its
+    start - context, cache, drafter - is the same with pictures on or off; the encoder takes what is free when a
+    picture arrives, else the CPU."""
+    vcfg = cfg.get("vision") or None
+    venv = dict(env)
+    if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
+        venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
+    # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
+    # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
+    # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
+    on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
+    engine_env, fp = env, None
+    if on_demand:
+        fp = vision_footprint(vcfg, venv, cache_file, (gpu_list(cfg) or [0])[0])
+        if fp is None:
+            vcfg, on_demand = dict(vcfg, gpu=False), False
+        else:
+            vcfg = dict(vcfg, max_tokens=fp[0])
+            if models.family(cfg) != "ik2":
+                engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+    return vcfg, venv, bool(on_demand), fp, engine_env
+
+
+def engine_environment(cfg: dict, cache_file: Path) -> dict:
+    """The environment the engine is started with for this config: child_env plus the picture keys."""
+    return vision_plan(cfg, child_env(cfg), cache_file)[4]
+
+
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
     """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
     `maya-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
@@ -7867,31 +7898,17 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
                   flush=True)
-        vcfg = cfg.get("vision") or None
-        vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
-        venv = dict(env)
-        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
-            venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
-        # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
-        # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
-        # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
-        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
-        engine_env = env
+        vcfg_in = cfg.get("vision") or None
+        vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg_in else None
+        # pictures: the encoder's environment, whether it runs on demand, and the engine's environment (one function,
+        # also the bench's: tools/maya_bench.py start_command)
+        vcfg, venv, on_demand, fp, engine_env = vision_plan(cfg, env, Path(a.config).resolve().with_name("vision-memory.json"))
         if on_demand:
-            fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
-                                  (gpu_list(cfg) or [0])[0])
-            if fp is None:
-                print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
-                      flush=True)
-                vcfg, on_demand = dict(vcfg, gpu=False), False
-            else:
-                vcfg = dict(vcfg, max_tokens=fp[0])
-                # (maya-ik2 lends no memory and plans none for pictures: its start - context, cache, drafter - is the
-                #  same with pictures on or off; the encoder takes what is free when a picture arrives, else the CPU)
-                if models.family(cfg) != "ik2":
-                    engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
-                print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
-                      "image tokens", flush=True)
+            print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
+                  "image tokens", flush=True)
+        elif vcfg_in and vcfg_in.get("gpu") and vcfg and not vcfg.get("gpu"):
+            print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
+                  flush=True)
         if vcfg and not on_demand:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(vcfg, log=vlog, env=venv)

@@ -370,5 +370,36 @@ class SharedCpuTiming(unittest.TestCase):
             self.assertEqual(MB.share_timing(a, Path(d) / "none.txt"), 0)
 
 
+class EngineStartMatchesServer(unittest.TestCase):
+    """The bench starts the engine from the server's own start code.  v1.1.77: the server gave maya-ik2 a pictures
+    figure (images on) that the bench never did, so the bench showed full speed while served answers were slow."""
+
+    EXES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2")
+
+    def cfg(self, exe, tmp):
+        return {"exe": exe, "gpu": [0], "args": [], "vision": {"exe": "maya-vision", "mmproj": str(Path(tmp) / "m.gguf"),
+                                                               "gpu": True}}
+
+    def test_bench_env_has_every_key_the_server_sets(self):
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as d, patch.object(SV, "vision_footprint", return_value=(4096, 2 << 30)):
+            cache = Path(d) / "vision-memory.json"
+            for exe in self.EXES:
+                for images in (True, False):
+                    c = self.cfg(exe, d)
+                    if not images:
+                        c.pop("vision")
+                    served = SV.vision_plan(c, SV.child_env(c), cache)[4]   # what serve/server.py starts the engine with
+                    bench = SV.engine_environment(c, cache)                 # what the bench's start_command reads
+                    self.assertEqual(sorted(set(served) - set(bench)), [], f"{exe} images={images}")
+                    self.assertEqual(sorted(set(bench) - set(served)), [], f"{exe} images={images}")
+
+    def test_bench_start_command_reads_the_servers_environment_function(self):
+        import inspect
+        src = inspect.getsource(MB.start_command)
+        self.assertIn("SV.engine_environment", src)
+        self.assertIn("SV.engine_args", src)
+
+
 if __name__ == "__main__":
     unittest.main()

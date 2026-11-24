@@ -841,10 +841,11 @@ def map_cfg(cfg: dict, here: Path, there: Path) -> dict:
 
 def start_command(root: Path, cfg: dict, cfg_file: Path):
     """[cmd, env] the build in `root` starts this config's engine with - its own serve/server.py (engine_args,
-    child_env), run as a separate Python so its modules never mix with this build's."""
+    engine_environment), run as a separate Python so its modules never mix with this build's."""
     code = ("import json,sys; sys.path[:0]=[sys.argv[1], sys.argv[1]+'/tools']; import serve.server as SV; "
             "c=json.load(open(sys.argv[2])); print(json.dumps([[c['exe'],'--serve']+SV.engine_args(c),"
-            "SV.child_env(c)]))")
+            "(SV.engine_environment(c, __import__('pathlib').Path(sys.argv[2]).resolve().with_name('vision-memory.json')) "
+            "if hasattr(SV, 'engine_environment') else SV.child_env(c))]))")   # (an older build: child_env alone)
     r = subprocess.run([sys.executable, "-c", code, str(root), str(cfg_file)], capture_output=True, text=True,
                        cwd=str(root))
     if r.returncode:
