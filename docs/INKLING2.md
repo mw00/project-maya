@@ -473,6 +473,45 @@ second card's experts from RAM, so they run at the offload path's speed. On Wind
 are untested there). CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list (`-DMAYA_IK2_WINDOWS=OFF`:
 not on Windows).
 
+**Long prompts on Turing and two cards (opt-in settings; the defaults and their answers are unchanged).** On an RTX 20 card the fused
+prompt attention was off (it wants `cp.async` and more shared memory than a Turing SM has) and the prompt's attention ran through cuBLAS with the
+whole logits matrix in memory, so a 100K prompt was attention-bound (79% of the time). `IK2_FLASH_TURING=1` runs the Ampere flash kernel on sm_75
+with a Turing layout (32-key tiles, K then V in one 19 KB tile, three blocks an SM; `IK2_FLASH_TV=0`: 64-key tiles, one block an SM); FP16 cache
+only (an FP8 cache keeps the old path). Same FP32 accumulation, a different order: most answers are the same tokens, some differ in their wording
+after the first lines. `IK2_PF_GPU1=1` (two-card split): the prompt's experts that GPU 0's tier lacks run on GPU 1, which holds them, instead of
+streaming from RAM (`IK2_PF_PEER=1`: the rows between the cards by peer copies when the pair has NVLink - checked at load both ways - else through
+pinned host memory; `IK2_PF_HOST=1` forces that). `--chunk 8192` reads prompts faster than the default 2048 on these cards (the experts' weights are
+decoded once a chunk). `IK2_DRAFT_GPU=1` runs the drafter on GPU 1 (frees GPU 0's expert tier of the drafter's VRAM). **A peer copy between two
+RTX 2080 Ti on NVLink that is issued on the DESTINATION card's stream arrives partly wrong for sizes from about 256 KB to 3 MB (measured; one on the
+SOURCE card's stream is right at every size, 47 GB/s), so the load-time test above, which issues them on the destination's stream, refuses peer copies there
+and the engine stays on host staging; the settings above issue theirs on the source's stream.** `IK2_PROF=1` prints a request's time by phase.
+Measured on RTX 2080 Ti 22 GB cards (modded, turing-unlock active, 250 W, PCIe 3.0 x16 each; two NVLink links on the pair), Xeon E5-2699 v4,
+52 GB RAM, driver 615.71, CUDA 13.4: unsloth's UD-Q4_K_XL (17.6 GB: the experts of layers 0-19 NVFP4, layers 20-23 and the dense weights Q8_0;
+other quants not measured), 262,144 context, drafting off, greedy, one request, prompts of 3,887 / 33,707 / 115,237 tokens; the "no bridge"
+row is the same cards with the peer copies switched off (`IK2_PF_HOST=1 IK2_HOST_STAGE=1`):
+
+| Cards | Cache | Settings | Prompts 4K / 32K / 100K (tok/s) | Answers short / 32K / 100K (tok/s) |
+| --- | --- | --- | ---: | ---: |
+| 1 | FP16 | none (defaults) | 1407 / 986 / 342 | 62 / 54 / 38 |
+| 1 | FP16 | `IK2_FLASH_TURING=1 --chunk 8192` | 1900 / 2286 / 1994 | 62 / 53 / 39 |
+| 2, `--gpus 2` | FP16 | none (defaults) | 1399 / 980 / 342 | 82 / 69 / 52 |
+| 2, no bridge | FP16 | + `IK2_PF_GPU1=1` | 2206 / 2372 / 2012 | 82 / 70 / 52 |
+| 2, NVLink | FP16 | + `IK2_PF_PEER=1` | 2403 / 2744 / 2289 | 82 / 69 / 52 |
+| 1 | FP8 | none (the setup's default `IK2_KV=fp8`) | 1643 / 1052 / 313 | 90 / 80 / 64 |
+| 2, `--gpus 2` | FP8 | none | 1647 / 1051 / 313 | 82 / 73 / 59 |
+| 2, NVLink | FP8 | `IK2_PF_GPU1=1 IK2_PF_PEER=1 --chunk 8192` | 2018 / 1226 / 343 | 83 / 75 / 61 |
+
+An FP8 cache keeps the old prompt attention (the flash kernel is FP16's), so its 32K and 100K prompts gain little; it keeps one card's
+experts resident (decode 90 against 62). A second card helps decode only where the cache and the experts do not fit one (82 against 62, FP16).
+The same pair of cards without a bridge on another PC (Xeon E5-2680 v4, 125 GB RAM) read 4K / 32K / 100K at 2190 / 2284 / 1901 with the
+no-bridge row's settings and the first kernel layout (`IK2_FLASH_TV=0`). `--drafting auto` on top: code 123 tok/s against 82 (+50%), prose about equal, 32K +8%.
+
+To reproduce the table and to check that the settings do not change what the model says: `python tools/ik2_check.py run one one-tuned two
+two-nobridge two-nvlink` (stdlib only; it writes your config's rows over a copy of it, one engine start a row, and prints each row's speed,
+7 greedy answers' hashes and 3 long-prompt retrievals; `compare A.json B.json` says which answers are the same tokens and where the others
+part, `table` prints the rows as the markdown above, `list` the rows' settings). `tests/ik2_p2p_stream.cu` (one `nvcc` line in its header)
+shows which way a pair of cards' peer copies behave; `tests/ik2_kernels_test.cu` covers the flash kernel's layouts against a double reference.
+
 **AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
 written for `mma.sync` / `ldmatrix` / `cp.async` run through AMD versions that keep their fragment layouts; the prompt's
 hot paths have kernels of their own on RDNA 3 / 3.5 / 4's matrix cores (`src/ik2/ik2_rdna.inc`): a layer's routed
