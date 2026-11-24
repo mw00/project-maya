@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>   // glm-dsa: std::memcpy for glmd_mv_dots.cuh's host path (included below, inside the namespace)
 #include <string>
+#include <mutex>
 
 #if defined(MAYA_USE_HIP)
 // The HC grid exchanges FP32 partials between workgroups. An agent-scope
@@ -4834,7 +4835,7 @@ template<int TG, int NW = GU_WARPS, bool LUT = false, bool GLOBAL = false, bool 
 __attribute__((amdgpu_waves_per_eu(MINWAVES > 0 ? MINWAVES : 1)))
 __global__ void __launch_bounds__(NW * 32)
 #else
-template<int TG>
+template<int TG, bool SPLIT = false>
 __global__ void __launch_bounds__(GU_WARPS * 32)
 #endif
 moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
@@ -4864,9 +4865,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
 #endif
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-#if defined(MAYA_USE_HIP)
     if constexpr (!SPLIT)
-#endif
     if (ei == k) {
         const int per = (n_embd + n_chunks - 1) / n_chunks;
         const int r1 = min(n_embd, (chunk + 1) * per);
@@ -7290,6 +7289,58 @@ void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off
 } // namespace
 #endif
 
+#if !defined(MAYA_USE_HIP)
+namespace {
+// Splitting shared down out of moe_gate_up_kernel removes any_row_dot's type switch from the routed kernel's
+// register budget (e.g. IQ2_S: REG:64 STACK:8 -> REG:64 STACK:0 on sm_89) and runs shared down concurrently on a
+// side stream; routed and shared outputs are bit-for-bit identical to the fused kernel.
+template<int T>
+__global__ void __launch_bounds__(256) cuda_shared_down_kernel(
+    const uint8_t* __restrict__ weights, int type, const block_q8_1* __restrict__ h,
+    int n_in, int n_out, float* __restrict__ out, const int* __restrict__ skip) {
+    if (skip != nullptr && *skip) return;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int row = (int) blockIdx.x * 8 + wave;
+    if (row < n_out) {
+        float v;
+        if constexpr (T > 0) v = row_dot<T>(weights + (size_t) row * rbytes<T>(n_in), h, n_in, lane);
+        else v = any_row_dot(type, weights, row, h, nullptr, n_in, lane);
+        if (lane == 0) out[row] = v;
+    }
+}
+
+bool cuda_split_shared_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_GLM_SPLIT_SHARED");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+bool cuda_split_shared_stream(int dev, cudaStream_t& s_sh, cudaEvent_t& ev_in, cudaEvent_t& ev_out) {
+    if (dev < 0 || dev >= 16) return false;
+    static std::mutex mu;
+    static cudaStream_t ss[16] = {};
+    static cudaEvent_t evi[16] = {}, evo[16] = {};
+    static std::atomic<uint8_t> init[16] = {};
+    if (init[dev].load(std::memory_order_acquire) == 1) {
+        s_sh = ss[dev]; ev_in = evi[dev]; ev_out = evo[dev];
+        return true;
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    if (init[dev].load(std::memory_order_relaxed) == 0) {
+        const bool ok = cudaStreamCreateWithFlags(&ss[dev], cudaStreamNonBlocking) == cudaSuccess &&
+                        cudaEventCreateWithFlags(&evi[dev], cudaEventDisableTiming) == cudaSuccess &&
+                        cudaEventCreateWithFlags(&evo[dev], cudaEventDisableTiming) == cudaSuccess;
+        init[dev].store(ok ? 1 : 2, std::memory_order_release);
+    }
+    if (init[dev].load(std::memory_order_acquire) != 1) return false;
+    s_sh = ss[dev]; ev_in = evi[dev]; ev_out = evo[dev];
+    return true;
+}
+} // namespace
+#endif
+
 void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     MoeDev d = d_in;
@@ -7319,6 +7370,50 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     const int kk = sh ? k : k + 1;   // no shared expert: no block has blockIdx.y == kk
     // cc 6.0: the room to stage the layer input in shared memory (moe_gate_up_kernel takes it when given)
     const size_t gx = sm60_gu_stage() && n_embd <= 4 * 4096 ? (size_t) (n_embd / 32) * sizeof(block_q8_1) : 0;
+#if !defined(MAYA_USE_HIP)
+    if (cuda_split_shared_on()) {
+        int dev = -1;
+        const bool have_dev = (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 16);
+        cudaStream_t s_sh = s;
+        cudaEvent_t ev_in = nullptr, ev_out = nullptr;
+        bool use_conc = false;
+        if (sh && k > 0 && have_dev) {
+            cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(s, &cap_st) == cudaSuccess && cap_st == cudaStreamCaptureStatusNone &&
+                cuda_split_shared_stream(dev, s_sh, ev_in, ev_out) &&
+                cudaEventRecord(ev_in, s) == cudaSuccess &&
+                cudaStreamWaitEvent(s_sh, ev_in, 0) == cudaSuccess) {
+                use_conc = true;
+            }
+        }
+        if (k > 0) {
+            const dim3 grid_r((unsigned) (n_ff / GU_ROWS), (unsigned) k);
+            switch (gu_type) {
+#define GLMF_GU_S(T) case T: moe_gate_up_kernel<T, true><<<grid_r, GU_WARPS * 32, gx, s>>>(d, k, n_embd, n_ff, limit, X, H, nullptr, 0, nullptr, 0, nullptr); break;
+                GLMF_GU_S(16) GLMF_GU_S(18) GLMF_GU_S(19) GLMF_GU_S(23) GLMF_GU_S(10) GLMF_GU_S(11) GLMF_GU_S(17) GLMF_GU_S(22) GLMF_GU_S(21) GLMF_GU_S(29)
+                GLMF_GU_S(12) GLMF_GU_S(13) GLMF_GU_S(14) GLMF_GU_S(8)
+#undef GLMF_GU_S
+                default:
+                    std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type);
+                    g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+                    return;
+            }
+        }
+        if (sh) {
+            cudaStream_t sh_s = use_conc ? s_sh : s;
+            const unsigned sh_blocks = (unsigned) ((n_embd + 7) / 8);
+            if (sh_type == 14) cuda_shared_down_kernel<14><<<sh_blocks, 256, 0, sh_s>>>(SD, sh_type, SH, n_ff_sh, n_embd, sh_out, d.skip);
+            else if (sh_type == 8) cuda_shared_down_kernel<8><<<sh_blocks, 256, 0, sh_s>>>(SD, sh_type, SH, n_ff_sh, n_embd, sh_out, d.skip);
+            else cuda_shared_down_kernel<0><<<sh_blocks, 256, 0, sh_s>>>(SD, sh_type, SH, n_ff_sh, n_embd, sh_out, d.skip);
+            if (use_conc) {
+                cudaEventRecord(ev_out, s_sh);
+                cudaStreamWaitEvent(s, ev_out, 0);
+            }
+        }
+        launch_check("moe_gate_up split-shared");
+        return;
+    }
+#endif
     switch (gu_type) {
 #define GLMF_GU(T) \
         case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, gx, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
