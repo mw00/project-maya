@@ -21,8 +21,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <cstring>
 #include <numeric>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -63,24 +69,94 @@ std::vector<int> read_ids(const std::string& path) {
     return parse_ints(buf);
 }
 
+// Run a subprocess directly via argument-list execvp (no shell interpolation, safe with quotes and $(...)).
+static bool run_argv_exec(const std::vector<std::string>& argv, std::string* captured_stdout, bool quiet_stderr,
+                          int& exit_code, std::string& err) {
+    exit_code = -1;
+    if (argv.empty() || argv[0].empty()) {
+        err = "empty argv";
+        return false;
+    }
+#if defined(_WIN32)
+    (void) captured_stdout;
+    (void) quiet_stderr;
+    err = "subprocess exec is not supported on Windows; pass --prompt-ids / --mmi1 directly";
+    return false;
+#else
+    int pipefd[2] = {-1, -1};
+    if (captured_stdout != nullptr) {
+        captured_stdout->clear();
+        if (::pipe(pipefd) != 0) {
+            err = std::string("pipe failed: ") + std::strerror(errno);
+            return false;
+        }
+    }
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        const int e = errno;
+        if (pipefd[0] >= 0) ::close(pipefd[0]);
+        if (pipefd[1] >= 0) ::close(pipefd[1]);
+        err = std::string("fork failed: ") + std::strerror(e);
+        return false;
+    }
+    if (pid == 0) {
+        if (pipefd[0] >= 0) ::close(pipefd[0]);
+        if (pipefd[1] >= 0) {
+            (void) ::dup2(pipefd[1], STDOUT_FILENO);
+            ::close(pipefd[1]);
+        }
+        if (quiet_stderr) {
+            const int devnull = ::open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                (void) ::dup2(devnull, STDERR_FILENO);
+                ::close(devnull);
+            }
+        }
+        std::vector<char*> cargv;
+        cargv.reserve(argv.size() + 1);
+        for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+        cargv.push_back(nullptr);
+        ::execvp(cargv[0], cargv.data());
+        ::_exit(127);
+    }
+    if (pipefd[1] >= 0) ::close(pipefd[1]);
+    if (pipefd[0] >= 0) {
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = ::read(pipefd[0], buf, sizeof buf);
+            if (n > 0) {
+                captured_stdout->append(buf, (size_t) n);
+            } else if (n == 0) {
+                break;
+            } else if (errno != EINTR) {
+                break;
+            }
+        }
+        ::close(pipefd[0]);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            err = std::string("waitpid failed: ") + std::strerror(errno);
+            return false;
+        }
+    }
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+        return true;
+    }
+    err = "child terminated by signal";
+    return false;
+#endif
+}
+
 std::vector<int> tokenize(const std::string& bin, const std::string& gguf, const std::string& text) {
-    if (text.find('\'') != std::string::npos) throw std::runtime_error("--prompt: a quote in the text");
-#ifdef _WIN32
-    const std::string cmd = "\"" + bin + "\" --ids -m \"" + gguf + "\" -p \"" + text + "\" 2>NUL";
-    FILE* p = _popen(cmd.c_str(), "r");
-#else
-    const std::string cmd = bin + " --ids -m '" + gguf + "' -p '" + text + "' 2>/dev/null";
-    FILE* p = popen(cmd.c_str(), "r");
-#endif
-    if (p == nullptr) throw std::runtime_error("cannot run " + bin);
-    std::string out;
-    char tmp[1024];
-    while (size_t n = std::fread(tmp, 1, sizeof tmp, p)) out.append(tmp, n);
-#ifdef _WIN32
-    if (_pclose(p) != 0) throw std::runtime_error(bin + " failed - use --prompt-ids");
-#else
-    if (pclose(p) != 0) throw std::runtime_error(bin + " failed - use --prompt-ids");
-#endif
+    std::string out, err;
+    int rc = -1;
+    if (!run_argv_exec({bin, "--ids", "-m", gguf, "-p", text}, &out, true, rc, err)) {
+        throw std::runtime_error("cannot run " + bin + ": " + err);
+    }
+    if (rc != 0) throw std::runtime_error(bin + " failed - use --prompt-ids");
     std::vector<int> ids = parse_ints(out);
     if (ids.empty()) throw std::runtime_error(bin + " returned no ids - use --prompt-ids");
     return ids;
@@ -152,7 +228,6 @@ void print_mem(const std::vector<int>& gpus) {
 #include <io.h>
 static long ling_read_stdin(char* buf, size_t n) { return (long) _read(0, buf, (unsigned) n); }
 #else
-#include <unistd.h>
 static long ling_read_stdin(char* buf, size_t n) { return (long) ::read(0, buf, n); }
 #endif
 
@@ -163,8 +238,35 @@ struct CliPic {
     uint64_t hash = 0;
 };
 
-static bool read_mmi1_file(const std::string& path, std::vector<CliPic>& out, std::string& err) {
+// Cap total raw RGB bytes across all pictures in a single request (256 MiB ~= twenty-one 2048x2048 images).
+static constexpr size_t kMaxRequestPicBytes = 256ULL << 20;
+
+static bool path_within_temp_dir(const std::string& path, std::string& err) {
+    std::error_code ec;
+    const std::filesystem::path base = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path(), ec);
+    if (ec) {
+        err = "cannot resolve temp directory";
+        return false;
+    }
+    const std::filesystem::path target = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+    if (ec) {
+        err = path + ": cannot resolve picture path";
+        return false;
+    }
+    auto bi = base.begin(), ti = target.begin();
+    for (; bi != base.end(); ++bi, ++ti) {
+        if (ti == target.end() || *bi != *ti) {
+            err = path + ": GENI picture file must reside inside temp directory";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool read_mmi1_file(const std::string& path, std::vector<CliPic>& out, std::string& err,
+                           bool restrict_temp = false) {
     out.clear();
+    if (restrict_temp && !path_within_temp_dir(path, err)) return false;
     std::ifstream f(path, std::ios::binary);
     char magic[4];
     int32_t n = 0;
@@ -172,19 +274,27 @@ static bool read_mmi1_file(const std::string& path, std::vector<CliPic>& out, st
         err = path + ": invalid MMI1 picture file";
         return false;
     }
+    size_t total_bytes = 0;
     for (int i = 0; i < n; ++i) {
         CliPic q;
         int64_t st = 0;
         int32_t wh[2] = {0, 0};
         if (!f.read((char*) &st, 8) || !f.read((char*) wh, 8) || wh[0] <= 0 || wh[1] <= 0 ||
-            (int64_t) wh[0] * wh[1] > (1LL << 26)) {
-            err = path + ": truncated picture " + std::to_string(i);
+            (int64_t) wh[0] * (int64_t) wh[1] > (1LL << 26)) {
+            err = path + ": invalid or truncated picture " + std::to_string(i);
             return false;
         }
+        const uint64_t px = (uint64_t) wh[0] * (uint64_t) wh[1];
+        const uint64_t pic_bytes_u64 = px * 3ULL;
+        if (pic_bytes_u64 > (uint64_t) (kMaxRequestPicBytes - total_bytes)) {
+            err = path + ": total picture bytes exceed limit (" + std::to_string(kMaxRequestPicBytes >> 20) + " MiB)";
+            return false;
+        }
+        total_bytes += (size_t) pic_bytes_u64;
         q.start = st;
         q.width = wh[0];
         q.height = wh[1];
-        q.rgb.resize((size_t) wh[0] * (size_t) wh[1] * 3);
+        q.rgb.resize((size_t) pic_bytes_u64);
         if (!f.read((char*) q.rgb.data(), (std::streamsize) q.rgb.size())) {
             err = path + ": truncated pixel data for picture " + std::to_string(i);
             return false;
@@ -200,7 +310,7 @@ static bool read_mmi1_file(const std::string& path, std::vector<CliPic>& out, st
 }
 
 static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g, CliPic& out, std::string& err) {
-    // Fast native binary PPM (P6) reader; falls back to Python Pillow bicubic smart-resize for PNG/JPEG/WebP.
+    // Fast native binary PPM (P6) reader; falls back to Python Pillow bicubic smart-resize via direct execvp (no shell).
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         err = "cannot open image: " + path;
@@ -230,9 +340,14 @@ static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g,
             err = path + ": invalid P6 PPM header";
             return false;
         }
+        const uint64_t pic_bytes_u64 = (uint64_t) w * (uint64_t) h * 3ULL;
+        if ((uint64_t) w * (uint64_t) h > (1ULL << 26) || pic_bytes_u64 > (uint64_t) kMaxRequestPicBytes) {
+            err = path + ": picture bytes exceed limit (" + std::to_string(kMaxRequestPicBytes >> 20) + " MiB)";
+            return false;
+        }
         out.width = w;
         out.height = h;
-        out.rgb.resize((size_t) w * (size_t) h * 3);
+        out.rgb.resize((size_t) pic_bytes_u64);
         if (!f.read((char*) out.rgb.data(), (std::streamsize) out.rgb.size())) {
             err = path + ": truncated P6 PPM";
             return false;
@@ -240,7 +355,25 @@ static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g,
         return true;
     }
     f.close();
-    const std::string tmp = (std::filesystem::temp_directory_path() / ("ling_img_" + std::to_string((unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count()) + ".mmi1")).string();
+#if defined(_WIN32)
+    err = "non-PPM --image decoding is not supported on Windows; pass a factor-32 P6 PPM / MMI1 file";
+    return false;
+#else
+    std::string tmpl = (std::filesystem::temp_directory_path() / "ling_img_XXXXXX").string();
+    std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
+    tmpl_buf.push_back('\0');
+    const int tmp_fd = ::mkstemp(tmpl_buf.data());
+    if (tmp_fd < 0) {
+        err = std::string("cannot create temp image file: ") + std::strerror(errno);
+        return false;
+    }
+    ::close(tmp_fd);
+    const std::string tmp(tmpl_buf.data());
+    struct TempGuard {
+        std::string p;
+        ~TempGuard() { if (!p.empty()) std::remove(p.c_str()); }
+    } tmp_guard{tmp};
+
     const char* py_code =
         "import math,struct,sys; from PIL import Image,ImageOps; "
         "im=ImageOps.exif_transpose(Image.open(sys.argv[1])); "
@@ -254,20 +387,22 @@ static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g,
         "im=im.resize((rw,rh),Image.BICUBIC) if (rw,rh)!=im.size else im; "
         "open(sys.argv[2],'wb').write(struct.pack('<4siqii',b'MMI1',1,0,rw,rh)+im.tobytes())";
     const char* py_exe = std::getenv("LING_PYTHON");
-    std::string cmd = std::string(py_exe && *py_exe ? py_exe : "python3") + " -c \"" + py_code + "\" \"" + path +
-                      "\" \"" + tmp + "\" " + std::to_string(g.factor()) + " " + std::to_string(g.min_pixels) + " " +
-                      std::to_string(g.max_pixels);
-    const int rc = std::system(cmd.c_str());
-    if (rc != 0) {
+    const std::string py_bin = (py_exe && *py_exe) ? std::string(py_exe) : std::string("python3");
+    int rc = -1;
+    std::string exec_err;
+    if (!run_argv_exec({py_bin, "-c", py_code, path, tmp, std::to_string(g.factor()),
+                        std::to_string(g.min_pixels), std::to_string(g.max_pixels)},
+                       nullptr, false, rc, exec_err) ||
+        rc != 0) {
         err = "image decode failed (install Pillow or pass a factor-32 P6 PPM / MMI1 file)";
         return false;
     }
     std::vector<CliPic> pics;
     const bool ok = read_mmi1_file(tmp, pics, err);
-    std::remove(tmp.c_str());
     if (!ok || pics.empty()) return false;
     out = std::move(pics[0]);
     return true;
+#endif
 }
 
 
@@ -351,16 +486,26 @@ static bool parse_serve_gen(const std::string& line, ServeReq& r) {
                 r.file = tok;
                 continue;
             }
+            auto push_id = [&](const std::string& s_id) -> bool {
+                if (s_id.empty()) return false;
+                char* end = nullptr;
+                errno = 0;
+                const long long v = std::strtoll(s_id.c_str(), &end, 10);
+                if (errno == ERANGE || end == s_id.c_str() || *end != '\0' || v < INT_MIN || v > INT_MAX)
+                    return false;
+                r.ids.push_back((int) v);
+                return true;
+            };
             std::string cur;
             for (char ch : tok) {
                 if (ch == ',') {
-                    if (!cur.empty()) r.ids.push_back(std::atoi(cur.c_str()));
+                    if (!push_id(cur)) return false;
                     cur.clear();
                 } else {
                     cur.push_back(ch);
                 }
             }
-            if (!cur.empty()) r.ids.push_back(std::atoi(cur.c_str()));
+            if (!push_id(cur)) return false;
             break;
         }
         const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
@@ -520,11 +665,23 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
     };
     auto is_eos = [&](int tok) -> bool {
-        return tok == c.eos_id || tok == 156892 || tok == 156895;
+        return c.is_stop_id(tok);
     };
 
-    // Rolling host-RAM KDA snapshots (~75 MiB each, up to 4 checkpoints) for instant multi-turn prefix reuse
-    constexpr size_t kMaxSnaps = 4;
+    // Derive rolling KDA snapshot count from model snapshot footprint and host RAM remaining after load
+    const size_t snap_bytes = model.kda_snapshot_bytes();
+    const uint64_t avail_after = hy4::ram_available();
+    const uint64_t total_ram = hy4::ram_total();
+    const uint64_t snap_headroom = std::max<uint64_t>(4ULL << 30, total_ram / 10);
+    size_t max_snaps = 0;
+    if (snap_bytes > 0) {
+        if (avail_after == 0) {
+            max_snaps = 2;  // host RAM unavailable: conservative fallback
+        } else if (avail_after > snap_headroom) {
+            const uint64_t budget = std::min<uint64_t>((avail_after - snap_headroom) / 20, 1ULL << 30);
+            max_snaps = std::min<size_t>((size_t) (budget / snap_bytes), 16);
+        }
+    }
     std::deque<ling::Model::KdaSnapshot> snaps;
     std::vector<int> live_tokens;
     std::vector<std::pair<int64_t, uint64_t>> live_pics;
@@ -540,13 +697,13 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
     };
 
     auto push_snap = [&](const std::vector<int>& toks, const std::vector<std::pair<int64_t, uint64_t>>& pics) {
-        if (toks.size() < 16) return;
+        if (max_snaps == 0 || toks.size() < 16) return;
         // Avoid duplicating an identical checkpoint length
         for (const auto& s : snaps)
             if (s.tokens.size() == toks.size() && s.tokens == toks && s.pics == pics) return;
         ling::Model::KdaSnapshot sp;
         model.save_kda_snapshot(sp, toks, pics);
-        if (snaps.size() >= kMaxSnaps) snaps.pop_front();
+        if (snaps.size() >= max_snaps) snaps.pop_front();
         snaps.push_back(std::move(sp));
     };
 
@@ -571,6 +728,23 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
             std::fflush(stdout);
             continue;
         }
+        bool bad_tok = false;
+        for (size_t i = 0; i < r.ids.size(); ++i) {
+            if (r.ids[i] < 0 || r.ids[i] >= c.vocab) {
+                std::printf("ERR token id %d at index %zu out of range [0, %d)\n", r.ids[i], i, c.vocab);
+                std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+                std::fflush(stdout);
+                bad_tok = true;
+                break;
+            }
+        }
+        if (bad_tok) continue;
+        if (r.think_end != -1 && (r.think_end < 0 || r.think_end >= c.vocab)) {
+            std::printf("ERR think_end token id %d out of range [0, %d)\n", r.think_end, c.vocab);
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+            std::fflush(stdout);
+            continue;
+        }
         if ((int) r.ids.size() >= model.max_ctx()) {
             std::printf("ERR prompt (%zu) exceeds context (%d)\n", r.ids.size(), model.max_ctx());
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
@@ -583,7 +757,7 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
         std::vector<std::pair<int64_t, uint64_t>> req_pic_sig;
         std::string err;
         if (!r.file.empty()) {
-            if (!read_mmi1_file(r.file, pics, err)) {
+            if (!read_mmi1_file(r.file, pics, err, /*restrict_temp=*/true)) {
                 std::printf("ERR %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", err.c_str(), r.ids.size());
                 std::fflush(stdout);
                 continue;
@@ -995,7 +1169,7 @@ int main(int argc, char** argv) {
     if (gguf.empty() || (!serve_mode && ids_file.empty() && prompt.empty() && vision_dump_emb.empty())) {
         std::fprintf(stderr,
                      "maya-ling --gguf MODEL.gguf [--prompt-ids ids.txt | --prompt text [--tokenize-bin PATH]]\n"
-                     "          [--n-predict N] [--ctx N] [--prefill-chunk N] [--prefill-block N] [--no-ep] [--gpus 0[,1]]\n"
+                     "          [--n-predict N] [--ctx|--max-context N] [--prefill-chunk N] [--prefill-block N] [--no-ep] [--gpus 0[,1]]\n"
                      "          [--offload auto|gpu|mix|cpu] [--mix-k-gpu N] [--kv fp16|q8]\n"
                      "          [--expert-vram-gib F] [--pin-ram-gib F] [--no-graph] [--no-cache-warm]\n"
                      "          [--temp F] [--top-k N] [--top-p F] [--seed N] [--print-text] [--no-stop]\n"
@@ -1097,6 +1271,12 @@ int main(int argc, char** argv) {
         if ((int) ids.size() + n_predict > opt.ctx) throw std::runtime_error("sequence does not fit --ctx");
 
         const ling::Config& c = model.cfg();
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] < 0 || ids[i] >= c.vocab) {
+                throw std::runtime_error("prompt token id " + std::to_string(ids[i]) + " at index " +
+                                         std::to_string(i) + " out of range [0, " + std::to_string(c.vocab) + ")");
+            }
+        }
         const char* lo = std::getenv("LING_LOGITS_OUT");
         FILE* lf = lo != nullptr ? std::fopen(lo, "wb") : nullptr;
         if (lo != nullptr && lf == nullptr) throw std::runtime_error(std::string("cannot open ") + lo);
@@ -1169,7 +1349,7 @@ int main(int argc, char** argv) {
             return sample_host(h_logits, temp, top_k, top_p, rng);
         };
         auto emit_tok = [&](int tok) -> bool {
-            if (!no_stop && tok == c.eos_id) return false;
+            if (!no_stop && c.is_stop_id(tok)) return false;
             out.push_back(tok);
             if (print_text) {
                 const std::string piece = model.detokenize_one(tok);

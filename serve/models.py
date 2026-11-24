@@ -45,6 +45,7 @@ DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepS
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
 HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]          # ... and Hy4-Flash (maya.py's HY4_CONTEXTS)
+LING_CONTEXTS = [8192, 32768, 65536, 131072, 262144]              # ... and Ling-3.2-air (trained for 262,144)
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
@@ -205,11 +206,12 @@ def ik2_apu(cfg: dict, card: dict | None = None) -> bool:
 
 # ------------------------------------------------------------------ the context a model was trained for
 def trained_context(model_dir) -> int | None:
-    """The context the model was trained for (`<arch>.context_length` in its first GGUF's header; GLM-5.3-Flash:
-    1,048,576): the top of the dashboard's Context size.  None when there is no readable GGUF."""
+    """The context the model was trained for (`<arch>.context_length` in its GGUF's header; GLM-5.3-Flash:
+    1,048,576; Ling-3.2-air: 262,144): the top of the dashboard's Context size.  None when there is no readable GGUF."""
     try:
         from gguf_reader import GGUFFile                # (tools/, on the path above)
-        shards = sorted(Path(model_dir).glob("*-00001-of-*.gguf")) or sorted(Path(model_dir).glob("*.gguf"))
+        p = Path(model_dir)
+        shards = [p] if p.is_file() else (sorted(p.glob("*-00001-of-*.gguf")) or sorted(p.glob("*.gguf")))
         if not shards:
             return None
         md = GGUFFile(shards[0]).metadata
@@ -249,6 +251,10 @@ def trained_context_of(cfg: dict) -> int | None:
         key, read_it = ("gguf", str(Path(args[args.index("--glm-pack") + 1]).resolve().parent)), trained_context
     elif "--pack" in args[:-1]:
         key, read_it = ("pack", args[args.index("--pack") + 1]), trained_context_ds4
+    elif any(f in args[:-1] for f in ("--gguf", "--model", "-m")):
+        f = next(f for f in ("--gguf", "--model", "-m") if f in args[:-1])
+        gp = Path(args[args.index(f) + 1]).resolve()
+        key, read_it = ("gguf", str(gp if gp.is_file() else gp.parent)), trained_context
     else:
         return None
     if key not in _trained:
@@ -429,12 +435,6 @@ def choices(cfg: dict) -> dict:
 
 
 def _choices(cfg: dict) -> dict:
-    if family(cfg) == "ling":
-        dr = flag(args, "--drafting") or ("auto" if flag(args, "--spec-k") == "auto" else "mtp" if "--mtp" in args else "none")
-        out.update(images=bool(flag(args, "--mmproj")) and flag(args, "--vision") != "off",
-                   kv=flag(args, "--kv", "q8"), draft=dr,
-                   prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
-        return out
     if family(cfg) == "minimax":
         return {"draft": ["dspark", "none"] if mm3_pack_has(cfg, "dspark.num_hidden_layers") else ["none"],
                 "images": mm3_pack_has(cfg, "vision.hidden_size")}
@@ -476,7 +476,7 @@ def _choices(cfg: dict) -> dict:
 def settings_of(cfg: dict) -> dict:
     args = cfg.get("args") or []
     env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
-    out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env,
+    out = {"context": _int(flag(args, "--max-context") or flag(args, "--ctx"), 32768), "gpus": gpus_of(cfg), "env": env,
            # (refusal ablation: the default for requests that leave `ablate` out - ablate_default)
            "ablate": ablate_default(cfg)}
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
@@ -497,6 +497,12 @@ def settings_of(cfg: dict) -> dict:
                    tp="auto" if tp == "auto" else _int(tp, "auto"), reserve_gb=_float(flag(args, "--reserve-gb")),
                    prefill_chunk=_int(flag(args, "--chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
                    kv=flag(args, "--kv", "auto"))     # (the latent cache's rows: auto, the engine's default)
+        return out
+    if family(cfg) == "ling":                          # (maya-ling's own defaults where the config names none)
+        dr = flag(args, "--drafting") or ("auto" if flag(args, "--spec-k") == "auto" else "mtp" if "--mtp" in args else "none")
+        out.update(images=bool(flag(args, "--mmproj")) and flag(args, "--vision") != "off",
+                   kv=flag(args, "--kv", "q8"), draft=dr,
+                   prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
         return out
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
         kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
@@ -749,6 +755,10 @@ def apply(cfg: dict, settings: dict) -> dict:
         if hy4_context_check(cfg, {**out, "args": args}) and flag(args, "--kv-streaming") is None:
             args = set_flag(args, "--kv-streaming", "auto")   # (streams only where nothing else fits, as the setup's)
     elif fam == "ling":
+        args = drop_flag(args, "--ctx")
+        if gpus != gpus_of(cfg):
+            n = len(set(gpus))
+            args = set_flag(args, "--gpus", ",".join(str(i) for i in range(n))) if n > 1 else drop_flag(args, "--gpus")
         kv = str(s.get("kv") or "q8").lower()
         if kv not in ("q8", "fp16", "f16", "int8"):
             raise ValueError("KV cache: q8 or fp16")
@@ -1058,7 +1068,7 @@ def describe(path: Path, running: str | None) -> dict:
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             # (Hy4-Flash: only the contexts that fit this config's cards - hy4_contexts; the slider ends at the largest)
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS,
-                         "hy4": hy4_fits, "ik2": IK2F.CONTEXTS}.get(family(cfg), CONTEXTS),
+                         "hy4": hy4_fits, "ik2": IK2F.CONTEXTS, "ling": LING_CONTEXTS}.get(family(cfg), CONTEXTS),
             # (the Engine settings' Context size slider: the same range as Settings > Model's for this model)
             "context_range": rng}
 

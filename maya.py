@@ -7005,7 +7005,7 @@ def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
     return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4",
-                           "ik2": "maya-ik2"}.get(config_family(cfg), "maya"))
+                           "ik2": "maya-ik2", "ling": "maya-ling"}.get(config_family(cfg), "maya"))
 
 
 
@@ -7033,6 +7033,13 @@ def bench_chat(family: str, tokenizer_dir: Path):
         tpl = ChatTemplate(path if path.exists() else ROOT / "tools" / "ik2" / "chat_template.jinja")
         return lambda q: tpl.render([{"role": "user", "content": q}], reasoning_effort="none",
                                     enable_thinking=False) + "<|message_model|><|content_text|>"
+    if family == "ling":       # (Ling-3.2-air: its GGUF chat template with thinking off)
+        from serve.frontend import ChatTemplate
+        path = Path(tokenizer_dir) / "chat_template.jinja"
+        if path.exists():
+            tpl = ChatTemplate(path)
+            return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False)
+        return "<role>HUMAN</role>{}<|role_end|><role>ASSISTANT</role><think>\n</think>\n".format
     if family == "qwen":       # (Qwen's turns, the think block closed: the answer itself)
         return "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".format
     return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
@@ -7048,7 +7055,7 @@ def bench_model_name(cfg: dict) -> str:
     q = (cfg.get("installer") or {}).get("quant")
     if not q:
         a = [str(x) for x in cfg.get("args") or []]
-        for k in ("--glm-pack", "--pack", "--model"):
+        for k in ("--glm-pack", "--pack", "--model", "--gguf"):
             if k in a[:-1]:
                 p = Path(a[a.index(k) + 1])
                 q = (p.parent.name if p.name in ("pack", "maya-hy4", "maya-ik2") or p.suffix == ".gguf" else p.name)

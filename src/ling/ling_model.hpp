@@ -37,7 +37,13 @@ struct Config {
     int n_layer_all = 0;     // including MTP block
     int n_nextn = 0;
     int n_embd = 0, n_head = 0, vocab = 0;
-    int eos_id = 156895;
+    int ctx_train = 262144;  // bailingmoe3.context_length from GGUF
+    int eos_id = -1;
+    std::vector<int> stop_ids;  // EOS / EOT ids read from GGUF metadata & vocab
+    bool is_stop_id(int tok) const {
+        for (int s : stop_ids) if (s == tok) return true;
+        return false;
+    }
     float eps = 1e-6f;
     bool kda[64] = {};       // head_count_kv[il] == 0
     int d_conv = 0, kda_head = 0;
@@ -55,10 +61,10 @@ struct Config {
 struct Options {
     int ctx = 8192;
     int prefill_chunk = 2048;        // 1: token-by-token prefill; >1: attention/tile chunk size
-    int prefill_block = 16384;       // macro-block size for MoE expert reuse (borrows tail of VRAM pool when > prefill_chunk)
+    int prefill_block = 0;           // <= 0: derive from GPU VRAM pool & expert count; > 0: explicit macro-block cap
     bool ep_prefill = false;         // opt-in multi-GPU EP prefill relay (default off; stage pipeline wins on multi-block)
     double expert_vram_gib = -1.0;   // < 0: free VRAM minus headroom per GPU
-    double pin_ram_gib = 54.0;       // max pinned host RAM for offloaded experts
+    double pin_ram_gib = -1.0;       // < 0: derive from host available RAM; 0: off; > 0: explicit cap in GiB
     std::vector<int> gpus = {0};     // CUDA device ordinals (layer split when size > 1)
     OffloadMode offload = OffloadMode::kAuto;
     int mix_k_gpu = 1;               // in kMix mode, max misses fetched on GPU per layer
@@ -109,6 +115,8 @@ public:
     int rope_delta() const { return rope_delta_; }
     void set_rope_delta(int d) { rope_delta_ = d; }
     int max_ctx() const { return o_.ctx; }
+    int prefill_block() const { return prefill_block_; }
+    size_t kda_snapshot_bytes() const;
     int prefill_chunk_size() const { return gpus_.empty() ? o_.prefill_chunk : gpus_[0].pf_cap; }
     double vram_gb() const { return total_vram_gb_; }
     size_t experts_all() const { return total_experts_; }
@@ -350,6 +358,7 @@ private:
     Mat emb_, out_w_;
     const float* out_norm_ = nullptr;
     size_t max_blob_ = 0;
+    int prefill_block_ = 0;
     bool mtp_loaded_ = false;
     MtpWeights mtp_;
     bool any_host_unpinned_ = false;
@@ -372,6 +381,7 @@ private:
     void* dev_alloc(Gpu& g, size_t bytes);
     void* host_alloc(Gpu& g, size_t bytes);
     void set_dev(int dev);
+    void check_token_id(int tok, const char* where) const;
     void load_layer_weights(Layer& l, int il, Gpu& g, const maya::GgufFile& gf,
                             const std::map<std::string, const maya::TensorInfo*>& want);
     void transfer_x(int g_from, int g_to, int T, bool prefill_buf);

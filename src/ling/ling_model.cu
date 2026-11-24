@@ -110,7 +110,14 @@ static Config parse_config(const maya::GgufFile& g) {
     c.n_dense_lead = (int) req_num(g, a + "leading_dense_block_count");
     c.w_scale = (float) opt_num(g, a + "expert_weights_scale", 0.0);
     c.w_norm = opt_num(g, a + "expert_weights_norm", 0) != 0.0;
-    c.eos_id = (int) opt_num(g, "tokenizer.ggml.eos_token_id", 156895);
+    c.ctx_train = (int) opt_num(g, a + "context_length", 262144);
+    c.eos_id = (int) opt_num(g, "tokenizer.ggml.eos_token_id", -1);
+    auto add_stop = [&](int id) {
+        if (id >= 0 && std::find(c.stop_ids.begin(), c.stop_ids.end(), id) == c.stop_ids.end())
+            c.stop_ids.push_back(id);
+    };
+    add_stop(c.eos_id);
+    add_stop((int) opt_num(g, "tokenizer.ggml.eot_token_id", -1));
     const std::vector<double> ce = get_array(g, a + "swiglu_clamp_exp", false);
     const std::vector<double> cs = get_array(g, a + "swiglu_clamp_shexp", false);
     if ((!ce.empty() && (int) ce.size() != c.n_layer_all) || (!cs.empty() && (int) cs.size() != c.n_layer_all))
@@ -193,6 +200,13 @@ static std::string decode_gpt2_token(const std::string& tok) {
 // ------------------------------ helpers ------------------------------
 
 void Model::set_dev(int dev) { CK(cudaSetDevice(dev)); }
+
+void Model::check_token_id(int tok, const char* where) const {
+    if (tok < 0 || tok >= c_.vocab) {
+        throw std::runtime_error(std::string(where) + ": token id " + std::to_string(tok) +
+                                 " out of range [0, " + std::to_string(c_.vocab) + ")");
+    }
+}
 
 void* Model::dev_alloc(Gpu& g, size_t bytes) {
     set_dev(g.dev);
@@ -326,11 +340,20 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
     c_ = parse_config(gf);
     const Config& c = c_;
 
+    if (o_.ctx < 1) throw std::runtime_error("maya-ling: --ctx must be >= 1");
     {
         maya::MetaValue vt;
         if (gf.get_full("tokenizer.ggml.tokens", vt) && !vt.items.empty()) {
             vocab_tokens_.reserve(vt.items.size());
-            for (const auto& it : vt.items) vocab_tokens_.push_back(it.s);
+            for (size_t i = 0; i < vt.items.size(); ++i) {
+                const std::string& ts = vt.items[i].s;
+                vocab_tokens_.push_back(ts);
+                if (ts == "<|role_end|>" || ts == "<|endoftext|>" || ts == "<|im_end|>" || ts == "<|eot_id|>") {
+                    const int id = (int) i;
+                    if (std::find(c_.stop_ids.begin(), c_.stop_ids.end(), id) == c_.stop_ids.end())
+                        c_.stop_ids.push_back(id);
+                }
+            }
         }
     }
 
@@ -471,6 +494,10 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         if (te.type != 0 && te.type != 1 && te.type != 8 && te.type != 30)
             throw std::runtime_error("GGUF: token_embd type not supported");
         c_.vocab = (int) te.shape[1];
+        c_.stop_ids.erase(
+            std::remove_if(c_.stop_ids.begin(), c_.stop_ids.end(), [&](int id) { return id < 0 || id >= c_.vocab; }),
+            c_.stop_ids.end());
+        if ((c_.eos_id < 0 || c_.eos_id >= c_.vocab) && !c_.stop_ids.empty()) c_.eos_id = c_.stop_ids[0];
         set_dev(gpus_[0].dev);
         void* pe = dev_alloc(gpus_[0], tensor_bytes(te));
         CK(cudaMemcpy(pe, gf.tensor_data(te), tensor_bytes(te), cudaMemcpyHostToDevice));
@@ -732,9 +759,6 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
             gp.pf_bounds = (int*) dev_alloc(gp, (size_t) (c.n_expert + 1) * sizeof(int));
             gp.pf_tok = (int*) dev_alloc(gp, (size_t) P * c.n_used * sizeof(int));
             gp.pf_row_of = (int*) dev_alloc(gp, (size_t) P * c.n_used * sizeof(int));
-            gp.h_pf_cap = std::max(P, std::min(o_.prefill_block > 0 ? o_.prefill_block : P, 32768));
-            gp.h_pf_ids = (int*) host_alloc(gp, (size_t) gp.h_pf_cap * c.n_used * sizeof(int));
-            gp.h_pf_w = (float*) host_alloc(gp, (size_t) gp.h_pf_cap * c.n_used * sizeof(float));
             gp.d_max_rows = (int*) dev_alloc(gp, sizeof(int));
             gp.h_max_rows = (int*) host_alloc(gp, sizeof(int));
             for (int b = 0; b < 2; ++b) {
@@ -791,6 +815,48 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         }
     }
 
+    // ---- Derive prefill macro-block size from GPUs' VRAM pool, host RAM, and GGUF expert count ----
+    {
+        auto macro_bytes_est = [&](int B) -> size_t {
+            const size_t x_cnt = (ngpu >= 2 && !o_.ep_prefill) ? 4u : 3u;
+            return align256((size_t) B * E * sizeof(float)) * x_cnt +
+                   align256((size_t) B * c.n_used * sizeof(int)) * 3 +
+                   align256((size_t) B * c.n_used * sizeof(float)) + 2048;
+        };
+        size_t min_pool = gpus_[0].vram_pool_bytes;
+        for (int gi = 1; gi < ngpu; ++gi) min_pool = std::min(min_pool, gpus_[(size_t) gi].vram_pool_bytes);
+        // Target enough tokens per macro-block to amortize routed experts (~256 tokens/expert), bounded by ctx & pool/4
+        const int exp_sat = std::max(P, 256 * c.n_expert / std::max(1, c.n_used));
+        const int auto_cap = std::min(o_.ctx, exp_sat);
+        int derived = P;
+        if (o_.prefill_block > 0) {
+            derived = std::max(P, std::min(o_.prefill_block, std::max(P, o_.ctx)));
+        } else if (min_pool > 0) {
+            const uint64_t avail_r = hy4::ram_available();
+            const size_t host_cap = avail_r > 0 ? (size_t) std::min<uint64_t>(avail_r / 256, 64ULL << 20) : (8ULL << 20);
+            int b = P;
+            while (b <= auto_cap / 2) {
+                const int next_b = b * 2;
+                const size_t need_v = macro_bytes_est(next_b);
+                const size_t need_h = (size_t) next_b * (size_t) c.n_used * (sizeof(int) + sizeof(float)) * (size_t) ngpu;
+                if (need_v * 4 <= min_pool && need_h <= host_cap) {
+                    b = next_b;
+                } else {
+                    break;
+                }
+            }
+            derived = b;
+        }
+        prefill_block_ = derived;
+        for (int gi = 0; gi < ngpu; ++gi) {
+            Gpu& gp = gpus_[(size_t) gi];
+            set_dev(gp.dev);
+            gp.h_pf_cap = std::max(P, prefill_block_);
+            gp.h_pf_ids = (int*) host_alloc(gp, (size_t) gp.h_pf_cap * c.n_used * sizeof(int));
+            gp.h_pf_w = (float*) host_alloc(gp, (size_t) gp.h_pf_cap * c.n_used * sizeof(float));
+        }
+    }
+
     // ---- Allocate & pack experts in host RAM (THP ram_alloc; register pinned only when needed) ----
     struct PackTask {
         Layer* l;
@@ -821,11 +887,28 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
                       (double) need_host_bytes / (double) (1ULL << 30), (double) avail_ram / (double) (1ULL << 30));
         throw std::runtime_error(ebuf);
     }
-    const bool want_pin = (o_.pin_ram_gib > 0.0);
-    double pin_budget = want_pin ? o_.pin_ram_gib * (double) (1ULL << 30) : 0.0;
-    if (want_pin && avail_ram > 0) {
-        const double safe_pin = 0.75 * (double) avail_ram;
-        if (pin_budget > safe_pin) pin_budget = safe_pin;
+    const double est_vram_frac =
+        total_experts > 0 ? (double) total_vram_experts / (double) total_experts : 1.0;
+    const uint64_t total_ram = hy4::ram_total();
+    const uint64_t ram_headroom = std::max<uint64_t>(8ULL << 30, total_ram / 10);
+    const uint64_t host_pin_cap =
+        (avail_ram > ram_headroom)
+            ? std::min<uint64_t>(avail_ram - ram_headroom, (uint64_t) (0.75 * (double) avail_ram))
+            : 0ULL;
+    const bool mode_uses_pin = (o_.offload == OffloadMode::kGpu || o_.offload == OffloadMode::kMix ||
+                                (o_.offload == OffloadMode::kAuto && est_vram_frac >= 0.65));
+    bool want_pin = false;
+    double pin_budget = 0.0;
+    if (o_.pin_ram_gib > 0.0) {
+        want_pin = true;
+        pin_budget = o_.pin_ram_gib * (double) (1ULL << 30);
+        if (avail_ram > 0) {
+            const double safe_pin = 0.75 * (double) avail_ram;
+            if (pin_budget > safe_pin) pin_budget = safe_pin;
+        }
+    } else if (o_.pin_ram_gib < 0.0 && mode_uses_pin) {
+        want_pin = (host_pin_cap > 0);
+        pin_budget = (double) host_pin_cap;
     }
     size_t pin_bytes = 0, page_bytes = 0;
 
@@ -1023,12 +1106,13 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
     std::snprintf(buf, sizeof buf,
                   "bailingmoe3: n_embd %d, layers %d (+%d MTP %s; %d KDA / %d MLA), vocab %d, ctx %d (%s KV)\n"
                   "experts %d x top%d in %d groups (keep %d), dense lead %d, mla %d+%d/kv %d/v %d, kda %dx%d\n"
-                  "gpus %d (mode: %s, graph %s, prefill_chunk %d): %zu/%zu expert slots in VRAM (%.1f%%, %.2f GiB), "
+                  "gpus %d (mode: %s, graph %s, prefill_chunk %d, prefill_block %d): %zu/%zu expert slots in VRAM (%.1f%%, %.2f GiB), "
                   "host RAM %.2f GiB pinned + %.2f GiB paged",
                   c.n_embd, c.n_layers, mtp_count, mtp_loaded_ ? "loaded" : "parked", n_kda, c.n_layers - n_kda,
                   c_.vocab, o_.ctx, o_.kv_q8 ? "INT8" : "FP16", c.n_expert, c.n_used, c.n_group, c.n_group_used,
                   c.n_dense_lead, c.qk_nope, c.n_rot, c.kv_lora, c.v_head, H, c.kda_head, ngpu, mode_name,
                   (o_.use_graph && active_offload_ == OffloadMode::kGpu && o_.seam_dir.empty()) ? "on" : "off", P,
+                  prefill_block_,
                   total_vram_experts, total_experts,
                   total_experts > 0 ? 100.0 * (double) total_vram_experts / (double) total_experts : 0.0,
                   (double) vram_sum / (double) (1ULL << 30), (double) pin_bytes / (double) (1ULL << 30),
@@ -1552,6 +1636,7 @@ void Model::decode_segment(int gi, bool capture_safe) {
 }
 
 const float* Model::step(int token, int pos) {
+    check_token_id(token, "step");
     tok_promo_budget_ = 32;
     promo_rr_ = c_.n_dense_lead + ((pos * 7) % std::max(1, c_.n_layers - c_.n_dense_lead));
     const int ngpu = (int) gpus_.size();
@@ -2386,6 +2471,7 @@ void Model::warm_vram_cache() {
 const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host,
                             const std::function<bool(int, int)>& on_progress) {
     if (n <= 0) throw std::runtime_error("prefill: empty prompt");
+    for (int i = 0; i < n; ++i) check_token_id(tokens[i], "prefill");
     for (auto& l : layers_) {
         if (l.promo_pending_e >= 0) {
             Gpu& gp = gpus_[(size_t) l.dev_idx];
@@ -2509,15 +2595,16 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
     size_t borrow_bytes = 0;
     bool has_pipe_x = false;
     std::vector<bool> layer_borrowed((size_t) c.n_layers, false);
-    if ((any_offloaded || ngpu >= 2) && n > P && o_.prefill_block > P) {
-        int want_cap = std::min(std::min(o_.prefill_block, gpus_[0].h_pf_cap), ((n + P - 1) / P) * P);
+    if ((any_offloaded || ngpu >= 2) && n > P && prefill_block_ > P) {
+        int want_cap = std::min(std::min(prefill_block_, gpus_[0].h_pf_cap), ((n + P - 1) / P) * P);
         if (ngpu >= 2 && !o_.ep_prefill && all_logits_host == nullptr) {
-            // Keep at least 2*ngpu blocks when n >= 16K (B=8192 on 32K, B=16384 on 64K+), and 2 blocks on 8K (B=4096)
-            if (n <= 8192) want_cap = std::min(want_cap, 4096);
-            else if (n <= 49152) want_cap = std::min(want_cap, 8192);
+            // Keep at least 2 blocks per stage-pipeline depth so multi-GPU stages overlap cleanly
+            const int pipe_cap = std::max(P, ((n / std::max(2, ngpu) + P - 1) / P) * P);
+            if (n > P * 2) want_cap = std::min(want_cap, pipe_cap);
         }
-        for (int cand : {16384, 8192, 4096}) {
-            if (cand > want_cap || cand <= P) continue;
+        int top_cand = P;
+        while (top_cand <= want_cap / 2) top_cand *= 2;
+        for (int cand = top_cand; cand > P; cand >>= 1) {
             const bool need_pipe = want_pipe_buf && (n > cand);
             const size_t need = macro_bytes_for(cand, need_pipe);
             bool fits = true;
@@ -3171,6 +3258,7 @@ void Model::decode_segment_win(int gi, int W, bool capture_safe) {
 const float* Model::step_window(const int* tokens, int W, int pos0) {
     if (W <= 1) return step(tokens[0], pos0);
     if (!mtp_loaded_ || W > kMaxWin) throw std::runtime_error("step_window requires --mtp and W <= 4");
+    for (int t = 0; t < W; ++t) check_token_id(tokens[t], "step_window");
     tok_promo_budget_ = 32;
     promo_rr_ = c_.n_dense_lead + ((pos0 * 7) % std::max(1, c_.n_layers - c_.n_dense_lead));
     const int ngpu = (int) gpus_.size();
@@ -3246,6 +3334,7 @@ void Model::mtp_draft(int base_tok, int base_pos, int max_k, float floor, std::v
     drafts.clear();
     confs.clear();
     if (!mtp_loaded_ || max_k <= 0 || base_pos <= 0) return;
+    check_token_id(base_tok, "mtp_draft");
     Gpu& gl = gpus_.back();
     const int E = c_.n_embd;
 
@@ -3289,6 +3378,7 @@ void Model::mtp_draft(int base_tok, int base_pos, int max_k, float floor, std::v
 
 const float* Model::mtp_step(const float* h_nextn_dev, int next_token, int pos) {
     if (!mtp_loaded_) throw std::runtime_error("mtp_step called without --mtp");
+    check_token_id(next_token, "mtp_step");
     const Config& c = c_;
     const int E = c.n_embd;
     Gpu& g0 = gpus_[0];
@@ -3459,6 +3549,16 @@ bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<
 
 
 // ------------------------------ KDA Prefix Session Snapshots ------------------------------
+
+size_t Model::kda_snapshot_bytes() const {
+    const Config& c = c_;
+    size_t n_kda = 0;
+    for (int il = 0; il < c.n_layers; ++il)
+        if (c.kda[il]) ++n_kda;
+    const size_t st_elems = (size_t) c.n_head * (size_t) c.kda_head * (size_t) c.kda_head;
+    const size_t cs_elems = (size_t) 3 * (size_t) c.d_inner() * (size_t) (c.d_conv - 1);
+    return n_kda * (st_elems + cs_elems) * sizeof(float);
+}
 
 void Model::save_kda_snapshot(KdaSnapshot& snap, const std::vector<int>& tokens,
                               const std::vector<std::pair<int64_t, uint64_t>>& pics) const {

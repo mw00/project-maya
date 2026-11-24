@@ -84,5 +84,52 @@ class Spans(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<qii", raw, 8 + 16 + len(a.rgb)), (7, 32, 64))
 
 
+
+class LingModelsConfig(unittest.TestCase):
+    def test_contexts_and_settings_offer_full_262k(self):
+        import json
+        from serve import models as M
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            tok_dir = d / "tokenizer"
+            tok_dir.mkdir()
+            (tok_dir / "vocab.json").write_text("{}", encoding="utf-8")
+            gguf = d / "Ling-3.2-air-test.gguf"
+
+            def gstr(x: str) -> bytes:
+                b = x.encode("utf-8")
+                return struct.pack("<Q", len(b)) + b
+
+            hdr = bytearray(struct.pack("<4sIQQ", b"GGUF", 3, 0, 2))
+            hdr += gstr("general.architecture") + struct.pack("<I", 8) + gstr("bailingmoe3")
+            hdr += gstr("bailingmoe3.context_length") + struct.pack("<I", 4) + struct.pack("<I", 262144)
+            gguf.write_bytes(bytes(hdr))
+            cfg_p = d / "maya-ling.json"
+            cfg = {
+                "exe": str(d / "maya-ling"),
+                "model_name": "ling-3.2-air",
+                "tokenizer": str(tok_dir / "vocab.json"),
+                "gpu": [0],
+                "args": ["--gguf", str(gguf), "--max-context", "32768", "--kv", "q8", "--drafting", "auto"],
+                "installer": {"family": "ling", "quant": "test"},
+            }
+            cfg_p.write_text(json.dumps(cfg), encoding="utf-8")
+            self.assertEqual(M.family(cfg), "ling")
+            self.assertEqual(M.trained_context_of(cfg), 262144)
+            cur = M.settings_of(cfg)
+            self.assertEqual((cur["context"], cur["kv"], cur["draft"]), (32768, "q8", "auto"))
+            can = M.choices(cfg)
+            self.assertEqual(can["kv"], ["q8", "fp16"])
+            self.assertIn("auto", can["draft"])
+            desc = M.describe(cfg_p, None)
+            self.assertIn(262144, desc["contexts"])
+            self.assertEqual(desc["context_range"]["max"], 262144)
+            self.assertEqual(desc["context_range"]["trained"], 262144)
+            upd = M.apply(cfg, {"context": 262144, "kv": "fp16", "draft": "none"})
+            self.assertEqual(M.settings_of(upd)["context"], 262144)
+            self.assertEqual(M.settings_of(upd)["kv"], "fp16")
+            self.assertEqual(M.settings_of(upd)["draft"], "none")
+
 if __name__ == "__main__":
     unittest.main()

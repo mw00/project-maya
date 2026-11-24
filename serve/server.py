@@ -1203,6 +1203,8 @@ class StrataEngine:
         args = list(args)
         if "--max-context" in args[:-1]:
             args[args.index("--max-context") + 1] = str(int(n))
+        elif "--ctx" in args[:-1]:
+            args[args.index("--ctx") + 1] = str(int(n))
         else:
             args += ["--max-context", str(int(n))]
         self.spawn = (exe, args, cwd, log, env)
@@ -3314,6 +3316,8 @@ class Service:
             args = list(cfg.get("args") or [])
             if "--max-context" in args[:-1]:
                 args[args.index("--max-context") + 1] = str(int(n))
+            elif "--ctx" in args[:-1]:
+                args[args.index("--ctx") + 1] = str(int(n))
             else:
                 args += ["--max-context", str(int(n))]
             cfg["args"] = args
@@ -8052,10 +8056,12 @@ def main() -> int:
         if kept:
             print(f"[maya] {kept} web-chat answer(s) of the last day kept for the page (answers/)", flush=True)
     args = [str(x) for x in cfg.get("args") or []]
-    flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
+    flag = next((f for f in ("--glm-pack", "--gguf", "--model", "-m") if f in args[:-1]), None)
     if flag:                                            # the model's folder: the parent of the pack or GGUF file
-        svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
-        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
+        target_p = Path(args[args.index(flag) + 1]).resolve()
+        svc.model_dir = target_p.parent
+        tc_src = target_p if target_p.is_file() else svc.model_dir
+        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(tc_src)),
                          daemon=True).start()
     elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
