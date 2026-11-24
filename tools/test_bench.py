@@ -297,5 +297,18 @@ class BenchStandard(unittest.TestCase):
         self.assertEqual((Path(c["exe"]), Path(c["cwd"])), (there / "build" / "maya", there))
 
 
+class SharedCpuTiming(unittest.TestCase):
+    def test_other_build_takes_this_builds_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b = Path(d) / "a.txt", Path(d) / "b.txt"
+            rest = " | /m/pack | layer 3 | 7536640 B | 0000:15:00.0 Tesla V100 | 36 threads | 4"
+            a.write_text("0.1.27 Nov 23 2026 23:41:47" + rest + "\t0.2520 0.6175 0.6148 0.2305\n" +
+                         "0.1.27 Nov 24 2026 03:00:00" + rest + "\t0.1250 0.5780 0.5800 0.1300\n")
+            b.write_text("0.1.27 Nov 24 2026 02:00:00" + rest + "\t0.2380 0.5770 0.5790 0.2400\n")
+            self.assertEqual(MB.share_timing(a, b), 1)
+            self.assertEqual(b.read_text(), "0.1.27 Nov 24 2026 02:00:00" + rest + "\t0.1250 0.5780 0.5800 0.1300\n")
+            self.assertEqual(MB.share_timing(a, Path(d) / "none.txt"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
