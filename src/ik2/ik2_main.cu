@@ -8855,6 +8855,13 @@ int main(int argc, char** argv) {
                             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                         }
+                        if (serve_maya) {   // (read, total, ms, tok/s, reused: the page's live bar and prompt speed;
+                                            //  the layer-major path above and --parallel print theirs, this path none)
+                            const double ms = (now() - t0) * 1e3;
+                            std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,
+                                        (p0 + n - L) / std::max(1e-3, ms / 1e3), (int) L);
+                            std::fflush(stdout);
+                        }
                     }
                 }
             }
