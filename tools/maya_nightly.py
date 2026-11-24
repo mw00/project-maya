@@ -242,7 +242,7 @@ def run_model(root: Path, m: dict, base: str, st: dict, say, bench=run_bench, bu
         time.sleep(15)
         why = busy(cfg, m)
     if why:
-        return dict(out, status="BUSY", why=why[:3], secs=time.time() - t)
+        return dict(out, status="BUSY", exact="-", why=why[:3], secs=time.time() - t)
     note = f"maya nightly pid {os.getpid()} on {socket.gethostname()} {time.strftime('%Y-%m-%d %H:%M')} {m['name']}"
     mine = []
     try:

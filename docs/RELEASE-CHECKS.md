@@ -120,8 +120,12 @@ PASS | 2026-11-24 | Jupiter | 8c618a59 vs v1.1.76 | 2 of 2 model(s) ran | 9.4 mi
 - `DIFF`: the answers differ from the previous release, or from the saved ones (the line says which request, which
   token). `SLOW`: decode or a prompt size is `slow_pct` or more below the previous release. `ERROR`: the run stopped
   (its output: `maya-nightly-<model>.log`).
-- `BUSY`: the machine was not free; the model is skipped and nothing was started. `SKIPPED`: it no longer fits the
-  night's budget. The budget is printed first, from each model's last run time.
+- `BUSY`: the machine was not free for `wait_min` minutes (another job on the GPU, a held lock, CPU load 2 or more,
+  the heat flag); the model is skipped and nothing was started. `SKIPPED`: it no longer fits the night's budget. The
+  budget is printed first, from each model's last run time.
+- Each model's run leaves `maya-nightly-<model>.log` (the bench's output) and `maya-nightly-<model>.tokens.json` (its
+  answers): `maya_golden.py --check --from-tokens <that file>` re-checks them, `--capture --from-tokens` saves them,
+  both without a GPU.
 - Exit code 0 all PASS, 1 a DIFF / SLOW / ERROR, 3 nothing ran.
 - The first night after a release builds the previous release's engines once (`.bench-builds/<commit>`); build them
   ahead (`./maya.sh --bench --compare <tag>` once per model) to keep that out of the night's budget.

@@ -65,6 +65,27 @@ class BenchParts(unittest.TestCase):
             (r / "data" / "expert-profile-x.bin").write_bytes(b"q")
             self.assertNotEqual(MB.choice_files(r, {}), c)
 
+    def test_a_compare_runs_restore_keeps_the_saved_answers(self):
+        """--compare puts the learned files back before every round and drops what a run wrote into data/: the
+        saved answers are neither (the first real nightly swept them away)."""
+        with tempfile.TemporaryDirectory() as d:
+            r, other = Path(d) / "this", Path(d) / "other"
+            gold = r / "data" / "golden" / "box" / "m.json"
+            gold.parent.mkdir(parents=True)
+            gold.write_text("{}")
+            (r / "data" / "expert-profile-x.bin").write_bytes(b"p")
+            (other / "data").mkdir(parents=True)
+            st = MB.LearnedState(r, {}, Path(d) / "snap")
+            (r / "data" / "written-by-the-run.txt").write_text("x")
+            (r / "data" / "expert-profile-x.bin").write_bytes(b"changed")
+            st.restore(other)
+            self.assertTrue(gold.exists())
+            self.assertFalse((r / "data" / "written-by-the-run.txt").exists())
+            self.assertEqual((r / "data" / "expert-profile-x.bin").read_bytes(), b"p")
+            self.assertFalse((other / "data" / "golden").exists())
+            st.finish()
+            self.assertTrue(gold.exists())
+
 
 class Locks(unittest.TestCase):
     def test_two_runs_that_found_it_quiet_together_do_not_both_get_a_gpu(self):

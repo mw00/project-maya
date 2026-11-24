@@ -621,7 +621,10 @@ class LearnedState:
 
     @staticmethod
     def _files(d: Path) -> set:
-        return {p for p in d.rglob("*") if p.is_file()} if d.is_dir() else set()
+        """A data folder's files - never the saved answers (data/golden): a restore must not sweep them away as
+        'written by the run'."""
+        return {p for p in d.rglob("*") if p.is_file() and GOLDEN_DIR not in p.relative_to(d).parts[:1]} \
+            if d.is_dir() else set()
 
     def _drop_new(self, d: Path, keep: set):
         """A file a run wrote that was not there at the start (a first start's measurement) goes too."""
