@@ -5655,7 +5655,7 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 
 }  // namespace
 
-// The Inkling 2 preview: Linux, one NVIDIA GPU of 24 GB, Ampere (sm_80) or newer.  Outside it the engine stops with one
+// Hardware check: what Inkling 2 is supported on is listed in docs/INKLING2.md.  Outside it the engine stops with one
 // line saying why; IK2_UNSUPPORTED=1 runs it anyway where it can run at all (two GPUs, smaller cards with the experts
 // streamed from RAM, Windows: untested).
 // Greedy decode on the resident path from `anchor` (chosen, not run yet) at position P until out holds gen tokens
@@ -5973,7 +5973,7 @@ int check_sampling() {
     return fails ? 1 : 0;
 }
 
-void check_preview(int n_gpu, bool serve) {
+void check_hardware(int n_gpu, bool serve) {
     auto refuse = [&](const std::string& m) {   // (--serve: the server prints a NOTE line)
         if (serve) std::printf("NOTE maya-ik2: %s\n", m.c_str()), std::fflush(stdout);
         die(m);
@@ -5981,7 +5981,7 @@ void check_preview(int n_gpu, bool serve) {
     const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
     const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
 #if defined(_WIN32) && defined(MAYA_USE_HIP)
-    if (!force) refuse("Inkling 2 on AMD runs on Linux only, Windows is outside it" + run_anyway);
+    if (!force) refuse("Inkling 2 on AMD is supported on Linux only, not on Windows" + run_anyway);
 #endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
@@ -5992,15 +5992,15 @@ void check_preview(int n_gpu, bool serve) {
 #endif
     if (e != cudaSuccess || nd < 1)
         refuse(std::string("no ") + vendor + " GPU visible (" + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
-            "): the Inkling 2 preview runs on one " + vendor + " GPU");
+            "): Inkling 2 needs one " + vendor + " GPU");
     if (n_gpu < 1 || n_gpu > 2)
-        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more are not in it yet)");
+        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more GPUs are not supported)");
     const bool old_two = (getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) || (getenv("IK2_TP") && std::atoi(getenv("IK2_TP")));
     if (n_gpu == 2 && old_two && !force)
-        refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are outside the preview (without them: "
+        refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are not supported (without them: "
                "the two-GPU split)" + run_anyway);
 #ifdef MAYA_USE_HIP   // (the split runs GPU 0 on the offload path, not checked on AMD yet)
-    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not in the Inkling 2 preview yet" + run_anyway);
+    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not supported yet" + run_anyway);
 #endif
     if (n_gpu == 2 && nd < 2)
         refuse("--gpus 2: " + std::to_string(nd) + " GPU visible");
@@ -6038,14 +6038,14 @@ void check_preview(int n_gpu, bool serve) {
         if (p.totalGlobalMem < ((p.integrated ? 22ull : 11ull) << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs " +
+            refuse(gpu + " has " + m + ", Inkling 2 needs " +
                    (p.integrated ? "24 GB of the APU's memory" : "an AMD card of 12 GB or more") + run_anyway);
         }
 #else
         if (p.totalGlobalMem < (7ull << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs a card of 8 GB or more" + run_anyway);
+            refuse(gpu + " has " + m + ", Inkling 2 needs a card of 8 GB or more" + run_anyway);
         }
 #endif
     }
@@ -6158,7 +6158,7 @@ int main(int argc, char** argv) {
         while (*p && *p != ',') ++p;
         if (*p == ',') ++p;
     }
-    check_preview(n_gpu, serve);
+    check_hardware(n_gpu, serve);
     // --gpus 2: the split (TwoGpu) - the engine runs as on one GPU (GPU 0), GPU 1 added to the token path at load;
     // IK2_EP=1 / IK2_TP=1: the older two-GPU modes on the cache path instead (IK2_UNSUPPORTED)
     if (n_gpu == 2 && !(getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) &&

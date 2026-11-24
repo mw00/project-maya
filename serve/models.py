@@ -593,7 +593,7 @@ def apply(cfg: dict, settings: dict) -> dict:
         if not_yet:
             raise ValueError(HY4_NOT_YET[not_yet[0]])
         known += tuple(HY4_NOT_YET)
-    if fam == "ik2":                                   # (Inkling-2-Mini's preview: what it does not have yet, said)
+    if fam == "ik2":                                   # (Inkling-2-Mini: what it does not support yet, said)
         not_yet = sorted(k for k in set(settings) & set(IK2_NOT_YET)
                          if settings[k] not in (None, "") and settings[k] != IK2_OFF.get(k))
         if not_yet:

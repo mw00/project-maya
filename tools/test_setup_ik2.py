@@ -1,5 +1,5 @@
 """tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2) in the setup: its names and setup ids,
-its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
+its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts Inkling 2
 does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 24 GB), the
 one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
 config it writes (its pictures too) and a start of it.  No GPU, no network.
@@ -149,7 +149,7 @@ class Manifest(unittest.TestCase):
 
 
 class Refusals(unittest.TestCase):
-    """One plain line, before anything is built or downloaded, wherever the preview does not run."""
+    """One plain line, before anything is built or downloaded, wherever Inkling 2 does not run."""
 
     def test_the_lines(self):
         ok = [card(24)]

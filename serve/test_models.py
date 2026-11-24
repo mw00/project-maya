@@ -317,7 +317,7 @@ class Settings(unittest.TestCase):
 
     def ik2_cfg(self, **extra) -> Path:
         """Inkling-2-Mini as the setup writes it (maya.write_config_ik2): its GGUF in the model's folder, the tokenizer
-        folder beside it (no drafter in the preview)."""
+        folder beside it (no drafter for it)."""
         d = self.d / "models" / "Inkling-2-Mini"
         (d / "maya-ik2" / "tokenizer").mkdir(parents=True, exist_ok=True)
         (d / "Inkling-2-Mini-UD-Q4_K_XL.gguf").write_bytes(b"x" * 1000)
