@@ -231,14 +231,14 @@ void test_project_res() {
     for (float v : r) n2 += (double) v * v;
     for (auto& v : r) v = (float) (v / std::sqrt(n2));
     const float scale = 1.25f;
-    std::vector<float> want((size_t) T * C), want0((size_t) T * C);
+    std::vector<double> want((size_t) T * C), want0((size_t) T * C);
     for (int t = 0; t < T; ++t) {
         double dot = 0;
         for (int e = 0; e < C; ++e) dot += (double) r[e] * y[(size_t) t * C + e];
         for (int e = 0; e < C; ++e) {
             const size_t i = (size_t) t * C + e;
-            want[i] = res[i] + (float) (y[i] - scale * dot * r[e]);
-            want0[i] = y[i] + res[i];
+            want[i] = (double) res[i] + (y[i] - scale * dot * r[e]);
+            want0[i] = (double) y[i] + res[i];
         }
     }
     float *dy = dev(y), *dr = dev(r), *dres = dev(res);
@@ -258,8 +258,8 @@ void test_project_res() {
     // no residual: y alone; scale 0: y + res as the fused conv adds it
     float* dy2 = dev(y);
     k::project_res(dy2, dr, scale, nullptr, T, C, 0);
-    std::vector<float> want_nores((size_t) T * C);
-    for (size_t i = 0; i < want_nores.size(); ++i) want_nores[i] = want[i] - res[i];
+    std::vector<double> want_nores((size_t) T * C);
+    for (size_t i = 0; i < want_nores.size(); ++i) want_nores[i] = want[i] - (double) res[i];
     expect("project_res: no residual", host(dy2, want.size()), want_nores, 2e-5);
     CU(cudaMemcpy(dy2, y.data(), y.size() * sizeof(float), cudaMemcpyHostToDevice));
     k::project_res(dy2, dr, 0.0f, dres, T, C, 0);
@@ -3252,7 +3252,6 @@ int main() {
     test_rms();
     test_l2clip();
     test_conv();
-    test_project_res();
     test_attn_res();
     test_attn_probs();
     test_route();
@@ -3281,6 +3280,7 @@ int main() {
 #endif
     test_window_exact(p.major >= 7);   // (Volta and Turing: their own tensor-core kernels)
     test_window_launches();
+    test_project_res();   // (last: it draws no numbers from the shared rng the earlier checks use)
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
