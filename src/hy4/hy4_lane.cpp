@@ -4,6 +4,7 @@
 #include "maya/kernels/cpu/pool.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -481,12 +482,26 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
 bool CpuExperts::init(int tg, int td, int n_embd, int n_ff, std::string& err) {
     if (!iqc::iq_cpu_fmt(tg, td, n_embd, n_ff, f, err)) return false;
     iqc::iq_cpu_row_hint(n_embd);   // (the row forms timed on this length)
-    g_stride = f.gu_row * (size_t) n_ff;
+    u_stride = g_stride = f.gu_row * (size_t)n_ff;
     d_stride = f.d_row * (size_t) n_embd;
     return true;
 }
 
+bool CpuExperts::init_mixed(int tg, int tu, int td, int n_embd, int n_ff, std::string& err) {
+    // Use the generic down-row API for each independently typed gate/up matrix.
+    if (!iqc::iq_cpu_fmt(8, td, n_embd, n_ff, f, err) || !iqc::iq_cpu_fmt(tg, tg, n_ff, n_embd, mix_g, err) ||
+        !iqc::iq_cpu_fmt(tu, tu, n_ff, n_embd, mix_u, err))
+        return false;
+    g_stride = mix_g.d_row * (size_t)n_ff;
+    u_stride = mix_u.d_row * (size_t)n_ff;
+    d_stride = f.d_row * (size_t)n_embd;
+    mixed = true;
+    return true;
+}
+
 bool CpuExperts::q4x_can() {
+    if (mixed)
+        return false;
     if (!iqc::iq_cpu_q4x_ok(f.tg) || !iqc::iq_cpu_q4x_ok(f.td) || f.n_embd % 256 || f.n_ff % 256) return false;
     q4x_gu = iqc::iq_cpu_q4x_row_bytes(f.n_embd) * (size_t) f.n_ff;
     q4x_d = iqc::iq_cpu_q4x_row_bytes(f.n_ff) * (size_t) f.n_embd;
@@ -552,10 +567,13 @@ void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int no
         const uint8_t* d = ex.D((size_t) e);
         if (Lane::node_of_page(g) == want && Lane::node_of_page(d) == want) continue;   // (there already)
         volatile uint8_t sink = 0;   // (mapped into this process first: move_pages takes mapped pages)
-        for (size_t b = 0; b < ex.g_stride; b += 4096) sink ^= g[b] ^ u[b];
+        for (size_t b = 0; b < ex.g_stride; b += 4096)
+            sink ^= g[b];
+        for (size_t b = 0; b < ex.u_stride; b += 4096)
+            sink ^= u[b];
         for (size_t b = 0; b < ex.d_stride; b += 4096) sink ^= d[b];
         Lane::move_to_node(g, ex.g_stride, want);
-        Lane::move_to_node(u, ex.g_stride, want);
+        Lane::move_to_node(u, ex.u_stride, want);
         Lane::move_to_node(d, ex.d_stride, want);
     }
 }
@@ -567,7 +585,10 @@ void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const s
         const uint8_t* g = ex.G((size_t) e);
         const uint8_t* u = ex.U((size_t) e);
         const uint8_t* d = ex.D((size_t) e);
-        for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ g[b] ^ u[b];
+        for (size_t b = 0; b < ex.g_stride; b += 4096)
+            sink = sink ^ g[b];
+        for (size_t b = 0; b < ex.u_stride; b += 4096)
+            sink = sink ^ u[b];
         for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ d[b];
     }
 }
@@ -669,8 +690,137 @@ uint64_t ram_total() {
 #endif
 }
 
+// The mixed-format lane uses the same per-matrix dot products as before, but groups
+// entries by expert so a weight row is reused across tokens, as in the uniform lane.
+static void cpu_experts_mixed(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x,
+                              int T, float* out) {
+    const int E = ex.f.n_embd, F = ex.f.n_ff, n = (int)entries.size();
+    std::fill(out, out + (size_t)T * E, 0.0f);
+    if (!n)
+        return;
+    struct MixedScratch {
+        std::vector<uint8_t> gx, ux, hq;
+        std::vector<float> gate, up, h, y;
+        std::vector<int> order, tokens, gu_node, dn_node;
+        std::vector<char> seen;
+        std::vector<Grp> groups;
+    };
+    thread_local MixedScratch tls;
+    MixedScratch& sc = tls;
+    sc.gx.resize((size_t)T * ex.mix_g.h_bytes);
+    sc.ux.resize((size_t)T * ex.mix_u.h_bytes);
+    sc.seen.assign((size_t)T, 0);
+    sc.tokens.clear();
+    for (const auto& ent : entries)
+        if (!sc.seen[(size_t)ent.t]) {
+            sc.seen[(size_t)ent.t] = 1;
+            sc.tokens.push_back(ent.t);
+        }
+    auto qx = [&](int i) {
+        const int t = sc.tokens[(size_t)i];
+        iqc::iq_cpu_quant(ex.mix_g.d_act, x + (size_t)t * E, E, sc.gx.data() + (size_t)t * ex.mix_g.h_bytes);
+        iqc::iq_cpu_quant(ex.mix_u.d_act, x + (size_t)t * E, E, sc.ux.data() + (size_t)t * ex.mix_u.h_bytes);
+    };
+    if (sc.tokens.size() <= 2)
+        for (int i = 0; i < (int)sc.tokens.size(); ++i)
+            qx(i);
+    else
+        lane.parallel_for((int)sc.tokens.size(), qx);
+    sc.gate.resize((size_t)n * F);
+    sc.up.resize((size_t)n * F);
+    sc.h.resize((size_t)n * F);
+    sc.y.resize((size_t)n * E);
+    sc.order.resize((size_t)n);
+    for (int i = 0; i < n; ++i)
+        sc.order[(size_t)i] = i;
+    std::stable_sort(sc.order.begin(), sc.order.end(),
+                     [&](int i, int j) { return entries[(size_t)i].e < entries[(size_t)j].e; });
+    sc.groups.clear();
+    const int gn = group_nt();
+    for (int i = 0; i < n;) {
+        const int e = entries[(size_t)sc.order[(size_t)i]].e;
+        int j = i;
+        while (j < n && entries[(size_t)sc.order[(size_t)j]].e == e)
+            ++j;
+        for (int at = i; at < j; at += gn)
+            sc.groups.push_back({e, at, std::min(gn, j - at), nullptr});
+        i = j;
+    }
+    const int gc = (F + kRowChunk - 1) / kRowChunk, dc = (E + kRowChunk - 1) / kRowChunk;
+    sc.gu_node.clear();
+    sc.dn_node.clear();
+    if (lane.nodes() > 1)
+        for (const auto& gr : sc.groups) {
+            const int node = gr.e % lane.nodes();
+            sc.gu_node.insert(sc.gu_node.end(), (size_t)gc, node);
+            sc.dn_node.insert(sc.dn_node.end(), (size_t)dc, node);
+        }
+    lane.parallel_for((int)sc.groups.size() * gc,
+                      [&](int task) {
+                          const auto& gr = sc.groups[(size_t)(task / gc)];
+                          const int r0 = task % gc * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
+                          const void* ga[kMaxNt];
+                          const void* ua[kMaxNt];
+                          float* go[kMaxNt];
+                          float* uo[kMaxNt];
+                          for (int k = 0; k < gr.c; ++k) {
+                              const int id = sc.order[(size_t)(gr.a + k)], t = entries[(size_t)id].t;
+                              ga[k] = sc.gx.data() + (size_t)t * ex.mix_g.h_bytes;
+                              ua[k] = sc.ux.data() + (size_t)t * ex.mix_u.h_bytes;
+                              go[k] = sc.gate.data() + (size_t)id * F;
+                              uo[k] = sc.up.data() + (size_t)id * F;
+                          }
+                          iqc::iq_cpu_down(ex.mix_g, ex.G((size_t)gr.e), ga, gr.c, go, r0, r1);
+                          iqc::iq_cpu_down(ex.mix_u, ex.U((size_t)gr.e), ua, gr.c, uo, r0, r1);
+                          for (int k = 0; k < gr.c; ++k) {
+                              const int id = sc.order[(size_t)(gr.a + k)];
+                              for (int r = r0; r < r1; ++r) {
+                                  float g = go[k][r], u = uo[k][r];
+                                  if (ex.limit > 0) {
+                                      g = std::fmin(g, ex.limit);
+                                      u = std::fmin(std::fmax(u, -ex.limit), ex.limit);
+                                  }
+                                  sc.h[(size_t)id * F + r] = (g / (1.0f + std::exp(-g))) * u;
+                              }
+                          }
+                      },
+                      sc.gu_node.empty() ? nullptr : &sc.gu_node);
+    sc.hq.resize((size_t)n * ex.f.h_bytes);
+    const auto qh = [&](int id) {
+        iqc::iq_cpu_quant(ex.f.d_act, sc.h.data() + (size_t)id * F, F, sc.hq.data() + (size_t)id * ex.f.h_bytes);
+    };
+    if (n <= 2)
+        for (int i = 0; i < n; ++i)
+            qh(i);
+    else
+        lane.parallel_for(n, qh);
+    lane.parallel_for((int)sc.groups.size() * dc,
+                      [&](int task) {
+                          const auto& gr = sc.groups[(size_t)(task / dc)];
+                          const int r0 = task % dc * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
+                          const void* act[kMaxNt];
+                          float* dst[kMaxNt];
+                          for (int k = 0; k < gr.c; ++k) {
+                              const int id = sc.order[(size_t)(gr.a + k)];
+                              act[k] = sc.hq.data() + (size_t)id * ex.f.h_bytes;
+                              dst[k] = sc.y.data() + (size_t)id * E;
+                          }
+                          iqc::iq_cpu_down(ex.f, ex.D((size_t)gr.e), act, gr.c, dst, r0, r1);
+                      },
+                      sc.dn_node.empty() ? nullptr : &sc.dn_node);
+    // Keep the original entry order, including duplicate experts, for the weighted sum.
+    for (int id = 0; id < n; ++id)
+        for (int j = 0; j < E; ++j)
+            out[(size_t)entries[(size_t)id].t * E + j] += entries[(size_t)id].w * sc.y[(size_t)id * E + j];
+    lane_count().entries.fetch_add(n, std::memory_order_relaxed);
+}
+
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,
                  float* out) {
+    if (ex.mixed) {
+        cpu_experts_mixed(lane, ex, entries, x, T, out);
+        return;
+    }
     const iqc::IqCpu& f = ex.f;
     const int E = f.n_embd, F = f.n_ff, n = (int) entries.size();
     std::fill(out, out + (size_t) T * E, 0.0f);

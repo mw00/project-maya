@@ -747,7 +747,227 @@ void lane_waits_cases() {
     std::printf("  CPU lane's waits by system and environment: %s\n", fails ? "FAILED" : "ok");
 }
 
+void test_mixed_cpu() {
+    namespace ic = maya::ds4::gguf;
+    const int E = 256, F = 256, NE = 3, T = 3;
+    std::mt19937 rng(741);
+    std::normal_distribution<float> nd(0, 0.05f);
+    auto decode = [](const uint8_t* p, int type, int i) {
+        if (type == 30) {
+            uint16_t b;
+            std::memcpy(&b, p + i * 2, 2);
+            uint32_t u = (uint32_t)b << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+        }
+        uint16_t b;
+        std::memcpy(&b, p + (i / 32) * 34, 2);
+        __half h;
+        std::memcpy(&h, &b, 2);
+        return __half2float(h) * (float)(int8_t)p[(i / 32) * 34 + 2 + i % 32];
+    };
+    for (int tg : {8, 30})
+        for (int tu : {8, 30}) {
+            if (tg == tu)
+                continue;
+            hy4::CpuExperts cx;
+            std::string err;
+            bool ok = cx.init_mixed(tg, tu, 8, E, F, err);
+            CHECK(ok);
+            if (!ok) {
+                std::printf("mixed init failed: %s\n", err.c_str());
+                continue;
+            }
+            std::vector<uint8_t> g(NE * cx.g_stride), u(NE * cx.u_stride), d(NE * cx.d_stride);
+            auto fill = [&](std::vector<uint8_t>& a, int type, int rows, int k) {
+                std::vector<float> w(k);
+                for (int r = 0; r < rows; ++r) {
+                    for (float& v : w)
+                        v = nd(rng);
+                    ic::iq_cpu_quant(type, w.data(), k, a.data() + (size_t)r * (type == 30 ? k * 2 : k / 32 * 34));
+                }
+            };
+            fill(g, tg, NE * F, E);
+            fill(u, tu, NE * F, E);
+            fill(d, 8, NE * E, F);
+            cx.gate = g.data();
+            cx.up = u.data();
+            cx.down = d.data();
+            cx.limit = 0.2f;
+            std::vector<float> x(T * E), got(T * E), ref(T * E, 0);
+            for (float& v : x)
+                v = nd(rng) * 4;
+            std::vector<hy4::CpuEntry> ent = {{0, 2, 0.7f}, {0, 0, 0.3f}, {2, 1, 1.0f}};
+            hy4::Lane lane(3);
+            hy4::cpu_experts(lane, cx, ent, x.data(), T, got.data());
+            for (auto en : ent) {
+                std::vector<uint8_t> xg(cx.mix_g.h_bytes), xu(cx.mix_u.h_bytes), hq(cx.f.h_bytes);
+                ic::iq_cpu_quant(cx.mix_g.d_act, x.data() + en.t * E, E, xg.data());
+                ic::iq_cpu_quant(cx.mix_u.d_act, x.data() + en.t * E, E, xu.data());
+                std::vector<float> h(F);
+                for (int r = 0; r < F; ++r) {
+                    double a = 0, b = 0;
+                    for (int k = 0; k < E; ++k) {
+                        a += (double)decode(g.data() + en.e * cx.g_stride + r * cx.mix_g.d_row, tg, k) *
+                             decode(xg.data(), cx.mix_g.d_act, k);
+                        b += (double)decode(u.data() + en.e * cx.u_stride + r * cx.mix_u.d_row, tu, k) *
+                             decode(xu.data(), cx.mix_u.d_act, k);
+                    }
+                    float ga = std::fmin((float)a, cx.limit), up = std::fmin(std::fmax((float)b, -cx.limit), cx.limit);
+                    h[r] = (ga / (1.0f + std::exp(-ga))) * up;
+                }
+                ic::iq_cpu_quant(cx.f.d_act, h.data(), F, hq.data());
+                for (int r = 0; r < E; ++r) {
+                    double a = 0;
+                    for (int k = 0; k < F; ++k)
+                        a += (double)decode(d.data() + en.e * cx.d_stride + r * cx.f.d_row, 8, k) *
+                             decode(hq.data(), cx.f.d_act, k);
+                    ref[en.t * E + r] += en.w * (float)a;
+                }
+            }
+            double er = 0, norm = 0;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                er += (got[i] - ref[i]) * (got[i] - ref[i]);
+                norm += ref[i] * ref[i];
+            }
+            const double rel = std::sqrt(er / norm);
+            std::printf("mixed CPU %d/%d/8: relative error %.3e\n", tg, tu, rel);
+            CHECK(rel < 0.005);
+            CHECK(std::all_of(got.begin() + E, got.begin() + 2 * E, [](float x) { return x == 0; }));
+            std::vector<float> empty(T * E, 1);
+            hy4::cpu_experts(lane, cx, {}, x.data(), T, empty.data());
+            CHECK(std::all_of(empty.begin(), empty.end(), [](float x) { return x == 0; }));
+        }
+}
+
+void test_mixed_gpu() {
+    namespace ic = maya::ds4::gguf;
+    constexpr int E = 256, F = 256, NE = 3, used = 16;
+    std::mt19937 rng(893);
+    std::normal_distribution<float> nd(0, 0.05f);
+    auto decode = [](const uint8_t* p, int type, int i) {
+        if (type == 30) {
+            uint16_t b;
+            std::memcpy(&b, p + i * 2, 2);
+            uint32_t u = (uint32_t)b << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+        }
+        __half h;
+        std::memcpy(&h, p + (i / 32) * 34, 2);
+        return __half2float(h) * (float)(int8_t)p[(i / 32) * 34 + 2 + i % 32];
+    };
+    for (int tg : {8, 30})
+        for (int tu : {8, 30})
+            for (int td : {8, 30}) {
+                const size_t rg = tg == 30 ? E * 2 : E / 32 * 34, ru = tu == 30 ? E * 2 : E / 32 * 34,
+                             rd = td == 30 ? F * 2 : F / 32 * 34;
+                auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+                const size_t up = al(rg * F), down = up + al(ru * F), stride = al(down + rd * E);
+                std::vector<uint8_t> blob(2 * stride, 0);
+                std::vector<float> w(E);
+                for (int e = 0; e < 2; ++e)
+                    for (int role = 0; role < 3; ++role)
+                        for (int row = 0; row < (role == 2 ? E : F); ++row) {
+                            for (float& v : w)
+                                v = nd(rng);
+                            const int ty = role == 0 ? tg : role == 1 ? tu : td;
+                            const size_t rb = role == 0   ? rg
+                                              : role == 1 ? ru
+                                                          : rd,
+                                         off = role == 0   ? 0
+                                               : role == 1 ? up
+                                                           : down;
+                            ic::iq_cpu_quant(ty, w.data(), E, blob.data() + e * stride + off + row * rb);
+                        }
+                for (int T : {1, 3, 17})
+                    for (bool half : {false, true})
+                        for (bool empty : {false, true}) {
+                            std::vector<int> slots = {-1, 1, 0}, ids(T * used);
+                            if (empty)
+                                slots = {-1, -1, -1};
+                            std::vector<float> x(T * E), weights(T * used), ref(T * E, 0), got(T * E);
+                            for (float& v : x)
+                                v = nd(rng) * 4;
+                            for (int i = 0; i < T * used; ++i) {
+                                ids[i] = i % NE;
+                                weights[i] = 1.0f / used;
+                            }
+                            const float limit = 0.2f;
+                            for (int en = 0; en < T * used; ++en) {
+                                int sl = slots[ids[en]], t = en / used;
+                                if (sl < 0)
+                                    continue;
+                                const uint8_t* b = blob.data() + sl * stride;
+                                std::vector<float> h(F);
+                                for (int row = 0; row < F; ++row) {
+                                    double a = 0, c = 0;
+                                    for (int k = 0; k < E; ++k) {
+                                        a += (double)decode(b + row * rg, tg, k) * x[t * E + k];
+                                        c += (double)decode(b + up + row * ru, tu, k) * x[t * E + k];
+                                    }
+                                    float ga = std::fmin((float)a, limit),
+                                          u = std::fmin(std::fmax((float)c, -limit), limit);
+                                    h[row] = ga / (1.0f + std::exp(-ga)) * u;
+                                    if (half)
+                                        h[row] = __half2float(__float2half_rn(h[row]));
+                                }
+                                for (int row = 0; row < E; ++row) {
+                                    double a = 0;
+                                    for (int k = 0; k < F; ++k)
+                                        a += (double)decode(b + down + row * rd, td, k) * h[k];
+                                    ref[t * E + row] += weights[en] * (float)a;
+                                }
+                            }
+                            std::vector<void*> dev;
+                            auto alloc = [&](size_t n) {
+                                void* p = nullptr;
+                                CU(cudaMalloc(&p, n));
+                                dev.push_back(p);
+                                return p;
+                            };
+                            auto db = (uint8_t*)alloc(blob.size());
+                            auto ds = (int*)alloc(NE * sizeof(int));
+                            auto di = (int*)alloc(ids.size() * sizeof(int));
+                            auto dx = (float*)alloc(x.size() * 4);
+                            auto dw = (float*)alloc(weights.size() * 4);
+                            void* dh = alloc(T * used * F * (half ? 2 : 4));
+                            auto dp = (float*)alloc(T * used * E * 4);
+                            auto dy = (float*)alloc(T * E * 4);
+                            CU(cudaMemcpy(db, blob.data(), blob.size(), cudaMemcpyHostToDevice));
+                            CU(cudaMemcpy(ds, slots.data(), NE * sizeof(int), cudaMemcpyHostToDevice));
+                            CU(cudaMemcpy(di, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+                            CU(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+                            CU(cudaMemcpy(dw, weights.data(), weights.size() * 4, cudaMemcpyHostToDevice));
+                            hy4::k::mixed_experts(dx, di, dw, ds, db, stride, up, down, tg, tu, td, E, F, T, used,
+                                                  limit, dh, half, dp, dy, 0);
+                            CU(cudaDeviceSynchronize());
+                            CU(cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost));
+                            double er = 0, norm = 0;
+                            for (size_t i = 0; i < got.size(); ++i) {
+                                CHECK(std::isfinite(got[i]));
+                                er += (got[i] - ref[i]) * (got[i] - ref[i]);
+                                norm += ref[i] * ref[i];
+                            }
+                            double rel = std::sqrt(er / std::max(norm, 1e-30));
+                            CHECK(rel < 0.0001);
+                            if (empty)
+                                CHECK(std::all_of(got.begin(), got.end(), [](float v) { return v == 0; }));
+                            std::printf("mixed GPU %d/%d/%d T=%d half=%d empty=%d error %.3e\n", tg, tu, td, T, half,
+                                        empty, rel);
+                            for (void* p : dev)
+                                CU(cudaFree(p));
+                        }
+            }
+}
+
 int main() {
+    test_mixed_gpu();
+    test_mixed_cpu();
+    if (std::getenv("HY4_MIXED_TEST_ONLY"))
+        return fails ? 1 : 0;
     lane_waits_cases();
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {

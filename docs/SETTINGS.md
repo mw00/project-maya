@@ -2924,3 +2924,16 @@ untested and refused unless this is set when the setup or `--check` runs (in the
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_HIP_ALLOW_ROCM6` | unset (ROCm 6 refused) | `1`: the setup goes on with a ROCm 6.x, with a warning (untested: the build or the engine may fail); the build then takes hipBLAS 2's `HIPBLAS_V2` API and leaves out `hipblasSetWorkspace`, which hipBLAS 2 does not have |
+
+## Hy4 mixed GGUF experts
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MAYA_GLM_HY4_MIXED_GPU` | `0` | Set to `1` to cache original mixed-role Q8_0/BF16/IQ3_S/IQ4_XS/Q5_K/Q6_K experts in VRAM. Cache misses use the CPU lane. Integer-quantized token/window decoding uses the native integer-dot kernels; prompt chunks and BF16 roles use the float fallback. Single GPU only. |
+
+The mixed-role CPU lane supports independently typed gate, up and down matrices.
+GPU-fetch streaming is disabled for mixed layers; their cache misses stay on the CPU.
+Q5_0/Q5_1 Engram tables and Q5_1 dense attention weights retain their GGUF values;
+the dense Q5_1 rows expand to F32 at load and are counted at that size by the VRAM planner.
+Moving an expert between CPU and GPU can change the last output bits because their
+activation rounding differs. The setting does not change the source GGUF weights.

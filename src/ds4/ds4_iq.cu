@@ -970,7 +970,12 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                             if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp);
                         } else {
                             const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
-                            if (lane == 0) *hp = EPI == 2 ? v : swigluoai(*hp, v, a.limit);
+                            if (lane == 0)
+                                *hp = EPI == 2 ? v
+                                               : (a.act == kActSwiglu
+                                                      ? (a.pexp ? maya::ds4::par::swiglu_portable(*hp, v, a.limit)
+                                                                : swiglu(*hp, v, a.limit))
+                                                      : swigluoai(*hp, v, a.limit));
                         }
                     }
             }
@@ -2359,6 +2364,15 @@ const char* name(int t) {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
     if (!k_whole(a.n_embd, 0, a.tg, a.tu, 0) || a.n_ff % (kWarps * kGuRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
+    if (a.act == kActSwiglu && a.tu != 0 && a.tu != a.tg) {
+#define GM2_(T) gu_ne<T, 2>(a, grid, ne_max, s)
+        DS4_IQ_SWITCH_EXP(a.tg, GM2_)
+#undef GM2_
+#define GM3_(T) gu_ne<T, 3>(a, grid, ne_max, s)
+        DS4_IQ_SWITCH_EXP(a.tu, GM3_)
+#undef GM3_
+        return true;
+    }
     if (a.act != kActSwiglu) {   // MiniMax's swigluoai: one pass, or (gate and up of different types) two
         if (a.tu == 0 || a.tu == a.tg) {
 #define GO_(T) gu_ne<T, 1>(a, grid, ne_max, s)

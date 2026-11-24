@@ -2,6 +2,7 @@
 // CUDA cores, the latent cache in F16 as the reference keeps it; the reference is AngelSlim's hy4-flash graph
 // (src/models/hy-v4-flash.cpp of their hy4-flash patch).
 #include "hy4_kernels.cuh"
+#include "hy4_mixed_quant.cuh"
 #include "maya/kernels/fresh_load.hpp"
 #include "maya/kernels/lane_xor.hpp"   // warp sums in registers on RDNA
 #include "maya/kernels/rdna_wmma.hpp"
@@ -2111,9 +2112,26 @@ __device__ __forceinline__ float f8e4m3(uint8_t x) {
 // a block (dim threads, dim <= 1024) a (column, token)
 __global__ void engram_rows_kernel(const uint8_t* __restrict__ rows, const float* __restrict__ valid, int cols, int dim,
                                    const float* __restrict__ ln, float eps, float* __restrict__ r,
-                                   const float* __restrict__ scale) {
+                                   const float* __restrict__ scale, int q5_type) {
     const int col = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
-    float v = i < dim ? f8e4m3(rows[((size_t) t * cols + col) * dim + i]) : 0.0f;
+    float v = 0.0f;
+    if (i < dim) {
+        const uint8_t* row = rows + ((size_t)t * cols + col) * dim;
+        if (q5_type) {
+            // ggml block_q5_1: fp16 d,m; 32 high bits; 16 packed low nibbles.
+            const int header = q5_type == 1 ? 4 : 2;
+            const uint8_t* b = row + (i / 32) * (q5_type == 1 ? 24 : 22);
+            const int j = i % 32;
+            const unsigned qh = (unsigned)b[header] | ((unsigned)b[header + 1] << 8) | ((unsigned)b[header + 2] << 16) |
+                                ((unsigned)b[header + 3] << 24);
+            const int lo = j < 16 ? (b[header + 4 + j] & 15) : (b[header + 4 + j - 16] >> 4);
+            const int q = lo | (((qh >> j) & 1u) << 4);
+            const float d = __half2float(*reinterpret_cast<const __half*>(b));
+            v = q5_type == 1 ? d * (float)q + __half2float(*reinterpret_cast<const __half*>(b + 2))
+                             : d * (float)(q - 16);
+        } else
+            v = f8e4m3(row[i]);
+    }
     if (scale != nullptr) v *= scale[(size_t) t * cols + col];
     const float ss = block_sum(v * v);
     const float rr = 1.0f / sqrtf(ss / (float) dim + eps);
@@ -2951,10 +2969,10 @@ void dup_rows_q8(const int8_t* q, const float* d, int rows, int k, int8_t* q2, f
     check("dup_rows_q8");
 }
 void engram_rows(const uint8_t* rows, const float* valid, int T, int cols, int dim, const float* lookup_norm, float eps,
-                 float* r, cudaStream_t s, const float* scale) {
+                 float* r, cudaStream_t s, const float* scale, int q5_type) {
     const int th = (dim + 31) / 32 * 32;
-    engram_rows_kernel<<<dim3((unsigned) cols, (unsigned) T), th, 0, s>>>(rows, valid, cols, dim, lookup_norm, eps, r,
-                                                                         scale);
+    engram_rows_kernel<<<dim3((unsigned)cols, (unsigned)T), th, 0, s>>>(rows, valid, cols, dim, lookup_norm, eps, r,
+                                                                        scale, q5_type);
     check("engram_rows");
 }
 void engram_mix(float* x, const float* kv, const float* kv_b, int T, int hc, int E, const float* egate,
@@ -3536,5 +3554,84 @@ std::string first_fault() {
     return g_fault;
 }
 void set_mix_out(float* p) { g_mix_out = p; }
+
+namespace {
+template <class H>
+__global__ void mixed_gu(const float* x, const int* ids, const int* slot, const uint8_t* base, size_t stride, size_t up,
+                         int tg, int tu, int E, int F, int used, float limit, H* h) {
+    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5), entry = blockIdx.y,
+              token = entry / used, e = ids[entry], sl = slot[e];
+    if (row >= F)
+        return;
+    if (sl < 0) {
+        if (lane == 0)
+            h[(size_t)entry * F + row] = H(0.0f);
+        return;
+    }
+    const uint8_t* b = base + (size_t)sl * stride;
+    const size_t rg = mixed_quant::row_bytes(tg, E);
+    const size_t ru = mixed_quant::row_bytes(tu, E);
+    float a = 0, c = 0;
+    for (int k = lane; k < E; k += 32) {
+        float v = x[(size_t)token * E + k];
+        a += mixed_quant::value(b + row * rg, tg, k) * v;
+        c += mixed_quant::value(b + up + row * ru, tu, k) * v;
+    }
+    a = warp_sum(a);
+    c = warp_sum(c);
+    if (lane == 0) {
+        if (limit > 0) {
+            a = fminf(a, limit);
+            c = fminf(fmaxf(c, -limit), limit);
+        }
+        h[(size_t)entry * F + row] = H(a / (1.0f + expf(-a)) * c);
+    }
+}
+template <class H>
+__global__ void mixed_dn(const H* h, const int* ids, const int* slot, const uint8_t* base, size_t stride, size_t down,
+                         int td, int E, int F, float* partial) {
+    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5), entry = blockIdx.y,
+              sl = slot[ids[entry]];
+    if (row >= E)
+        return;
+    if (sl < 0) {
+        if (lane == 0)
+            partial[(size_t)entry * E + row] = 0;
+        return;
+    }
+    const size_t rd = mixed_quant::row_bytes(td, F);
+    const uint8_t* w = base + (size_t)sl * stride + down + row * rd;
+    float a = 0;
+    for (int k = lane; k < F; k += 32)
+        a += mixed_quant::value(w, td, k) * (float)h[(size_t)entry * F + k];
+    a = warp_sum(a);
+    if (lane == 0)
+        partial[(size_t)entry * E + row] = a;
+}
+} // namespace
+void mixed_experts(const float* x, const int* ids, const float* weights, const int* slot, const uint8_t* base,
+                   size_t stride, size_t up, size_t down, int tg, int tu, int td, int E, int F, int T, int used,
+                   float limit, void* hidden, bool half_hidden, float* partial, float* out, cudaStream_t stream) {
+    if (!mixed_quant::supported(tg) || !mixed_quant::supported(tu) || !mixed_quant::supported(td)) {
+        std::fprintf(stderr, "mixed_experts: unsupported types %d/%d/%d\n", tg, tu, td);
+        g_err.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (half_hidden) {
+        mixed_gu<<<dim3((F + 7) / 8, T * used), 256, 0, stream>>>(x, ids, slot, base, stride, up, tg, tu, E, F, used,
+                                                                  limit, (__half*)hidden);
+        mixed_dn<<<dim3((E + 7) / 8, T * used), 256, 0, stream>>>((__half*)hidden, ids, slot, base, stride, down, td, E,
+                                                                  F, partial);
+    } else {
+        mixed_gu<<<dim3((F + 7) / 8, T * used), 256, 0, stream>>>(x, ids, slot, base, stride, up, tg, tu, E, F, used,
+                                                                  limit, (float*)hidden);
+        mixed_dn<<<dim3((E + 7) / 8, T * used), 256, 0, stream>>>((float*)hidden, ids, slot, base, stride, down, td, E,
+                                                                  F, partial);
+    }
+    check("mixed_experts");
+    moe_sum_kernel<<<dim3((unsigned)((E + 255) / 256), (unsigned)T), 256, 0, stream>>>(partial, used, E, weights, out,
+                                                                                       used, Q8Out{});
+    check("mixed_experts sum");
+}
 
 }  // namespace hy4::k
