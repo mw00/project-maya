@@ -4523,8 +4523,6 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     # only the towers and kernels Maya's pictures use are compiled (tools/vision/lean.cmake); should that stop on
     # some toolchain, all of llama.cpp's image library is, as before v1.1.78 (the build folder then keeps that choice)
     if not steps():
-        if metal:
-            return False
         say("  (once more, with all of llama.cpp's image library: -DMAYA_VISION_FULL=ON)")
         if not steps(["-DMAYA_VISION_FULL=ON"]):
             return False
