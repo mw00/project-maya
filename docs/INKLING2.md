@@ -515,6 +515,14 @@ one) do not project: the engine says so and loads no direction there. Fitting a 
 makes the engine read out each visit's two writes (the last prompt token's row, as on the other engines) instead of
 projecting, and `tools/ablate_fit.py` takes it from there; the visit index plays the layer's part.
 
+The direction in Maya's repo was fitted on UD-Q4_K_XL at visit 38 (the third pass of layer 14; hidden size 2,304,
+strength 1): `tools/ablate_fit.py eval` on 50 held-out harmful prompts (thinking off, 96 tokens, greedy): 49 refused with
+ablation off, 5 with it on (0.98 -> 0.10); of 50 harmless prompts none refused in either mode; the 16 everyday prompts
+(384 tokens) had no loop and no empty answer either way, and the loop test (5 answers, 1,024 tokens) found 0 loops.
+Cost, Radeon 8065S (gfx1151), plain decoding, the engine's own CLI, 192 tokens, three alternated pairs: 39.6 tokens/s
+with the direction loaded and a request not asking, 38.4 with it projecting (about 3%: 96 small launches a token);
+`--bench` with the direction loaded and off: the same as without one (decode +0.0%, prompts +0.2% / +0.0%, exact).
+
 **Files** (Apache 2.0, the model and unsloth's GGUF alike):
 
 | File | Repository | sha256 |
