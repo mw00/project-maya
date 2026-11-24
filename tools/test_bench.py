@@ -475,5 +475,17 @@ class LayoutFingerprint(unittest.TestCase):
 
 
 
+class SetupWording(unittest.TestCase):
+    def test_picture_reader_time_is_an_honest_range(self):
+        self.assertIn("up to about 10 minutes", maya.VISION_BUILD_TIME)
+        self.assertNotIn("a few", maya.VISION_BUILD_TIME)
+        src = Path(maya.__file__).read_text(encoding="utf-8")
+        self.assertIn('" kernels: " + VISION_BUILD_TIME', src)
+        self.assertNotIn('"CUDA") + " kernels: a few minutes"', src)
+        setup = (Path(maya.__file__).parent / "docs" / "SETUP.md").read_text(encoding="utf-8")
+        self.assertIn("compiles the image encoder (1 to 6 minutes, up to about 10 minutes on a small PC; once)", setup)
+        self.assertIn("compiles the engine for your GPU(s) (a few minutes, once)", setup)   # (the engine's text stays)
+
+
 if __name__ == "__main__":
     unittest.main()

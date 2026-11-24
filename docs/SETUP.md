@@ -99,7 +99,7 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 6. builds the *pack* - the engine's index of the model files, about 1 GB, written into the model folder. A Maya
    model's files that were already there are checked against their sha256 first (once each); the pack records the
    files, and a start refuses it if they change afterwards (`--repack` builds it again);
-7. **pictures**: compiles the image encoder (a few minutes, once) and fetches its files (1.1 GB, shown and asked
+7. **pictures**: compiles the image encoder (1 to 6 minutes, up to about 10 minutes on a small PC; once) and fetches its files (1.1 GB, shown and asked
    first); `--no-vision` skips it;
 8. writes `maya-<model>.json` and `run-maya-<model>.sh`; with DFlash2 it runs the
    [speed calibration](SETTINGS.md#the-speed-calibration) (5-20 minutes: DFlash2 stays only if it is faster on your

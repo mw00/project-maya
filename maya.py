@@ -4464,6 +4464,9 @@ def ablate_step(cfg_path: Path, key: str, models: Path, a=None) -> None:
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
 
 
+VISION_BUILD_TIME = "1 to 6 minutes, up to about 10 minutes on a small PC"   # (measured clean installs; the engine: 1.5-4)
+
+
 def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's and Inkling 2's vision towers added
     (tools/vision/glm5next_patch.py, inkling2v_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
@@ -4511,7 +4514,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
-        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: a few minutes") +
+        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: " + VISION_BUILD_TIME) +
         ", once) ...")
     def steps(more=()) -> bool:
         return not cmake_steps(conf + list(more), [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j",
