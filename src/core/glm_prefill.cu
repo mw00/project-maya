@@ -4027,7 +4027,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // where MMQ has no int8 tensor cores: ~25 TOPS); lighter experts stay on MMQ.  GLM-5.3-Flash on one V100, two
         // rounds: 27K prompt 39.7 / 39.9 -> 31.7 / 31.8 s, 8K 623 / 621 -> 764 / 764 tok/s, 2K 549 / 548 -> 581 / 568;
         // KL against MMQ 0.015 (MMQ against itself 0), the target token's log-prob +0.025 (FP16 activations, not q8_1).
-        // Default 128 rows on sm_70 (Turing+ run MMQ on int8 tensor cores: 0 there); 0 = MMQ only.
+        // sm_80 (GA100) as well: MMQ's int8 products reach ~41 T ops/s there on these shapes, the FP16 GEMM ~120.
+        // GLM-5.3-Flash Maya-S24 on one CMP 170HX (sm_80), two rounds: 8K 916 / 916 -> 1027 / 1025 tok/s, 2K 377 /
+        // 377 -> 381 / 380, a 130K prompt 1157 -> 1392; KL against MMQ 0.016-0.019 on two texts.
+        // Default 128 rows on sm_70 and sm_80 (other Turing+ cards run MMQ on int8 tensor cores: 0 there); 0 = MMQ only.
         // (per device: a split over a V100 and a newer card keeps MMQ on the newer one)
         const int blas_rows = [] {
             static const int env = [] {
@@ -4046,7 +4049,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 int major = 0, minor = 0;
                 cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
                 cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-                blas_dev[dev] = (major == 7 && minor == 0 ? 128 : 0) + 1;
+                blas_dev[dev] = ((major == 7 || major == 8) && minor == 0 ? 128 : 0) + 1;
             }
             return blas_dev[dev] - 1;
 #endif
