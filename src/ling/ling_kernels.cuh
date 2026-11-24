@@ -34,14 +34,18 @@ void router_grouped(const float* logits, const float* bias, int T, int n_exp, in
 /// and glmd::mla_prompt_wmma: RMSNorm(kv_lora) -> lat (FP16 or 544-byte INT8 records), double-precision NORM RoPE
 /// -> k_pe (FP16).  pos_dev non-null: per-token device positions; else p0 + t.
 void kv_store_split(const float* kv_in, int T, int kv_lora, int n_rot, const float* kv_a_norm, float eps,
-                    const int* pos_dev, int p0, float base, void* lat, bool lat_q8, uint16_t* k_pe, cudaStream_t s);
+                    const int* pos_dev, int p0, float base, void* lat, bool lat_q8, uint16_t* k_pe, cudaStream_t s,
+                    const int* rope_delta_dev = nullptr, const int* mrope_pos = nullptr, int mrope_hw = 24,
+                    int mrope_stride = 0);
 
 /// MLA query prep on qm [T][n_head][qk_head]:
 ///   - Applies double-precision NORM RoPE in place to qm[t][h][qk_nope .. qk_head).
 ///   - If q8n != nullptr: quantizes qm[t][h][0 .. qk_nope) into q8_heads layout (row h*T + t) for iq::mv_heads.
 ///   - If qm16 != nullptr: converts qm[t][h][0 .. qk_nope) to FP16 at stride qk_head for strided-batched cuBLAS.
 void mla_q_prep(float* qm, int T, int n_head, int qk_head, int qk_nope, int n_rot, const int* pos_dev, int p0,
-                float base, int8_t* q8n, float* d8n, uint16_t* qm16, cudaStream_t s);
+                float base, int8_t* q8n, float* d8n, uint16_t* qm16, cudaStream_t s,
+                const int* rope_delta_dev = nullptr, const int* mrope_pos = nullptr, int mrope_hw = 24,
+                int mrope_stride = 0);
 
 /// MLA per-head output gate: o[t][h][e] *= sigmoid(gate[t][h]), with optional fused Q8 or FP16 output.
 void head_gate_out(float* o, const float* gate, int T, int n_head, int head_dim, int8_t* xq_out, float* xd_out,
@@ -68,7 +72,8 @@ void fill_iota(int* dst, int n, cudaStream_t s);
 /// Tiled dense MLA prefill helpers:
 /// Apply double-precision NORM RoPE on q_pe and write head-major FP16 q_nope16 [H][T][qk_nope], q_pe16 [H][T][n_rot].
 void mla_q_split_rope_f16(const float* qm, int T, int n_head, int qk_head, int qk_nope, int n_rot, int pos0, float base,
-                          uint16_t* q_nope16, uint16_t* q_pe16, cudaStream_t s);
+                          uint16_t* q_nope16, uint16_t* q_pe16, cudaStream_t s, const int* mrope_pos = nullptr,
+                          int mrope_hw = 24, int mrope_stride = 0);
 
 /// Dequantize BK rows of INT8 MLA latent cache starting at k0 -> FP16 [BK][kv_lora].
 void lat_q8_to_f16(const void* lat, int k0, int BK, int kv_lora, uint16_t* out16, cudaStream_t s);
@@ -158,8 +163,9 @@ void argmax_rows_f32(const float* logits, int W, int n, float* scratch_val, int*
 
 /// Copy W contiguous rows from src [W][E] into ring buffer ring [R][E] at positions (pos0 + t) % R.
 void store_hring(const float* src, int W, int E, float* ring, int R, int pos0, cudaStream_t s);
-void set_step(int* d_step, int tok, int pos, int n_kv, cudaStream_t s);
-void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, cudaStream_t s);
+void set_step(int* d_step, int tok, int pos, int n_kv, int rope_delta, cudaStream_t s);
+void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, int rope_delta,
+                  cudaStream_t s);
 
 }  // namespace ling::k
 

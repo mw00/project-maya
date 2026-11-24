@@ -36,6 +36,13 @@ __device__ __forceinline__ void q8_store_warp(float v, size_t at, int8_t* __rest
     if ((threadIdx.x & 31) == 0) d[at >> 5] = sc;
 }
 
+__device__ __forceinline__ int mrope_pos_at(int t, int kv_p, int rope_delta, int i,
+                                            const int* __restrict__ mrope_pos, int mrope_hw, int mrope_stride) {
+    if (mrope_pos == nullptr) return kv_p + rope_delta;
+    if (i < mrope_hw) return mrope_pos[(size_t) ((i & 1) ? 2 : 1) * (size_t) mrope_stride + (size_t) t];
+    return mrope_pos[(size_t) t];
+}
+
 __device__ __forceinline__ void rope_pair_d(float& a, float& b, int pos, int i, int n_rot, float base) {
     const double inv = pow((double) base, -2.0 * (double) i / (double) n_rot);
     const double theta = (double) pos * inv;
@@ -416,7 +423,8 @@ __global__ void __launch_bounds__(256)
 __global__ void __launch_bounds__(256)
     kv_store_split_kernel(const float* __restrict__ kv_in, int kv_lora, int n_rot, const float* __restrict__ w,
                           float eps, const int* __restrict__ pos_dev, int p0, float base, void* __restrict__ lat,
-                          int lat_q8, uint16_t* __restrict__ k_pe) {
+                          int lat_q8, uint16_t* __restrict__ k_pe, const int* __restrict__ rope_delta_dev,
+                          const int* __restrict__ mrope_pos, int mrope_hw, int mrope_stride) {
     __shared__ float sred[8];
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
@@ -455,11 +463,13 @@ __global__ void __launch_bounds__(256)
         }
     }
 
+    const int rd = rope_delta_dev != nullptr ? *rope_delta_dev : 0;
     __half* kp = (__half*) k_pe + (size_t) p * n_rot;
     for (int i = tid; i < n_rot / 2; i += blockDim.x) {
         float a = x[kv_lora + 2 * i];
         float b = x[kv_lora + 2 * i + 1];
-        rope_pair_d(a, b, p, i, n_rot, base);
+        const int rp = mrope_pos_at(t, p, rd, i, mrope_pos, mrope_hw, mrope_stride);
+        rope_pair_d(a, b, rp, i, n_rot, base);
         kp[2 * i] = __float2half_rn(a);
         kp[2 * i + 1] = __float2half_rn(b);
     }
@@ -469,7 +479,8 @@ __global__ void __launch_bounds__(256)
 __global__ void __launch_bounds__(256)
     mla_q_prep_kernel(float* __restrict__ qm, int T, int n_head, int qk_head, int qk_nope, int n_rot,
                       const int* __restrict__ pos_dev, int p0, float base, int8_t* __restrict__ q8n,
-                      float* __restrict__ d8n, uint16_t* __restrict__ qm16) {
+                      float* __restrict__ d8n, uint16_t* __restrict__ qm16, const int* __restrict__ rope_delta_dev,
+                      const int* __restrict__ mrope_pos, int mrope_hw, int mrope_stride) {
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const int c = threadIdx.x;
@@ -482,9 +493,11 @@ __global__ void __launch_bounds__(256)
         if (qm16 != nullptr) ((__half*) qm16)[((size_t) t * n_head + h) * qk_head + c] = __float2half_rn(v);
     } else if (c < qk_nope + (n_rot >> 1)) {
         const int i = c - qk_nope;
+        const int rd = rope_delta_dev != nullptr ? *rope_delta_dev : 0;
+        const int rp = mrope_pos_at(t, p, rd, i, mrope_pos, mrope_hw, mrope_stride);
         float a = qh[qk_nope + 2 * i];
         float b = qh[qk_nope + 2 * i + 1];
-        rope_pair_d(a, b, p, i, n_rot, base);
+        rope_pair_d(a, b, rp, i, n_rot, base);
         qh[qk_nope + 2 * i] = a;
         qh[qk_nope + 2 * i + 1] = b;
     }
@@ -599,7 +612,8 @@ __global__ void fill_iota_kernel(int* __restrict__ dst, int n) {
 // ---- Tiled dense MLA prefill kernels ----
 __global__ void __launch_bounds__(256)
     mla_q_split_rope_f16_kernel(const float* __restrict__ qm, int T, int n_head, int qk_head, int qk_nope, int n_rot,
-                                int pos0, float base, uint16_t* __restrict__ q_nope16, uint16_t* __restrict__ q_pe16) {
+                                int pos0, float base, uint16_t* __restrict__ q_nope16, uint16_t* __restrict__ q_pe16,
+                                const int* __restrict__ mrope_pos, int mrope_hw, int mrope_stride) {
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const int c = threadIdx.x;
@@ -610,7 +624,8 @@ __global__ void __launch_bounds__(256)
         const int i = c - qk_nope;
         float a = qh[qk_nope + 2 * i];
         float b = qh[qk_nope + 2 * i + 1];
-        rope_pair_d(a, b, pos0 + t, i, n_rot, base);
+        const int rp = mrope_pos_at(t, pos0 + t, 0, i, mrope_pos, mrope_hw, mrope_stride);
+        rope_pair_d(a, b, rp, i, n_rot, base);
         __half* dst = (__half*) q_pe16 + ((size_t) h * T + t) * n_rot;
         dst[2 * i] = __float2half_rn(a);
         dst[2 * i + 1] = __float2half_rn(b);
@@ -1783,17 +1798,19 @@ __global__ void __launch_bounds__(128)
     }
 }
 
-__global__ void set_step_kernel(int* __restrict__ d_step, int tok, int pos, int n_kv) {
+__global__ void set_step_kernel(int* __restrict__ d_step, int tok, int pos, int n_kv, int rope_delta) {
     d_step[0] = tok;
     d_step[1] = pos;
     d_step[2] = n_kv;
+    d_step[3] = rope_delta;
 }
 
 __global__ void set_step_win_kernel(int* __restrict__ d_step, int* __restrict__ d_tok, int* __restrict__ d_pos,
-                                    int t0, int t1, int t2, int t3, int W, int pos0) {
+                                    int t0, int t1, int t2, int t3, int W, int pos0, int rope_delta) {
     d_step[0] = t0;
     d_step[1] = pos0;
     d_step[2] = pos0 + W;
+    d_step[3] = rope_delta;
     const int ts[4] = {t0, t1, t2, t3};
     for (int i = 0; i < W; ++i) {
         d_tok[i] = ts[i];
@@ -1839,17 +1856,21 @@ void router_grouped(const float* logits, const float* bias, int T, int n_exp, in
 }
 
 void kv_store_split(const float* kv_in, int T, int kv_lora, int n_rot, const float* kv_a_norm, float eps,
-                    const int* pos_dev, int p0, float base, void* lat, bool lat_q8, uint16_t* k_pe, cudaStream_t s) {
+                    const int* pos_dev, int p0, float base, void* lat, bool lat_q8, uint16_t* k_pe, cudaStream_t s,
+                    const int* rope_delta_dev, const int* mrope_pos, int mrope_hw, int mrope_stride) {
     if (T <= 0) return;
     kv_store_split_kernel<<<(unsigned) T, 256, 0, s>>>(kv_in, kv_lora, n_rot, kv_a_norm, eps, pos_dev, p0, base, lat,
-                                                       lat_q8 ? 1 : 0, k_pe);
+                                                       lat_q8 ? 1 : 0, k_pe, rope_delta_dev, mrope_pos, mrope_hw,
+                                                       mrope_stride > 0 ? mrope_stride : T);
 }
 
 void mla_q_prep(float* qm, int T, int n_head, int qk_head, int qk_nope, int n_rot, const int* pos_dev, int p0,
-                float base, int8_t* q8n, float* d8n, uint16_t* qm16, cudaStream_t s) {
+                float base, int8_t* q8n, float* d8n, uint16_t* qm16, cudaStream_t s, const int* rope_delta_dev,
+                const int* mrope_pos, int mrope_hw, int mrope_stride) {
     if (T <= 0) return;
-    mla_q_prep_kernel<<<dim3((unsigned) n_head, (unsigned) T), 256, 0, s>>>(qm, T, n_head, qk_head, qk_nope, n_rot,
-                                                                            pos_dev, p0, base, q8n, d8n, qm16);
+    mla_q_prep_kernel<<<dim3((unsigned) n_head, (unsigned) T), 256, 0, s>>>(
+        qm, T, n_head, qk_head, qk_nope, n_rot, pos_dev, p0, base, q8n, d8n, qm16, rope_delta_dev, mrope_pos, mrope_hw,
+        mrope_stride > 0 ? mrope_stride : T);
 }
 
 void head_gate_out(float* o, const float* gate, int T, int n_head, int head_dim, int8_t* xq_out, float* xd_out,
@@ -1895,10 +1916,12 @@ void fill_iota(int* dst, int n, cudaStream_t s) {
 }
 
 void mla_q_split_rope_f16(const float* qm, int T, int n_head, int qk_head, int qk_nope, int n_rot, int pos0, float base,
-                          uint16_t* q_nope16, uint16_t* q_pe16, cudaStream_t s) {
+                          uint16_t* q_nope16, uint16_t* q_pe16, cudaStream_t s, const int* mrope_pos, int mrope_hw,
+                          int mrope_stride) {
     if (T <= 0) return;
     mla_q_split_rope_f16_kernel<<<dim3((unsigned) n_head, (unsigned) T), 256, 0, s>>>(
-        qm, T, n_head, qk_head, qk_nope, n_rot, pos0, base, q_nope16, q_pe16);
+        qm, T, n_head, qk_head, qk_nope, n_rot, pos0, base, q_nope16, q_pe16, mrope_pos, mrope_hw,
+        mrope_stride > 0 ? mrope_stride : T);
 }
 
 void lat_q8_to_f16(const void* lat, int k0, int BK, int kv_lora, uint16_t* out16, cudaStream_t s) {
@@ -2057,12 +2080,13 @@ void store_hring(const float* src, int W, int E, float* ring, int R, int pos0, c
     store_hring_kernel<<<dim3((unsigned) ((E + 255) / 256), (unsigned) W), 256, 0, s>>>(src, E, ring, R, pos0);
 }
 
-void set_step(int* d_step, int tok, int pos, int n_kv, cudaStream_t s) {
-    set_step_kernel<<<1, 1, 0, s>>>(d_step, tok, pos, n_kv);
+void set_step(int* d_step, int tok, int pos, int n_kv, int rope_delta, cudaStream_t s) {
+    set_step_kernel<<<1, 1, 0, s>>>(d_step, tok, pos, n_kv, rope_delta);
 }
 
-void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, cudaStream_t s) {
-    set_step_win_kernel<<<1, 1, 0, s>>>(d_step, d_tok, d_pos, t0, t1, t2, t3, W, pos0);
+void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, int rope_delta,
+                  cudaStream_t s) {
+    set_step_win_kernel<<<1, 1, 0, s>>>(d_step, d_tok, d_pos, t0, t1, t2, t3, W, pos0, rope_delta);
 }
 
 }  // namespace ling::k

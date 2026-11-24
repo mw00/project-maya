@@ -14,6 +14,7 @@
 
 #include "hy4_kernels.cuh"
 #include "ling_kernels.cuh"
+#include "ling_vision.hpp"
 #include "hy4_lane.hpp"
 
 namespace maya {
@@ -65,7 +66,8 @@ struct Options {
     bool use_graph = true;           // CUDA graph for single-token decode (in kGpu / full-VRAM mode)
     bool cache_warm = true;          // warm VRAM expert cache from prompt routing frequencies
     bool load_mtp = false;           // also load blk.<n_layers> MTP block
-    std::string seam_dir;            // optional per-layer seam dump dir (parity testing)
+    std::string seam_dir;
+    std::string mmproj_path;            // optional per-layer seam dump dir (parity testing)
 };
 
 struct TierStats {
@@ -91,6 +93,20 @@ public:
     bool has_mtp() const { return mtp_loaded_; }
     const float* last_h_nextn() const { return gpus_.back().hn; }
     double last_warm_s() const { return last_warm_s_; }
+
+    struct Image {
+        int64_t start = 0;   // prompt index of first <|image_pad|>
+        int width = 0;
+        int height = 0;
+        std::vector<float> rows;  // [tokens * n_embd] F32
+    };
+    const VisionGeo* vision() const { return (vision_ && vision_->loaded()) ? &vision_->geo() : nullptr; }
+    const char* vision_room() const;
+    size_t vision_room_bytes() const { return (vision_ && vision_->loaded()) ? vision_->max_room_bytes() : 0; }
+    bool encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& out_rows, std::string& err);
+    void set_images(std::vector<Image> imgs);
+    int rope_delta() const { return rope_delta_; }
+    void set_rope_delta(int d) { rope_delta_ = d; }
 
     // Reset KDA states and prompt frequency counters for a fresh sequence.
     void reset();
@@ -225,6 +241,8 @@ private:
         float *gu = nullptr, *eh = nullptr, *shact = nullptr, *part = nullptr, *shout = nullptr, *moe = nullptr;
         float *rlog = nullptr, *d_w = nullptr, *d_cpu_out = nullptr, *logits = nullptr;
         int *d_ids = nullptr, *d_step = nullptr, *d_iota = nullptr;
+        int* d_mrope_pos = nullptr;
+        int mrope_cap = 0;
         unsigned long long* d_plan = nullptr;
         int8_t *ehq = nullptr, *shq = nullptr;
         float *ehd = nullptr, *shd = nullptr;
@@ -326,6 +344,9 @@ private:
     double vram_res_frac_ = 1.0;
     int mtp_done_ = 0;
     std::vector<int> mtp_tokens_;
+    std::unique_ptr<VisionTower> vision_;
+    std::vector<Image> images_;
+    int rope_delta_ = 0;
 
     void* dev_alloc(Gpu& g, size_t bytes);
     void* host_alloc(Gpu& g, size_t bytes);
@@ -354,7 +375,7 @@ private:
         int *ids = nullptr, *tok = nullptr, *row_of = nullptr;
     };
     void kda_prefill(Gpu& gp, Layer& l, int T, float* x_io);
-    void mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io);
+    void mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io, const int* mrope_pos = nullptr, int mrope_stride = 0);
     void ffn_dense_prefill(Gpu& gp, Layer& l, int il, int T, float* x_io);
     void ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_block, bool layer_borrowed,
                                const std::vector<MacroBufs>& mbufs);

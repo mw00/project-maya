@@ -1,3 +1,5 @@
+#include <fstream>
+#include <cstring>
 // src/ling/ling_main.cu - maya-ling CLI for Ling-3.2-air (bailingmoe3).
 #include "ling_model.hpp"
 
@@ -125,6 +127,115 @@ void print_mem(const std::vector<int>& gpus) {
 
 }  // namespace
 
+
+struct CliPic {
+    int64_t start = 0;
+    int width = 0, height = 0;
+    std::vector<uint8_t> rgb;
+};
+
+static bool read_mmi1_file(const std::string& path, std::vector<CliPic>& out, std::string& err) {
+    out.clear();
+    std::ifstream f(path, std::ios::binary);
+    char magic[4];
+    int32_t n = 0;
+    if (!f.read(magic, 4) || std::memcmp(magic, "MMI1", 4) != 0 || !f.read((char*) &n, 4) || n < 0 || n > 4096) {
+        err = path + ": invalid MMI1 picture file";
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        CliPic q;
+        int64_t st = 0;
+        int32_t wh[2] = {0, 0};
+        if (!f.read((char*) &st, 8) || !f.read((char*) wh, 8) || wh[0] <= 0 || wh[1] <= 0 ||
+            (int64_t) wh[0] * wh[1] > (1LL << 26)) {
+            err = path + ": truncated picture " + std::to_string(i);
+            return false;
+        }
+        q.start = st;
+        q.width = wh[0];
+        q.height = wh[1];
+        q.rgb.resize((size_t) wh[0] * (size_t) wh[1] * 3);
+        if (!f.read((char*) q.rgb.data(), (std::streamsize) q.rgb.size())) {
+            err = path + ": truncated pixel data for picture " + std::to_string(i);
+            return false;
+        }
+        out.push_back(std::move(q));
+    }
+    return true;
+}
+
+static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g, CliPic& out, std::string& err) {
+    // Fast native binary PPM (P6) reader; falls back to Python Pillow bicubic smart-resize for PNG/JPEG/WebP.
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        err = "cannot open image: " + path;
+        return false;
+    }
+    char m[2] = {};
+    f.read(m, 2);
+    if (m[0] == 'P' && m[1] == '6') {
+        auto next_tok = [&]() -> std::string {
+            std::string s;
+            char ch;
+            while (f.get(ch)) {
+                if (ch == '#') {
+                    while (f.get(ch) && ch != '\n') {}
+                } else if (!std::isspace((unsigned char) ch)) {
+                    s.push_back(ch);
+                    break;
+                }
+            }
+            while (f.get(ch) && !std::isspace((unsigned char) ch)) s.push_back(ch);
+            return s;
+        };
+        const int w = std::atoi(next_tok().c_str());
+        const int h = std::atoi(next_tok().c_str());
+        const int mv = std::atoi(next_tok().c_str());
+        if (w <= 0 || h <= 0 || mv != 255) {
+            err = path + ": invalid P6 PPM header";
+            return false;
+        }
+        out.width = w;
+        out.height = h;
+        out.rgb.resize((size_t) w * (size_t) h * 3);
+        if (!f.read((char*) out.rgb.data(), (std::streamsize) out.rgb.size())) {
+            err = path + ": truncated P6 PPM";
+            return false;
+        }
+        return true;
+    }
+    f.close();
+    const std::string tmp = "/tmp/ling_img_" + std::to_string((unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count()) + ".mmi1";
+    const char* py_code =
+        "import math,struct,sys; from PIL import Image,ImageOps; "
+        "im=ImageOps.exif_transpose(Image.open(sys.argv[1])); "
+        "bg=Image.new('RGB',im.size,(255,255,255)); "
+        "im=Image.alpha_composite(bg.convert('RGBA'),im.convert('RGBA')).convert('RGB') if im.mode in ('RGBA','LA','PA') else im.convert('RGB'); "
+        "h,w=im.height,im.width; f=int(sys.argv[3]); mn,mx=int(sys.argv[4]),int(sys.argv[5]); "
+        "rh=max(f,round(h/f)*f); rw=max(f,round(w/f)*f); "
+        "s=math.sqrt(mx/(h*w)) if rh*rw>mx else (math.sqrt(mn/(h*w)) if rh*rw<mn else 1.0); "
+        "rh=max(f,(math.floor(h*s/f) if rh*rw>mx else math.ceil(h*s/f))*f) if s!=1.0 else rh; "
+        "rw=max(f,(math.floor(w*s/f) if rh*rw>mx else math.ceil(w*s/f))*f) if s!=1.0 else rw; "
+        "im=im.resize((rw,rh),Image.BICUBIC) if (rw,rh)!=im.size else im; "
+        "open(sys.argv[2],'wb').write(struct.pack('<4siqii',b'MMI1',1,0,rw,rh)+im.tobytes())";
+    const char* py_exe = std::getenv("LING_PYTHON");
+    std::string cmd = std::string(py_exe && *py_exe ? py_exe : "python3") + " -c \"" + py_code + "\" \"" + path +
+                      "\" \"" + tmp + "\" " + std::to_string(g.factor()) + " " + std::to_string(g.min_pixels) + " " +
+                      std::to_string(g.max_pixels);
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+        err = "image decode failed (install Pillow or pass a factor-32 P6 PPM / MMI1 file)";
+        return false;
+    }
+    std::vector<CliPic> pics;
+    const bool ok = read_mmi1_file(tmp, pics, err);
+    std::remove(tmp.c_str());
+    if (!ok || pics.empty()) return false;
+    out = std::move(pics[0]);
+    return true;
+}
+
 int main(int argc, char** argv) {
     std::string gguf, ids_file, prompt, tok_bin = "llama-tokenize";
     ling::Options opt;
@@ -135,6 +246,7 @@ int main(int argc, char** argv) {
     bool print_text = false, no_stop = false, mtp_check = false;
     int spec_k = 0;           // 0=off, 1..3=fixed max drafts, -1=auto
     float draft_floor = 0.50f;
+    std::string mmi1_file, image_file, vision_dump_emb;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -188,6 +300,14 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--draft-floor") {
             draft_floor = (float) std::atof(val("--draft-floor").c_str());
+        } else if (a == "--mmproj") {
+            opt.mmproj_path = val("--mmproj");
+        } else if (a == "--mmi1") {
+            mmi1_file = val("--mmi1");
+        } else if (a == "--image") {
+            image_file = val("--image");
+        } else if (a == "--vision-dump-emb") {
+            vision_dump_emb = val("--vision-dump-emb");
         } else if (a == "--temp") temp = (float) std::atof(val("--temp").c_str());
         else if (a == "--top-k") top_k = std::atoi(val("--top-k").c_str());
         else if (a == "--top-p") top_p = (float) std::atof(val("--top-p").c_str());
@@ -197,14 +317,15 @@ int main(int argc, char** argv) {
         else throw std::runtime_error("unknown argument " + a);
     }
 
-    if (gguf.empty() || (ids_file.empty() && prompt.empty())) {
+    if (gguf.empty() || (ids_file.empty() && prompt.empty() && vision_dump_emb.empty())) {
         std::fprintf(stderr,
                      "maya-ling --gguf MODEL.gguf [--prompt-ids ids.txt | --prompt text [--tokenize-bin PATH]]\n"
                      "          [--n-predict N] [--ctx N] [--prefill-chunk N] [--prefill-block N] [--no-ep] [--gpus 0[,1]]\n"
                      "          [--offload auto|gpu|mix|cpu] [--mix-k-gpu N] [--kv fp16|q8]\n"
                      "          [--expert-vram-gib F] [--pin-ram-gib F] [--no-graph] [--no-cache-warm]\n"
                      "          [--temp F] [--top-k N] [--top-p F] [--seed N] [--print-text] [--no-stop]\n"
-                     "          [--mtp] [--mtp-check] [--spec-k 0|1|2|3|auto] [--draft-floor F] [--cpu-threads N]\n");
+                     "          [--mtp] [--mtp-check] [--spec-k 0|1|2|3|auto] [--draft-floor F] [--cpu-threads N]\n"
+                     "          [--mmproj PATH] [--image PATH | --mmi1 PATH] [--vision-dump-emb PATH]\n");
         return 1;
     }
 
@@ -218,7 +339,84 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\nload: %.2f s\n", model.info().c_str(), load_s);
         print_mem(opt.gpus);
 
+        if (!vision_dump_emb.empty()) {
+            const ling::VisionGeo* vg = model.vision();
+            if (!vg) throw std::runtime_error("--vision-dump-emb requires --mmproj PATH");
+            CliPic pic;
+            std::string verr;
+            if (!mmi1_file.empty()) {
+                std::vector<CliPic> vp;
+                if (!read_mmi1_file(mmi1_file, vp, verr) || vp.empty()) throw std::runtime_error(verr);
+                pic = std::move(vp[0]);
+            } else if (!image_file.empty()) {
+                if (!read_ppm_or_image(image_file, *vg, pic, verr)) throw std::runtime_error(verr);
+            } else {
+                throw std::runtime_error("--vision-dump-emb requires --image or --mmi1");
+            }
+            std::vector<float> rows;
+            const auto tv0 = std::chrono::steady_clock::now();
+            if (!model.encode_image(pic.rgb.data(), pic.width, pic.height, rows, verr)) throw std::runtime_error(verr);
+            const double vms = std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0).count() * 1e3;
+            std::ofstream of(vision_dump_emb, std::ios::binary);
+            of.write((const char*) rows.data(), (std::streamsize) (rows.size() * sizeof(float)));
+            std::fprintf(stderr, "vision: %dx%d -> %zu tokens (%zu floats) in %.1f ms (room=%s)\n",
+                         pic.width, pic.height, rows.size() / (size_t) model.cfg().n_embd, rows.size(), vms,
+                         model.vision_room());
+            return 0;
+        }
+
         std::vector<int> ids = !ids_file.empty() ? read_ids(ids_file) : tokenize(tok_bin, gguf, prompt);
+
+        if (!mmi1_file.empty() || !image_file.empty()) {
+            const ling::VisionGeo* vg = model.vision();
+            if (!vg) throw std::runtime_error("--image / --mmi1 requires --mmproj PATH");
+            std::vector<CliPic> pics;
+            std::string verr;
+            if (!mmi1_file.empty()) {
+                if (!read_mmi1_file(mmi1_file, pics, verr)) throw std::runtime_error(verr);
+            } else {
+                CliPic pic;
+                if (!read_ppm_or_image(image_file, *vg, pic, verr)) throw std::runtime_error(verr);
+                // Expand single <|image_pad|> placeholder in ids if present; otherwise insert <|vision_start|>...<|vision_end|> before user text
+                const int ntok = vg->tokens(pic.width, pic.height);
+                std::vector<int> expanded;
+                bool found = false;
+                for (size_t k = 0; k < ids.size(); ++k) {
+                    if (!found && ids[k] == vg->image_token) {
+                        pic.start = (int64_t) expanded.size();
+                        for (int j = 0; j < ntok; ++j) expanded.push_back(vg->image_token);
+                        found = true;
+                    } else {
+                        expanded.push_back(ids[k]);
+                    }
+                }
+                if (!found) {
+                    // Wrap with standard Ling chat template if raw prompt was passed
+                    expanded.clear();
+                    expanded.push_back(vg->image_start);
+                    pic.start = (int64_t) expanded.size();
+                    for (int j = 0; j < ntok; ++j) expanded.push_back(vg->image_token);
+                    expanded.push_back(vg->image_end);
+                    expanded.insert(expanded.end(), ids.begin(), ids.end());
+                }
+                ids = std::move(expanded);
+                pics.push_back(std::move(pic));
+            }
+            std::vector<ling::Model::Image> mimgs;
+            for (const auto& q : pics) {
+                ling::Model::Image im;
+                im.start = q.start;
+                im.width = q.width;
+                im.height = q.height;
+                const auto tv0 = std::chrono::steady_clock::now();
+                if (!model.encode_image(q.rgb.data(), q.width, q.height, im.rows, verr)) throw std::runtime_error(verr);
+                const double vms = std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0).count() * 1e3;
+                std::fprintf(stderr, "vision: %dx%d (%zu tok) encoded in %.1f ms (room=%s)\n",
+                             q.width, q.height, im.rows.size() / (size_t) model.cfg().n_embd, vms, model.vision_room());
+                mimgs.push_back(std::move(im));
+            }
+            model.set_images(std::move(mimgs));
+        }
         if (ids.empty()) throw std::runtime_error("empty prompt");
         if ((int) ids.size() + n_predict > opt.ctx) throw std::runtime_error("sequence does not fit --ctx");
 

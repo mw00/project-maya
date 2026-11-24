@@ -658,7 +658,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
             gp.d_top_pair = (float*) dev_alloc(gp, 2 * sizeof(float));
             gp.h_top_pair = (float*) host_alloc(gp, 2 * sizeof(float));
         }
-        gp.d_step = (int*) dev_alloc(gp, 3 * sizeof(int));
+        gp.d_step = (int*) dev_alloc(gp, 4 * sizeof(int));
         gp.d_iota = (int*) dev_alloc(gp, (size_t) o_.ctx * sizeof(int));
         k::fill_iota(gp.d_iota, o_.ctx, gp.s);
         k::mla_dec_wmma_init();
@@ -971,6 +971,14 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
                             : active_offload_ == OffloadMode::kMix ? "gpu-cache+cpu-lane"
                                                                    : "vram+cpu-lane";
     size_t vram_sum = std::accumulate(gpu_vram_used.begin(), gpu_vram_used.end(), size_t(0));
+    if (!o_.mmproj_path.empty()) {
+        vision_ = std::make_unique<VisionTower>();
+        std::string verr;
+        if (!vision_->load(o_.mmproj_path, gpus_[0].dev, verr)) {
+            throw std::runtime_error(verr);
+        }
+    }
+
     char buf[1024];
     std::snprintf(buf, sizeof buf,
                   "bailingmoe3: n_embd %d, layers %d (+%d MTP %s; %d KDA / %d MLA), vocab %d, ctx %d (%s KV)\n"
@@ -1023,6 +1031,7 @@ Model::~Model() {
 
     for (auto& gp : gpus_) {
         set_dev(gp.dev);
+        if (gp.d_mrope_pos != nullptr) cudaFree(gp.d_mrope_pos);
         for (void* p : gp.dev_allocs) cudaFree(p);
         for (void* p : gp.host_allocs) cudaFreeHost(p);
         for (int b = 0; b < 2; ++b) {
@@ -1057,6 +1066,8 @@ void Model::reset() {
     }
     mtp_done_ = 0;
     mtp_tokens_.clear();
+    rope_delta_ = 0;
+    images_.clear();
     for (auto& gp : gpus_) {
         set_dev(gp.dev);
         CK(cudaStreamSynchronize(gp.s));
@@ -1183,12 +1194,12 @@ void Model::mla_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x) {
     j[2] = mk(l.wgate, gp.gate);
     if (!iq::mv(j, 3, s)) throw std::runtime_error("mla: type not supported");
 
-    k::mla_q_prep(gp.qm, 1, H, c.qk_head, c.qk_nope, R, gp.d_step + 1, 0, c.rope_base, gp.q8n, gp.d8n, nullptr, s);
+    k::mla_q_prep(gp.qm, 1, H, c.qk_head, c.qk_nope, R, gp.d_step + 1, 0, c.rope_base, gp.q8n, gp.d8n, nullptr, s, gp.d_step + 3);
     iq::MvJob kb{l.wkb.p, l.wkb.ld, l.wkb.type, c.qk_nope, KL, 1, gp.q8n, gp.d8n, gp.q_abs, (size_t) KL, nullptr, 1.0f};
     if (!iq::mv_heads(kb, H, (size_t) KL * l.wkb.ld, (size_t) c.qk_nope, (size_t) (c.qk_nope / 32), (size_t) KL, s))
         throw std::runtime_error("mla: k_b type not supported");
 
-    k::kv_store_split(gp.kvall, 1, KL, R, l.kv_a_norm, c.eps, gp.d_step + 1, 0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s);
+    k::kv_store_split(gp.kvall, 1, KL, R, l.kv_a_norm, c.eps, gp.d_step + 1, 0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s, gp.d_step + 3);
 
     if (!k::mla_dec_wmma(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, o_.ctx,
                          gp.d_step + 2, 1, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s)) {
@@ -1510,7 +1521,7 @@ const float* Model::step(int token, int pos) {
     for (int gi = 0; gi < ngpu; ++gi) {
         Gpu& gp = gpus_[(size_t) gi];
         set_dev(gp.dev);
-        k::set_step(gp.d_step, token, pos, pos + 1, gp.s);
+        k::set_step(gp.d_step, token, pos, pos + 1, rope_delta_, gp.s);
         if (gi > 0) transfer_x(gi - 1, gi, 1, false);
 
         if (graph_ok) {
@@ -1592,7 +1603,8 @@ void Model::kda_prefill(Gpu& gp, Layer& l, int T, float* x_io) {
     hy::add(x_io, gp.pf_out, (size_t) T * E, s);
 }
 
-void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io) {
+void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io, const int* mrope_pos, int mrope_stride) {
+    const int mhw = vision_ ? (vision_->geo().mrope_section[1] + vision_->geo().mrope_section[2]) : 24;
     const Config& c = c_;
     const int E = c.n_embd, H = c.n_head, KL = c.kv_lora, R = c.n_rot;
     const int QN = c.qk_nope, VH = c.v_head;
@@ -1630,7 +1642,7 @@ void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io) {
         gemm_mat(gp, l.wkva, gp.pf_x16, T, pf_kvall);
         gemm_mat(gp, l.wgate, gp.pf_x16, T, pf_gate);
 
-        k::mla_q_prep(pf_qm, T, H, c.qk_head, QN, R, nullptr, pos0, c.rope_base, nullptr, nullptr, pf_qm16, s);
+        k::mla_q_prep(pf_qm, T, H, c.qk_head, QN, R, nullptr, pos0, c.rope_base, nullptr, nullptr, pf_qm16, s, nullptr, mrope_pos, mhw, mrope_stride);
 
         if (!iq::f16_rows(l.wkb.type, l.wkb.p, QN, KL * H, gp.pf_w16, QN, s))
             throw std::runtime_error("mla prefill: k_b f16_rows failed");
@@ -1641,7 +1653,7 @@ void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io) {
                                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 
         k::kv_store_split(pf_kvall, T, KL, R, l.kv_a_norm, c.eps, nullptr, pos0, c.rope_base, l.lat, o_.kv_q8, l.k_pe,
-                          s);
+                          s, nullptr, mrope_pos, mhw, mrope_stride);
 
         glmd::MlaPrompt mp;
         mp.q_abs = pf_qabs;
@@ -1717,8 +1729,8 @@ void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io) {
     gemm_mat(gp, l.wkva, gp.pf_x16, T, pf_kvall);
     gemm_mat(gp, l.wgate, gp.pf_x16, T, pf_gate);
 
-    k::mla_q_split_rope_f16(pf_qm, T, H, c.qk_head, QN, R, pos0, c.rope_base, q_nope16, q_pe16, s);
-    k::kv_store_split(pf_kvall, T, KL, R, l.kv_a_norm, c.eps, nullptr, pos0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s);
+    k::mla_q_split_rope_f16(pf_qm, T, H, c.qk_head, QN, R, pos0, c.rope_base, q_nope16, q_pe16, s, mrope_pos, mhw, mrope_stride);
+    k::kv_store_split(pf_kvall, T, KL, R, l.kv_a_norm, c.eps, nullptr, pos0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s, nullptr, mrope_pos, mhw, mrope_stride);
 
     if (!iq::f16_rows(l.wkb.type, l.wkb.p, QN, KL * H, wkb16, QN, s))
         throw std::runtime_error("mla prefill: k_b f16_rows failed");
@@ -2370,6 +2382,62 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
     const int E = c.n_embd, NU = c.n_used, NE = c.n_expert, ngpu = (int) gpus_.size();
     const int P = gpus_[0].pf_cap;
 
+    // Build 3D M-RoPE position table [3][n] if this prompt has multimodal images (body-diagonal symmetry).
+    bool use_mrope = false;
+    if (!images_.empty() || rope_delta_ != 0) {
+        use_mrope = true;
+        std::vector<int> h_mrope((size_t) 3 * (size_t) n, 0);
+        int st_idx = pos0 + rope_delta_;
+        const int merge_f = vision_ ? vision_->geo().factor() : 32;
+        int i = 0;
+        while (i < n) {
+            const int64_t gpos = (int64_t) pos0 + i;
+            const Image* hit = nullptr;
+            for (const auto& im : images_) {
+                if (im.start == gpos && !im.rows.empty()) {
+                    hit = &im;
+                    break;
+                }
+            }
+            if (hit != nullptr) {
+                const int gh = hit->height / merge_f;
+                const int gw = hit->width / merge_f;
+                const int ntok = gh * gw;
+                const int t_idx = st_idx;
+                for (int r = 0; r < gh; ++r) {
+                    for (int col = 0; col < gw; ++col) {
+                        const int k = r * gw + col;
+                        if (i + k < n) {
+                            h_mrope[(size_t) (i + k)] = t_idx;
+                            h_mrope[(size_t) n + (size_t) (i + k)] = r - (gh - 1) / 2 + t_idx;
+                            h_mrope[(size_t) 2 * (size_t) n + (size_t) (i + k)] = col - (gw - 1) / 2 + t_idx;
+                        }
+                    }
+                }
+                st_idx = t_idx + 1;
+                i += std::max(1, ntok);
+            } else {
+                h_mrope[(size_t) i] = st_idx;
+                h_mrope[(size_t) n + (size_t) i] = st_idx;
+                h_mrope[(size_t) 2 * (size_t) n + (size_t) i] = st_idx;
+                ++st_idx;
+                ++i;
+            }
+        }
+        rope_delta_ = st_idx - (pos0 + n);
+        for (int gi = 0; gi < ngpu; ++gi) {
+            Gpu& gp = gpus_[(size_t) gi];
+            set_dev(gp.dev);
+            if (gp.mrope_cap < n) {
+                if (gp.d_mrope_pos != nullptr) CK(cudaFree(gp.d_mrope_pos));
+                CK(cudaMalloc(&gp.d_mrope_pos, (size_t) 3 * (size_t) n * sizeof(int)));
+                gp.mrope_cap = n;
+            }
+            CK(cudaMemcpyAsync(gp.d_mrope_pos, h_mrope.data(), (size_t) 3 * (size_t) n * sizeof(int),
+                               cudaMemcpyHostToDevice, gp.s));
+        }
+    }
+
     bool any_offloaded = false;
     for (int il = c.n_dense_lead; il < c.n_layers; ++il) {
         if (layers_[(size_t) il].n_res < NE && layers_[(size_t) il].host_blobs != nullptr) {
@@ -2481,6 +2549,20 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
                 if (!k::emb_rows(emb_.p, emb_.type, emb_.k, gp.pf_tok_ids, T, x_buf + (size_t) t0 * E, gp.s))
                     throw std::runtime_error("prefill: emb_rows failed");
             }
+            if (!images_.empty()) {
+                for (const auto& im : images_) {
+                    const int64_t ntok = (int64_t) (im.rows.size() / (size_t) E);
+                    const int64_t a0 = std::max<int64_t>(im.start, (int64_t) cp0);
+                    const int64_t a1 = std::min<int64_t>(im.start + ntok, (int64_t) (cp0 + B));
+                    if (a1 > a0) {
+                        const int64_t dst_off = a0 - (int64_t) cp0;
+                        const int64_t src_off = a0 - im.start;
+                        CK(cudaMemcpyAsync(x_buf + (size_t) dst_off * E, im.rows.data() + (size_t) src_off * E,
+                                           (size_t) (a1 - a0) * (size_t) E * sizeof(float), cudaMemcpyHostToDevice,
+                                           gp.s));
+                    }
+                }
+            }
         }
         for (int il = gp.l0; il < gp.l1; ++il) {
             Layer& l = layers_[(size_t) il];
@@ -2490,7 +2572,7 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
                 float* x_t = x_buf + (size_t) t0 * E;
                 hy::rmsnorm(x_t, (size_t) E, T, E, l.attn_norm, c.eps, gp.pf_cur, (size_t) E, gp.s);
                 if (l.kda) kda_prefill(gp, l, T, x_t);
-                else mla_prefill(gp, l, T, cp0 + t0, x_t);
+                else mla_prefill(gp, l, T, cp0 + t0, x_t, use_mrope ? (gp.d_mrope_pos + (cp0 - pos0) + t0) : nullptr, use_mrope ? n : 0);
             }
             if (il < c.n_dense_lead) {
                 for (int t0 = 0; t0 < B; t0 += P) {
@@ -2763,12 +2845,12 @@ void Model::mla_decode_win(Gpu& gp, Layer& l, int il, int W, bool add_to_x) {
     };
     if (!iq::mv(j, 3, s)) throw std::runtime_error("mla_win: type not supported");
 
-    k::mla_q_prep(gp.qm, W, H, c.qk_head, c.qk_nope, R, gp.d_pos_win, 0, c.rope_base, gp.q8n, gp.d8n, nullptr, s);
+    k::mla_q_prep(gp.qm, W, H, c.qk_head, c.qk_nope, R, gp.d_pos_win, 0, c.rope_base, gp.q8n, gp.d8n, nullptr, s, gp.d_step + 3);
     iq::MvJob kb{l.wkb.p, l.wkb.ld, l.wkb.type, c.qk_nope, KL, W, gp.q8n, gp.d8n, gp.q_abs, (size_t) H * KL, nullptr, 1.0f};
     if (!iq::mv_heads(kb, H, (size_t) KL * l.wkb.ld, (size_t) W * c.qk_nope, (size_t) W * (c.qk_nope / 32), (size_t) KL, s))
         throw std::runtime_error("mla_win: k_b type not supported");
 
-    k::kv_store_split(gp.kvall, W, KL, R, l.kv_a_norm, c.eps, gp.d_pos_win, 0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s);
+    k::kv_store_split(gp.kvall, W, KL, R, l.kv_a_norm, c.eps, gp.d_pos_win, 0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s, gp.d_step + 3);
 
     if (!k::mla_dec_wmma(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, o_.ctx,
                          gp.d_step + 2, W, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s))
@@ -3043,7 +3125,7 @@ const float* Model::step_window(const int* tokens, int W, int pos0) {
         Gpu& gp = gpus_[(size_t) gi];
         set_dev(gp.dev);
         k::set_step_win(gp.d_step, gp.d_tok_win, gp.d_pos_win, tokens[0], W > 1 ? tokens[1] : 0,
-                        W > 2 ? tokens[2] : 0, W > 3 ? tokens[3] : 0, W, pos0, gp.s);
+                        W > 2 ? tokens[2] : 0, W > 3 ? tokens[3] : 0, W, pos0, rope_delta_, gp.s);
         if (gi > 0) transfer_x(gi - 1, gi, W, false);
 
         if (graph_ok) {
@@ -3157,7 +3239,7 @@ const float* Model::mtp_step(const float* h_nextn_dev, int next_token, int pos) 
     Gpu& gl = gpus_.back();
 
     set_dev(g0.dev);
-    k::set_step(g0.d_step, next_token, pos, pos + 1, g0.s);
+    k::set_step(g0.d_step, next_token, pos, pos + 1, rope_delta_, g0.s);
     if (!k::emb_rows(emb_.p, emb_.type, emb_.k, g0.d_step, 1, g0.dev == gl.dev ? mtp_.emb_buf : g0.out, g0.s))
         throw std::runtime_error("mtp: emb_rows failed");
     if (g0.dev != gl.dev) {
@@ -3166,7 +3248,7 @@ const float* Model::mtp_step(const float* h_nextn_dev, int next_token, int pos) 
         set_dev(gl.dev);
     }
 
-    k::set_step(gl.d_step, next_token, pos, pos + 1, gl.s);
+    k::set_step(gl.d_step, next_token, pos, pos + 1, rope_delta_, gl.s);
 
     k::concat_norm_eh(mtp_.emb_buf, mtp_.enorm, h_nextn_dev, mtp_.hnorm, c.eps, E, nullptr, mtp_.eh_q, mtp_.eh_d, gl.s);
     iq::MvJob eh{mtp_.eh_proj.p, mtp_.eh_proj.ld, mtp_.eh_proj.type, 2 * E, E, 1, mtp_.eh_q, mtp_.eh_d, gl.x,
@@ -3223,6 +3305,100 @@ std::string Model::detokenize(const std::vector<int>& ids) const {
     std::string out;
     for (int id : ids) out += detokenize_one(id);
     return out;
+}
+
+
+// ------------------------------ Vision (lent-VRAM arena, zero permanent VRAM) ------------------------------
+
+const char* Model::vision_room() const {
+    if (!vision_ || !vision_->loaded()) return "none";
+    const Gpu& g0 = gpus_[0];
+    if (g0.vram_pool != nullptr && g0.vram_pool_bytes >= vision_->max_room_bytes()) return "tail";
+    return "free";
+}
+
+void Model::set_images(std::vector<Image> imgs) {
+    images_ = std::move(imgs);
+}
+
+bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& out_rows, std::string& err) {
+    if (!vision_ || !vision_->loaded()) {
+        err = "vision tower not loaded (pass --mmproj PATH)";
+        return false;
+    }
+    Gpu& g0 = gpus_[0];
+    set_dev(g0.dev);
+    CK(cudaStreamSynchronize(g0.s));
+    CK(cudaStreamSynchronize(g0.s_copy));
+
+    const size_t need = vision_->room_of(width, height);
+    uint8_t* lent = nullptr;
+    size_t lent_bytes = 0;
+    size_t cut = g0.vram_pool_bytes;
+    struct RestoreLayer {
+        Layer* l;
+        std::vector<int> owners;
+        int sl_first;
+    };
+    std::vector<RestoreLayer> to_restore;
+
+    if (g0.vram_pool != nullptr && g0.vram_pool_bytes >= need) {
+        cut = g0.vram_pool_bytes - need;
+        bool can_lend = true;
+        for (int il = std::max(g0.l0, c_.n_dense_lead); il < g0.l1; ++il) {
+            Layer& l = layers_[(size_t) il];
+            if (l.n_res <= 0) continue;
+            const size_t end_off = l.vram_pool_off + (size_t) l.n_res * l.blob;
+            if (end_off <= cut) continue;
+            if (l.host_blobs == nullptr) {
+                can_lend = false;
+                break;
+            }
+            const int sl_first = l.vram_pool_off >= cut ? 0 : (int) ((cut - l.vram_pool_off) / l.blob);
+            RestoreLayer rl{&l, std::vector<int>((size_t) l.n_res, -1), sl_first};
+            CK(cudaMemcpy(rl.owners.data(), l.fl.owner, (size_t) l.n_res * sizeof(int), cudaMemcpyDeviceToHost));
+            to_restore.push_back(std::move(rl));
+        }
+        if (can_lend && mtp_loaded_ && gpus_.size() == 1 && mtp_.layer.n_res > 0) {
+            Layer& ml = mtp_.layer;
+            const size_t end_off = ml.vram_pool_off + (size_t) ml.n_res * ml.blob;
+            if (end_off > cut) {
+                if (ml.host_blobs == nullptr) {
+                    can_lend = false;
+                } else {
+                    const int sl_first = ml.vram_pool_off >= cut ? 0 : (int) ((cut - ml.vram_pool_off) / ml.blob);
+                    RestoreLayer rl{&ml, std::vector<int>((size_t) ml.n_res, -1), sl_first};
+                    CK(cudaMemcpy(rl.owners.data(), ml.fl.owner, (size_t) ml.n_res * sizeof(int), cudaMemcpyDeviceToHost));
+                    to_restore.push_back(std::move(rl));
+                }
+            }
+        }
+        if (can_lend) {
+            lent = g0.vram_pool + cut;
+            lent_bytes = need;
+        } else {
+            to_restore.clear();
+        }
+    }
+
+    const bool ok = vision_->encode(rgb, width, height, out_rows, err, lent, lent_bytes);
+
+    // Restore every borrowed resident expert slot from host_blobs before any subsequent prefill/decode
+    if (lent != nullptr && !to_restore.empty()) {
+        set_dev(g0.dev);
+        for (const auto& rl : to_restore) {
+            Layer& l = *rl.l;
+            for (int sl = rl.sl_first; sl < l.n_res; ++sl) {
+                const int e = rl.owners[(size_t) sl];
+                if (e >= 0 && e < c_.n_expert) {
+                    CK(cudaMemcpyAsync(l.fl.vram + (size_t) sl * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob,
+                                       cudaMemcpyHostToDevice, g0.s));
+                }
+            }
+        }
+        CK(cudaStreamSynchronize(g0.s));
+    }
+    return ok;
 }
 
 }  // namespace ling

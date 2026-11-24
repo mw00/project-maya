@@ -1064,7 +1064,7 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     # Ling-3.2-air (llama.cpp's bailingmoe3): its own engine (src/ling) on maya-ds4's ggml block-type GEMVs
     # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; NVIDIA only
     if(MAYA_ENABLE_CUDA)
-      add_executable(maya-ling src/ling/ling_main.cu src/ling/ling_model.cu src/ling/ling_kernels.cu
+      add_executable(maya-ling src/ling/ling_main.cu src/ling/ling_model.cu src/ling/ling_kernels.cu src/ling/ling_vision.cu
                                src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp
                                src/kernels/cuda/glmd_dec.cu src/kernels/cuda/glmd_batch.cu
                                src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
