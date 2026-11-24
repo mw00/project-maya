@@ -62,10 +62,11 @@ static void test_default_and_row_halves_multithreaded(int ne, int n_ff, int T, b
     };
 
     const int n_threads = std::min(T, 8);
-    std::vector<std::thread> th;
     if (!row_halves) {
         const int tot = ne * n_ff;
         std::atomic<int> next_job{0};
+        std::vector<std::thread> th;
+        th.reserve((size_t) n_threads);
         for (int w = 0; w < n_threads; ++w) {
             th.emplace_back([&] {
                 for (;;) {
@@ -84,6 +85,7 @@ static void test_default_and_row_halves_multithreaded(int ne, int n_ff, int T, b
                 }
             });
         }
+        for (auto& t : th) t.join();
     } else {
         const int J = std::max(1, T / 2);
         const int half = n_ff / 2;
@@ -91,6 +93,8 @@ static void test_default_and_row_halves_multithreaded(int ne, int n_ff, int T, b
         std::atomic<int> qp[2];
         qp[0].store(0, std::memory_order_relaxed);
         qp[1].store(0, std::memory_order_relaxed);
+        std::vector<std::thread> th;
+        th.reserve((size_t) n_threads);
         for (int w = 0; w < n_threads; ++w) {
             th.emplace_back([&, w] {
                 const int me = w & 1;
@@ -114,8 +118,8 @@ static void test_default_and_row_halves_multithreaded(int ne, int n_ff, int T, b
                 }
             });
         }
+        for (auto& t : th) t.join();
     }
-    for (auto& t : th) t.join();
 
     for (size_t idx = 0; idx < calls.size(); ++idx) {
         assert(calls[idx].load() == 1);
