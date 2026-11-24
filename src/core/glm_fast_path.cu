@@ -27,6 +27,8 @@
 #include "maya/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
 #include "maya/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
 #include "maya/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_lane_par_hq.hpp"
 #include "maya/kernels/glmd_graph.hpp"   // glm-dsa B15.6
 #include "maya/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
 #include "maya/core/glm_mtp_state.hpp"   // glm-dsa B15.3
@@ -3094,6 +3096,20 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
     for (int i = 1; rh0 != nullptr && i < ne; ++i)
         if (const RowHalves* rh = row_halves_of(blob[i]); rh == nullptr || rh->n0 != rh0->n0 || rh->n1 != rh0->n1)
             rh0 = nullptr;
+    static const bool par_hq_env = maya::glmenv::env_flag("MAYA_GLM_LANE_PAR_HQ", false);
+    const bool par_hq = par_hq_env && maya::core::glmlane::ParHqTracker::eligible(ne, n_ff, nf.h_bytes);
+    maya::core::glmlane::ParHqTracker hq_tracker;
+    kc::NativeFmt nf_b = nf;
+    size_t hb_step = 0;
+    if (par_hq) {
+        nf_b.n_ff = maya::core::glmlane::ParHqTracker::kBlockSize;
+        hb_step = nf.h_bytes / (size_t) (n_ff / maya::core::glmlane::ParHqTracker::kBlockSize);
+        hq_tracker.reset(ne, n_ff);
+    }
+    const auto quant_block = [&](int ei, int b) {
+        kc::native_quant_h(nf_b, ff + (size_t) ei * n_ff + (size_t) b * maya::core::glmlane::ParHqTracker::kBlockSize,
+                           hq + (size_t) ei * kc::kNativeHBytes + (size_t) b * hb_step);
+    };
     if (rh0 != nullptr) {
         const int J = std::max(1, T / 2);   // jobs a node and phase
         const int n0 = rh0->n0;
@@ -3124,21 +3140,28 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             const void* a[1] = {act};
             float* o[1] = {ff + (size_t) i * n_ff};
             kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
+            if (par_hq) hq_tracker.mark_rows(i, r0, r1, quant_block);
         });
         mark(2);
-        for (int i = 0; i < ne; ++i)
-            kc::native_quant_h(nf, ff + (size_t) i * n_ff, hq + (size_t) i * kc::kNativeHBytes);
+        if (!par_hq) {
+            for (int i = 0; i < ne; ++i)
+                kc::native_quant_h(nf, ff + (size_t) i * n_ff, hq + (size_t) i * kc::kNativeHBytes);
+        }
         mark(3);
         phase(n_embd, [&](int i, int r0, int r1) {
             const void* h[1] = {hq + (size_t) i * kc::kNativeHBytes};
-            float* o[1] = {dn + (size_t) i * n_embd};
+            float* dst = dn + (size_t) i * n_embd;
+            float* o[1] = {dst};
             kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+            if (par_hq && ne == 1) maya::core::glmlane::scale_single_rows(out, dst, w[0], r0, r1);
         });
         mark(4);
-        for (int r = 0; r < n_embd; ++r) {
-            float m = 0.0f;
-            for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
-            out[r] = m;
+        if (!par_hq || ne > 1) {
+            for (int r = 0; r < n_embd; ++r) {
+                float m = 0.0f;
+                for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
+                out[r] = m;
+            }
         }
         mark(5);
         if (lprof) g_lane_prof.add(ne, lt);
@@ -3152,12 +3175,15 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             const int i = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
             float* o[1] = {ff + (size_t) i * n_ff};
             kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
+            if (par_hq) hq_tracker.mark_rows(i, r0, r1, quant_block);
             q += r1 - r0;
         }
     });
     mark(2);
-    for (int i = 0; i < ne; ++i)
-        kc::native_quant_h(nf, ff + (size_t) i * n_ff, hq + (size_t) i * kc::kNativeHBytes);
+    if (!par_hq) {
+        for (int i = 0; i < ne; ++i)
+            kc::native_quant_h(nf, ff + (size_t) i * n_ff, hq + (size_t) i * kc::kNativeHBytes);
+    }
     mark(3);
     const int dn_tot = ne * n_embd;
     pool.run(T, [&](int job) {
@@ -3165,16 +3191,20 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
             const void* h[1] = {hq + (size_t) i * kc::kNativeHBytes};
-            float* o[1] = {dn + (size_t) i * n_embd};
+            float* dst = dn + (size_t) i * n_embd;
+            float* o[1] = {dst};
             kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+            if (par_hq && ne == 1) maya::core::glmlane::scale_single_rows(out, dst, w[0], r0, r1);
             q += r1 - r0;
         }
     });
     mark(4);
-    for (int r = 0; r < n_embd; ++r) {
-        float m = 0.0f;
-        for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
-        out[r] = m;
+    if (!par_hq || ne > 1) {
+        for (int r = 0; r < n_embd; ++r) {
+            float m = 0.0f;
+            for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
+            out[r] = m;
+        }
     }
     mark(5);
     if (lprof) g_lane_prof.add(ne, lt);
