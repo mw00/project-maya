@@ -1,6 +1,7 @@
 // src/core/glm_tier_numa.cu - the glm-dsa port B8.2 / B8.3 / B8.4 / B8.7: the memory tiers at run time (see
 // glm_tier_numa.hpp).  Host code plus two small copy kernels; nothing here runs unless its feature is on.
 #include "maya/core/glm_env.hpp"
+#include "maya/core/glm_numa_diag.hpp"
 #include "maya/core/glm_req_knobs.hpp"   // speed plan: per-request prefetch_blocks / cpu_split
 #include "glm_tier_numa.hpp"
 
@@ -699,12 +700,20 @@ bool lane_pools(Glm5Model::FastState& F, const Glm5Geometry& g, int n_parts, int
     const std::vector<int> nodes = online_nodes();
     const bool split = T != nullptr && T->split_any();
     const char* shv = getenv("MAYA_GLM_CPU_SHARED");
-    const LanePool mode = lane_pool_mode(n_parts, own_count, shv, split, (int) nodes.size(),
-                                         g.arch == GlmArch::GlmDsa);
+    const bool dsa = g.arch == GlmArch::GlmDsa;
+    const LanePool mode = lane_pool_mode(n_parts, own_count, shv, split, (int) nodes.size(), dsa);
     if (T != nullptr) T->mode = mode;
     if (n_parts >= 2 || split)
         std::fprintf(stderr, "glm tier: CUDA%d CPU lane pool mode: %s (MAYA_GLM_CPU_SHARED=%s, %d part(s), %zu NUMA node(s))\n",
                      dev, lane_pool_name(mode), shv != nullptr ? shv : "unset", n_parts, nodes.size());
+    if (maya::core::glmnuma::shared_socket_fallback_on_flash(dsa, n_parts, own_count, shv)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "glm tier: WARNING - MAYA_GLM_CPU_SHARED=socket is only supported on GLM-DSA; "
+                                 "on GLM-5.3-Flash it falls back to per-part pools (unset or set MAYA_GLM_CPU_SHARED=1 "
+                                 "for one shared pool)\n");
+        }
+    }
     if (mode != LanePool::Socket && mode != LanePool::NodeSplit) return false;
     const auto per_node = [&](int node) {
         if (const int t = env_int("MAYA_GLM_NUMA_LANE_THREADS", 0); t > 0) return std::min(64, t);
