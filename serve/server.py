@@ -7491,6 +7491,21 @@ def apply_server_env(cfg: dict) -> None:
     Server.request_queue_size = _backlog()
 
 
+def ds4_one_gpu_switch_note(cfg: dict, env: dict) -> str | None:
+    """DS4_STREAM_WIN / DS4_LAND are the one-GPU decode path's switches, and that path is NVIDIA's (v1.1.27's stays on
+    other cards).  Set by hand for DeepSeek on one AMD GPU they forced it on a card the path was not made for: decode 19
+    -> 2 tok/s and a stalled answer (#1120).  The text to print at start for that case, else None.  Message only."""
+    if models.family(cfg) != "deepseek" or cfg.get("backend") != "hip" or len(gpu_list(cfg)) > 1:
+        return None
+    on = [k for k in ("DS4_STREAM_WIN", "DS4_LAND") if str(env.get(k) or "").strip() not in ("", "0")]
+    if not on:
+        return None
+    return ("[maya] NOTE: " + " and ".join(on) + (" is" if len(on) == 1 else " are") + " set, but the one-GPU decode "
+            "path they belong to is NVIDIA's: it does not apply to one AMD GPU, where the default is the earlier "
+            "decode path (the engine's line says so).  Forced on, they made decode much slower and stalled answers "
+            "(#1120).  Remove them (and DS4_STREAM_ZC) from the environment or the config's env to run as designed.")
+
+
 def warn_tight_ram(arena_mib) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
     system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27) and Windows
@@ -8009,6 +8024,8 @@ def main() -> int:
             print(link_line, flush=True)
         vision = None
         env = child_env(cfg)
+        if note := ds4_one_gpu_switch_note(cfg, env):
+            print(note, flush=True)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if "sampling" not in cfg:                       # (a config without them: the model's own, not none)
             sampling_defaults = maya_quants.model_defaults(cfg)[0]

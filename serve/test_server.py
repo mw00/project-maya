@@ -3245,5 +3245,27 @@ class EngineEndTests(unittest.TestCase):
         self.assertIn("running out of RAM", self.note("ds4: something else\n", returncode=-9))
 
 
+class Ds4OneGpuSwitchNote(unittest.TestCase):
+    """#1120: DS4_STREAM_WIN / DS4_LAND set by hand for DeepSeek on one AMD GPU: the start says they do not apply."""
+
+    CFG = {"exe": "/x/maya-ds4", "backend": "hip", "gpu": "0", "args": ["--pack", "/m"]}
+
+    def test_set_on_one_amd_gpu(self):
+        from serve.server import ds4_one_gpu_switch_note as note
+        msg = note(self.CFG, {"DS4_STREAM_WIN": "1", "DS4_LAND": "1"})
+        self.assertIn("DS4_STREAM_WIN and DS4_LAND are set", msg)
+        self.assertIn("does not apply", msg)
+        self.assertIn("DS4_LAND is set", note(self.CFG, {"DS4_LAND": "1", "DS4_STREAM_WIN": "0"}))
+
+    def test_silent_everywhere_else(self):
+        from serve.server import ds4_one_gpu_switch_note as note
+        env = {"DS4_STREAM_WIN": "1", "DS4_LAND": "1"}
+        self.assertIsNone(note(self.CFG, {}))
+        self.assertIsNone(note(self.CFG, {"DS4_LAND": "0"}))
+        self.assertIsNone(note({**self.CFG, "backend": "cuda"}, env))                 # NVIDIA: the path they belong to
+        self.assertIsNone(note({**self.CFG, "gpu": "0,1"}, env))                      # two GPUs
+        self.assertIsNone(note({**self.CFG, "exe": "/x/maya-mm3"}, env))             # another model
+
+
 if __name__ == "__main__":
     unittest.main()
