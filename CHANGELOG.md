@@ -4,6 +4,24 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.77 - 2026-11-24
+
+Fixes for PCs that could not run Maya, steadier answers, and a batch of same-answer speed-ups from the community.
+
+- **Fix: DeepSeek could read out of range when a routing row had no valid score (#1114).** It now stays in range and drops that pick.
+- **Fix: DeepSeek packs without an expert profile (#1161)** start from the profile Maya ships, and the load says which profile it read.
+- **Fix: GLM-5.3-Flash with the DFlash drafter (#1137):** the first answer token after a forced end of thinking continued the thinking.
+- **Fix: pictures (#915):** picture data is kept while a request is being prepared.
+- **Fix: Windows setup (#1128)** also finds Visual Studio through a standalone `vswhere` on the PATH.
+- **Fix: Inkling 2 Mini's engine could hang on exit after a fatal error (#1136);** it now ends at once.
+- **Fix: building with plain `cmake`** (without Maya's setup) failed since v1.1.75.
+- **Inkling 2 Mini on small NVIDIA cards: the first start runs at full speed.** The one-time drafting measurement no longer borrows VRAM from the experts for the rest of that session, and it times plain decoding on the real layout.
+- **GLM-5.3-Flash: answers stay the same after an update.** The CPU timing Maya measures once is now kept per PC, not per version; `--speed-calibration` measures again. On Linux PCs with two CPU sockets and three or more GPUs, the CPU helper threads are pinned one per core (`MAYA_GLM_CPU_PIN=0` turns it off), so a fresh measurement is the same every time; a fresh install there may word answers differently from a fresh v1.1.76 install, an updated one keeps its answers.
+- **Same-answer speed-ups from the community:** Hy4-Flash on AMD with the CPU helping under tensor parallel (#1168, the author measured +53% on Maya-M), faster sums on Radeon RDNA cards (#1164), Hy4-Flash on Radeon RX 7900-class cards (#1150, #1151), and GLM-5.3-Flash decoding (#1138, #1139). #1168, #1150 and #1151 run on hardware we do not own - please report how they do.
+- **A malformed request now gets a clear "400 bad request"** on all three APIs instead of an internal error.
+- **Benchmark and release checks:** `--bench` fixes (the first-start label, the Windows log, `--bench-lock-ok`), and new tools that test only what a release changed and compare every night against the last release (docs/RELEASE-CHECKS.md).
+- **Credits.** #1168, #1164, #1161, #1151 and #1150 were contributed by @Antero128; #1139, #1138 and #1137 by @vdkcf; #1128 by @Thymos2027; #915 by @jorphex. The rest of this release is by @mw00 (peasantsmith).
+
 ## v1.1.76 - 2026-11-23
 
 A fix release: since v1.1.73 some PCs could no longer load a model when a VRAM reserve was set. That is fixed, and the VRAM Maya keeps free is now always shown.
