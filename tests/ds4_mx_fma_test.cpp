@@ -49,6 +49,14 @@ static void check_rounding_dispatch() {
     gg::mx_rows(weights.data(), row_bytes, width, 0, 1, activation, 1, got);
     if (bits(result) != bits(unguarded ? rounded : reference))
         throw std::runtime_error("wrong FMA mode on row double-rounding witness");
+    for (int mode : {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        if (std::fesetround(mode) != 0) throw std::runtime_error("cannot set rounding mode");
+        gg::mx_rows_reference(weights.data(), row_bytes, width, 0, 1, activation, 1, ref);
+        gg::mx_rows(weights.data(), row_bytes, width, 0, 1, activation, 1, got);
+        if (bits(result) != bits(reference)) throw std::runtime_error("directed rounding row did not fall back");
+    }
+    std::fesetround(FE_TONEAREST);
+    gg::mx_rows_reference(weights.data(), row_bytes, width, 0, 1, activation, 1, ref);
 #if defined(__x86_64__) || defined(_M_X64)
     const unsigned csr = _mm_getcsr();
     _mm_setcsr(csr | 0x8040u);
@@ -62,6 +70,11 @@ static void check_rounding_dispatch() {
 
 int main(int argc, char** argv) {
     try {
+        const char* fast_setting = std::getenv("DS4_MX_FAST_FMA");
+        const bool expected_fast = fast_setting ? std::strcmp(fast_setting, "1") == 0
+                                                : gg::mx_tier() == gg::kMxSsse3;
+        if (gg::mx_fast_fma_requested() != expected_fast)
+            throw std::runtime_error("wrong explicit or automatic FMA setting");
         check_rounding_dispatch();
         if (argc > 1 && std::strcmp(argv[1], "--dispatch") == 0) return 0;
         const int random_count = argc > 1 && std::strcmp(argv[1], "--smoke") == 0 ? 20000 : 5000000;

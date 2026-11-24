@@ -75,7 +75,7 @@ const char* mx_tier_report();    // the measurement behind it (each candidate's 
 bool mx_tier_ok(int t);          // this CPU runs tier t
 const char* mx_tier_name(int t);
 bool mx_ssse3_enabled();         // DS4_MX_SSSE3=0 disables, 1 forces when supported, unset keeps the automatic selection
-bool mx_fast_fma_requested();    // DS4_MX_FAST_FMA=1 opts in, independently of the integer tier (default: off)
+bool mx_fast_fma_requested();    // DS4_MX_FAST_FMA=0/1 overrides; unset enables guarded FMA on the selected SSSE3 tier
 bool mx_fast_fma_active();       // requested and this thread's FP environment is supported
 /// Unchanged scalar std::fma arithmetic, independent of both flags: numerical reference / diagnostics.
 void mx_rows_reference(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,

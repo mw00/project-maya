@@ -407,18 +407,25 @@ bool mx_ssse3_enabled() {
     }();
     return on;
 }
-bool mx_fast_fma_requested() {
-    static const bool on = [] {
+namespace {
+bool fast_fma_for_tier(int tier) {
+    static const int setting = [] {
         const char* v = std::getenv("DS4_MX_FAST_FMA");
-        return v != nullptr && std::strcmp(v, "1") == 0;
+        if (v == nullptr) return -1;
+        return std::strcmp(v, "1") == 0 ? 1 : 0;
     }();
-    return on;
+    return setting < 0 ? tier == kMxSsse3 : setting == 1;
 }
+}  // namespace
+
+bool mx_fast_fma_requested() { return fast_fma_for_tier(mx_tier()); }
 bool mx_fast_fma_active() { return mx_fast_fma_requested() && detail::fast_fma_environment_ok(); }
 
 namespace {
-FmaMode mx_fma_mode() {
-    if (!mx_fast_fma_active()) return FmaMode::reference;
+FmaMode mx_fma_mode(int tier) {
+    // Tier measurement calls mx_rows_tier before mx_tier has finished initializing.
+    // Use the candidate tier directly so automatic FMA selection cannot re-enter that initialization.
+    if (!fast_fma_for_tier(tier) || !detail::fast_fma_environment_ok()) return FmaMode::reference;
     static const bool unguarded = [] {
         const char* value = std::getenv("DS4_MX_FMA_UNGUARDED");
         return value && std::strcmp(value, "1") == 0;
@@ -479,7 +486,7 @@ void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, con
     // SSSE3 handles partial groups; AVX2+ takes eight blocks a step.
     if (!mx_tier_ok(t) || (t != kMxSsse3 && k % 256 != 0)) t = kMxScalar;
     const float* tb = e8().v;
-    const FmaMode mode = (t == kMxScalar || t == kMxSsse3) ? mx_fma_mode() : FmaMode::reference;
+    const FmaMode mode = (t == kMxScalar || t == kMxSsse3) ? mx_fma_mode(t) : FmaMode::reference;
 #if defined(MX_X86)
     switch (t) {
         case kMxSsse3:

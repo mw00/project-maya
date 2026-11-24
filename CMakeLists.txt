@@ -824,6 +824,13 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
         set_tests_properties(ds4_mx_fma_unguarded_s${_s}_f${_f} PROPERTIES TIMEOUT 30
                              ENVIRONMENT "DS4_MX_SSSE3=${_s};DS4_MX_FAST_FMA=${_f};DS4_MX_FMA_UNGUARDED=1")
       endforeach()
+      add_test(NAME ds4_mx_fma_default_s${_s}
+               COMMAND ${CMAKE_COMMAND} -E env --unset=DS4_MX_FAST_FMA
+                       DS4_MX_SSSE3=${_s} DS4_MX_FMA_UNGUARDED=0 $<TARGET_FILE:ds4_mx_fma_test>)
+      add_test(NAME ds4_mx_fma_unguarded_default_s${_s}
+               COMMAND ${CMAKE_COMMAND} -E env --unset=DS4_MX_FAST_FMA
+                       DS4_MX_SSSE3=${_s} DS4_MX_FMA_UNGUARDED=1 $<TARGET_FILE:ds4_mx_fma_test> --dispatch)
+      set_tests_properties(ds4_mx_fma_default_s${_s} ds4_mx_fma_unguarded_default_s${_s} PROPERTIES TIMEOUT 180)
     endforeach()
     # DS4_LANE_PARITY's CPU rows against the CPU lane's ggml rows, one thread (built by name)
     add_executable(ds4_par_bench EXCLUDE_FROM_ALL tests/ds4_par_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp
