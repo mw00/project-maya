@@ -270,6 +270,15 @@ public:
     int active() const { return active_.load(std::memory_order_acquire); }
     // the priority of this thread's batches on a concurrent pool (higher first; default 0)
     static void set_thread_prio(int p) { tl_prio() = p; }
+    bool is_concurrent() const { return concurrent_; }
+    uint64_t epoch() const { return epoch_.load(std::memory_order_acquire); }
+    int busy_slots() const {
+        if (!concurrent_) return 0;
+        int n = 0;
+        for (int s = 0; s < kSlots; ++s)
+            if (slots_[s].busy.load(std::memory_order_acquire)) ++n;
+        return n;
+    }
 
 private:
     static int& tl_prio() {
@@ -994,6 +1003,8 @@ struct Glm5Model::FastState {
     } cpu_win;
     std::vector<float> cpu_x3;                               // EXL3: per expert gate / up inputs, h, down input, out
     std::atomic<uint64_t> cpu_experts{0}, cpu_routes{0}, cpu_us{0};
+    // MAYA_GLM_RETIME_SOLO=1: contention-free CPU-lane timing counters fed to lane_retime() (telemetry above unchanged)
+    std::atomic<uint64_t> rt_solo_experts{0}, rt_solo_routes{0}, rt_solo_us{0};
     // MAYA_GLM_SPEC_CANCEL=1 (the pipelined two-half decode, a head half of one GPU): the head's speculative pass reads
     // the pinned, host-mapped word spec_live_h at every layer (skip_gate) into spec_skip_d - 1: its draft still stands,
     // 0: the draft was wrong, its heavy kernels do nothing from that layer on and the redo can start at once

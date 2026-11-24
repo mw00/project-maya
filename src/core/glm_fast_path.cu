@@ -27,6 +27,8 @@
 #include "maya/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
 #include "maya/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
 #include "maya/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_retime_solo.hpp"
 #include "maya/kernels/glmd_graph.hpp"   // glm-dsa B15.6
 #include "maya/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
 #include "maya/core/glm_mtp_state.hpp"   // glm-dsa B15.3
@@ -5037,6 +5039,11 @@ void Glm5Model::lane_drift_check() {
 // link is steady) - at most three times.  Only a split the timing
 // chose (not MAYA_GLM_CPU_PLAN / MAYA_GLM_PCIE_SHARE, setup's tuning), and only from windows run on that split (a
 // request's own pcie_frac is setup's calibration at work).  MAYA_GLM_CPU_RETIME=0 turns it off.
+static bool retime_solo_on() {
+    static const bool on = maya::glmenv::env_flag("MAYA_GLM_RETIME_SOLO", false);
+    return on;
+}
+
 void Glm5Model::lane_retime() {
     static const bool on = [] {
         const char* v = getenv("MAYA_GLM_CPU_RETIME");
@@ -5050,7 +5057,10 @@ void Glm5Model::lane_retime() {
         if (F != nullptr && (glmfast::repeatable(F->helper.linked()) || glmfast::same_answers())) continue;
         if (F == nullptr || F->cpu_pool == nullptr || !F->cpu_retime || F->rt_windows >= 8 || F->rt_changes >= 3)
             continue;
-        const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load(), r = F->cpu_routes.load();
+        const bool solo_src = retime_solo_on();
+        const uint64_t e = solo_src ? F->rt_solo_experts.load() : F->cpu_experts.load();
+        const uint64_t us = solo_src ? F->rt_solo_us.load() : F->cpu_us.load();
+        const uint64_t r = solo_src ? F->rt_solo_routes.load() : F->cpu_routes.load();
         if (F->cpu_plan != F->cpu_plan_start) {   // a request's own split: its window is not this one's
             F->rt_e0 = e, F->rt_us0 = us, F->rt_r0 = r;
             continue;
@@ -5857,6 +5867,8 @@ void Glm5Model::fast_service() {
                     float cpu_part[gf::kMaxEmbd];
                     uint64_t lane_us = 0;
                     if (ne > 0) {
+                        const uint64_t ep0 = F->cpu_pool != nullptr ? F->cpu_pool->epoch() : 0;
+                        const int busy0 = F->cpu_pool != nullptr ? F->cpu_pool->busy_slots() : 0;
                         const auto cpu_t0 = std::chrono::steady_clock::now();
                         fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
                         lane_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
@@ -5864,6 +5876,14 @@ void Glm5Model::fast_service() {
                         F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
                         F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
                         F->cpu_us.fetch_add(lane_us, std::memory_order_relaxed);
+                        if (retime_solo_on() && F->cpu_pool != nullptr &&
+                            maya::core::glmretime::is_solo_sample(F->cpu_pool->is_concurrent(), busy0,
+                                                                  F->cpu_pool->busy_slots(), ep0,
+                                                                  F->cpu_pool->epoch())) {
+                            F->rt_solo_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+                            F->rt_solo_routes.fetch_add(1, std::memory_order_relaxed);
+                            F->rt_solo_us.fetch_add(lane_us, std::memory_order_relaxed);
+                        }
                     }
                     if (queued) {
                         const auto w0 = std::chrono::steady_clock::now();
@@ -5899,14 +5919,25 @@ void Glm5Model::fast_service() {
                     }
                     // Quantize on the CPU only when this route actually has CPU fallback.
                     if (ne > 0) {
+                        const uint64_t ep0 = F->cpu_pool != nullptr ? F->cpu_pool->epoch() : 0;
+                        const int busy0 = F->cpu_pool != nullptr ? F->cpu_pool->busy_slots() : 0;
                         const auto cpu_t0 = std::chrono::steady_clock::now();
                         float cpu_part[gf::kMaxEmbd];
                         fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
                         for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
+                        const uint64_t dt_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now() - cpu_t0).count();
                         F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
                         F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
-                        F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
-                                               std::chrono::steady_clock::now() - cpu_t0).count(), std::memory_order_relaxed);
+                        F->cpu_us.fetch_add(dt_us, std::memory_order_relaxed);
+                        if (retime_solo_on() && F->cpu_pool != nullptr &&
+                            maya::core::glmretime::is_solo_sample(F->cpu_pool->is_concurrent(), busy0,
+                                                                  F->cpu_pool->busy_slots(), ep0,
+                                                                  F->cpu_pool->epoch())) {
+                            F->rt_solo_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+                            F->rt_solo_routes.fetch_add(1, std::memory_order_relaxed);
+                            F->rt_solo_us.fetch_add(dt_us, std::memory_order_relaxed);
+                        }
                     }
                 }
                 F->helper_experts.fetch_add((uint64_t) hn, std::memory_order_relaxed);
@@ -5927,14 +5958,25 @@ void Glm5Model::fast_service() {
                 j.seq = next;
                 F->win_lane[rq->win & 1]->push(j);
             } else {
+                const uint64_t ep0 = F->cpu_pool != nullptr ? F->cpu_pool->epoch() : 0;
+                const int busy0 = F->cpu_pool != nullptr ? F->cpu_pool->busy_slots() : 0;
                 fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part);
+                const auto cpu_done = std::chrono::steady_clock::now();
                 std::atomic_thread_fence(std::memory_order_release);
                 ans->seq = next;
+                const uint64_t dt_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                           cpu_done - t0).count();
                 F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
                 F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
-                F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - t0).count(),
-                                    std::memory_order_relaxed);
+                F->cpu_us.fetch_add(dt_us, std::memory_order_relaxed);
+                if (retime_solo_on() && F->cpu_pool != nullptr &&
+                    maya::core::glmretime::is_solo_sample(F->cpu_pool->is_concurrent(), busy0,
+                                                          F->cpu_pool->busy_slots(), ep0,
+                                                          F->cpu_pool->epoch())) {
+                    F->rt_solo_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+                    F->rt_solo_routes.fetch_add(1, std::memory_order_relaxed);
+                    F->rt_solo_us.fetch_add(dt_us, std::memory_order_relaxed);
+                }
             }
         }
         F->processed.fetch_add(1, std::memory_order_release);
