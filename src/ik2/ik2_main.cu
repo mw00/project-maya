@@ -102,13 +102,22 @@ static inline int munmap(void*, size_t) { return 0; }
 namespace {
 
 namespace k = ik2::k;
+// A fatal error ends the engine at once: stdout and stderr are flushed, then out WITHOUT std::exit - its flush of every
+// stdio stream takes stdin's lock, which the --serve reader thread holds while it waits for input, and its static
+// destructors may wait on the GPU while our threads still use it (#1136).
+[[noreturn]] inline void fatal_exit() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
 
 #define CU(x)                                                                                              \
     do {                                                                                                   \
         cudaError_t e_ = (x);                                                                              \
         if (e_ != cudaSuccess) {                                                                           \
             std::fprintf(stderr, "maya-ik2: %s: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                   \
         }                                                                                                  \
     } while (0)
 #define CB(x)                                                                                              \
@@ -116,13 +125,13 @@ namespace k = ik2::k;
         cublasStatus_t e_ = (x);                                                                           \
         if (e_ != CUBLAS_STATUS_SUCCESS) {                                                                 \
             std::fprintf(stderr, "maya-ik2: %s: cuBLAS status %d (line %d)\n", #x, (int) e_, __LINE__);    \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                   \
         }                                                                                                  \
     } while (0)
 
 [[noreturn]] void die(const std::string& m) {
     std::fprintf(stderr, "maya-ik2: %s\n", m.c_str());
-    std::exit(1);
+    fatal_exit();
 }
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -4724,6 +4733,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 CU(cudaMemcpyPeer(Tn.blocks + (size_t) i * Tn.blk_ld * C, Ly.dev, F.blocks + (size_t) i * F.blk_ld * C,
                                   from, TC * 4));
             CU(cudaMemcpyPeer(Tn.pos, Ly.dev, F.pos, from, (size_t) T * 4));
+            // A hop inside a looped core's later pass: the layers over there read their messages from the pass before's
+            // bank, filled on this GPU - it goes along too (#1107). (lp_pre is written and read at core0 only.)
+            if (c.n_pass > 1 && M.V[vis].pass > 0 && n_bank > 0)
+                CU(cudaMemcpyPeer(Tn.lp_bank, Ly.dev, F.lp_bank, from, (size_t) n_bank * TC * 4));
             use_dev(Ly.dev);
             Wp = &dev_work(g_cur);
             ECp = &dev_cache(g_cur);
