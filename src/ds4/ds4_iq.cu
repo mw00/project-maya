@@ -4,6 +4,7 @@
 #include "ds4_iq1_codes.hpp"
 #include "ds4_par_exp.h"
 #include "ds4_pdl.cuh"
+#include "maya/kernels/lane_xor.hpp"   // warp sums in registers on RDNA
 #if defined(MAYA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
 #include "maya/prefill/moe_mmq.hpp"
 #if defined(MAYA_USE_HIP)
@@ -730,12 +731,19 @@ __device__ __forceinline__ float warp_sum(float v) {
     v += hip_xor1(v);
 #endif
     return v;
-#else
-#pragma unroll
+#else   // (the shuffle's xor order 16, 8, 4, 2, 1; maya_lane_xor: in registers on RDNA, the same bits)
 #if DS4_IQ_STRICT_FP
-    for (int o = 16; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+    v = fadd_no_fma(v, maya_lane_xor<16>(v));
+    v = fadd_no_fma(v, maya_lane_xor<8>(v));
+    v = fadd_no_fma(v, maya_lane_xor<4>(v));
+    v = fadd_no_fma(v, maya_lane_xor<2>(v));
+    v = fadd_no_fma(v, maya_lane_xor<1>(v));
 #else
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    v += maya_lane_xor<16>(v);
+    v += maya_lane_xor<8>(v);
+    v += maya_lane_xor<4>(v);
+    v += maya_lane_xor<2>(v);
+    v += maya_lane_xor<1>(v);
 #endif
     return v;
 #endif
@@ -803,12 +811,19 @@ __device__ __forceinline__ float lanes_sum(float v) {
     if constexpr (RW <= 16) v += hip_xor1(v);
 #endif
     return v;
-#else
-#pragma unroll
+#else   // (the shuffle's xor order 16 / RW .. 1, in registers on RDNA: maya_lane_xor)
 #if DS4_IQ_STRICT_FP
-    for (int o = 16 / RW; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if constexpr (RW <= 1) v = fadd_no_fma(v, maya_lane_xor<16>(v));
+    if constexpr (RW <= 2) v = fadd_no_fma(v, maya_lane_xor<8>(v));
+    if constexpr (RW <= 4) v = fadd_no_fma(v, maya_lane_xor<4>(v));
+    if constexpr (RW <= 8) v = fadd_no_fma(v, maya_lane_xor<2>(v));
+    if constexpr (RW <= 16) v = fadd_no_fma(v, maya_lane_xor<1>(v));
 #else
-    for (int o = 16 / RW; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if constexpr (RW <= 1) v += maya_lane_xor<16>(v);
+    if constexpr (RW <= 2) v += maya_lane_xor<8>(v);
+    if constexpr (RW <= 4) v += maya_lane_xor<4>(v);
+    if constexpr (RW <= 8) v += maya_lane_xor<2>(v);
+    if constexpr (RW <= 16) v += maya_lane_xor<1>(v);
 #endif
     return v;
 #endif

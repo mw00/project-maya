@@ -3,6 +3,7 @@
 // (src/models/hy-v4-flash.cpp of their hy4-flash patch).
 #include "hy4_kernels.cuh"
 #include "maya/kernels/fresh_load.hpp"
+#include "maya/kernels/lane_xor.hpp"   // warp sums in registers on RDNA
 #include "maya/kernels/rdna_wmma.hpp"
 
 #include <cuda_fp16.h>
@@ -49,14 +50,21 @@ void check(const char* what) {
     }
 }
 
+// the shuffle's xor order 16, 8, 4, 2, 1; maya_lane_xor moves the same values in registers on RDNA (the same bits)
 __device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    v += maya_lane_xor<16>(v);
+    v += maya_lane_xor<8>(v);
+    v += maya_lane_xor<4>(v);
+    v += maya_lane_xor<2>(v);
+    v += maya_lane_xor<1>(v);
     return v;
 }
 __device__ __forceinline__ float warp_max(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    v = fmaxf(v, maya_lane_xor<16>(v));
+    v = fmaxf(v, maya_lane_xor<8>(v));
+    v = fmaxf(v, maya_lane_xor<4>(v));
+    v = fmaxf(v, maya_lane_xor<2>(v));
+    v = fmaxf(v, maya_lane_xor<1>(v));
     return v;
 }
 // a block's sum (blockDim.x a multiple of 32, at most 1024); every thread gets it
