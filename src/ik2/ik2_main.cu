@@ -6543,18 +6543,17 @@ int main(int argc, char** argv) {
                     : g_off_want ? "the experts in host memory, a tier of them in VRAM, the rest fetched by the GPU"
                                  : "the experts in host memory, a cache of them in VRAM");
         // Drafting never changes the context, the cache or the pictures' room of this plan.  Where every expert stays
-        // in VRAM (the resident path) a loaded drafter takes room only where everything above stays as it is: its
-        // room - the drafter's, or the prompt lookup's window records alone - beside the model at this context, and
-        // not the room the pictures' encoder would have had on the GPU (IK2_VISION_GIB, the server's: the encoder
-        // starts on the GPU when the free VRAM holds it).  Where the experts already left VRAM for the cache (the
-        // offload path: a long context) the drafter's room is the experts' too - the tier gives it, at most half of
-        // what it had, with the verify window's staging; the drafter's context rows FP16, else FP8, else FP8 rows of
+        // in VRAM (the resident path) a loaded drafter takes room only where everything above stays as it is: its room
+        // - the drafter's, or the prompt lookup's window records alone - beside the model at this context.  The
+        // pictures' encoder has no room in this plan and takes none from the drafter: the server starts it when a
+        // picture arrives, on the GPU only while the VRAM then free holds it beside the model and the drafter, else on
+        // the CPU (the plan is the same with pictures on or off).  Where the experts already left VRAM for the cache
+        // (the offload path: a long context) the drafter's room is the experts' too - the tier gives it, at most half
+        // of what it had, with the verify window's staging; the drafter's context rows FP16, else FP8, else FP8 rows of
         // the last positions only (half the context, a quarter .. 65,536: its drafts read less far back, the model
-        // checks every token as ever).  The window there is mode A's (the resident kernels over the tier's bytes):
-        // one GPU, the whole cache in VRAM, no lane parity.  Else it is left out, said why.
+        // checks every token as ever).  The window there is mode A's (the resident kernels over the tier's bytes): one
+        // GPU, the whole cache in VRAM, no lane parity.  Else it is left out, said why.
         const size_t used = exp_b + dense_b + kv_b + reserve;
-        const double vis = getenv("IK2_VISION_GIB") ? std::atof(getenv("IK2_VISION_GIB")) * 1073741824.0 : 0.0;
-        const double left = fr0 > used ? (double) (fr0 - used) : 0.0;
         const bool off_layout = g_off_want && !g_fast_want;
         std::string off_why;
         size_t tier_room = 0, stage_b = 0;
@@ -6589,8 +6588,6 @@ int main(int argc, char** argv) {
                 else if (need + stage_b > tier_room / 2) why = "its room does not fit beside the model at this context";
             } else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
             else if (used + need > fr0) why = "its room does not fit beside the model at this context";
-            else if (vis > 0 && left >= vis && left - (double) need < vis)
-                why = "its room would move the pictures' encoder from the GPU to the CPU";
             return why.empty();
         };
         for (int pass = 0; pass < 2; ++pass) {   // (the drafter, else the prompt lookup alone)

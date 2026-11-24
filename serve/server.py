@@ -7886,10 +7886,10 @@ def main() -> int:
                 vcfg, on_demand = dict(vcfg, gpu=False), False
             else:
                 vcfg = dict(vcfg, max_tokens=fp[0])
-                if models.family(cfg) != "ik2":   # (maya-ik2 lends no memory: the encoder takes what is free)
+                # (maya-ik2 lends no memory and plans none for pictures: its start - context, cache, drafter - is the
+                #  same with pictures on or off; the encoder takes what is free when a picture arrives, else the CPU)
+                if models.family(cfg) != "ik2":
                     engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
-                else:   # (... and its drafting leaves the room the encoder would have had on the GPU: IK2_VISION_GIB)
-                    engine_env = dict(env, IK2_VISION_GIB=f"{fp[1] / 2**30:.3f}")
                 print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
