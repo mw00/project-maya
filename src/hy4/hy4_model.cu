@@ -2967,13 +2967,15 @@ struct Model::Impl {
     // layer's attention matrices are a member, and the 15 of its FFN's dense ones; an RTX 3090: 6 MB).  The prefetch
     // kernel is a block a multiprocessor: its threads wait on the memory, and more of them took the room of the main
     // stream's kernels (128 blocks on 36 multiprocessors: a 4-token window a sixth slower).
-    // HY4_PREFETCH unset: measured, on NVIDIA; 0: off; N: bits, unmeasured (1 the FFN's router, routed down, shared
-    // gate / up; 2 its routed up and shared down; 4 the next layer's q_a, kv_a, gate; 8 its other attention matrices).
-    // HY4_PF_BLOCKS: the kernel's blocks
-#if defined(MAYA_USE_HIP)
-    const int pf_mode = std::getenv("HY4_PREFETCH") ? std::atoi(std::getenv("HY4_PREFETCH")) : 0;   // (AMD: not run)
-#else
+    // HY4_PREFETCH unset: measured, on NVIDIA and on AMD's gfx1100 (3 x RX 7900 XTX, tp 2: a window 1.7% faster; other
+    // AMD GPUs read nothing ahead unless asked for); -1: measured on any GPU; 0: off; N: bits, unmeasured (1 the FFN's
+    // router, routed down, shared gate / up; 2 its routed up and shared down; 4 the next layer's q_a, kv_a, gate; 8 its
+    // other attention matrices).  HY4_PF_BLOCKS: the kernel's blocks
     const int pf_mode = std::getenv("HY4_PREFETCH") ? std::atoi(std::getenv("HY4_PREFETCH")) : -1;
+#if defined(MAYA_USE_HIP)
+    const bool pf_amd_auto = std::getenv("HY4_PREFETCH") == nullptr;   // (unset: gfx1100 only, where it was measured)
+#else
+    const bool pf_amd_auto = false;
 #endif
     const int pf_bits = pf_mode > 0 ? pf_mode : 15;
     const int pf_blocks_env = std::getenv("HY4_PF_BLOCKS") ? std::atoi(std::getenv("HY4_PF_BLOCKS")) : 0;
@@ -3073,7 +3075,7 @@ struct Model::Impl {
     void pf_probe() {
         if (tp <= 1 || pf_mode == 0) return;
         size_t least = SIZE_MAX, most = 0;
-        int on = 0;
+        int on = 0, unmeasured = 0;
         for (int m = 0; m < tp; ++m) {
             Gpu& gp = G[(size_t) mem[(size_t) m]];
             if (gp.s5 == nullptr) continue;
@@ -3087,6 +3089,12 @@ struct Model::Impl {
                 continue;
             }
             gp.pf_blocks = pf_blocks_env > 0 ? pf_blocks_env : std::max(8, std::min(64, pi.multiProcessorCount));
+#if defined(MAYA_USE_HIP)
+            if (pf_amd_auto && std::strncmp(pi.gcnArchName, "gfx1100", 7) != 0) {
+                ++unmeasured;
+                continue;
+            }
+#endif
             if (pf_mode > 0) {   // (asked for by hand: not measured)
                 gp.pf_cap = (size_t) 1 << 40;
                 ++on;
@@ -3148,6 +3156,9 @@ struct Model::Impl {
             std::snprintf(buf, sizeof buf, "INFO tensor parallel: a token window's dense weights read ahead, behind the "
                           "members' sums, on %d of the %d GPUs (their caches hold %zu%s MB of a range read twice)", on, tp,
                           least >> 20, most > least ? " and more" : "");
+        else if (unmeasured > 0)
+            std::snprintf(buf, sizeof buf, "INFO tensor parallel: no weights read ahead (on AMD measured on gfx1100 "
+                          "only; HY4_PREFETCH=-1 measures it on this GPU)");
         else
             std::snprintf(buf, sizeof buf, "INFO tensor parallel: no weights read ahead (the GPUs' caches held under 8 MB "
                           "of a range read twice)");
