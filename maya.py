@@ -12068,9 +12068,9 @@ def main() -> int:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if not have:
             fail("Maya is not set up here yet", f"run {ME} first")
-        more = {k: v for k, v in (("tokens_file", a.bench_tokens), ("text_ref", a.bench_text_ref)) if v}
-        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait),
-                     a.bench_lock_ok, **more)
+        more = {k: v for k, v in (("lock_ok", a.bench_lock_ok), ("tokens_file", a.bench_tokens),
+                                  ("text_ref", a.bench_text_ref)) if v}
+        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait), **more)
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
     if a.backend:
