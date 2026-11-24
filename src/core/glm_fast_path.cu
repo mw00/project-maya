@@ -3862,14 +3862,23 @@ static std::string cal_rest(const std::string& key) {
     const size_t at = key.find(" | ");
     return at == std::string::npos ? std::string() : key.substr(at + 3);
 }
-// A timing taken again (maya --speed-calibration marks the saved line "redo"; MAYA_GLM_CPU_CAL_REDO=1) replaces the
-// saved one only when it differs clearly - any of the three values by more than 25%: within that it is the same PC
-// measured at another moment, and the plans (so the answers) stay as they are
+// A timing taken again (maya --speed-calibration marks the saved line "redo"; MAYA_GLM_CPU_CAL_REDO=1) replaces a
+// saved value only when the new one is clearly FASTER - by more than 25%.  Within 25% it is the same PC measured at
+// another moment, and the plans (so the answers) stay as they are.  A slower one is not the PC's speed either: other
+// work only ever adds time (the calibration keeps its fastest round for the same reason), and where the lane's
+// threads land differs from start to start - a quiet two-socket box (2 x 20 cores, 36 lane threads) times an expert
+// at 0.131 ms on one start and 0.233 ms on the next, nothing in between.  So the saved timing moves towards the PC's
+// own speed, at most once or twice, and then stays whatever a later moment measures.  (MAYA_GLM_CPU_CAL_REDO=2: the
+// new timing as it is - a PC that did get slower without its CPU, card or thread count changing.)  True: all kept
 constexpr double kCalKeep = 1.25;
-static bool cal_same(const double* was, const double* now) {
-    for (int i = 0; i < 3; ++i)
-        if (!(was[i] > 0.0) || now[i] > kCalKeep * was[i] || now[i] < was[i] / kCalKeep) return false;
-    return true;
+static bool cal_keep(const double* was, double* now, bool as_it_is) {
+    bool same = true;
+    for (int i = 0; i < 3; ++i) {
+        const bool take = as_it_is ? std::fabs(now[i] - was[i]) > 5e-5 : !(was[i] > 0.0) || now[i] < was[i] / kCalKeep;
+        if (take) same = false;
+        else now[i] = was[i];
+    }
+    return same;
 }
 
 // the CPU lane's lane-call overhead the split plans with (ms a call), and the split itself: of f RAM-tier experts,
@@ -4144,7 +4153,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const char* calf = getenv("MAYA_GLM_CPU_CAL");
     std::string cal_key;
     double c_ms = 0.0, p_ms = 0.0, ps_ms = 0.0;
-    bool cached = false, redo = false, taken_over = false;
+    bool cached = false, redo = false, taken_over = false, redo_as_it_is = false;
     if (calf != nullptr && *calf != '\0') {
         char bus[32] = "?";
         if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev_) != cudaSuccess) cudaGetLastError();
@@ -4181,7 +4190,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             }
             std::fclose(cf);
         }
-        if (const char* rv = getenv("MAYA_GLM_CPU_CAL_REDO")) redo = redo || (cached && std::atoi(rv) != 0);
+        if (const char* rv = getenv("MAYA_GLM_CPU_CAL_REDO")) {
+            redo = redo || (cached && std::atoi(rv) != 0);
+            redo_as_it_is = std::atoi(rv) == 2;
+        }
         if (cached && taken_over) {
             cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, F->cal_ref));
             std::fprintf(stderr, "glm fast: CUDA%d CPU lane: the timing an earlier version saved on this PC is kept "
@@ -4270,14 +4282,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // (and by default - glmfast::same_answers: the first start plans with the values every later start reads back)
     if (glmfast::repeatable(F->helper.linked()) || glmfast::same_answers())
         for (double* v : {&c_ms, &p_ms, &ps_ms}) *v = std::round(*v * 1e4) / 1e4;
-    if (cached) {   // timed again on request: only a clear difference replaces what the PC plans with (cal_same)
-        const double now[3] = {c_ms, p_ms, ps_ms};
-        const bool same = cal_same(was, now);
+    if (cached) {   // timed again on request: only a clearly faster value replaces what the PC plans with (cal_keep)
+        double now[3] = {c_ms, p_ms, ps_ms};
+        const bool same = cal_keep(was, now, redo_as_it_is);
         std::fprintf(stderr, "glm fast: CUDA%d CPU lane timed again: %.4f / %.4f / %.4f ms, saved %.4f / %.4f / %.4f - "
-                             "%s\n", dev_, now[0], now[1], now[2], was[0], was[1], was[2],
-                     same ? "within 25%, the saved timing stays" : "the new timing is saved");
-        if (same) c_ms = was[0], p_ms = was[1], ps_ms = was[2];
-        else F->cal_ref = 0.0;
+                             "%s", dev_, c_ms, p_ms, ps_ms, was[0], was[1], was[2],
+                     same ? "none clearly faster (25%), the saved timing stays\n" : "now ");
+        if (!same) std::fprintf(stderr, "%.4f / %.4f / %.4f\n", now[0], now[1], now[2]);
+        c_ms = now[0], p_ms = now[1], ps_ms = now[2];
+        if (!same) F->cal_ref = 0.0;
     }
     if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, cached ? F->cal_ref : 0.0));
     }
@@ -4347,7 +4360,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                  : (" on " + std::to_string(pin_cpus.size()) + " CPUs of its own" +
                     (pin_node >= 0 ? " (NUMA node " + std::to_string(pin_node) + ")" : std::string())).c_str(),
                  c_ms, p_ms, tab.c_str());
-    if (cached) std::fprintf(stderr, "glm fast: CUDA%d CPU lane: those times from %s (not timed)\n", dev_, calf);
+    if (cached && !redo) std::fprintf(stderr, "glm fast: CUDA%d CPU lane: those times from %s (not timed)\n", dev_, calf);
     // MAYA_GLM_CPU_LANE_CHECK=1: the calibration expert on one normalised input three ways - the device's decode
     // kernels, the CPU lane, and a double-precision reference from ggml's dequantised rows - and their distances
     if (getenv("MAYA_GLM_CPU_LANE_CHECK") != nullptr && F->L[(size_t) il_cal].exl3) {

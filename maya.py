@@ -5494,7 +5494,7 @@ def ik2_draft_forget() -> None:
 def glm_lane_timing_again(cfg: dict) -> int:
     """--speed-calibration: the GLM engine's saved CPU lane timing (data/glm-cpu-cal.txt, or the config's own
     MAYA_GLM_CPU_CAL) is marked "redo": the next start of each GPU times its lane again and keeps the saved values
-    unless the new ones differ clearly (more than 25%), so the same PC measured at another moment plans - and
+    unless a new one is clearly faster (more than 25%), so the same PC measured at another moment plans - and
     answers - as before.  The lines marked."""
     path = Path((cfg.get("env") or {}).get("MAYA_GLM_CPU_CAL") or ROOT / "data" / "glm-cpu-cal.txt")
     try:
@@ -5515,8 +5515,8 @@ def glm_lane_timing_again(cfg: dict) -> int:
         except OSError as e:
             warn(f"{path} could not be written ({e}): the CPU lane's timing stays as saved")
             return 0
-        ok("the CPU lane's timing is taken again at the next start (the saved one stays unless the new one differs "
-           "by more than 25%)")
+        ok("the CPU lane's timing is taken again at the next start (the saved one stays unless the new one is "
+           "more than 25% faster)")
     return n
 
 
