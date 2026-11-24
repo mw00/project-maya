@@ -6629,8 +6629,7 @@ void dsa_score2_launch(int p, int blocks, const float* iq, const float* pooled, 
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
                float* score, cudaStream_t s, bool token) {
     if (n_pools <= 0) return;
-    // the take-two kernel on the decode's token path only (and under the bench's override); the record is the token
-    // path's - a prompt's windows, which keep the original, never write it
+    // the take-two kernel for the callers that ask (the token path, a window's tokens) and under the bench's override
     const bool path = token || g_dsa2_set.load(std::memory_order_acquire);
     const DsaScore2 t = path ? dsa2_shape() : DsaScore2{};
     const bool two = t.on && idx_heads == kDsaH && key_dim == kDsaK;
