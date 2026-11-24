@@ -3106,6 +3106,143 @@ void test_q8_kv() {
     cudaFree(o_ref); cudaFree(o_q8); cudaFree(q16); cudaFree(o_mma); cudaFree(pos_d); cudaFree(dbias);
 }
 
+
+void test_q8_quest_sparse() {
+    const int H = 6, Hkv = 2, D = 128, d_rel = 16, extent = 64, nk = 4096, vcap = 256, T = 4;
+    const int needle_pos = 2100;   // page 16 (in host RAM, far outside sink & local windows!)
+    const float qk_scale = 1.0f / std::sqrt((float) D);
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+
+    std::vector<float> k_f(nk * Hkv * D), v_f(nk * Hkv * D), q_f(T * H * D), r_f(T * H * d_rel);
+    std::vector<float> proj_f(extent * d_rel, 0.0f), sink_f(T * H, -10.0f);
+    for (float& x : k_f) x = dist(rng);
+    for (float& x : v_f) x = dist(rng);
+    for (float& x : q_f) x = dist(rng) * 2.0f;
+    // Plant a strong needle key aligned with q[0] at needle_pos for both KV heads
+    for (int g = 0; g < Hkv; ++g) {
+        for (int d = 0; d < D; ++d) {
+            const float qv = q_f[(g * (H / Hkv)) * D + d];
+            k_f[(needle_pos * Hkv + g) * D + d] = qv * 20.0f;
+            v_f[(needle_pos * Hkv + g) * D + d] = (d & 1) ? 1.5f : -1.5f;
+        }
+    }
+
+    // Quantize K and V into VRAM [0..vcap) + host [vcap..nk)
+    k::KvQ8 kc{}, vc{};
+    kc.vram_cap = vc.vram_cap = vcap;
+    const int hcap = nk - vcap, mp = (nk + k::kQuestPage - 1) / k::kQuestPage;
+    kc.max_pages = mp;
+    CU(cudaMalloc(&kc.q, (size_t) vcap * Hkv * D));
+    CU(cudaMalloc(&kc.s, (size_t) vcap * Hkv * 4 * sizeof(uint16_t)));
+    CU(cudaMalloc(&vc.q, (size_t) vcap * Hkv * D));
+    CU(cudaMalloc(&vc.s, (size_t) vcap * Hkv * 4 * sizeof(uint16_t)));
+    CU(cudaMalloc(&kc.kmin, (size_t) mp * Hkv * D));
+    CU(cudaMalloc(&kc.kmax, (size_t) mp * Hkv * D));
+    CU(cudaMalloc(&kc.ks_mm, (size_t) mp * Hkv * 4 * sizeof(uint16_t)));
+    void *hkq, *hks, *hvq, *hvs;
+    CU(cudaHostAlloc(&hkq, (size_t) hcap * Hkv * D, cudaHostAllocMapped | cudaHostAllocPortable));
+    CU(cudaHostAlloc(&hks, (size_t) hcap * Hkv * 4 * sizeof(uint16_t), cudaHostAllocMapped | cudaHostAllocPortable));
+    CU(cudaHostAlloc(&hvq, (size_t) hcap * Hkv * D, cudaHostAllocMapped | cudaHostAllocPortable));
+    CU(cudaHostAlloc(&hvs, (size_t) hcap * Hkv * 4 * sizeof(uint16_t), cudaHostAllocMapped | cudaHostAllocPortable));
+    CU(cudaHostGetDevicePointer(&kc.q_host, hkq, 0));
+    CU(cudaHostGetDevicePointer(&kc.s_host, hks, 0));
+    CU(cudaHostGetDevicePointer(&vc.q_host, hvq, 0));
+    CU(cudaHostGetDevicePointer(&vc.s_host, hvs, 0));
+
+    float *kd, *vd, *qd, *rd, *projd, *sinkd, *scratch, *out_dense, *out_sp, *out_blk_d, *out_blk_sp;
+    uint16_t *q16d;
+    int *posd, *seld, *nseld;
+    CU(cudaMalloc(&kd, k_f.size() * 4)); CU(cudaMemcpy(kd, k_f.data(), k_f.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMalloc(&vd, v_f.size() * 4)); CU(cudaMemcpy(vd, v_f.data(), v_f.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMalloc(&qd, q_f.size() * 4)); CU(cudaMemcpy(qd, q_f.data(), q_f.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMalloc(&q16d, q_f.size() * 2));
+    k::to_f16(qd, q_f.size(), q16d, 0);
+    CU(cudaMalloc(&rd, r_f.size() * 4)); CU(cudaMemset(rd, 0, r_f.size() * 4));
+    CU(cudaMalloc(&projd, proj_f.size() * 4)); CU(cudaMemset(projd, 0, proj_f.size() * 4));
+    CU(cudaMalloc(&sinkd, sink_f.size() * 4)); CU(cudaMemcpy(sinkd, sink_f.data(), sink_f.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMalloc(&scratch, (size_t) 64 * 4 * T * H * 130 * 4));
+    CU(cudaMalloc(&out_dense, H * D * 4)); CU(cudaMalloc(&out_sp, H * D * 4));
+    CU(cudaMalloc(&out_blk_d, T * H * D * 4)); CU(cudaMalloc(&out_blk_sp, T * H * D * 4));
+    CU(cudaMalloc(&posd, 4)); CU(cudaMalloc(&seld, Hkv * k::kQuestMaxPages * 4)); CU(cudaMalloc(&nseld, 4));
+
+    // Populate KV in chunks of 512 via prep_qkv_r_q8 + q8_update_page_bounds
+    float *qtmp, *rtmp;
+    CU(cudaMalloc(&qtmp, 512 * H * D * 4)); CU(cudaMemset(qtmp, 0, 512 * H * D * 4));
+    CU(cudaMalloc(&rtmp, 512 * H * d_rel * 4)); CU(cudaMemset(rtmp, 0, 512 * H * d_rel * 4));
+    for (int p0 = 0; p0 < nk; p0 += 512) {
+        k::prep_qkv_r_q8(qtmp, nullptr, kd + (size_t) p0 * Hkv * D, kc, vd + (size_t) p0 * Hkv * D, vc,
+                         rtmp, nullptr, 512, H, Hkv, D, d_rel, 1e6f, 1e6f, 1e-6f, nullptr, 0.0f, 1.0f, p0, 0, 0);
+        k::q8_update_page_bounds(kc, Hkv, p0, 512, 0);
+    }
+
+    // 1. Single-token Quest sparse decode at pos = nk - 1 (needle at page 16 MUST be selected!)
+    int qpos = nk - 1;
+    CU(cudaMemcpy(posd, &qpos, 4, cudaMemcpyHostToDevice));
+    k::q8_quest_select(q16d, kc, H, Hkv, posd, 1, 2, 4, 12, seld, nseld, 0);
+    k::attn_decode_mma_q8(q16d, rd, sinkd, kc, vc, 0, H, Hkv, posd, qpos, 8, qk_scale, projd, d_rel, extent, 1 << 30,
+                          scratch, out_dense, nullptr, nullptr, 0);
+    k::attn_decode_mma_q8(q16d, rd, sinkd, kc, vc, 0, H, Hkv, posd, qpos, 8, qk_scale, projd, d_rel, extent, 1 << 30,
+                          scratch, out_sp, nullptr, nullptr, 0, seld, nseld);
+    CU(cudaDeviceSynchronize());
+
+    int nsel_h = 0;
+    std::vector<int> sel_h(Hkv * k::kQuestMaxPages);
+    CU(cudaMemcpy(&nsel_h, nseld, 4, cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(sel_h.data(), seld, sel_h.size() * 4, cudaMemcpyDeviceToHost));
+    int needle_page = needle_pos / k::kQuestPage;
+    bool found_all = (nsel_h == 12);
+    for (int g = 0; g < Hkv; ++g) {
+        bool fg = false;
+        for (int i = 0; i < nsel_h; ++i) if (sel_h[g * k::kQuestMaxPages + i] == needle_page) fg = true;
+        found_all = found_all && fg;
+    }
+    if (!found_all) { std::printf("FAIL q8_quest_sparse: needle page %d not selected (nsel=%d)\n", needle_page, nsel_h); ++g_fail; }
+    else std::printf("ok   q8_quest_sparse needle page %d selected for all %d KV heads (nsel=%d/32 pages)\n", needle_page, Hkv, nsel_h);
+
+    auto hd = host(out_dense, D), hs = host(out_sp, D);
+    expect("q8_quest_sparse decode (needle head 0) vs dense", hs, std::vector<double>(hd.begin(), hd.end()), 0.03, 0.03);
+
+    // 1b. Exact indexing check: selecting all 32 pages via sparse path must match dense to < 1e-4!
+    std::vector<int> all_pages(Hkv * k::kQuestMaxPages, 0);
+    for (int g = 0; g < Hkv; ++g) for (int p = 0; p < mp; ++p) all_pages[g * k::kQuestMaxPages + p] = p;
+    CU(cudaMemcpy(seld, all_pages.data(), all_pages.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(nseld, &mp, 4, cudaMemcpyHostToDevice));
+    k::attn_decode_mma_q8(q16d, rd, sinkd, kc, vc, 0, H, Hkv, posd, qpos, 8, qk_scale, projd, d_rel, extent, 1 << 30,
+                          scratch, out_sp, nullptr, nullptr, 0, seld, nseld);
+    CU(cudaDeviceSynchronize());
+    auto hs_all = host(out_sp, D);
+    expect("q8_quest_sparse decode (all 32 pages exact) vs dense", hs_all, std::vector<double>(hd.begin(), hd.end()), 1e-4, 1e-4);
+
+    // 2. Block Quest sparse decode (T=4) at pos0 = nk - T
+    int pos0_blk = nk - T;
+    CU(cudaMemcpy(posd, &pos0_blk, 4, cudaMemcpyHostToDevice));
+    k::q8_quest_select(q16d, kc, H, Hkv, posd, T, 2, 4, 12, seld, nseld, 0);
+    k::attn_block_q8(q16d, rd, H * d_rel, sinkd, kc, vc, 0, H, Hkv, posd, T, 8, qk_scale, projd, d_rel, extent, 1 << 30,
+                     scratch, out_blk_d, nullptr, 0, nullptr, 0);
+    k::attn_block_q8(q16d, rd, H * d_rel, sinkd, kc, vc, 0, H, Hkv, posd, T, 8, qk_scale, projd, d_rel, extent, 1 << 30,
+                     scratch, out_blk_sp, nullptr, 0, nullptr, 0, seld, nseld);
+    CU(cudaDeviceSynchronize());
+    auto hbd = host(out_blk_d, D), hbs = host(out_blk_sp, D);
+    expect("q8_quest_sparse block (T=4, needle head 0) vs dense", hbs, std::vector<double>(hbd.begin(), hbd.end()), 0.03, 0.03);
+
+    // 3. Auto-bypass check when pos < vram_cap (must be 0.0 exact match!)
+    int pos_short = vcap - 10;
+    CU(cudaMemcpy(posd, &pos_short, 4, cudaMemcpyHostToDevice));
+    k::q8_quest_select(q16d, kc, H, Hkv, posd, 1, 2, 4, 12, seld, nseld, 0);
+    CU(cudaMemcpy(&nsel_h, nseld, 4, cudaMemcpyDeviceToHost));
+    if (nsel_h != 0) { std::printf("FAIL q8_quest_sparse auto-bypass expected nsel=0 got %d\n", nsel_h); ++g_fail; }
+    else std::printf("ok   q8_quest_sparse auto-bypass when pos < vram_cap (nsel=0)\n");
+
+    cudaFree(kc.q); cudaFree(kc.s); cudaFree(vc.q); cudaFree(vc.s);
+    cudaFree(kc.kmin); cudaFree(kc.kmax); cudaFree(kc.ks_mm);
+    cudaFreeHost(hkq); cudaFreeHost(hks); cudaFreeHost(hvq); cudaFreeHost(hvs);
+    cudaFree(kd); cudaFree(vd); cudaFree(qd); cudaFree(q16d); cudaFree(rd); cudaFree(projd);
+    cudaFree(sinkd); cudaFree(scratch); cudaFree(out_dense); cudaFree(out_sp);
+    cudaFree(out_blk_d); cudaFree(out_blk_sp); cudaFree(posd); cudaFree(seld); cudaFree(nseld);
+    cudaFree(qtmp); cudaFree(rtmp);
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3137,6 +3274,7 @@ int main() {
     test_fp8_kv();
     test_q4_kv();
     test_q8_kv();
+    test_q8_quest_sparse();
     test_round6();
     if (!k::attn_flash_available()) std::printf("skip attn_flash: not built for this GPU\n");
     else if (k::arch_class() >= 80) test_attn_flash();   // (last: its random data leaves the others' as they were)

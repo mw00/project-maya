@@ -66,7 +66,7 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
         cnt->tier += (unsigned long long) n_tier;
         cnt->stage += (unsigned long long) n_stage;
         cnt->fetched += (unsigned long long) n_fetch;
-        cnt->bytes += (unsigned long long) n_fetch * hstride;
+        cnt->bytes += (unsigned long long) n_fetch * (hstride ? hstride : st.sb);
     }
 }
 
@@ -136,7 +136,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
                     dc.ghost[key] = es;
                     uint8_t* dst = st.data + (size_t) ss * st.sb;
                     blob[i] = dst;
-                    fl->src[n_fetch] = host + (size_t) top[i] * hstride;
+                    fl->src[n_fetch] = off_src(host, hstride, top[i]);
                     fl->dst[n_fetch] = dst;
                     if (cls) cls[i] = 1;
                     ++n_fetch;
@@ -180,7 +180,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
         dc.freq[v] = (uint8_t) (is_ghost ? 2 : 0);
         uint8_t* dst = dc.data + (size_t) v * dc.sb;
         blob[i] = dst;
-        fl->src[n_fetch] = host + (size_t) top[i] * hstride;
+        fl->src[n_fetch] = off_src(host, hstride, top[i]);
         fl->dst[n_fetch] = dst;
         if (cls) cls[i] = 1;
         ++n_fetch;
@@ -190,7 +190,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
     cnt->tier += (unsigned long long) n_hit;
     cnt->stage += (unsigned long long) n_stage;
     cnt->fetched += (unsigned long long) n_fetch;
-    cnt->bytes += (unsigned long long) n_fetch * hstride;
+    cnt->bytes += (unsigned long long) n_fetch * (hstride ? hstride : dc.sb);
 }
 
 
@@ -357,7 +357,7 @@ __global__ void off_cache_plan_lfu_kernel(const uint8_t** blob, const int* __res
                     st.used[ss] = seq;
                     uint8_t* dst = st.data + (size_t) ss * st.sb;
                     blob[i] = dst;
-                    fl->src[s_n_fetch] = host + (size_t) top[i] * hstride;
+                    fl->src[s_n_fetch] = off_src(host, hstride, top[i]);
                     fl->dst[s_n_fetch] = dst;
                     if (cls) cls[i] = 1;
                     ++s_n_fetch;
@@ -373,7 +373,7 @@ __global__ void off_cache_plan_lfu_kernel(const uint8_t** blob, const int* __res
                 dc.used[v] = seq;
                 uint8_t* dst = dc.data + (size_t) v * dc.sb;
                 blob[i] = dst;
-                fl->src[s_n_fetch] = host + (size_t) top[i] * hstride;
+                fl->src[s_n_fetch] = off_src(host, hstride, top[i]);
                 fl->dst[s_n_fetch] = dst;
                 if (cls) cls[i] = 1;
                 ++s_n_fetch;
@@ -388,7 +388,7 @@ __global__ void off_cache_plan_lfu_kernel(const uint8_t** blob, const int* __res
         cnt->tier += (unsigned long long) s_n_hit;
         cnt->stage += (unsigned long long) s_n_stage;
         cnt->fetched += (unsigned long long) s_n_fetch;
-        cnt->bytes += (unsigned long long) s_n_fetch * hstride;
+        cnt->bytes += (unsigned long long) s_n_fetch * (hstride ? hstride : dc.sb);
     }
 }
 
@@ -503,7 +503,7 @@ __global__ void off_lane_plan_kernel(const uint8_t** blob, const int* __restrict
         cnt->tier += (unsigned long long) (n_gpu - n_stage);
         cnt->stage += (unsigned long long) n_stage;
         cnt->fetched += (unsigned long long) n_fetch;
-        cnt->bytes += (unsigned long long) n_fetch * hstride;
+        cnt->bytes += (unsigned long long) n_fetch * (hstride ? hstride : st.sb);
         cnt->cpu += (unsigned long long) n_cpu;
     }
     if (n_cpu > 0) {   // the input beside the job, then the flag the lane waits for

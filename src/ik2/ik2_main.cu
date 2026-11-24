@@ -517,6 +517,8 @@ bool g_kv_q4_stream = false;
 bool g_kv_q8 = false;
 bool g_kv_q8_stream = false;   // (IK2_KV=q8: Q8_32 rows past VRAM share stream from hugepage pinned host RAM)   // (IK2_KV=q4: the Q4 rows past their VRAM share stream from pinned host RAM, IK2_KV_STREAM)
 int g_kv_vram_mb = 64;
+int g_kv_sparse = 0;        // IK2_KV_SPARSE=K_pages: Quest page-filtered sparse INT8 KV (B=128) past vram_cap
+int g_kv_sparse_local = 6;  // IK2_KV_SPARSE_LOCAL=L: always-kept trailing local pages (default 6 = 768 toks)
 bool g_off_dynamic = false; // IK2_OFF_DYNAMIC=1: GPU-side dynamic Clock-LFU expert cache inside token CUDA graph
 int g_split_mode = 1;       // IK2_SPLIT: 0 the old sequential path, 1 fork+split, 2 fork, GEMMs unsplit (tests)
 int g_pf_prom = getenv("IK2_PF_PROM") ? std::atoi(getenv("IK2_PF_PROM")) : 1;
@@ -1369,6 +1371,7 @@ struct Work {
     uint8_t *rg_h = nullptr, *rg_d = nullptr;
     int rg_slots = 0, rg_groups = 0;
     size_t rg_bytes = 0;
+    int *q8_sel = nullptr, *q8_nsel = nullptr;   // Quest sparse page selection [KV][kQuestMaxPages], [1]
 };
 
 // --serve: SIGUSR1 asks the request running to stop (its client went away) at its next token or prompt chunk
@@ -1753,6 +1756,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         k::prep_qkv_r_q8(q_p, Ly.q_clip, W.kconv, Ly.kcq8, W.vconv, Ly.vcq8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                          c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                          Ly.kv_cap, g_s);
+        if (Ly.kcq8.kmin) k::q8_update_page_bounds(Ly.kcq8, c.KV, pos0, T, g_s);
     } else if (g_kv_q4) {
         k::prep_qkv_r_q4(q_p, Ly.q_clip, W.kconv, Ly.kc4, W.vconv, Ly.vc4, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                          c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
@@ -2905,9 +2909,16 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::prep_qkv_r_q8_at(q_p, Ly.q_clip, W.kconv, Ly.kcq8, W.vconv, Ly.vcq8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                 c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16, g_s,
                                 Ly.sink16, W.xq, C, W.sink);
-            if (mma)
+            if (Ly.kcq8.kmin) k::q8_update_page_bounds_at(Ly.kcq8, c.KV, W.pos, 1, g_s);
+            if (mma) {
+                const bool use_sp = Ly.kcq8.kmin && g_kv_sparse > 0 && W.q8_sel;
+                if (use_sp)
+                    k::q8_quest_select(q16, Ly.kcq8, c.H, c.KV, W.pos, 1, 2, g_kv_sparse_local, g_kv_sparse,
+                                       W.q8_sel, W.q8_nsel, g_s);
                 k::attn_decode_mma_q8(q16, r_p, W.sink, Ly.kcq8, Ly.vcq8, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
-                                      Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
+                                      Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s,
+                                      use_sp ? W.q8_sel : nullptr, use_sp ? W.q8_nsel : nullptr);
+            }
             else
                 k::attn_decode_q8_at(q_p, r_p, W.sink, Ly.kcq8, Ly.vcq8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
@@ -3016,7 +3027,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             if (g_off_dynamic) {
                 const auto& dc = g_offs.dcache[g_dev[0].EC.layer_pool[l]];
                 static const bool g_ghost_bypass = getenv("IK2_GHOST_BYPASS") && std::atoi(getenv("IK2_GHOST_BYPASS"));
-                k::off_cache_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl, g_offs.cnt,
+                k::off_cache_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, dc, g_offs.fl, g_offs.cnt,
                                   g_offs.heat, g_offs.cls_dyn, g_s, (g_ghost_bypass || dc.lfu_mode) ? &st : nullptr);
                 if (fork) {   // the split: the copy stream fetches this visit's misses while the residents compute
                     CU(cudaEventRecord(g_cap_ev[2 * vis], g_s));
@@ -3935,10 +3946,17 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                                         Ly.vcq8, rt, Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, pt,
                                         !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16t, g_s, Ly.sink16,
                                         W.xq + (size_t) t * C, C, sk);
-                    if (mma)
+                    if (Ly.kcq8.kmin) k::q8_update_page_bounds_at(Ly.kcq8, c.KV, pt, 1, g_s);
+                    if (mma) {
+                        const bool use_sp = Ly.kcq8.kmin && g_kv_sparse > 0 && W.q8_sel;
+                        if (use_sp)
+                            k::q8_quest_select(q16t, Ly.kcq8, c.H, c.KV, pt, 1, 2, g_kv_sparse_local, g_kv_sparse,
+                                               W.q8_sel, W.q8_nsel, g_s);
                         k::attn_decode_mma_q8(q16t, rt, sk, Ly.kcq8, Ly.vcq8, ring, c.H, c.KV, pt, 0, ns, qk_scale,
                                               Ly.rel_proj, c.d_rel, extent, window, W.lg, ot, gt,
-                                              W.x16 + (size_t) t * HD, g_s);
+                                              W.x16 + (size_t) t * HD, g_s,
+                                              use_sp ? W.q8_sel : nullptr, use_sp ? W.q8_nsel : nullptr);
+                    }
                     else
                         k::attn_decode_q8_at(qt, rt, sk, Ly.kcq8, Ly.vcq8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, pt, P,
                                              qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, ot, g_s);
@@ -3986,9 +4004,15 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::prep_qkv_r_q8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kcq8, W.vconv, Ly.vcq8, r_p, r_ld, Ly.r_clip, T, c.H,
                                    c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
                                    c.n_floor, Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+            if (Ly.kcq8.kmin) k::q8_update_page_bounds_at(Ly.kcq8, c.KV, W.pos, T, g_s);
+            const bool use_sp = Ly.kcq8.kmin && g_kv_sparse > 0 && W.q8_sel;
+            if (use_sp)
+                k::q8_quest_select(q16, Ly.kcq8, c.H, c.KV, W.pos, T, 2, g_kv_sparse_local, g_kv_sparse,
+                                   W.q8_sel, W.q8_nsel, g_s);
             const int ns_blk = std::min(ns, std::max(1, (int) (W.lg_cap / ((size_t) 4 * T * c.H * 130))));
             k::attn_block_q8(q16, r_p, r_ld, W.sink, Ly.kcq8, Ly.vcq8, ring, c.H, c.KV, W.pos, T, ns_blk, qk_scale,
-                             Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s);
+                             Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s,
+                             use_sp ? W.q8_sel : nullptr, use_sp ? W.q8_nsel : nullptr);
         } else if (g_kv_q4) {
             k::prep_qkv_r_q4_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc4, W.vconv, Ly.vc4, r_p, r_ld, Ly.r_clip, T, c.H,
                                    c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
@@ -4045,7 +4069,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             const auto& dc = g_offs.dcache[g_dev[0].EC.layer_pool[l]];
             static const bool g_ghost_bypass = getenv("IK2_GHOST_BYPASS") && std::atoi(getenv("IK2_GHOST_BYPASS"));
             const auto& st_blk = g_offs.stage[g_offs.pool[l]];
-            k::off_cache_plan(g_blk.blob_pp, rtop, S, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl,
+            k::off_cache_plan(g_blk.blob_pp, rtop, S, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, dc, g_offs.fl,
                               g_offs.cnt, g_offs.heat, split_moe ? g_offs.cls_dyn : nullptr, g_s,
                               (g_ghost_bypass || dc.lfu_mode) ? &st_blk : nullptr);
             if (fork) {
@@ -6185,6 +6209,13 @@ int main(int argc, char** argv) {
     g_kv_q4_stream = g_kv_q4 && getenv("IK2_KV_STREAM") && std::atoi(getenv("IK2_KV_STREAM"));
     g_kv_q8_stream = g_kv_q8 && getenv("IK2_KV_STREAM") && std::atoi(getenv("IK2_KV_STREAM"));
     if (getenv("IK2_KV_VRAM_MB")) g_kv_vram_mb = std::max(0, std::atoi(getenv("IK2_KV_VRAM_MB")));
+    if (getenv("IK2_KV_SPARSE")) {
+        int ks = std::atoi(getenv("IK2_KV_SPARSE"));
+        g_kv_sparse = ks > 0 ? std::max(10, std::min(ks, k::kQuestMaxPages)) : 0;
+    } else if (g_kv_q8_stream && ctx > 8192) {
+        g_kv_sparse = 16;   // Quest sparse default for streamed INT8 long-ctx (auto-dense <= vram_cap; 0 disables)
+    }
+    g_kv_sparse_local = getenv("IK2_KV_SPARSE_LOCAL") ? std::max(2, std::min(32, std::atoi(getenv("IK2_KV_SPARSE_LOCAL")))) : 4;
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
@@ -6993,6 +7024,13 @@ int main(int argc, char** argv) {
             };
             alloc_q8(Vi.kcq8);
             alloc_q8(Vi.vcq8);
+            if (g_kv_sparse > 0 && !Ly.sliding) {
+                const int mp = (Vi.kv_cap + k::kQuestPage - 1) / k::kQuestPage;
+                Vi.kcq8.max_pages = mp;
+                Vi.kcq8.kmin = dalloc<int8_t>((size_t) mp * c.KV * 128);
+                Vi.kcq8.kmax = dalloc<int8_t>((size_t) mp * c.KV * 128);
+                Vi.kcq8.ks_mm = dalloc<uint16_t>((size_t) mp * c.KV * 4);
+            }
         } else if (g_kv_q4) {
             if (c.D != 128) die("IK2_KV=q4 requires head_dim == 128");
             int n_full_vis = 0;
@@ -7121,6 +7159,7 @@ int main(int argc, char** argv) {
             if (g_kv_q8) {
                 const size_t row_b = (size_t) c.KV * (128 + 8) * 2;
                 kv_vram += (size_t) Vi.kcq8.vram_cap * row_b;
+                if (Vi.kcq8.kmin) kv_vram += (size_t) Vi.kcq8.max_pages * c.KV * (256 + 8);
                 kv_host += (size_t) (Vi.kv_cap - Vi.kcq8.vram_cap) * row_b;
             } else if (g_kv_q4) {
                 const size_t row_b = (size_t) c.KV * (64 + 8) * 2;
@@ -7130,6 +7169,9 @@ int main(int argc, char** argv) {
                 kv_vram += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
             }
         }
+        if (g_kv_q8 && g_kv_sparse > 0)
+            std::printf("kv sparse (Quest): page=%d, budget=%d pages (%d tokens), sink=2, local=%d (auto-dense <= vram_cap)\n",
+                        k::kQuestPage, g_kv_sparse, g_kv_sparse * k::kQuestPage, g_kv_sparse_local);
         std::printf("kv cache: %s (%.2f GiB VRAM%s across %d layer%s)\n",
                     g_kv_q8 ? (kv_host ? "INT8 Q8_32 + host-stream" : "INT8 Q8_32")
                             : (g_kv_q4 ? (kv_host ? "INT4 Q4_32 + host-stream" : "INT4 Q4_32") : (g_kv_fp8 ? "FP8 E4M3" : "FP16")),
@@ -7161,6 +7203,10 @@ int main(int argc, char** argv) {
     // reserved here (no RAM), the tier planned on the real free VRAM (EC.init), copied in from where the files are
     // mapped, then the rest read and pinned (below the warm) - an 8 GB card's tier is RAM a 16 GB PC does not need.
     // Linux, where the GPU reads a registered range at its own address; IK2_PIN_ALL=1: every expert pinned here.
+    const char* penv_early = getenv("IK2_PIN_M");
+    const int pin_m_want = (penv_early && *penv_early)
+                               ? std::clamp(std::atoi(penv_early), 0, c.n_layer * c.E)
+                               : ((g_kv_q8_stream && ctx > 131072 && getenv("IK2_WARM") && *getenv("IK2_WARM")) ? 720 : 0);
     bool pin_later = false;
 #ifndef _WIN32
     if (!host_mmap && g_off_want && !(getenv("IK2_PIN_ALL") && std::atoi(getenv("IK2_PIN_ALL"))) &&
@@ -7169,7 +7215,10 @@ int main(int argc, char** argv) {
         int dv = 0, same = 0;
         CU(cudaGetDevice(&dv));
         CU(cudaDeviceGetAttribute(&same, cudaDevAttrCanUseHostPointerForRegisteredMem, dv));
-        pin_later = !g_off_dynamic && same && host_register_works();
+        if ((!g_off_dynamic || pin_m_want > 0) && host_register_works()) {
+            pin_later = true;
+            if (!same) g_offs.tab = true;
+        }
     }
 #else
     // (Windows: the GPU does not read a registered range at its own address - each run of experts registered has a
@@ -7582,6 +7631,10 @@ int main(int argc, char** argv) {
         W.rg_h = halloc_flex<uint8_t>(W.rg_bytes);
         W.rg_d = dalloc<uint8_t>(W.rg_bytes);
     }
+    if (g_kv_q8 && g_kv_sparse > 0) {
+        W.q8_sel = dalloc<int>((size_t) c.KV * k::kQuestMaxPages);
+        W.q8_nsel = dalloc<int>(1);
+    }
     W.cand_d = dalloc<int>(2 + 2 * kCandCap);
     W.cand_part = dalloc<int>(k::cand_scratch(c.n_vocab));
     const int n_ev = (c.E + Work::kMissBatch - 1) / Work::kMissBatch;
@@ -7769,18 +7822,53 @@ int main(int argc, char** argv) {
         }
     }
     if (g_off_want && d == 0) {   // the offload path: the tier is what the cache holds (warmed above), tables a layer
+        std::vector<uint8_t> pinh_pre;
+        int pin_np_pre = 0;
+        std::vector<int> pin_pools_pre;
+        if (g_off_dynamic && pin_m_want > 0) {
+            const int n_keys_p = c.n_layer * c.E;
+            std::vector<uint64_t> pcnt((size_t) n_keys_p, 0);
+            const char* wfp = getenv("IK2_WARM");
+            if (wfp && *wfp) {
+                FILE* pin_in = std::fopen(wfp, "rb");
+                int32_t ph[2] = {0, 0};
+                if (pin_in && std::fread(ph, 4, 2, pin_in) == 2 && ph[0] == c.n_layer && ph[1] == c.E &&
+                    std::fread(pcnt.data(), 8, pcnt.size(), pin_in) == pcnt.size()) {}
+                else std::printf("pin: the profile read failed; the pin stays off\n");
+                if (pin_in) std::fclose(pin_in);
+            }
+            std::vector<int> rid;
+            for (int k2 = 0; k2 < n_keys_p; ++k2)
+                if (EC.loc[k2] >= 0 && pcnt[k2] > 0) rid.push_back(k2);
+            std::stable_sort(rid.begin(), rid.end(), [&](int a, int b) { return pcnt[a] > pcnt[b]; });
+            pinh_pre.assign((size_t) n_keys_p, 0);
+            pin_pools_pre.assign(EC.pools.size(), 0);
+            for (int k2 : rid) {
+                const size_t pp = (size_t) EC.layer_pool[k2 / c.E];
+                if (pin_pools_pre[pp] >= EC.pools[pp].n_slots - 8) continue;
+                if (pin_np_pre >= pin_m_want) break;
+                pinh_pre[k2] = 1;
+                ++pin_pools_pre[pp];
+                ++pin_np_pre;
+            }
+        }
         if (pin_later) {   // the experts the tier does not hold: read into their blocks, then pinned a run at a time
             const double tp0 = now();
-            for (int l = 0; l < c.n_layer; ++l)
-                for (int e = 0; e < c.E; ++e) M.L[l].nopin[e] = EC.loc[(size_t) l * c.E + e] >= 0;
+            if (g_off_dynamic && !pinh_pre.empty()) {
+                for (int l = 0; l < c.n_layer; ++l)
+                    for (int e = 0; e < c.E; ++e) M.L[l].nopin[e] = pinh_pre[(size_t) l * c.E + e];
+            } else {
+                for (int l = 0; l < c.n_layer; ++l)
+                    for (int e = 0; e < c.E; ++e) M.L[l].nopin[e] = EC.loc[(size_t) l * c.E + e] >= 0;
+            }
 #ifdef _WIN32
             SYSTEM_INFO si{};
             GetSystemInfo(&si);
             const size_t pg = si.dwPageSize;
-            g_offs.htab_h.assign((size_t) c.n_layer * c.E, nullptr);
 #else
             const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
 #endif
+            if (g_offs.tab) g_offs.htab_h.assign((size_t) c.n_layer * c.E, nullptr);
             auto runs_of = [&](int l, auto&& f) {   // f(e0, n): a run of the layer's experts not in the tier
                 const auto& np = M.L[l].nopin;
                 for (int e = 0; e < c.E;) {
@@ -7832,6 +7920,7 @@ int main(int argc, char** argv) {
                             const auto ab = run_span(J.l, e0, n);
                             const uintptr_t a = ab.first, b = ab.second;
                             void* dp = nullptr;
+                            ::madvise((void*) a, b - a, MADV_HUGEPAGE);
                             if (cudaHostRegister((void*) a, b - a, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
                                 cudaGetLastError(), ++fails;
                                 return;
@@ -7840,18 +7929,18 @@ int main(int argc, char** argv) {
                                 std::lock_guard<std::mutex> lk(rm);
                                 pin.runs.push_back({(void*) a, (size_t) (b - a)});
                             }
-#ifdef _WIN32
-                            // (the run's own device address: each of its experts' in the table)
-                            if (cudaHostGetDevicePointer(&dp, (void*) a, 0) != cudaSuccess || !dp)
-                                cudaGetLastError(), ++fails;
-                            else
-                                for (int e = e0; e < e0 + n; ++e)
-                                    g_offs.htab_h[(size_t) J.l * c.E + e] =
-                                        (const uint8_t*) dp + ((uintptr_t) blk + (size_t) e * Ly.slot_bytes - a);
-#else
-                            if (cudaHostGetDevicePointer(&dp, (void*) a, 0) != cudaSuccess || dp != (void*) a)
-                                cudaGetLastError(), ++fails;
-#endif
+                            if (g_offs.tab) {
+                                // (the run's own device address: each of its experts' in the table)
+                                if (cudaHostGetDevicePointer(&dp, (void*) a, 0) != cudaSuccess || !dp)
+                                    cudaGetLastError(), ++fails;
+                                else
+                                    for (int e = e0; e < e0 + n; ++e)
+                                        g_offs.htab_h[(size_t) J.l * c.E + e] =
+                                            (const uint8_t*) dp + ((uintptr_t) blk + (size_t) e * Ly.slot_bytes - a);
+                            } else {
+                                if (cudaHostGetDevicePointer(&dp, (void*) a, 0) != cudaSuccess || dp != (void*) a)
+                                    cudaGetLastError(), ++fails;
+                            }
                             pinned += (size_t) n * Ly.slot_bytes;
                         });
                     }
@@ -7867,9 +7956,6 @@ int main(int argc, char** argv) {
                 if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*) &pm, sizeof pm))
                     anon = pm.PrivateUsage / 1073741824.0;
             }
-            g_offs.htab_d = dalloc<const uint8_t*>(g_offs.htab_h.size());
-            CU(cudaMemcpy(g_offs.htab_d, g_offs.htab_h.data(), g_offs.htab_h.size() * sizeof(void*),
-                          cudaMemcpyHostToDevice));
 #else
             if (FILE* f = std::fopen("/proc/self/status", "r")) {
                 char ln[256];
@@ -7878,6 +7964,11 @@ int main(int argc, char** argv) {
                 std::fclose(f);
             }
 #endif
+            if (g_offs.tab) {
+                g_offs.htab_d = dalloc<const uint8_t*>(g_offs.htab_h.size());
+                CU(cudaMemcpy(g_offs.htab_d, g_offs.htab_h.data(), g_offs.htab_h.size() * sizeof(void*),
+                              cudaMemcpyHostToDevice));
+            }
             std::printf("experts in pinned memory: %.1f GiB (the %.1f GiB the tier holds not in RAM), read and pinned in "
                         "%.1f s; the engine's RAM %.1f GiB in all\n", pinned.load() / 1073741824.0,
                         (host_total - pinned.load()) / 1073741824.0, now() - tp0, anon);
@@ -7927,40 +8018,13 @@ int main(int argc, char** argv) {
                     if (EC.loc[k2] >= 0) init_sc[k2] = lfu_seed;
                 CU(cudaMemcpy(g_offs.dcache_score, init_sc.data(), n_keys * sizeof(uint32_t), cudaMemcpyHostToDevice));
             }
-            const char* penv = getenv("IK2_PIN_M");   // (PF-B': the eviction pin - the decode's Clock-LFU walk skips the pinned pairs)
-            int pin_m = penv && *penv ? std::clamp(std::atoi(penv), 0, (int) n_keys) : 0;
-            if (pin_m > 0) {
-                std::vector<uint64_t> pcnt((size_t) c.n_layer * c.E, 0);
-                const char* wfp = getenv("IK2_WARM");
-                if (wfp && *wfp) {
-                    FILE* pin_in = std::fopen(wfp, "rb");
-                    int32_t ph[2] = {0, 0};
-                    if (pin_in && std::fread(ph, 4, 2, pin_in) == 2 && ph[0] == c.n_layer && ph[1] == c.E &&
-                        std::fread(pcnt.data(), 8, pcnt.size(), pin_in) == pcnt.size()) {}
-                    else std::printf("pin: the profile read failed; the pin stays off\n");
-                    if (pin_in) std::fclose(pin_in);
-                }
-                std::vector<int> rid;
-                for (int k2 = 0; k2 < n_keys; ++k2)
-                    if (EC.loc[k2] >= 0 && pcnt[k2] > 0) rid.push_back(k2);
-                std::stable_sort(rid.begin(), rid.end(), [&](int a, int b) { return pcnt[a] > pcnt[b]; });
-                std::vector<uint8_t> pinh((size_t) c.n_layer * c.E, 0);
-                std::vector<int> pinned(EC.pools.size(), 0);
-                int np = 0;
-                for (int k2 : rid) {
-                    const size_t pp = (size_t) EC.layer_pool[k2 / c.E];
-                    if (pinned[pp] >= EC.pools[pp].n_slots - 4) continue;   // (the walk must always find a victim)
-                    if (np >= pin_m) break;
-                    pinh[k2] = 1;
-                    ++pinned[pp];
-                    ++np;
-                }
-                if (np > 0) {
-                    g_offs.dcache_pin = dalloc<uint8_t>((size_t) c.n_layer * c.E);
-                    CU(cudaMemcpy(g_offs.dcache_pin, pinh.data(), (size_t) c.n_layer * c.E, cudaMemcpyHostToDevice));
-                }
-                std::printf("pin: %d pairs pinned (pool0 %d, pool1 %d)\n", np, pinned.size() > 0 ? pinned[0] : 0,
-                            pinned.size() > 1 ? pinned[1] : 0);
+            if (pin_np_pre > 0 && !pinh_pre.empty()) {
+                g_offs.dcache_pin = dalloc<uint8_t>((size_t) c.n_layer * c.E);
+                CU(cudaMemcpy(g_offs.dcache_pin, pinh_pre.data(), (size_t) c.n_layer * c.E, cudaMemcpyHostToDevice));
+                std::printf("pin: %d pairs pinned in VRAM (pool0 %d, pool1 %d; %s)\n", pin_np_pre,
+                            pin_pools_pre.size() > 0 ? pin_pools_pre[0] : 0,
+                            pin_pools_pre.size() > 1 ? pin_pools_pre[1] : 0,
+                            pin_later ? "excluded from host RAM" : "also on host");
             }
             g_offs.dcache.resize(EC.pools.size());
             for (size_t p = 0; p < EC.pools.size(); ++p) {

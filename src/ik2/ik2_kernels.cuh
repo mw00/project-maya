@@ -109,12 +109,20 @@ struct KvQ4 {
 /// INT8 (Q8_32, group size 32) KV cache descriptor with optional VRAM/mapped-host split for 128K streaming.
 /// Each 128-dim head stores 128 bytes of symmetric signed int8 ([-127, 127]) and 4 FP16 scales (136 B/head).
 /// Slots [0 .. vram_cap) live in VRAM (q, s); slots [vram_cap .. kv_cap) live in mapped pinned host RAM (q_host, s_host).
+constexpr int kQuestPage = 128;
+constexpr int kQuestMaxPages = 64;
+
 struct KvQ8 {
     int8_t* q = nullptr;
     uint16_t* s = nullptr;
     int8_t* q_host = nullptr;
     uint16_t* s_host = nullptr;
     int vram_cap = 0;
+    // Optional Quest page bounding boxes in VRAM for sparse long-context decode (full visits only)
+    int8_t* kmin = nullptr;      // [max_pages][Hkv][128]
+    int8_t* kmax = nullptr;      // [max_pages][Hkv][128]
+    uint16_t* ks_mm = nullptr;   // [max_pages][Hkv][4]
+    int max_pages = 0;
 };
 
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
@@ -397,14 +405,18 @@ void prep_qkv_r_q8_at(float* q, const float* q_clip, const float* k_in, KvQ8 kc,
 void attn_decode_q8_at(const float* q, const float* r, const float* sink, KvQ8 kc, KvQ8 vc, int kv_cap, int H, int Hkv,
                        const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
                        float* scratch, float* out, cudaStream_t s);
+void q8_update_page_bounds(KvQ8 kc, int Hkv, int pos0, int T, cudaStream_t s);
+void q8_update_page_bounds_at(KvQ8 kc, int Hkv, const int* pos_d, int T, cudaStream_t s);
+void q8_quest_select(const uint16_t* q16, KvQ8 kc, int H, int Hkv, const int* pos_d, int T, int n_sink, int n_local,
+                     int k_budget, int* sel_out, int* nsel_out, cudaStream_t s);
 void attn_decode_mma_q8(const uint16_t* q16, const float* r, const float* sink, KvQ8 kc, KvQ8 vc, int kv_cap, int H,
                         int Hkv, const int* pos, int qpos, int n_split, float qk_scale, const float* proj, int d_rel,
                         int extent, int window, float* scratch, float* out, const float* gate, uint16_t* out16,
-                        cudaStream_t s);
+                        cudaStream_t s, const int* sel_pages = nullptr, const int* nsel_d = nullptr);
 void attn_block_q8(const uint16_t* q16, const float* r, int r_ld, const float* sink, KvQ8 kc, KvQ8 vc, int kv_cap,
                    int H, int Hkv, const int* pos, int T, int n_split, float qk_scale, const float* proj, int d_rel,
                    int extent, int window, float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
-                   cudaStream_t s);
+                   cudaStream_t s, const int* sel_pages = nullptr, const int* nsel_d = nullptr);
 void prep_qkv_r_q8_block(float* q, int q_ld, const float* q_clip, const float* k_in, KvQ8 kc, const float* v_in,
                          KvQ8 vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
                          float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
