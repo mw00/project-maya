@@ -2501,8 +2501,9 @@ def child_env(cfg: dict) -> dict:
     # lane kernels (maya --speed-calibration measures again)
     # GLM's CPU lane: its timing (an expert on the CPU vs over PCIe), which plans the split of RAM-tier experts between
     # the CPU and the GPU, timed at the first start on this PC and kept - re-timed at every start it moved experts
-    # between the two (other bits) and so the same request's greedy answer from start to start (the engine re-times
-    # by itself when decode drifts from it for 5 requests in a row; a new build has its own entry)
+    # between the two (other bits) and so the same request's greedy answer from start to start.  The entry is the
+    # PC's (its CPU, the model, the card and the lane's threads), not a build's: an update keeps it, and with it the
+    # answers; maya --speed-calibration times again and replaces it only when the new timing is clearly faster
     if models.family(cfg) == "glm":
         env.setdefault("MAYA_GLM_CPU_CAL", str(GLM_CPU_CAL_FILE))
     if models.family(cfg) == "hy4":

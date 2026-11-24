@@ -5491,6 +5491,35 @@ def ik2_draft_forget() -> None:
         warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
 
 
+def glm_lane_timing_again(cfg: dict) -> int:
+    """--speed-calibration: the GLM engine's saved CPU lane timing (data/glm-cpu-cal.txt, or the config's own
+    MAYA_GLM_CPU_CAL) is marked "redo": the next start of each GPU times its lane again and keeps the saved values
+    unless a new one is clearly faster (more than 25%), so the same PC measured at another moment plans - and
+    answers - as before.  The lines marked."""
+    path = Path((cfg.get("env") or {}).get("MAYA_GLM_CPU_CAL") or ROOT / "data" / "glm-cpu-cal.txt")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    out, n = [], 0
+    for line in lines:
+        key, tab, vals = line.rpartition("\t")
+        if tab and key.startswith("cal") and "redo" not in vals.split():
+            line, n = f"{key}\t{vals} redo", n + 1
+        out.append(line)
+    if n:
+        try:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            warn(f"{path} could not be written ({e}): the CPU lane's timing stays as saved")
+            return 0
+        ok("the CPU lane's timing is taken again at the next start (the saved one stays unless the new one is "
+           "more than 25% faster)")
+    return n
+
+
 def route_forget() -> None:
     """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
     so the engine measures them again - in the CPU lane check's run below, else at the next start (before it is
@@ -5729,6 +5758,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
+    if why == "asked for":                             # (--speed-calibration: the GLM CPU lane's timing again too)
+        glm_lane_timing_again(cfg)
     if g53_one_gpu_drafting(cfg):
         return speed_calibration_g53(cfg_path, cfg, why)
     if glm_draft_length_candidate(cfg):
