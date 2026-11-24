@@ -35,12 +35,12 @@
   "amd": "dspark-Inkling-2-Mini-Q8_0.gguf"
  },
  "ablate": {
-  "_": "Refusal ablation: the model's direction file (a control vector, tools/ablate_fit.py) from Maya's own repo, folder refusal-directions/. The revision and the sha256 are PLACEHOLDERs until the file is uploaded: until then the setup reads the repo's main and checks the file's shape alone, as it does for every other model's direction (maya.ablate_pin).",
+  "_": "Refusal ablation: the model's direction file (a control vector, tools/ablate_fit.py) from Maya's own repo, folder refusal-directions/. Pinned by revision and sha256 (maya.ablate_pin).",
   "repo": "peasantsmith/Inkling-2-Mini-Maya-GGUF",
-  "revision": "PLACEHOLDER",
+  "revision": "435f1723e836f0acd6400b041ec76fd453d6b7dd",
   "folder": "refusal-directions",
   "files": {
-   "Inkling-2-Mini-refusal-direction.gguf": [9760, "PLACEHOLDER"]
+   "Inkling-2-Mini-refusal-direction.gguf": [9760, "0b953fc37e8490a95b2af9e11ff11ad5b33f8a873c3a49f328f19ebe047b129f"]
   }
  }
 }
