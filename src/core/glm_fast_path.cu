@@ -738,6 +738,11 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
     while (done < len) {
         const ssize_t r = pread(sh.fd, dst + done, len - done, (off_t) (off + done));
         if (r <= 0) {
+            if (sh.base == nullptr) {   // the views went after the load (pack_release_views): nothing to fall back to
+                std::fprintf(stderr, "glm fast: an expert read of %s failed - MAYA_GLM_KEEP_MAP=1 keeps the mapping "
+                                     "to fall back to\n", sh.path.c_str());
+                std::abort();
+            }
             std::memcpy(dst + done, sh.base + off + done, len - done);
             return;
         }
