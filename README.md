@@ -410,6 +410,8 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
 - **Built on [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License, Copyright (c) 2023-2026 The ggml
   authors): the quantization formats, the CPU dot products and the prompt path's MMQ kernels, built from a pinned
   commit (`third_party/ggml/LICENSE`).
+- **Started from [Strata](https://github.com/Niko1221/Strata)** (MIT License, Copyright (c) 2026 Niko1221 and the Strata
+  contributors).
 - **EXL3 support** follows [exllamav3](https://github.com/turboderp-org/exllamav3)'s format, codebooks, CPU expert
   kernel and tensor-core decoding of a tile (MIT License, Copyright (c) 2025 Turboderp; `third_party/exllamav3/LICENSE`). **The DFlash2 drafter's
   forward** follows [beellama.cpp](https://github.com/Anbeeld/beellama.cpp)'s (MIT License, Copyright (c) 2023-2026
