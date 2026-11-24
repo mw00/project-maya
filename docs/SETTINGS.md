@@ -746,6 +746,29 @@ the SSD, and the threads are its queue: on Linux the default is twice the hardwa
 in RAM need few threads, so it matters most for Engram tables on an SSD.
 
 
+## One model on two machines (GLM-5.3-Flash, experimental)
+
+`--role front|back` with `--link host:port` and `--layer-split K` runs one GLM-5.3-Flash model on two machines: the
+front runs layers `[0, K)` and the server, the back the rest and the sampler. It is off without `--role`, and
+nothing below is read then. The setup, the correctness check and the limits are in
+[TWO-RIG-SPLIT.md](TWO-RIG-SPLIT.md).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_GLM_ROLE` (`--role`) | unset (off) | `front` or `back`: this process is one side of a two-machine split at `--layer-split K` (or `K:b1,b2,..` for several local GPUs a side). GLM-5.3-Flash packs only |
+| `MAYA_GLM_LINK` (`--link`) | unset | `host:port`: the back listens there, the front connects there. Needed with a role |
+| `MAYA_GLM_LINK_KEY_FILE` | unset | A file with the link's shared key (32 bytes at least), the same on both sides: every connection is authenticated both ways with HMAC-SHA256. Set but missing or short: the engine stops before it loads. Unset: the engine starts only when the link's address is numeric loopback (`127.0.0.1`) or with `MAYA_GLM_LINK_NO_AUTH=1` |
+| `MAYA_GLM_LINK_NO_AUTH` | `0` | `1`: a link off loopback without a key (a network you trust: the back's address allowlist alone) |
+| `MAYA_GLM_LINK_ALLOW` | loopback only | The back: comma-separated IPv4 addresses a front may connect from |
+| `MAYA_GLM_LINK_BIND` | the `--link` host | The back: the address it listens on (an empty host means loopback; every interface only if you name `0.0.0.0`) |
+| `MAYA_GLM_LINK_BF16` | `1` | Both sides: `1` sends the residual as bf16 (rounded to nearest even, so not bit-exact); `0` sends fp32 (exact, about 2.7× the bytes). The two sides must agree |
+| `MAYA_GLM_LINK_PACK` | `1` with bf16 | Both sides: lossless packing of the bf16 rows (about 12 bits a value). The two sides must agree |
+| `MAYA_GLM_LINK_WAIT` | `1800` | The front: seconds it waits for the back at start |
+| `MAYA_GLM_RELINK_WAIT` | `5` | The front: seconds a command gives the reconnect after a link failure, all of it (connecting, authentication, the settings check). `1` at least |
+| `MAYA_GLM_LINK_DEAD_S` | `30` | Both sides: seconds after which a peer that is gone without a word (its power, a cable) ends the request - TCP keepalive and `TCP_USER_TIMEOUT` on the link's sockets. `0`: off |
+| `MAYA_GLM_LINK_STALL_S` | `60` | Both sides: seconds after which a peer that is connected but sends or takes nothing (a stuck process) ends the request and the link. `0`: off. Keep it under `MAYA_ENGINE_STALL_S` and `MAYA_WATCHDOG_S`, which end the engine instead |
+| `MAYA_GLM_BACK_STAY` | `1` | The back: `1` stays up when a front goes away and accepts the next one; `0` exits |
+
 ## Drafting with DFlash2
 
 `./maya.sh --setup --draft dflash2` downloads the drafter (0.7 GB,
