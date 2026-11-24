@@ -2721,6 +2721,23 @@ def g53_drafting_default(pc: dict, pack, ctx: int, env: dict) -> dict | None:
     return {"on": on, "outside": out}
 
 
+def g53_drafting_line(pc: dict, choice: tuple | None, draft: str) -> str:
+    """The setup's "drafting: ..." line for a model of the GLM-5.3 (744B, glm-dsa) family - what the engine will do
+    (glm_mtp.cu mtp_decode_wanted): on one discrete GPU it keeps the MTP block off (the experts stream from RAM and a
+    verify window reads the union of its rows' experts: measured slower), unless MAYA_GLM_MTP_DECODE=1; on one APU the
+    speed calibration decides (g53_drafting_default sets the first value); on two GPUs or more it drafts."""
+    gpus = pc.get("gpus") or []
+    if draft == "dflash2":
+        return "drafting: a DFlash2 drafter (downloaded with the model)"
+    if pc.get("backend") == "metal" or len(gpus) != 1:
+        return "drafting: the MTP block"
+    if pc.get("backend") == "hip" and hip_unified_memory(gpus[0]):
+        return ("drafting: the MTP block where this PC's memory holds the experts, off where it does not - the first "
+                "speed calibration measures it")
+    return ("drafting: off on this PC (one GPU: GLM-5.3's experts stream from RAM and a drafted window reads more "
+            "of them, so it decodes slower; two GPUs or more draft with the MTP block; MAYA_GLM_MTP_DECODE=1 forces it)")
+
+
 def g53_one_gpu_drafting(cfg: dict) -> bool:
     """A GLM-5.3 config whose one-GPU drafting the speed calibration decides: the setup wrote its default
     (installer.one_gpu_drafting, g53_drafting_default), one conversation at a time, no DFlash2."""
@@ -7544,7 +7561,8 @@ def _set_up(a, prev: dict) -> Path | None:
             ctx = choose_context(a, prev_ctx, recommended=rec_ctx)
     ok(f"context: {ctx} tokens")
     draft = choose_draft(a, pc, inst)
-    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
+    ok(g53_drafting_line(pc, choice, draft) if g53_choice(choice) else
+       "drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
     mixed_builds(a, pc, llama, "maya")                 # (an NVIDIA card beside an AMD GPU: its engine too)
