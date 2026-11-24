@@ -7079,12 +7079,17 @@ def bench_prompt_text(ref: str | None = None) -> str:
 
 
 def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0,
-          lock_ok: bool = False, tokens_file: Path | None = None, text_ref: str | None = None) -> int:
+          lock_ok: bool = False, tokens_file: Path | None = None, text_ref: str | None = None,
+          smoke: bool = False) -> int:
     """--bench: the speed-test standard (tools/maya_bench.py) on the installed model - a quiet-machine check, one engine
     session with a warm-up answer, 3 answers of 256 tokens and the 2K / 8K prompts 3 times each; medians with min-max,
     what drafting chose, the wall time of each phase and one result line (maya-bench-results.txt).  --compare: the same
-    on this build and another, alternated, exactness first.  Writes maya-bench.txt (--report includes it)."""
+    on this build and another, alternated, exactness first.  Writes maya-bench.txt (--report includes it).
+    smoke (--bench-smoke): two short answers and no 2K / 8K prompts - does the model load and answer (the saved
+    answers and the nightly check use it for a model too large for its box); no result line, never a speed number."""
     import socket
+    if smoke and compare:
+        fail("--bench-smoke runs this build alone", "leave --compare out")
     import urllib.request
     cfg = read_json(cfg_path)
     select_build_backend(cfg.get("backend", "cuda"))
@@ -7125,9 +7130,12 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
     try:
         tok = ST.Tokenizer.from_dir(tp)
         ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
-        prompts, warm = MB.plan_prompts(tok.encode(bench_prompt_text(text_ref)), ctx)
         fmt = bench_chat(config_family(cfg), tp)   # (each family's own chat format, thinking off - #416, #549)
         chats = [tok.encode(fmt(q), parse_special=True) for q in BENCH_TOPICS]
+        if smoke:                                # (the last topic warms up, the first ones are the answers)
+            prompts, warm, chats = {}, chats[-1], chats[:MB.SMOKE_ANSWERS]
+        else:
+            prompts, warm = MB.plan_prompts(tok.encode(bench_prompt_text(text_ref)), ctx)
         start = lambda c, cmd, env, tag: (cmd, env, c.get("cwd") or str(ROOT), ROOT / f"maya-bench{tag}.log")  # noqa
         here = start(cfg, [cfg["exe"], "--serve"] + SV.engine_args(cfg), SV.child_env(cfg), "")
         found = S.amd_gpus() if backend == "hip" else S.gpus()
@@ -7140,7 +7148,8 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         choices = MB.choice_files(ROOT, cfg) if tokens_file else {}   # (the saved per-PC choices this run starts from)
         if not compare:
             before = MB.learned_listing(ROOT, cfg)
-            run = MB.run_session(here, chats, prompts, warm, "", say)
+            run = MB.run_session(here, chats, prompts, warm, "", say,
+                                 MB.SMOKE_TOKENS if smoke else MB.DECODE_TOKENS)
             runs = {"this": [run]}
             res = MB.summarize([run], prompts)
             drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"],
@@ -7155,6 +7164,14 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
                                                   "prompt reuse seen" if run["reused"] else "") if x))
             lines = bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, [run], t_quiet, t_all)
             records = [MB.record_line(rec)]
+            if smoke and any(a["produced"] == 0 for a in run["answers"]):
+                fail("the model answered nothing (0 tokens) in the smoke run",
+                     f"its log: {ROOT / 'maya-bench.log'}")
+            if smoke:                            # (not the standard: no result line, the answers are what it is for)
+                lines = [lines[0].replace(" benchmark, ", " smoke run, ")] + lines[1:3] + [
+                    f"{len(run['answers'])} answers of up to {MB.SMOKE_TOKENS} tokens (greedy, thinking off): " +
+                    ", ".join(f"{a['produced']} tokens" for a in run["answers"]) + " - not a speed number", lines[-1]]
+                records = []
         else:
             lines, records, runs = bench_compare(cfg, cfg_path, compare, rounds, here, start, chats, prompts, warm,
                                                  base, version, ctx, args, gpu_text, t_quiet, t_all, SV)
@@ -7165,7 +7182,8 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
             Path(tokens_file).write_text(json.dumps(dict(
                 base, config=str(cfg_path), family=config_family(cfg), backend=backend, gpu_index=gpus or [],
                 context=ctx, commit=MB.commit_of(ROOT), version=version, text_ref=text_ref or "",
-                compare=compare or "", inputs=MB.input_hashes(chats, prompts, warm), choices=choices,
+                compare=compare or "", smoke=bool(smoke), inputs=MB.input_hashes(chats, prompts, warm),
+                choices=choices,
                 heads={k: tok.decode(v[:MB.HEAD_TOKENS]) for k, v in first.items()},
                 runs={k: [r["tokens"] for r in v] for k, v in runs.items()}, records=records)), encoding="utf-8")
     except RuntimeError as e:                    # (the engine stopped or refused, a build failed: said plainly)
@@ -7177,11 +7195,15 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         if (ROOT / "maya-bench.log").exists() else []
     out.write_text("\n".join(lines + records + ["", "engine lines:"] +
                              [x.replace(str(Path.home()), "~") for x in stats[-40:]]) + "\n", encoding="utf-8")
-    with open(ROOT / MB.RESULTS_FILE, "a", encoding="utf-8") as f:
-        f.write("\n".join(records) + "\n")
+    if records:
+        with open(ROOT / MB.RESULTS_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(records) + "\n")
     say()
     for x in lines + [""] + records:
         say("  " + x)
+    if smoke:
+        ok(f"written: {out} - the model loads and answers (a smoke run: no speed number, no result line)")
+        return 0
     ok(f"written: {out} (the result line also in {MB.RESULTS_FILE}) - attach it (with {ME} --report) to a speed "
        "report")
     return 0
@@ -12006,6 +12028,9 @@ def main() -> int:
                     "tokens to this JSON file (tools/maya_golden.py: saved answers)")
     ap.add_argument("--bench-text-ref", metavar="REF", help="--bench: cut the 2K / 8K prompts from the docs of this "
                     "git ref instead of today's (the same prompts on every build)")
+    ap.add_argument("--bench-smoke", action="store_true", help="--bench: the short run - two short answers and no "
+                                                               "2K / 8K prompts: does the model load and answer "
+                                                               "(not a speed number, no result line)")
     ap.add_argument("--bench-wait", type=float, default=10.0, help="--bench: minutes to wait for a quiet machine "
                                                                    "before refusing (default 10; 0 = refuse at once)")
     ap.add_argument("--calibrate", action="store_true",
@@ -12069,7 +12094,7 @@ def main() -> int:
         if not have:
             fail("Maya is not set up here yet", f"run {ME} first")
         more = {k: v for k, v in (("lock_ok", a.bench_lock_ok), ("tokens_file", a.bench_tokens),
-                                  ("text_ref", a.bench_text_ref)) if v}
+                                  ("text_ref", a.bench_text_ref), ("smoke", a.bench_smoke)) if v}
         return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait), **more)
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)

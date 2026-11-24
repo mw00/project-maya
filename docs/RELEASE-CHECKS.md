@@ -99,6 +99,27 @@ Capture once per release, per machine and layout, on the release commit (`--from
   {"name": "GLM S",   "config": "maya-maya-s2.json", "layout": "3x-v100"}]}
 ```
 
+The Halo box (Sun) has one more line, for the model that is too large for its card to run the standard in a night:
+
+```json
+  {"name": "GLM-5.3 full", "config": "maya-glm-5.3-maya-xs.json", "layout": "1x-v100-smoke", "smoke": true,
+   "answers_vary": true, "locks": ["~/hy4/locks/v100"]}
+```
+
+`"smoke": true` is the short run (`./maya.sh --bench --bench-smoke`): the model loads, a warm-up and two answers of 64
+tokens, greedy, checked against the saved ones - no previous release's build, no 2K / 8K prompts, no speed verdict
+(about 3.5 minutes there). A build that cannot answer, or answers nothing, is an `ERROR` line. Save its answers once
+per release with
+`python tools/maya_golden.py --config maya-glm-5.3-maya-xs.json --capture --smoke --layout 1x-v100-smoke`
+(`--check --smoke` by hand), on a second start: the first start on a PC measures it and answers differently.
+
+`"answers_vary": true`: on that box the full model reads most experts from the disk while it answers, and which
+experts the card holds at a given token follows those reads - so its greedy answers are not the same on every start
+(measured: 1 to 3 of the 3 requests differ between two starts of one build, from token 0 to 33). Saved answers that
+differ are then written in the line ("2 of 3 equal") and are not a `DIFF`; the line is there to prove that the model
+loads and writes an answer. Read the answers' first words in `maya-nightly-glm-5.3-full.tokens.json` ("heads") when
+in doubt.
+
 `"base": "auto"` is the newest release tag before the checkout's commit. `"locks"` (optional, per model) names lock
 files of the box that the bench does not take itself, e.g. `["~/hy4/locks/v100"]` for the V100 on the Halo box.
 
@@ -157,6 +178,17 @@ schtasks /Create /TN "Maya nightly" /SC DAILY /ST 03:30 /TR "cmd /c cd /d C:\may
    or SKIPPED, and every DIFF / SLOW line (investigate before calling the candidate good).
 4. After the release: `maya_golden.py --capture --text-ref <new tag>` per machine and layout (or `--from-tokens` from
    the release's own compare run), so the next nights check against the new release.
+
+Two models, one engine: GLM-5.3-Flash and the full GLM-5.3 (744B) are both run by `maya`, and `maya_changed.py` shows
+them as one GLM row - but the full model has its own loader and layer code (`src/core/glm_dsa_*`), so a Flash PASS
+says nothing about it. v1.1.75 to v1.1.77 shipped with the full model failing every request (#1200) because only Flash
+was run. Whenever the GLM row is FULL, both of these have to be green before the candidate is good:
+
+- the full model's smoke on the Halo box's V100 (the `"smoke": true` line above: last night's PASS, or
+  `maya_golden.py --check --smoke` by hand);
+- the full model's fast path on the synthetic pack, on any GPU box, no model files needed (build with
+  `-DMAYA_BUILD_TESTS=ON`): `ctest -R "glm_dsa_bind_widths_test|glm_dsa_pack_fast_test"` - both must run, a
+  "skipped" (no device, or the fixture tools are missing) is not a pass.
 
 What still needs a person:
 

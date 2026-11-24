@@ -28,6 +28,8 @@ PROMPT_SIZES = (2048, 8192)
 DECODE_TOKENS = 256
 REPEATS = 3
 WARM_TOKENS = 32
+SMOKE_ANSWERS = 2        # --bench-smoke: this many short answers and no 2K / 8K prompts - "does it still answer, and the
+SMOKE_TOKENS = 64        # same": minutes on a model too large for its box to run the standard (never a speed number)
 MIN_ANSWER = 64          # an answer shorter than this (the model stopped early) is listed, not in the decode median
 RESULTS_FILE = "maya-bench-results.txt"
 LEARNED_MAX = 64 << 20   # a learned file named in the config (an expert profile ...): at most this; a model is larger
@@ -547,7 +549,7 @@ def input_hashes(chats, prompts, warm) -> dict:
     return out
 
 
-def run_session(start, chats, prompts, warm, label, say) -> dict:
+def run_session(start, chats, prompts, warm, label, say, decode_tokens: int = DECODE_TOKENS) -> dict:
     """Everything one round measures, in one engine session: the warm-up answer, the decode answers and the prompts.
     Returns the samples, the greedy tokens of every request (exactness) and the wall time of each phase."""
     ph = {}
@@ -561,7 +563,7 @@ def run_session(start, chats, prompts, warm, label, say) -> dict:
         answers, toks = [], {"warm-up": wtok}
         t = time.time()
         for i, ids in enumerate(chats):
-            d, tk = s.gen(ids, DECODE_TOKENS)
+            d, tk = s.gen(ids, decode_tokens)
             answers.append(d)
             toks[f"decode {i + 1}"] = tk
             say(f"  {label}decode  {decode_speed(d):6.1f} tokens/s  ({d['produced']} tokens)")

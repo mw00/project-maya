@@ -198,6 +198,32 @@ class Night(unittest.TestCase):
         self.assertIn("time budget: 6 of 20 min for 1 model(s)", text)
         self.assertIn("dry run: nothing started", text)
 
+    def test_smoke_model_checks_the_saved_answers_alone(self):
+        # (a model too large for its box: the short run, no other build - PASS on equal answers, DIFF on others,
+        #  and a run that cannot answer is the bench's own failure = ERROR, as #1200 would have been)
+        self.doc["models"][0]["smoke"] = True
+        tok = dict(self.tok, records=[], smoke=True)
+        self.assertEqual(self.night(tok=tok, dry=True), 0)
+        self.assertIn("--bench --bench-tokens <tokens> --bench-wait 0 --bench-smoke", "\n".join(self.said))
+        self.assertNotIn("--compare", "\n".join(self.said))
+        self.assertEqual(self.night(tok=tok), 0)                    # nothing saved yet: a note, it answered
+        self.assertIn("smoke: it loads and answers", (self.root / N.STATUS).read_text())
+        G.capture(tok, CFG, G.golden_dir(self.root), "one")
+        self.assertEqual(self.night(tok=tok), 0)
+        line = (self.root / N.RESULTS).read_text().strip().splitlines()[-1]
+        self.assertIn("exact: - |", line)
+        self.assertIn("s | PASS: smoke: it loads and answers, against the saved answers", line)
+        other =json.loads(json.dumps(tok))
+        name = sorted(other["runs"]["this"][0])[0]
+        other["runs"]["this"][0][name] = other["runs"]["this"][0][name][:-1] + [7]
+        self.assertEqual(self.night(tok=other), 1)
+        self.assertIn("DIFF    A (one)", (self.root / N.STATUS).read_text())
+        # (a layout whose answers vary between starts: said, not a DIFF)
+        self.doc["models"][0]["answers_vary"] = True
+        self.assertEqual(self.night(tok=other), 0)
+        self.assertIn("saved answers: 4 of 5 equal - this layout's answers vary between starts",
+                      (self.root / N.STATUS).read_text())
+
     def test_over_budget_is_skipped(self):
         self.doc["budget_min"] = 1
         self.assertEqual(self.night(), 3)

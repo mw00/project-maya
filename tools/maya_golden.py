@@ -199,10 +199,13 @@ def golden_dir(root: Path = ROOT) -> Path:
 
 
 def bench_command(root: Path, config: Path, tokens_file: Path, text_ref: str = "", compare: str = "",
-                  rounds: int = 2, wait_min: float = 10.0) -> list:
-    """The --bench run that writes a tokens file (this Python, this folder's maya.py)."""
+                  rounds: int = 2, wait_min: float = 10.0, smoke: bool = False) -> list:
+    """The --bench run that writes a tokens file (this Python, this folder's maya.py).  smoke: the short run
+    (--bench-smoke: two short answers, no 2K / 8K prompts, no other build)."""
     cmd = [sys.executable, str(root / "maya.py"), "--config", str(config), "--bench", "--bench-tokens",
            str(tokens_file), "--bench-wait", f"{wait_min:g}"]
+    if smoke:
+        return cmd + ["--bench-smoke"]
     if text_ref:
         cmd += ["--bench-text-ref", text_ref]
     if compare:
@@ -210,10 +213,10 @@ def bench_command(root: Path, config: Path, tokens_file: Path, text_ref: str = "
     return cmd
 
 
-def run_bench(root: Path, config: Path, text_ref: str, wait_min: float) -> dict:
+def run_bench(root: Path, config: Path, text_ref: str, wait_min: float, smoke: bool = False) -> dict:
     with tempfile.TemporaryDirectory() as d:
         f = Path(d) / "tokens.json"
-        r = subprocess.run(bench_command(root, config, f, text_ref, wait_min=wait_min), cwd=str(root))
+        r = subprocess.run(bench_command(root, config, f, text_ref, wait_min=wait_min, smoke=smoke), cwd=str(root))
         if r.returncode or not f.exists():
             raise RuntimeError(f"the --bench run failed (exit {r.returncode})")
         return json.loads(f.read_text(encoding="utf-8"))
@@ -260,6 +263,9 @@ def main(argv=None) -> int:
     ap.add_argument("--dir", type=Path, default=None, help="the folder of this machine's files "
                                                            "(default data/golden/<machine>)")
     ap.add_argument("--wait", type=float, default=10.0, help="minutes to wait for a quiet machine (default 10)")
+    ap.add_argument("--smoke", action="store_true", help="the short run (--bench-smoke: two short answers, no 2K / 8K "
+                                                         "prompts) - for a model too large for its box to run the "
+                                                         "standard; give it its own --layout name")
     a = ap.parse_args(argv)
     folder = a.dir or golden_dir()
     if a.list:
@@ -276,7 +282,7 @@ def main(argv=None) -> int:
             tokens = json.loads(a.from_tokens.read_text(encoding="utf-8"))
         else:
             ref = a.text_ref or (saved_text_ref(folder, a.config, a.layout) if a.check else "")
-            tokens = run_bench(ROOT, a.config, ref, a.wait)
+            tokens = run_bench(ROOT, a.config, ref, a.wait, a.smoke)
         cfg = json.loads(Path(a.config or tokens["config"]).read_text(encoding="utf-8"))
     except (OSError, ValueError, KeyError, RuntimeError) as e:
         print(f"maya_golden: {e}", file=sys.stderr)

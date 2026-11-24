@@ -20,6 +20,12 @@ maya-nightly.json (docs/RELEASE-CHECKS.md has an example):
                "locks": ["~/hy4/locks/v100"]}]}
 "base": "auto" is the newest release tag before this commit.  The config is the one the setup wrote.  "locks": lock
 files of the box the bench does not take itself (it takes gpu<N> / radeon in ~/.maya/locks and ~/hy4/locks).
+"smoke": true (per model): the short run instead - two short answers against the saved ones, no previous release's
+build, no 2K / 8K prompts, no speed verdict.  For a model too large for its box to run the standard in a night's
+budget (the full GLM-5.3 on one 32 GB card): it still has to load and answer (#1200).
+"answers_vary": true (per model): this layout's greedy answers are not the same on every start (experts read from
+the disk while it answers: which ones a GPU holds at a token follows the reads) - answers that differ from the saved
+ones are then said in the line, not a DIFF; an engine that cannot answer is still an ERROR.
 
 Exit code: 0 all PASS, 1 something differs or failed, 3 nothing ran (busy or over budget).
 The pure parts (the plan, the budget, a model's verdict, the files' lines) need no GPU: tools/test_nightly.py.
@@ -101,17 +107,23 @@ def compare_parts(record: str) -> tuple:
     return (m.group(1).strip() if m else "?"), {k: float(v) for k, v in COMPARE.findall(record)}
 
 
-def verdict(exact: str, speeds: dict, golden, slow_pct: float) -> tuple:
+def verdict(exact: str, speeds: dict, golden, slow_pct: float, vary: bool = False) -> tuple:
     """(status, what differs): PASS, or DIFF / SLOW with the reasons.  golden: maya_golden.compare()'s result, or
-    None when nothing is saved yet (a note, not a failure)."""
+    None when nothing is saved yet (a note, not a failure).  vary: the model's answers are known to differ between
+    starts on this layout ("answers_vary") - saved answers that differ are a note."""
     why, status = [], "PASS"
-    if exact.startswith("NO") or exact == "?":
+    if exact == "-":                             # (a smoke run: no other build - the saved answers alone)
+        why.append("smoke: it loads and answers" + ("" if golden is None else ", against the saved answers"))
+    elif exact.startswith("NO") or exact == "?":
         status = "DIFF"
         why.append("answers differ from the previous release" if exact != "?" else "no compare line")
     elif exact != "yes":
         why.append(f"exact: {exact}")
     if golden is None:
         why.append("no saved answers yet (maya_golden --capture on the release)")
+    elif golden["status"] == "DIFF" and vary:
+        why.append(f"saved answers: {golden['compared'] - len(golden['diffs'])} of {golden['compared']} equal - "
+                   "this layout's answers vary between starts (not a failure)")
     elif golden["status"] != "PASS":
         status = "DIFF"
         why.append("saved answers: " + (golden["diffs"][0] if golden["diffs"] else "nothing compared") +
@@ -219,9 +231,10 @@ def busy_reasons(cfg: dict, m: dict) -> list:
 
 
 def run_bench(root: Path, m: dict, cfg_path: Path, base: str, st: dict, tokens_file: Path, log: Path) -> int:
-    """The --bench --compare run (its own quiet wait and GPU locks), its output in `log`."""
+    """The --bench --compare run (its own quiet wait and GPU locks), its output in `log`; a "smoke" model's short
+    run has no other build."""
     cmd = MG.bench_command(root, cfg_path, tokens_file, text_ref=base, compare=base, rounds=int(st["rounds"]),
-                           wait_min=float(st["wait_min"]))
+                           wait_min=float(st["wait_min"]), smoke=bool(m.get("smoke")))
     with open(log, "w", encoding="utf-8") as f:
         return subprocess.run(cmd, cwd=str(root), stdout=f, stderr=subprocess.STDOUT).returncode
 
@@ -263,9 +276,9 @@ def run_model(root: Path, m: dict, base: str, st: dict, say, bench=run_bench, bu
                 return dict(out, status="BUSY" if quiet else "ERROR", secs=time.time() - t, why=first_try + [
                     f"--bench stopped (exit {code}, {log.name}): " + " / ".join(x.strip() for x in tail)])
             tokens = json.loads(tokens_file.read_text(encoding="utf-8"))
-            exact, speeds = compare_parts((tokens.get("records") or [""])[-1])
+            exact, speeds = ("-", {}) if m.get("smoke") else compare_parts((tokens.get("records") or [""])[-1])
             res, _ = MG.check(tokens, cfg, MG.golden_dir(root), m.get("layout", ""))
-            status, why = verdict(exact, speeds, res, float(st["slow_pct"]))
+            status, why = verdict(exact, speeds, res, float(st["slow_pct"]), bool(m.get("answers_vary")))
             # (slow with equal answers: once more before it is called SLOW - a job that started beside the run, or
             #  the model's files gone cold in the page cache, slows one build's first round only)
             if status != "SLOW" or attempt == 2 or not st.get("retry_slow", True):
@@ -302,7 +315,8 @@ def night(root: Path, doc: dict, say, only=(), dry=False, run=run_model) -> int:
         for m, _, fits in rows_plan:
             if fits:
                 say("  would run: " + " ".join(MG.bench_command(root, Path(m["config"]), Path("<tokens>"), base, base,
-                                                              int(st["rounds"]), float(st["wait_min"]))[1:]) +
+                                                              int(st["rounds"]), float(st["wait_min"]),
+                                                              bool(m.get("smoke")))[1:]) +
                     (f"  [locks: {', '.join(m['locks'])}]" if m.get("locks") else ""))
         say("dry run: nothing started, nothing written")
         return 0
