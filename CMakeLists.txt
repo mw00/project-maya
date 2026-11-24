@@ -1061,6 +1061,20 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
         set_tests_properties(hy4_experts_test PROPERTIES TIMEOUT 300)
       endif()
     endif()
+    # Ling-3.2-air (llama.cpp's bailingmoe3): its own engine (src/ling) on maya-ds4's ggml block-type GEMVs
+    # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; NVIDIA only
+    if(MAYA_ENABLE_CUDA)
+      add_executable(maya-ling src/ling/ling_main.cu src/ling/ling_model.cu src/ling/ling_kernels.cu
+                               src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp
+                               src/kernels/cuda/glmd_dec.cu src/kernels/cuda/glmd_batch.cu
+                               src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                               src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_lt.cu)
+      target_include_directories(maya-ling PRIVATE ${_maya_gpu_include_directories} include src/ling src/hy4
+                                                   src/ds4 src/mm3 src/kernels/cuda third_party/ggml)
+      target_link_libraries(maya-ling PRIVATE maya_kernels maya_kernels_cpu ${_maya_gpu_runtime_target}
+                                              ${_maya_gpu_blas_target} Threads::Threads)
+      target_compile_definitions(maya-ling PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
+    endif()
     if(MAYA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
