@@ -582,6 +582,7 @@ NONFINITE = "non-finite"
 
 # what Service._sliced yields when the loop guard ends an answer (a loop that came back): run() ends it, "stop"
 LOOP_STOP = object()
+SEGMENT = object()          # separates one engine call's tokens from the next's in segments() (run's drain)
 # ... and the answer it gets when that happens before any answer text (never a silent end after the thinking)
 LOOP_STOP_NOTE = "(The answer was stopped: the model kept repeating itself.)"
 # a request's max_tokens lowers the thinking budget only at or below this (Service.run)
@@ -606,6 +607,10 @@ THINK_RESTARTS = 2
 THINK_NOTE = ("[The server's note, not the user: your thinking was cut off there - an end-of-turn marker written "
               "inside the thinking is a quote, not the turn's end. Do not stop: go on with the thinking, right where "
               "it stopped.]")
+# A model whose thinking ends the turn even after the restarts above leaves nothing for the answer; the turn goes out
+# with a reasoning block and no content at all, which an agent client retries as an empty answer.  As the loop guard
+# does (LOOP_STOP_NOTE), the turn says so in one line instead of ending empty.
+THINK_STOP_NOTE = "(The answer was stopped: the model's thinking ended the turn without an answer.)"
 _THINK_BOUNDARY = re.compile(r"(?:\n|(?<![\d.])[.!?][\"')\]]*|[。！？])[ \t]*$")
 
 
@@ -4809,6 +4814,7 @@ class Service:
         think_resume = (sampling or {}).get("_think_resume")   # (ids, thinks): a quoted marker inside the thinking
         think_restarts = 0                          # times the thinking was resumed in this answer
         said = []                                   # this engine call's text for the user (stops_short)
+        reason_said = []                            # its reasoning's text (a call the model wrote in it, salvaged below)
         join = None                                 # after a keep: the paragraph break before the continuation (#921)
         kept = 0                                    # times it was kept going in this answer
         called = False                              # it wrote a tool call (then its turn does not end here)
@@ -4973,8 +4979,13 @@ class Service:
                     """attempts(), and after a blocked call (seg["next"]) the engine again on that prompt.  That prompt
                     also holds the server's own tokens (the call's result or KEEP_NOTE, a steer), which max_new - n
                     does not count: the context's room caps it too (with an unlimited max_new, prepare's room, the
-                    engine rejected prompt + max_new + CTX_SLACK > context)."""
+                    engine rejected prompt + max_new + CTX_SLACK > context).  SEGMENT separates one call's tokens
+                    from the next's: the thinking restarts' drain stops at it, and the token loop skips it."""
+                    first = True
                     while True:
+                        if not first:
+                            yield SEGMENT               # (a continuation begins: not a token, not a heartbeat)
+                        first = False
                         room = self.engine.max_context - CTX_SLACK - len(seg["prompt"])
                         l0 = getattr(self.engine, "last", None)
                         yield from attempts(seg["prompt"], max(1, min(max_new - n, room)))
@@ -5005,6 +5016,7 @@ class Service:
                 guard_on = self._loop_guard_on(sampling)
                 gen = segments()
                 answered = bool(pre_events)             # any answer (text or a call) went out yet
+                said_note = False                       # (a stop that already explains itself: the loop guard's)
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
@@ -5023,8 +5035,11 @@ class Service:
                                     yield "event", ev
                                 held = ""
                             if not answered:             # (a model with no end-of-thinking token, still thinking)
+                                said_note = True
                                 yield "event", Event("content", LOOP_STOP_NOTE)
                             break
+                        if t is SEGMENT:                # a continuation's first token follows: not the model's
+                            continue
                         n += 1
                         if my_first is None:
                             my_first = time.time()
@@ -5037,8 +5052,12 @@ class Service:
                                       f"{f', {soft} + {think_budget - soft} without a sentence end' if soft else ''})"
                                       ": closed, answering", flush=True)
                         text, stopped = detok.push(t), False
-                        if end_think and parser.token_only_end:
-                            text = ""            # (the token's own text: the reasoning ends at the token, the tag is no one's text)
+                        if t == self.think_end_id and parser.token_only_end:
+                            # the token's own text: the tag is no one's text.  Not only when it closes the reasoning
+                            # (end_think): a model that closes twice - or the answer's continuation, a reasoning that
+                            # was already closed (see the last restart) - would otherwise put the tag verbatim into
+                            # the answer's text (measured: 46 turns of 11-23; an 8-char piece each)
+                            text = ""
                         if t in self.stop_ids and parser.state == "reasoning" and not answered and not called \
                                 and not pending:
                             # a marker inside the thinking is the model's own text - it quotes the server's own markers
@@ -5052,13 +5071,43 @@ class Service:
                                 finish = "stop"
                                 break
                             think_restarts += 1
+                            last = think_restarts >= THINK_RESTARTS
                             print(f"[maya] thinking: an end-of-turn marker inside it is a quote - going on with the "
-                                  f"thinking ({think_restarts}. of {THINK_RESTARTS})", flush=True)
+                                  f"{'answer' if last else 'thinking'} ({think_restarts}. of {THINK_RESTARTS})",
+                                  flush=True)
                             ids_k, thinks = think_resume
+                            if last:
+                                # the restarts are spent, and asking the model to think on only made it plan again
+                                # (measured: 565 more tokens of the same, then EOS).  Its thinking is done - it
+                                # wrote the calls it means to make in it - so the reasoning is closed here, at the
+                                # model's own end-of-thinking token put in the prompt, and the turn goes on from a
+                                # thinking that is closed, not one that was cut
+                                for ev in parser.close_reasoning():
+                                    answered = answered or ev.kind != "reasoning"
+                                    yield "event", ev
+                                if thinks and self.think_end_id is not None:
+                                    ids_k = [*ids_k, self.think_end_id]
+                                thinks = False
+                                # the engine restarts the thinking's budget at every call, and this continuation is the
+                                # answer's: a budget firing here would swap a sampled token for the think-end one, whose
+                                # text no one swallows now (a literal </think> in the answer).  The keep path strips
+                                # the same keys for the same reason.
+                                sampling = {k: v for k, v in (sampling or {}).items()
+                                            if k not in ("_think_budget", "_think_soft", "_think_end", "_think_stops")}
                             steer = self.tok.encode(loop_guard.keep_steer(think_restarts)) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
+                            # (reason_said stays: the restarts are one continuous thinking, and a call the model
+                            # wrote in it is what the salvage at the end reads out)
                             parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
                             in_think = thinks and bool(thinking) and self.think_end_id is not None
+                            if last:
+                                # this engine call's tail is the thinking's own (the continuation above re-reads
+                                # it from its prompt): it is dropped - fed to the answer's parser, a stop token in
+                                # it would end the turn before the continuation ever ran.  The drain stops at
+                                # SEGMENT, so what follows is the continuation's own first token.
+                                for t2 in gen:
+                                    if t2 is SEGMENT:
+                                        break
                             continue
                         # a marker the model wrote as its answer's text - quoted, in a code fence, a tool call's body - is
                         # not the turn's end (the stream's own parser has the same rule for calls)
@@ -5085,7 +5134,8 @@ class Service:
                                 steer = self.tok.encode(loop_guard.keep_steer(kept)) if thinks else []
                                 seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
                                 sampling = loop_guard.block_sampling(sampling, kept)
-                                parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
+                                parser, detok, held, said[:], reason_said[:] = \
+                                    new_parser(thinks), Detokenizer(self.tok), "", [], []
                                 in_think = thinks and bool(thinking) and self.think_end_id is not None
                                 continue
                             if key is None:
@@ -5101,7 +5151,7 @@ class Service:
                             steer = self.tok.encode(loop_guard.block_steer(rep, key[1], tries[key])) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix + steer
                             sampling = loop_guard.block_sampling(sampling, tries[key])
-                            parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
+                            parser, detok, held, said[:], reason_said[:] = new_parser(), Detokenizer(self.tok), "", [], []
                             in_think = bool(thinking) and self.think_end_id is not None
                             continue
                         seg["ids"].append(t)
@@ -5156,6 +5206,8 @@ class Service:
                                     ev = dataclasses.replace(ev, text=t)
                             if ev.kind == "content":
                                 said.append(ev.text)
+                            elif ev.kind == "reasoning":
+                                reason_said.append(ev.text)
                             elif ev.kind == "tool_call":
                                 called = True
                             if blocked and (pending or ev.kind.startswith("tool")):
@@ -5175,6 +5227,32 @@ class Service:
                         for ev in with_lp(parser.feed(held), was):
                             yield "event", ev
                         held = ""
+                    if finish == "stop" and not answered and not said_note and (reason_said or think_restarts):
+                        # DeepSeek writes the call it means to make in its thinking and can end the turn there: the
+                        # reasoning holds a whole <tool_call>, the answer holds nothing, and an agent client sees a
+                        # turn that did nothing.  A call is read out of what the model wrote there - a fresh parser,
+                        # so nothing goes out twice (this runs only when the turn emitted neither text nor a call;
+                        # reason_said / think_restarts gate it to a thinking that truly happened, so a client's stop
+                        # sequence on an empty answer keeps its old meaning: an empty answer, not this note)
+                        salvaged = False
+                        thought = "".join(reason_said)
+                        if not called and thought.rstrip().endswith(CALL_END):
+                            # only a call the reasoning ENDS with: one it wrote and then went on reasoning past is a
+                            # draft it thought better of (or a quoted example of this server's own syntax), not a call
+                            # it meant to make - and never one the loop guard just blocked (blocked's own key)
+                            last = None
+                            for ev in new_parser(False).feed(thought):
+                                if ev.kind == "tool_call":
+                                    last = ev
+                            if last is not None and (not blocked or (last.call.name, loop_guard.args_key(last.call.arguments)) not in blocked):
+                                called, answered, salvaged = True, True, True
+                                yield "event", last
+                        if not salvaged:
+                            if CALL_START in thought:
+                                print(f"[maya] a tool call written in the thinking was not read out of it"
+                                      f"{' (blocked)' if blocked else ''}: the turn ends with the note", flush=True)
+                            # never end empty: an agent client retries an empty turn (the loop guard says its own line)
+                            yield "event", Event("content", THINK_STOP_NOTE)
                     if cancel.is_set():
                         finish = "cancel"
                 except EngineFault as e:                # (#827: the engine ended the answer itself, on an error)

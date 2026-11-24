@@ -885,6 +885,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const bool slot_keep =
         std::getenv("MAYA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("MAYA_DS4_SLOT_KEEP")) != 0;
     int slot_max = slot_keep ? std::max(0, (int) env_num("MAYA_DS4_SLOT_CAP", 4)) : 0;
+    // DS4_SLOT_TRACE=1: every kept conversation saved, taken back or rewound, in the log (the diagnosis of a state
+    // that does not fit the prompt it was served for; the engine's own lines are in restore / slot_load)
+    const bool slot_trace =
+        std::getenv("DS4_SLOT_TRACE") != nullptr && std::atoi(std::getenv("DS4_SLOT_TRACE")) != 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("MAYA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("MAYA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("MAYA_DS4_SLOT_GB", 16) * 1073741824.0);
@@ -1106,6 +1110,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
+        if (slot_trace)
+            note("slot trace: setting aside " + std::to_string(t.size()) + " tokens (" + std::string(why) + "); " +
+                 std::to_string(slots.size()) + " kept");
         slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), {}});
         slots.back().data = buf;
         slots.back().pics.clear();
@@ -1148,7 +1155,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                bool& whole) -> size_t {
         whole = false;
         if (slot_max <= 0 || prompt.size() < 2) return 0;
-        size_t best = SIZE_MAX, len = 0;
+        size_t best = SIZE_MAX, len = 0, best_c = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
             const size_t lim = std::min(t.size(), prompt.size() - 1);   // (a prompt always reads its last token)
@@ -1162,8 +1169,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (!pics_match(slots[i].pics, want, u)) continue;   // (another picture, another place: not this state)
             best = i;
             len = u;
+            best_c = c;
         }
         if (best == SIZE_MAX) return 0;
+        if (slot_trace)   // (the prompt's own agreement: `len` is where the state is taken back to, best_c where the
+                          // tokens stop agreeing - past it the state must not be served)
+            note("slot trace: slot " + std::to_string(best) + " of " + std::to_string(slots.size()) + ": the prompt " +
+                 "agrees for " + std::to_string(best_c) + " tokens, taking back " + std::to_string(len) + " of " +
+                 std::to_string(slots[best].tokens.size()));
         const size_t whole_len = slots[best].tokens.size();
         const auto t0 = std::chrono::steady_clock::now();
         const bool ram = slots[best].data != nullptr;

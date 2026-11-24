@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import loop_guard as LG  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (IM_END, LOOP_STOP_NOTE, THINK_NOTE, THINK_RESTARTS, ByteTokenizer, Service, check_request_sampling,  # noqa: E402
+from serve.server import (IM_END, LOOP_STOP_NOTE, THINK_NOTE, THINK_RESTARTS, THINK_STOP_NOTE, ByteTokenizer, Service, check_request_sampling,  # noqa: E402
                           loop_guard_setting, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1227,7 +1227,62 @@ class ThinkingMarkers(unittest.TestCase):
         eos = tok.encode(DS_EOS, parse_special=True)[0]
         seq = tok.encode("thinking ", parse_special=True) + [eos]
         svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
-        self.assertEqual((len(eng.prompts), done["finish"], text), (1 + THINK_RESTARTS, "stop", ""))
+        # the last restart is the answer's: the reasoning is closed, </think> is in the prompt, and the continuation
+        # (a third engine call) is the model writing its answer - the fixture replays its one script, so that replay
+        # is the answer here, not the note
+        self.assertEqual((len(eng.prompts), done["finish"]), (1 + THINK_RESTARTS, "stop"))
+        self.assertTrue(text.strip())                       # (never an empty answer: the client would retry it)
+
+    def test_a_whole_thinking_turn_is_never_empty(self):
+        # the shape an agent gets from DeepSeek-V4.1 when the history carries its reasoning as plain text: the answer
+        # (and the tool calls) written inside the thinking, then the engine's EOS - every time the server resumes.
+        # The last restart closes the thinking and the continuation is the answer: the fixture's replay of its
+        # script, so the turn ends with something to read, never with a reasoning block and no content at all.
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("Let me check these.\n\nLet me do it.", parse_special=True) + [eos]
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((done["finish"], len(eng.prompts)), ("stop", 1 + THINK_RESTARTS))
+        self.assertIn("Let me do it.", reason)              # (what it wrote stayed the reasoning: not the answer)
+        self.assertTrue(text.strip())                       # (the answer is the continuation's: never empty)
+
+    def test_no_resume_a_call_at_the_thinking_s_end_is_read_out_of_it(self):
+        # no resume the template can render: the restarts never run, the turn ends at the first EOS - and a call
+        # the reasoning ENDS with is read out of it by the salvage (the note only when there is no such call)
+        from serve.frontend import openai_to_messages
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("Let me look.\n\n", parse_special=True) + \
+            tok.encode(call_text("ls -la"), parse_special=True) + [eos]
+        eng = SeqEngine(tok, seq)
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(agent())
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events, done = [], None
+        for kind, x in svc.run(ids, thinking, tools, max_new, {"_blocked": None, "_think_resume": None},
+                               threading.Event()):
+            if kind == "event":
+                events.append(x)
+            elif kind == "done":
+                done = x
+        text = "".join(e.text for e in events if e.kind == "content")
+        calls = [e.call.name for e in events if e.kind == "tool_call"]
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertEqual(calls, ["bash"])                   # (the call its reasoning ended with)
+        self.assertNotIn(THINK_STOP_NOTE, text)
+
+    def test_a_call_written_in_the_thinking_is_read_out_of_it(self):
+        # the turn a DeepSeek agent really dies in: the model writes the call it means to make INSIDE its thinking and
+        # ends the turn there.  The answer channel never sees it, so nothing went out at all - the call is read out of
+        # what the model wrote (see the salvage in the restarts' last branch), not the note
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("Let me look.\n\n", parse_special=True) + \
+            tok.encode(call_text("ls -la"), parse_special=True) + [eos]
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual(calls, ["bash"])                   # (the call it wrote in the thinking, as the answer's)
+        self.assertNotIn(THINK_STOP_NOTE, text)
+        self.assertIn("<tool_call>", reason)                # (still the reasoning's text too: nothing was moved)
 
     def test_a_marker_in_code_or_a_call_in_the_answer_is_text(self):
         tok = DeepTok()
@@ -1267,6 +1322,22 @@ class ThinkingMarkers(unittest.TestCase):
         svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
         self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
         self.assertIn("ANSWER OK", text)
+
+    def test_a_second_think_end_in_the_answer_is_dropped(self):
+        # the answer's continuation runs after the reasoning was closed (the last restart's shape): a model that
+        # closes once more - or closes first and reasons on in the content, as its context's examples show it -
+        # would otherwise put the tag verbatim into the answer's text (46 turns of 11-23).  The tag is no one's text
+        tok = DeepTok()
+        tag = chr(0x3c) + "/think" + chr(0x3e)             # the end-of-thinking tag, spelled out codepoint-wise
+        end = tok.encode(tag, parse_special=True)[0]
+        seq = tok.encode("thinking about it", parse_special=True) + [end] + \
+            tok.encode("ANSWER OK", parse_special=True) + [end] + \
+            tok.encode(" the model wrote this on in the content", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok, token_only_end=True)
+        self.assertNotIn(tag, text)                         # (the second one: dropped, not the answer's text)
+        self.assertIn("ANSWER OK", text)
+        self.assertIn("the model wrote this on in the content", text)   # (what follows it: still the answer)
+        self.assertNotIn(tag, reason)                       # (the first one closed the reasoning: not its text either)
 
     def test_a_gguf_named_tokenizer_resumes_at_every_turn_end_the_engine_stops_at(self):
         # GLM's pack tokenizer names its ids by their GGUF keys (no "eos"), and the GLM engine ends at every turn-end
