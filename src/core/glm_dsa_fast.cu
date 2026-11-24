@@ -221,6 +221,10 @@ void Glm5Model::fast_bind_dsa(int il, std::string& missing) {
     Ly.recr = false;
     Ly.moe = il >= g.dense_lead;
     Ly.mtp = is_mtp;
+    // v1.1.75's shared MoE / dense code sizes its launches from these (glm_fast_path.cu sets them for Flash)
+    Ly.ff = g.n_ff_exp;
+    Ly.ffd = g.n_ff_dense;
+    Ly.f0 = 0;
     if (is_mtp) {
         Ly.eh = mvw("nextn.eh_proj.weight", 2 * E, E);
         Ly.enorm = f32("nextn.enorm.weight");
