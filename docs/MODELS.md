@@ -321,6 +321,10 @@ GGUF as it is: `maya.py --setup --model inkling-2-mini`, or the Models page's li
 - **Pictures:** on by default - the setup fetches the model's vision tower (`mmproj-Inkling-2-Mini-BF16.gguf`, 0.6 GB, from Maya's repo - unsloth's file byte for byte, a copy you already have is kept; `--no-vision` skips it) and builds Maya's image encoder; the encoder starts only when a picture arrives
   (on the GPU where its free VRAM holds it, else on the CPU), so the context's fit is the same. Images on the Models
   page turns them off and on.
+- **Refusal ablation:** as on the other models - the setup fetches the model's direction file from Maya's repo
+  (`Inkling-2-Mini-refusal-direction.gguf`, a few KB, `refusal-directions/`; `--ablation off` skips it), loaded and off
+  by default; the Models page's **Refusal ablation** switch and a request's `"ablate": true` turn it on
+  ([docs/SETTINGS.md](SETTINGS.md#refusal-ablation-per-request-ablate)). Drafting stays exact with it on.
 - One request at a time for now.
 
 ## Inkling-2-Small (by hand, for now)
