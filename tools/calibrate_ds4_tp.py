@@ -37,6 +37,7 @@ import calibrate_glm as CAL  # noqa: E402  the prompts, the measuring session, t
 
 MIN_GAIN = 0.05                          # a setting must beat the config's own by this much (separate starts: noisier)
 CONFIRM_BELOW = 0.15                     # ... and one that wins by less than this is started again beside it
+REUSED_MAX = 0.05                        # a prompt read with more than this share taken from a kept conversation is not a reading
 PROMPT_FLOOR = 0.6                       # its long prompt must read at least this share of the config's own speed
 GROUPS = 2                               # prompt groups (CAL.GROUP each) a start's decode speed is the median of
 LONG_TOKENS = 16384                      # the long prompt (CHANGELOG.md, as one message)
@@ -142,12 +143,17 @@ def prompt_ids(cfg: dict) -> tuple[list[list[int]], list[int]]:
 
 
 def read_rate(eng, ids: list[int]) -> float:
-    """tok/s of reading `ids` (one token answered; the part the conversation cache did not already hold)."""
+    """tok/s of reading `ids` (one token answered).  0.0 = not measured, never "slow": the engine answered from a
+    conversation it had kept (MAYA_DS4_SLOT_KEEP: 1 new token read in 60 ms was 17 tok/s, #1203), or gave no time."""
     import threading
     for _ in eng.generate(ids, 1, {"temperature": 0}, threading.Event()):
         pass
     last = getattr(eng, "last", None) or {}
-    ms, n = last.get("prompt_ms") or 0.0, (last.get("prompt_tokens") or len(ids)) - (last.get("reused") or 0)
+    total = last.get("prompt_tokens") or len(ids)
+    reused = last.get("reused") or 0
+    ms, n = last.get("prompt_ms") or 0.0, total - reused
+    if reused > REUSED_MAX * total:
+        return 0.0
     return n / (ms / 1000.0) if ms > 0 and n > 0 else 0.0
 
 
@@ -221,9 +227,14 @@ def run(cfg: dict, vram: list[float], say=print, start_engine=None) -> dict:
 
         def start_engine(c):
             return StrataEngine(c["exe"], engine_args(c), cwd=c.get("cwd"), log=c.get("log"), env=child_env(c))
-    base = {**cfg, "args": CAL.without_writes(list(cfg.get("args") or []))}
     short, long_ids = prompt_ids(cfg)
     with tempfile.TemporaryDirectory(prefix="maya-calibrate-ds4-") as tmp:
+        # (no conversations kept aside, none read back: with MAYA_DS4_SLOT_KEEP a start took its earlier answer's state
+        # and read 1 new token, so the long prompt looked slow and the right layout lost (#1203); a throw-away folder
+        # too, so the calibration's conversations never push out this PC's own)
+        base = {**cfg, "args": CAL.without_writes(list(cfg.get("args") or [])),
+                "env": {**(cfg.get("env") or {}), "MAYA_DS4_SLOT_KEEP": "0",
+                        "MAYA_DS4_SLOT_DIR": str(Path(tmp) / "slots")}}
         return measure(base, vram, short, long_ids, start_engine, say, profile_copy(base["args"], Path(tmp)))
 
 
@@ -277,6 +288,9 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
     eligible = {t: r for t, r in by_tp.items() if r["prompt"] >= floor or t == own_tp}
     for t in by_tp:
         if t not in eligible:
+            if by_tp[t]["prompt"] <= 0:               # (a reading that was not one: never called slow)
+                say(f"    (--tp {t}: the long prompt's reading was not measured: not taken)")
+                continue
             say(f"    (--tp {t} reads long prompts at {by_tp[t]['prompt']:.0f} tok/s, below {PROMPT_FLOOR:.0%} of "
                 f"--tp {own_tp}'s: not taken)")
     best = max(eligible, key=lambda t: med(eligible[t]))

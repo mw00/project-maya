@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -190,6 +191,45 @@ class Measure(unittest.TestCase):
         self.assertTrue(all(s[1] == "40" for s in r.starts[:4]))
         self.assertEqual(r.starts[4:], [(8, "30")])
         self.assertEqual(r.res["args"], {"--tp": 8, "--cpu-threads": 40})
+
+
+class ReadRate(unittest.TestCase):
+    """#1203: a long prompt taken back from a kept conversation (MAYA_DS4_SLOT_KEEP) is not a reading of the prompt."""
+
+    class Eng:
+        def __init__(self, last):
+            self.last = last
+
+        def generate(self, ids, max_new, sampling, cancel):
+            yield 0
+
+    def test_a_fresh_read_is_n_over_ms(self):
+        e = self.Eng({"prompt_tokens": 16000, "prompt_ms": 20000.0, "reused": 0})
+        self.assertAlmostEqual(C4.read_rate(e, [0] * 16000), 800.0)
+
+    def test_a_read_taken_back_is_not_measured(self):
+        e = self.Eng({"prompt_tokens": 16000, "prompt_ms": 60.0, "reused": 15999})   # (1 new token in 60 ms: not 17 tok/s)
+        self.assertEqual(C4.read_rate(e, [0] * 16000), 0.0)
+
+    def test_a_little_reuse_still_counts(self):
+        e = self.Eng({"prompt_tokens": 16000, "prompt_ms": 19000.0, "reused": 500})
+        self.assertAlmostEqual(C4.read_rate(e, [0] * 16000), 15500 / 19.0)
+
+    def test_the_calibration_starts_without_kept_conversations(self):
+        seen = []
+
+        def start(c):
+            seen.append(c.get("env") or {})
+            raise RuntimeError("stop here")
+        patch = unittest.mock.patch.object(C4, "prompt_ids", lambda cfg: ([[1]] * 12, [0] * 16))
+        patch.start()
+        self.addCleanup(patch.stop)
+        with self.assertRaises(Exception):
+            C4.run({"args": ["--pack", "/m", "--tp", "2"], "env": {"X": "1"}}, NINE, say=lambda *a: None, start_engine=start)
+        self.assertTrue(seen)
+        self.assertEqual(seen[0]["MAYA_DS4_SLOT_KEEP"], "0")
+        self.assertIn("MAYA_DS4_SLOT_DIR", seen[0])
+        self.assertEqual(seen[0]["X"], "1")
 
 
 class Profile(unittest.TestCase):
