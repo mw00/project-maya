@@ -15,6 +15,7 @@ import os
 import sys
 import threading
 import time
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOOLS = [
@@ -108,6 +109,12 @@ def stdio():
             answer(msg)
 
 
+class _Quiet(ThreadingHTTPServer):
+    def server_bind(self):                              # (no reverse lookup of the address: a slow resolver stalled every start)
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
+
+
 def http_server(port: int = 0) -> ThreadingHTTPServer:
     """Streamable HTTP at /mcp: JSON answers, except tools/call, which answers as an event stream (a progress
     notification first); a session id from initialize is required afterwards."""
@@ -154,7 +161,7 @@ def http_server(port: int = 0) -> ThreadingHTTPServer:
             self.send_response(200)
             self.end_headers()
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+    httpd = _Quiet(("127.0.0.1", port), H)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 

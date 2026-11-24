@@ -40,6 +40,10 @@ IDS = {
     "deepseek-maya-m": ("deepseek", "maya-m", "DeepSeek V4.1 · Maya-M"),
     "minimax-maya-xs": ("minimax", "gguf-xs", "MiniMax M3.1 · Maya-XS"),
     "minimax-maya-s": ("minimax", "gguf-s", "MiniMax M3.1 · Maya-S"),
+    "hy4-flash-maya-xs": ("hy4", "maya-xs", "Hy4-Flash · Maya-XS"),
+    "hy4-flash-maya-s": ("hy4", "maya-s", "Hy4-Flash · Maya-S"),
+    "hy4-flash-maya-m": ("hy4", "maya-m", "Hy4-Flash · Maya-M"),
+    "hy4-flash-maya-l": ("hy4", "maya-l", "Hy4-Flash · Maya-L"),
 }
 
 
@@ -311,7 +315,8 @@ class MiniMaxFiles(unittest.TestCase):
         m["files"] = {n: 1000 + i for i, n in enumerate(m["files"])}
         quiet = [patch.object(maya, k, lambda *a, **kw: None) for k in ("ok", "warn", "step")]
         with tempfile.TemporaryDirectory() as d, patch.object(maya, "mm3_gguf_entry", return_value=m), \
-                patch.object(maya, "rotational", return_value=False):
+                patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya, "sha256_checked", return_value=True):   # (empty stand-ins: the names only, #672)
             for p in quiet:
                 p.start()
             try:

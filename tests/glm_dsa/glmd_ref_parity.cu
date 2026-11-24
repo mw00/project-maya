@@ -7,7 +7,7 @@
 //   top-k     the GPU top-2048 of the GPU scores equals the CPU top-2048 of the same scores, exactly;
 //   MLA       absorb + attention over the selected cells (scale 1/16): max err < 1e-4 of the largest magnitude.
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 

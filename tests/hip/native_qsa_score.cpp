@@ -1,6 +1,6 @@
 // Device parity for the scalar HIP implementation of the optional native QSA scorer.
 #include <hip/hip_runtime.h>
-#include "strata/kernels/native_qsa_score.hpp"
+#include "maya/kernels/native_qsa_score.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -16,7 +16,7 @@
     } while (0)
 
 int main() {
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     constexpr int kDim = 128, kHeads = 4, kBlock = 4;
     constexpr int kMaxCells = 8, kMaxBlocks = 3, kCells = 7;
     const QsaShapes shapes = qsa_real_shapes();

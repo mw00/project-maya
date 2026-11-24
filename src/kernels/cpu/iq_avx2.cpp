@@ -12,7 +12,7 @@
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23), Q4_K (12), Q5_K (13).
 // IQ1_M (29) shares its grid, scale and delta decode across tokens, preserving ggml's two float accumulators.
-#include "strata/kernels/cpu/iq_avx2.hpp"
+#include "maya/kernels/cpu/iq_avx2.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -34,7 +34,7 @@
 #include <cpuid.h>
 #endif
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 std::atomic<bool> q5k_fused{true};   // see iq_avx512.cpp
@@ -896,4 +896,4 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

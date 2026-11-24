@@ -24,8 +24,8 @@ int main() {
                         const size_t length = down ? matrix.size() : matrix.size() / members;
                         const size_t offset = down ? 0 : member * length;
                         std::vector<unsigned char> staged(length + 32, 0xa5);
-                        std::array<strata::ds4::RamSlice, 2> slices;
-                        int n = strata::ds4::ram_slices(pb, parts, offset, length, slices);
+                        std::array<maya::ds4::RamSlice, 2> slices;
+                        int n = maya::ds4::ram_slices(pb, parts, offset, length, slices);
                         assert(n > 0 && n <= parts);
                         size_t copied = 0;
                         for (int i = 0; i < n; ++i) {
@@ -45,8 +45,8 @@ int main() {
             }
         }
     }
-    std::array<strata::ds4::RamSlice, 2> slices;
-    assert(strata::ds4::ram_slices(32, 2, 60, 8, slices) == -1);
-    assert(strata::ds4::ram_slices(32, 2, 0, 0, slices) == 0);
+    std::array<maya::ds4::RamSlice, 2> slices;
+    assert(maya::ds4::ram_slices(32, 2, 60, 8, slices) == -1);
+    assert(maya::ds4::ram_slices(32, 2, 0, 0, slices) == 0);
     std::puts("PASS: packed gate/up and full down staging, TP 1/2/4, NUMA 1/2, guards and bounds");
 }

@@ -1,6 +1,6 @@
 // src/core/glm_prompt_cache.cpp - glm-dsa B14.14: the content-addressed prompt-cache store
-// (include/strata/core/glm_prompt_cache.hpp).
-#include "strata/core/glm_prompt_cache.hpp"
+// (include/maya/core/glm_prompt_cache.hpp).
+#include "maya/core/glm_prompt_cache.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -9,7 +9,7 @@
 #include <filesystem>
 #include <fstream>
 
-namespace strata::core::glmpc {
+namespace maya::core::glmpc {
 
 namespace fs = std::filesystem;
 
@@ -355,4 +355,4 @@ bool Store::put(const std::vector<int32_t>& tokens, const SaveFn& save, std::str
     return true;
 }
 
-}  // namespace strata::core::glmpc
+}  // namespace maya::core::glmpc

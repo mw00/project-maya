@@ -454,11 +454,19 @@ def main() -> int:
     for l in moe_layers:
         ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
         per = [t.expected_bytes() // n_expert for t in ts]
-        if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
+        if ts[0].type_name == ts[1].type_name:
+            gt = str(ts[0].type_id)
+        elif arch == "qwen4exp":
+            # unsloth's Qwen3.8 UD-IQ1_S: blk.18 keeps gate IQ2_S and up IQ2_XXS.  The row's type column
+            # becomes "gate:up" (only on such a layer - every other row stays byte-identical); the Qwen
+            # engine reads it, an older engine refuses the line as malformed instead of misreading it
+            gt = "%d:%d" % (ts[0].type_id, ts[1].type_id)
+            print("layer %d: gate %s, up %s (mixed types)" % (l, ts[0].type_name, ts[1].type_name))
+        else:
             print("layer %d: gate and up differ in type" % l)
             return 1
         blob = per[0] + per[1] + per[2]
-        layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
+        layout.append((l, gt, ts[2].type_id, offset, blob, ts))
         offset += blob * n_expert
     with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
         straddle = any(len({w[3] for w in (model.where[t.name] for t in ts)}) != 1
@@ -478,7 +486,7 @@ def main() -> int:
             offs = [w[0].data_start + t.offset for w, t in zip(ws, ts)]
             if len(set(shards)) == 1:
                 # v3 row: one shard for the whole blob (omitted when it is shard 1)
-                line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, *offs)
+                line = "%d %s %d %d %d %d %d %d" % (l, gt, dt, off, blob, *offs)
                 fo.write(line + ("" if shards[0] == src else " " + shards[0].name) + "\n")
             else:
                 # v4 row: the layer straddles shards (a shard boundary inside a layer); each
@@ -488,7 +496,7 @@ def main() -> int:
                 # checks each offset against that shard's directory at load, so gate and up may
                 # sit in different files too (a split by size can cut between them).
                 names = [s.name for s in shards]
-                fo.write("%d %d %d %d %d %d %d %d %s\n"
+                fo.write("%d %s %d %d %d %d %d %d %s\n"
                          % (l, gt, dt, off, blob, *offs, " ".join(names)))
     if a.skip_experts or not a.experts_bin:
         if (out / "experts.bin").exists() and not a.experts_bin:

@@ -40,6 +40,12 @@ def is_glm(cfg: dict) -> bool:
     return "--glm-pack" in args[:-1]
 
 
+def is_exl3(cfg: dict) -> bool:
+    """The config's pack is an EXL3 quant's (tools/exl3_pack.py writes exl3.txt into the pack folder)."""
+    args = cfg.get("args") or []
+    return is_glm(cfg) and (Path(args[args.index("--glm-pack") + 1]) / "exl3.txt").is_file()
+
+
 def cuda_exe(cfg: dict) -> Path:
     """The CUDA build of maya beside the config's HIP build (build-hip/maya -> build-cuda/maya), or "mixed_exe"."""
     if cfg.get("mixed_exe"):
@@ -64,8 +70,8 @@ def why_not(cfg: dict, cards: list[int] | None = None) -> str | None:
     if not (cards if cards is not None else nvidia_cards()):
         return "no NVIDIA card answers nvidia-smi"
     if not cuda_exe(cfg).is_file():
-        return f"no CUDA build of maya at {cuda_exe(cfg)} (cmake -S . -B build-cuda -DSTRATA_ENABLE_CUDA=ON " \
-               "-DSTRATA_ENABLE_HIP=OFF; cmake --build build-cuda --target maya)"
+        return f"no CUDA build of maya at {cuda_exe(cfg)} (cmake -S . -B build-cuda -DMAYA_ENABLE_CUDA=ON " \
+               "-DMAYA_ENABLE_HIP=OFF; cmake --build build-cuda --target maya)"
     if not helper_exe(cfg).is_file():
         return f"no helper program at {helper_exe(cfg)} (cmake --build build-hip --target maya-glm-helper)"
     return None
@@ -97,6 +103,9 @@ def link_config(cfg: dict, cards: list[int] | None = None) -> dict:
     env = {k: v for k, v in (cfg.get("env") or {}).items() if k not in AMD_ONLY_ENV}
     env.update({"MAYA_GLM_EXPERT_HELPER": "link", "MAYA_GLM_SPLIT": "0", "MAYA_GLM_HELPER_EXE": str(helper_exe(cfg)),
                 "HIP_VISIBLE_DEVICES": ",".join(amd)})
+    # an EXL3 quant: the helper computes its experts too (decode windows and prompt chunks) - the engine's opt-in
+    if is_exl3(cfg):
+        env.setdefault("MAYA_GLM_HELPER_EXL3", "1")
     # repeatable answers: the engine drafts a fixed length in link mode - the one the speed check's search kept
     n = mtp_draft(cfg)
     if n is not None and "MAYA_GLM_MTP_FIXED" not in env and "MAYA_GLM_MTP_ADAPT" not in env:

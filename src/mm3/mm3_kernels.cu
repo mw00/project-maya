@@ -2,7 +2,7 @@
 #include "mm3_kernels.cuh"
 
 #include <cuda_fp16.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #endif
@@ -19,10 +19,10 @@ namespace {
 
 __device__ __forceinline__ float bf2f(uint16_t b) { return __uint_as_float((uint32_t) b << 16); }
 __device__ __forceinline__ uint16_t f2bf(float f) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     return __bfloat16_as_ushort(__float2bfloat16_rn(f));
 #else
-    return strata::ds4::bf16_rn(f);
+    return maya::ds4::bf16_rn(f);
 #endif
 }
 __device__ __forceinline__ uint16_t f2h(float f) { return __half_as_ushort(__float2half_rn(f)); }
@@ -118,7 +118,7 @@ __device__ float block_absmax(float v, float* red) {
 __device__ unsigned g_wait_timeouts = 0;
 constexpr unsigned long long kWaitLimitNs = 120ull * 1000000000ull;
 __device__ __forceinline__ unsigned long long gtimer() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return wall_clock64() * 10ull;   // (RDNA's constant 100 MHz clock, in ns: a safety timeout, not a measurement)
 #else
     unsigned long long t;
@@ -265,11 +265,11 @@ __device__ __forceinline__ float e2m1_val(uint32_t c) {
 }
 // E4M3 (FP8): the nearest of v (saturated at 448), and a code's value (exact; no NaN codes are written)
 __device__ __forceinline__ uint32_t e4m3_enc(float v) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     return (uint32_t) __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
 #else   // (the same code: ds4_numerics' rounding - ties to even, saturated - then that value's bits)
     if (!(v == v)) return 0x7fu;
-    const float a = fabsf(strata::ds4::e4m3_round(v));
+    const float a = fabsf(maya::ds4::e4m3_round(v));
     const uint32_t s = (__float_as_uint(v) >> 31) << 7, f = __float_as_uint(a);
     const int E = (int) ((f >> 23) & 0xffu) - 127;
     if (a == 0.0f) return s;
@@ -502,7 +502,7 @@ __global__ void __launch_bounds__(256) block_scores_tok_kernel(const float* iq, 
 // keys is exact in any order), at a quarter of its shared memory reads a product
 // (KW keys a step: 64 on AMD - 50 KB of its 64 KB LDS; 32 under CUDA's 48 KB of static shared memory - the same bits)
 constexpr int kBwV = 64, kBwP = 132;   // (rows padded to 132 floats / halves: 16 rows of keys, 16 banks)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 constexpr int kBwK = 64;
 #else
 constexpr int kBwK = 32;
@@ -1330,12 +1330,12 @@ __global__ void mxfp8_kernel(const uint8_t* w, const uint8_t* sc, int K, uint16_
     const size_t n = blockIdx.y;
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < K; k += gridDim.x * blockDim.x) {
         const uint8_t e = sc[n * (size_t) (K / 32) + (size_t) (k / 32)];
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
         __nv_fp8_e4m3 f;
         f.__x = w[n * (size_t) K + k];
         const float v = ldexpf((float) f, (int) e - 127);   // (exact: E4M3's 3 mantissa bits fit BF16's 7)
 #else
-        const float v = ldexpf(strata::ds4::e4m3_value(w[n * (size_t) K + k]), (int) e - 127);
+        const float v = ldexpf(maya::ds4::e4m3_value(w[n * (size_t) K + k]), (int) e - 127);
 #endif
         out[n * (size_t) K + k] = f2bf(v);
     }
@@ -1352,12 +1352,12 @@ __global__ void __launch_bounds__(256) mx_rows_kernel(const uint8_t* w, const ui
     __shared__ float tab[256];
     __shared__ __align__(16) float xs[R][512];
     {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
         __nv_fp8_e4m3 f;
         f.__x = (uint8_t) threadIdx.x;
         tab[threadIdx.x] = (float) f;
 #else
-        tab[threadIdx.x] = strata::ds4::e4m3_value((uint8_t) threadIdx.x);
+        tab[threadIdx.x] = maya::ds4::e4m3_value((uint8_t) threadIdx.x);
 #endif
     }
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -1958,7 +1958,7 @@ __device__ uint32_t kth_key(const F& val, int V, int k, SelScratch& S) {
                 bin = (key >> shift) & 255u;
             }
             const unsigned act = __ballot_sync(0xffffffffu, in);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
             // (HIP has no 32-lane-mask __match_any_sync: the same peer masks from one ballot per distinct bin, the
             //  whole warp in the loop - act and rest are the warp's own, so every lane takes the same turns)
             unsigned peers = 0;
@@ -2212,7 +2212,7 @@ void block_scores(const float* iq, const uint16_t* ic, const int* pos, int T, in
 }
 
 static int select_wave_size() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 32;
     static int cached[16] = {};
@@ -2512,7 +2512,7 @@ void mx_rows(const uint8_t* w, const uint8_t* scale, int N, int K, const float* 
     }
     // (up to 8 rows - a proposal's block, a verify window's context: mxc_kernel, CUDA - measured on the V100s; HIP and
     //  MAYA_MM3_MXC=0: the kernel below)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     constexpr bool mxc_on = false;
 #else
     static const bool mxc_on = [] {

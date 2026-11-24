@@ -97,6 +97,18 @@ class ParallelOptionTests(unittest.TestCase):
                 self.assertIn(str(self.path), command)
                 self.assertEqual(maya.read_json(self.path)["args"], cfg["args"])
 
+    def test_an_api_only_config_opens_no_browser(self):
+        # #1089: "web_ui": false - no page, so a desktop start opens no browser on it
+        self.args.parallel = None
+        for web_ui, opened in ((None, True), (False, False)):
+            cfg = self.config("deepseek")
+            if web_ui is not None:
+                self.path.write_text(json.dumps({**cfg, "web_ui": web_ui}), encoding="utf-8")
+            with patch.object(maya, "rename_programs"), patch.object(maya, "WIN", True), \
+                    patch.dict(os.environ, {"MAYA_WEB_UI": ""}):
+                command, _, _ = maya.server_command(self.path, self.args)
+            self.assertEqual("--open" in command, opened)
+
     def test_glm_start_still_saves_parallel_once(self):
         self.config("glm")
         for parallel in (4, 2):

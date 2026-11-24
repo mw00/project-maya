@@ -1,10 +1,10 @@
-// tests/dp4a_sm60_test.cu - __dp4a as the kernels see it (include/strata/kernels/dp4a.hpp: four vmad on sm_60, the
+// tests/dp4a_sm60_test.cu - __dp4a as the kernels see it (include/maya/kernels/dp4a.hpp: four vmad on sm_60, the
 // hardware instruction on sm_61 and newer) against its byte-wise definition, both integer forms, bit for bit (needs a
 // GPU).  Per form ~1.07e9 cases: every edge byte (0x00, 0x7f, 0x80, 0xff) against every edge byte in all four lanes,
 // every (lane, a byte, b byte) combination once with random bytes in the other lanes, the rest random.  It also times
 // the signed form against the byte loop (informational).
 #include <cuda_runtime.h>
-#include "../include/strata/kernels/dp4a.hpp"
+#include "../include/maya/kernels/dp4a.hpp"
 
 #include <cstdint>
 #include <cstdio>

@@ -144,6 +144,9 @@ class Dashboard(unittest.TestCase):
             ({"engine_kind": "qwen", "mtp": 0, "lookup": 0}, {}, []),
             ({"engine_kind": "mm3", "dspark": 1}, {}, ["DSpark"]),
             ({"engine_kind": "mm3", "dspark": 0}, {}, []),
+            ({"engine_kind": "hy4", "dspark": 0, "mtp": 0}, {}, []),                   # (maya-hy4: drafting off)
+            ({"engine_kind": "hy4", "dspark": 0, "mtp": 0, "dfly2": 1}, {}, ["DFly2"]),
+            ({"engine_kind": "hy4", "dspark": 0, "mtp": 0, "dfly2": 0}, {}, []),
             ({"engine_kind": "ds4"}, {"dspark": True, "lookup": True}, ["DSpark", "Lookup"]),
             ({"engine_kind": "ds4"}, {"dspark": False, "lookup": True}, ["Lookup"]),
             ({"engine_kind": "ds4"}, {"dspark": False, "lookup": False}, []),
@@ -408,6 +411,28 @@ class GpuMap(unittest.TestCase):
         self.assertEqual(self.r["pool"], 15536793108)
         self.assertIsNone(self.gm.parse("INFO context=32768"))
         self.assertEqual(self.gm.pci_key("00000000:0A:00.0"), "0000:0a:00")
+
+    def test_hy4_tensor_parallel_lines(self):
+        # maya-hy4's VRAM lines (Model::vram_lines): the head's GPU (the output head's share, the MTP block and its
+        # scratch as the drafter, a helper's slices of the experts) and eight members of one tensor-parallel group, each
+        # with slices of every layer's experts - layers [0, 42) - and its group's size; they hold the same slots, so the
+        # room a member has beyond the group's least free stays idle
+        head = self.gm.parse(f"VRAM dev=0 pci=0000:3b:00.0 total={24 * GB} free={4 * GB} weights={GB // 3} kv=0 kv_ram=0 "
+                             f"act=0 drafter={6 * GB} window=0 pool={9 * GB} helper=0 tail=0 borrow=0 vision=0 "
+                             f"vision_own=0 prompt={2 * GB} tp=0 tp_n=1 slots=13981 ctx=262144 layers=0-42")
+        members = [self.gm.parse(f"VRAM dev={d} pci=0000:{0x40 + d:02x}:00.0 total={16 * GB} free={GB // (2 + d % 2)} "
+                                 f"weights={GB} kv={2 * GB} kv_ram=0 act=0 drafter={GB // 50} window=0 pool={9 * GB} "
+                                 f"helper=0 tail=0 borrow=0 vision=0 vision_own=0 prompt={GB} tp=0 tp_n=8 slots=14022 "
+                                 f"ctx=262144 layers=0-42") for d in range(1, 9)]
+        self.assertEqual((head["tp_n"], head["layers"], head["slots"], head["drafter"]), (1, [0, 42], 13981, 6 * GB))
+        gs = self.gm.view([head] + members, [], engine_pid=100)
+        self.assertEqual(len(gs), 9)
+        self.assertEqual({k: v for k, v in gs[0]["parts"].items() if v and k != "rest"},
+                         {"weights": GB // 3, "prompt": 2 * GB, "drafter": 6 * GB, "pool": 9 * GB})
+        self.assertNotIn("tp_group", gs[0])                                  # (the head's GPU: no group)
+        self.assertEqual({g["tp_group"] for g in gs[1:]}, {1})
+        self.assertEqual({g["tp_room"] for g in gs[1:]}, {min(g["free"] for g in gs[1:])})
+        self.assertEqual(gs[1]["parts"]["kv"], 2 * GB)
 
     def test_helper_pool_is_accounted_separately_from_drafter_and_rest(self):
         helper = 20_000_000_000
@@ -878,6 +903,91 @@ console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glm
         self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
         self.assertEqual(got["stale"], "")
         self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
+
+    def test_hy4_its_two_levels_its_own_settings_and_its_monitor_tiers(self):
+        # Hy4-Flash ("hy4-flash", maya-hy4): the two levels it is made for (High, Off), High the default; chat settings of
+        # its own; a level of another model's goes to High; the Monitor: the CPU lane and the n-gram table's
+        # read, the experts in VRAM from its INFO line - no SSD tier, no promotions
+        got = self.node("""
+const m = await import(web + "/monitor.js"), lib = await import(web + "/lib.js"), tc = await import(web + "/turbo-core.js");
+const out = {family: st.familyOf("hy4-flash"), others: ["glm-5.3-flash", "glm-5.3", "deepseek-v4.1-flash", "minimax-m3.1-flash",
+  "cyber-frost-3.8-ps", "qwen3.8-flash-next", ""].map((x) => st.familyOf(x))};
+st.setFamily("hy4-flash");
+st.S.health = {model: "hy4-flash"};
+out.levels = st.LEVELS; out.dflt = st.DEFAULTS.thinking; out.titles = st.thinkTitles(); out.key = st.prefsKey();
+out.nearest = ["none", "auto", "low", "medium", "high", "xhigh", "max"].map((l) => st.levelFor(l));
+out.pills = st.LEVELS.map((l) => st.thinkPill(l.id).i);
+out.fastest = tc.fastestThinking(st.THINKING);
+out.name = lib.modelName("hy4-flash"); out.logo = lib.modelLogo("hy4-flash"); out.catalogLogo = lib.modelLogo("Hy4-Flash · Maya-XS");
+const eng = {engine_kind: "hy4", experts: "6144", vram_slots: "1900"}, n = {vram_hit: 0.31, cpu: 5.52, engram_ms: 0.42};
+out.set = m.tierSet(eng).map((x) => [x.key, x.label]); out.shares = sv.tierShares(n, eng);
+out.tip = m.tierTip(n, eng, {disk: 0}); out.calm = m.tierTip({...n, vram_hit: 0.9}, eng, {disk: 0});
+out.sets = ["ds4", "mm3", "qwen", "glm-fast"].map((k) => m.tierSet({engine_kind: k}).map((x) => x.key).join());
+// its INFO line as the server parses it (numbers): tensor parallel (every expert's slices on the members: all in VRAM),
+// a layer split with all of them in VRAM, one GPU with the CPU lane (Jupiter's V100, Maya-XS)
+const info = (line) => Object.fromEntries(line.split(" ").slice(1).map((kv) => kv.split("=")).map(([k, v]) => [k, /^-?\\d+$/.test(v) ? +v : v]));
+const lay = {tp: "INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=32768 vram_gb=49.40 dspark=0 mtp=1 experts=20992 vram_slots=20992",
+             one: "INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=32768 vram_gb=31.40 dspark=0 mtp=1 experts=20992 vram_slots=8118"};
+out.lay = Object.fromEntries(Object.entries(lay).map(([k, l]) => [k, sv.tierShares({vram_hit: 1, cpu: 0}, info(l))]));
+out.layTip = m.tierTip({vram_hit: 1, cpu: 0, engram_ms: 0.07}, info(lay.tp), {disk: 0});
+console.log(JSON.stringify(out));""")
+        self.assertEqual(got["family"], "hy4")
+        self.assertEqual(got["others"], ["glm", "glm", "deepseek", "minimax", "qwen", "qwen", "glm"])   # (as before)
+        self.assertEqual([(lv["id"], lv["name"]) for lv in got["levels"]], [("none", "Off"), ("high", "High")])
+        self.assertEqual((got["dflt"], got["key"], got["fastest"]), ("high", "sampling_hy4", "none"))
+        self.assertEqual(sorted(got["titles"]), ["high", "none"])
+        self.assertEqual(got["titles"]["none"], "No thinking: it answers right away (Hy4's no_think)")
+        self.assertEqual(got["nearest"], ["none", None, None, "high", "high", "high", "high"])   # (None: its default, High)
+        self.assertEqual(len(got["pills"]), 2)
+        self.assertEqual((got["name"], got["logo"], got["catalogLogo"]),
+                         ("Hy4 Flash", {"src": "web/logo-hy4.svg", "mono": False}, {"src": "web/logo-hy4.svg", "mono": False}))
+        self.assertTrue((ROOT / "serve" / "web" / "logo-hy4.svg").is_file())
+        self.assertEqual(got["set"], [["cpu", "On the CPU"], ["engram_ms", "N-gram memory"]])
+        self.assertEqual(got["shares"], {"vu": 1900, "ru": 4244, "total": 6144, "disk": 0, "vramGb": None, "ramGb": None,
+                                         "diskGb": None})
+        self.assertTrue(got["tip"].startswith("Most experts run on the CPU"))
+        self.assertEqual(got["calm"], "")
+        # (maya-hy4 before the fix said vram_slots=0 in tensor parallel: the bar all RAM beside a 100% VRAM hit)
+        self.assertEqual({k: (v["vu"], v["ru"], v["total"], v["disk"]) for k, v in got["lay"].items()},
+                         {"tp": (20992, 0, 20992, 0), "one": (8118, 12874, 20992, 0)})
+        self.assertEqual(got["layTip"], "")
+        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo",
+                                       "promo,ram_fetch,disk",                    # (Qwen: Promoted since #1103)
+                                       "ram_fetch,disk,promo"])                   # (the other engines': unchanged)
+
+    def test_ik2_its_levels_its_own_settings_its_name_and_its_monitor(self):
+        # Inkling 2 Mini ("inkling-2-mini", maya-ik2, an experimental preview): its template's effort levels by name -
+        # Off, Low, Medium, High (its default: 0.9), Max - chat settings of its own; a level of another model's goes to
+        # the nearest it has; its name from its id; no maker's mark in lobe-icons (the page's chip); the Monitor: no
+        # tiers card (maya-ik2 writes no STAT lines) and the other engines' sets as they were
+        got = self.node("""
+const m = await import(web + "/monitor.js"), lib = await import(web + "/lib.js"), tc = await import(web + "/turbo-core.js");
+const out = {family: st.familyOf("inkling-2-mini"), small: st.familyOf("inkling-2-small"),
+  others: ["glm-5.3-flash", "deepseek-v4.1-flash", "minimax-m3.1-flash", "cyber-frost-3.8-ps", "hy4-flash", ""].map((x) => st.familyOf(x))};
+st.setFamily("inkling-2-mini");
+st.S.health = {model: "inkling-2-mini"};
+out.levels = st.LEVELS.map((l) => [l.id, l.name]); out.dflt = st.DEFAULTS.thinking; out.titles = st.thinkTitles(); out.key = st.prefsKey();
+out.nearest = ["none", "auto", "low", "medium", "high", "xhigh", "max"].map((l) => st.levelFor(l));
+out.fastest = tc.fastestThinking(st.THINKING);
+out.name = lib.modelName("inkling-2-mini"); out.short = lib.modelName("inkling-2-mini", true);
+out.logo = lib.modelLogo("inkling-2-mini");
+const eng = {engine_kind: "ik2", model: "Inkling-2", kv: "fp8", ctx: 262144, gpus: 1};
+out.set = m.tierSet(eng).map((x) => x.key).join(); out.tip = m.tierTip({}, eng, {disk: 0});
+out.sets = ["ds4", "mm3", "qwen", "hy4", "glm-fast"].map((k) => m.tierSet({engine_kind: k}).map((x) => x.key).join());
+console.log(JSON.stringify(out));""")
+        self.assertEqual((got["family"], got["small"]), ("ik2", "ik2"))
+        self.assertEqual(got["others"], ["glm", "deepseek", "minimax", "qwen", "hy4", "glm"])   # (as before)
+        self.assertEqual(got["levels"], [["none", "Off"], ["low", "Low"], ["medium", "Medium"], ["high", "High"],
+                                         ["max", "Max"]])
+        self.assertEqual((got["dflt"], got["key"], got["fastest"]), ("high", "sampling_ik2", "none"))
+        self.assertEqual(sorted(got["titles"]), ["high", "low", "max", "medium", "none"])
+        self.assertIn("its default", got["titles"]["high"])
+        self.assertEqual(got["nearest"], ["none", None, "low", "medium", "high", "max", "max"])   # (None: its default)
+        self.assertEqual((got["name"], got["short"], got["logo"]), ("Inkling 2 Mini", "Inkling 2 Mini", None))
+        self.assertEqual(got["tip"], "")
+        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo",
+                                       "promo,ram_fetch,disk",                    # (Qwen: Promoted since #1103)
+                                       "cpu,engram_ms", "ram_fetch,disk,promo"])
 
     def test_about_has_the_support_line_always_and_the_update_card_none(self):
         # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold

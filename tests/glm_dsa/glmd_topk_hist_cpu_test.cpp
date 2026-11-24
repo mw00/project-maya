@@ -7,8 +7,8 @@
 // against a sort oracle (std::stable_sort by score, descending, then by cell) and against glmd::twin::topk on:
 // random scores, many exact ties, all equal, two values, -inf and +-0, a heavy boundary bucket (the fallback), huge
 // dynamic range, n <= top_k (identity), per-row positions, n up to 131072; plus the policy's dispatch.
-#include "strata/kernels/glmd_decode_policy.hpp"
-#include "strata/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
+#include "maya/kernels/glmd_fast.hpp"
 
 #include <algorithm>
 #include <cmath>

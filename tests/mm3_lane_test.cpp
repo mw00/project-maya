@@ -14,7 +14,7 @@
 #include "mm3_cpu.hpp"
 
 // (expert_layout.cpp's, which the rest of that file would bring ggml with)
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 bool cpu_avx2_ok() { return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"); }
 // (pool.cpp's, which would bring the rest of the CPU kernels: every logical CPU stands in for a core here)
 std::vector<int> physical_cores(bool skip_first) {

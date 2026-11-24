@@ -14,15 +14,15 @@
 
 #include <utility>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 __device__ __forceinline__ void pdl_wait() {
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if !defined(MAYA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
 __device__ __forceinline__ void pdl_trigger() {
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if !defined(MAYA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
@@ -38,7 +38,7 @@ bool pdl_on();
 
 template <typename... P, typename... A>
 inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_t smem, cudaStream_t s, A&&... args) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (pdl_on()) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = grid;
@@ -57,4 +57,4 @@ inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_t smem,
     kernel<<<grid, block, smem, s>>>(std::forward<A>(args)...);
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

@@ -57,7 +57,7 @@ function Fail([string]$m) { $script:fails++; Note "FAIL $m" }
 if (-not $Force -and (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue)) {
     Write-Output "port 8080 is serving (the dashboard holds the GPU): stop it, then rerun (-Force skips this)"; exit 3
 }
-foreach ($e in @(Get-ChildItem Env: | Where-Object { $_.Name -match '^(STRATA_|MAYA_|DS4_)' })) {
+foreach ($e in @(Get-ChildItem Env: | Where-Object { $_.Name -match '^(MAYA_|MAYA_|DS4_)' })) {
     Note "note: $($e.Name)=$($e.Value) is set in this shell and reaches every run"
 }
 

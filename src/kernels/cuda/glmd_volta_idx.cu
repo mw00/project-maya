@@ -1,14 +1,14 @@
 // src/kernels/cuda/glmd_volta_idx.cu - glm-dsa B10.3 lightning-indexer scorers (WMMA and CUDA-core, F32 or FP16 keys:
-// B10.8) and B10.4 multi-block radix top-k.  See include/strata/kernels/glmd_volta.hpp; the twins are in
+// B10.8) and B10.4 multi-block radix top-k.  See include/maya/kernels/glmd_volta.hpp; the twins are in
 // src/core/glm_dsa_cpu_volta_twin.cpp.
 //
 // HIP builds compile the CUDA-core scorer and the radix top-k and leave the WMMA scorer out (nvcuda::wmma: GLMD_WMMA,
 // glmd_arch.cuh, is 0 there, and the scorer's kernel and launcher are not built): there idx_wmma_enabled() and
 // idx_score_wmma_supported() are false and idx_score_wmma() refuses.
-#include "strata/core/glm_env.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
-#include "glmd_arch.cuh"   // STRATA_GRID_CONSTANT, GLMD_WMMA (Pascal pass)
+#include "glmd_arch.cuh"   // MAYA_GRID_CONSTANT, GLMD_WMMA (Pascal pass)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -20,7 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // The radix top-k's last block reads the other blocks' counts after their publication fences: an agent-scope acquire
 // load is CUDA's __ldcg there (HIP spells __ldcg only for its vector and half types; glm_fast.cu does the same for
 // float).
@@ -50,7 +50,7 @@ bool launch_check(const char* what) {
     return false;
 }
 // an on/off switch, default off ("auto" counts as on here: these dispatchers have no auto rule of their own)
-bool env_on(const char* name) { return strata::glmenv::env_switch(name, strata::glmenv::kOff, true) != strata::glmenv::kOff; }
+bool env_on(const char* name) { return maya::glmenv::env_switch(name, maya::glmenv::kOff, true) != maya::glmenv::kOff; }
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -60,7 +60,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 __device__ __forceinline__ __half half_sat(float v) { return __float2half(fmaxf(-65504.0f, fminf(65504.0f, v))); }
 
 // ---------------------------------------------------------------- B10.3 WMMA scorer (CUDA: nvcuda::wmma)
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // 8 warps x 16 cells per block, TB tokens per block (blockIdx.y), NTH = idx_heads / 16 column tiles per token.
 // Shared: the queries of the block's tokens as FP16 [TB * H][D + 8] (matrix_b, col-major), the head weights, and per
 // warp a 16 x (D + 8) FP16 key tile that becomes the warp's 16 x H f32 output scratch after the k-loop.
@@ -70,7 +70,7 @@ size_t idx_wmma_smem(int TB, int H, int D) {
 }
 
 template <int TB, int NTH, bool F16K>
-__global__ void __launch_bounds__(kIdxWarps * 32) idx_wmma_kernel(const STRATA_GRID_CONSTANT IdxScoreWmma a, int ld) {
+__global__ void __launch_bounds__(kIdxWarps * 32) idx_wmma_kernel(const MAYA_GRID_CONSTANT IdxScoreWmma a, int ld) {
 #if !GLMD_WMMA
     __trap();   // Pascal (no tensor cores): stops loudly - nothing keeps the auto scorer choice off below sm_70 yet
 #else
@@ -185,12 +185,12 @@ bool launch_idx_wmma(const IdxScoreWmma& a, int ld, cudaStream_t s) {
         idx_wmma_kernel<TB, NTH, false><<<grid, kIdxWarps * 32, smem, s>>>(a, ld);
     return launch_check("idx_score_wmma");
 }
-#endif  // !STRATA_USE_HIP (the WMMA scorer)
+#endif  // !MAYA_USE_HIP (the WMMA scorer)
 
 // ---------------------------------------------------------------- the CUDA-core scorer (glmf::dsa_score's form)
 // a warp per cell, the queries of token blockIdx.y in shared memory; F32 or FP16 keys
 template <bool F16K>
-__global__ void __launch_bounds__(256) idx_simple_kernel(const STRATA_GRID_CONSTANT IdxScoreWmma a, int ld) {
+__global__ void __launch_bounds__(256) idx_simple_kernel(const MAYA_GRID_CONSTANT IdxScoreWmma a, int ld) {
     extern __shared__ float s_q[];   // H * D, then H weights
     const int H = a.idx_heads, D = a.idx_dim, t = blockIdx.y;
     float* s_w = s_q + H * D;
@@ -405,7 +405,7 @@ __global__ void __launch_bounds__(NT) topk_mb_write(const float* __restrict__ sc
 int volta_idx_launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
 bool idx_wmma_enabled() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;   // the WMMA scorer is a CUDA kernel: HIP builds score with the CUDA-core one
 #else
     static const bool on = env_on("MAYA_GLMD_IDX_WMMA");
@@ -414,7 +414,7 @@ bool idx_wmma_enabled() {
 }
 
 bool idx_score_wmma_supported(int idx_heads, int idx_dim) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) idx_heads;
     (void) idx_dim;
     return false;   // (no WMMA scorer in a HIP build)
@@ -436,7 +436,7 @@ bool idx_score_wmma(const IdxScoreWmma& a, void* stream) {
         return false;
     }
     if (a.n_kv == 0 || a.T == 0) return true;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) stream;
     return false;   // (unreachable: idx_score_wmma_supported refused above)
 #else

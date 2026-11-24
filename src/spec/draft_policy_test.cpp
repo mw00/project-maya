@@ -6,11 +6,11 @@
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
 //   5. the policy never proposes a window beyond its cap.
-#include "strata/spec/draft_policy.hpp"
+#include "maya/spec/draft_policy.hpp"
 
 #include <cstdio>
 
-using strata::spec::DraftPolicy;
+using maya::spec::DraftPolicy;
 
 namespace {
 int g_fail = 0;

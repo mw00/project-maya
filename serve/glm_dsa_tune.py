@@ -3,7 +3,7 @@
 A request's `strata_tune` object may name, besides Maya's keys (pcie_frac, cpu_threads, read_chunks, spec, spec_min_p,
 spec_n_min, spec_cum), the engine settings below; StrataEngine.sampling_keys (serve/server.py, one hook) appends what
 engine_keys() returns to the GEN line.  The engine applies them from the request's first token and puts every knob the
-request leaves out back to the value it started with (include/strata/core/glm_req_knobs.hpp), so a request without
+request leaves out back to the value it started with (include/maya/core/glm_req_knobs.hpp), so a request without
 them runs exactly as the engine started.  A value outside a key's range, or of the wrong type, is dropped here.
 
     promote_min      0..65535        MAYA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged count clears it

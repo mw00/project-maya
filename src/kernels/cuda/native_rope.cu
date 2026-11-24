@@ -22,8 +22,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "strata/kernels/native_rope.hpp"
-#include "strata/kernels/mrope.hpp"
+#include "maya/kernels/native_rope.hpp"
+#include "maya/kernels/mrope.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cmath>
@@ -31,7 +31,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 bool overlaps(const void* a, size_t an, const void* b, size_t bn) {

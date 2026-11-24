@@ -1,20 +1,20 @@
 // src/core/glm_ngram_draft.cpp - glm-dsa B14.13: the n-gram draft matcher, its bookkeeping and the decode_spec session
-// (include/strata/core/glm_ngram_draft.hpp).
-#include "strata/core/glm_env.hpp"
-#include "strata/core/glm_ngram_draft.hpp"
-#include "strata/core/glm_req_knobs.hpp"
+// (include/maya/core/glm_ngram_draft.hpp).
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_ngram_draft.hpp"
+#include "maya/core/glm_req_knobs.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 
-namespace strata::core::glmng {
+namespace maya::core::glmng {
 
 namespace {
 
 int env_int(const char* k, int dflt, int lo, int hi) {
-    return (int) std::max<long long>(lo, std::min<long long>(hi, strata::glmenv::env_int(k, dflt)));
+    return (int) std::max<long long>(lo, std::min<long long>(hi, maya::glmenv::env_int(k, dflt)));
 }
 
 std::mutex g_mu;
@@ -28,7 +28,7 @@ std::unordered_map<const void*, std::vector<int32_t>>& registry() {
 NgramConfig ngram_config_env() {
     NgramConfig c;
     // a request's GEN ngram= (the speed plan's knobs, glm_req_knobs.hpp) wins over the switch for that request
-    c.on = glmknob::get(glmknob::Ngram, strata::glmenv::env_flag("MAYA_GLM_NGRAM_DRAFT", false) ? 1 : 0) != 0;
+    c.on = glmknob::get(glmknob::Ngram, maya::glmenv::env_flag("MAYA_GLM_NGRAM_DRAFT", false) ? 1 : 0) != 0;
     c.n_max = env_int("MAYA_GLM_NGRAM_MAX", 4, 1, kMaxDraft);
     c.min_match = env_int("MAYA_GLM_NGRAM_MIN", 3, 1, 16);
     c.max_match = std::max(c.max_match, c.min_match);
@@ -216,4 +216,4 @@ std::vector<int32_t> take_history(const void* model) {
     return v;
 }
 
-}  // namespace strata::core::glmng
+}  // namespace maya::core::glmng

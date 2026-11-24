@@ -8,13 +8,13 @@
 //
 // Also here: the small pack-level hooks the Maya-owned loader calls (pack geometry before the split bounds, split
 // boundaries on full-indexer layers, the forward and prompt gates, the NextN lists, the dense split cost).
-#include "strata/core/glm_env.hpp"
-#include "strata/core/glm_arch.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_dsa_split.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_arch.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_dsa_split.hpp"
 
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/glmd_mmq_pad.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/glmd_mmq_pad.hpp"
 
 #include "ggml.h"
 
@@ -27,7 +27,7 @@
 #include <memory>
 #include <sstream>
 
-namespace strata::core {
+namespace maya::core {
 
 const char* glm_arch_name(GlmArch a) {
     switch (a) {
@@ -47,12 +47,12 @@ bool glm52_default_full(int il) { return il < 78 && (il < 2 || (il - 2) % 4 == 0
 
 // a scalar KV, or an array whose items all hold the same number (llama.cpp's get_key_or_arr writes per-layer arrays
 // for some keys); false = absent or not one number
-bool uniform_num(const strata::MetaValue* v, double& out, std::string& why) {
+bool uniform_num(const maya::MetaValue* v, double& out, std::string& why) {
     if (v == nullptr) {
         why = "missing";
         return false;
     }
-    if (v->type == strata::MetaType::ARRAY) {
+    if (v->type == maya::MetaType::ARRAY) {
         if (v->items.empty() || v->items.size() != v->count) {
             why = "an empty or truncated array";
             return false;
@@ -114,9 +114,9 @@ bool pack_shards(const std::string& pack_dir, std::vector<std::string>& names, s
 
 // ---------------------------------------------------------------- the dispatch
 
-int glm_arch_route(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
-    const strata::MetaValue* a = g.get("general.architecture");
-    if (a == nullptr || a->type != strata::MetaType::STRING) {
+int glm_arch_route(const maya::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const maya::MetaValue* a = g.get("general.architecture");
+    if (a == nullptr || a->type != maya::MetaType::STRING) {
         std::fprintf(stderr, "glm geometry: WARNING the GGUF has no general.architecture - reading it as glm5-next "
                              "(Maya's key probe)\n");
         out.arch = GlmArch::Glm5Next;
@@ -133,18 +133,18 @@ int glm_arch_route(const strata::GgufFile& g, Glm5Geometry& out, std::string& er
 
 // ---------------------------------------------------------------- the glm-dsa reader
 
-bool from_gguf_glm_dsa(const strata::GgufFile& g, Glm5Geometry& out_ref, std::string& err) {
+bool from_gguf_glm_dsa(const maya::GgufFile& g, Glm5Geometry& out_ref, std::string& err) {
     const std::string p = "glm-dsa.";
     Glm5Geometry out;   // from the defaults, never from a previous read
     // the reader keeps a 64-item sample of each array (metadata()); glm-dsa reads per-layer arrays of 78/79 items
     // (attention.indexer.types and the like), so an array the sample truncated is read again whole (get_full)
-    std::map<std::string, strata::MetaValue> whole;
-    const auto get = [&](const std::string& key) -> const strata::MetaValue* {
-        const strata::MetaValue* v = g.get(key);
-        if (v == nullptr || v->type != strata::MetaType::ARRAY || v->items.size() == v->count) return v;
+    std::map<std::string, maya::MetaValue> whole;
+    const auto get = [&](const std::string& key) -> const maya::MetaValue* {
+        const maya::MetaValue* v = g.get(key);
+        if (v == nullptr || v->type != maya::MetaType::ARRAY || v->items.size() == v->count) return v;
         auto it = whole.find(key);
         if (it == whole.end()) {
-            strata::MetaValue f;
+            maya::MetaValue f;
             if (!g.get_full(key, f)) return v;
             it = whole.emplace(key, std::move(f)).first;
         }
@@ -237,8 +237,8 @@ bool from_gguf_glm_dsa(const strata::GgufFile& g, Glm5Geometry& out_ref, std::st
     // RoPE: NORM (interleaved pairs), theta from the file, no scaling of any kind
     out.rope_theta = theta;
     if (!(theta > 0) || !std::isfinite(theta)) return fail("rope.freq_base " + std::to_string(theta) + " is invalid");
-    if (const strata::MetaValue* v = get(p + "rope.scaling.type"))
-        if (v->type != strata::MetaType::STRING || (v->s != "none" && !v->s.empty()))
+    if (const maya::MetaValue* v = get(p + "rope.scaling.type"))
+        if (v->type != maya::MetaType::STRING || (v->s != "none" && !v->s.empty()))
             return fail("rope scaling '" + v->s + "' is refused (GLM-5.3 uses plain RoPE)");
     for (const char* k : {"rope.scaling.factor", "rope.scaling.attn_factor", "rope.scale_linear"}) {
         double f = 0;
@@ -279,9 +279,9 @@ bool from_gguf_glm_dsa(const strata::GgufFile& g, Glm5Geometry& out_ref, std::st
     // llama.cpp's back-compat rule (glm-dsa.cpp:59-66): n_ctx_train < 1048576 (GLM-5/5.1) all full, else GLM-5.2's
     const int n_all = out.n_layers + out.nextn;
     out.indexer_full.assign((size_t) n_all, 1);
-    if (const strata::MetaValue* v = get(p + "attention.indexer.types")) {
-        if (v->type != strata::MetaType::ARRAY || (v->count != (uint64_t) out.n_layers && v->count != (uint64_t) n_all))
-            return fail("attention.indexer.types has " + std::to_string(v->type == strata::MetaType::ARRAY ? v->count : 1) +
+    if (const maya::MetaValue* v = get(p + "attention.indexer.types")) {
+        if (v->type != maya::MetaType::ARRAY || (v->count != (uint64_t) out.n_layers && v->count != (uint64_t) n_all))
+            return fail("attention.indexer.types has " + std::to_string(v->type == maya::MetaType::ARRAY ? v->count : 1) +
                         " entries, expected " + std::to_string(out.n_layers) +
                         (out.nextn ? " or " + std::to_string(n_all) : std::string()));
         if (v->items.size() != v->count) return fail("attention.indexer.types was truncated by the reader");
@@ -327,7 +327,7 @@ bool from_gguf_glm_dsa(const strata::GgufFile& g, Glm5Geometry& out_ref, std::st
 
     // the vocabulary: vocab_size, else glm_geometry_check takes token_embd's rows (0 until then)
     out.n_vocab = 0;
-    if (const strata::MetaValue* v = get(p + "vocab_size")) {
+    if (const maya::MetaValue* v = get(p + "vocab_size")) {
         double nv = 0;
         std::string why;
         if (!uniform_num(v, nv, why) || nv < 1) return fail("vocab_size is " + why);
@@ -346,9 +346,9 @@ bool glm_pack_geometry(const std::string& pack_dir, Glm5Geometry& out, std::stri
     std::string why;
     if (!pack_shards(pack_dir, names, why)) return true;
     try {
-        const strata::GgufFile g(pack_dir + "/../" + names[0]);
-        const strata::MetaValue* a = g.get("general.architecture");
-        if (a == nullptr || a->type != strata::MetaType::STRING || a->s != "glm-dsa") return true;
+        const maya::GgufFile g(pack_dir + "/../" + names[0]);
+        const maya::MetaValue* a = g.get("general.architecture");
+        if (a == nullptr || a->type != maya::MetaType::STRING || a->s != "glm-dsa") return true;
         Glm5Geometry geo;
         if (!Glm5Geometry::from_gguf(g, geo, err)) return false;
         out = geo;
@@ -356,6 +356,30 @@ bool glm_pack_geometry(const std::string& pack_dir, Glm5Geometry& out, std::stri
     } catch (const std::exception& e) {
         (void) e;
         return true;   // load_pack reports an unreadable pack as before
+    }
+    return true;
+}
+
+bool glm_pack_geometry_full(const std::string& pack_dir, Glm5Geometry& out, std::string& err,
+                            std::vector<std::pair<std::string, int>>* types) {
+    std::vector<std::string> names;
+    if (!pack_shards(pack_dir, names, err)) return false;
+    try {
+        const maya::GgufFile g(pack_dir + "/../" + names[0]);
+        Glm5Geometry geo;
+        if (!Glm5Geometry::from_gguf(g, geo, err)) return false;
+        out = geo;
+        if (types != nullptr) {
+            types->clear();
+            for (size_t i = 0; i < names.size(); ++i) {
+                std::unique_ptr<maya::GgufFile> other;
+                if (i > 0) other.reset(new maya::GgufFile(pack_dir + "/../" + names[i]));
+                for (const auto& t : (i == 0 ? g : *other).tensors()) types->push_back({t.name, (int) t.type});
+            }
+        }
+    } catch (const std::exception& e) {
+        err = std::string("glm pack geometry: ") + e.what();
+        return false;
     }
     return true;
 }
@@ -382,7 +406,7 @@ bool glm_forward_available(const Glm5Geometry& g, std::string& err) {
     // A geometry the decode kernels cannot serve is refused by glmdsa::mixer_setup with the reason.
     // MAYA_GLM_CHECK_ONLY=1 stops a glm-dsa load here, after the geometry and tensor-shape checks and before any
     // weight upload (a pack check without a GPU; the loader test uses it).
-    if (!strata::glmenv::env_flag("MAYA_GLM_CHECK_ONLY", false)) return true;
+    if (!maya::glmenv::env_flag("MAYA_GLM_CHECK_ONLY", false)) return true;
     int full = 0;
     for (int il = 0; il < g.n_layers; ++il) full += g.idx_full(il) ? 1 : 0;
     char buf[512];
@@ -419,9 +443,9 @@ void glm_dense_layer_cost(const Glm5Geometry& g, const std::string& pack_dir, st
     std::vector<std::string> names;
     std::string err;
     if (!pack_shards(pack_dir, names, err)) return;
-    std::vector<std::unique_ptr<strata::GgufFile>> gfs;
+    std::vector<std::unique_ptr<maya::GgufFile>> gfs;
     try {
-        for (const auto& n : names) gfs.emplace_back(new strata::GgufFile(pack_dir + "/../" + n));
+        for (const auto& n : names) gfs.emplace_back(new maya::GgufFile(pack_dir + "/../" + n));
     } catch (const std::exception&) {
         return;
     }
@@ -437,7 +461,7 @@ void glm_dense_layer_cost(const Glm5Geometry& g, const std::string& pack_dir, st
         const int il = std::atoi(nm.c_str() + 4);
         if (il < 0 || il >= (int) c.size() || nm.find("_exps.") != std::string::npos) continue;
         for (const auto& gf : gfs)
-            if (const strata::TensorInfo* t = gf->find(nm)) {
+            if (const maya::TensorInfo* t = gf->find(nm)) {
                 c[(size_t) il] += (double) ggml_row_size((ggml_type) t->type, (int64_t) t->shape[0]) *
                                   (double) (t->elements() / t->shape[0]);
                 ++rows;
@@ -447,4 +471,4 @@ void glm_dense_layer_cost(const Glm5Geometry& g, const std::string& pack_dir, st
     if (rows > 0) cost = c;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

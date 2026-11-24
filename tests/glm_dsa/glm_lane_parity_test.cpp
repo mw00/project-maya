@@ -14,11 +14,11 @@
 //      every grid index), the largest block scales and all-negative or all-positive signs, against Q8_K activations
 //      of +-127 (the int16 / int32 overflow cases; -128 is outside the quantizers' range, checked too), checked against a double-precision reference from ggml's own
 //      dequantizers (relative 1e-5 of the row's sum of |terms|).
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/iq_avx2.hpp"
-#include "strata/kernels/cpu/iq_avx512.hpp"
-#include "strata/kernels/cpu/kq_avx512.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/iq_avx2.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/kq_avx512.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 namespace {
 

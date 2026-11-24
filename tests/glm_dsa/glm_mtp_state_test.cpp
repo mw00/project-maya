@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_mtp_state_test.cpp - glm-dsa B15.3 (CPU): the NextN carrier's sequence state, the MTP1 slot
-// trailer, the block identity and the draft budget (include/strata/core/glm_mtp_state.hpp).
+// trailer, the block identity and the draft budget (include/maya/core/glm_mtp_state.hpp).
 //
 // A toy twin of the engine's MTP data flow runs the engine's own state machine (glmmtp::HostCarrier, the trailer
 // functions, spec_budget) next to "legacy", Maya's behaviour (one shared scratch row per card, written by every
@@ -16,8 +16,8 @@
 //   6. the draft budget (#28473): draft_budget's table, and decode_spec's loop (simulated) issues no speculative
 //      verify row past n_predict or the context, with the same tokens (counted for every max_new and context);
 //   7. the block identity: order-independent, changes with a tensor type or the source, never 0; fingerprint words.
-#include "strata/core/glm_mtp_state.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_mtp_state.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -36,7 +36,7 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-using namespace strata::core;
+using namespace maya::core;
 
 constexpr int E = 16, V = 23;
 

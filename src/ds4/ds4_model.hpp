@@ -22,13 +22,14 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 struct Options {
     std::string pack;                 // <model>/maya-ds4
     int64_t max_context = 32768;
     std::vector<int> gpus;            // empty: every visible GPU
     int64_t reserve_mib = 600;        // VRAM left free on each GPU
+    bool reserve_given = false;       // (--reserve-mib on the command line: held for the whole run - #1026)
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
     // the CPU lane's threads: 0 a thread a physical core, or where the host offers it the performance cores or one
     // NUMA node's cores when measured faster at load; n: at most n, a thread a core
@@ -278,7 +279,8 @@ public:
     void set_cancel(std::function<bool()> f);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
     /// After a request: true when no later one can trust this process - a layer GPU took a fault inside a kernel (its
-    /// context returns that error from then on) or the prompt path's room was not handed back.  The serve loop then
+    /// context returns that error from then on), a peer all-reduce failed, or the prompt path's room was not handed back.
+    /// The serve loop then
     /// ends the engine (exit 3) once the request's DONE is out, and the server starts a fresh one for the next request.
     bool broken();
     /// Asked while a run of chunks goes through the layers: true (a yield) ends it at a chunk every GPU reaches, as a
@@ -288,6 +290,8 @@ public:
     int fed() const;   // the tokens the last feed() / feed_mark() took (all of them unless a yield)
     /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
     void begin_request();
+    /// (#1026) > 0: this start came out short of --reserve-mib; the next keeps this many MiB beside it (its file)
+    int reserve_short_mib() const;
     int64_t pos() const;
     int64_t max_context() const;
     int vocab() const;
@@ -425,4 +429,4 @@ private:
     std::unique_ptr<Impl> p_;
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

@@ -1,7 +1,7 @@
 // split_groups (MAYA_GLM_EVEN_GROUPS): the old rule's groups of k unchanged; the even rule's two groups at least,
 // near-equal sizes of k at most, and in steady state - only the group that came back is ready - that group again,
 // not cut smaller.  CPU only.
-#include "strata/core/split_groups.hpp"
+#include "maya/core/split_groups.hpp"
 
 #include <cstdio>
 #include <numeric>
@@ -21,7 +21,7 @@ void check(const std::vector<int>& got, const std::vector<int>& want, const char
 }  // namespace
 
 int main() {
-    using strata::core::split_groups;
+    using maya::core::split_groups;
     // the old rule: k at a time, whatever runs
     check(split_groups(8, 8, 2, false), {2, 2, 2, 2}, "greedy 8 by 2");
     check(split_groups(4, 4, 4, false), {4}, "greedy 4 by 4 (one group)");

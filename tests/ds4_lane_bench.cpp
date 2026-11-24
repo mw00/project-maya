@@ -11,7 +11,7 @@
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_pcie.hpp"
 #include "../src/ds4/ds4_pool.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"   // (--check: whether the exact rows passed their ggml check)
+#include "maya/kernels/cpu/native_expert.hpp"   // (--check: whether the exact rows passed their ggml check)
 
 #include "ggml.h"   // (--check: ggml's dequantize_row_* for the reference)
 
@@ -27,9 +27,9 @@
 #include <thread>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
-namespace pcie = strata::ds4::pcie;
-using strata::ds4::Pool;
+namespace gg = maya::ds4::gguf;
+namespace pcie = maya::ds4::pcie;
+using maya::ds4::Pool;
 
 namespace {
 
@@ -199,7 +199,7 @@ bool check_fmt(Lane& ln, const Experts& X, const float* x) {
     std::printf("check %s (%s / %s): CPU lane vs the double reference: gate/up %.2e, down %.2e of the largest  %s\n",
                 X.f.name.c_str(), ggml_type_name((ggml_type) X.f.tg), ggml_type_name((ggml_type) X.f.td), he, ye,
                 ok ? "ok" : "FAIL");
-    namespace kc = strata::kernels::cpu;   // (bit for bit vs ggml-cpu's dot: rows_match_ggml, else ggml's dot is used)
+    namespace kc = maya::kernels::cpu;   // (bit for bit vs ggml-cpu's dot: rows_match_ggml, else ggml's dot is used)
     std::printf("check %s: own rows bit-identical to ggml's dot: one token %s, several tokens %s\n", X.f.name.c_str(),
                 kc::native_rows1_exact(X.f.tg) ? "yes" : "no (ggml's dot)",
                 kc::native_multi_rows_exact(X.f.tg) ? "yes" : "no (ggml's dot)");

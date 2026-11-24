@@ -1,5 +1,5 @@
 // src/prefill/failure_test.cpp - the allocation failures the recovery recognizes (no GPU, no model).
-#include "strata/prefill/failure.hpp"
+#include "maya/prefill/failure.hpp"
 
 #include <cstdio>
 #include <string>
@@ -16,7 +16,7 @@ int main() {
         "prefill mmq: there is not enough memory for the scratch",
     };
     for (const char* m : alloc)
-        if (!strata::prefill::is_allocation_failure(m)) {
+        if (!maya::prefill::is_allocation_failure(m)) {
             std::fprintf(stderr, "not seen as an allocation failure: %s\n", m);
             ++fail;
         }
@@ -29,16 +29,16 @@ int main() {
         "prefill gemm: cuBLAS status 1",
     };
     for (const char* m : other)
-        if (strata::prefill::is_allocation_failure(m)) {
+        if (maya::prefill::is_allocation_failure(m)) {
             std::fprintf(stderr, "seen as an allocation failure: %s\n", m);
             ++fail;
         }
     // the Failure carries its reason
     try {
-        strata::prefill::fail("prefill: out of memory");
+        maya::prefill::fail("prefill: out of memory");
         std::fprintf(stderr, "fail() did not throw\n");
         ++fail;
-    } catch (const strata::prefill::Failure& e) {
+    } catch (const maya::prefill::Failure& e) {
         if (std::string(e.what()) != "prefill: out of memory") {
             std::fprintf(stderr, "the reason was lost: %s\n", e.what());
             ++fail;

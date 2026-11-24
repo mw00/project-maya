@@ -1,15 +1,15 @@
-// src/kernels/cuda/verify_kernels.cu - see include/strata/kernels/verify_kernels.hpp.
+// src/kernels/cuda/verify_kernels.cu - see include/maya/kernels/verify_kernels.hpp.
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
-#include "strata/kernels/verify_kernels.hpp"
+#include "maya/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int S = 128;          // GDN state size
@@ -563,4 +563,4 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

@@ -9,7 +9,7 @@
 //   tiling    B9.1 / B14.6: an 8K chunk at a 64K context stays within the 2.2 GB lend; sizes past 2^31 bytes;
 //   lane      B14.7: a 200-token turn computes RAM-tier experts on the lane, an 8K chunk uploads them;
 //   stream    B9.9: three links concurrently take a third of the serial time.
-#include "strata/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_batch.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 

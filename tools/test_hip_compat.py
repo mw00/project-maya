@@ -1,4 +1,4 @@
-"""tools/test_hip_compat.py - the AMD build compiles the CUDA-shaped sources through include/strata/hip_compat/: every
+"""tools/test_hip_compat.py - the AMD build compiles the CUDA-shaped sources through include/maya/hip_compat/: every
 CUDA runtime / cuBLAS name it compiles must have a mapping there (v1.0.21 shipped three without, and no AMD build
 compiled).  No ROCm or GPU needed.
 
@@ -18,13 +18,13 @@ REPO = Path(__file__).resolve().parents[1]
 class HipCompat(unittest.TestCase):
     def test_every_cuda_name_the_hip_build_compiles_is_mapped(self):
         bad = C.unmapped(REPO)
-        self.assertEqual(bad, [], "\n".join(f"{f}:{n}: {name} - add it to include/strata/hip_compat/"
+        self.assertEqual(bad, [], "\n".join(f"{f}:{n}: {name} - add it to include/maya/hip_compat/"
                                             for f, n, name in bad))
 
     def test_the_check_sees_what_it_must(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            compat = root / "include" / "strata" / "hip_compat"
+            compat = root / "include" / "maya" / "hip_compat"
             compat.mkdir(parents=True)
             (compat / "cuda_runtime.h").write_text("#define cudaMalloc hipMalloc\n#define cudaFree hipFree\n")
             (root / "src").mkdir()
@@ -33,10 +33,10 @@ class HipCompat(unittest.TestCase):
                 "  cudaMalloc(&p, 4);                       // mapped\n"
                 "  cudaDeviceGetPCIBusId(b, 16, 0);         // not: the AMD build breaks\n"
                 "  puts(\"cudaMemcpyPeer failed\");         // a string\n"
-                "#ifndef STRATA_USE_HIP\n"
+                "#ifndef MAYA_USE_HIP\n"
                 "  cudaMemcpyPeerAsync(a, 1, b, 0, n, s);   // CUDA only\n"
                 "#endif\n"
-                "#if defined(STRATA_USE_HIP)\n"
+                "#if defined(MAYA_USE_HIP)\n"
                 "  hipFree(p);\n"
                 "#else\n"
                 "  cudaFuncGetAttributes(&x, k);            // CUDA only: the #else of a HIP block\n"
@@ -47,7 +47,7 @@ class HipCompat(unittest.TestCase):
     def test_glm_dsa_prompt_gemms_are_mapped(self):
         # the glm-dsa prompt path (src/core/glm_prefill_dsa.cu) builds on HIP: its absorbed MLA products are
         # strided-batched GemmEx calls, mapped like Maya's own GemmEx
-        have = C.mapped_names(REPO / "include" / "strata" / "hip_compat")
+        have = C.mapped_names(REPO / "include" / "maya" / "hip_compat")
         for name in ("cublasGemmStridedBatchedEx", "cublasGemmEx", "cublasSgemmStridedBatched", "CUBLAS_COMPUTE_32F",
                      "CUBLAS_GEMM_DEFAULT_TENSOR_OP", "CUDA_R_16F", "CUDA_R_32F"):
             self.assertIn(name, have)

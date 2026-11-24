@@ -1,8 +1,8 @@
 // src/core/glm_warm_seq.cpp - glm-dsa B8.1 (warm): the file-order warm-up's switches, order, run count, counters and
-// the kept warm digests (include/strata/core/glm_warm_seq.hpp).  Plain C++: tests/glm_dsa/glm_warm_seq_test.cpp links
+// the kept warm digests (include/maya/core/glm_warm_seq.hpp).  Plain C++: tests/glm_dsa/glm_warm_seq_test.cpp links
 // it alone; the engine side (Turn, computing the digests) is src/core/glm_warm_seq_model.cu.
-#include "strata/core/glm_env.hpp"
-#include "strata/core/glm_warm_seq.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_warm_seq.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -10,12 +10,12 @@
 #include <numeric>
 #include <utility>
 
-namespace strata::core::glmwarm {
+namespace maya::core::glmwarm {
 
 // read at each warm-up, not once a process: a test loads the same pack in both orders
-bool seq_on(bool glm_dsa) { return strata::glmenv::env_flag("MAYA_GLM_WARM_SEQ", glm_dsa); }
+bool seq_on(bool glm_dsa) { return maya::glmenv::env_flag("MAYA_GLM_WARM_SEQ", glm_dsa); }
 
-bool sum_on() { return strata::glmenv::env_flag("MAYA_GLM_WARM_SUM", false); }
+bool sum_on() { return maya::glmenv::env_flag("MAYA_GLM_WARM_SUM", false); }
 
 static bool before(const At& a, const At& b) { return a.shard != b.shard ? a.shard < b.shard : a.off < b.off; }
 
@@ -116,4 +116,4 @@ void busy_enter() {
 
 void busy_leave() { g_busy.fetch_sub(1); }
 
-}  // namespace strata::core::glmwarm
+}  // namespace maya::core::glmwarm

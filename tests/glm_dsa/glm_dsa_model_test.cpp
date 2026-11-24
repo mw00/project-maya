@@ -19,7 +19,7 @@
 // and requires X / M to equal the committed oracle-hf-small-48.f32 / oracle-hf-small-mtp-47.f32 byte for byte (the
 // CLI, the generator and the references agree).  Without the tools, or without a GPU, the test says why and exits 77.
 // The position offset 1,000,000 variant needs a start-position API on Glm5Model and is still open.
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include "glm_dsa_fixtures.hpp"
 #include "glm_test_env.hpp"   // setenv / unsetenv (<unistd.h> on POSIX; mapped on Windows)
@@ -35,8 +35,8 @@
 #include <string>
 #include <vector>
 
-#ifndef STRATA_SOURCE_DIR
-#define STRATA_SOURCE_DIR "."
+#ifndef MAYA_SOURCE_DIR
+#define MAYA_SOURCE_DIR "."
 #endif
 
 namespace fs = std::filesystem;
@@ -58,7 +58,7 @@ Result run_case(const char* name, const fs::path& gguf, int n_tok, int row0, con
         setenv("MAYA_GLM_IDX_LN_EPS", "0", 1);   // read at load: the indexer LayerNorm as llama.cpp computes it
     else
         unsetenv("MAYA_GLM_IDX_LN_EPS");
-    strata::core::Glm5Model m;
+    maya::core::Glm5Model m;
     std::string err;
     const bool loaded = m.load(gguf.string(), (int64_t) n_tok + 8, err);
     unsetenv("MAYA_GLM_IDX_LN_EPS");
@@ -67,7 +67,7 @@ Result run_case(const char* name, const fs::path& gguf, int n_tok, int row0, con
         return Result::Fail;
     }
     const size_t V = (size_t) m.geometry().n_vocab;
-    if (m.geometry().arch != strata::core::GlmArch::GlmDsa || V == 0 || want.size() != (size_t) (n_tok - row0) * V) {
+    if (m.geometry().arch != maya::core::GlmArch::GlmDsa || V == 0 || want.size() != (size_t) (n_tok - row0) * V) {
         std::printf("  %s: FAIL - not a glm-dsa model whose vocab (%zu) fits %s\n", name, V, ref.filename().string().c_str());
         return Result::Fail;
     }

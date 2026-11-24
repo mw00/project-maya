@@ -20,8 +20,8 @@
 // Building the table once on the host and passing it in makes the TABLE exactly the reference's values and
 // leaves the kernel a pure rotation, so each half can be checked tightly instead of both halves sharing one
 // loose tolerance.  The engine wants a cached table anyway: it is per (n_rot, theta, position), not per token.
-#include "strata/kernels/rope.hpp"
-#include "strata/kernels/mrope.hpp"
+#include "maya/kernels/rope.hpp"
+#include "maya/kernels/mrope.hpp"
 
 #include <cuda_runtime.h>
 
@@ -29,7 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;
@@ -92,4 +92,4 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

@@ -1,29 +1,29 @@
-// src/core/mtp.cpp - see include/strata/core/mtp.hpp.
-#include "strata/core/mtp.hpp"
-#include "strata/core/on_device.hpp"
+// src/core/mtp.cpp - see include/maya/core/mtp.hpp.
+#include "maya/core/mtp.hpp"
+#include "maya/core/on_device.hpp"
 
-#include "strata/core/native_head.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/gr.hpp"
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/native_moe.hpp"
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/native_qsa.hpp"
-#include "strata/kernels/native_rope.hpp"
-#include "strata/kernels/native_router.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/rope.hpp"
-#include "strata/kernels/router_top10.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/sampler.hpp"
-#include "strata/kernels/shared_expert.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+#include "maya/core/native_head.hpp"
+#include "maya/kernels/bf16_gemv.hpp"
+#include "maya/kernels/cpu/expert.hpp"
+#include "maya/kernels/elementwise.hpp"
+#include "maya/kernels/fused_gr.hpp"
+#include "maya/kernels/gr.hpp"
+#include "maya/kernels/kv_q4.hpp"
+#include "maya/kernels/kv_q8.hpp"
+#include "maya/kernels/native_moe.hpp"
+#include "maya/kernels/native_mmvq.hpp"
+#include "maya/kernels/native_qsa.hpp"
+#include "maya/kernels/native_rope.hpp"
+#include "maya/kernels/native_router.hpp"
+#include "maya/kernels/qsa.hpp"
+#include "maya/kernels/qsa_decode_attn.hpp"
+#include "maya/kernels/quantize_act.hpp"
+#include "maya/kernels/rope.hpp"
+#include "maya/kernels/router_top10.hpp"
+#include "maya/kernels/s2_expert_grouped.hpp"
+#include "maya/kernels/sampler.hpp"
+#include "maya/kernels/shared_expert.hpp"
+#include "maya/kernels/verify_kernels.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -35,7 +35,7 @@
 #include <sstream>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -59,8 +59,8 @@ bool mapped(size_t bytes, void** h, void** d) {
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
 
-strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+maya::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
+    maya::kernels::QsaShapes s = maya::kernels::qsa_real_shapes();
     s.n_head = g.n_head;
     s.n_head_kv = g.n_head_kv;
     s.head_dim = g.head_dim;
@@ -71,11 +71,11 @@ strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
 
 // 64-bit seek/tell on a `FILE*`: `fseek`/`ftell` take a 32-bit `long` on Windows and would wrap past 2 GiB.
 #if defined(_WIN32)
-#define STRATA_FILE_SEEK64(f, o, w) _fseeki64((f), (long long) (o), (w))
-#define STRATA_FILE_TELL64(f) _ftelli64(f)
+#define MAYA_FILE_SEEK64(f, o, w) _fseeki64((f), (long long) (o), (w))
+#define MAYA_FILE_TELL64(f) _ftelli64(f)
 #else
-#define STRATA_FILE_SEEK64(f, o, w) fseeko((f), (off_t) (o), (w))
-#define STRATA_FILE_TELL64(f) ftello(f)
+#define MAYA_FILE_SEEK64(f, o, w) fseeko((f), (off_t) (o), (w))
+#define MAYA_FILE_TELL64(f) ftello(f)
 #endif
 
 bool read_file(const std::string& path, std::vector<uint8_t>& out) {
@@ -89,9 +89,9 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
         FILE* f;
         ~Closer() { if (f != nullptr) std::fclose(f); }
     } closer{f};
-    if (STRATA_FILE_SEEK64(f, 0, SEEK_END) != 0) return false;
-    const long long n = (long long) STRATA_FILE_TELL64(f);
-    if (n < 0 || STRATA_FILE_SEEK64(f, 0, SEEK_SET) != 0) return false;
+    if (MAYA_FILE_SEEK64(f, 0, SEEK_END) != 0) return false;
+    const long long n = (long long) MAYA_FILE_TELL64(f);
+    if (n < 0 || MAYA_FILE_SEEK64(f, 0, SEEK_SET) != 0) return false;
     out.resize((size_t) n);
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
@@ -177,7 +177,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
-    if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    if (max_t < 1 || max_t > maya::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
     const auto t_files = std::chrono::steady_clock::now();
@@ -210,7 +210,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     // ---- the 512 routed experts, one blob each
     {
-        const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
+        const uint64_t bytes = (uint64_t) g.n_expert * maya::kernels::cpu::BLOB;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
         FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
@@ -246,7 +246,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (q8_0)"; return false; }
 
     // ---- the layer's own K/V (dense attention: no indexer state is read)
-    const strata::kernels::QsaShapes s = shapes_of(g);
+    const maya::kernels::QsaShapes s = shapes_of(g);
     const int64_t max_cells = ss.qsa_states[0].max_cells;
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
@@ -280,7 +280,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
     cap_ = (((window_ > 0 ? window_ : max_cells) + 63) / 64) * 64;
-    attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    attn_scratch_floats_ = (int64_t) maya::kernels::qsa_decode_attn_scratch_floats(cap_, s);
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t R2 = 2 * T;   // step/pos rows: T catch-up rows + up to T-2 chain steps
@@ -300,7 +300,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         mixed_ = b.take<float>(T * N); inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); bo_ = b.take<float>(T * N);
         xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) (NH * HD), 8));
+        xq_ = b.take<uint8_t>(maya::kernels::native_q8_1_bytes((int) (NH * HD), 8));
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
@@ -312,8 +312,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
-        sh_scratch_ = (float*) b.take<uint8_t>(strata::kernels::shared_expert_scratch_bytes(g.n_ff));
+        hit_scratch_ = b.take<uint8_t>(maya::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
+        sh_scratch_ = (float*) b.take<uint8_t>(maya::kernels::shared_expert_scratch_bytes(g.n_ff));
         x_bf16_ = b.take<uint16_t>(N);
         out_ids_ = b.take<int32_t>(T + 4);
         probs_ = b.take<float>(T + 4);
@@ -336,9 +336,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     std::fprintf(stderr, "maya mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
-                 (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+                 (double) vram_ / 1048576.0, (double) g.n_expert * maya::kernels::cpu::BLOB / 1048576.0,
                  (double) tensors_.back().off / 1048576.0, files_s,
-                 files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
+                 files_s > 0 ? ((double) g.n_expert * maya::kernels::cpu::BLOB + (double) tensors_.back().off) /
                                    1048576.0 / files_s : 0.0);
     return true;
 }
@@ -369,7 +369,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
-            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+            maya::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "maya mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
@@ -381,7 +381,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
 bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
@@ -494,7 +494,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) maya::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
@@ -562,7 +562,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
@@ -580,7 +580,7 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 
 bool MtpDrafter::capture_round(int T, std::string& err) {
     if (round_exec_[T]) return true;
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     bool ok = true;
@@ -608,7 +608,7 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
 bool MtpDrafter::capture_step(int j, std::string& err) {
     if (step_exec_[j]) return true;
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
@@ -623,9 +623,9 @@ void MtpDrafter::kv_restore(int64_t upto) {
     const OnDevice on_device(device_);
     if (st_.kv_mode != 2 || upto <= 0) return;
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
-    const strata::kernels::QsaShapes s = shapes_of(*g_);
+    const maya::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
-    strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
+    maya::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
     cudaStreamSynchronize(cs_);
 }
 
@@ -784,4 +784,4 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

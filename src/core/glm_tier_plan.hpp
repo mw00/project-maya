@@ -31,7 +31,7 @@
 #define GLMTIER_HD
 #endif
 
-namespace strata::core::glmtier {
+namespace maya::core::glmtier {
 
 // ---------------------------------------------------------------- B8.2 segments
 
@@ -243,4 +243,4 @@ size_t half_stride(const std::vector<SplitLayout>& layers);
 /// The partial sums' combine of the split lane: y[r] = y0[r] + y1[r] (one n_embd add per layer).
 void add_partial(const float* y0, const float* y1, float* y, int64_t n);
 
-}  // namespace strata::core::glmtier
+}  // namespace maya::core::glmtier

@@ -1,8 +1,8 @@
 // src/core/glm_dsa_ref_host.cpp - host-side pieces of the glm-dsa F32 reference forward (B3.5).  Contracts:
-// include/strata/kernels/glmd_forward.hpp.  Plain C++, shared by src/core/glm_dsa_ref.cu and the CPU test.
-#include "strata/kernels/glmd_forward.hpp"
+// include/maya/kernels/glmd_forward.hpp.  Plain C++, shared by src/core/glm_dsa_ref.cu and the CPU test.
+#include "maya/kernels/glmd_forward.hpp"
 
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include <algorithm>
 #include <cmath>

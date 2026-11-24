@@ -1,27 +1,27 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
 
-#include "strata/platform/cpu_relax.hpp"
+#include "maya/platform/cpu_relax.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
-#elif defined(STRATA_X86)
+#elif defined(MAYA_X86)
 #include <cpuid.h>
 #endif
 #include <fstream>
 #include <sstream>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 ExpertLayout g_layout;
 }
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
-#if !defined(STRATA_X86)
+#if !defined(MAYA_X86)
 bool cpu_avx512_ok() { return false; }
 bool cpu_avx512bw_ok() { return false; }
 bool cpu_avx2_ok() { return false; }
@@ -124,7 +124,7 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
-#endif  // STRATA_X86
+#endif  // MAYA_X86
 
 // A CPU without AVX2 (and without AVX-512) has no kernel for these: say so instead of an illegal instruction.
 // Run with the CPU expert lane off (MAYA_GLM_CPU_LANE=0) so the GPUs compute every expert.
@@ -148,10 +148,14 @@ void act_quant_any(const float* x, int n, ActQ& a) {
     else act_quant_q8_1_avx2(x, n, a);
 }
 
-#if !defined(STRATA_NATIVE_EXPERTS)
+#if !defined(MAYA_NATIVE_EXPERTS)
 // Without ggml-cpu no native pack loads (expert_layout_load refuses), so these are never reached.
 bool native_experts_available() noexcept { return false; }
 bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
+bool native_fmt_mixed(int, int, int, int64_t, int64_t, NativeFmt&, std::string& err) {
+    err = "built without native experts";
+    return false;
+}
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
@@ -168,7 +172,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         g_layout = L;
         return true;
     }
-#if !defined(STRATA_NATIVE_EXPERTS)
+#if !defined(MAYA_NATIVE_EXPERTS)
     err = "this pack has native (IQ) experts but the engine was built without MAYA_NATIVE_EXPERTS";
     return false;
 #else
@@ -190,14 +194,29 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             continue;
         }
         std::istringstream ss(line);
-        long long l = -1, gt = -1, dt = -1;
+        long long l = -1, gt = -1, ut = -1, dt = -1;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
-        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
+        // the type column: one gate/up type, or "gate:up" on a mixed layer (unsloth's Qwen3.8 UD-IQ1_S blk.18)
+        std::string gu;
+        bool gu_ok = false;
+        if (ss >> l >> gu) {
+            char* end = nullptr;
+            gt = std::strtoll(gu.c_str(), &end, 10);
+            ut = gt;
+            if (end != gu.c_str() && *end == ':') {
+                const char* u0 = end + 1;
+                ut = std::strtoll(u0, &end, 10);
+                gu_ok = end != u0 && *end == 0;
+            } else {
+                gu_ok = end != gu.c_str() && *end == 0;
+            }
+        }
+        if (!gu_ok || !(ss >> dt >> off >> blob) || l < 0 || l >= n_layers) {
             err = "native_experts.txt: a malformed line: " + line;
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt_mixed((int) gt, (int) ut, (int) dt, H, FF, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -233,4 +252,4 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
 #endif
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

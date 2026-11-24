@@ -23,7 +23,7 @@
 # Every check runs without a GPU, and a failure stops the run before anything is pushed:
 #   - setup.py's llama.cpp pin is the one CMakeLists.txt names (when it names one);
 #   - VERSION is the release (when REF is a vX.Y.Z tag);
-#   - the engines were configured portable: STRATA_PORTABLE on, GGML_NATIVE off, GGML_AVX2 on, nothing above AVX2;
+#   - the engines were configured portable: MAYA_PORTABLE on, GGML_NATIVE off, GGML_AVX2 on, nothing above AVX2;
 #   - they were configured for the CUDA architectures asked for;
 #   - every library of maya, maya-ds4 and maya-mm3 resolves, except the host driver's (libcuda, libnvidia-*);
 #   - serve/server.py and the three pack builders start (--help);
@@ -90,7 +90,7 @@ for line in sys.argv[1].splitlines():
     name, _, value = line.partition("=")
     seen[name.split(":")[0]] = value.strip().upper()
 bad = [] if seen else ["no CPU settings recorded"]
-for name, want in (("STRATA_PORTABLE", "ON"), ("GGML_NATIVE", "OFF"), ("GGML_AVX2", "ON")):
+for name, want in (("MAYA_PORTABLE", "ON"), ("GGML_NATIVE", "OFF"), ("GGML_AVX2", "ON")):
     if seen and seen.get(name) != want:
         bad.append(f"{name}={seen.get(name, '(unset)')}, want {want}")
 for name, value in sorted(seen.items()):
@@ -100,7 +100,7 @@ for m in bad:
     print(f"[maya-docker]   {m}", file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
-  say "check: the engines were configured portable (STRATA_PORTABLE on, GGML_NATIVE off, nothing above AVX2)"
+  say "check: the engines were configured portable (MAYA_PORTABLE on, GGML_NATIVE off, nothing above AVX2)"
 
   archs="$("${run[@]}" cat "$ref" /opt/maya/image/cuda-architectures.txt 2>/dev/null | tr -d '[:space:]')" \
     || die "$ref has no /opt/maya/image/cuda-architectures.txt"

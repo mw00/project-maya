@@ -7,18 +7,18 @@
 // (one n_embd add per layer, glmtier::add_partial).  Gate/up rows are bit-identical to the unsplit lane; down rows
 // differ by the reassociation of one float sum (two partial dots added).
 //
-// Plain C++ over ggml-cpu (strata_kernels_cpu); the threads, pools and NUMA placement live in glm_tier_numa.cu.
+// Plain C++ over ggml-cpu (maya_kernels_cpu); the threads, pools and NUMA placement live in glm_tier_numa.cu.
 #pragma once
 
 #include "glm_tier_plan.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include <limits>
 #include <string>
 
-namespace strata::core::glmtier {
+namespace maya::core::glmtier {
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 /// The half format: the full layer's types at n_ff / 2 (same gate/up rows; down rows of hd_row bytes; h of H values).
 bool half_fmt(const kc::NativeFmt& full, kc::NativeFmt& half, std::string& why);
@@ -36,4 +36,4 @@ void half_experts_serial(const kc::NativeFmt& half, const SplitLayout& L, int ne
                          const float* w, const void* act, float swiglu_limit, float* y_h, float* ff, void* hq,
                          float* dn);
 
-}  // namespace strata::core::glmtier
+}  // namespace maya::core::glmtier

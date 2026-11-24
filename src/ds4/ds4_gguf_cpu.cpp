@@ -1,7 +1,7 @@
 // src/ds4/ds4_gguf_cpu.cpp - a GGUF's MXFP4 experts on the CPU lane (see ds4_gguf_cpu.hpp).
 #include "ds4_gguf_cpu.hpp"
 
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "maya/kernels/cpu/exl3_cpu.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -31,12 +31,15 @@
 #endif
 #define MX_AVX2 MX_TARGET("avx2,fma")
 // AVX-VNNI's intrinsics: GCC 11, Clang 12, MSVC 2022
-#if defined(MX_X86) && (defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) || \
-                        (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11))
+// (MAYA_NO_AVXVNNI: the toolchain's assembler has no AVX-VNNI - Rocky / RHEL 9's binutils 2.35 with any GCC, #535's
+//  "unsupported instruction `vpdpbusd'" - so the tier is left out and the AVX2 one runs; CMake checks it)
+#if defined(MX_X86) && !defined(MAYA_NO_AVXVNNI) && \
+    (defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) || \
+     (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11))
 #define MX_AVXVNNI 1
 #endif
 
-namespace strata::ds4::gguf {
+namespace maya::ds4::gguf {
 namespace {
 
 constexpr int kBlock = 32, kBytes = 17;
@@ -338,7 +341,7 @@ void q8_round(const float* x, int k, float* out) {
 
 void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float* const* x, int n, float* const* y) {
 #if defined(MX_X86)
-    static const bool avx2 = strata::kernels::cpu::exl3_cpu_tier() >= 1;
+    static const bool avx2 = maya::kernels::cpu::exl3_cpu_tier() >= 1;
     if (avx2) return rows_avx2(w, rb, k, r0, r1, x, n, y);
 #endif
     rows_scalar(w, rb, k, r0, r1, x, n, y);
@@ -413,4 +416,4 @@ void mx_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* con
     mx_rows_tier(mx_tier(), w, rb, k, r0, r1, act, n, y, pf);
 }
 
-}  // namespace strata::ds4::gguf
+}  // namespace maya::ds4::gguf

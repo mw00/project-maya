@@ -15,7 +15,7 @@
 #pragma once
 
 #include "glm_dsa_fast.hpp"
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,12 +23,12 @@
 
 #include <cublas_v2.h>   // (HIP: the build's compat headers map it, as for glm_prefill.cu)
 
-namespace strata::kernels { struct KvStreamMap; }
-namespace strata::prefill {
-class Gemm;   // include/strata/prefill/gemm.hpp
+namespace maya::kernels { struct KvStreamMap; }
+namespace maya::prefill {
+class Gemm;   // include/maya/prefill/gemm.hpp
 }
 
-namespace strata::core::glmpf {
+namespace maya::core::glmpf {
 
 /// What one prompt layer of a chunk works with (device pointers; valid while the prompt path is lent its memory).
 /// L1-6 KV streaming: a part's streamed glm-dsa caches for the prompt path.  A streamed layer's chunk runs on the
@@ -37,7 +37,7 @@ namespace strata::core::glmpf {
 struct KvIo {
     uint8_t* const* lat_host = nullptr;   // per layer (null: not streamed); device-mapped, position order
     uint8_t* const* kpe_host = nullptr;   // per layer (null array: no k_pe copy)
-    const strata::kernels::KvStreamMap* map = nullptr;   // per layer
+    const maya::kernels::KvStreamMap* map = nullptr;   // per layer
     int lat_row = 0, kpe_row = 0;         // bytes a position
     uint8_t* stage = nullptr;
     int64_t stage_rows = 0;
@@ -67,7 +67,7 @@ struct Io {
     bool skip_output = false;         // the tail-skip layer: caches only, no attn_output
     int sub = 2048;                   // the mixer sub-batch the union was carved for (PrefillState::sub)
     const KvIo* kv = nullptr;         // L1-6 KV streaming (null: every cache in the arena)
-    strata::prefill::Gemm* lt = nullptr;   // HIP (S7): the prompt path's hipBLASLt GEMM (the setup's tuning tables) for
+    maya::prefill::Gemm* lt = nullptr;   // HIP (S7): the prompt path's hipBLASLt GEMM (the setup's tuning tables) for
                                            // the FP16 projections; null: cuBLAS / plain hipBLAS (every CUDA build)
 };
 
@@ -131,4 +131,4 @@ bool mtp_fill(const Io& io, const MtpIo& m, std::string& err);
 /// No-op unless `on` (glm-dsa) and on HIP.
 void mmq_clamp(bool on, void* xq, int64_t rows, int64_t cols, int type, cudaStream_t s);
 
-}  // namespace strata::core::glmpf
+}  // namespace maya::core::glmpf

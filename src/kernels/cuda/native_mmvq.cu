@@ -23,19 +23,19 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/kernels/native_mmvq.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
+#include "maya/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int QK = 256;
@@ -1490,4 +1490,4 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
-} // namespace strata::kernels
+} // namespace maya::kernels

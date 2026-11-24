@@ -1,23 +1,23 @@
-// src/kernels/cuda/glm_batch.cu - see include/strata/kernels/glm_batch.hpp.
+// src/kernels/cuda/glm_batch.cu - see include/maya/kernels/glm_batch.hpp.
 //
 // Every kernel here is the batched twin of a one-token kernel in glm_fast.cu with the same per-token arithmetic
 // (same operation order where the order is observable), so a prompt read in chunks leaves the state the token path
 // would have left up to float rounding - the projections around them (FP16 tensor-core GEMMs instead of q8_1 dot
 // products) are where the two paths really differ, as llama.cpp's batched and one-token paths do.
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // rocWMMA (the f16q prompt attention) knows gfx11 and gfx12 only: its config.hpp stops a device pass for any other
 // architecture (RDNA 2, gfx1030) with a static_assert, so that pass leaves it out and compiles the f16q kernel empty -
 // a GPU without WMMA never takes f16q (glm_prefill.cu's mla_attn_path).  The host pass reads it only when the build
-// targets WMMA-capable archs (hip_backend.cmake's STRATA_HAS_WMMA) - an RDNA 2-only build skips the include entirely,
+// targets WMMA-capable archs (hip_backend.cmake's MAYA_HAS_WMMA) - an RDNA 2-only build skips the include entirely,
 // so it links without the rocWMMA headers (ROCm 7 no longer ships them).
-#if (!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && STRATA_HAS_WMMA) || \
+#if (!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && MAYA_HAS_WMMA) || \
     ((defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
     defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)))
-#define STRATA_ROCWMMA 1
+#define MAYA_ROCWMMA 1
 #else
-#define STRATA_ROCWMMA 0
+#define MAYA_ROCWMMA 0
 #endif
-#if STRATA_ROCWMMA
+#if MAYA_ROCWMMA
 // The HIP bf16/fp8 headers rocWMMA pulls in define the __shfl_*_sync names that the force-included hip_compat macros
 // remap; hide the macros while they are read.
 #pragma push_macro("__shfl_xor_sync")
@@ -35,13 +35,13 @@
 #pragma pop_macro("__shfl_sync")
 #endif
 #endif
-#include "strata/kernels/glm_batch.hpp"
+#include "maya/kernels/glm_batch.hpp"
 #include "dsa_topk.cuh"
 #include "glm_lat8.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <mma.h>
 #endif
 
@@ -53,11 +53,11 @@
 #include <cstring>
 #include <vector>
 
-namespace strata::kernels::glmb {
+namespace maya::kernels::glmb {
 namespace {
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -71,7 +71,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
@@ -686,7 +686,7 @@ __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restric
         for (int i = threadIdx.x; i < n_vis * kpool; i += blockDim.x) cells[i] = i;
     } else {
         // the top pools in rank order, O(n_vis) - src/kernels/cuda/dsa_topk.cuh
-        strata::kernels::dsa::select_top_pools(score + (size_t) t * score_ld, n_vis, top, kpool, cells);
+        maya::kernels::dsa::select_top_pools(score + (size_t) t * score_ld, n_vis, top, kpool, cells);
     }
     __syncthreads();
     if (threadIdx.x == 0 && tail) {
@@ -807,7 +807,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
     }
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // The same attention on the tensor cores (sm_70+): block = (token, 16 heads), 8 warps.  The token's cells are walked
 // in chunks of 32: their latent rows go to FP16 in shared memory, the scores S = Q16 . L^T come from the tensor cores
 // (two 16-cell tiles, the K = 512 split in four quarters across the warps and summed), the softmax is the online one
@@ -1649,7 +1649,7 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
 }
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // mla_attn_tc_kernel on RDNA3 WMMA (rocWMMA).  RDNA allows 64 KiB of LDS a workgroup, the CUDA kernel takes 91,
 // so Q (FP16, from the q_abs product) stays in registers - each warp holds its 64-wide K slice of the 16 heads as four
 // A fragments - and the cells go in chunks of 16: O 32 KiB (F32) + L 16 KiB + score partials 8 KiB + P 0.5 KiB.
@@ -1662,7 +1662,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
                                                             const int* __restrict__ cells_all,
                                                             const int* __restrict__ n_sel_arr, int n_sel_max,
                                                             int n_head, float scale, float* __restrict__ ctx, bool q8) {
-#if !STRATA_ROCWMMA
+#if !MAYA_ROCWMMA
     __builtin_trap();   // (a device pass without rocWMMA: never launched there)
 #else
     namespace wm = rocwmma;
@@ -2324,7 +2324,7 @@ void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, fl
     check("dsa_pool");
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // The tiled kernel's scores on the FP16 tensor cores (the default on CUDA; MAYA_GLM_DSA_SCORE=2 as well): the same tile - 4 tokens' 128 (token,
 // head) query rows against 64 pools, the whole 128-long k in shared memory as FP16 - eight warps of 16 rows x 64 pools
 // (four m16n16k16 accumulators), FP32 sums; the epilogue as the tiled one's (relu(dot) * w over the 32 heads, FP32).
@@ -2403,7 +2403,7 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
         const char* v = getenv("MAYA_GLM_DSA_SCORE");
         return v == nullptr || std::atoi(v) != 0;
     }();
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     // (the default on CUDA; MAYA_GLM_DSA_SCORE=1: the FP32 tiled kernel, 0: the warp kernel) - 27K prompt dsa_index
     // 826 / 826 -> 495 / 495 ms, prompt 36.9 / 37.0 -> 36.6 / 36.6 s, the needle answered
     static const bool tc = getenv("MAYA_GLM_DSA_SCORE") == nullptr || std::atoi(getenv("MAYA_GLM_DSA_SCORE")) == 2;
@@ -2452,7 +2452,7 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
 
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
                     float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) q_abs, (void) lat, (void) cells, (void) n_sel, (void) n_head, (void) kv_lora, (void) scale, (void) ctx;
     (void) part, (void) part_cap, (void) s, (void) lat_q8;
     return false;   // (Volta only)
@@ -2509,7 +2509,7 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
         return;
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head / MB_HG));
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     // per device, the prompt attention kernel: 0 not chosen yet, 1 tensor cores with O in shared memory (91 KB: Volta,
     // and Ampere+ with MAYA_GLM_PREFILL_ATTN=wmma), 2 tensor cores with O in registers (58 KB: Turing, sm_75 - its
     // rescale assumes the sm_75+ fragment layout), 3 mma.sync, 32 heads a block (Ampere and newer), -1 the F32 kernel
@@ -2627,7 +2627,7 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
     check("mla_attn");
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
     if (T <= 0) return;
@@ -2755,4 +2755,4 @@ void moe_combine(const float* out, const int* pos, const float* w, const float* 
     check("moe_combine");
 }
 
-}  // namespace strata::kernels::glmb
+}  // namespace maya::kernels::glmb

@@ -12,11 +12,11 @@
 //       gate rows against ggml's vec_dot on the same Q8_K activations: rel < 1e-5.
 // The GPU third of the comparison is native_expert_parity on the same file (ctest native_expert_parity_fixture,
 // label gpu).
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/iq_avx2.hpp"
-#include "strata/kernels/cpu/iq_avx512.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/iq_avx2.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-namespace cpu = strata::kernels::cpu;
+namespace cpu = maya::kernels::cpu;
 
 static double rel(const std::vector<float>& a, const std::vector<float>& b) {
     double n = 0, d = 0;
@@ -40,13 +40,13 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) { std::fprintf(stderr, "usage: iq_fixture_cpu_test <fixture.gguf> <fixture.ref.f32>\n"); return 2; }
     if (!cpu::native_experts_available()) { std::printf("iq_fixture_cpu_test: built without native experts\n"); return 77; }
-    strata::GgufFile gguf(argv[1]);
+    maya::GgufFile gguf(argv[1]);
     std::FILE* rf = std::fopen(argv[2], "rb");
     if (!rf) { std::fprintf(stderr, "iq_fixture_cpu_test: cannot open %s\n", argv[2]); return 1; }
     constexpr int E = 7, R = 16, NT = 3;
     int failures = 0, layers = 0;
     for (int l = 0;; ++l) {
-        const strata::TensorInfo* t[3] = {};
+        const maya::TensorInfo* t[3] = {};
         const char* roles[3] = {"gate", "up", "down"};
         for (const auto& ti : gguf.tensors())
             for (int r = 0; r < 3; ++r)

@@ -1,0 +1,308 @@
+#pragma once
+
+#include "maya/core/expert_cache.hpp"
+#include "maya/core/expert_source.hpp"
+#include "maya/core/glm_helper_link.hpp"
+#include "maya/kernels/exl3.hpp"
+#include "maya/kernels/glm_fast.hpp"
+
+#include <cuda_runtime.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace maya::core {
+
+/// GLM helper-owned experts. UMA aliases pinned RAM; discrete helpers cache in
+/// their own VRAM. Neither backend changes the legacy Qwen RemoteExperts path.
+class GlmExpertHelper {
+public:
+    GlmExpertHelper() = default;
+    ~GlmExpertHelper();
+    GlmExpertHelper(const GlmExpertHelper&) = delete;
+    GlmExpertHelper& operator=(const GlmExpertHelper&) = delete;
+    /// exl3: the experts are an EXL3 pack's (compute_exl3): the helper stream's EXL3 scratch is made here, before
+    /// reserve() measures the free VRAM
+    bool open(int device, int n_embd, int n_ff,
+              const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3 = false);
+    bool reserve(int keys, size_t requested_bytes, std::string& err);
+    bool insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
+    bool replace(int out, int in, const uint8_t* host, std::string& err);
+    struct Swap { uint32_t gain; int in, out; };
+    std::vector<Swap> swaps(const std::vector<uint32_t>& usage, const std::vector<int>& primary,
+                            int experts_per_layer, int max_swaps) const;
+    const std::vector<uint8_t>& owners() const { return owned_; }
+    bool owns(int key) const { return !owned_.empty() && owned_[(size_t) key] != 0; }
+    bool integrated() const { return integrated_; }
+    bool zero_copy() const { return zero_copy_; }   // the selected call path (an integrated helper's default)
+    bool profiling() const { return prof_; }         // MAYA_GLM_PROF read at open
+    size_t available() const { return capacity_ - used_; }
+    size_t used() const { return used_; }
+    bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                 const int* keys, const float* weights, const float* x,
+                 float* out, std::string& err);
+    /// The same for an EXL3 pack's experts (lay: their layer's blob layout; open(..., exl3 = true)): the F32 input
+    /// through exl3::moe_gate_up / moe_down on the helper's device - its decode kernels are exl3.cu's choice for it
+    /// (MAYA_GLM_EXL3_DECODE<n>).  A launch that failed there (exl3::launch_errors) fails the call.
+    bool compute_exl3(const maya::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                      const int* keys, const float* weights, const float* x,
+                      float* out, std::string& err);
+    /// compute / compute_exl3 in two halves, for a caller with work of its own meanwhile (MAYA_GLM_HELPER_OVERLAP):
+    /// enqueue copies the input and the plan up and queues the kernels and the result's copy into out - out must stay
+    /// untouched until wait returns (mapped pinned memory: the copy runs while the caller works) - and wait finishes
+    /// the call (the stream, the EXL3 launch check, the profile).  One call at a time: wait before the next enqueue
+    /// and before replace() - each refuses while a call or a replacement holds the helper (pending()).  A failed
+    /// enqueue leaves nothing to wait for; a failed wait leaves out undefined.  The hold ends only once the helper's
+    /// stream has been synchronized: if even that fails it stays until close().
+    bool enqueue(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                 const int* keys, const float* weights, const float* x,
+                 float* out, std::string& err);
+    bool enqueue_exl3(const maya::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                      const int* keys, const float* weights, const float* x,
+                      float* out, std::string& err);
+    bool wait(std::string& err);
+    /// A verify window's layer in one call (a linked helper whose program has it - glm_helper_link.hpp kComputeWin):
+    /// T tokens (<= win_cap()), token t with ne[t] experts (0: none), its keys and weights at keys / w + 8 t in its
+    /// route's order, its input row x[t].  win_post sends the call, win_wait waits for it and copies each token's
+    /// sum into out[t] (tokens with ne[t] == 0: left alone) - compute()'s result for that token, bit for bit (the
+    /// same kernels; every token's arithmetic its own).  One call at a time, as enqueue / wait.
+    int win_cap() const { return link_ && ctl_ != nullptr && (ctl_->caps & hlink::kCapWin) ? hlink::kWinTokens : 0; }
+    bool win_post(int gu_type, int d_type, size_t down_off, float limit, int T, const int* ne, const int* keys,
+                  const float* w, const float* const* x, std::string& err);
+    bool win_wait(int T, const int* ne, float* const* out, std::string& err);
+    /// helper program: whether this device has the window call (an integrated AMD device's zero-copy path), and the
+    /// call itself over the header and rows the lead wrote (gpu_ms: with MAYA_GLM_PROF, the launches' time)
+    bool win_ready() const { return win_z_ != nullptr; }
+    bool win_run(int gu_type, int d_type, size_t down_off, float limit, const hlink::WinCall& c, const float* x,
+                 float* out, std::string& err);
+    bool pending() const { return pending_.load(std::memory_order_acquire); }
+    /// the last waited call's GPU time (its stages' events, ms) with MAYA_GLM_PROF, else -1
+    double last_gpu_ms() const { return last_gpu_ms_; }
+    void close();
+    int device() const { return device_; }
+    /// MAYA_GLM_EXPERT_HELPER=link: the helper in a second program (glm_helper_link.hpp) - the device number the
+    /// lead passes to open() for it, and whether this helper is one
+    static constexpr int kLinkDevice = 99;
+    bool linked() const { return link_; }
+
+    /// The prompt exchange of a linked helper (glm_helper_link.hpp PfLayout): a prompt chunk's MoE layer computes the
+    /// experts the helper owns there - only the chunk's rows cross, never an expert.  Lead side: pf_cap() tokens a
+    /// chunk at most (0: none), the exchange's arrays in this process (pf_out_dev: out as this GPU reads it),
+    /// pf_post sends the layer (keys/cnts/rtok/pos/rw/x filled), pf_wait waits for out.
+    int pf_cap() const { return pf_cap_; }
+    bool pf_pair_ok(int gu, int d) const {   // (the helper has a prompt product for a layer of these expert types)
+        return link_ && ctl_ != nullptr && gu >= 0 && gu < 64 && d >= 0 && d < 64 &&
+               hlink::pf_pair_mode(ctl_->pf_types[gu], ctl_->pf_types[d]) >= 0;
+    }
+    int pf_type_bits(int t) const;                  // helper side: kOpen's answer for a type
+    int pf_mode(int gu_type, int d_type) const;     // helper side: hlink::pf_pair_mode of the two
+    /// (an EXL3 pack) whether the linked helper's prompt products cover EXL3 experts (kOpen's answer)
+    bool pf_x3_ok() const { return link_ && ctl_ != nullptr && ctl_->x3_pf != 0; }
+    bool pf_type_ok(int t) const { return link_ && ctl_ != nullptr && t >= 0 && t < 64 && ctl_->pf_types[t] != 0; }
+    // slot 0: the whole exchange (chunks up to pf_cap() tokens); slots 1 / 2: two halves of up to pf_slot_cap() tokens
+    // each (glm_helper_link.hpp pf_slot_layout), for the staggered prompt pipeline's two chunk halves
+    int pf_slot_cap() const { return pf_cap_ / 2; }
+    float* pf_x(int slot = 0) const { return (float*) pf_at(slot, &hlink::PfLayout::x, pf_); }
+    const float* pf_out(int slot = 0) const { return (const float*) pf_at(slot, &hlink::PfLayout::out, pf_); }
+    const float* pf_out_dev(int slot = 0) const { return (const float*) pf_at(slot, &hlink::PfLayout::out, pf_dev_); }
+    int32_t* pf_pos(int slot = 0) const { return (int32_t*) pf_at(slot, &hlink::PfLayout::pos, pf_); }
+    float* pf_rw(int slot = 0) const { return (float*) pf_at(slot, &hlink::PfLayout::rw, pf_); }
+    int32_t* pf_rtok(int slot = 0) const { return (int32_t*) pf_at(slot, &hlink::PfLayout::rtok, pf_); }
+    uint64_t* pf_ptrs(int slot = 0) const { return (uint64_t*) pf_at(slot, &hlink::PfLayout::keys, pf_); }   // (lead addresses)
+    int32_t* pf_cnts(int slot = 0) const { return (int32_t*) pf_at(slot, &hlink::PfLayout::cnts, pf_); }
+    bool pf_post(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n, int rows, int r0,
+                 std::string& err, int slot = 0,
+                 const maya::kernels::exl3::ExpertLayout* xl = nullptr);
+    bool pf_wait(std::string& err, double* helper_ms = nullptr);
+    /// Helper side (the helper program): the exchange mapped here (registered with this GPU), then one layer's call.
+    bool pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std::string& err);
+    /// blobs: the n experts' blobs in this process (the helper program translated the lead's addresses); any expert
+    /// of the shared tier, owned for decode or not (an APU reads it in place)
+    bool pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n, int rows, int r0,
+                const uint8_t* const* blobs, std::string& err, int slot = 0);
+    /// helper program: the same for an EXL3 pack's experts (lay: the layer's blob layout) - each expert's rows
+    /// through the prompt path's EXL3 lane (the weights decoded once, FP16 GEMMs)
+    bool pf_run_x3(const maya::kernels::exl3::ExpertLayout& lay, float limit, int T, int K, int n, int rows,
+                   int r0, const uint8_t* const* blobs, std::string& err, int slot = 0);
+    /// helper program: pf_run_x3's scratch and BLAS handle made now (kOpen of an EXL3 pack) rather than at the first
+    /// prompt call - the first prompt then waits on no allocation
+    bool pf_x3_init(std::string& err);
+
+private:
+    bool start(const maya::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off, float limit,
+               int ne, const int* keys, const float* weights, const float* x, float* out, std::string& err);
+    bool finish(std::string& err, bool split);
+    // the call enqueued and not yet waited for
+    struct Pending {
+        bool exl3 = false;
+        int x3_errors = 0, ne = 0;
+        size_t bytes = 0;
+        float* out = nullptr;
+        std::chrono::steady_clock::time_point t0{}, t1{};   // the enqueue's start and end
+    };
+    Pending pend_;
+    // the linked helper (a second program): its control block, its process, the last request's sequence
+    bool link_ = false;
+    hlink::Ctl* ctl_ = nullptr;
+    int ctl_fd_ = -1, child_ = -1;
+    uint32_t seq_ = 0;
+    bool open_link(int n_embd, int n_ff, const std::vector<std::pair<void*, size_t>>& regions, std::string& err,
+                   bool exl3 = false);
+    bool link_post(std::string& err);            // sends the request the control block holds
+    bool link_wait(std::string& err);            // waits for its answer (status 0) or the program's end
+    void close_link();
+    // the prompt exchange: its host mapping (pf_), as this process's GPU sees it (pf_dev_), its layout and fd
+    uint8_t* pf_ = nullptr;
+    uint8_t* pf_at(int slot, size_t hlink::PfLayout::*field, uint8_t* base) const {
+        size_t b = 0;
+        const hlink::PfLayout L = hlink::pf_slot_layout((size_t) pf_cap_, (size_t) n_embd_, slot, &b);
+        return base + b + L.*field;
+    }
+    uint8_t* pf_dev_ = nullptr;
+    hlink::PfLayout pf_lay_{0, 0};
+    size_t pf_bytes_ = 0;
+    int pf_cap_ = 0, pf_fd_ = -1;
+    bool pf_registered_ = false;
+    // helper side: the prompt scratch (rows a window at most), the window bounds (mapped), the MMQ context
+    void* pf_scratch_ = nullptr;
+    size_t pf_scratch_bytes_ = 0;
+    int pf_win_ = 0;
+    int32_t* pf_bnd_h_ = nullptr;
+    int32_t* pf_bnd_d_ = nullptr;
+    void* pf_mq_ = nullptr;
+    // ... and the fused expert kernel's (pf_run): the chunk's rounded input, a window's rounded H and its tiles; the
+    // experts' places in the shared tier (mapped, beside the bounds)
+    void* pf_fx_ = nullptr;
+    int pf_fx_T_ = 0;
+    uint64_t* pf_off_h_ = nullptr;
+    uint64_t* pf_off_d_ = nullptr;
+    void* pf_x3_blas_ = nullptr;      // (pf_run_x3) its BLAS handle, FP16 scratch and rows window
+    void* pf_x3_scratch_ = nullptr;
+    int pf_x3_win_ = 0;
+    std::atomic<bool> pending_{false};   // a call (enqueue .. wait) or a replace holds the stream and the buffers
+    double last_gpu_ms_ = -1.0;
+    struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
+    std::vector<Region> regions_;
+    struct Slot { uint8_t* host = nullptr; uint8_t* device = nullptr; size_t bytes = 0; };
+    std::vector<Slot> slots_;
+    std::vector<uint8_t> owned_;
+    bool integrated_ = false;
+    uint8_t* pool_ = nullptr;
+    size_t capacity_ = 0, used_ = 0;
+    int device_ = -1, n_embd_ = 0, n_ff_ = 0;
+    cudaStream_t stream_ = nullptr;
+    uint8_t* arena_ = nullptr;
+    float *x_ = nullptr, *out_ = nullptr;
+    void *xq_ = nullptr, *hq_ = nullptr;
+    maya::kernels::glmf::MoeDev plan_;
+    // an integrated (UMA) helper: the input, the plan and the result in mapped pinned memory the kernels use in place
+    // - four copies fewer a call (MAYA_GLM_HELPER_ZEROCOPY=0: the copies)
+    bool zero_copy_ = false;
+    uint8_t* zc_host_ = nullptr;      // [x | out | plan pointers | plan weights], host side
+    float *x_h_ = nullptr, *out_h_ = nullptr;
+    unsigned long long* plan_ptr_h_ = nullptr;
+    float* plan_w_h_ = nullptr;
+    float *x_z_ = nullptr, *out_z_ = nullptr;   // the same, as the helper's device sees them
+    maya::kernels::glmf::MoeDev zplan_;
+    // the window call (win_run): kWinTokens tokens' [x | out | plan pointers | plan weights] in mapped pinned memory
+    // (host side, and as the device sees it), their activation and h quants in device memory
+    uint8_t* win_h_ = nullptr;
+    uint8_t* win_z_ = nullptr;
+    uint8_t* win_q_ = nullptr;
+    unsigned long long win_calls_ = 0, win_tokens_ = 0, win_experts_ = 0, win_distinct_ = 0, win_bytes_ = 0;
+    // win_run's shared experts unpacked once (MoeDev::mt_dedup; MAYA_GLM_WIN_ONCE auto / 1 / 0): per window size, the
+    // calls with a shared expert are timed both ways in turn and the faster way stays - the same bits either way
+    struct WinOnce {
+        int choice = -1;                 // -1 measuring, 0 per token, 1 once
+        int n[2] = {0, 0};               // calls measured per way
+        double blk_ms[2][8] = {};        // ... their time and expert-tokens, in blocks of 32 calls
+        double blk_ex[2][8] = {};
+    };
+    WinOnce win_once_[5];
+    int win_once_mode_ = -1;
+    unsigned long long win_once_calls_ = 0;
+    double win_ms_ = 0, win_post_ms_ = 0;
+    std::chrono::steady_clock::time_point win_t0_{};
+    // MAYA_GLM_PROF: each call's host time and its stages' GPU time, summed; printed when the helper closes
+    bool prof_ = false;
+    cudaEvent_t ev_[6] = {};
+    unsigned long long calls_ = 0, experts_ = 0, bytes_ = 0, split_calls_ = 0;
+    double enqueue_ms_ = 0, wait_ms_ = 0, out_ms_ = 0, stage_ms_[5] = {};   // (out: the zero-copy result's host copy)
+    double beside_ms_ = 0;   // split calls: the time between enqueue's end and wait's start (the caller's own work)
+};
+
+/// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
+/// dense weights and state; results return through the existing pinned CPU rows.
+class RemoteExperts {
+public:
+    RemoteExperts() = default;
+    ~RemoteExperts();
+    RemoteExperts(const RemoteExperts&) = delete;
+    RemoteExperts& operator=(const RemoteExperts&) = delete;
+
+    /// Initialise the device before the host expert arena registers
+    /// tens of GiB of portable mapped memory with CUDA.
+    static bool preflight(int device, double& free_gib, std::string& err);
+    bool open(int device, int slots, int64_t layers, int64_t experts,
+              const std::vector<std::pair<int32_t, int32_t>>& ranked,
+              const ExpertCache& primary, ExpertSource& source,
+              std::vector<uint8_t>& claimed, std::string& err);
+    void close();
+
+    /// `kind` is the primary verifier's classification (-1 = CPU candidate),
+    /// or null on the one-token path. Entries already served on CUDA0 are excluded.
+    bool begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
+               int64_t k, const int32_t* kind, const int32_t* primary_res,
+               std::string& err);
+    bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
+    bool finish(float* out, std::string& err);
+    int64_t resident() const { return cache_.resident(); }
+    int64_t computed() const { return computed_; }
+    int64_t launched_layers() const { return launched_layers_; }
+    double gib() const { return cache_.gib(); }
+    uint64_t returned_bytes() const { return returned_bytes_; }
+    uint64_t full_row_bytes() const { return full_row_bytes_; }
+    /// host time spent in begin() (staging + launches) and in finish() (waiting for this GPU), cumulative
+    double ms_begin() const { return ms_begin_; }
+    double ms_wait() const { return ms_wait_; }
+
+private:
+    int device_ = -1;
+    int64_t n_expert_ = 0;
+    int32_t groups_ = 0;
+    int64_t computed_ = 0;
+    int64_t launched_layers_ = 0;
+    uint64_t returned_bytes_ = 0;
+    uint64_t full_row_bytes_ = 0;
+    double ms_begin_ = 0, ms_wait_ = 0;
+    ExpertCache cache_;
+    cudaStream_t stream_ = nullptr;
+    float* h_x_ = nullptr;
+    float* h_out_ = nullptr;
+    void* h_meta_ = nullptr;
+    float* d_x_ = nullptr;
+    float* z_x_ = nullptr;     ///< h_x_ as the helper GPU sees it (zero-copy: no input copy per layer)
+    float* z_out_ = nullptr;   ///< h_out_ as the helper GPU sees it (zero-copy: no result copy)
+    bool zero_copy_ = false;
+    float* d_out_ = nullptr;
+    uint8_t* d_q8_ = nullptr;
+    float* d_scales_ = nullptr;
+    void* d_scratch_ = nullptr;
+    void* d_meta_ = nullptr;  ///< one contiguous upload of grouped indices, instead of five small copies
+    int32_t* d_start_ = nullptr;
+    int32_t* d_dst_ = nullptr;
+    int32_t* d_tok_ = nullptr;
+    int32_t* d_count_ = nullptr;
+    unsigned long long* d_ptr_ = nullptr;
+    std::vector<uint8_t> owned_;
+    std::vector<uint8_t> layers_present_;
+    std::vector<int32_t> group_of_, group_id_;
+    std::vector<int32_t> start_, dst_, tok_, original_row_;
+    std::vector<unsigned long long> ptr_;
+};
+
+} // namespace maya::core

@@ -21,6 +21,15 @@ refused by default; `MAYA_HIP_ALLOW_ROCM6=1` lets setup go on with a warning. Th
 `HIPBLAS_V2` API and skips `hipblasSetWorkspace` (absent before hipBLAS 3). Measured that way on Debian sid
 (ROCm 6.4.3, hipBLAS 2.4) with an MI50 + MI100 layer split and a CPU without AVX2 - see the pull request.
 
+**Ubuntu's own ROCm packages: the rocWMMA headers.** Ubuntu's `librocwmma-dev` (seen with 7.1.0-0ubuntu1) ships
+`rocwmma.hpp` but not the `internal/` headers it includes, so the HIP build for a card with matrix cores (`gfx1100`,
+`gfx1201`, `gfx1151`) stops at `internal/accessors.hpp`, and no other Ubuntu package has that file. rocWMMA is
+headers only: take the header tree of the same version from AMD's `ROCm/rocWMMA` repository (the tag that matches the
+package, e.g. `rocm-7.1.0`), put it in `~/.local/include/rocwmma`, and run the setup with
+`CPLUS_INCLUDE_PATH=~/.local/include` set (for example `CPLUS_INCLUDE_PATH=$HOME/.local/include ./maya.sh --backend hip
+...`); a user's build compiled cleanly that way. The other way is ROCm from AMD's own repository (repo.radeon.com)
+instead of Ubuntu's packages, with rocWMMA's development package from there.
+
 ```sh
 ./maya.sh --backend hip --gpu 0 --check
 ./maya.sh --backend hip --gpu 0 --context 8192 --no-vision --yes \
@@ -208,6 +217,28 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 8065S, Maya-S, 32K context), 256-token answers run at 28.4-29.6 tokens/s to short prompts and at 23.2-23.5 after
 3K- and 8K-token prompts, against 18.4-19.7 without it; 3K- and 8K-token prompts read at 271 and 278 tokens/s
 (the fused prompt experts and the `wmma2` attention, both on by default on `gfx1151`).
+
+### Hy4-Flash on a Strix Halo / Gorgon Halo
+
+`./maya.sh --setup --backend hip --model hy4-flash-maya-xs` (Linux). Hy4-Flash's engine (`maya-hy4`) keeps a whole size in the GPU's memory where the PC's memory holds it - a 64 GB Halo Maya-XS, a 96 GB one Maya-M, a 128 GB one Maya-L ([MEMORY.md](MEMORY.md)) - and then computes no expert on the CPU. It takes what the RAM has available less 8 GB (or a tenth of the RAM, if more) for the system; the model file is not held twice, and the n-gram table is read from the SSD.
+
+Linux limits how much of the RAM a GPU may take (by default about half). The setup reads the limit and says so when a size does not fit under it; the engine then keeps the most-routed experts on the GPU and computes the rest on the CPU, slower. To let the GPU take more, set the kernel parameter `ttm.pages_limit` (in 4 KiB pages: GiB x 262144) and restart - for example `ttm.pages_limit=14680064` (56 GiB) on a 64 GB PC. Older kernels take `amdgpu.gttsize` (in MiB). Run on a 192 GB Gorgon Halo (Radeon 8065S, Ubuntu 26.04, kernel 7.0, ROCm 7.14) with `ttm.pages_limit=46137344`; the kernel's default limit has not been run. Windows: [experimental](#hy4-flash-under-windows-experimental).
+
+### Hy4-Flash under Windows (experimental)
+
+Hy4-Flash also sets up on an AMD GPU under Windows - a Strix Halo / Gorgon Halo, or a Radeon card - with the same command as the other models (`START-MAYA.bat --backend hip --setup --model hy4-flash-maya-xs`). It is **experimental: we have not run it on Windows ourselves** (no Windows PC with an AMD GPU here). It is the same engine that runs on Linux, built with AMD's SDK for Windows the way GLM's and DeepSeek's engines are, with the same Windows rules they follow: on a Halo the model stays within the memory Windows gives the GPU (Variable Graphics Memory, set in AMD Software) and within what Windows can still commit (the RAM and the page file), and the setup says once that the platform is experimental. With several AMD GPUs, tensor parallel is not taken by default on Windows (the layers split over the GPUs; `--tp N` in the config's `"args"` asks for it).
+
+**If it does not work.** A start that stops, an answer that never comes (the engine waiting with the GPU idle) or answers that look wrong: please open an issue with your GPU, Windows version, the setup's output and the engine's log from the start (its first line says the platform is experimental), and, if it stops or hangs, whether it runs with `"GPU_FLUSH_ON_EXECUTION": "1"` in the config's `"env"` (AMD's runtime then sends the GPU its work at once - slower, but it tells us where to look). Meanwhile: turn drafting off (`--drafting off` at the setup), or run Hy4-Flash on Linux on the same PC (see above), or pick another model - GLM-5.3-Flash and DeepSeek-V4.1-Flash have been run on AMD under Windows.
+
+### Inkling-2-Mini (experimental preview)
+
+`./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) runs on an RDNA 3 / 3.5 / 4
+GPU (gfx11 / gfx12) with 12 GB of VRAM or more - under 24 GB the experts the card does not hold stay in RAM (about 9 GB
+of RAM with a 12 GB card) - or a Strix Halo / Gorgon Halo, whose memory is the RAM and holds the whole model (the
+setup counts what the system leaves, less max(8 GB, 10%)). Run by Maya's team on a
+Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.1): text, thinking, tool calls and pictures, the same greedy answers over
+starts; Radeon RX 7000 / 9000 cards build the same engine but have not been run here yet. Older AMD GPUs and AMD
+under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD paths.
 
 ## Instinct MI300X / MI325X
 

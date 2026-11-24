@@ -5,7 +5,7 @@
 # release's tree and checks it; docs/DOCKER.md says what it holds and what it doesn't.
 #
 # It compiles the engines the way maya.py's setup does, with two differences:
-#   - STRATA_PORTABLE=ON: ggml's CPU code for an AVX2 baseline instead of the build machine's own CPU, so the image
+#   - MAYA_PORTABLE=ON: ggml's CPU code for an AVX2 baseline instead of the build machine's own CPU, so the image
 #     runs on CPUs without AVX-512 (Maya's own AVX-512 kernels are compiled per file and picked at run time anyway);
 #   - CMAKE_CUDA_ARCHITECTURES from CUDA_ARCHITECTURES (one cubin per architecture, plus its PTX) instead of the
 #     PC's own cards.
@@ -38,9 +38,9 @@ RUN test -n "$LLAMA_CPP_COMMIT" \
     && rm /tmp/llama.zip
 
 RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DSTRATA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
-        -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON \
-        -DSTRATA_GGML_DIR=/llama.cpp \
+        -DMAYA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
+        -DMAYA_NATIVE_EXPERTS=ON -DMAYA_BUILD_TESTS=OFF -DMAYA_PORTABLE=ON \
+        -DMAYA_GGML_DIR=/llama.cpp \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
 # The three engines: maya (GLM-5.3-Flash), maya-ds4 (DeepSeek-V4.1-Flash-1017) and maya-mm3 (MiniMax-M3.1-Flash).
 # The ccache statistics go to the build log.
@@ -52,7 +52,7 @@ RUN --mount=type=cache,id=project-maya-ccache,target=/root/.cache/ccache \
 # The CPU settings and the CUDA architectures the tree was configured with, read from CMakeCache.txt for
 # docker/build.sh's checks
 RUN mkdir -p /out/bin && for t in maya maya-ds4 maya-mm3; do cp "/build/$t" "/out/bin/$t" || exit 1; done \
-    && grep -E '^(STRATA_PORTABLE|GGML_NATIVE|GGML_AVX[A-Z0-9_]*|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_AMX_[A-Z0-9_]*):' \
+    && grep -E '^(MAYA_PORTABLE|GGML_NATIVE|GGML_AVX[A-Z0-9_]*|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_AMX_[A-Z0-9_]*):' \
          /build/CMakeCache.txt > /out/cpu-flags.txt \
     && sed -n 's/^CMAKE_CUDA_ARCHITECTURES:[A-Z]*=//p' /build/CMakeCache.txt > /out/cuda-architectures.txt
 

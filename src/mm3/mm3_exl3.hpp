@@ -1,8 +1,8 @@
 // src/mm3/mm3_exl3.hpp - EXL3 (exllamav3) quantized weights on the device for maya-mm3 (MiniMax-M3.1-Flash): the
 // decode GEMV, the routed experts, and the full reconstruction for the prompt path.
 //
-// maya-mm3's own copy of include/strata/kernels/exl3.hpp (the GLM and DeepSeek engines keep theirs): the same format
-// and interface in namespace strata::mm3::exl3, with the routed experts' activation MiniMax's swigluoai -
+// maya-mm3's own copy of include/maya/kernels/exl3.hpp (the GLM and DeepSeek engines keep theirs): the same format
+// and interface in namespace maya::mm3::exl3, with the routed experts' activation MiniMax's swigluoai -
 // g = min(g, limit), u = clamp(u, -limit, limit), h = g * sigmoid(kSwigluAlpha g) * (u + 1) - instead of the clamped
 // swiglu.  Before sm_80: Volta / Turing's tensor cores (nvcuda::wmma) for every tile, and the prompt path's busy
 // matrices through cuBLAS' FP16 GEMMs over their decoded weights (blas_enable).
@@ -32,7 +32,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace strata::mm3::exl3 {
+namespace maya::mm3::exl3 {
 
 /// The weight type the engine's MvJob / WSlot carry for EXL3: their weight pointer is a (host) const Mat*.
 constexpr int kTypeEXL3 = 200;
@@ -238,4 +238,4 @@ int launch_errors();
 /// The current device's win_experts waits on the host's word that gave up after 120 s (the host never answered).
 unsigned wait_timeouts();
 
-}  // namespace strata::mm3::exl3
+}  // namespace maya::mm3::exl3

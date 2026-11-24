@@ -27,11 +27,11 @@
 //      layer's warm order, so the file order must move experts and reads them in contiguous runs; the 3 parts'
 //      file-order warm-ups run one at a time.
 // With fewer than 3 devices the 3-part steps are skipped (2 devices: the 2-part speculative check still runs).
-#include "strata/core/glm_arch.hpp"
-#include "strata/core/glm_dsa_split.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_warm_seq.hpp"
-#include "strata/kernels/sampler.hpp"
+#include "maya/core/glm_arch.hpp"
+#include "maya/core/glm_dsa_split.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_warm_seq.hpp"
+#include "maya/kernels/sampler.hpp"
 
 #include "glm_dsa_fixtures.hpp"
 #include "glm_test_env.hpp"   // setenv / unsetenv (<unistd.h> on POSIX; mapped on Windows)
@@ -65,7 +65,7 @@ void check(bool ok, const std::string& what) {
 int argmax(const std::vector<float>& v) { return (int) (std::max_element(v.begin(), v.end()) - v.begin()); }
 
 // greedy `n` tokens after `prompt`; false + err on any failure
-bool greedy(strata::core::Glm5Model& m, const std::vector<int32_t>& prompt, int n, std::vector<int>& out,
+bool greedy(maya::core::Glm5Model& m, const std::vector<int32_t>& prompt, int n, std::vector<int>& out,
             std::string& err) {
     std::vector<float> logits;
     out.clear();
@@ -84,9 +84,9 @@ std::string first_diff(const std::vector<int>& a, const std::vector<int>& b) {
     return a.size() == b.size() ? "identical" : "lengths differ";
 }
 
-std::unique_ptr<strata::core::Glm5Model> load_split(const fs::path& pack, const std::vector<int>& bounds,
+std::unique_ptr<maya::core::Glm5Model> load_split(const fs::path& pack, const std::vector<int>& bounds,
                                                     const std::vector<int>& devs, std::string& err) {
-    auto m = std::make_unique<strata::core::Glm5Model>();
+    auto m = std::make_unique<maya::core::Glm5Model>();
     if (!m->load_pack_split(pack.string(), kCtx, bounds, devs, err) || !m->fast()) return nullptr;
     return m;
 }
@@ -94,7 +94,7 @@ std::unique_ptr<strata::core::Glm5Model> load_split(const fs::path& pack, const 
 /// The speculative decode vs the plain greedy tokens, with MAYA_GLM_SPEC_DRAFT_EARLY off (today's step order) and on
 /// (glm-dsa B11.2: the NextN draft runs while the tail group's front parts compute; on a one-part tail the redo goes in
 /// before the draft); "" when it ran, else why it did not.
-std::string spec_check(strata::core::Glm5Model& m, const std::vector<int32_t>& prompt, const std::vector<int>& want,
+std::string spec_check(maya::core::Glm5Model& m, const std::vector<int32_t>& prompt, const std::vector<int>& want,
                        const std::string& what) {
     if (!m.spec_ready()) return what + ": the speculative decode is not ready (no NextN block on the last part?)";
     for (int early = 0; early < 2; ++early) {
@@ -108,7 +108,7 @@ std::string spec_check(strata::core::Glm5Model& m, const std::vector<int32_t>& p
             unsetenv("MAYA_GLM_SPEC_DRAFT_EARLY");
             return label + ": prompt: " + err;
         }
-        strata::kernels::SamplerParams sp;
+        maya::kernels::SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
         std::vector<int> got;
@@ -127,9 +127,9 @@ std::string spec_check(strata::core::Glm5Model& m, const std::vector<int32_t>& p
 /// 6. B8.1 (warm): the pack loaded with MAYA_GLM_WARM_SEQ=0 (slot order, Maya's parallel reads) and =1 (file
 /// order, one reader, the parts in turn) gives the same warm digest (MAYA_GLM_WARM_SUM: every part's tiers at the end
 /// of its warm-up) - only the order of the reads differs.
-void warm_order_check(const fs::path& pack, const strata::core::Glm5Geometry& g, const std::vector<int>& b3,
+void warm_order_check(const fs::path& pack, const maya::core::Glm5Geometry& g, const std::vector<int>& b3,
                       int n_dev) {
-    namespace gw = strata::core::glmwarm;
+    namespace gw = maya::core::glmwarm;
     // the usage file (MAYA_GLM_USAGE) leads each layer's warm order: a scrambled one, so the VRAM slots take
     // experts from all over each layer and the slot order reads all over the files
     const fs::path usage = glmfx::fixture_dir() / "pack_fast_test_warm.usage";
@@ -155,12 +155,12 @@ void warm_order_check(const fs::path& pack, const strata::core::Glm5Geometry& g,
     const auto load = [&](const char* seq, bool three, gw::Digest& d, gw::Stats& st, std::string& err) {
         setenv("MAYA_GLM_WARM_SEQ", seq, 1);
         gw::stats_reset();
-        std::unique_ptr<strata::core::Glm5Model> m;
+        std::unique_ptr<maya::core::Glm5Model> m;
         if (three) {
             m = load_split(pack, b3, {0, 1, 2}, err);
         } else {
             setenv("MAYA_GLM_SPLIT", "0", 1);
-            m = std::make_unique<strata::core::Glm5Model>();
+            m = std::make_unique<maya::core::Glm5Model>();
             if (!m->load_pack_env(pack.string(), kCtx, err) || !m->fast()) m.reset();
             unsetenv("MAYA_GLM_SPLIT");
         }
@@ -238,20 +238,20 @@ int main() {
             return glmfx::fixture_missing("glm_dsa_pack_fast_test", why);
         }
     }
-    strata::core::Glm5Geometry g;
-    if (!strata::core::glm_pack_geometry(pack.string(), g, err) || g.arch != strata::core::GlmArch::GlmDsa) {
+    maya::core::Glm5Geometry g;
+    if (!maya::core::glm_pack_geometry(pack.string(), g, err) || g.arch != maya::core::GlmArch::GlmDsa) {
         std::fprintf(stderr, "glm_dsa_pack_fast_test: %s: %s\n", pack.string().c_str(),
                      err.empty() ? "not a glm-dsa pack" : err.c_str());
         return 1;
     }
-    if (!strata::core::glm_forward_available(g, err)) {
+    if (!maya::core::glm_forward_available(g, err)) {
         std::fprintf(stderr, "glm_dsa_pack_fast_test: the glm-dsa forward is gated off: %s\n", err.c_str());
         return 1;
     }
     {   // the pack passes the glm-dsa loader's geometry and tensor-shape checks (no GPU work: MAYA_GLM_CHECK_ONLY)
         setenv("MAYA_GLM_CHECK_ONLY", "1", 1);
         setenv("MAYA_GLM_SPLIT", "0", 1);
-        strata::core::Glm5Model m;
+        maya::core::Glm5Model m;
         std::string e;
         m.load_pack_env(pack.string(), kCtx, e);
         unsetenv("MAYA_GLM_CHECK_ONLY");
@@ -275,7 +275,7 @@ int main() {
     {   // 1 part (no NextN block: MAYA_GLM_MTP unset)
         setenv("MAYA_GLM_SPLIT", "0", 1);
         unsetenv("MAYA_GLM_MTP");
-        auto m = std::make_unique<strata::core::Glm5Model>();
+        auto m = std::make_unique<maya::core::Glm5Model>();
         if (!m->load_pack_env(pack.string(), kCtx, err) || !m->fast() || !greedy(*m, prompt, kTokens, one, err)) {
             std::fprintf(stderr, "glm_dsa_pack_fast_test: 1 part: %s\n", err.c_str());
             return 1;
@@ -289,8 +289,8 @@ int main() {
     std::vector<int> fulls;
     for (int il = 1; il < g.n_layers; ++il)
         if (g.idx_full(il)) fulls.push_back(il);
-    std::vector<int> b3 = strata::core::glm_snap_bounds(g, {g.n_layers / 3, 2 * g.n_layers / 3});
-    if (b3.size() != 2 || b3[0] >= b3[1] || !strata::core::glm_split_bounds_ok(g, b3, err)) {
+    std::vector<int> b3 = maya::core::glm_snap_bounds(g, {g.n_layers / 3, 2 * g.n_layers / 3});
+    if (b3.size() != 2 || b3[0] >= b3[1] || !maya::core::glm_split_bounds_ok(g, b3, err)) {
         if (fulls.size() < 2) {
             std::printf("glm_dsa_pack_fast_test: fewer than two full-indexer layers past 0 - no 3-part split\n");
             return g_fail ? 1 : kSkip;
@@ -338,7 +338,7 @@ int main() {
                                               (ra && rb ? first_diff(a, b) : "not run: " + err));
                 int64_t want = 0;
                 for (int il = 0; il < g.n_layers; ++il)
-                    want += strata::core::glm_dsa_state_row_bytes(g, il, m->kv_int8()) * (int64_t) head.size();
+                    want += maya::core::glm_dsa_state_row_bytes(g, il, m->kv_int8()) * (int64_t) head.size();
                 check(bytes >= (uint64_t) want, "the slot (" + std::to_string(bytes) + " B) holds every layer's latent + "
                                                     "k_pe and the full layers' index keys (" + std::to_string(want) + " B)");
                 // a slot whose fingerprint names another latent row size is refused
@@ -419,7 +419,7 @@ int main() {
             check(f0 && fo && f1 && y1 == y0 && d1 == d0,
                   "B15.3: the first draft after a reset that followed a same-length prompt == the fresh one (" +
                       std::to_string(d1) + " vs " + std::to_string(d0) + (f0 && fo && f1 ? "" : ": " + err) + ")");
-            const strata::core::GlmStateFingerprint fp = m->state_fp();
+            const maya::core::GlmStateFingerprint fp = m->state_fp();
             check(fp[12] != 0 && fp[13] == 4 * g.n_embd, "B15.3: the fingerprint names the NextN block (" +
                                                              std::to_string(fp[12]) + ") and the carrier bytes");
             // slot: the snapshot after the whole prompt holds h_{n-1}; the draft right after slot_load (no trunk

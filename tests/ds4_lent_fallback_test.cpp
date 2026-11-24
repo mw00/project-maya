@@ -51,8 +51,8 @@ struct FakeClear {
 }  // namespace
 
 int main() {
-    using strata::ds4::clear_retry;
-    using strata::ds4::lent_recover;
+    using maya::ds4::clear_retry;
+    using maya::ds4::lent_recover;
     {   // one GPU, healthy: the copies dropped, the request goes on
         FakeRt rt;
         rt.healthy = {true};

@@ -16,7 +16,7 @@
 #include <random>
 #include <vector>
 
-namespace ga = strata::core::glmabl;
+namespace ga = maya::core::glmabl;
 
 static int fails = 0;
 #define CHECK(c, ...)                                                                                                  \

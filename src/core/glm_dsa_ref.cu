@@ -41,11 +41,11 @@
 //
 // Environment: MAYA_GLMD_TILE_MB (each of the two dequant tiles' cap, default 512), MAYA_GLMD_KQ_SCALE (a
 // different attention scale, for mutation runs only).
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/glmd_forward.hpp"
-#include "strata/kernels/glmd_ref.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/dequant_bf16.hpp"
+#include "maya/kernels/glmd_forward.hpp"
+#include "maya/kernels/glmd_ref.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include "../kernels/cuda/glmd_rope.cuh"
 #include "glm_cb_dump.hpp"
@@ -66,7 +66,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -228,13 +228,13 @@ bool dq_rows(DsaRef& R, const WRef& w, int64_t r0, int64_t nr, int64_t cols, flo
         f16_kernel<<<grid_for(n), kThreads, 0, st>>>((const __half*) w.p + r0 * cols, out, n);
         return cuda_ok(cudaGetLastError(), "f16 widen", err);
     }
-    if (strata::kernels::dequant_bf16_supported(w.type)) {
-        strata::kernels::dequant_f32(w.type, w.p, r0, nr, cols, out, st);
+    if (maya::kernels::dequant_bf16_supported(w.type)) {
+        maya::kernels::dequant_f32(w.type, w.p, r0, nr, cols, out, st);
         return cuda_ok(cudaGetLastError(), "dequant_f32", err);
     }
-    if (strata::kernels::iq_supported(w.type) && cols % 256 == 0) {
-        const size_t rb = strata::kernels::iq_row_bytes(w.type, cols);
-        strata::kernels::iq_dequant_f32(w.type, (const uint8_t*) w.p + (size_t) r0 * rb, n, out, st);
+    if (maya::kernels::iq_supported(w.type) && cols % 256 == 0) {
+        const size_t rb = maya::kernels::iq_row_bytes(w.type, cols);
+        maya::kernels::iq_dequant_f32(w.type, (const uint8_t*) w.p + (size_t) r0 * rb, n, out, st);
         return cuda_ok(cudaGetLastError(), "iq_dequant_f32", err);
     }
     // no device dequantizer (Q2_K, Q4_1, Q5_1, ...): ggml's own to_float on the host, synchronously
@@ -748,4 +748,4 @@ bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
     return cuda_ok(cudaGetLastError(), "step", err);
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

@@ -5,7 +5,7 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 ## Start here
 
 - [SETUP.md](SETUP.md): what the first run does, starting again and updating, the setup's options, and the fix for each build failure.
-- [MODELS.md](MODELS.md): the four models, how the quants are named, and each one's files, drafters, pictures and options.
+- [MODELS.md](MODELS.md): the five models, how the quants are named, and each one's files, drafters, pictures and options.
 - [GLM53.md](GLM53.md): GLM-5.3 (744B): its files, setup, context and defaults.
 - [MEMORY.md](MEMORY.md): which model fits your PC - each model's recommended memory (VRAM + RAM together).
 - [WINDOWS.md](WINDOWS.md): installing and running Maya on Windows 10/11.
@@ -43,6 +43,7 @@ How the engine works and how changes were measured. You do not need these to run
 - [deepseek-prompt-format.md](deepseek-prompt-format.md): DeepSeek-V4.1's prompt encoding and the vendored `serve/ds41_encoding.py`.
 - [ds4-draft-timing.md](ds4-draft-timing.md): the DSpark drafter timing fields in DeepSeek `STAT` lines.
 - [ds4-skip-unpicked.md](ds4-skip-unpicked.md): DeepSeek prefill transfers of only the experts a chunk picks (`DS4_SKIP_UNPICKED`).
+- [ds4-exl3-packs.md](ds4-exl3-packs.md): other makers' DeepSeek EXL3 packs - type-ordered shards (`tools/ds4/reorder.py`) and Diffbot's 3 bpw.
 - [DS4_PROFILE_REFRESH.md](DS4_PROFILE_REFRESH.md): refreshing DeepSeek's startup expert placement, measured on a three-GPU AMD PC.
 - [EXL3_HIP.md](EXL3_HIP.md): EXL3 prefill on HIP.
 - [EXL3_HIP_SCALAR_ROWS.md](EXL3_HIP_SCALAR_ROWS.md): configurable scalar EXL3 prompt tiles on RDNA4.

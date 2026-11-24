@@ -35,7 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+import sys as _sys   # (an older MAYA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
 _sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 import maya_names  # noqa: E402,F401
 import pathlib

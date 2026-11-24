@@ -1,5 +1,5 @@
 // src/core/glm_dsa_prefill_share.cpp - the glm-dsa port B9.9: the prompt's host share on a node-split layer, one
-// node's arithmetic (see glm_dsa_prefill_stream.hpp).  Plain C++ over ggml-cpu (strata_kernels_cpu); the node lanes
+// node's arithmetic (see glm_dsa_prefill_stream.hpp).  Plain C++ over ggml-cpu (maya_kernels_cpu); the node lanes
 // that run it are driven by glm_dsa_prefill_stream.cpp.
 //
 // Maya's share (glm_prefill.cu, the CPU's share of a layer's staged experts) computes, for every routed row of each
@@ -13,7 +13,7 @@
 
 #include <algorithm>
 
-namespace strata::core::glmpfs {
+namespace maya::core::glmpfs {
 
 namespace {
 constexpr int kGu = 32;   // gate/up rows a job (Maya's share: kGu)
@@ -77,4 +77,4 @@ void share_add(const float* p0, const float* p1, float* out, size_t n, const Run
     });
 }
 
-}  // namespace strata::core::glmpfs
+}  // namespace maya::core::glmpfs

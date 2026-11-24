@@ -4,7 +4,7 @@
 // a checksum per layer).  The size is a FLAG rather than hard-coded because the honest way to measure a 34 GB
 // load is to measure a smaller one first and project - and because pinning 34 GB evicts every page of page
 // cache on the machine, which is not something a test should do while other work is running.
-#include "strata/core/pinned.hpp"
+#include "maya/core/pinned.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -49,11 +49,11 @@ int main(int argc, char** argv) {
                 (unsigned long long) blobs_per_layer, (unsigned long long) blob_bytes,
                 (double) bytes / (1024.0 * 1024 * 1024));
 
-    strata::core::PinnedArena arena;
+    maya::core::PinnedArena arena;
     uint8_t* dst = nullptr;
     if (pin) {
         // constructed in place so the note from the constructor can be printed before the load
-        new (&arena) strata::core::PinnedArena(bytes);
+        new (&arena) maya::core::PinnedArena(bytes);
         std::printf("backing: %s\n", arena.note.c_str());
         if (!arena.valid()) { std::fprintf(stderr, "arena allocation failed\n"); return 1; }
         dst = arena.data();
@@ -63,8 +63,8 @@ int main(int argc, char** argv) {
         std::printf("backing: malloc, NOT pinned (--no-pin)\n");
     }
 
-    const strata::core::LoadStats st =
-        strata::core::load_experts(path, dst, blob_bytes, blobs_per_layer, layers, threads, chunk);
+    const maya::core::LoadStats st =
+        maya::core::load_experts(path, dst, blob_bytes, blobs_per_layer, layers, threads, chunk);
     if (!st.ok) {
         std::fprintf(stderr, "loading the experts failed: %s\n", st.error.empty() ? "unknown" : st.error.c_str());
         return 1;
@@ -90,8 +90,8 @@ int main(int argc, char** argv) {
             const uint64_t g = granularities[i];
             if (g > bytes) continue;
             const int iters = (int) (g >= bytes ? 3 : (bytes / g >= 8 ? 8 : 3));
-            const strata::core::StreamStats ss =
-                strata::core::stream_bandwidth(dst, (bytes / g) * g, g, iters);
+            const maya::core::StreamStats ss =
+                maya::core::stream_bandwidth(dst, (bytes / g) * g, g, iters);
             if (ss.seconds < 0) continue;
             std::printf("  %-18s chunk %8.2f MB  %6.2f GB/s  (%.3f GiB in %.3f s)\n", names[i],
                         (double) g / 1e6, ss.gib_per_second() * 1.073741824,
@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
         (void) best;
         std::printf("\nper-token expert stream at E = 663.6 MB and hit rate h (VRAM-resident fraction):\n");
         std::printf("  %-8s %-14s %-14s %s\n", "h", "miss MB/token", "ms at 1 blob", "tok/s ceiling");
-        const strata::core::StreamStats one = strata::core::stream_bandwidth(dst, blob_bytes, blob_bytes, 64);
+        const maya::core::StreamStats one = maya::core::stream_bandwidth(dst, blob_bytes, blob_bytes, 64);
         for (double h : {0.0, 0.5, 0.833, 0.9, 0.95}) {
             const double miss_mb = (1.0 - h) * 663.6;
             const double ms = miss_mb / 1000.0 / (one.gib_per_second() * 1.073741824) * 1000.0;

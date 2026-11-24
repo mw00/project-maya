@@ -1,5 +1,5 @@
-// src/platform/direct_file.cpp - see include/strata/platform/direct_file.hpp.
-#include "strata/platform/direct_file.hpp"
+// src/platform/direct_file.cpp - see include/maya/platform/direct_file.hpp.
+#include "maya/platform/direct_file.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -21,7 +21,7 @@
 #include <unistd.h>
 #endif
 
-namespace strata::platform {
+namespace maya::platform {
 
 double now_us() {
     using namespace std::chrono;
@@ -362,4 +362,4 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
 }
 #endif
 
-}  // namespace strata::platform
+}  // namespace maya::platform

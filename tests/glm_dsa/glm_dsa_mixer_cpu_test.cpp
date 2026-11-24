@@ -110,9 +110,9 @@ void suite(const char* name, const mixfx::Model& m, bool full_suite = true) {
 
 int main() {
     std::printf("glm_dsa_mixer_cpu_test: the glm-dsa decode mixer (glmdsa::mixer_layer) on the CPU twins\n");
-    check(strata::core::glmdsa::sel_count(0, 2048, false) == 1 && strata::core::glmdsa::sel_count(2047, 2048, false) == 2048 &&
-              strata::core::glmdsa::sel_count(2048, 2048, false) == 2048 &&
-              strata::core::glmdsa::sel_count(5000, 2048, true) == 5001,
+    check(maya::core::glmdsa::sel_count(0, 2048, false) == 1 && maya::core::glmdsa::sel_count(2047, 2048, false) == 2048 &&
+              maya::core::glmdsa::sel_count(2048, 2048, false) == 2048 &&
+              maya::core::glmdsa::sel_count(5000, 2048, true) == 5001,
           "sel_count: identity to 2048 cells, then 2048; dense p + 1");
     {
         const std::vector<bool> pat = {true, false, false, true, false, false, true};

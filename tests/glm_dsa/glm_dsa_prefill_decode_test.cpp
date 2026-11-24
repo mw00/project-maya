@@ -18,9 +18,9 @@
 // with decode graphs (MAYA_GLMD_FUSED_MLA / IDX_WMMA / TOPK_MB = 1, MAYA_GLM_DSA_GRAPHS=1, B10.1-B10.4); and
 // --native32: the pack keeps attn_k_b / attn_v_b native Q8_0 (MAYA_PACK_NATIVE32=1, B10.7).
 // Without a device or the fixture tools: exit 77.
-#include "strata/core/glm_arch.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_arch.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include "glm_dsa_fixtures.hpp"
 #include "glm_test_env.hpp"   // setenv / unsetenv (<unistd.h> on POSIX; mapped on Windows)
@@ -160,10 +160,10 @@ bool row_written(const std::vector<float>& st, int64_t off_floats, int64_t pp_fl
 }
 
 bool run_model(const fs::path& pack, bool batched, const std::vector<int32_t>& prompt, const std::vector<int>* forced,
-               Run& out, strata::core::GlmStateLayout& lay, int64_t& pos_end) {
+               Run& out, maya::core::GlmStateLayout& lay, int64_t& pos_end) {
     if (batched) unsetenv("MAYA_GLM_NO_PREFILL");
     else setenv("MAYA_GLM_NO_PREFILL", "1", 1);
-    auto m = std::make_unique<strata::core::Glm5Model>();
+    auto m = std::make_unique<maya::core::Glm5Model>();
     std::string& err = out.err;
     if (!m->load_pack_env(pack.string(), kCtx, err) || !m->fast()) {
         if (err.empty()) err = "not on the fast path";
@@ -233,8 +233,8 @@ int main(int argc, char** argv) {
         std::printf("glm_dsa_prefill_decode_test: no CUDA device - SKIP\n");
         return kSkip;
     }
-    strata::core::Glm5Geometry g;
-    if (!strata::core::glm_pack_geometry(pack.string(), g, err) || g.arch != strata::core::GlmArch::GlmDsa) {
+    maya::core::Glm5Geometry g;
+    if (!maya::core::glm_pack_geometry(pack.string(), g, err) || g.arch != maya::core::GlmArch::GlmDsa) {
         std::fprintf(stderr, "glm_dsa_prefill_decode_test: %s: %s\n", pack.string().c_str(), err.c_str());
         return 1;
     }
@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < L; ++i) prompt[(size_t) i] = (int32_t) ((i * 7919 + 13) % std::max<int64_t>(2, g.n_vocab));
 
     Run A, B;
-    strata::core::GlmStateLayout la, lb;
+    maya::core::GlmStateLayout la, lb;
     int64_t pa = 0, pb = 0;
     if (!run_model(pack, true, prompt, nullptr, A, la, pa)) {
         std::fprintf(stderr, "glm_dsa_prefill_decode_test: the batched run: %s\n", A.err.c_str());
@@ -285,7 +285,7 @@ int main(int argc, char** argv) {
             int width, dtype;
         };
         std::vector<Comp> comps;
-        comps.push_back({"latent", la.dsa_lat[(size_t) il], la.lat_pp, g.kv_lora, la.mode == strata::core::GlmStateMode::Int8 ? 2 : 1});
+        comps.push_back({"latent", la.dsa_lat[(size_t) il], la.lat_pp, g.kv_lora, la.mode == maya::core::GlmStateMode::Int8 ? 2 : 1});
         if (la.has_kpe(il)) comps.push_back({"k_pe", la.dsa_kpe[(size_t) il], la.kpe_pp, g.qk_rope, 1});
         if (la.has_index_cache(il)) comps.push_back({"index keys", la.dsa_ik[(size_t) il], la.ik_pp, g.idx_key, la.ik_bytes == 2 ? 1 : 0});
         for (const Comp& c : comps) {

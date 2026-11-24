@@ -19,7 +19,8 @@ compilers and keeps its cache in Docker's build cache on the machine that builds
 
 - **The three engines**, compiled the way `maya.py`'s setup compiles them, where the setup puts them:
   `build/maya` (GLM-5.3, GLM-5.3-Flash and Qwen-3.8-Flash-Next), `build/maya-ds4` (DeepSeek-V4.1-Flash-1017) and `build/maya-mm3`
-  (MiniMax-M3.1-Flash).
+  (MiniMax-M3.1-Flash). Hy4-Flash's engine (`maya-hy4`) is not in the image yet: the setup compiles it outside a
+  container ([MODELS.md](MODELS.md#hy4-flash)).
 - **The release's tree** in `/opt/maya`: the server (`serve/server.py`), the pack builders (`tools/iq_pack.py`,
   `tools/ds4/pack_gguf.py`, `tools/mm3/pack_gguf.py`) and the data files they use (the expert profiles, MiniMax's chat
   template). The tests, the benches, `ref/` and the bundled wheels are left out.
@@ -37,7 +38,7 @@ compilers and keeps its cache in Docker's build cache on the machine that builds
 
 ### A portable CPU build
 
-The Dockerfile passes `-DSTRATA_PORTABLE=ON`, which `maya.py` passes only for its HIP build. Without it the CMake sets
+The Dockerfile passes `-DMAYA_PORTABLE=ON`, which `maya.py` passes only for its HIP build. Without it the CMake sets
 `GGML_NATIVE=ON`, which compiles ggml's CPU code for the build machine's own CPU. That's right for a PC that compiles
 its own engine and wrong for an image: an image built on an AVX-512 machine stops with an illegal instruction on a CPU
 without AVX-512, a Ryzen 5000 for example. With it, ggml's CPU code targets an AVX2 baseline. Maya's own AVX-512
@@ -74,7 +75,7 @@ at the first failed check, before anything is pushed. None of the checks needs a
 |---|---|
 | `setup.py`'s llama.cpp pin (`LLAMA_CPP_COMMIT`) is the one `CMakeLists.txt` names | the two pins disagreeing (the image builds from `setup.py`'s, as `maya.py` does) |
 | `VERSION` is the release, when `--ref` is a `vX.Y.Z` tag | a tag on a tree whose `VERSION` wasn't bumped (v1.1.21 shipped an empty one) |
-| `CMakeCache.txt`: `STRATA_PORTABLE` on, `GGML_NATIVE` off, `GGML_AVX2` on, no AVX-512, VNNI or AMX | a native build slipping into the image |
+| `CMakeCache.txt`: `MAYA_PORTABLE` on, `GGML_NATIVE` off, `GGML_AVX2` on, no AVX-512, VNNI or AMX | a native build slipping into the image |
 | the architectures in `CMakeCache.txt` are the ones asked for | a build for the wrong cards |
 | `ldd` on each engine: everything resolves except the host driver's `libcuda` and `libnvidia-*` | a library missing from the runtime image |
 | `serve/server.py --help` and each pack builder's `--help` run | an import or a package the server needs missing |

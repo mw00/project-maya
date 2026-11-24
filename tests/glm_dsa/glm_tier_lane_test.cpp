@@ -27,8 +27,8 @@
 #include <string>
 #include <vector>
 
-namespace gt = strata::core::glmtier;
-namespace kc = strata::kernels::cpu;
+namespace gt = maya::core::glmtier;
+namespace kc = maya::kernels::cpu;
 
 namespace {
 

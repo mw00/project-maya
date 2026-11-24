@@ -1,19 +1,19 @@
 // tests/glm_dsa/glmd_mmq_sm70_test.cpp - B14.2 / B9.8 on the host: for every type the prompt path sends to MMQ
-// (strata::prefill::mmq::supported), every tile width the host switch can pick on a V100 (cc 700, 96 KB opt-in
+// (maya::prefill::mmq::supported), every tile width the host switch can pick on a V100 (cc 700, 96 KB opt-in
 // shared memory) has a real sm_70 instance in this build (llama.cpp 1163af96: a host-picked mmq_x whose device code
 // was NO_DEVICE_CODE gave silent zeros), for chunks of 1..8192 columns; and the B14.1 clamp sees the scale layout.
 // CPU only: no device is touched.
-#include "strata/prefill/moe_mmq.hpp"
-#include "strata/prefill/moe_mmq_strata.hpp"
+#include "maya/prefill/moe_mmq.hpp"
+#include "maya/prefill/moe_mmq_strata.hpp"
 
 #include <cstdio>
 #include <string>
 
 int main() {
-    namespace ma = strata::prefill::mmq_strata;
+    namespace ma = maya::prefill::mmq_strata;
     int fail = 0, n = 0;
     for (int t = 0; t < 64; ++t) {
-        if (!strata::prefill::mmq::supported(t)) continue;
+        if (!maya::prefill::mmq::supported(t)) continue;
         ++n;
         std::string why;
         const bool ok = ma::sm70_check(t, 700, 98304, 8192, why);

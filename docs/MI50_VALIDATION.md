@@ -31,7 +31,7 @@ These are fresh checks of this patch, separate from earlier custom-build reports
 | Host compiler | GCC 13.3.0 |
 | CMake | 3.28.3 |
 
-Upstream accepts `gfx906` at configure time via #505. This pull request adds direct peer-to-peer PCIe transfers (`MAYA_GLM_P2P`), enables opt-in tuned IQ2_S expert dispatch on gfx906 (`MAYA_GLM_GU22_TUNED`), enables `DS4_IQ_STRICT_FP` on `gfx906` in `src/ds4/ds4_iq.cu`, and restores the wave64 64-lane logical-warp regression probe in `tests/hip/intrinsics.cpp`. Every gfx906 code path is guarded behind strict architecture checks (`#if defined(STRATA_USE_HIP)` and `enable_gfx906_peer_cached` / `allow_gfx906 && gfx906` / `__gfx906__`), leaving non-gfx906 GPUs completely unchanged.
+Upstream accepts `gfx906` at configure time via #505. This pull request adds direct peer-to-peer PCIe transfers (`MAYA_GLM_P2P`), enables opt-in tuned IQ2_S expert dispatch on gfx906 (`MAYA_GLM_GU22_TUNED`), enables `DS4_IQ_STRICT_FP` on `gfx906` in `src/ds4/ds4_iq.cu`, and restores the wave64 64-lane logical-warp regression probe in `tests/hip/intrinsics.cpp`. Every gfx906 code path is guarded behind strict architecture checks (`#if defined(MAYA_USE_HIP)` and `enable_gfx906_peer_cached` / `allow_gfx906 && gfx906` / `__gfx906__`), leaving non-gfx906 GPUs completely unchanged.
 
 The source build used HIP for `gfx906`, disabled CUDA, enabled tests, prefill MMQ, and native experts, and used the pinned GGML checkout. The build produced Maya and the applicable HIP parity targets. Sections 2–6 report the GLM-5.3 server benchmark suite; `ds4_gguf_test` kernel and quant parity for `src/ds4/ds4_iq.cu` is reported in Section 7.
 
@@ -46,15 +46,15 @@ cmake -S . -B build-gfx906 \
   -DCMAKE_HIP_ARCHITECTURES=gfx906 \
   -DCMAKE_HIP_PLATFORM=amd \
   -DBUILD_SHARED_LIBS=OFF \
-  -DSTRATA_BUILD_TESTS=ON \
-  -DSTRATA_ENABLE_CUDA=OFF \
-  -DSTRATA_ENABLE_HIP=ON \
-  -DSTRATA_PREFILL_MMQ=ON \
-  -DSTRATA_GGML_DIR=/path/to/pinned/llama.cpp \
-  -DSTRATA_NATIVE_EXPERTS=ON \
-  -DSTRATA_PLE_FIXTURE_DIR=/path/to/checkout/bench/micro \
-  -DSTRATA_PORTABLE=OFF \
-  -DSTRATA_WERROR=OFF
+  -DMAYA_BUILD_TESTS=ON \
+  -DMAYA_ENABLE_CUDA=OFF \
+  -DMAYA_ENABLE_HIP=ON \
+  -DMAYA_PREFILL_MMQ=ON \
+  -DMAYA_GGML_DIR=/path/to/pinned/llama.cpp \
+  -DMAYA_NATIVE_EXPERTS=ON \
+  -DMAYA_PLE_FIXTURE_DIR=/path/to/checkout/bench/micro \
+  -DMAYA_PORTABLE=OFF \
+  -DMAYA_WERROR=OFF
 cmake --build build-gfx906 --target maya --parallel 8
 ```
 

@@ -1,5 +1,5 @@
 // src/kernels/cuda/glmd_volta_mla.cu - glm-dsa B10.2 fused sparse-gather MLA decode for sm_70 and the B10.7 native
-// headwise GEMV (W_kb / W_vb in BF16 or Q8_0).  See include/strata/kernels/glmd_volta.hpp for the algorithm;
+// headwise GEMV (W_kb / W_vb in BF16 or Q8_0).  See include/maya/kernels/glmd_volta.hpp for the algorithm;
 // glmd::vtwin::mla_fused (src/core/glm_dsa_cpu_volta_twin.cpp) is the same algorithm on the host.
 //
 // WMMA on Volta: m16n16k16 with FP16 inputs and FP32 accumulators.  The accumulator fragment's element-to-row map
@@ -10,10 +10,10 @@
 // HIP builds compile the headwise GEMV (portable) and leave the fused attention out (nvcuda::wmma: GLMD_WMMA,
 // glmd_arch.cuh, is 0 there, and the fused attention's kernels are not built): there fused_mla_enabled() is false,
 // mla_fused() refuses and mla_auto() runs mla2.
-#include "strata/core/glm_env.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
-#include "glmd_arch.cuh"   // STRATA_GRID_CONSTANT, GLMD_WMMA (Pascal pass)
+#include "glmd_arch.cuh"   // MAYA_GRID_CONSTANT, GLMD_WMMA (Pascal pass)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -127,7 +127,7 @@ struct HwArgs {
     int q_stride, q_pe_off, n_rot;
 };
 template <int WT>
-__global__ void __launch_bounds__(256) headwise_kernel(const STRATA_GRID_CONSTANT HwArgs a) {
+__global__ void __launch_bounds__(256) headwise_kernel(const MAYA_GRID_CONSTANT HwArgs a) {
     __shared__ float s_o[32];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int n_main = a.n_head * a.R / 32;
@@ -170,7 +170,7 @@ bool launch_headwise(const HwArgs& a, int w_type, int extra_blocks, cudaStream_t
     return launch_check("headwise");
 }
 
-#if !defined(STRATA_USE_HIP)   // (the fused attention is nvcuda::wmma, CUDA builds only: HIP runs mla2)
+#if !defined(MAYA_USE_HIP)   // (the fused attention is nvcuda::wmma, CUDA builds only: HIP runs mla2)
 // ---------------------------------------------------------------- the fused attention
 #if GLMD_WMMA
 using FragAcc = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
@@ -367,12 +367,12 @@ __global__ void __launch_bounds__(256) fused_combine_kernel(const float* __restr
         ctx[(size_t) h * L + c] = acc * inv;
     }
 }
-#endif  // !STRATA_USE_HIP (the fused attention)
+#endif  // !MAYA_USE_HIP (the fused attention)
 
 // an on/off switch, default off ("auto" counts as on here: these dispatchers have no auto rule of their own)
-bool env_on(const char* name) { return strata::glmenv::env_switch(name, strata::glmenv::kOff, true) != strata::glmenv::kOff; }
+bool env_on(const char* name) { return maya::glmenv::env_switch(name, maya::glmenv::kOff, true) != maya::glmenv::kOff; }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // the attention kernel's dynamic shared memory above 48 KB, set once per device and instantiation
 template <int R>
 bool fused_smem_attr() {
@@ -394,7 +394,7 @@ int volta_idx_launch_errors();   // glmd_volta_idx.cu
 int volta_launch_errors() { return g_errors.load(std::memory_order_relaxed) + volta_idx_launch_errors(); }
 
 bool fused_mla_enabled() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;   // the fused attention is a WMMA kernel of CUDA builds; mla_auto runs mla2 here
 #else
     static const bool on = env_on("MAYA_GLMD_FUSED_MLA");
@@ -404,7 +404,7 @@ bool fused_mla_enabled() {
 
 int fused_split_default() {
     static const int n = [] {
-        const long long x = strata::glmenv::env_int("MAYA_GLMD_FUSED_SPLIT", 0);
+        const long long x = maya::glmenv::env_int("MAYA_GLMD_FUSED_SPLIT", 0);
         return x > 0 ? (int) std::min<long long>(x, 1 << 20) : kFusedSplitDefault;
     }();
     return n;
@@ -430,7 +430,7 @@ bool headwise(const void* W, int w_type, const float* in, int n_head, int R, int
 }
 
 bool mla_fused(const FusedMla& a, void* stream) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) a;
     (void) stream;
     refuse("mla_fused (a CUDA WMMA kernel: HIP builds run mla2)");

@@ -23,6 +23,12 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "ref"))
 
+from _paths import add_gguf_py  # noqa: E402
+try:                            # (the fixtures need llama.cpp's gguf-py: without it this file skips, instead of
+    add_gguf_py()               #  a SystemExit in its setup ending the whole test run)
+except SystemExit as e:
+    raise unittest.SkipTest(str(e))
+
 import numpy as np  # noqa: E402
 
 import glm_synth_gguf  # noqa: E402

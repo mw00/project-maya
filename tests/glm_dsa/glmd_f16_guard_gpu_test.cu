@@ -8,11 +8,11 @@
 //   mla     glmd::mla_prompt_wmma (16 heads) and mla_prompt_h64 (64 heads) with a Q tile past 65504 (q_abs 1.5e6 x
 //           the 0.0625 scale) vs the F32 twin
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/glm_batch.hpp"
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_f16_guard.hpp"
-#include "strata/kernels/glmd_fast.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/glm_batch.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_f16_guard.hpp"
+#include "maya/kernels/glmd_fast.hpp"
 
 #include "glm_test_env.hpp"   // setenv (<unistd.h> on POSIX; mapped on Windows)
 
@@ -29,7 +29,7 @@
 
 namespace {
 
-namespace sk = strata::kernels;
+namespace sk = maya::kernels;
 namespace gt = glmd::guard_twin;
 
 int g_fail = 0;

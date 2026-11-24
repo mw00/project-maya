@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_ngram_draft_test.cpp - glm-dsa B14.13 (CPU only): the n-gram draft matcher and its bookkeeping
-// (include/strata/core/glm_ngram_draft.hpp).
+// (include/maya/core/glm_ngram_draft.hpp).
 //   1. the switches: off by default, n_max 4 (capped at 8), min_match 3; a request's GEN ngram= (glm_req_knobs.hpp)
 //      over MAYA_GLM_NGRAM_DRAFT, the switch again once a request leaves it out;
 //   2. the matcher: the continuation of the earlier occurrence, the longest backward match wins, the most recent wins
@@ -11,8 +11,8 @@
 //      edit turn (the answer repeats a code block of the prompt with one edit) against a 70%-accurate MTP stand-in:
 //      the accepted fraction rises, every emitted token is the truth (drafts never change the output), and with the
 //      switch off pick() returns the MTP draft untouched.
-#include "strata/core/glm_ngram_draft.hpp"
-#include "strata/core/glm_req_knobs.hpp"
+#include "maya/core/glm_ngram_draft.hpp"
+#include "maya/core/glm_req_knobs.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,7 +20,7 @@
 #include <vector>
 #include "glm_test_env.hpp"   // setenv / unsetenv / getpid (<unistd.h> on POSIX; mapped on Windows)
 
-using namespace strata::core::glmng;
+using namespace maya::core::glmng;
 
 namespace {
 
@@ -58,7 +58,7 @@ void test_switches() {
     check(c.on && c.n_max == kMaxDraft && c.min_match == 2, "MAYA_GLM_NGRAM_MAX=64 is capped at 8; MIN=2 read");
     setenv("MAYA_GLM_NGRAM_DRAFT", "0", 1);
     check(!ngram_config_env().on, "MAYA_GLM_NGRAM_DRAFT=0: off");
-    namespace gk = strata::core::glmknob;
+    namespace gk = maya::core::glmknob;
     gk::set(gk::Ngram, 1);
     check(ngram_config_env().on, "a request's ngram=1 over MAYA_GLM_NGRAM_DRAFT=0: on");
     setenv("MAYA_GLM_NGRAM_DRAFT", "1", 1);

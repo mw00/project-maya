@@ -1,13 +1,13 @@
 // src/kernels/cpu/native_expert.cpp - plan v0.3 P6: native (GGUF-form) experts on the CPU through ggml-cpu.
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
-#include "strata/kernels/cpu/native_expert.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/iq_avx512.hpp"
-#include "strata/kernels/cpu/iq_avx512_one.hpp"
-#include "strata/kernels/cpu/iq_avx2.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/glm_lane_row4.hpp"   // glm-dsa B14.9: MAYA_GLM_LANE_ROW4 lane hooks
+#include "maya/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/expert.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/iq_avx512_one.hpp"
+#include "maya/kernels/cpu/iq_avx2.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/glm_lane_row4.hpp"   // glm-dsa B14.9: MAYA_GLM_LANE_ROW4 lane hooks
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -20,7 +20,7 @@
 #include <mutex>
 #include <vector>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
@@ -232,6 +232,30 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: activation larger than the pool's buffers";
         return false;
     }
+    f.u_type = gu_type;
+    f.u_row = f.gu_row;
+    return true;
+}
+
+bool native_fmt_mixed(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f,
+                      std::string& err) {
+    if (!native_fmt(gate_type, d_type, n_embd, n_ff, f, err)) return false;
+    if (up_type == gate_type) return true;
+    NativeFmt u;
+    if (!native_fmt(up_type, d_type, n_embd, n_ff, u, err)) return false;
+    if (gate_type == 42 || up_type == 42) {   // the Q2_0 own kernels read gate and up as one type
+        err = "native experts: Q2_0 gate/up cannot be mixed with another type";
+        return false;
+    }
+    if (u.gu_act != f.gu_act) {
+        err = "native experts: gate type " + std::to_string(gate_type) + " and up type " + std::to_string(up_type) +
+              " quantize their activation differently";
+        return false;
+    }
+    f.u_type = up_type;
+    f.u_row = u.gu_row;
+    f.down_off = f.up_off + f.u_row * (size_t) n_ff;
+    f.bytes = f.down_off + f.d_row * (size_t) n_embd;
     return true;
 }
 
@@ -243,8 +267,48 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
+namespace {
+// A mixed layer (gate and up of two types, one activation format): the gate rows by their type, the up rows by
+// theirs - each with the exact multi-token rows when this CPU has them (bit for bit ggml-cpu's dot), else
+// ggml-cpu's dot - then the same epilogue as native_gu_rows.  llama.cpp computes the two products the same way.
+void mixed_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
+                   int r0, int r1) {
+    if (r1 <= r0) return;
+    const int n = (int) f.n_embd, nr = r1 - r0;
+    thread_local std::vector<float> buf;
+    thread_local std::vector<float*> go, uo;
+    buf.resize((size_t) 2 * nt * nr);
+    go.resize((size_t) nt);
+    uo.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        go[(size_t) t] = buf.data() + (size_t) t * nr;
+        uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
+    }
+    const auto part = [&](int type, const uint8_t* base, size_t row, float* const* out) {
+        if (const RowsFn fn = exact_rows_nt(type, nt)) {
+            fn(type, base + (size_t) r0 * row, row, n, act, nt, out, 0, nr);
+            return;
+        }
+        const ggml_vec_dot_t dot = traits(type)->vec_dot;
+        for (int r = 0; r < nr; ++r)
+            for (int t = 0; t < nt; ++t) dot(n, &out[t][r], 0, base + (size_t) (r0 + r) * row, 0, act[t], 0, 1);
+    };
+    part(f.gu_type, blob, f.gu_row, go.data());
+    part(f.u_type, blob + f.up_off, f.u_row, uo.data());
+    for (int t = 0; t < nt; ++t)
+        for (int r = 0; r < nr; ++r) {
+            const float g = go[(size_t) t][r], u = uo[(size_t) t][r];
+            ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
+        }
+}
+}  // namespace
+
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.mixed()) {
+        mixed_gu_rows(f, blob, act, nt, ff, r0, r1);
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  MAYA_NO_IQ512 drops an AVX-512 CPU to the
@@ -377,4 +441,4 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

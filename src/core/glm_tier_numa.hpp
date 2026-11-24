@@ -38,7 +38,7 @@
 #include <thread>
 #include <vector>
 
-namespace strata::core::glmtier {
+namespace maya::core::glmtier {
 
 /// One RAM class pinned by pin_class.
 struct TierClass {
@@ -136,4 +136,4 @@ bool set_lane_threads(Glm5Model::FastState& F, int n);
 bool cpu_experts(Glm5Model::FastState& F, const Glm5Geometry& g, int il, int ne, const uint8_t* const* blob,
                  const float* w, const float* x, float* out);
 
-}  // namespace strata::core::glmtier
+}  // namespace maya::core::glmtier

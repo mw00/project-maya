@@ -17,8 +17,8 @@
 #include <string>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
-namespace par = strata::ds4::par;
+namespace gg = maya::ds4::gguf;
+namespace par = maya::ds4::par;
 
 namespace {
 constexpr int E = 5120, FF = 2304;

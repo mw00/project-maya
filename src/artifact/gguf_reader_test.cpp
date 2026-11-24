@@ -9,7 +9,7 @@
 // The fixture is a minimal GGUF v3 written here (header, no metadata, two F32[8] tensors, 32-byte
 // alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed:
 // on Windows an open mapping keeps it.
-#include "strata/artifact/gguf_reader.hpp"
+#include "maya/artifact/gguf_reader.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -51,7 +51,7 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names) {
         put<uint64_t>(b, 32 * i);    // offset from data_start
     }
     b.resize((b.size() + 31) / 32 * 32 + 32 * names.size(), 0);
-    const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_test.gguf";
+    const auto path = std::filesystem::temp_directory_path() / "maya_gguf_reader_test.gguf";
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
     return path;
 }
@@ -65,7 +65,7 @@ int main() {
         size_t n = 0;
         bool both = false;
         try {
-            strata::GgufFile g(path.string());
+            maya::GgufFile g(path.string());
             n = g.tensors().size();
             both = g.find("blk.0.attn_q.weight") && g.find("blk.0.attn_k.weight");
         } catch (const std::exception& e) {
@@ -78,7 +78,7 @@ int main() {
         const auto path = write_gguf({"blk.0.attn_q.weight", "blk.0.attn_q.weight"});
         std::string err;
         try {
-            strata::GgufFile g(path.string());
+            maya::GgufFile g(path.string());
         } catch (const std::exception& e) {
             err = e.what();
         }

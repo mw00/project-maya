@@ -22,7 +22,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_qsa.hpp"
+#include "maya/kernels/native_qsa.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cmath>
@@ -32,7 +32,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
@@ -124,4 +124,4 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
     gate<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(attn, q_full, output, n_head, head_dim);
     check_launch();
 }
-} // namespace strata::kernels
+} // namespace maya::kernels

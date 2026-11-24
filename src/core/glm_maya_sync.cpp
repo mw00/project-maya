@@ -1,11 +1,11 @@
 // src/core/glm_maya_sync.cpp - the glm-dsa port W10: Maya v1.1.3's new features against the glm-dsa arch
-// (include/strata/core/glm_maya_sync.hpp, docs/strata/engine/MAYA-SYNC.md).
-#include "strata/core/glm_maya_sync.hpp"
+// (include/maya/core/glm_maya_sync.hpp, docs/strata/engine/MAYA-SYNC.md).
+#include "maya/core/glm_maya_sync.hpp"
 
 #include <cstdio>
 #include <cstring>
 
-namespace strata::core {
+namespace maya::core {
 
 bool glm_exl3_ok(GlmArch a, std::string& err) {
     if (a != GlmArch::GlmDsa) return true;
@@ -54,4 +54,4 @@ std::string glm_profile_hint(GlmArch a, int64_t profile_layers, int64_t n_expert
     return buf;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

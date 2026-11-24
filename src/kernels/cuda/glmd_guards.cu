@@ -1,10 +1,10 @@
 // src/kernels/cuda/glmd_guards.cu - glm-dsa wave 9: the device halves of B15.1 (the FP16 activation range guard of
 // the prompt path) and B15.2 (mmq_malloc / mmq_zero_gaps of the MMQ expert banks).  The design is in
-// include/strata/kernels/glmd_f16_guard.hpp and glmd_mmq_pad.hpp.  In strata_engine on every GPU backend because the
+// include/maya/kernels/glmd_f16_guard.hpp and glmd_mmq_pad.hpp.  In maya_engine on every GPU backend because the
 // Maya-owned glm_prefill.cu / glm_fast_path.cu call it.  HIP builds compile the same code (the glm-dsa prompt path runs
 // there too).  The guard's auto mode is on for every device, AMD's included: see f16_guard_active.
-#include "strata/kernels/glmd_f16_guard.hpp"
-#include "strata/kernels/glmd_mmq_pad.hpp"
+#include "maya/kernels/glmd_f16_guard.hpp"
+#include "maya/kernels/glmd_mmq_pad.hpp"
 
 #include <cuda_runtime.h>
 
@@ -282,7 +282,7 @@ int mmq_malloc(void** p, size_t bytes) {
     void* q = nullptr;
     const cudaError_t e = cudaMalloc(&q, mmq_padded(bytes));
     if (e != cudaSuccess) return (int) e;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // the legacy-stream zeroing must land before the tiers' non-blocking streams copy experts in: Windows' HIP runtime
     // submits legacy-stream work only when the host waits on it (#133), so wait for it here (allocation time only)
     cudaError_t z = cudaMemset(q, 0, mmq_padded(bytes));

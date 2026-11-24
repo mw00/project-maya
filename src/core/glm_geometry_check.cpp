@@ -7,16 +7,16 @@
 //
 // Indexer tensors: required on full layers; on a shared layer they are tolerated with one warning (early GLM-5.2
 // converters wrote them on every layer, llama.cpp #25407) and never read.
-#include "strata/core/glm_arch.hpp"
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_arch.hpp"
+#include "maya/core/glm_model.hpp"
 
-#include "strata/artifact/gguf_reader.hpp"
+#include "maya/artifact/gguf_reader.hpp"
 
 #include <cstdio>
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -39,7 +39,7 @@ bool glm_geometry_check(Glm5Geometry& g, const GlmFindTensor& find, int l0, int 
     const uint64_t E = (uint64_t) g.n_embd;
     if (l1 <= 0) l1 = g.n_layers;
 
-    const strata::TensorInfo* emb = find("token_embd.weight");
+    const maya::TensorInfo* emb = find("token_embd.weight");
     if (emb == nullptr) {
         err = "glm-dsa: tensor token_embd.weight is missing";
         return false;
@@ -55,7 +55,7 @@ bool glm_geometry_check(Glm5Geometry& g, const GlmFindTensor& find, int l0, int 
 
     // a tensor that must exist with exactly this shape
     const auto need = [&](const std::string& name, std::vector<uint64_t> want) -> bool {
-        const strata::TensorInfo* t = find(name);
+        const maya::TensorInfo* t = find(name);
         if (t == nullptr) {
             err = "glm-dsa: tensor " + name + " is missing (expected " + dims(want) + ")";
             return false;
@@ -143,4 +143,4 @@ bool glm_geometry_check(Glm5Geometry& g, const GlmFindTensor& find, int l0, int 
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

@@ -32,15 +32,15 @@ class LaneParityEnv(unittest.TestCase):
         harness = directory / "parity.cpp"
         harness.write_text(
             '#include <atomic>\n#include <cstdio>\n#include <cstdlib>\n'
-            '#include "strata/platform/env_alias.hpp"\n'
+            '#include "maya/platform/env_alias.hpp"\n'
             + source[start:end] + '\n'
             'int main(int argc, char** argv) {\n'
-            '    if (argc > 1) strata::platform::env_aliases();\n'
+            '    if (argc > 1) maya::platform::env_aliases();\n'
             '    if (argc > 2) g_lane_par.store(std::atoi(argv[2]));\n'
             '    std::printf("%d\\n", lane_parity_on() ? 1 : 0);\n'
             '    return 0;\n}\n', encoding="utf-8")
         cls.binaries = {}
-        for backend, flags in (("cuda-host", []), ("hip-host", ["-DSTRATA_USE_HIP=1"])):
+        for backend, flags in (("cuda-host", []), ("hip-host", ["-DMAYA_USE_HIP=1"])):
             binary = directory / backend
             subprocess.run([compiler, "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror",
                             "-Wno-unused-parameter", *flags, "-I", str(ROOT / "include"),

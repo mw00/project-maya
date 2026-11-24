@@ -6,8 +6,8 @@
 // same chunked online softmax over FP16-staged cells, and the selector is the same radix cut-off plus
 // position-ordered compaction, so its output is identical to the GPU's.  Plain C++, no CUDA: the CPU test links
 // this file directly.
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include "../kernels/cuda/glmd_had.cuh"
 #include "../kernels/cuda/glmd_rope.cuh"
@@ -370,7 +370,7 @@ void topk(const float* score, int ld, int n_kv, int T, const int* pos, int top_k
 }  // namespace glmd::twin
 
 // ---- the mixer's own kernels (glmd_mixer.hpp)
-#include "strata/kernels/glmd_mixer.hpp"
+#include "maya/kernels/glmd_mixer.hpp"
 
 namespace glmd::twin {
 

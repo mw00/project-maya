@@ -85,11 +85,11 @@ class Picture:
         return self.n + 2
 
 
-def prepare(data: bytes, g: Geometry) -> Picture:
-    """A picture's bytes (any format Pillow reads) -> its resized pixels."""
+def rgb_image(data: bytes):
+    """A picture's bytes (any format Pillow reads) -> a PIL RGB image as viewers see it (EXIF orientation applied,
+    transparent areas white)."""
     try:
         from PIL import Image, ImageOps
-        import numpy as np
     except ImportError:
         raise ValueError("pictures need Pillow and numpy (python -m pip install pillow numpy)") from None
     try:
@@ -105,6 +105,17 @@ def prepare(data: bytes, g: Geometry) -> Picture:
                 im = im.convert("RGB")
     except Exception as e:  # noqa: BLE001 - whatever Pillow raises for a file it cannot read
         raise ValueError(f"the image could not be read ({e})") from None
+    return im
+
+
+def prepare(data: bytes, g: Geometry) -> Picture:
+    """A picture's bytes (any format Pillow reads) -> its resized pixels."""
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        raise ValueError("pictures need Pillow and numpy (python -m pip install pillow numpy)") from None
+    im = rgb_image(data)
     h, w = smart_resize(im.height, im.width, g)
     if (w, h) != im.size:
         im = im.resize((w, h), Image.BICUBIC)

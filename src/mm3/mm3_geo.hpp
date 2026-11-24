@@ -62,7 +62,7 @@ struct Geo {
         if ((int) moe.size() != n_layers || (int) sparse.size() != n_layers) return no("per-layer lists");
         for (int s : sparse)
             if (!s) return no("a full-attention layer (every layer of M3.1 is sparse)");
-        if (std::fabs(alpha - strata::mm3::exl3::kSwigluAlpha) > 1e-6f) return no("swiglu_alpha " + std::to_string(alpha));
+        if (std::fabs(alpha - maya::mm3::exl3::kSwigluAlpha) > 1e-6f) return no("swiglu_alpha " + std::to_string(alpha));
         if (k_exp > 8 || n_exp > 256) return no("experts");
         if (dim % 128 || ff % 128 || ff_dense % 128 || ff_shared % 128) return no("matrix sides");
         return true;

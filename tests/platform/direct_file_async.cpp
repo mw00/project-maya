@@ -1,4 +1,4 @@
-#include "strata/platform/direct_file.hpp"
+#include "maya/platform/direct_file.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -8,8 +8,8 @@
 #include <thread>
 #include <vector>
 #include <unistd.h>
-using strata::platform::DirectFile;
-using strata::platform::Completion;
+using maya::platform::DirectFile;
+using maya::platform::Completion;
 static void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 int main() {
     char name[] = "/tmp/strata-direct-test-XXXXXX";

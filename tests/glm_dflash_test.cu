@@ -8,9 +8,9 @@
 // the context K / V, the block's 5 layers with their grouped convolutions, the non-causal windowed attention, the
 // final norm, the head's top-k, the selector's gate and greedy walk.  It checks the mask rows' final hidden states
 // (cosine), the candidate sets and the picks, which the GPU's q8_1 activations may only perturb where two scores tie.
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/core/glm_dflash.hpp"
-#include "strata/core/glm_model.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/core/glm_dflash.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include "ggml.h"
 
@@ -29,8 +29,8 @@
 #include <thread>
 #include <vector>
 
-using strata::core::GlmDflash;
-using strata::core::WSlot;
+using maya::core::GlmDflash;
+using maya::core::WSlot;
 
 namespace {
 
@@ -55,13 +55,13 @@ float from_bf16(uint16_t b) {
 }
 
 struct Ref {
-    const strata::GgufFile& G;
+    const maya::GgufFile& G;
     std::map<std::string, std::vector<float>> w;
-    explicit Ref(const strata::GgufFile& g) : G(g) {}
+    explicit Ref(const maya::GgufFile& g) : G(g) {}
     const std::vector<float>& t(const std::string& n) {
         auto it = w.find(n);
         if (it != w.end()) return it->second;
-        const strata::TensorInfo* ti = G.find(n);
+        const maya::TensorInfo* ti = G.find(n);
         if (ti == nullptr) {
             std::fprintf(stderr, "missing %s\n", n.c_str());
             std::exit(2);
@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     const std::string path = argv[1];
     const int64_t n_past = argc > 2 ? std::atoll(argv[2]) : 2100;
     g_q8 = getenv("DFT_FLOAT") == nullptr;   // DFT_FLOAT=1: the reference without the q8_1 rounding
-    strata::GgufFile G(path);
+    maya::GgufFile G(path);
     const auto num = [&](const char* k) { return G.get(std::string("dflash.") + k)->num(); };
     // the model the drafter serves: its hidden size (GLM-5.3-Flash 4096, GLM-5.3 744B 6144), the shared vocabulary, a
     // trunk deep enough for its taps (Flash 45 layers, the 744B 78)

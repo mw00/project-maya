@@ -2,7 +2,7 @@
 #include <climits>
 #include <cstdio>
 
-using strata::ds4::PrefillCounts;
+using maya::ds4::PrefillCounts;
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
 
 int main() {

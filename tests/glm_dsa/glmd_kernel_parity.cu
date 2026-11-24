@@ -21,9 +21,9 @@
 // Exits 77 (ctest SKIP_RETURN_CODE) without a device.
 #include "glm_dsa_mixer_fixture.hpp"
 
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glmd_graph.hpp"
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include <cuda_runtime.h>
 
@@ -33,7 +33,7 @@
 #include <random>
 #include <vector>
 
-#ifndef STRATA_USE_HIP   // (hip_compat maps no capture mode but thread-local: the guard keeps check_hip_compat exact)
+#ifndef MAYA_USE_HIP   // (hip_compat maps no capture mode but thread-local: the guard keeps check_hip_compat exact)
 #define GLMD_CAPTURE_RELAXED cudaStreamCaptureModeRelaxed
 #else
 #define GLMD_CAPTURE_RELAXED hipStreamCaptureModeRelaxed
@@ -209,7 +209,7 @@ void score_vs_maya() {
         a.iq = d_iq, a.ik_cache = d_ik, a.w = d_w, a.idx_heads = H, a.idx_dim = K, a.n_cap = cap, a.p_dev = p_dev;
         a.score = s1, a.skip_le = 0, a.n_sel_out = n_sel, a.sel_cap = 2048;
         const bool ok = glmd::idx_score(a, be.s);
-        strata::kernels::glmf::dsa_score(d_iq, d_ik, d_w, K, H, n, s2, be.s);
+        maya::kernels::glmf::dsa_score(d_iq, d_ik, d_w, K, H, n, s2, be.s);
         std::vector<float> a1((size_t) n), a2((size_t) n);
         be.get(a1.data(), s1, (size_t) n * 4);
         be.get(a2.data(), s2, (size_t) n * 4);
@@ -311,7 +311,7 @@ void graph_replay(const mixfx::Model& m) {
             if (!w.full) c.ik = nullptr;
             cudaGraph_t gr = nullptr;
             CK(cudaStreamBeginCapture(bg.s, GLMD_CAPTURE_RELAXED));
-            ok = strata::core::glmdsa::mixer_layer(hg, hg.d, hg.b, c, w, il, 0, false, hg.st, err);
+            ok = maya::core::glmdsa::mixer_layer(hg, hg.d, hg.b, c, w, il, 0, false, hg.st, err);
             CK(cudaStreamEndCapture(bg.s, &gr));
             ok = ok && cudaGraphInstantiate(&ex[il], gr, 0) == cudaSuccess;
             cudaGraphDestroy(gr);

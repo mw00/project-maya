@@ -1,6 +1,6 @@
 // Capture/direct repeated-step parity, dynamic tables, plans and request counts.
 #include "../src/core/glm_layer_graphs.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
-using strata::core::glmfast::LayerGraphs;
+namespace gf = maya::kernels::glmf;
+using maya::core::glmfast::LayerGraphs;
 
 static void check(cudaError_t e) {
     if (e != cudaSuccess) {

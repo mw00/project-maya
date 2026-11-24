@@ -34,7 +34,7 @@ static void part_close(sock_t s) { ::close(s); }
 #include <atomic>
 #include <cstdio>
 
-namespace strata::ds4::part {
+namespace maya::ds4::part {
 
 namespace {
 bool net_init() {
@@ -336,4 +336,4 @@ static std::atomic<uint32_t>* shm_word(uint8_t* p, int i) { return reinterpret_c
 bool Shm::full(int i) const { return shm_word(p_, i)->load(std::memory_order_acquire) != 0; }
 void Shm::set_full(int i, bool f) { shm_word(p_, i)->store(f ? 1u : 0u, std::memory_order_release); }
 
-}  // namespace strata::ds4::part
+}  // namespace maya::ds4::part

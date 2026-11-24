@@ -18,8 +18,8 @@
 //   5. a layer split at a full layer reproduces the one-part logits bit for bit; a part that starts on a shared
 //      layer is refused (no selection to reuse), as step_layers_dsa refuses it;
 //   6. the host helpers: attn_scale(256) == 1/16, kv_carve, tile_rows.
-#include "strata/kernels/glmd_forward.hpp"
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_forward.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 

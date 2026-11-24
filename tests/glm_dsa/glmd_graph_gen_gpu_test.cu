@@ -10,7 +10,7 @@
 // the re-capture.
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
 #include "glm_dsa_graphs.hpp"
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cuda_runtime.h>
 
@@ -52,7 +52,7 @@ bool all_equal(const float* d, int n, float v) {
 }
 
 void run(bool same_base) {
-    using strata::core::glmdsa::DsaGraphs;
+    using maya::core::glmdsa::DsaGraphs;
     cudaStream_t s;
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
     int n = 1 << 16;

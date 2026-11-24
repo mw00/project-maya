@@ -37,8 +37,8 @@
 #include <utility>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
-namespace x3 = strata::kernels::exl3;
+namespace gg = maya::ds4::gguf;
+namespace x3 = maya::kernels::exl3;
 
 namespace {
 
@@ -906,7 +906,7 @@ QExperts make_q(int D, int F, int n_exp, int tg, int td) {
 // |x| < 100, NaNs and infinities), and within 1 ulp of e^x where the result is normal
 __global__ void par_exp_kernel(const float* x, float* y, int n) {
     const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
-    if (i < n) y[i] = strata::ds4::par::exp_portable(x[i]);
+    if (i < n) y[i] = maya::ds4::par::exp_portable(x[i]);
 }
 void test_par_exp(cudaStream_t s) {
     std::vector<float> x;
@@ -927,7 +927,7 @@ void test_par_exp(cudaStream_t s) {
     long diff = 0;
     double worst = 0.0;
     for (int i = 0; i < n; ++i) {
-        const float h = strata::ds4::par::exp_portable(x[i]);
+        const float h = maya::ds4::par::exp_portable(x[i]);
         if (std::memcmp(&h, &got[(size_t) i], 4) != 0) ++diff;
         const double want = std::exp((double) x[i]);
         if (x[i] >= -87.0f && std::isfinite(want) && want <= 3.4028234663852886e38) {   // (below e^-87: 0 by design)
@@ -945,7 +945,7 @@ void test_par_exp(cudaStream_t s) {
 // lane (par:: rows, their outputs as cpu_picks) bit for bit the same as with every pick in VRAM, and the lane's h bit for
 // bit the device's
 void test_lane_parity(int D, int F, int tg, int td, cudaStream_t s) {
-    namespace par = strata::ds4::par;
+    namespace par = maya::ds4::par;
     char what[112];
     std::snprintf(what, sizeof(what), "lane parity %s/%s (D %d, F %d)", tn(tg), tn(td), D, F);
     if (!gg::lane_parity()) {
@@ -1112,7 +1112,7 @@ void test_lane_parity(int D, int F, int tg, int td, cudaStream_t s) {
     cudaFree(E.dev);
 }
 void test_lane_parity_all(cudaStream_t s) {   // (on for these, whatever MAYA_DS4_LANE_PARITY says)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     std::printf("%-52s skip  (an AMD build: the setting is ignored there)\n", "lane parity");
     return;
 #endif
@@ -2041,7 +2041,7 @@ void bench(cudaStream_t s) {
 // row against the BF16 row the same finish writes - a host decode of every value bit for bit - then the readers (the
 // window ring and its rollback, the sparse attention over the compressed KV, the indexer's scores) the same bits from
 // either, at full size (a 64K context's compressed rows)
-namespace dk = strata::ds4;
+namespace dk = maya::ds4;
 
 float h_e2m1(uint32_t c) {
     static const float m[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
@@ -2135,8 +2135,8 @@ void test_router_rows(cudaStream_t s) {
         float *dw = dev(w), *dx = dev(x), *y1 = nullptr, *yt = nullptr;
         CU(cudaMalloc(&y1, (size_t) T * 1024 * 4));
         CU(cudaMalloc(&yt, (size_t) T * 1024 * 4));
-        strata::ds4::gemv_f32(dw, dx, n, k, T, yt, 1024, s);
-        for (int t = 0; t < T; ++t) strata::ds4::gemv_f32(dw, dx + (size_t) t * k, n, k, 1, y1 + (size_t) t * 1024, 1024, s);
+        maya::ds4::gemv_f32(dw, dx, n, k, T, yt, 1024, s);
+        for (int t = 0; t < T; ++t) maya::ds4::gemv_f32(dw, dx + (size_t) t * k, n, k, 1, y1 + (size_t) t * 1024, 1024, s);
         std::vector<float> a((size_t) T * 1024), b((size_t) T * 1024);
         CU(cudaMemcpy(a.data(), yt, a.size() * 4, cudaMemcpyDeviceToHost));
         CU(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost));
@@ -2263,7 +2263,7 @@ void test_kv_pack(cudaStream_t s) {
         const float scale = 1.0f / std::sqrt((float) HD);
         // (kAttnWmma's slabs on CUDA compute capability 7.x: the FP16 tensor-core kernel, unless DS4_ATTN_V7=0)
         bool fp16_slabs = false;
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
         {
             int dev = 0;
             cudaDeviceProp p{};
@@ -2537,7 +2537,7 @@ void test_kv_pack(cudaStream_t s) {
 // (blobs on the device, hblobs their bytes on the host)
 void test_lane(const char* name, const x3::ExpertLayout& lay, const uint8_t* blobs, const uint8_t* hblobs, size_t blob,
                int D, int F, cudaStream_t s) {
-    namespace pc = strata::ds4::pcie;
+    namespace pc = maya::ds4::pcie;
     const int k = 6;
     const float lim = 10.0f;
     std::vector<float> x(D), sh(D), w(8, 0.0f);
@@ -2727,7 +2727,7 @@ __global__ void q6k_rows_kernel(const uint8_t* rows, int hd, float* out) {   // 
     const int r = blockIdx.x;
     for (int e = threadIdx.x; e < hd; e += blockDim.x)
         out[(size_t) r * hd + e] =
-            strata::ds4::q6k_value(rows + (size_t) r * hd + (size_t) (e / 256) * strata::ds4::kQ6kBytes, e % 256);
+            maya::ds4::q6k_value(rows + (size_t) r * hd + (size_t) (e / 256) * maya::ds4::kQ6kBytes, e % 256);
 }
 void test_engram_q6k(cudaStream_t s) {
     const int n = 64, hd = 512, sb = hd / 256;   // rows of two superblocks, each row hd bytes apart (as the engine keeps)
@@ -2755,7 +2755,7 @@ void test_engram_q6k(cudaStream_t s) {
 __global__ void iq4nl_rows_kernel(const uint8_t* rows, int hd, float* out) {   // (engram_dequant's IQ4_NL branch)
     const int r = blockIdx.x;
     for (int e = threadIdx.x; e < hd; e += blockDim.x)
-        out[(size_t) r * hd + e] = strata::ds4::eg_block_value(rows + (size_t) r * hd, e, 2);
+        out[(size_t) r * hd + e] = maya::ds4::eg_block_value(rows + (size_t) r * hd, e, 2);
 }
 void test_engram_iq4nl(cudaStream_t s) {
     const int n = 64, hd = 512, nb = hd / 32;   // rows hd bytes apart (as the engine keeps them), 16 blocks of 18 bytes
@@ -2782,15 +2782,15 @@ void test_engram_iq4nl(cudaStream_t s) {
 __global__ void q5k_rows_kernel(const uint8_t* rows, int hd, float* out) {   // (engram_dequant's Q5_K branch)
     const int r = blockIdx.x;
     for (int e = threadIdx.x; e < hd; e += blockDim.x)
-        out[(size_t) r * hd + e] = strata::ds4::eg_block_value(rows + (size_t) r * hd, e, 3);
+        out[(size_t) r * hd + e] = maya::ds4::eg_block_value(rows + (size_t) r * hd, e, 3);
 }
 void test_engram_q5k(cudaStream_t s) {
     const int n = 64, hd = 512, sb = hd / 256;   // rows hd bytes apart (as the engine keeps them), 2 superblocks of 176
     const std::vector<uint8_t> packed = q_rand(gg::iq::kQ5_K, n, hd);
     std::vector<uint8_t> rows((size_t) n * hd, 0);
     for (int r = 0; r < n; ++r)
-        std::memcpy(&rows[(size_t) r * hd], &packed[(size_t) r * sb * strata::ds4::kQ5kBytes],
-                    (size_t) sb * strata::ds4::kQ5kBytes);
+        std::memcpy(&rows[(size_t) r * hd], &packed[(size_t) r * sb * maya::ds4::kQ5kBytes],
+                    (size_t) sb * maya::ds4::kQ5kBytes);
     std::vector<float> want((size_t) n * hd);
     ggml_get_type_traits(GGML_TYPE_Q5_K)->to_float(packed.data(), want.data(), (int64_t) n * hd);
     uint8_t* d_rows = dev(rows);
@@ -2801,7 +2801,7 @@ void test_engram_q5k(cudaStream_t s) {
     size_t bad = 0, at = got.size();
     for (size_t i = 0; i < got.size(); ++i)
         if (std::memcmp(&got[i], &want[i], 4) != 0 && bad++ == 0) at = i;
-    const bool same = bad == 0 && strata::ds4::eg_block_row_bytes(3, hd) == (uint32_t) sb * 176;
+    const bool same = bad == 0 && maya::ds4::eg_block_row_bytes(3, hd) == (uint32_t) sb * 176;
     if (!same) ++g_fail;
     if (same) std::printf("%-52s ok\n", "Engram Q5_K rows = ggml's, bit for bit");
     else
@@ -2814,7 +2814,7 @@ void test_q6k_host() {
     std::vector<uint8_t> w = q_rand(gg::iq::kQ6_K, 1, nb * 256);
     std::vector<float> want((size_t) nb * 256), got((size_t) nb * 256);
     ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(w.data(), want.data(), (int64_t) nb * 256);
-    for (int b = 0; b < nb; ++b) strata::ds4::q6k_values(w.data() + (size_t) b * 210, got.data() + (size_t) b * 256);
+    for (int b = 0; b < nb; ++b) maya::ds4::q6k_values(w.data() + (size_t) b * 210, got.data() + (size_t) b * 256);
     const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
     if (!same) ++g_fail;
     std::printf("%-52s %s\n", "Q6_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
@@ -2824,7 +2824,7 @@ void test_q5k_host() {
     std::vector<uint8_t> w = q_rand(gg::iq::kQ5_K, 1, nb * 256);
     std::vector<float> want((size_t) nb * 256), got((size_t) nb * 256);
     ggml_get_type_traits(GGML_TYPE_Q5_K)->to_float(w.data(), want.data(), (int64_t) nb * 256);
-    for (int b = 0; b < nb; ++b) strata::ds4::q5k_values(w.data() + (size_t) b * 176, got.data() + (size_t) b * 256);
+    for (int b = 0; b < nb; ++b) maya::ds4::q5k_values(w.data() + (size_t) b * 176, got.data() + (size_t) b * 256);
     const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
     if (!same) ++g_fail;
     std::printf("%-52s %s\n", "Q5_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
@@ -3095,7 +3095,7 @@ void test_decode_trims(cudaStream_t s) {
 // members, 2 the host's fp16(sat(p0)) + fp16(sat(p1)) in F32 on both.  Then each one's time at rows x 5120 (30720: a
 // 32K prompt's chunk): the slower member's, and GB/s a member each way
 void test_ar2(int da, int db, int rows) {
-    namespace sd = strata::ds4;
+    namespace sd = maya::ds4;
     const int D = 5120, devs[2] = {da, db};
     const size_t nmax = (size_t) rows * D;
     // DS4_AR_P2P=1: the buffers in the first device's memory, the second reaching them by peer access (as the
@@ -3242,7 +3242,7 @@ static void mx_lane_cmp(const char* what, const std::vector<float>& a, const std
                 mx > 0.0 ? worst / mx : worst);
 }
 void test_mx_lane(cudaStream_t s) {
-    namespace par = strata::ds4::par;
+    namespace par = maya::ds4::par;
     const int D = 5120, F = 2304, n_exp = 9;   // (experts 0..8: the stability section uses up to 9 in one call)
     const float lim = 10.0f;
     Experts E = make_experts(D, F, n_exp);
@@ -3496,7 +3496,7 @@ int main(int argc, char** argv) {
             std::vector<float> want((size_t) n * k), got((size_t) n * k);
             ggml_get_type_traits((ggml_type) t)->to_float(w.data(), want.data(), (int64_t) n * k);
             if (t == GGML_TYPE_Q5_K) {
-                for (size_t b = 0; b < (size_t) n * k / 256; ++b) strata::ds4::q5k_values(w.data() + b * 176, got.data() + b * 256);
+                for (size_t b = 0; b < (size_t) n * k / 256; ++b) maya::ds4::q5k_values(w.data() + b * 176, got.data() + b * 256);
             } else {
                 std::vector<uint8_t> rows((size_t) n * k, 0);   // (each row k bytes apart, as the engine keeps them)
                 for (int r = 0; r < n; ++r) std::memcpy(&rows[(size_t) r * k], &w[(size_t) r * k / 32 * 18], (size_t) k / 32 * 18);

@@ -1,13 +1,13 @@
 // src/kernels/cpu/glm_lane_row4_x86.hpp - the glm-dsa port B14.9: what glm_lane_row4.cpp (the CPU expert lane's
 // 4-row switch, CPU check and hooks; compiled for any x86-64) takes from glm_lane_row4_avx2.cpp (the kernels; AVX2 +
-// FMA + F16C).  Only x86-64 builds with STRATA_GLM_LANE_ROW4_KERNELS compile either side of it
+// FMA + F16C).  Only x86-64 builds with MAYA_GLM_LANE_ROW4_KERNELS compile either side of it
 // (cmake/glm_dsa.d/70-glm-lane-row4.cmake).
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels::cpu::row4x86 {
+namespace maya::kernels::cpu::row4x86 {
 
 constexpr int kQK = 256;       // values per super-block
 constexpr size_t kQ8K = 292;   // block_q8_K: float d, int8 qs[256], int16 bsums[16]
@@ -20,4 +20,4 @@ using Kernel = void (*)(int nb, const uint8_t* const w[4], const uint8_t* q8, fl
 /// function are AVX2 code: call it only once glm_lane_row4.cpp's CPU check has passed.
 Kernel kernel(int ggml_type, bool iq1s_fused);
 
-}  // namespace strata::kernels::cpu::row4x86
+}  // namespace maya::kernels::cpu::row4x86

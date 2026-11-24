@@ -11,7 +11,7 @@
 //      step is never worse than each request's share cut by the product of the confidences;
 //   7. the acceptance table: drafts that hold less often than their confidence says pull it down, by position;
 //   8. the lookup's choices are those of the policy before the cost-aware window, bit for bit (random rounds).
-#include "strata/spec/draft_policy.hpp"
+#include "maya/spec/draft_policy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,7 +20,7 @@
 #include <random>
 #include <vector>
 
-using strata::spec::DraftPolicy;
+using maya::spec::DraftPolicy;
 
 namespace {
 

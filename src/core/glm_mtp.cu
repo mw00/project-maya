@@ -30,10 +30,10 @@
 // The NextN cache's entry p pairs h_p with the token at p + 1 (the prompt path writes them so).
 #include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the block's cache rows through its mixer
 #include "glm_fast_state.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/sampler.hpp"
-#include "strata/platform/env_switch.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/sampler.hpp"
+#include "maya/platform/env_switch.hpp"
 
 #include "ggml.h"
 
@@ -48,9 +48,9 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 constexpr size_t kQ8 = 36;   // bytes per q8_1 block (32 values)
@@ -83,7 +83,7 @@ bool mtp_chain_wanted() {
 // load_pack / fast_setup: whether this model decodes with the MTP block on one GPU (see the top of this file); dsa: a
 // glm-dsa model, which takes it only when MAYA_GLM_MTP_DECODE asks
 bool Glm5Model::mtp_decode_wanted(int dev, int n_parts, bool dsa) {
-    if (strata::platform::env_switch("MAYA_GLM_NO_SPEC") || strata::platform::env_switch("MAYA_GLM_NO_MTP") ||
+    if (maya::platform::env_switch("MAYA_GLM_NO_SPEC") || maya::platform::env_switch("MAYA_GLM_NO_MTP") ||
         mtp_draft_cap() <= 0)
         return false;
     if (const char* q = getenv("MAYA_GLM_SEQS"); q != nullptr && std::atoi(q) > 1) return false;   // (--parallel)
@@ -93,7 +93,7 @@ bool Glm5Model::mtp_decode_wanted(int dev, int n_parts, bool dsa) {
     // the helper's experts read in place its decode is faster with MTP (GLM-5.3-Flash +15..18 %, GLM-5.3 744B as well)
     if (hlink::wanted()) return n_parts == 1;
     if (n_parts != 1 || dsa) return false;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // the Strix / Gorgon Halo APUs (gfx1150 / gfx1151 / gfx1152): their memory holds every expert
     hipDeviceProp_t prop{};
     if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
@@ -154,7 +154,7 @@ static void token_kind(const std::string& s, bool& ascii, bool& digits) {
 // load_pack, the part with the NextN block: the draft vocabulary from the GGUF's tokenizer (mtp_vlead_, mtp_vextra_,
 // mtp_vin_; left empty - the whole head - without a byte-level BPE vocabulary of n_vocab tokens, or where it would
 // not pay: more than 90% of the head, or a leading block under an eighth of it)
-void Glm5Model::mtp_vocab_scan(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs) {
+void Glm5Model::mtp_vocab_scan(const std::vector<std::unique_ptr<maya::GgufFile>>& gfs) {
     mtp_vlead_ = 0;
     mtp_vextra_.clear();
     mtp_vin_.clear();
@@ -164,8 +164,8 @@ void Glm5Model::mtp_vocab_scan(const std::vector<std::unique_ptr<strata::GgufFil
     }();
     if (env == 0) return;
     // (the reader's metadata keeps a sample of each array: the two arrays read whole)
-    strata::MetaValue toks_v, types_v;
-    const strata::MetaValue *toks = nullptr, *types = nullptr, *model = nullptr;
+    maya::MetaValue toks_v, types_v;
+    const maya::MetaValue *toks = nullptr, *types = nullptr, *model = nullptr;
     for (const auto& gf : gfs) {
         if (toks == nullptr && gf->get_full("tokenizer.ggml.tokens", toks_v)) toks = &toks_v;
         if (types == nullptr && gf->get_full("tokenizer.ggml.token_type", types_v)) types = &types_v;
@@ -519,7 +519,10 @@ int Glm5Model::mtp_choose(int n_cap) {
     // two runs can verify different windows and part - the start length instead, unless MAYA_GLM_MTP_ADAPT=1 (the
     // setup's speed check runs the search once and keeps its pick as MAYA_GLM_MTP_FIXED, serve/glm_link.py)
     static const bool adapt_set = getenv("MAYA_GLM_MTP_ADAPT") != nullptr;
-    if (!adapt_set && fast_ != nullptr && glmfast::repeatable(fast_->helper.linked()))
+    // (and by default - glmfast::same_answers: the window's length changes the answer's bits - a kept row's
+    //  recurrent-state replay and the window's shape - so a length picked by measured times parted two starts' answers;
+    //  the start length 2 gives the same tokens as no drafting on three V100s)
+    if (!adapt_set && fast_ != nullptr && (glmfast::repeatable(fast_->helper.linked()) || glmfast::same_answers()))
         return std::min(start_n, n_cap);
     if (n_cap <= 0) return 0;
     if (fixed) return n_cap;
@@ -583,7 +586,7 @@ int Glm5Model::mtp_choose(int n_cap) {
 }
 
 // ---------------------------------------------------------------- the decode
-bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+bool Glm5Model::decode_mtp(maya::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                            int64_t& produced, std::string& err) {
     produced = 0;
     if (!mtp_ready()) {
@@ -835,13 +838,10 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
 // the kept rows' trunk hidden states feed the NextN cache and the next round's first draft step - so the draft chain
 // can be enqueued while the parts' commit runs.  The draft-ahead shape of the DFlash decode; the drafter is the
 // NextN block's chain.
-bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+bool Glm5Model::decode_spec_pipe(maya::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                                  int64_t& produced, std::string& err) {
     produced = 0;
-    const bool on = [] {
-        const char* e = getenv("MAYA_GLM_SPEC_WIN");
-        return e != nullptr && std::atoi(e) != 0;
-    }();
+    const bool on = spec_win_mode() != 0;
     if (!on || split_next_ == nullptr || spec_tail_last()->mtp_il_ < 0) {
         err = "glm spec pipe: needs MAYA_GLM_SPEC_WIN and a split with the NextN block";
         return false;
@@ -1111,4 +1111,4 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
 }
 
 // ---------------------------------------------------------------- the decode
-}  // namespace strata::core
+}  // namespace maya::core

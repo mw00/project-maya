@@ -13,8 +13,8 @@
 // The CPU side is a READ LOOP over the same pinned arena rather than the real VNNI kernel, and that is
 // deliberate: the question is whether the two paths contend for DRAM BANDWIDTH, and a read loop is a pure
 // measurement of that demand, with no compute that could mask it.
-#include "strata/core/pinned.hpp"
-#include "strata/kernels/s_gemv.hpp"
+#include "maya/core/pinned.hpp"
+#include "maya/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 
@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     const uint64_t role_codes = (uint64_t) n_out * n_in / 4;
     const uint64_t plane_bytes = role_codes;      // the CPU loop reads the same planes
 
-    strata::core::PinnedArena arena((uint64_t) experts * role_codes);
+    maya::core::PinnedArena arena((uint64_t) experts * role_codes);
     if (!arena.valid()) { std::fprintf(stderr, "arena allocation failed\n"); return 1; }
     {
         std::ifstream f(path, std::ios::binary);
@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
     cudaStream_t s_copy{}, s_comp{};
     check(cudaStreamCreate(&s_copy), "stream copy");
     check(cudaStreamCreate(&s_comp), "stream compute");
-    const strata::kernels::SForm form{2, -1, 64, strata::kernels::Codebook::Affine, false};
+    const maya::kernels::SForm form{2, -1, 64, maya::kernels::Codebook::Affine, false};
 
     // The CPU loop: read the whole arena, Nthreads ways, and sum bytes so nothing is elided.
     auto cpu_work = [&](std::atomic<bool>& stop, std::atomic<uint64_t>& bytes) {
@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
                 check(cudaEventRecord(ev[nxt], s_copy), "event");
             }
             check(cudaStreamWaitEvent(s_comp, ev[cur], 0), "wait");
-            strata::kernels::s_gemv_split_async(d_x, buf[cur], d_scales, nullptr, d_y, n_in, n_out, form, 32,
+            maya::kernels::s_gemv_split_async(d_x, buf[cur], d_scales, nullptr, d_y, n_in, n_out, form, 32,
                                                 (void*) s_comp);
         }
         check(cudaStreamSynchronize(s_comp), "sync comp");

@@ -11,7 +11,7 @@
 // The products inside the prompt path (their rows, the down's in-place order, the FP16 range guard) are checked end to
 // end by glm_dsa_prefill_decode_test --iq1m against the token path.
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
-#include "strata/prefill/moe_mmq.hpp"
+#include "maya/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
 
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace mmq = strata::prefill::mmq;
+namespace mmq = maya::prefill::mmq;
 
 namespace {
 

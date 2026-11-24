@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 // Per-device executed routing, excluding rows removed by dependency pruning.
 // One virtual expert may serve many rows: row hits and unique uses differ.
 struct PrefillCounts {

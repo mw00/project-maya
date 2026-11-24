@@ -23,7 +23,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "strata/kernels/native_gdn.hpp"
+#include "maya/kernels/native_gdn.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cmath>
@@ -31,7 +31,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int S = 128;
@@ -119,4 +119,4 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-} // namespace strata::kernels
+} // namespace maya::kernels

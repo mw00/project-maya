@@ -15,8 +15,8 @@
 //   route    route_rows == glmd::cpu::route_select (HF normalisation) on 512 random rows;
 //   clamp    q8_mmq_clamp turns +-inf halves into +-65504 and leaves finite ones.
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_route.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_route.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 
@@ -32,7 +32,7 @@
 
 namespace {
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 constexpr bool kWmma = false;   // the WMMA kernels (B9.5, H64, the WMMA score tile) are CUDA's: HIP runs the F32 ones
 #else
 constexpr bool kWmma = true;

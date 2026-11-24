@@ -10,10 +10,10 @@
 // WMMA scorer rounds products to FP16: near-ties may swap).
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
 #include "glm_prefill_dsa.hpp"
-#include "strata/core/glm_state_layout.hpp"
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_forward.hpp"
+#include "maya/core/glm_state_layout.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_forward.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 
@@ -30,7 +30,7 @@
 #include <random>
 #include <vector>
 
-using namespace strata::core;
+using namespace maya::core;
 
 namespace {
 

@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core::glmabl {
+namespace maya::core::glmabl {
 
 /// The runs [first, end) of consecutive rows whose on[i] is set, in row order (none: empty - no launch).
 inline std::vector<std::pair<int, int>> runs(const uint8_t* on, int n) {
@@ -40,4 +40,4 @@ inline void project_row_ref(float* y, const float* r, float s, int dim) {
     for (int e = 0; e < dim; ++e) y[e] = (float) ((double) y[e] - (double) s * d * (double) r[e]);
 }
 
-}  // namespace strata::core::glmabl
+}  // namespace maya::core::glmabl

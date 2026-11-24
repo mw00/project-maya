@@ -9,8 +9,8 @@
 //   top-k    the GPU selection equals the twin's exactly (same algorithm) on 300 rows of n 2049 / 8192 / 131072
 //            and a per-row-position batch, and equals ref_topk (sorted to position order) at n 4096.
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 

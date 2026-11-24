@@ -1,0 +1,245 @@
+// include/maya/core/expert_cache.hpp - R4: the VRAM-resident expert tier.
+//
+// **WHY THIS EXISTS, IN ONE PARAGRAPH.** The CPU expert pool is the engine's largest single cost: measured,
+// **663.6 MB of expert bytes per token at ~40 GB/s = 16.2 ms**, on a token of ~53 ms, and `test_expert_pool`
+// says the pipeline hides **1.055 ms of 19.035** - the CPU work is 96% exposed because the residual chain is
+// strictly serial. The only way past it is to stop reading those bytes: put some of the 48 x 512 experts in
+// VRAM and let the GPU compute them, so the CPU reads only the misses.
+//
+// **THE DESIGN IS SIZED AGAINST MEASUREMENTS, NOT AGAINST THE PLAN'S ASSUMPTIONS.**
+//
+//   * `h_expert` at 4,105 slots, **ten-fold leave-one-out: 0.6447 [0.6110, 0.6750]** (`tools/routing_kfold.py`).
+//     The 0.6573 the README published is in-sample and 0.4720 measured a single-prompt CORPUS, not the metric.
+//   * VRAM, measured on a live run rather than at startup: **6414 MiB free** with the engine at steady state,
+//     against **5413 MiB** for 4,105 slots. It fits, with ~1 GB spare. `strata-device`'s planner agrees and says
+//     FITS, but the planner runs before the dense arena exists, so the live figure is the one that counts.
+//   * `h_layer` held-out is **0.0456** - only 4.6% of (layer, token) pairs have all ten experts resident - so
+//     this cannot be a per-layer grouped kernel and the three-way split is not an optimisation.
+//
+// **WHAT THIS FILE IS AND IS NOT, TODAY.** It is the SLOT STORAGE and the RESIDENCY TABLE: it allocates the
+// VRAM, fills it from the host arena, and answers `(layer, expert) -> slot or -1`. It does **not** yet compute
+// anything - `moe_hit_grouped_s2` does not exist and the hit/miss split is not wired into the graph - so with
+// the cache on and nothing consuming it, **the engine is slower by the fill cost and faster by nothing.**
+// That is stated here rather than discovered from a benchmark, and it is why `--expert-cache` defaults to 0.
+//
+// The order of work is `Memory/R4-design-note.md` §7: slots and residency first, then the split, then the
+// kernel. This is that first step, and the step it unblocks is the one that can be measured.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace maya::core {
+
+/// Where one expert's VRAM lives, or -1.  `int32_t` and not a bool because the slot index is what the kernel
+/// needs, and a table that has to be re-derived from a bitmask is a table that will be re-derived differently
+/// in the two places that use it.
+inline constexpr int32_t kNotResident = -1;
+
+/// **THE STATIC RESIDENCY PLAN, READ BACK FROM THE FILE `tools/make_profile.py` WROTE.**
+///
+/// `profile.bin` is `STRP`, then `version, n_layers, n_expert, slots, n_ranked`, then `n_ranked` `(layer,
+/// expert)` pairs ranked by descending routing frequency, then a `n_layers x n_expert` frequency table.
+///
+/// **WHY A PROFILE AND NOT THE COMPULSORY-MISS POLICY THIS ENGINE ALREADY HAD.**  Compulsory-miss fills with
+/// the first `S` DISTINCT experts the run happens to route, which on this workload is whatever the prompt
+/// touched first - it measured `h = 0.4864`.  A profile ranked by frequency over a whole trace is what the
+/// plan's `0.6447` refers to, and the CPU's half of the drain is linear in `h`, so the gap is worth about
+/// 4 ms of drain.  The point of reading it from a file is that a profile built on ONE prompt can be scored on
+/// ANOTHER, which is the only way to know whether it transfers.
+///
+/// The frequency table is not returned: it is the profile's own working, and the engine measures `h` by
+/// running rather than by re-deriving what the file claims.
+bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
+
+/// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
+/// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
+/// (the routing the adaptive tier counted, descending), then by `prior` (the profile the engine started from: an
+/// expert this run never routed keeps its old place), then by index.  A start from it begins where this one ended;
+/// one with more slots adds the hottest of the rest, one with fewer keeps the hottest.
+/// `resident` and `heat`: n_layers x n_expert entries (`heat` may be empty: no counts, the prior decides).
+std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                              const std::vector<uint8_t>& resident,
+                                                              const std::vector<double>& heat,
+                                                              const std::vector<std::pair<int32_t, int32_t>>& prior);
+
+/// #477: writes `ranked` in tools/make_profile.py's format, byte for byte: `STRP`, `1, n_layers, n_expert,
+/// n_ranked, n_ranked` (uint32), the pairs (uint16 layer, uint16 expert), then the n_layers x n_expert int32 table
+/// of each pair's rank (-1: not ranked).  Atomically: a `<path>.tmp` beside it, renamed over `path` once complete,
+/// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
+bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                          const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
+
+/// Device memory that can be given back to the driver while another process (the on-demand vision encoder) needs
+/// it, and taken back later at the SAME addresses: an address range reserved once and backed by 64 MiB pieces of
+/// physical memory through CUDA's virtual memory API (the runtime's driver entry points).  Unmapping a piece gives
+/// its memory back; mapping a new piece there makes the range whole again (its bytes must be written again), so
+/// every pointer into it and every captured graph stays valid.  HIP builds, and devices without that API: `open`
+/// fails and the caller keeps its plain allocation.
+class LendableArena {
+public:
+    LendableArena() = default;
+    ~LendableArena() { close(); }
+    LendableArena(const LendableArena&) = delete;
+    LendableArena& operator=(const LendableArena&) = delete;
+
+    /// Reserves and maps `bytes` (rounded up to the granularity) on the current device; false with `err`.
+    bool open(uint64_t bytes, std::string& err);
+    void close();
+    uint8_t* data() const { return base_; }
+    bool ok() const { return !pieces_.empty(); }
+    /// Unmaps whole pieces from the end until at least `bytes` are given back (never the first `keep_bytes`);
+    /// `from` = the offset where the unmapped part starts (bytes past it are lost), `given` = the bytes given back.
+    /// False with `err` when nothing could be given back.
+    bool lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err);
+    /// Maps the unmapped pieces again (false while the driver has not got that memory free yet; the pieces mapped
+    /// so far stay mapped, a later call maps the rest).  True when nothing is lent.
+    bool reclaim_tail(std::string& err);
+    /// Bytes `lend_tail` could give back at most, keeping the first `keep_bytes` (0 when not `ok`).
+    uint64_t lendable_bytes(uint64_t keep_bytes) const;
+    bool lent() const { return lent_from_ != UINT64_MAX; }
+    uint64_t lent_from() const { return lent_from_; }
+
+private:
+    struct Piece { uint64_t off, size; bool mapped; };
+    bool map_piece(Piece& p, std::string& err);
+    uint8_t* base_ = nullptr;
+    std::vector<Piece> pieces_;
+    uint64_t va_bytes_ = 0;
+    uint64_t lent_from_ = UINT64_MAX;
+    int dev_ = 0;
+};
+
+class ExpertCache {
+public:
+    ExpertCache() = default;
+    ~ExpertCache();
+    ExpertCache(const ExpertCache&) = delete;
+    ExpertCache& operator=(const ExpertCache&) = delete;
+
+    /// Allocates `n_slots * blob_bytes` of DEVICE memory and a `n_layers * n_expert` residency table, and
+    /// **CHECKS THE ALLOCATION AGAINST WHAT THE CARD ACTUALLY HAS** rather than assuming the planner was right.
+    /// A cache that silently allocates less than it was asked for would report a hit rate for slots it does
+    /// not have, which is the shape of error this project keeps paying for.
+    bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes, std::string& err);
+    /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
+    /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
+    bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
+    /// Byte offset of each slot in the arena (null for uniform slots).
+    const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
+    void close();
+
+    bool valid() const { return base_ != nullptr; }
+    int64_t slots() const { return slots_; }
+    /// Slots actually claimed.  Not the same as `slots()` - the cache does not evict, so a run that routes
+    /// fewer distinct experts than there are slots leaves the rest empty.
+    int64_t resident() const { return per_layer_ ? admitted_ : next_free_; }
+    int64_t bytes() const { return off_.empty() ? slots_ * blob_ : (int64_t) off_.back(); }
+    double gib() const { return (double) bytes() / 1073741824.0; }
+
+    /// `(layer, expert)` -> slot index, or `kNotResident`.  Bounds-checked: a bad layer or expert returns
+    /// `kNotResident` rather than reading whatever is adjacent in the table.
+    int32_t slot_of(int64_t layer, int64_t expert) const;
+    /// Claims the next free slot for `(layer, expert)`.  Returns the slot, or `kNotResident` when the cache is
+    /// full - **it never evicts**, because eviction policy is a measured question (`R4.1`'s LFU-decay vs LRU
+    /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
+    int32_t admit(int64_t layer, int64_t expert);
+
+    /// **R4.2g: GIVE EACH LAYER ITS OWN SLOTS.  ROUND 328 MEASURED WHY THE GLOBAL FORM CANNOT WORK.**
+    ///
+    /// `admit`'s original policy hands out slots in ARRIVAL ORDER from one counter shared by every layer
+    /// (`if (next_free_ >= slots_) return kNotResident;`).  A position looks at 10 experts in each of 48
+    /// layers, so the first `n_slots` distinct (layer, expert) pairs are **about 26 layers of POSITION 0** -
+    /// the cache fills entirely inside the first position it ever sees and never changes again, so hits are
+    /// confined to those few layers for the rest of the run.
+    ///
+    /// Measured, `--expert-cache 256`: **1781 of 60000 = 2.97%**.  `Memory/cache_allocation.py` scores the
+    /// same run's routing and says **8 slots per layer is worth 21.4%** and 64 is worth **70.4%**.  The cache
+    /// was never short of capacity - it was handing all of it to two layers.
+    ///
+    /// With this on, layer `l` may only use slots `[l*q, (l+1)*q)` where `q = slots()/n_layers`, the last
+    /// layer taking the remainder.  **EVICTION IS STILL ABSENT** - the property the comment above calls
+    /// deliberate is preserved exactly; only WHICH slot a layer may take changes.  Default off, so every
+    /// caller that predates this flag is bit-for-bit unaffected.
+    void set_per_layer_admission(bool on) { per_layer_ = on; }
+    bool per_layer_admission() const { return per_layer_; }
+    /// The slot range layer `l` may admit into under per-layer admission.  Exposed so a test can check it.
+    void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
+
+    /// The device address of one slot.
+    uint8_t* device_slot(int32_t slot);
+    const uint8_t* device_slot(int32_t slot) const;
+
+    /// Copies `(layer, expert)`'s blob from `host_blob` into `slot` on `stream`.  Asynchronous: the caller
+    /// orders it.  Returns false if the indices are out of range rather than reading past the arena.
+    /// `bytes` (plan v0.3 P6): the blob's own size when it is smaller than the slot (a native pack); 0 = the slot.
+    bool fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes = 0);
+
+    /// **THE SAME COPY, BUT BLOCKING, AND THE PROFILE FILL NEEDS IT.**  `fill_slot` is asynchronous because on
+    /// the token path the fill and the kernel that reads it are ordered by one stream and waiting would be a
+    /// synchronisation per layer.  At STARTUP there is no such ordering to lean on: the source is pageable host
+    /// memory, `verify_slot` reads the slot back on the LEGACY stream, and a legacy-stream copy is not ordered
+    /// against a `cudaStreamNonBlocking` one.  The first version used the async form and `verify_slot` refused
+    /// the whole run with "slot 0 differs from the arena at byte 0" - which is the check doing its job.
+    bool fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+    /// perf-review D-4: `fill_slot_blocking`'s copy on the same (legacy) stream, but queued: many slots are refilled
+    /// with one `sync_queued` at the end instead of a wait per slot. Same ordering against earlier work, same bytes.
+    bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+    bool sync_queued(std::string& err);
+
+    /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS
+    /// THE CACHE HOLDS THE EXPERT IT CLAIMS TO.**  A slot table that is right about indices and wrong about
+    /// bytes produces a plausible token, which is exactly the failure this project has paid for most often.
+    bool verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+
+    /// Slots filled so far, for the startup report.
+    int64_t fills() const { return fills_; }
+
+    /// The on-demand vision encoder (serve VLEND / VRECLAIM): with `set_lendable(true)` before `open`, the arena is
+    /// mapped in pieces through CUDA's virtual memory API instead of one cudaMalloc, so pieces at its end can be
+    /// given back to the driver - another process (the encoder) can then allocate that memory - and mapped again
+    /// later at the SAME addresses (every pointer, table and captured graph stays valid; the slots there must be
+    /// filled again).  A device or build without that API gets the plain allocation: `lendable()` is false.
+    void set_lendable(bool on) { want_lend_ = on; }
+    bool lendable() const { return arena_.ok(); }
+    /// Unmaps whole pieces from the end until at least `bytes` are given back (never the first `keep_bytes`);
+    /// `from` = the arena offset where the unmapped part starts (a slot ending past it has lost its contents),
+    /// `given` = the bytes given back.  False with `err` when nothing can be given back.
+    bool lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err);
+    /// Maps the unmapped pieces again (false while the driver has not got that memory free yet; the pieces mapped
+    /// so far stay mapped, a later call maps the rest).  True when nothing is lent.
+    bool reclaim_tail(std::string& err) { return arena_.reclaim_tail(err); }
+    /// Bytes `lend_tail` could give back at most, keeping the first `keep_bytes` (0 without lending).
+    uint64_t lendable_bytes(uint64_t keep_bytes) const { return arena_.lendable_bytes(keep_bytes); }
+    bool lent() const { return arena_.lent(); }
+
+private:
+    std::string vmm_err_;
+    bool want_lend_ = false;
+    LendableArena arena_;                 ///< the slots' memory when it is lendable (not ok: one cudaMalloc)
+#if defined(MAYA_USE_HIP)
+    bool ensure_blocking_staging(std::size_t bytes, std::string& err);
+    uint8_t* blocking_staging_ = nullptr;
+    std::size_t blocking_staging_bytes_ = 0;
+#endif
+    uint8_t* base_ = nullptr;
+    std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
+    int64_t slots_ = 0;
+    int64_t n_layers_ = 0;
+    int64_t n_expert_ = 0;
+    int64_t blob_ = 0;
+    int64_t next_free_ = 0;
+    int64_t fills_ = 0;
+    /// R4.2g.  `per_layer_` off (the default) leaves `next_free_` as the only admission counter, so the
+    /// pre-existing path is untouched.
+    bool per_layer_ = false;
+    std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
+    std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
+    int64_t admitted_ = 0;
+};
+
+}  // namespace maya::core

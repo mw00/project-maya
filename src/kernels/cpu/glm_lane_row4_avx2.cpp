@@ -1,8 +1,8 @@
 // src/kernels/cpu/glm_lane_row4_avx2.cpp - the glm-dsa port B14.9: the lockstep 4-row decode GEMV kernels of the CPU
-// expert lane (AVX2 + FMA + F16C).  See include/strata/kernels/cpu/glm_lane_row4.hpp for the contract.
+// expert lane (AVX2 + FMA + F16C).  See include/maya/kernels/cpu/glm_lane_row4.hpp for the contract.
 //
 // x86-64 only: cmake/glm_dsa.d/70-glm-lane-row4.cmake builds this file with the AVX2 flags and
-// STRATA_GLM_LANE_ROW4_KERNELS where STRATA_CPU_X86 holds (and the option of that name is ON).  Every instruction here
+// MAYA_GLM_LANE_ROW4_KERNELS where MAYA_CPU_X86 holds (and the option of that name is ON).  Every instruction here
 // may be AVX2, so nothing in it runs before glm_lane_row4.cpp's CPU check has passed: that file (the switch, the check
 // and the two hooks native_expert.cpp calls on every decode step) is compiled for any x86-64 and only then asks
 // row4x86::kernel() for a kernel (glm_lane_row4_x86.hpp).
@@ -24,7 +24,7 @@
 // The file is compiled with -ffp-contract=off so the compiler cannot fuse anything ggml does not.
 #include "glm_lane_row4_x86.hpp"
 
-#if defined(STRATA_GLM_LANE_ROW4_KERNELS) && (defined(__x86_64__) || defined(_M_X64))
+#if defined(MAYA_GLM_LANE_ROW4_KERNELS) && (defined(__x86_64__) || defined(_M_X64))
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -35,7 +35,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 using row4x86::kQ8K;   // block_q8_K: float d, int8 qs[256], int16 bsums[16]
@@ -605,6 +605,6 @@ Kernel kernel(int ggml_type, bool iq1s_fused) {
 }
 
 }  // namespace row4x86
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu
 
-#endif  // STRATA_GLM_LANE_ROW4_KERNELS on x86-64
+#endif  // MAYA_GLM_LANE_ROW4_KERNELS on x86-64

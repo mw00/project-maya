@@ -1,7 +1,7 @@
-// src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
-#include "strata/kernels/qsa_prompt_attn.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/kv_q4.hpp"
+// src/kernels/cuda/qsa_prompt_attn.cu - see include/maya/kernels/qsa_prompt_attn.hpp.
+#include "maya/kernels/qsa_prompt_attn.hpp"
+#include "maya/kernels/kv_q8.hpp"
+#include "maya/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <type_traits>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int HD = 256;           // head_dim
@@ -26,15 +26,15 @@ constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free 
 // The MMA and cp.async below need sm_80. Builds for older cards (the experimental sm_75 one) compile them to a trap;
 // qsa_prompt_attn_batch refuses such a device at run time, so the old kernel runs there.
 #if defined(__HIPCC__)          // AMD: no mma.sync / cp.async; the host keeps the old kernel (below)
-#define STRATA_PA_SM80 0
+#define MAYA_PA_SM80 0
 #elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-#define STRATA_PA_SM80 1
+#define MAYA_PA_SM80 1
 #else
-#define STRATA_PA_SM80 0
+#define MAYA_PA_SM80 0
 #endif
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
-#if !STRATA_PA_SM80
+#if !MAYA_PA_SM80
     __trap();
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
@@ -378,7 +378,7 @@ __device__ __forceinline__ int swz(int cell, int byte) {   // byte offset of (ce
     return cell * 64 + ((((byte >> 4) ^ (cell >> 1)) & 3) << 4) + (byte & 15);
 }
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool valid) {
-#if !STRATA_PA_SM80
+#if !MAYA_PA_SM80
     __trap();
 #else
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
@@ -386,12 +386,12 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool va
 #endif
 }
 __device__ __forceinline__ void cp_async_commit() {
-#if STRATA_PA_SM80
+#if MAYA_PA_SM80
     asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
 __device__ __forceinline__ void cp_async_wait1() {
-#if STRATA_PA_SM80
+#if MAYA_PA_SM80
     asm volatile("cp.async.wait_group 1;\n" ::);
 #endif
 }
@@ -714,4 +714,4 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

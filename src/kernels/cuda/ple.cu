@@ -1,6 +1,6 @@
 // src/kernels/cuda/ple.cu - P2.S4: the PLE block's GPU half.
 //
-// See include/strata/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
+// See include/maya/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
 //
 // The legacy arithmetic below follows the captured CPU ggml graph
 // (`bench/micro/ple_in.bin` / `ple_out.bin`, produced by `ple_layer_xcheck.cpp`):
@@ -13,14 +13,14 @@
 //
 // The opt-in native BF16 path replaces only ple_value with the pinned CUDA single-token BF16/F32 MMVF.
 // A separate opt-in native postops path follows the pinned CUDA arithmetic after both projections.
-#include "strata/kernels/ple.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/ngram.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_gemv_q8.hpp"
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/native_ple_postops.hpp"
+#include "maya/kernels/ple.hpp"
+#include "maya/kernels/bf16_gemv.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/ngram.hpp"
+#include "maya/kernels/quantize_act.hpp"
+#include "maya/kernels/s2_gemv_q8.hpp"
+#include "maya/kernels/native_mmvq.hpp"
+#include "maya/kernels/native_ple_postops.hpp"
 
 #include <cuda_runtime.h>
 
@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -364,4 +364,4 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // itself, and the engine's caller does not want that at all.
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

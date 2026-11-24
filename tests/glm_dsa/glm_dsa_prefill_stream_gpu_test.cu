@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace gp = strata::core::glmpfs;
+namespace gp = maya::core::glmpfs;
 
 namespace {
 
@@ -57,7 +57,7 @@ int main() {
         const int e = gp::host_alloc_node(&p, bytes, 0, dsa != 0);
         check(e == 0 && p != nullptr, tag + ": allocated");
         if (p == nullptr) continue;
-#ifndef STRATA_USE_HIP   // the attribute checks are CUDA-only (no hip_compat mapping); the round trip below runs on both
+#ifndef MAYA_USE_HIP   // the attribute checks are CUDA-only (no hip_compat mapping); the round trip below runs on both
         cudaPointerAttributes at{};
         const bool host = cudaPointerGetAttributes(&at, p) == cudaSuccess && at.type == cudaMemoryTypeHost;
         cudaGetLastError();

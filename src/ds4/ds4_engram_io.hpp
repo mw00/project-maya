@@ -33,7 +33,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 inline int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -592,4 +592,4 @@ public:
     std::condition_variable done_cv_;
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

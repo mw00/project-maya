@@ -1,5 +1,5 @@
-// src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
-#include "strata/kernels/qsa_select.hpp"
+// src/kernels/cuda/qsa_select.cu - see include/maya/kernels/qsa_select.hpp.
+#include "maya/kernels/qsa_select.hpp"
 
 #include <cuda_runtime.h>
 
@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int IDX_DIM = 128, IDX_HEADS = 4, R = 4;
@@ -162,14 +162,14 @@ constexpr int TC_KS = IDX_DIM + 4;               // key row stride
 
 // TF32 conversion and MMA need sm_80: below it they compile to a trap and qsa_block_scores_tc refuses the device
 #if defined(__HIPCC__)          // AMD: no mma.sync / cp.async; the host keeps the warp kernel (below)
-#define STRATA_SEL_SM80 0
+#define MAYA_SEL_SM80 0
 #elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-#define STRATA_SEL_SM80 1
+#define MAYA_SEL_SM80 1
 #else
-#define STRATA_SEL_SM80 0
+#define MAYA_SEL_SM80 0
 #endif
 __device__ __forceinline__ uint32_t tf32_hi(float x) {
-#if STRATA_SEL_SM80
+#if MAYA_SEL_SM80
     uint32_t r;
     asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
     return r;
@@ -178,7 +178,7 @@ __device__ __forceinline__ uint32_t tf32_hi(float x) {
 #endif
 }
 __device__ __forceinline__ void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
-#if !STRATA_SEL_SM80
+#if !MAYA_SEL_SM80
     __trap();
 #else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
@@ -522,4 +522,4 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

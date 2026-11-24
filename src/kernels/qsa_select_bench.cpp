@@ -2,8 +2,8 @@
 // (the warp kernel and the tensor-core one) and top-k, for a batch of consecutive queries at a given context, and
 // the two scorers compared: score difference and how many selections differ (GPU, synthetic, no model).
 // Usage: qsa_select_bench [context=131072] [queries=256] [reps=10]
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_select.hpp"
+#include "maya/kernels/qsa.hpp"
+#include "maya/kernels/qsa_select.hpp"
 
 #include <cuda_runtime.h>
 
@@ -14,7 +14,7 @@
 #include <random>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = maya::kernels;
 
 namespace {
 void ck(cudaError_t e, const char* w) {

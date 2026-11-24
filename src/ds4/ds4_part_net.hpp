@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::ds4::part {
+namespace maya::ds4::part {
 
 enum Op : uint32_t {
     kHello = 1,
@@ -147,4 +147,4 @@ struct Reader {
     }
 };
 
-}  // namespace strata::ds4::part
+}  // namespace maya::ds4::part

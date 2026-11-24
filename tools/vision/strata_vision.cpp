@@ -4,8 +4,9 @@
 // mtmd library and the model's mmproj file (vision encoder + projector).  The engine does the rest: it places the
 // rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in generate.cpp).
 //
-//   maya-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
+//   maya-vision --mmproj <mmproj.gguf> [--model <text model .gguf, first split>] [--gpu] [--threads N]
 //                 [--max-tokens N] [--no-flash-attn] [--no-warmup] [--measure]
+// (--model left out: no text model - Inkling 2's, which this llama.cpp does not open; its markers are the server's)
 //
 // --measure: load, warm up at the largest picture, print "MEM <bytes> <base> <total>" and end - the GPU memory this
 // encoder needs on this machine (its weights and work buffers; <base> is what the device had in use once this
@@ -81,8 +82,8 @@ int main(int argc, char** argv) {
         else if (a == "--measure") measure = true;
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    if (mmproj.empty() || model.empty()) {
-        std::fprintf(stderr, "usage: maya-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
+    if (mmproj.empty()) {
+        std::fprintf(stderr, "usage: maya-vision --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] [--threads N] "
                              "[--max-tokens N]\n");
         return 2;
     }
@@ -102,10 +103,15 @@ int main(int argc, char** argv) {
         if (mdev != nullptr) ggml_backend_dev_memory(mdev, &free0, &total0);
     }
 
-    llama_model_params mp = llama_model_default_params();
-    mp.vocab_only = true;
-    llama_model* text = llama_model_load_from_file(model.c_str(), mp);
-    if (!text) { std::printf("ERR cannot open the text model %s\n", model.c_str()); std::fflush(stdout); return 1; }
+    // (no --model: Inkling 2 - this llama.cpp cannot open its text model, and its pictures need none: the server
+    //  writes the markers, this tool keeps only the image chunks; tools/vision/inkling2v_patch.py)
+    llama_model* text = nullptr;
+    if (!model.empty()) {
+        llama_model_params mp = llama_model_default_params();
+        mp.vocab_only = true;
+        text = llama_model_load_from_file(model.c_str(), mp);
+        if (!text) { std::printf("ERR cannot open the text model %s\n", model.c_str()); std::fflush(stdout); return 1; }
+    }
 
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = gpu;
@@ -168,7 +174,7 @@ int main(int argc, char** argv) {
         std::printf("MEM %zu %zu %zu\n", free0 > free1 ? free0 - free1 : (size_t) 0, total0 - free0, total0);
         std::fflush(stdout);
         mtmd_free(ctx);
-        llama_model_free(text);
+        if (text) llama_model_free(text);
         llama_backend_free();
         return 0;
     }
@@ -244,7 +250,7 @@ int main(int argc, char** argv) {
         if (bw.video_ctx) mtmd_helper_video_free(bw.video_ctx);
     }
     mtmd_free(ctx);
-    llama_model_free(text);
+    if (text) llama_model_free(text);
     llama_backend_free();
     return 0;
 }

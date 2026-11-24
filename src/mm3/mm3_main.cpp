@@ -59,8 +59,8 @@
 #include "mm3_sample.hpp"
 #include "mm3_slots.hpp"
 #include "mm3_vision.hpp"
-#include "strata/spec/draft_policy.hpp"
-#include "strata/spec/suffix_drafter.hpp"
+#include "maya/spec/draft_policy.hpp"
+#include "maya/spec/suffix_drafter.hpp"
 #if defined(_WIN32)
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
@@ -333,12 +333,15 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
                     vg->patch, vg->merge, vg->max_pixels, vg->min_pixels);
+    // (#1026: a start that came out short of its VRAM reserve - the server starts the engine once more, which keeps
+    //  what this one measured free beside it)
+    if (const int short_mib = m.late_check(true); short_mib > 0) std::printf("INFO reserve_short=%d\n", short_mib);
 }
 
-// Prompt lookup (--suffix-draft N, maya-ds4's): the suffix drafter (strata/spec/suffix_drafter.hpp) proposes the tokens
+// Prompt lookup (--suffix-draft N, maya-ds4's): the suffix drafter (maya/spec/suffix_drafter.hpp) proposes the tokens
 // that followed an earlier repeat of the context - a file edit, a tool call's arguments, quoted text - and a round
 // whose proposal starts with DSpark's first draft verifies the lookup's tokens instead where the draft policy
-// (strata/spec/draft_policy.hpp) expects more committed tokens a millisecond from them, from this PC's round times by
+// (maya/spec/draft_policy.hpp) expects more committed tokens a millisecond from them, from this PC's round times by
 // window size and the lookup drafts' acceptance, both measured as it decodes; a lookup window may run past DSpark's
 // block, up to 16 tokens (the decode window's most).  A proposal the policy trusts (a long match whose windows measured
 // hold) is verified alone, the draft not made that round (the draft's context comes from the target's forwards, so it
@@ -351,8 +354,8 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
 // request's lookup_trust=0|1 over it): no trusted rounds, every round with DSpark drafts first.
 struct Lookup {
     static constexpr int kMaxT = 16;   // (the decode window's tokens at most: kWin in mm3_model.cu / mm3_tp.cu)
-    strata::spec::SuffixDrafter sfx;
-    strata::spec::DraftPolicy policy;   // (over the engine's life: the round times are this PC's)
+    maya::spec::SuffixDrafter sfx;
+    maya::spec::DraftPolicy policy;   // (over the engine's life: the round times are this PC's)
     std::vector<int32_t> buf;
     long long windows = 0, offered = 0, accepted = 0, trusted = 0;   // the lookup's rounds (trusted: no draft), drafts
     double draft_ms = 0.0;                                           // a draft's time (EMA)
@@ -401,6 +404,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             std::fflush(stdout);
             continue;
         }
+        (void) m.late_check(false);   // (#1026: what the requests before allocated, against the reserve)
         in.stop.store(false);
         Req r;
         if (!parse_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
@@ -644,7 +648,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                         L->draft_ms = L->draft_ms > 0.0 ? 0.9 * L->draft_ms + 0.1 * dms : dms;
                         L->t_mtp = k + 1;
                         if (klk > 0 && !drafts.empty() && L->buf[0] == drafts[0]) {
-                            const strata::spec::DraftPolicy::Pick pk = L->policy.choose(k + 1, klk, match);
+                            const maya::spec::DraftPolicy::Pick pk = L->policy.choose(k + 1, klk, match);
                             if (pk.lookup) {
                                 k = pk.t - 1;
                                 drafts.assign(L->buf.begin(), L->buf.begin() + k);
@@ -654,7 +658,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                     }
                 }
             } else if (klk > 0) {   // (no DSpark: the lookup's window against a plain step)
-                const strata::spec::DraftPolicy::Pick pk = L->policy.choose(1, klk, match);
+                const maya::spec::DraftPolicy::Pick pk = L->policy.choose(1, klk, match);
                 if (pk.lookup && pk.t > 1) {
                     k = pk.t - 1;
                     drafts.assign(L->buf.begin(), L->buf.begin() + k);
@@ -755,7 +759,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         if (!profile_out.empty()) {   // (this PC's routing learned: the next start places its experts by it)
             std::string perr;
             const std::string tmp = profile_out + ".tmp";
-            if (!m.save_profile(tmp, perr) || !strata::ds4::os::replace_file(tmp, profile_out))
+            if (!m.save_profile(tmp, perr) || !maya::ds4::os::replace_file(tmp, profile_out))
                 std::fprintf(stderr, "mm3: the expert profile %s not saved %s\n", profile_out.c_str(), perr.c_str());
         }
         std::fprintf(stderr,
@@ -883,7 +887,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         if (!profile_out.empty()) {   // (this PC's routing learned: the next start places its experts by it)
             std::string perr;
             const std::string tmp = profile_out + ".tmp";
-            if (!m.save_profile(tmp, perr) || !strata::ds4::os::replace_file(tmp, profile_out))
+            if (!m.save_profile(tmp, perr) || !maya::ds4::os::replace_file(tmp, profile_out))
                 std::fprintf(stderr, "mm3: the expert profile %s not saved %s\n", profile_out.c_str(), perr.c_str());
         }
     };
@@ -1184,6 +1188,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         if (l == "QUIT") {
             quit = true;
         } else if (l.rfind("GEN ", 0) == 0 || l.rfind("GENI ", 0) == 0) {
+            (void) m.late_check(false);   // (#1026: what the requests before allocated, against the reserve)
             admit(l);
         } else {
             std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", l.substr(0, l.find(' ')).c_str());
