@@ -1301,6 +1301,7 @@ SSSE3 decoding/integer dot products and software-FMA acceleration have separate 
 | --- | --- | --- |
 | `DS4_MX_SSSE3` | unset: automatic tier selection above | `0`: exclude SSSE3; `1`: explicitly select it where supported, taking precedence over `DS4_MX_TIER`. Unsupported CPUs retain a supported tier. |
 | `DS4_MX_FAST_FMA` | off | `1`: accelerate binary32 FMA in the scalar and SSSE3 MXFP4 tiers using an exact binary64 product/sum with guarded fallback to `std::fma`. Independent of `DS4_MX_SSSE3`; AVX2+ kernels are unchanged. |
+| `DS4_MX_FMA_UNGUARDED` | off | `1` with `DS4_MX_FAST_FMA=1`: experimental binary64 multiply/add followed by a binary32 cast in the scalar and SSSE3 tiers. Skips the per-operation midpoint and range checks. Uses the same x86-64 rounding-mode and FTZ/DAZ checks as the guarded path. |
 | `DS4_MX_FMA_VERIFY` | off | `1`: recompute accelerated matrix outputs with the original scalar `std::fma`, compare bits, and abort on a mismatch. Prints checked values/batches on clean exit. This is a slow diagnostic; leave it off when measuring speed. |
 
 For an E5 v2, the four combinations are `DS4_MX_SSSE3=0 DS4_MX_FAST_FMA=0` (original scalar),
@@ -1312,6 +1313,12 @@ or FTZ/DAZ retain `std::fma`. Midpoints between adjacent normal binary32 values,
 and nonfinite results also use `std::fma`. This avoids binary64-to-binary32 double rounding; it does not
 replace fused arithmetic with float multiplication/addition. The source is compiled with FP contraction
 disabled. The shortcut preserves result bits; floating-point exception flags are not part of its API contract.
+
+For the experimental path, set `DS4_MX_FAST_FMA=1` and `DS4_MX_FMA_UNGUARDED=1` before starting the engine.
+Double rounding can change finite results by one adjacent binary32 value per operation and can change overflow at the
+boundary. Such differences can propagate through a matrix or through generation. `DS4_MX_FMA_VERIFY=1` also checks
+this path against the original scalar result and aborts on any bit difference. Use it for diagnostics and use
+`DS4_MX_FMA_VERIFY=0` for speed measurements. Set `DS4_MX_FMA_UNGUARDED=0` to use guarded FAST_FMA.
 
 ## DeepSeek: the CPU lane's threads
 

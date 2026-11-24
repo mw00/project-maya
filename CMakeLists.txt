@@ -819,7 +819,10 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
       foreach(_f 0 1)
         add_test(NAME ds4_mx_fma_s${_s}_f${_f} COMMAND ds4_mx_fma_test)
         set_tests_properties(ds4_mx_fma_s${_s}_f${_f} PROPERTIES TIMEOUT 180
-                             ENVIRONMENT "DS4_MX_SSSE3=${_s};DS4_MX_FAST_FMA=${_f}")
+                             ENVIRONMENT "DS4_MX_SSSE3=${_s};DS4_MX_FAST_FMA=${_f};DS4_MX_FMA_UNGUARDED=0")
+        add_test(NAME ds4_mx_fma_unguarded_s${_s}_f${_f} COMMAND ds4_mx_fma_test --dispatch)
+        set_tests_properties(ds4_mx_fma_unguarded_s${_s}_f${_f} PROPERTIES TIMEOUT 30
+                             ENVIRONMENT "DS4_MX_SSSE3=${_s};DS4_MX_FAST_FMA=${_f};DS4_MX_FMA_UNGUARDED=1")
       endforeach()
     endforeach()
     # DS4_LANE_PARITY's CPU rows against the CPU lane's ggml rows, one thread (built by name)

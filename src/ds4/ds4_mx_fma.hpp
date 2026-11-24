@@ -38,8 +38,12 @@ inline float fma_guarded_rn(float a, float b, float c) {
         return (float) sum;
     return std::fma(a, b, c);
 }
-template <bool Fast> inline float mx_fma(float a, float b, float c) {
-    if constexpr (Fast) return fma_guarded_rn(a, b, c);
+enum class FmaMode { reference, guarded, unguarded };
+
+template <FmaMode Mode> inline float mx_fma(float a, float b, float c) {
+    if constexpr (Mode == FmaMode::unguarded)
+        return static_cast<float>(static_cast<double>(a) * static_cast<double>(b) + static_cast<double>(c));
+    if constexpr (Mode == FmaMode::guarded) return fma_guarded_rn(a, b, c);
     return std::fma(a, b, c);
 }
 }  // namespace maya::ds4::gguf::detail

@@ -1,6 +1,7 @@
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_mx_fma.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -10,8 +11,59 @@ namespace gg = maya::ds4::gguf;
 namespace d = maya::ds4::gguf::detail;
 static float value(uint32_t bits) { float f; std::memcpy(&f, &bits, 4); return f; }
 static uint32_t bits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+// Blocks 0 and 8 update the same accumulator. The second dot is
+// 12 * (127 + 127 + 87) + 5 = 4097, a double-rounding witness with the first block's addend.
+static void check_rounding_dispatch() {
+    constexpr int width = 288, row_bytes = width / 32 * 17;
+    constexpr int qbytes = 384, scale_lanes = 16;
+    std::vector<uint8_t> weights(row_bytes), act(gg::mx_act_bytes(width));
+    for (int offset = 0; offset < row_bytes; offset += 17) weights[offset] = 128;
+    weights[1] = 1;
+    weights[8 * 17 + 1] = 7;
+    weights[8 * 17 + 2] = 7;
+    weights[8 * 17 + 3] = 7;
+    weights[8 * 17 + 4] = 1;
+    act[0] = 1;
+    act[256] = 127;
+    act[257] = 127;
+    act[258] = 87;
+    act[259] = 5;
+    auto set_lane = [&](int lane, float scale, int32_t correction) {
+        std::memcpy(act.data() + qbytes + lane * sizeof(float), &scale, sizeof(scale));
+        std::memcpy(act.data() + qbytes + scale_lanes * sizeof(float) + lane * sizeof(int32_t),
+                    &correction, sizeof(correction));
+    };
+    set_lane(0, std::ldexp(1.0f, -53), -12);
+    set_lane(8, std::ldexp(4097.0f, -24), -12 * (127 + 127 + 87 + 5));
+    const void* activation[] = {act.data()};
+    float reference = 0, result = 0;
+    float* ref[] = {&reference};
+    float* got[] = {&result};
+    gg::mx_rows_reference(weights.data(), row_bytes, width, 0, 1, activation, 1, ref);
+    const float a = 4097.0f, b = std::ldexp(a, -24), c = std::ldexp(1.0f, -53);
+    const float rounded = static_cast<float>(static_cast<double>(a) * static_cast<double>(b) + c);
+    if (bits(reference) != bits(std::fma(a, b, c)) || bits(reference) == bits(rounded))
+        throw std::runtime_error("invalid row double-rounding witness");
+    const char* opt_in = std::getenv("DS4_MX_FMA_UNGUARDED");
+    const bool unguarded = opt_in && std::strcmp(opt_in, "1") == 0 && gg::mx_fast_fma_active();
+    gg::mx_rows(weights.data(), row_bytes, width, 0, 1, activation, 1, got);
+    if (bits(result) != bits(unguarded ? rounded : reference))
+        throw std::runtime_error("wrong FMA mode on row double-rounding witness");
+#if defined(__x86_64__) || defined(_M_X64)
+    const unsigned csr = _mm_getcsr();
+    _mm_setcsr(csr | 0x8040u);
+    gg::mx_rows(weights.data(), row_bytes, width, 0, 1, activation, 1, got);
+    _mm_setcsr(csr);
+    if (bits(result) != bits(reference)) throw std::runtime_error("FTZ/DAZ row did not fall back");
+#endif
+    std::printf("PASS rounding dispatch tier=%s unguarded=%d (FTZ/DAZ fallback checked on x86-64)\n",
+                gg::mx_tier_name(gg::mx_tier()), unguarded);
+}
+
 int main(int argc, char** argv) {
     try {
+        check_rounding_dispatch();
+        if (argc > 1 && std::strcmp(argv[1], "--dispatch") == 0) return 0;
         const int random_count = argc > 1 && std::strcmp(argv[1], "--smoke") == 0 ? 20000 : 5000000;
         std::mt19937 rng(0x5f4a9u);
         uint64_t tested = 0, naive_wrong = 0;

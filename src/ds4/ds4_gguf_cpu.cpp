@@ -44,6 +44,8 @@
 namespace maya::ds4::gguf {
 namespace {
 
+using detail::FmaMode;
+
 constexpr int kBlock = 32, kBytes = 17;
 constexpr float kValues[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
                                0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
@@ -187,7 +189,7 @@ void quant_scalar(const float* x, int b0, int b1, uint8_t* act, int k) {
     }
 }
 
-template <bool Fast>
+template <FmaMode Mode>
 void rows_q_scalar(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n, float* const* y) {
     const float* t = e8().v;
     for (int r = r0; r < r1; ++r) {
@@ -204,7 +206,7 @@ void rows_q_scalar(const uint8_t* w, size_t rb, int k, int r0, int r1, const voi
                 const uint8_t* a = (const uint8_t*) act[i];
                 int s = 0;
                 for (int j = 0; j < kBlock; ++j) s += wv[j] * act_q(a, b, j);
-                acc[i][l] = detail::mx_fma<Fast>((float) s, t[p[0]] * act_d(a, k, b), acc[i][l]);
+                acc[i][l] = detail::mx_fma<Mode>((float) s, t[p[0]] * act_d(a, k, b), acc[i][l]);
             }
         }
         for (int i = 0; i < n; ++i) {
@@ -415,6 +417,15 @@ bool mx_fast_fma_requested() {
 bool mx_fast_fma_active() { return mx_fast_fma_requested() && detail::fast_fma_environment_ok(); }
 
 namespace {
+FmaMode mx_fma_mode() {
+    if (!mx_fast_fma_active()) return FmaMode::reference;
+    static const bool unguarded = [] {
+        const char* value = std::getenv("DS4_MX_FMA_UNGUARDED");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return unguarded ? FmaMode::unguarded : FmaMode::guarded;
+}
+
 std::atomic<uint64_t> fma_verified_values{0}, fma_verified_batches{0};
 bool verify_fma() {
     static const bool on = [] {
@@ -448,7 +459,7 @@ void check_fma(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* c
 void mx_rows_reference(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
                        float* const* y) {
     for (int i = 0; i < n; i += kMxCpuMaxN)
-        rows_q_scalar<false>(w, rb, k, r0, r1, act + i, std::min(kMxCpuMaxN, n - i), y + i);
+        rows_q_scalar<FmaMode::reference>(w, rb, k, r0, r1, act + i, std::min(kMxCpuMaxN, n - i), y + i);
 }
 
 void mx_quant_blocks(const float* x, int b0, int b1, void* act, int k) {
@@ -468,13 +479,17 @@ void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, con
     // SSSE3 handles partial groups; AVX2+ takes eight blocks a step.
     if (!mx_tier_ok(t) || (t != kMxSsse3 && k % 256 != 0)) t = kMxScalar;
     const float* tb = e8().v;
-    const bool fast = mx_fast_fma_active();
+    const FmaMode mode = (t == kMxScalar || t == kMxSsse3) ? mx_fma_mode() : FmaMode::reference;
 #if defined(MX_X86)
     switch (t) {
         case kMxSsse3:
-            if (fast) rows_ssse3<true>(w, rb, k, r0, r1, act, n, y, tb, pf);
-            else rows_ssse3<false>(w, rb, k, r0, r1, act, n, y, tb, pf);
-            if (fast && verify_fma()) check_fma(w, rb, k, r0, r1, act, n, y);
+            if (mode == FmaMode::unguarded)
+                rows_ssse3<FmaMode::unguarded>(w, rb, k, r0, r1, act, n, y, tb, pf);
+            else if (mode == FmaMode::guarded)
+                rows_ssse3<FmaMode::guarded>(w, rb, k, r0, r1, act, n, y, tb, pf);
+            else
+                rows_ssse3<FmaMode::reference>(w, rb, k, r0, r1, act, n, y, tb, pf);
+            if (mode != FmaMode::reference && verify_fma()) check_fma(w, rb, k, r0, r1, act, n, y);
             return;
         case kMxAvx2: return mx_avx2::rows(w, rb, k, r0, r1, act, n, y, tb, pf);
 #if defined(MX_AVXVNNI)
@@ -487,10 +502,15 @@ void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, con
 #endif
     (void) tb, (void) pf;
     for (int i0 = 0; i0 < n; i0 += kMxCpuMaxN) {
-        if (fast) rows_q_scalar<true>(w, rb, k, r0, r1, act + i0, std::min(kMxCpuMaxN, n - i0), y + i0);
-        else rows_q_scalar<false>(w, rb, k, r0, r1, act + i0, std::min(kMxCpuMaxN, n - i0), y + i0);
+        const int count = std::min(kMxCpuMaxN, n - i0);
+        if (mode == FmaMode::unguarded)
+            rows_q_scalar<FmaMode::unguarded>(w, rb, k, r0, r1, act + i0, count, y + i0);
+        else if (mode == FmaMode::guarded)
+            rows_q_scalar<FmaMode::guarded>(w, rb, k, r0, r1, act + i0, count, y + i0);
+        else
+            rows_q_scalar<FmaMode::reference>(w, rb, k, r0, r1, act + i0, count, y + i0);
     }
-    if (fast && verify_fma()) check_fma(w, rb, k, r0, r1, act, n, y);
+    if (mode != FmaMode::reference && verify_fma()) check_fma(w, rb, k, r0, r1, act, n, y);
 }
 
 void mx_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n, float* const* y) {
