@@ -1,7 +1,7 @@
 """tools/strata/glm53_long_gate.py - the long-context quality gate of the glm-dsa (GLM-5.3) port, Maya only (no
 llama.cpp reference needed): the SAME tokens scored twice,
 
-    long   after the whole file read through the prompt path (STRATA_GLM_SCORE=c, STRATA_GLM_SCORE_PREFILL=1): the
+    long   after the whole file read through the prompt path (MAYA_GLM_SCORE=c, MAYA_GLM_SCORE_PREFILL=1): the
            DSA indexer selects 2,048 of up to N cells for every scored row (the production read)
     short  with only CONTEXT tokens of the file before them (plus the prompt head), at most 2,048 cells: no selection
            at all, every cell attended (where day 1 matched llama.cpp, KL 0.017)
@@ -17,7 +17,7 @@ FILE: comma-separated token ids (a chat prompt over a long document; --head = th
 document, kept at the start of the short file).  Each run loads the model (~3 min on 3 V100s) and writes a score dump
 of --rows rows (rows x 620 KB, deleted after unless --keep).  Measured 2026-11-07 (UD-IQ2_M, 3x V100): 8K docs -0.06 (PASS), 16K docs+code +0.14, 32K docs+code +1.38 (FAIL; GLM-5.3-Flash on the same file +0.22).
 A PASS is not the whole story: the same 8K rows read with the attention sink + the last 2,044 cells instead of the
-indexer's choice (~/glm53-work/l15/dsa-experiments.patch, STRATA_GLMD_SINK=4 STRATA_GLMD_LOCAL=2044) score 2.45
+indexer's choice (~/glm53-work/l15/dsa-experiments.patch, MAYA_GLMD_SINK=4 MAYA_GLMD_LOCAL=2044) score 2.45
 against the indexer's 3.35 - see the notes before trusting a long read.
 """
 from __future__ import annotations
@@ -44,8 +44,8 @@ def score(a, name, ids, c, out):
     tok = out / f"{name}.tok"
     tok.write_text(",".join(map(str, ids)) + "\n")
     dump = out / f"{name}.f32"
-    env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=a.gpus, STRATA_GLM_SCORE=str(c),
-               STRATA_GLM_SCORE_PREFILL="1", STRATA_GLM_SCORE_DUMP=str(dump))
+    env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=a.gpus, MAYA_GLM_SCORE=str(c),
+               MAYA_GLM_SCORE_PREFILL="1", MAYA_GLM_SCORE_DUMP=str(dump))
     for kv in a.env:
         k, v = kv.split("=", 1)
         env[k] = v

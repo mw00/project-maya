@@ -20,7 +20,7 @@ fi
 if [ ! -f $OUT/pack/index.txt ]; then
   echo "$(date +%T) packing"
   cd $SRC
-  STRATA_GGUF_PY=$SRC/build/_deps/strata_llamacpp-src/gguf-py $PY tools/iq_pack.py --gguf $(ls $OUT/$N-00001-of-*.gguf) \
+  MAYA_GGUF_PY=$SRC/build/_deps/strata_llamacpp-src/gguf-py $PY tools/iq_pack.py --gguf $(ls $OUT/$N-00001-of-*.gguf) \
       --out $OUT/pack --compat-bf16 || { echo "$(date +%T) pack failed"; exit 1; }
   cp /mnt/nvme/maya/models/glm53-iq1s/pack/expert_prior.txt /mnt/nvme/maya/models/glm53-iq1s/pack/expert_counts.txt $OUT/pack/
 fi

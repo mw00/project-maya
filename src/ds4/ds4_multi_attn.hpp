@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 constexpr int kMaRows = 16;   // a multi step's rows at most (kWin)
 
@@ -104,4 +104,4 @@ inline int ma_spans(const MaPlan& p, const int* cls, int max_rows, MaSpan* out) 
     return ns;
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

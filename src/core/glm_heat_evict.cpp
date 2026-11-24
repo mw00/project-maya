@@ -1,8 +1,8 @@
-// src/core/glm_heat_evict.cpp - glm-dsa B15.8: heat-decay expert promotion / eviction (include/strata/core/
+// src/core/glm_heat_evict.cpp - glm-dsa B15.8: heat-decay expert promotion / eviction (include/maya/core/
 // glm_heat_evict.hpp): the heat table, the LRU-window victim, upload coalescing, the engine registry and the
 // policy simulator.  Plain C++.
-#include "strata/core/glm_env.hpp"
-#include "strata/core/glm_heat_evict.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_heat_evict.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,18 +12,18 @@
 #include <mutex>
 #include <numeric>
 
-namespace strata::core::glmheat {
+namespace maya::core::glmheat {
 
 bool heat_on() {
     static const bool on = [] {
-        return strata::glmenv::env_flag("STRATA_GLM_HEAT_EVICT", false);
+        return maya::glmenv::env_flag("MAYA_GLM_HEAT_EVICT", false);
     }();
     return on;
 }
 
 double heat_margin() {
     static const double m = [] {
-        const char* v = std::getenv("STRATA_GLM_HEAT_MARGIN");
+        const char* v = std::getenv("MAYA_GLM_HEAT_MARGIN");
         const double x = v != nullptr ? std::atof(v) : 0.0;
         return x > 0.0 ? x : kMarginDefault;
     }();
@@ -376,4 +376,4 @@ SimResult simulate(const Trace& t, Policy pol, const SimConfig& c) {
     return R;
 }
 
-}  // namespace strata::core::glmheat
+}  // namespace maya::core::glmheat

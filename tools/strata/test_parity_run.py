@@ -46,11 +46,11 @@ COMMON = textwrap.dedent('''
 FAKE_STRATA = COMMON + textwrap.dedent('''
     a = sys.argv[1:]
     tokens = read_tokens(a[a.index("--tokens-file") + 1])
-    c = int(os.environ["STRATA_GLM_SCORE"])
-    slow = os.environ.get("STRATA_GLM_SLOW") == "1"
-    strict = os.environ.get("STRATA_GLM_IDX_LN_EPS") == "0"
+    c = int(os.environ["MAYA_GLM_SCORE"])
+    slow = os.environ.get("MAYA_GLM_SLOW") == "1"
+    strict = os.environ.get("MAYA_GLM_IDX_LN_EPS") == "0"
     bad = float(os.environ.get("FAKE_BAD", "0"))
-    dump = os.environ.get("STRATA_GLM_SCORE_DUMP")
+    dump = os.environ.get("MAYA_GLM_SCORE_DUMP")
     cb = os.environ.get("GLM_CB_DIR")
     append = os.environ.get("GLM_CB_APPEND") == "1"
     only = [s for s in os.environ.get("GLM_CB_ONLY", "").split(",") if s]
@@ -194,8 +194,8 @@ class ParityRun(unittest.TestCase):
 
     def test_dry_run_and_usage(self):
         r = self.run_sh("--gate", "M2", "--out", str(self.d / "dry"), "--dry-run")
-        self.assertIn("STRATA_GLM_IDX_LN_EPS=0", r.stdout)
-        self.assertIn("STRATA_GLM_SLOW=1", r.stdout)
+        self.assertIn("MAYA_GLM_IDX_LN_EPS=0", r.stdout)
+        self.assertIn("MAYA_GLM_SLOW=1", r.stdout)
         self.assertIn("GLM_CB_APPEND=1", r.stdout)
         self.assertIn("parity_compare.py gate", r.stdout)
         self.assertFalse((self.d / "dry" / "gate.json").exists())

@@ -6,7 +6,7 @@
 //     part, also when the reallocated arena came back at the SAME base address (the case the address fields miss);
 //   - graph_generation_note bumps only for a new name or a changed (base, bytes), and counts per name;
 //   - bumps from several threads are all counted and the generation stays monotonic.
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -105,7 +105,7 @@ void key_logic() {
     CHECK(G.captures == before + 2, "crossing p + 1 > top_k re-captures");
 }
 
-// review fix: several sequences (STRATA_GLM_SEQS / --parallel) bind their own state arenas; the cache keeps a graph
+// review fix: several sequences (MAYA_GLM_SEQS / --parallel) bind their own state arenas; the cache keeps a graph
 // per (part, state) up to the sequence count, so alternating sequences replay instead of re-capturing every token
 void sequences() {
     MockGraphs G;

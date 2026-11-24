@@ -249,6 +249,16 @@ class Config(unittest.TestCase):
         a = self.write(args(no_vision=True))["args"]
         self.assertEqual(a[a.index("--vision") + 1], "off")
 
+    def test_prompt_lookup_on_for_one_gpu_only(self):
+        """Prompt lookup (--suffix-draft 3) is written for one GPU; on several GPUs it is the user's choice (not written,
+        the engine's default is off), and a --suffix-draft in the config before is kept."""
+        self.assertNotIn("--suffix-draft", self.write(args(), gpus=3)["args"])
+        a = self.write(args(), gpus=1)["args"]
+        self.assertEqual(a[a.index("--suffix-draft") + 1], "3")
+        old = {"installer": {"family": "minimax"}, "args": ["--pack", "/p", "--suffix-draft", "3"]}
+        a = self.write(args(), old=old, gpus=3)["args"]
+        self.assertEqual(a[a.index("--suffix-draft") + 1], "3")
+
     def test_parallel_written_kept_and_given_back(self):
         """--parallel N is written and kept by a setup again; with N above 1 a new config does not ask for KV streaming
         (the engine runs each conversation's cache in VRAM), and --parallel 1 brings it back."""
@@ -283,6 +293,18 @@ class Config(unittest.TestCase):
         # (the model's own sampling and level every setup - the owner, 2026-10-27: no exceptions)
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("auto", {"temperature": 1.0, "top_p": 0.95},
                                                                               "0.0.0.0"))
+
+    def test_again_keeps_the_servers_own_settings(self):
+        # #1089: "model_management": false (and the port, the idle unload, ...) came back as the defaults after a setup
+        own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}
+        ports = []
+        with patch.object(maya, "write_run_script", lambda p, port: ports.append(port) or self.root / "run.sh"):
+            c = self.write(args(), {"args": ["--pack", "/old"], **own})
+            self.assertEqual({k: c.get(k) for k in own}, own)
+            c = self.write(args(port=9002, host="127.0.0.1"), {"args": ["--pack", "/old"], **own})
+        self.assertEqual((c["port"], c["host"], c["model_management"], ports), (9002, "127.0.0.1", False, [9001, 9002]))
 
     def test_tp_follows_the_gpus_chosen_now(self):
         """#436 (DeepSeek's, the same rule here): the config before's --tp only for the same GPUs"""
@@ -435,6 +457,31 @@ class Gguf(unittest.TestCase):
             self.assertEqual(len(maya.mm3_gguf_model_step(args(), d, "gguf-xs")), 3)
             self.assertTrue((d / ix).is_file())
             self.assertFalse((d / ix.replace(".bin", ".gguf")).exists())
+
+    def test_published_files_in_place_by_sha256(self):
+        """Published: files already there are taken by their sha256 too, not their sizes alone - a damaged file of the
+        right size stops the setup (#672: NaN weights, the router then picks no expert); a good one is read once."""
+        import hashlib
+        m = maya.mm3_gguf_entry("gguf-xs")
+        body = {n: bytes([i + 1]) * (1000 + i) for i, n in enumerate(m["files"])}
+        m["files"] = {n: len(b) for n, b in body.items()}
+        m["sha256"] = {n: hashlib.sha256(b).hexdigest() for n, b in body.items()}
+        m["revision"] = "0" * 40
+        with tempfile.TemporaryDirectory() as d, patch.object(maya, "fail", fail), \
+                patch.object(maya, "step", lambda *a: None), patch.object(maya, "warn", lambda *a: None), \
+                patch.object(maya, "ok", lambda *a: None), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya, "mm3_gguf_entry", return_value=m):
+            d = Path(d)
+            for n, b in body.items():
+                (d / n).write_bytes(b)
+            first = next(iter(body))
+            (d / first).write_bytes(b"\xff" + body[first][1:])   # (one byte changed, the size kept)
+            with self.assertRaisesRegex(Failed, "sha256 does not match"):
+                maya.mm3_gguf_model_step(args(), d, "gguf-xs")
+            (d / first).write_bytes(body[first])
+            self.assertEqual(len(maya.mm3_gguf_model_step(args(), d, "gguf-xs")), 3)
+            self.assertEqual(set(json.loads((d / maya.VERIFIED).read_text())), set(body))   # (remembered)
 
 
 if __name__ == "__main__":

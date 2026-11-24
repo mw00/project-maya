@@ -18,14 +18,14 @@
 // The legacy canonical projections use their explicit Q8_0/Q8_K activation images. The optional native
 // BF16 path affects only the scalar gate: it reads the original F32 input and uses pinned CUDA MMVF plus
 // an FP32 sigmoid. Native projection overrides independently select CUDA Q8_1 MMVQ and FP32 SwiGLU.
-#include "strata/kernels/shared_expert.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_gemv_q8.hpp"
-#include "strata/kernels/s_gemv.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "maya/kernels/shared_expert.hpp"
+#include "maya/kernels/bf16_gemv.hpp"
+#include "maya/kernels/bf16_bits.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/quantize_act.hpp"
+#include "maya/kernels/s2_gemv_q8.hpp"
+#include "maya/kernels/s_gemv.hpp"
+#include "maya/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -37,7 +37,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int THREADS = 128;
@@ -179,7 +179,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
     native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool batch = [] { const char* v = std::getenv("MAYA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
         native_scalar_sigmoid_multi_kernel<<<1, n_tok, 0, cs>>>(g);
@@ -343,4 +343,4 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

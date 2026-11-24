@@ -11,7 +11,7 @@
 // Unlike the reference's 2560/640 experts, GLM uses E=4096, FF=2048. IQ2_S and
 // IQ3_XXS down matrices also use the 256-value block addressing of the GU decoder.
 // Only populated 64-row tiles are enumerated from Maya's existing expert bounds.
-#include "strata/prefill/moe_fused_rdna4.hpp"
+#include "maya/prefill/moe_fused_rdna4.hpp"
 
 #include "common.cuh"
 
@@ -27,7 +27,7 @@
 #include <cstring>
 #include <mutex>
 
-namespace strata::prefill::rdna4 {
+namespace maya::prefill::rdna4 {
 namespace {
 
 void ck(cudaError_t e, const char* what) {
@@ -176,8 +176,8 @@ __device__ __forceinline__ uint4 sign_entry(int i, bool parity) {
 #endif
 // 8 nibbles of q4 through a 16-entry int8 table (4 words): the low nibbles' values in .x, the high ones' in .y
 // W (X5): direct-selector form on gfx: p = low 3 bits of each nibble picks within the table half, bit 3 picks the half;
-// exhaustively bit-exact over all 2^32 inputs (X5). Disable with -DSTRATA_W_NO_T16.
-#if defined(__HIPCC__) && !defined(STRATA_W_NO_T16)
+// exhaustively bit-exact over all 2^32 inputs (X5). Disable with -DMAYA_W_NO_T16.
+#if defined(__HIPCC__) && !defined(MAYA_W_NO_T16)
 __device__ __forceinline__ uint32_t table16_one(uint32_t x, const uint32_t (&t)[4]) {
     const uint32_t p = x & 0x07070707u;
     const uint32_t a = __builtin_amdgcn_perm(t[1], t[0], p), b = __builtin_amdgcn_perm(t[3], t[2], p);
@@ -383,25 +383,25 @@ template <int T> __device__ __forceinline__ const void* grid_src() {
 // gfx11 device code follows Strata's moe_fused_iq.cu (the same v_wmma_i32_16x16x16_iu8 layout;
 // gfx1151 is RDNA3.5); gfx12 keeps the RDNA4 layout below. Maya builds one arch at a time.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
-#define STRATA_NAT_W11 1
+#define MAYA_NAT_W11 1
 #else
-#define STRATA_NAT_W11 0
+#define MAYA_NAT_W11 0
 #endif
 #if defined(__gfx1200__) || defined(__gfx1201__)
-#define STRATA_NAT_W12 1
+#define MAYA_NAT_W12 1
 #else
-#define STRATA_NAT_W12 0
+#define MAYA_NAT_W12 0
 #endif
-#define STRATA_NAT_WMMA (STRATA_NAT_W11 || STRATA_NAT_W12)
-#if STRATA_NAT_W12
+#define MAYA_NAT_WMMA (MAYA_NAT_W11 || MAYA_NAT_W12)
+#if MAYA_NAT_W12
 #define NW_DROW(i, hi) (8 * (hi) + (i))
 #else
 #define NW_DROW(i, hi) (2 * (i) + (hi))
 #endif
 // The VGPR cap of the occupancy variant (amdgpu_waves_per_eu).  8 was measured against ROCm 7's clang; clang 22 (ROCm 7.10)
-// computes wrong results with it (#1180: gfx1100, every run), so there the cap is off.  -DSTRATA_W_LB=N sets it.
-#if defined(STRATA_W_LB)
-constexpr int NW_LB = STRATA_W_LB;
+// computes wrong results with it (#1180: gfx1100, every run), so there the cap is off.  -DMAYA_W_LB=N sets it.
+#if defined(MAYA_W_LB)
+constexpr int NW_LB = MAYA_W_LB;
 #elif defined(__clang_major__) && __clang_major__ >= 22
 constexpr int NW_LB = 1;
 #else
@@ -414,7 +414,7 @@ constexpr int NW_ROWS = 128;
 constexpr int NW_THREADS = 256;
 
 // one A / B fragment: gfx11 16 int8 per lane (uint4), gfx12 8 (uint2)
-#if STRATA_NAT_W12
+#if MAYA_NAT_W12
 typedef uint2 nw_frag;
 typedef nw_i2 nw_ab;
 __device__ __forceinline__ nw_ab nw_v(uint2 v) { return nw_ab{(int) v.x, (int) v.y}; }
@@ -424,9 +424,9 @@ typedef nw_i4 nw_ab;
 __device__ __forceinline__ nw_ab nw_v(uint4 v) { return nw_ab{(int) v.x, (int) v.y, (int) v.z, (int) v.w}; }
 #endif
 __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
-#if STRATA_NAT_W11
+#if MAYA_NAT_W11
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
-#elif STRATA_NAT_W12
+#elif MAYA_NAT_W12
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
 #else
     __builtin_trap();
@@ -435,13 +435,13 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
 }
 
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap).
-// Disable both with -DSTRATA_W_NO_OCC (the launch sites then use <WT, GU, false, 0> and grid factor wgp_blocks).
+// Disable both with -DMAYA_W_NO_OCC (the launch sites then use <WT, GU, false, 0> and grid factor wgp_blocks).
 template <int WT, bool GU, bool ALIAS = false, int LB = 0, int E = 4096, int FF = 2048>
 __global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
 native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles, const int* bounds,
                   const Geometry geo, const uint8_t* __restrict__ act,
                   const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
-#if STRATA_NAT_WMMA
+#if MAYA_NAT_WMMA
     static_assert(E % NW_ROWS == 0 && (2 * FF) % NW_ROWS == 0 && E % 64 == 0 && FF % 64 == 0, "the shape's tiles");
     constexpr int NS = (GU ? E : FF) / 64;  // 64-value stages along K
     constexpr int NFB = (GU ? 2 * FF : E) / NW_ROWS;     // work items per tile
@@ -483,7 +483,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
         const int fb = w % NFB, e = tile.x, row0 = tile.y;
         const int nrows = min(kTileRows, bounds[e + 1] - bounds[0] - row0);
         if (nrows <= 0) continue; // uniform for the block; no barriers are skipped by individual lanes
-        const uint8_t* blob = wbase + (size_t) e * stride;
+        const uint8_t* blob = geo.offs != nullptr ? wbase + geo.offs[e] : wbase + (size_t) e * stride;
         const int rbase = fb * NW_ROWS;
         const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : geo.gate_off) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
@@ -527,7 +527,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
         auto fetch_b = [&](int s, nw_frag (&q)[2][4], float2 (&x)[2], float2 (&sm)[2]) {
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
-#if STRATA_NAT_W12
+#if MAYA_NAT_W12
                 const uint2* p = reinterpret_cast<const uint2*>(brow[nt] + s * AB + 8 * hi);   // k 16 j + 8 hi .. + 7
                 q[nt][0] = p[0]; q[nt][1] = p[2]; q[nt][2] = p[4]; q[nt][3] = p[6];
 #else
@@ -552,7 +552,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         const int rb = 32 * wm + 16 * mt;
-#if STRATA_NAT_W12
+#if MAYA_NAT_W12
                         // k 32 h + 8 hi .. + 7 (A0) and 32 h + 16 + 8 hi .. + 7 (A1) of row rb + l16
                         const uint2* ap = reinterpret_cast<const uint2*>(&wt[bf][rb + l16][32 * h + 8 * hi]);
                         const nw_ab A0 = nw_v(ap[0]), A1 = nw_v(ap[2]);
@@ -612,7 +612,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
                 for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt) {
-#if STRATA_NAT_W12
+#if MAYA_NAT_W12
                         // lane l: local rows rb + 8 hi + i = features 16 wm + 8 mt + 4 hi + j, gate (i = 2j) and up (2j + 1)
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
@@ -665,7 +665,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
                     for (int nt = 0; nt < 2; ++nt) {
                         const int r = 32 * wn + 16 * nt + l16;
                         if (r < nrows) {
-#if STRATA_NAT_W12
+#if MAYA_NAT_W12
                             // columns rbase + 32 wm + 16 mt + 8 hi .. + 7: contiguous, 32-byte aligned (dm: 16, checked in experts_native)
                             float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * E + rbase + 32 * wm + 16 * mt + 8 * hi);
                             d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
@@ -721,7 +721,7 @@ DeviceInfo device_info() {
 
 bool available() {
     static const bool on = [] {
-        const char* off = std::getenv("STRATA_GLM_PREFILL_FUSED");
+        const char* off = std::getenv("MAYA_GLM_PREFILL_FUSED");
         return !(off && off[0] == '0');
     }();
     if (!on) return false;
@@ -734,6 +734,10 @@ bool supported(int gu, int down) {
         !(down == T_Q2_0 || down == T_IQ4_NL || down == T_IQ2_S || down == T_IQ3_XXS || down == T_IQ1_M ||
           down == T_IQ2_XXS || down == T_IQ2_XS)) return false;
     return available();
+}
+
+bool shape_ok(int n_embd, int n_ff) {
+    return (n_embd == 4096 && n_ff == 2048) || (n_embd == 5120 && n_ff == 2304) || (n_embd == 6144 && n_ff == 2048);
 }
 
 size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) (cols / 64) * AB; }
@@ -759,6 +763,7 @@ void run_experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int n
     for (int e = 0; e < ne; ++e) ntiles += (host_bounds[e+1] - host_bounds[e] + 63) / 64;
     if (!ntiles) return;
     const bool ds4 = geo.n_embd == 5120 && geo.n_ff == 2304;   // (DeepSeek-V4.1's experts; else GLM's 4096 / 2048)
+    const bool g61 = geo.n_embd == 6144 && geo.n_ff == 2048;   // (GLM-5.3's experts: a linked helper's prompt rows)
     // blocks a multiprocessor, measured (hip_prefill_fused_bench): GLM's shape on gfx1151 3 for every pair (Radeon
     // 8060S, 9K-token layer, IQ2_XXS/IQ3_XXS: 184 -> 155 ms; 4 and 5 are slower, 6 between them); elsewhere 3 for
     // IQ2_S / IQ2_XS, else 4 - DeepSeek's shape on every GPU as well (a Radeon 8060S, hip_prefill_fused_bench ds4 at
@@ -769,10 +774,11 @@ void run_experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int n
     const unsigned grid_gu = (unsigned) std::min(ntiles * 32, sms * gu_blocks);
     const unsigned grid_dn = (unsigned) std::min(ntiles * 32, sms * dn_blocks);
     const auto s = (cudaStream_t) stream;
-    if (!ds4 && ((geo.n_embd != 0 && geo.n_embd != 4096) || (geo.n_ff != 0 && geo.n_ff != 2048))) std::abort();
+    if (!ds4 && !g61 && ((geo.n_embd != 0 && geo.n_embd != 4096) || (geo.n_ff != 0 && geo.n_ff != 2048))) std::abort();
     auto* tiles = (int2*) tile_scratch;
     make_tiles_kernel<<<1, 256, 0, s>>>(bounds, ne, tiles);
 #define GU(T) (ds4 ? native_kernel<T, true, true, NW_LB, 5120, 2304><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr) \
+                 : g61 ? native_kernel<T, true, true, NW_LB, 6144, 2048><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr) \
                  : native_kernel<T, true, true, NW_LB><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr))
     if (gu) switch (geo.gu_type) {
         case T_IQ2_XXS: GU(T_IQ2_XXS); break;
@@ -786,6 +792,7 @@ void run_experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int n
     }
 #undef GU
 #define DN(T) (ds4 ? native_kernel<T, false, true, NW_LB, 5120, 2304><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out) \
+                 : g61 ? native_kernel<T, false, true, NW_LB, 6144, 2048><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out) \
                  : native_kernel<T, false, true, NW_LB><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out))
     if (!dn) {}
     else if (geo.d_type == T_Q2_0) { DN(T_Q2_0); }
@@ -823,4 +830,4 @@ void quantize_rows(const float* x, int64_t ldx, const int* idx, int64_t rows, in
                                                                                          (uint8_t*) xa);
     ck(cudaGetLastError(), "quantize rows");
 }
-} // namespace strata::prefill::rdna4
+} // namespace maya::prefill::rdna4

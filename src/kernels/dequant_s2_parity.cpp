@@ -1,13 +1,13 @@
 // src/kernels/dequant_s2_parity.cpp - P2.S2's parity test for the S2 decode.
 //
-// THE REFERENCE IS THE CHAIN, NOT A SECOND OPINION.  `strata::dequantize_q2_0` (include/strata/artifact/
+// THE REFERENCE IS THE CHAIN, NOT A SECOND OPINION.  `maya::dequantize_q2_0` (include/maya/artifact/
 // dequant.hpp) is a scalar transcription that `bench/micro/dequant_xcheck` checks against **ggml's own**
 // dequantizer on real block bytes; and `tools/canonical_xcheck.py --full` checks that the canonical form
 // decodes to the same values on every block of the artifact.  So this compares "GPU canonical decode" against
 // "CPU decode already proven equal to ggml", and a fault in either the canonicaliser or the kernel shows up
 // here.  A parity test whose two sides were written together would show neither.
-#include "strata/artifact/dequant.hpp"
-#include "strata/kernels/dequant_s2.hpp"
+#include "maya/artifact/dequant.hpp"
+#include "maya/kernels/dequant_s2.hpp"
 
 #include <cuda_runtime.h>
 
@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
     // the CPU reference, over the RAW blocks
     std::vector<float> cpu((size_t) n_blocks * QK);
     for (long long b = 0; b < n_blocks; ++b) {
-        strata::dequantize_q2_0(&raw[(size_t) b * 18], &cpu[(size_t) b * QK]);
+        maya::dequantize_q2_0(&raw[(size_t) b * 18], &cpu[(size_t) b * QK]);
     }
 
     // canonical planes: S2 packs 4 codes per byte exactly as Q2_0 stores them, so the codes plane is the raw
@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     for (long long b = 0; b < n_blocks; ++b) {
         std::memcpy(&codes[(size_t) b * 16], &raw[(size_t) b * 18 + 2], 16);
         const uint16_t d = (uint16_t) (raw[(size_t) b * 18] | (raw[(size_t) b * 18 + 1] << 8));
-        scales[(size_t) b] = strata::fp16_to_fp32(d);
+        scales[(size_t) b] = maya::fp16_to_fp32(d);
     }
 
     uint8_t* d_codes = nullptr;
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
           "copy scales");
 
-    strata::kernels::dequant_s2(d_codes, d_scales, d_out, n_blocks);
+    maya::kernels::dequant_s2(d_codes, d_scales, d_out, n_blocks);
 
     std::vector<float> gpu(cpu.size());
     check(cudaMemcpy(gpu.data(), d_out, gpu.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");

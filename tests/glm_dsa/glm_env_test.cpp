@@ -1,4 +1,4 @@
-// tests/glm_dsa/glm_env_test.cpp - glm-dsa's switch parser (include/strata/core/glm_env.hpp), CPU only:
+// tests/glm_dsa/glm_env_test.cpp - glm-dsa's switch parser (include/maya/core/glm_env.hpp), CPU only:
 //   * glmenv::parse: 1/0, on/off, true/false, yes/no in any case, integers, auto, and what it refuses;
 //   * switch_value / env_flag / env_switch: unset and empty keep the default, an unknown value warns and keeps it,
 //     "auto" only where the switch has an auto mode; env_int / env_num with their end checks;
@@ -6,18 +6,18 @@
 //     FUSED_SPLIT), glmd::random_routing_seed, the tier plan's thp_mode / numa_split_requested, the state layout's
 //     IDX_FP16 / IDX_HADAMARD, and the prefill stream's PREFILL_STREAM (default on): the spellings that used to flip a
 //     switch the wrong way ("off" / "false" / a JSON false passed as "False" -> on; "on" / "true" -> off);
-//   * the decode graphs' host-side gate (glmdsa::host_off_reason): the switch that keeps STRATA_GLM_DSA_GRAPHS off,
+//   * the decode graphs' host-side gate (glmdsa::host_off_reason): the switch that keeps MAYA_GLM_DSA_GRAPHS off,
 //     and a request's graphs=0;
 //   * a request's engine knobs (glm_req_knobs.hpp, the speed plan): the GEN keys parsed and range-checked, a knob
 //     no request names gives its reader's start value, and a request that leaves it out puts it back;
-//   * --random-routing (STRATA_GLM_RANDOM_ROUTING=1): spec decode gated off, the glm-dsa state fingerprint marked.
-#include "strata/core/glm_dsa_spec.hpp"
-#include "strata/core/glm_env.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_req_knobs.hpp"
-#include "strata/core/glm_state_layout.hpp"
-#include "strata/kernels/glmd_decode_policy.hpp"
-#include "strata/kernels/glmd_random_route.hpp"
+//   * --random-routing (MAYA_GLM_RANDOM_ROUTING=1): spec decode gated off, the glm-dsa state fingerprint marked.
+#include "maya/core/glm_dsa_spec.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_req_knobs.hpp"
+#include "maya/core/glm_state_layout.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
+#include "maya/kernels/glmd_random_route.hpp"
 
 #include "glm_dsa_fast.hpp"
 #include "glm_dsa_prefill_stream.hpp"
@@ -28,7 +28,7 @@
 #include <string>
 #include "glm_test_env.hpp"   // setenv / unsetenv / getpid (<unistd.h> on POSIX; mapped on Windows)
 
-namespace ge = strata::glmenv;
+namespace ge = maya::glmenv;
 
 static int g_fail = 0;
 #define CHECK(c)                                                                \
@@ -77,31 +77,31 @@ static void test_readers() {
     CHECK(parse_switch("off", kSwitchOn) == kSwitchOff && parse_switch("false", kSwitchOn) == kSwitchOff);
     CHECK(parse_switch("on", kSwitchOff) == kSwitchOn && parse_switch("auto", kSwitchOff) == kSwitchAuto);
     CHECK(parse_switch("bogus", kSwitchAuto) == kSwitchAuto && parse_switch(nullptr, kSwitchOff) == kSwitchOff);
-    setenv("STRATA_GLMD_FUSED_MLA", "off", 1);
-    setenv("STRATA_GLMD_TOPK_HIST", "False", 1);
-    setenv("STRATA_GLMD_IDX_WMMA", "no", 1);
-    setenv("STRATA_GLMD_TOPK_MB", "AUTO", 1);
-    setenv("STRATA_GLMD_FUSED_SPLIT", "abc", 1);
+    setenv("MAYA_GLMD_FUSED_MLA", "off", 1);
+    setenv("MAYA_GLMD_TOPK_HIST", "False", 1);
+    setenv("MAYA_GLMD_IDX_WMMA", "no", 1);
+    setenv("MAYA_GLMD_TOPK_MB", "AUTO", 1);
+    setenv("MAYA_GLMD_FUSED_SPLIT", "abc", 1);
     DecodePolicy p = decode_policy_env();
     CHECK(!p.fused_mla && !p.topk_hist && p.idx_wmma == kSwitchOff && p.topk_mb == kSwitchAuto);
     CHECK(p.fused_split == kFusedSplitDefault);
-    setenv("STRATA_GLMD_FUSED_MLA", "on", 1);
-    setenv("STRATA_GLMD_TOPK_HIST", "true", 1);
-    setenv("STRATA_GLMD_FUSED_SPLIT", "3", 1);
+    setenv("MAYA_GLMD_FUSED_MLA", "on", 1);
+    setenv("MAYA_GLMD_TOPK_HIST", "true", 1);
+    setenv("MAYA_GLMD_FUSED_SPLIT", "3", 1);
     p = decode_policy_env();
     CHECK(p.fused_mla && p.topk_hist && p.fused_split == 3);
-    for (const char* n : {"STRATA_GLMD_FUSED_MLA", "STRATA_GLMD_TOPK_HIST", "STRATA_GLMD_IDX_WMMA", "STRATA_GLMD_TOPK_MB",
-                          "STRATA_GLMD_FUSED_SPLIT"})
+    for (const char* n : {"MAYA_GLMD_FUSED_MLA", "MAYA_GLMD_TOPK_HIST", "MAYA_GLMD_IDX_WMMA", "MAYA_GLMD_TOPK_MB",
+                          "MAYA_GLMD_FUSED_SPLIT"})
         unsetenv(n);
 
     // the random-routing bench mode: a JSON false ("False") must leave it off (read once per process), so spec decode
     // stays allowed and the state fingerprint unmarked
-    setenv("STRATA_GLM_RANDOM_ROUTING", "False", 1);
-    CHECK(random_routing_seed() == 0 && !strata::core::glmspec::spec_bench_off());
-    unsetenv("STRATA_GLM_RANDOM_ROUTING");
+    setenv("MAYA_GLM_RANDOM_ROUTING", "False", 1);
+    CHECK(random_routing_seed() == 0 && !maya::core::glmspec::spec_bench_off());
+    unsetenv("MAYA_GLM_RANDOM_ROUTING");
 
     // the tier plan's string readers
-    namespace gt = strata::core::glmtier;
+    namespace gt = maya::core::glmtier;
     CHECK(gt::thp_mode("on") == 1 && gt::thp_mode("off") == 0 && gt::thp_mode("true") == 1 && gt::thp_mode("auto") == -1);
     CHECK(gt::thp_mode("bogus") == -1 && gt::thp_mode(nullptr) == -1);
     CHECK(gt::numa_split_requested(true, "on") && gt::numa_split_requested(true, "true"));
@@ -109,62 +109,62 @@ static void test_readers() {
     CHECK(!gt::numa_split_requested(false, "on"));
 
     // the state layout's index-key switches
-    setenv("STRATA_GLM_IDX_FP16", "off", 1);
-    setenv("STRATA_GLM_IDX_HADAMARD", "false", 1);
-    CHECK(!strata::core::glm_state_idx_fp16() && !strata::core::glm_state_idx_hadamard());
-    setenv("STRATA_GLM_IDX_FP16", "ON", 1);
-    setenv("STRATA_GLM_IDX_HADAMARD", "yes", 1);
-    CHECK(strata::core::glm_state_idx_fp16() && strata::core::glm_state_idx_hadamard());
-    unsetenv("STRATA_GLM_IDX_FP16");
-    unsetenv("STRATA_GLM_IDX_HADAMARD");
+    setenv("MAYA_GLM_IDX_FP16", "off", 1);
+    setenv("MAYA_GLM_IDX_HADAMARD", "false", 1);
+    CHECK(!maya::core::glm_state_idx_fp16() && !maya::core::glm_state_idx_hadamard());
+    setenv("MAYA_GLM_IDX_FP16", "ON", 1);
+    setenv("MAYA_GLM_IDX_HADAMARD", "yes", 1);
+    CHECK(maya::core::glm_state_idx_fp16() && maya::core::glm_state_idx_hadamard());
+    unsetenv("MAYA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_HADAMARD");
 
     // a default-on switch: "true" keeps it on (atoi read it as 0)
-    namespace gs = strata::core::glmpfs;
-    setenv("STRATA_GLM_PREFILL_STREAM", "true", 1);
+    namespace gs = maya::core::glmpfs;
+    setenv("MAYA_GLM_PREFILL_STREAM", "true", 1);
     CHECK(gs::stream_on(true));
-    setenv("STRATA_GLM_PREFILL_STREAM", "off", 1);
+    setenv("MAYA_GLM_PREFILL_STREAM", "off", 1);
     CHECK(!gs::stream_on(true));
-    unsetenv("STRATA_GLM_PREFILL_STREAM");
+    unsetenv("MAYA_GLM_PREFILL_STREAM");
     CHECK(gs::stream_on(true) && !gs::stream_on(false));
 }
 
-// B15.7 isolation (run as `glm_env_test --random-routing` with STRATA_GLM_RANDOM_ROUTING=1 set by ctest): the seed is
+// B15.7 isolation (run as `glm_env_test --random-routing` with MAYA_GLM_RANDOM_ROUTING=1 set by ctest): the seed is
 // on, spec_ready's gate says no, and a glm-dsa state fingerprint carries kGlmFpRandomRoute (a Flash layout does not)
 static int random_routing_mode() {
-    CHECK(glmd::random_routing_seed() == 7);   // STRATA_GLM_RANDOM_ROUTING_SEED=7
-    CHECK(strata::core::glmspec::spec_bench_off());
-    strata::core::Glm5Geometry g;
-    strata::core::GlmStateLayout lay;
-    lay.arch = strata::core::GlmArch::GlmDsa;
-    CHECK(strata::core::glm_state_fingerprint(g, lay)[0] == (strata::core::kGlmFpFormat | strata::core::kGlmFpRandomRoute));
-    lay.arch = strata::core::GlmArch::Glm5Next;
-    CHECK(strata::core::glm_state_fingerprint(g, lay)[0] == strata::core::kGlmFpFormat);
+    CHECK(glmd::random_routing_seed() == 7);   // MAYA_GLM_RANDOM_ROUTING_SEED=7
+    CHECK(maya::core::glmspec::spec_bench_off());
+    maya::core::Glm5Geometry g;
+    maya::core::GlmStateLayout lay;
+    lay.arch = maya::core::GlmArch::GlmDsa;
+    CHECK(maya::core::glm_state_fingerprint(g, lay)[0] == (maya::core::kGlmFpFormat | maya::core::kGlmFpRandomRoute));
+    lay.arch = maya::core::GlmArch::Glm5Next;
+    CHECK(maya::core::glm_state_fingerprint(g, lay)[0] == maya::core::kGlmFpFormat);
     std::printf("glm_env_test --random-routing: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
 }
 
-// STRATA_GLM_DSA_GRAPHS=1 meets a host-side switch: fast_layers_plain names it (graph_prepare logs it once a part and
+// MAYA_GLM_DSA_GRAPHS=1 meets a host-side switch: fast_layers_plain names it (graph_prepare logs it once a part and
 // counts the part-tokens), instead of a load log that said "on" while every token ran eagerly
 static void test_graph_host_off() {
-    using strata::core::glmdsa::host_off_reason;
+    using maya::core::glmdsa::host_off_reason;
     CHECK(host_off_reason(false, false, 0, 0, false) == nullptr);
-    CHECK(std::string(host_off_reason(true, true, 1, 1, true)).find("STRATA_GLM_PROF") != std::string::npos);
+    CHECK(std::string(host_off_reason(true, true, 1, 1, true)).find("MAYA_GLM_PROF") != std::string::npos);
     CHECK(std::string(host_off_reason(false, true, 0, 0, false)).find("GLM_CB_DIR") != std::string::npos);
-    CHECK(std::string(host_off_reason(false, false, 2, 0, false)).find("STRATA_GLM_PREFETCH_N") != std::string::npos);
-    CHECK(std::string(host_off_reason(false, false, 0, 1, false)).find("STRATA_GLM_AHEAD") != std::string::npos);
+    CHECK(std::string(host_off_reason(false, false, 2, 0, false)).find("MAYA_GLM_PREFETCH_N") != std::string::npos);
+    CHECK(std::string(host_off_reason(false, false, 0, 1, false)).find("MAYA_GLM_AHEAD") != std::string::npos);
     CHECK(std::string(host_off_reason(false, false, 0, 0, true)).find("GLM_DUMP_H") != std::string::npos);
     // a request that asks for no graphs (GEN graphs=0); a host switch still names itself first
     CHECK(host_off_reason(false, false, 0, 0, false, false) == nullptr);
     CHECK(std::string(host_off_reason(false, false, 0, 0, false, true)).find("graphs=0") != std::string::npos);
     const std::string first = host_off_reason(false, false, 1, 0, false, true);
-    CHECK(first.find("STRATA_GLM_PREFETCH_N") != std::string::npos);
+    CHECK(first.find("MAYA_GLM_PREFETCH_N") != std::string::npos);
     CHECK(first.find("prefetch_n=") != std::string::npos);   // (the count may be the request's, not the switch's)
 }
 
 // The speed plan's per-request knobs: what generate.cpp's GEN line hands to Request::take, and the store apply()
 // sets (apply itself needs a model; the store is what the readers see)
 static void test_request_knobs() {
-    namespace gk = strata::core::glmknob;
+    namespace gk = maya::core::glmknob;
     gk::Request r;
     CHECK(!r.named() && r.line().empty());
     CHECK(r.take("promote_min", "6") && r.take("prefetch_n", "1") && r.take("prefetch_at", "fetch"));

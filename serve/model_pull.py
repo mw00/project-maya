@@ -28,19 +28,22 @@ PROGRESS = re.compile(r"([\d.]+) / ([\d.]+) GB(?: \((\d+)%\))?(?: · ([\d.]+) MB
 # by its name): (catalog id, family, the setup's key, who made them).  The Models page lists them under "Other quants".
 # Left out as the setup's own list leaves them out: DeepSeek's UD-Q4_K_XL (maya.DS4_BY_HAND) and GLM's
 # EXL3-sc_4.10bpw (maya.MODELS_BY_HAND) - a command line still takes them.
-DS4_OTHER = (("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"), ("gguf-iq1_s", "unsloth"),
-             ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
+DS4_OTHER = (("exl3-2.25", "turboderp"), ("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"),
+             ("gguf-iq1_s", "unsloth"), ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
              ("gguf-iq3_xxs", "unsloth"), ("gguf-iq3_s", "unsloth"), ("gguf-q3_k_xl", "unsloth"),
              ("abliterated-128g", "orcarouter"), ("abliterated-256g", "orcarouter"))
 GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
 # (Qwen3.8-Flash-Next itself: unsloth's UD-IQ2_XS only - its other UD quants run on the same code but are not listed;
 #  the setup id: maya_quants.QWEN_UD_IDS[0])
 QWEN_OTHER = (("qwen-ud-iq2_xs", "qwen", "ud-iq2_xs", "unsloth"),)
+# (Inkling-2-Mini on maya-ik2, an experimental preview: unsloth's UD-Q4_K_XL - the setup id: maya_quants.IK2_IDS[0])
+IK2_OTHER = ((Q.IK2_IDS[0], "ik2", Q.IK2_QUANT, "unsloth"),)
 OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [("minimax-exl3", "minimax", "exl3", "Mia-AiLab")] +
-              [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER))
+              [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER) + list(IK2_OTHER))
 GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gated: the setup sends the user's HF token)
 EXL3_MIN_CC = 70                                     # (maya.DS4_MIN_CC / mm3_min_cc: the EXL3 quants from V100 on)
 QWEN_MIN_CC = 70                                     # (maya.QWEN_MIN_CC: the Qwen path from V100 on)
+IK2_MIN_CC = 70                                      # (maya.IK2_MIN_CC: maya-ik2's kernels, V100 / RTX 20 on)
 
 
 def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
@@ -53,6 +56,9 @@ def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
         return max(ccs) >= EXL3_MIN_CC                                  # maya-ds4's / maya-mm3's kernels, V100 on)
     if fam == "qwen" and backend != "hip" and ccs:                     # (unsloth's Qwen GGUF: the setup's check_pc)
         return max(ccs) >= QWEN_MIN_CC
+    if fam == "ik2":                                   # (Inkling-2-Mini: NVIDIA, Linux / Windows - check_pc)
+        return backend == "cuda" and (sys.platform.startswith("linux") or sys.platform == "win32") and \
+            (not ccs or max(ccs) >= IK2_MIN_CC)
     return True
 
 
@@ -60,6 +66,8 @@ def _note(fam: str, key: str, backend: str) -> str:
     out = []
     if key in GATED:
         out.append("gated repo: needs your Hugging Face token (HF_TOKEN or `hf auth login`)")
+    if fam == "ik2":
+        out.append("experimental preview: one NVIDIA GPU with 24 GB or more, Linux; text only")
     return "; ".join(out)
 
 
@@ -103,14 +111,22 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
         if isinstance(c.get("installer"), dict):
             have.add((Q.family_of(c), str(Q.config_key(c))))
     sizes = glm_sizes if glm_sizes is not None else _glm_sizes()
+    backend = (cfg or {}).get("backend") or "cuda"
+    ccs = _nvidia_ccs(backend) if ccs is None else ccs
+    # Hy4-Flash (maya-hy4): the sizes that are uploaded, on NVIDIA from V100 on only (no AMD or Mac engine yet)
+    hy4 = _hy4_downloads() if backend not in ("hip", "metal") and (not ccs or max(ccs) >= HY4_MIN_CC) else {}
     out = []
     for fam, key, _tier, ident in Q.QUANTS:
+        if fam == "hy4":
+            if key in hy4:
+                out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya",
+                            "note": "text only", "installed": (fam, key) in have,
+                            "size_gb": round(float(hy4[key]["download_gb"]), 1) if hy4[key].get("download_gb") else None})
+            continue
         out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya", "note": "",
                     "installed": (fam, key) in have, "size_gb": sizes.get(key)})
     out.append({"id": "cyber-frost", "family": "qwen", "name": Q.shown("qwen", "q5_k_m"), "group": "maya",
                 "by": "peasantsmith", "note": "", "installed": ("qwen", "q5_k_m") in have, "size_gb": None})
-    backend = (cfg or {}).get("backend") or "cuda"
-    ccs = _nvidia_ccs(backend) if ccs is None else ccs
     extra = other_sizes if other_sizes is not None else (_other_sizes() if glm_sizes is None else {})
     for ident, fam, key, by in OTHER:
         if not _offered(fam, key, backend, ccs):
@@ -144,6 +160,20 @@ def _g53_downloads() -> dict:
         return {}
 
 
+HY4_MIN_CC = 70                                      # (maya.HY4_MIN_CC: maya-hy4's kernels, V100 on)
+
+
+def _hy4_downloads() -> dict:
+    """Hy4-Flash's downloads, by the setup's key ("maya-xs"): the sizes whose files are uploaded (maya.hy4_published),
+    each as maya.hy4_entry says it - a size is listed the day its files are, by the setup's data alone."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import maya                                    # (the setup's own table; nothing runs on import)
+        return {k: maya.hy4_entry(k) for k in maya.HY4_QUANTS if maya.hy4_published(k)}
+    except (Exception, SystemExit):  # noqa: BLE001 - a manifest not readable: not offered
+        return {}
+
+
 _other_gb: dict = {}
 
 
@@ -173,6 +203,9 @@ def _other_sizes() -> dict:
             elif fam == "qwen":                        # (its files and the vision tower the setup fetches with them)
                 vision = maya.qwen_vision_model()
                 gb = maya.qwen_entry(key)["download_gb"] + (vision["download_gb"] if vision else 0)
+            elif fam == "ik2":                         # (the GGUF, the vision tower and the drafter the setup fetches)
+                vision, drafter = maya.ik2_vision_model(), maya.ik2_drafter_model()
+                gb = maya.ik2_entry()["download_gb"] + sum(x["download_gb"] for x in (vision, drafter) if x)
             else:
                 continue                               # (GLM's: the MODELS table, as Maya's own)
             _other_gb[ident] = round(float(gb), 1)
@@ -198,7 +231,7 @@ def setup_command(model_id: str, cfg: dict | None) -> list:
         which = ["--model", model_id]
     elif other[0] == "glm":                            # (a GLM download by its name)
         which = ["--model", other[1]]
-    elif other[0] == "qwen":                           # (its setup id: maya_quants.QWEN_UD_IDS)
+    elif other[0] in ("qwen", "ik2"):                  # (their setup ids: maya_quants.QWEN_UD_IDS, IK2_IDS)
         which = ["--model", model_id]
     else:                                              # (the model, its files by --ds4-quant / --mm3-quant)
         which = ["--model", Q.MODEL[other[0]], "--ds4-quant" if other[0] == "deepseek" else "--mm3-quant", other[1]]

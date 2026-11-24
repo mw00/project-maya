@@ -18,9 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_ple_postops.hpp"
-#include "strata/kernels/native_gr_norm.hpp"
-#include "strata/kernels/ngram.hpp"
+#include "maya/kernels/native_ple_postops.hpp"
+#include "maya/kernels/native_gr_norm.hpp"
+#include "maya/kernels/ngram.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
 __device__ float warp_sum(float x) {
@@ -218,4 +218,4 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     history_batch_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T);
     launch_check();
 }
-} // namespace strata::kernels
+} // namespace maya::kernels

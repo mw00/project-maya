@@ -8,8 +8,8 @@
 // and the committed references in data/glm-dsa/ (raw float32, (n_tokens, n_vocab) row-major; token i of every
 // reference is (i * 37 + 11) % n_vocab).
 //
-// The interpreter is $STRATA_PYTHON, else python3; gguf-py must be importable (the ctest registration puts
-// ${STRATA_GGML_DIR}/gguf-py on PYTHONPATH).  Fixtures land in $STRATA_GLMD_FIXTURES, else <tmp>/glm_dsa_fixtures, and
+// The interpreter is $MAYA_PYTHON, else python3; gguf-py must be importable (the ctest registration puts
+// ${MAYA_GGML_DIR}/gguf-py on PYTHONPATH).  Fixtures land in $MAYA_GLMD_FIXTURES, else <tmp>/glm_dsa_fixtures, and
 // are reused while their sha256 (synthetic GGUFs) or their marker file (packs) says they are current.
 #pragma once
 
@@ -22,50 +22,51 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "glm_test_env.hpp"   // setenv / unsetenv (the pack switch below)
 
-#ifndef STRATA_SOURCE_DIR
-#define STRATA_SOURCE_DIR "."
+#ifndef MAYA_SOURCE_DIR
+#define MAYA_SOURCE_DIR "."
 #endif
 
 namespace glmfx {
 
 namespace fs = std::filesystem;
 
-inline fs::path src_dir() { return fs::path(STRATA_SOURCE_DIR); }
+inline fs::path src_dir() { return fs::path(MAYA_SOURCE_DIR); }
 inline fs::path data_dir() { return src_dir() / "data" / "glm-dsa"; }
 inline fs::path fixture_dir() {
-    const char* fx = std::getenv("STRATA_GLMD_FIXTURES");
+    const char* fx = std::getenv("MAYA_GLMD_FIXTURES");
     const fs::path d = fx != nullptr && fx[0] != '\0' ? fs::path(fx) : fs::temp_directory_path() / "glm_dsa_fixtures";
     std::error_code ec;
     fs::create_directories(d, ec);
     return d;
 }
 inline std::string python() {
-    const char* p = std::getenv("STRATA_PYTHON");
+    const char* p = std::getenv("MAYA_PYTHON");
     return p != nullptr && p[0] != '\0' ? p : "python3";
 }
 inline std::string q(const fs::path& p) { return "\"" + p.string() + "\""; }
 
-/// A fixture tool failed (no numpy / gguf-py for $STRATA_PYTHON, a missing script). Without a CUDA device the test
+/// A fixture tool failed (no numpy / gguf-py for $MAYA_PYTHON, a missing script). Without a CUDA device the test
 /// skips (77). With one it FAILS (1): on the test PC a forward-parity gate must not show as Skipped because the Python
-/// side is missing (docs/strata/volta3/BRINGUP.md). STRATA_GLMD_FIXTURES_OPTIONAL=1 restores the skip.
+/// side is missing (docs/strata/volta3/BRINGUP.md). MAYA_GLMD_FIXTURES_OPTIONAL=1 restores the skip.
 inline int fixture_missing(const char* test, const std::string& why) {
     int n = 0;
     const bool device = cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
     cudaGetLastError();
-    const char* opt = std::getenv("STRATA_GLMD_FIXTURES_OPTIONAL");
+    const char* opt = std::getenv("MAYA_GLMD_FIXTURES_OPTIONAL");
     if (!device || (opt != nullptr && opt[0] == '1')) {
         std::printf("%s: SKIP - %s\n", test, why.c_str());
         return 77;
     }
     std::printf("%s: FAIL - a CUDA device is present but the fixture failed: %s\n"
-                "  (point STRATA_PYTHON at a Python with numpy and gguf-py, e.g. ~/strata-venv/bin/python; "
-                "STRATA_GLMD_FIXTURES_OPTIONAL=1 skips instead)\n", test, why.c_str());
+                "  (point MAYA_PYTHON at a Python with numpy and gguf-py, e.g. ~/strata-venv/bin/python; "
+                "MAYA_GLMD_FIXTURES_OPTIONAL=1 skips instead)\n", test, why.c_str());
     return 1;
 }
 
@@ -109,15 +110,23 @@ inline std::string committed_sha(const std::string& stem) {
     return "";
 }
 
-/// sha256 of a file through the interpreter (hashlib; no extra dependency).
+/// sha256 of a file through the interpreter (hashlib; no extra dependency).  The hash goes through a file of this
+/// call's own: one shared <gguf>.sha, truncated by another test's check of the same GGUF while this one read it, read
+/// back empty - a "mismatch" that regenerated the GGUF in place, made every pack built from it stale and had them
+/// rebuilt under the tests reading them (the likely way to ctest -j4's garbage cache rows in
+/// glm_dsa_prefill_decode_test_native32; ctest also runs the fixture tests one at a time: RESOURCE_LOCK, 90-ci-tests).
 inline std::string sha256(const fs::path& p, const fs::path& log) {
-    const fs::path out = p.string() + ".sha";
+    const fs::path out = p.string() + "." + std::to_string(std::random_device{}()) + ".sha";
     const std::string c = python() + " -c \"import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())\" " +
                           q(p) + " > " + q(out) + " 2>> " + q(log);
-    if (std::system(c.c_str()) != 0) return "";
-    std::ifstream f(out);
+    const bool ok = std::system(c.c_str()) == 0;
     std::string h;
-    f >> h;
+    if (ok) {
+        std::ifstream f(out);
+        f >> h;
+    }
+    std::error_code ec;
+    fs::remove(out, ec);
     return h;
 }
 
@@ -160,13 +169,13 @@ inline fs::path pack(const fs::path& gguf, std::string& why) {
     }
     std::error_code ec;
     fs::remove_all(out, ec);
-    // the fixtures' pack keeps W_kb / W_vb in BF16 as the tests were written against (STRATA_PACK_NATIVE32=0); the
+    // the fixtures' pack keeps W_kb / W_vb in BF16 as the tests were written against (MAYA_PACK_NATIVE32=0); the
     // pack's default (native Q8_0) is the --native32 pack of glm_dsa_prefill_decode_test
-    setenv("STRATA_PACK_NATIVE32", "0", 1);
+    setenv("MAYA_PACK_NATIVE32", "0", 1);
     const bool packed = run(python() + " " + q(src_dir() / "tools" / "iq_pack.py") + " --gguf " + q(gguf) + " --out " +
                                 q(out),
                             log);
-    unsetenv("STRATA_PACK_NATIVE32");
+    unsetenv("MAYA_PACK_NATIVE32");
     if (!packed) {
         why = "tools/iq_pack.py on " + gguf.filename().string() + " failed (see " + log.string() + ")";
         return {};

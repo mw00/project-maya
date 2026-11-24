@@ -11,7 +11,7 @@ NaN or garbage logits pass it. This wrapper runs it (GLM_TEST_IDS=--ids when giv
 * always: one row per token, every value finite, every row with a nonzero spread (max - min > 1e-3);
 * with --ref-logits (llm_logits_dump on the same ids: n_rows x n_vocab float32, row i = the logits after id i):
   top-1 agreement >= --min-top1 and mean KL(ref || engine) over the common vocabulary <= --max-kl (defaults are
-  the M1a numbers, BUILD-PLAN section 6; the M1a gate itself uses top-64 + rest KL through STRATA_GLM_SCORE);
+  the M1a numbers, BUILD-PLAN section 6; the M1a gate itself uses top-64 + rest KL through MAYA_GLM_SCORE);
 * without a reference the run FAILS unless --informational is given (then it is a smoke run: finiteness only).
 
 Exit: 0 pass, 1 fail, 2 usage, 77 glm_pack_test returned 77.

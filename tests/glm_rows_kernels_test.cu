@@ -1,4 +1,4 @@
-// tests/glm_rows_kernels_test.cu - the batched rows' one-launch kernels (glm_rows.cu, STRATA_GLM_ROWS_BATCH) against
+// tests/glm_rows_kernels_test.cu - the batched rows' one-launch kernels (glm_rows.cu, MAYA_GLM_ROWS_BATCH) against
 // the per-row kernels the rows take without it, on random inputs (needs a GPU, no model), compared bitwise:
 //  - hc_rows over n rows (each its own args, partials and counter) against hc() for each row alone: R_new, pre, post,
 //    comb, x and xq, with and without a previous block's output to fold in;
@@ -6,7 +6,7 @@
 //    kda_prep + kda_rec for each row alone: the conv outputs, g1 / g2, both states and the q8_1 output;
 //  - mv_nt for 2 .. kMaxMvNt activations (past 8: in groups of 8) against mv() for each activation alone, BF16 and
 //    Q8_0 weights.
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@
 #include <random>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace {
 

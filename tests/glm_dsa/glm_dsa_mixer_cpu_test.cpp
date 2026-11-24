@@ -9,7 +9,7 @@
 //   * correct, FP16 latents: max rel L2 < 5e-3, the top-k sets equal the reference's once p + 1 > top_k, and the
 //     recorded n_sel_last = min(p + 1, top_k) on every full layer;
 //   * correct, INT8 latents (Maya's record): max rel L2 < 3e-2;
-//   * the dense switch (STRATA_GLM_DSA_DENSE) against a reference attending every cell: max rel L2 < 5e-3, and it
+//   * the dense switch (MAYA_GLM_DSA_DENSE) against a reference attending every cell: max rel L2 < 5e-3, and it
 //     differs from the sparse reference once selection is active;
 //   * each named wrong reading (NEOX pairing, q_pe rope at offset 0, indexer LayerNorm eps 0, shared layers run as
 //     full, scale 1/sqrt(qk_nope)) must FAIL the correct gate by a wide margin;
@@ -110,9 +110,9 @@ void suite(const char* name, const mixfx::Model& m, bool full_suite = true) {
 
 int main() {
     std::printf("glm_dsa_mixer_cpu_test: the glm-dsa decode mixer (glmdsa::mixer_layer) on the CPU twins\n");
-    check(strata::core::glmdsa::sel_count(0, 2048, false) == 1 && strata::core::glmdsa::sel_count(2047, 2048, false) == 2048 &&
-              strata::core::glmdsa::sel_count(2048, 2048, false) == 2048 &&
-              strata::core::glmdsa::sel_count(5000, 2048, true) == 5001,
+    check(maya::core::glmdsa::sel_count(0, 2048, false) == 1 && maya::core::glmdsa::sel_count(2047, 2048, false) == 2048 &&
+              maya::core::glmdsa::sel_count(2048, 2048, false) == 2048 &&
+              maya::core::glmdsa::sel_count(5000, 2048, true) == 5001,
           "sel_count: identity to 2048 cells, then 2048; dense p + 1");
     {
         const std::vector<bool> pat = {true, false, false, true, false, false, true};

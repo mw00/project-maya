@@ -1,11 +1,11 @@
 // src/core/glm_maya_sync.cpp - the glm-dsa port W10: Maya v1.1.3's new features against the glm-dsa arch
-// (include/strata/core/glm_maya_sync.hpp, docs/strata/engine/MAYA-SYNC.md).
-#include "strata/core/glm_maya_sync.hpp"
+// (include/maya/core/glm_maya_sync.hpp, docs/strata/engine/MAYA-SYNC.md).
+#include "maya/core/glm_maya_sync.hpp"
 
 #include <cstdio>
 #include <cstring>
 
-namespace strata::core {
+namespace maya::core {
 
 bool glm_exl3_ok(GlmArch a, std::string& err) {
     if (a != GlmArch::GlmDsa) return true;
@@ -15,10 +15,9 @@ bool glm_exl3_ok(GlmArch a, std::string& err) {
 }
 
 bool glm_dflash_ok(GlmArch a, std::string& err) {
-    if (a != GlmArch::GlmDsa) return true;
-    err = "glm dflash: the DFlash2 drafter is made for GLM-5.3-Flash (its hidden-state taps and vocabulary); GLM-5.3 "
-          "744B (glm-dsa) drafts with its NextN block - unset STRATA_GLM_DFLASH / --dflash";
-    return false;
+    (void) a;   // GLM-5.3 744B drafts with its own DFlash2 drafter too (its taps: the plain residual, glm_residual.cu)
+    err.clear();
+    return true;
 }
 
 bool glm_rows_ok(GlmArch a) { return a != GlmArch::GlmDsa; }
@@ -55,4 +54,4 @@ std::string glm_profile_hint(GlmArch a, int64_t profile_layers, int64_t n_expert
     return buf;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

@@ -14,7 +14,7 @@
 //
 // S2 IS SPECIALISED DELIBERATELY: it is 31.64 GiB of the 38 GiB pack, so it is the kernel that matters.  The
 // generic `s_gemv_split` still serves S4 and S8.
-#include "strata/kernels/s_gemv.hpp"
+#include "maya/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -22,7 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 // QK = 64 elements per group; a quad of 4 elements is 1/16 of a group, so
@@ -90,4 +90,4 @@ void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales,
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

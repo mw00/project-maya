@@ -30,8 +30,8 @@
 | live server (multi-turn, 60-150 token answers) | 30 -> 39 -> 42 tok/s as the tiers warm (was 31-34) |
 
 Tried and measured NOT faster on the 2x V100 PC (kept, off by default): reading predicted disk-only experts ahead in decode
-(STRATA_GLM_AHEAD - only ~40% of disk misses are predictable within 4 layers, the wasted reads share the one NVMe),
-and in the prompt path reading the next layer's whole disk-only set ahead (STRATA_GLM_PREFILL_PRED_T - a 2k chunk
+(MAYA_GLM_AHEAD - only ~40% of disk misses are predictable within 4 layers, the wasted reads share the one NVMe),
+and in the prompt path reading the next layer's whole disk-only set ahead (MAYA_GLM_PREFILL_PRED_T - a 2k chunk
 leaves ~40% of them unrouted).  A CPU expert path is slower than the PCIe pull on this Xeon (1.4 vs 0.56 ms an expert).
 Cache policy: replaying 1000 tokens of routes, LRU = LFU (97.7 / 96.4% per GPU) and even Belady's optimum only
 reaches 98.6 / 98.0% - the misses are capacity (30 GB RAM), not policy.
@@ -43,7 +43,7 @@ PCIe ~0.56 ms an expert, disk reads ~3.1 ms) - the two halves wait on each other
 
 | mode | ms/token | tok/s | drafts accepted |
 |---|---|---|---|
-| plain (STRATA_GLM_NO_SPEC=1) | 38.1 | 26.2 | - |
+| plain (MAYA_GLM_NO_SPEC=1) | 38.1 | 26.2 | - |
 | speculative, split 22 | 27.6 | 36.3 | 99% |
 | speculative, split 24 (default) | 25.0 | 40.0 | 97% |
 
@@ -59,9 +59,9 @@ is Part 2).  TTFT 13 s for ~880 prompt tokens, 33 s for ~3.5k.
 
 ## Reproduce (the 2x V100 PC)
 
-    STRATA_GLM_RAM_GB=20 STRATA_GLM_SPLIT=24 build/strata --glm-pack <pack> --max-context 8192 --greedy --max-new 300 --tokens <ids>
-    (STRATA_GLM_NO_SPEC=1 for the plain loop; STRATA_GLM_SPEC_PROF=1 prints the per-step host phases;
-     STRATA_GLM_PREFILL_VERBOSE=1 / STRATA_GLM_PREFILL_PROF=1 for the prompt path)
+    MAYA_GLM_RAM_GB=20 MAYA_GLM_SPLIT=24 build/strata --glm-pack <pack> --max-context 8192 --greedy --max-new 300 --tokens <ids>
+    (MAYA_GLM_NO_SPEC=1 for the plain loop; MAYA_GLM_SPEC_PROF=1 prints the per-step host phases;
+     MAYA_GLM_PREFILL_VERBOSE=1 / MAYA_GLM_PREFILL_PROF=1 for the prompt path)
 
-Pinning `STRATA_GLM_RAM_GB` makes runs bit-reproducible: the RAM tier's size otherwise follows MemAvailable, which moves
+Pinning `MAYA_GLM_RAM_GB` makes runs bit-reproducible: the RAM tier's size otherwise follows MemAvailable, which moves
 experts between staging groups and changes MMQ's stream-k summation order in the prompt path.

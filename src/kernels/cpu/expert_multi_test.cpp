@@ -6,7 +6,7 @@
 //
 // The bench measures the speculation model's `extra_use_cost`: the CPU time of each extra token routed to an
 // expert, as a fraction of reading the expert once (tools/spec_economics.py assumes 0.2).
-#include "strata/kernels/cpu/expert.hpp"
+#include "maya/kernels/cpu/expert.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -15,7 +15,7 @@
 #include <random>
 #include <vector>
 
-namespace c = strata::kernels::cpu;
+namespace c = maya::kernels::cpu;
 
 namespace {
 void make_blob(uint8_t* b, std::mt19937& rng) {

@@ -1,5 +1,5 @@
 """tools/strata/test_parity_compare.py - the B7.4a / M2 parity numbers and gates (tools/strata/parity_compare.py) on
-synthetic logits: the KL equals generate.cpp's STRATA_GLM_SCORE_TOPK loop, full and top-k references agree, row offsets
+synthetic logits: the KL equals generate.cpp's MAYA_GLM_SCORE_TOPK loop, full and top-k references agree, row offsets
 line up, near-ties are found, and the gate applies BUILD-PLAN section 6 (M2, M2-alt) and B7.4a."""
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import llama_to_score_ref as conv  # noqa: E402
 import parity_compare as pc  # noqa: E402
 from test_llama_to_score_ref import engine_score_topk  # noqa: E402
 
-V, N, C = 300, 40, 10          # vocab, tokens, STRATA_GLM_SCORE context
+V, N, C = 300, 40, 10          # vocab, tokens, MAYA_GLM_SCORE context
 
 
 def log_softmax(x):
@@ -48,7 +48,7 @@ class Fixture:
         self.ref.tofile(self.ref_bin)
         self.topk = d / f"ref{seed}.topk"
         conv.convert(str(self.ref_bin), V, self.tokens, C, str(self.topk), "topk", 64, None)
-        self.dump = d / f"eng{seed}.lsm"        # the engine's STRATA_GLM_SCORE_DUMP: rows C .. N-2
+        self.dump = d / f"eng{seed}.lsm"        # the engine's MAYA_GLM_SCORE_DUMP: rows C .. N-2
         log_softmax(self.eng[C:N - 1]).astype("<f4").tofile(self.dump)
 
 

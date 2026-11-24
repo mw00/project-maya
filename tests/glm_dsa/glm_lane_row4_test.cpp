@@ -20,8 +20,8 @@
 // `glm_lane_row4_test --bench [seconds]` adds a single-thread microbenchmark: GB/s of weight rows streamed by ggml's
 // vec_dot loop vs row4_rows, for an L2-resident (~1 MB) and a DRAM-sized (~192 MB) matrix: 6144-wide rows (GLM-5.3's
 // gate/up rows, IQ1_S among them) and IQ4_XS at 2048 (its down rows).
-#include "strata/kernels/cpu/glm_lane_row4.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/kernels/cpu/glm_lane_row4.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -38,7 +38,7 @@
 #include <utility>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 namespace {
 
@@ -257,7 +257,7 @@ struct HookCase {
 };
 
 void test_hooks(std::mt19937& rng) {
-    std::printf("lane hooks (native_gu_rows_split / native_down_rows_split, nt = 1), STRATA_GLM_LANE_ROW4 off vs on:\n");
+    std::printf("lane hooks (native_gu_rows_split / native_down_rows_split, nt = 1), MAYA_GLM_LANE_ROW4 off vs on:\n");
     std::vector<HookCase> hc;
     for (int i = 0; i < kNTypes; ++i) hc.push_back({i, (i + 3) % kNTypes, 1024, 768});   // every type as gu and down
     hc.push_back({type_index(19), type_index(23), 6144, 2048});   // the served pair at GLM-5.3's expert shape
@@ -364,7 +364,7 @@ void test_setter(std::mt19937& rng, bool env_on) {
     check(kc::lane_row4_on() && kc::lane_row4_types() == kc::kRow4AllTypes, "override(1) after set(0): on, mask kept");
     kc::lane_row4_set(-1);
     check(kc::lane_row4_on() == env_on && kc::lane_row4_types() == kc::kRow4AllTypes,
-          "set(-1): back to STRATA_GLM_LANE_ROW4, every type");
+          "set(-1): back to MAYA_GLM_LANE_ROW4, every type");
     std::printf("  done\n");
 }
 
@@ -438,7 +438,7 @@ int main(int argc, char** argv) {
     }
     ggml_cpu_init();
     const bool env_on = kc::lane_row4_on();
-    std::printf("glm_lane_row4_test (B14.9); ggml-cpu avx2=%d fma=%d f16c=%d; STRATA_GLM_LANE_ROW4 now %s\n",
+    std::printf("glm_lane_row4_test (B14.9); ggml-cpu avx2=%d fma=%d f16c=%d; MAYA_GLM_LANE_ROW4 now %s\n",
                 ggml_cpu_has_avx2(), ggml_cpu_has_fma(), ggml_cpu_has_f16c(), env_on ? "on" : "off");
     std::mt19937 rng(20261012);
     test_rows(rng);

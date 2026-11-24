@@ -10,10 +10,10 @@
 // WMMA scorer rounds products to FP16: near-ties may swap).
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
 #include "glm_prefill_dsa.hpp"
-#include "strata/core/glm_state_layout.hpp"
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_forward.hpp"
+#include "maya/core/glm_state_layout.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_forward.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 
@@ -30,7 +30,7 @@
 #include <random>
 #include <vector>
 
-using namespace strata::core;
+using namespace maya::core;
 
 namespace {
 
@@ -455,8 +455,8 @@ int main() {
             std::printf("state carve: %s\n", err.c_str());
             return 1;
         }
-        if (c.ratio) setenv("STRATA_GLMD_GATHER_RATIO", c.ratio, 1);
-        else unsetenv("STRATA_GLMD_GATHER_RATIO");
+        if (c.ratio) setenv("MAYA_GLMD_GATHER_RATIO", c.ratio, 1);
+        else unsetenv("MAYA_GLMD_GATHER_RATIO");
         const auto x = randn((size_t) Tall * E, 1.0f);
         const Run b = batched(g, lay, dsa, x, c.chunks, blas);
         const Run t = token(lay, W, x, blas);

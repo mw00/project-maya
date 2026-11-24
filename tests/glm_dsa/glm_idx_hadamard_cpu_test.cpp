@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_idx_hadamard_cpu_test.cpp - glm-dsa B14.11 (CPU only): the 128-point Walsh-Hadamard rotation of the
-// glm-dsa indexer keys and queries (STRATA_GLM_IDX_HADAMARD, GlmStateLayout::ik_had).
+// glm-dsa indexer keys and queries (MAYA_GLM_IDX_HADAMARD, GlmStateLayout::ik_had).
 //   1. the transform: orthonormal (norm kept, H H x = x), ik's order and scale, the kernels' serial bits;
 //   2. scores: dsa_prep (keys) + dsa_rope_q (queries) + idx_score through the twins with and without the rotation are
 //      equal within float rounding, for F32 keys, at GLM-5.3's 32 x 128 indexer;
@@ -12,11 +12,11 @@
 //      fingerprint differs by kGlmFpIdxHad (a slot from one setting is refused by the other), an idx_key that is not
 //      a power of two is refused by name, Flash never rotates.
 #include "glm_dsa_mixer_fixture.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
-#include "strata/kernels/glmd_decode_policy.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_mixer.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_mixer.hpp"
 
 #include "../../src/kernels/cuda/glmd_had.cuh"
 
@@ -290,8 +290,8 @@ void test_mixer(const char* name, const mixfx::MixerDims& d, const std::vector<b
 }
 
 // ---------------------------------------------------------------- 5. the state layout
-strata::core::Glm5Geometry glm53(int idx_key = 128) {
-    using namespace strata::core;
+maya::core::Glm5Geometry glm53(int idx_key = 128) {
+    using namespace maya::core;
     Glm5Geometry g;
     g.arch = GlmArch::GlmDsa;
     g.n_embd = 6144;
@@ -320,43 +320,43 @@ strata::core::Glm5Geometry glm53(int idx_key = 128) {
 }
 
 void test_layout() {
-    using namespace strata::core;
+    using namespace maya::core;
     std::printf("[5. the state layout and the slot fingerprint]\n");
-    unsetenv("STRATA_GLM_IDX_HADAMARD");
-    unsetenv("STRATA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_HADAMARD");
+    unsetenv("MAYA_GLM_IDX_FP16");
     const Glm5Geometry g = glm53();
     std::string err;
     GlmStateLayout off, on, on8, onS, on16;
     check(!glm_state_idx_hadamard() && glm_state_carve(g, 0, 26, 78, 4096, GlmStateMode::Fp16, 0, off, err) &&
               off.ik_had == 0,
           "default: no rotation");
-    setenv("STRATA_GLM_IDX_HADAMARD", "1", 1);
+    setenv("MAYA_GLM_IDX_HADAMARD", "1", 1);
     check(glm_state_idx_hadamard() && glm_state_carve(g, 0, 26, 78, 4096, GlmStateMode::Fp16, 0, on, err) &&
               glm_state_carve(g, 0, 26, 78, 4096, GlmStateMode::Int8, 0, on8, err) &&
               glm_state_carve(g, 0, 26, 78, 4096, GlmStateMode::SlowF32, 0, onS, err) && on.ik_had == 1 &&
               on8.ik_had == 1 && onS.ik_had == 0,
-          "STRATA_GLM_IDX_HADAMARD=1: FP16 / INT8 carves rotate, the slow F32 reference does not");
+          "MAYA_GLM_IDX_HADAMARD=1: FP16 / INT8 carves rotate, the slow F32 reference does not");
     check(on.bytes == off.bytes && on.ik_pp == off.ik_pp, "the rotation costs no state bytes");
     const GlmStateFingerprint f0 = glm_state_fingerprint(g, off), f1 = glm_state_fingerprint(g, on);
     check(f0 != f1 && f1[10] == (4 | kGlmFpIdxHad) && f0[10] == 4,
           "fingerprint word 10: 4 unrotated, 4 | 0x100 rotated (a slot of one setting is refused by the other)");
-    setenv("STRATA_GLM_IDX_FP16", "1", 1);
+    setenv("MAYA_GLM_IDX_FP16", "1", 1);
     check(glm_state_carve(g, 0, 26, 78, 4096, GlmStateMode::Fp16, 0, on16, err) && on16.ik_had == 1 &&
               glm_state_fingerprint(g, on16)[10] == (2 | kGlmFpIdxHad) &&
               on16.describe().find("Hadamard-rotated") != std::string::npos,
           "with FP16 keys: word 10 = 2 | 0x100, the load line names the rotation");
-    unsetenv("STRATA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_FP16");
     GlmStateLayout bad;
     err.clear();
     const bool refused = !glm_state_carve(glm53(96), 0, 26, 78, 4096, GlmStateMode::Fp16, 0, bad, err);
-    check(refused && err.find("STRATA_GLM_IDX_HADAMARD") != std::string::npos, "idx_key 96 is refused by name: " + err);
+    check(refused && err.find("MAYA_GLM_IDX_HADAMARD") != std::string::npos, "idx_key 96 is refused by name: " + err);
     Glm5Geometry flash = g;
     flash.arch = GlmArch::Glm5Next;
     GlmStateLayout fl;
     std::string ferr;
     const bool fok = glm_state_carve(flash, 0, 1, -1, 1024, GlmStateMode::Fp16, 1024, fl, ferr);
     check(!fok || fl.ik_had == 0, "Flash never rotates" + (fok ? std::string() : " (its carve refused: " + ferr + ")"));
-    unsetenv("STRATA_GLM_IDX_HADAMARD");
+    unsetenv("MAYA_GLM_IDX_HADAMARD");
 }
 
 }  // namespace

@@ -23,6 +23,7 @@ from serve.frontend import ChatTemplate  # noqa: E402
 from serve.responses import normalize_request  # noqa: E402
 from serve.server import (LOGPROB_FLOOR, ByteTokenizer, LpToken, MockEngine, Service, StrataEngine,  # noqa: E402
                           logprobs_of, parse_lp, serve)
+from serve.test_multi import FAKE, script_exe  # noqa: E402  (the fake engine, on Windows too)
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 8192
@@ -132,7 +133,7 @@ class SeveralConversations(unittest.TestCase):
     not ask gets plain tokens (serve/fake_multi_engine.py writes LP lines only for a GEN with logprobs=)."""
 
     def setUp(self):
-        self.engine = StrataEngine(str(ROOT / "serve/fake_multi_engine.py"), ["2"])
+        self.engine = StrataEngine(script_exe(FAKE), ["2"])
 
     def tearDown(self):
         self.engine.close()

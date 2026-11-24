@@ -10,8 +10,8 @@
 //      residual pair); INT8 records 544 B and every region 16-byte aligned; open_rows() == 0 (no snap_pool_);
 //      slot runs cover exactly the first n positions of each cache; the fingerprint differs from Flash's and between
 //      FP16 and INT8; a 3-part split's arenas sum to the single-part caches.
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,11 +20,11 @@
 #include <utility>
 #include <vector>
 
-using strata::core::GlmArch;
-using strata::core::GlmIdxKind;
-using strata::core::GlmStateLayout;
-using strata::core::GlmStateMode;
-using strata::core::Glm5Geometry;
+using maya::core::GlmArch;
+using maya::core::GlmIdxKind;
+using maya::core::GlmStateLayout;
+using maya::core::GlmStateMode;
+using maya::core::Glm5Geometry;
 
 namespace {
 
@@ -191,19 +191,19 @@ int main() {
         for (int64_t ctx : {(int64_t) 4096, (int64_t) 8192 + 64, (int64_t) 131072}) {
             const std::string at = " (ctx " + std::to_string(ctx) + ")";
             GlmStateLayout L;
-            bool ok = strata::core::glm_state_carve(g, 0, g.n_layers, -1, ctx, GlmStateMode::SlowF32, (int) ctx, L, err);
+            bool ok = maya::core::glm_state_carve(g, 0, g.n_layers, -1, ctx, GlmStateMode::SlowF32, (int) ctx, L, err);
             check(ok && same(old_load(g, ctx), L, true), "Flash load(): offsets, ring and bytes equal Maya's" + at);
             const int split = 22;
             for (int mode = 0; mode < 3; ++mode) {
                 const GlmStateMode m = (GlmStateMode) mode;
-                const int ring = mode ? strata::core::glm_state_fast_ik_ring(ctx) : (int) ctx;
+                const int ring = mode ? maya::core::glm_state_fast_ik_ring(ctx) : (int) ctx;
                 const struct { int l0, l1, mtp; } parts[] = {{0, g.n_layers, -1}, {0, g.n_layers, g.n_layers},
                                                              {0, split, -1}, {split, g.n_layers, g.n_layers}};
                 for (const auto& p : parts) {
                     const std::string what = "Flash load_pack mode " + std::to_string(mode) + " [" +
                                              std::to_string(p.l0) + "," + std::to_string(p.l1) + ") mtp " +
                                              std::to_string(p.mtp) + at;
-                    ok = strata::core::glm_state_carve(g, p.l0, p.l1, p.mtp, ctx, m, ring, L, err);
+                    ok = maya::core::glm_state_carve(g, p.l0, p.l1, p.mtp, ctx, m, ring, L, err);
                     const OldLayout o = old_pack(g, ctx, p.l0, p.l1, p.mtp, mode);
                     check(ok && same(o, L, false), what + ": offsets, ring and bytes");
                     bool runs_ok = true;
@@ -221,7 +221,7 @@ int main() {
             }
             // the split search's price: whole-context rings, FP16 on the fast path, F32 on the slow one
             for (bool fast : {false, true}) {
-                ok = strata::core::glm_state_carve(g, 0, g.n_layers, g.n_layers, ctx,
+                ok = maya::core::glm_state_carve(g, 0, g.n_layers, g.n_layers, ctx,
                                                    fast ? GlmStateMode::Fp16 : GlmStateMode::SlowF32, (int) ctx, L, err);
                 bool price_ok = ok;
                 for (int l = 0; l <= g.n_layers; ++l)
@@ -230,7 +230,7 @@ int main() {
             }
         }
         const GlmStateLayout L0;
-        check(strata::core::glm_slot_magic(L0) == 0x3254534C4159414Dull, "Flash slots stay MAYALST2");
+        check(maya::core::glm_slot_magic(L0) == 0x3254534C4159414Dull, "Flash slots stay MAYALST2");
     }
 
     // ---------------------------------------------------------------- 2. glm-dsa (GLM-5.3 744B)
@@ -238,7 +238,7 @@ int main() {
         const Glm5Geometry g = glm53();
         const int64_t ctx = 32768;
         GlmStateLayout L;
-        bool ok = strata::core::glm_state_carve(g, 0, 78, 78, ctx, GlmStateMode::Fp16, 0, L, err);
+        bool ok = maya::core::glm_state_carve(g, 0, 78, 78, ctx, GlmStateMode::Fp16, 0, L, err);
         check(ok, "glm-dsa FP16 carve: " + err);
         const uint64_t formula = 79ull * 1152 * 32768 + 22ull * 512 * 32768;
         check(formula == 3351248896ull, "the 32K formula is 3.35 GB");
@@ -294,12 +294,12 @@ int main() {
         for (int il : L.dsa_layers())
             if (g.idx_full(il)) runs_ok = runs_ok && runs[k++] == std::make_pair(L.dsa_ik[il], n * L.ik_pp);
         check(runs_ok, "glm-dsa slot runs: latent + k_pe x 79, then 22 index-key runs");
-        check(strata::core::glm_slot_magic(L) == strata::core::kGlmSlotMagicV3, "glm-dsa slots are MAYALST3");
+        check(maya::core::glm_slot_magic(L) == maya::core::kGlmSlotMagicV3, "glm-dsa slots are MAYALST3");
         std::printf("     %s\n", L.describe().c_str());
 
         // INT8: 544 B records, 16-byte aligned; 672 B a position with k_pe
         GlmStateLayout L8;
-        ok = strata::core::glm_state_carve(g, 0, 78, 78, ctx, GlmStateMode::Int8, 0, L8, err);
+        ok = maya::core::glm_state_carve(g, 0, 78, 78, ctx, GlmStateMode::Int8, 0, L8, err);
         bool a8 = ok && L8.lat_pp * 4 == 544 && (L8.lat_pp * 4) % 16 == 0;
         for (int il = 0; il <= 78 && a8; ++il) a8 = (L8.dsa_lat[il] * 4) % 16 == 0 && (L8.dsa_kpe[il] * 4) % 16 == 0;
         check(a8, "INT8 record 544 B, every record 16-byte aligned");
@@ -307,21 +307,21 @@ int main() {
 
         // reference path: one F32 [c_kv | k_pe] row a position, k_pe inline
         GlmStateLayout Ls;
-        ok = strata::core::glm_state_carve(g, 0, 78, -1, 4096, GlmStateMode::SlowF32, 4096, Ls, err);
+        ok = maya::core::glm_state_carve(g, 0, 78, -1, 4096, GlmStateMode::SlowF32, 4096, Ls, err);
         check(ok && Ls.lat_pp == 576 && Ls.kpe_pp == 0 && !Ls.has_kpe(5) && Ls.dsa_kpe[5] == GlmStateLayout::kNone &&
                   Ls.cache_bytes() == 78ull * 2304 * 4096 + 21ull * 512 * 4096,
               "reference path: F32 576-float rows, k_pe inline, 21 key caches without the NextN block");
 
         // fingerprints
-        const auto fp16 = strata::core::glm_state_fingerprint(g, L), fp8 = strata::core::glm_state_fingerprint(g, L8);
+        const auto fp16 = maya::core::glm_state_fingerprint(g, L), fp8 = maya::core::glm_state_fingerprint(g, L8);
         GlmStateLayout Lf;
         const Glm5Geometry gf = flash();
-        strata::core::glm_state_carve(gf, 0, gf.n_layers, -1, ctx, GlmStateMode::Fp16, 8256, Lf, err);
-        const auto ffp = strata::core::glm_state_fingerprint(gf, Lf);
+        maya::core::glm_state_carve(gf, 0, gf.n_layers, -1, ctx, GlmStateMode::Fp16, 8256, Lf, err);
+        const auto ffp = maya::core::glm_state_fingerprint(gf, Lf);
         check(fp16 != fp8 && fp16 != ffp && fp16[1] == 1 && fp16[7] == 21 && fp16[9] == 128 && fp16[10] == 4 &&
                   fp16[11] == 1024 && fp8[11] == 544 && ffp[11] == 0,
               "fingerprint: arch, 21 full layers, k_pe 128 B, F32 keys, latent row 1024 / 544 B; FP16 != INT8 != Flash");
-        check(fp16[0] == strata::core::kGlmFpFormat && strata::core::kGlmFpFormat == 2 && fp16.size() == 14,
+        check(fp16[0] == maya::core::kGlmFpFormat && maya::core::kGlmFpFormat == 2 && fp16.size() == 14,
               "fingerprint format word 2: the 14-word fingerprint of B15.3 (bumped from 1 with the NextN words)");
 
         // a 3-part split at full layers: the parts' caches sum to the whole
@@ -329,7 +329,7 @@ int main() {
         const int b[4] = {0, 26, 54, 78};
         for (int p = 0; p < 3; ++p) {
             GlmStateLayout P;
-            ok = strata::core::glm_state_carve(g, b[p], b[p + 1], p == 2 ? 78 : -1, ctx, GlmStateMode::Fp16, 0, P, err);
+            ok = maya::core::glm_state_carve(g, b[p], b[p + 1], p == 2 ? 78 : -1, ctx, GlmStateMode::Fp16, 0, P, err);
             parts += ok ? P.cache_bytes() : 0;
         }
         check(parts == formula, "3 parts [0,26) [26,54) [54,78)+NextN sum to the formula");
@@ -337,14 +337,14 @@ int main() {
         // refusals
         Glm5Geometry bad = g;
         bad.qk_rope = 63;
-        check(!strata::core::glm_state_carve(bad, 0, 78, -1, ctx, GlmStateMode::Fp16, 0, L, err), "odd rope tail refused");
+        check(!maya::core::glm_state_carve(bad, 0, 78, -1, ctx, GlmStateMode::Fp16, 0, L, err), "odd rope tail refused");
         bad = g;
         bad.indexer_full.resize(10);
-        check(!strata::core::glm_state_carve(bad, 0, 78, -1, ctx, GlmStateMode::Fp16, 0, L, err),
+        check(!maya::core::glm_state_carve(bad, 0, 78, -1, ctx, GlmStateMode::Fp16, 0, L, err),
               "a missing indexer schedule refused");
         bad = g;
         bad.kv_lora = 520;   // record 552 B: not 16-byte aligned
-        check(!strata::core::glm_state_carve(bad, 0, 78, -1, ctx, GlmStateMode::Int8, 0, L, err),
+        check(!maya::core::glm_state_carve(bad, 0, 78, -1, ctx, GlmStateMode::Int8, 0, L, err),
               "an INT8 record off 16 bytes refused");
     }
     std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);

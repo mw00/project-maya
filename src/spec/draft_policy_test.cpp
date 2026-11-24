@@ -6,11 +6,11 @@
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
 //   5. the policy never proposes a window beyond its cap.
-#include "strata/spec/draft_policy.hpp"
+#include "maya/spec/draft_policy.hpp"
 
 #include <cstdio>
 
-using strata::spec::DraftPolicy;
+using maya::spec::DraftPolicy;
 
 namespace {
 int g_fail = 0;
@@ -57,6 +57,18 @@ int main() {
         check(k.lookup && k.t == 6, "an unmeasured size is probed for a confident lookup");
         for (int i = 0; i < 3; ++i) p.observe(true, 6, 5, 40, 3.0 * cost(6));   // it turns out very expensive
         check(!p.choose(4, 5, 40).lookup, "after the probes, the measured cost decides");
+    }
+    {
+        DraftPolicy p(16);
+        for (int i = 0; i < 50; ++i) p.observe(false, 4, 2, 0, cost(4));      // the drafter: 3 tokens a round
+        for (int t = 2; t <= 16; ++t) p.observe(false, t, 1, 0, cost(t));
+        check(!p.trust(4, 15, 40), "trust: not from the prior alone (no lookup window measured)");
+        for (int i = 0; i < 8; ++i) p.observe(true, 16, 15, 40, cost(16));   // long matches, all held
+        check(p.trust(4, 15, 40), "trust: measured long matches that hold are verified alone");
+        check(!p.trust(4, 15, 8), "trust: never for a match under kTrustMatch");
+        check(!p.trust(4, 1, 40), "trust: never for a one-token proposal");
+        for (int i = 0; i < 30; ++i) p.observe(true, 16, 2, 40, cost(16));   // then they stop holding
+        check(!p.trust(4, 15, 40), "trust: withdrawn once its drafts stop holding");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

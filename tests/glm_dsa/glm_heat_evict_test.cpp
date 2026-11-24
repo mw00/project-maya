@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_heat_evict_test.cpp - glm-dsa B15.8 (CPU): heat-decay expert promotion / eviction
-// (include/strata/core/glm_heat_evict.hpp).
+// (include/maya/core/glm_heat_evict.hpp).
 //   1. HeatTable: 0.90 decay per tick (lazy scale == eager decay), route_layer ticks once per forward pass, the
 //      renormalisation keeps values, quant() saturates;
 //   2. the LRU-window victim: only the 16 oldest resident slots compete, the coldest of them wins, ties to the older;
@@ -10,7 +10,7 @@
 //      5000 tokens, 1000 warm-up): stationary, 4 recurring topics, a gradual walk; at 64 / 96 / 160 VRAM slots a
 //      layer.  The hit rates are printed (the B15.8 report) and checked: heat wins by >= 1 point on every drifting
 //      trace at 64 and 96 slots and stays within 1.5 points on the stationary one; it is deterministic.
-#include "strata/core/glm_heat_evict.hpp"
+#include "maya/core/glm_heat_evict.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -25,7 +25,7 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-using namespace strata::core::glmheat;
+using namespace maya::core::glmheat;
 
 void test_table() {
     std::printf("[1. HeatTable]\n");

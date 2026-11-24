@@ -1,7 +1,7 @@
 // src/core/glm_dsa_ref.cu - the glm-dsa F32 reference forward (glm-dsa B3.5): Glm5Model::step_layers_dsa.
 //
 // The correctness-first decode of GLM-5.3 (744B-A40B, GGUF arch glm-dsa) that the fast path (B4) and every parity
-// gate are measured against.  STRATA_GLM_SLOW=1 selects it (glm_forward_available lets glm-dsa through only on that
+// gate are measured against.  MAYA_GLM_SLOW=1 selects it (glm_forward_available lets glm-dsa through only on that
 // path); step_layers() dispatches here for glm-dsa with one line, so Flash (glm5-next) never reaches this file.
 //
 // One token at position p through this part's layers [l0_, l1_) (GLM-5.3-SPEC.md dataflow; llama.cpp
@@ -39,13 +39,13 @@
 // ffn_moe_logits, ffn_moe_topk, ffn_moe_weights_scaled, ffn_moe_out, ffn_shexp, ffn_out, l_out; result_norm and
 // result_output without a layer suffix).  top_k and ffn_moe_topk hold int32 ids.
 //
-// Environment: STRATA_GLMD_TILE_MB (each of the two dequant tiles' cap, default 512), STRATA_GLMD_KQ_SCALE (a
+// Environment: MAYA_GLMD_TILE_MB (each of the two dequant tiles' cap, default 512), MAYA_GLMD_KQ_SCALE (a
 // different attention scale, for mutation runs only).
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/glmd_forward.hpp"
-#include "strata/kernels/glmd_ref.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/dequant_bf16.hpp"
+#include "maya/kernels/glmd_forward.hpp"
+#include "maya/kernels/glmd_ref.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include "../kernels/cuda/glmd_rope.cuh"
 #include "glm_cb_dump.hpp"
@@ -66,7 +66,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -228,13 +228,13 @@ bool dq_rows(DsaRef& R, const WRef& w, int64_t r0, int64_t nr, int64_t cols, flo
         f16_kernel<<<grid_for(n), kThreads, 0, st>>>((const __half*) w.p + r0 * cols, out, n);
         return cuda_ok(cudaGetLastError(), "f16 widen", err);
     }
-    if (strata::kernels::dequant_bf16_supported(w.type)) {
-        strata::kernels::dequant_f32(w.type, w.p, r0, nr, cols, out, st);
+    if (maya::kernels::dequant_bf16_supported(w.type)) {
+        maya::kernels::dequant_f32(w.type, w.p, r0, nr, cols, out, st);
         return cuda_ok(cudaGetLastError(), "dequant_f32", err);
     }
-    if (strata::kernels::iq_supported(w.type) && cols % 256 == 0) {
-        const size_t rb = strata::kernels::iq_row_bytes(w.type, cols);
-        strata::kernels::iq_dequant_f32(w.type, (const uint8_t*) w.p + (size_t) r0 * rb, n, out, st);
+    if (maya::kernels::iq_supported(w.type) && cols % 256 == 0) {
+        const size_t rb = maya::kernels::iq_row_bytes(w.type, cols);
+        maya::kernels::iq_dequant_f32(w.type, (const uint8_t*) w.p + (size_t) r0 * rb, n, out, st);
         return cuda_ok(cudaGetLastError(), "iq_dequant_f32", err);
     }
     // no device dequantizer (Q2_K, Q4_1, Q5_1, ...): ggml's own to_float on the host, synchronously
@@ -339,9 +339,9 @@ bool Glm5Model::dsa_ref_setup(std::string& err) {
     DsaRef& R = *st;
     R.dev = dev_;
     R.kq_scale = glmd::attn_scale(g.qk_head());
-    if (const char* s = getenv("STRATA_GLMD_KQ_SCALE")) {
+    if (const char* s = getenv("MAYA_GLMD_KQ_SCALE")) {
         R.kq_scale = (float) std::atof(s);
-        std::fprintf(stderr, "glm-dsa ref: CUDA%d attention scale overridden to %g (STRATA_GLMD_KQ_SCALE)\n", dev_,
+        std::fprintf(stderr, "glm-dsa ref: CUDA%d attention scale overridden to %g (MAYA_GLMD_KQ_SCALE)\n", dev_,
                      (double) R.kq_scale);
     }
     if (g.hc != 1 || g.idx_kpool != 1 || g.qk_rope <= 0 || g.qk_rope % 2 != 0 || g.idx_rope % 2 != 0 ||
@@ -480,7 +480,7 @@ bool Glm5Model::dsa_ref_setup(std::string& err) {
         smalls.push_back({"output_norm.weight", E});
     }
     int64_t cap = (int64_t) 512 << 20;
-    if (const char* t = getenv("STRATA_GLMD_TILE_MB")) cap = std::max<int64_t>(1, std::atoll(t)) << 20;
+    if (const char* t = getenv("MAYA_GLMD_TILE_MB")) cap = std::max<int64_t>(1, std::atoll(t)) << 20;
     cap /= 4;   // floats
     int64_t tile = 0;
     for (const auto& n : needs) {
@@ -526,7 +526,7 @@ bool Glm5Model::dsa_ref_setup(std::string& err) {
         }
     }
     if (!cuda_ok(cudaDeviceSynchronize(), "setup", err)) return false;
-    std::fprintf(stderr, "glm-dsa ref: CUDA%d layers [%d, %d): F32 reference forward (STRATA_GLM_SLOW), KV %.3f GB F32 %s, "
+    std::fprintf(stderr, "glm-dsa ref: CUDA%d layers [%d, %d): F32 reference forward (MAYA_GLM_SLOW), KV %.3f GB F32 %s, "
                          "dequant tiles 2 x %.3f GB, scratch %.1f MB, scale %g\n",
                  dev_, l0_, l1_, (double) R.kv_bytes / 1e9, R.kv_in_state ? "in the state arena" : "(own buffer)",
                  (double) tile * 4 / 1e9, (double) R.scratch_bytes / 1e6, (double) R.kq_scale);
@@ -540,7 +540,7 @@ bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
     const Glm5Geometry& g = g_;
     DsaRef* Rp = static_cast<DsaRef*>(dsa_ref_.get());
     if (Rp == nullptr) {
-        err = "glm-dsa ref: the reference state was not set up (load with STRATA_GLM_SLOW=1)";
+        err = "glm-dsa ref: the reference state was not set up (load with MAYA_GLM_SLOW=1)";
         return false;
     }
     DsaRef& R = *Rp;
@@ -748,4 +748,4 @@ bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
     return cuda_ok(cudaGetLastError(), "step", err);
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

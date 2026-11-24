@@ -12,7 +12,7 @@
 #include <vector>
 
 __global__ void new_kernel(const float* sc, int n, int top, int kpool, int* cells) {
-    strata::kernels::dsa::select_top_pools(sc, n, top, kpool, cells);
+    maya::kernels::dsa::select_top_pools(sc, n, top, kpool, cells);
 }
 
 // the loop it replaces (glm_fast.cu before 2026-10-07), scores from global memory

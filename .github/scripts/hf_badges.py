@@ -12,6 +12,7 @@ BADGES = [
     ("glm-m-derisked", "GLM-5.3-Flash Maya-M-Derisked downloads", "peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"),
     ("deepseek", "DeepSeek-V4.1-Flash Maya downloads", "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"),
     ("minimax", "MiniMax-M3.1-Flash Maya downloads", "peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"),
+    ("hy4", "Hy4-Flash Maya downloads", "peasantsmith/Hy4-Flash-Maya-GGUF"),
 ]
 
 

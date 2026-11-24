@@ -5,23 +5,24 @@
 //   res_read(R, previous FFN out, attn_norm) -> the mixer (fast_dsa) -> res_read(R, mixer, ffn_norm) -> the FFN
 // and once at the end of the part res_close(R, last FFN out), so the residual at state_ is complete for the hop or the
 // head (the same convention as the mHC path: "the residual lives at state_").  R is updated in place (no ping-pong).
-// glm-dsa B10.1: with STRATA_GLM_DSA_GRAPHS=1 the whole loop (and the close) is one captured CUDA graph per part, replayed
+// glm-dsa B10.1: with MAYA_GLM_DSA_GRAPHS=1 the whole loop (and the close) is one captured CUDA graph per part, replayed
 // per token (glmdsa::graph_prepare / graph_run, src/core/glm_dsa_mixer.cu); the MoE CPU-lane waits stay device spins
 // inside it, as Maya's KDA layer graphs keep them.
 #include "glm_residual.hpp"
 #include "glm_dsa_fast.hpp"
 #include "glm_fast_state.hpp"
 #include "glm_memory.hpp"
-#include "strata/core/glm_req_knobs.hpp"
+#include "maya/core/glm_req_knobs.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace glmres {
 
@@ -99,6 +100,9 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
         const char* host_off = glmdsa::host_off_reason(F->prof_on, dumps, glmknob::get(glmknob::PrefetchN, F->max_pf),
                                                         F->n_ahead, getenv("GLM_DUMP_H") != nullptr,
                                                         glmknob::get(glmknob::GraphsOff, 0) != 0);
+        // a DFlash2 drafter's captures (dflash_capture) copy each position's rows to the host and book them there:
+        // host work a replayed graph would skip
+        if (host_off == nullptr && dflash_captures_here()) host_off = "the DFlash2 drafter's captures";
         uint64_t requests = 0;
         for (int il = l0_; il < l1_; ++il) requests += F->L[(size_t) il].moe ? 1 : 0;
         if (!glmdsa::graph_prepare(*F->dsa, lay_, l0_, l1_, p, F->cpu_plan, R, state_, host_off, requests, s, pg, err,
@@ -118,6 +122,9 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
         if (il != l0_) ablate(F->ffn, 1, s);   // (--ablate: the previous FFN's write loses the direction)
         glmres::res_read(R, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
         if (F->prof_on) F->mark("res_attn");
+        // R now holds the layer's input (the previous FFN's add is in): the DFlash2 drafter's feature when it reads
+        // this layer (GLM-5.3 744B's taps, dflash.target_layers)
+        dflash_capture(il, R, 1, p, F->cap, F->cap_rows, s);
         if (dumps) {
             if (il != l0_) plain_dump(s, "l_out-" + std::to_string(il - 1), R, E);
             plain_dump(s, "attn_norm-" + std::to_string(il), F->x, E);
@@ -197,7 +204,7 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
         if (err.empty()) err = "glm window: the glm-dsa mixer is not set up on this part";
         return false;
     }
-    static const bool prof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
         if (prof) W.mark(nm, s);
     };
@@ -216,6 +223,9 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
             glmres::res_read(R + (size_t) t * E, il == l0_ ? nullptr : W.ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps,
                              E, W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
         mark("res_attn");
+        // the rows' layer inputs: the DFlash2 drafter's features when it reads this layer (rejected rows are written
+        // again by the next window at their positions; only kept ones reach its ring)
+        dflash_capture(il, R + (size_t) t0 * E, n, p0 + t0, F->cap, F->cap_rows, s);
         if (!fast_dsa_glm_window(il, p0, t0, n, W.x, W.xq, W.xq_s, W.mixer, err)) return false;
         mark("dsa");
         ablate(W.mixer + (size_t) t0 * E, n, s);
@@ -263,10 +273,10 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     mark("start");
     // (fast_window_layers' staggered row groups and their switches)
     static const bool stagger_env = [] {
-        const char* v = getenv("STRATA_GLM_WIN_STAGGER");
-        return v == nullptr || std::atoi(v) != 0;
+        const char* v = getenv("MAYA_GLM_WIN_STAGGER");   // (auto - glm_window.cu's measured choice - is 1 here)
+        return v == nullptr || std::strcmp(v, "auto") == 0 || std::atoi(v) != 0;
     }();
-    static const bool batch_env = glmfast::off_by_default_on_amd("STRATA_GLM_WIN_BATCH");
+    static const bool batch_env = glmfast::off_by_default_on_amd("MAYA_GLM_WIN_BATCH");
     const bool stagger = stagger_env && batch_env && T >= 2 && !W.per_token && W.mplan_ptr != nullptr;
     if (stagger) {
         const int ka = (T + 1) / 2, kb = T - ka;
@@ -293,4 +303,4 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

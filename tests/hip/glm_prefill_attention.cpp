@@ -1,7 +1,7 @@
 // Real batched MLA attention against a CPU softmax reference, without weights.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include "strata/kernels/glm_batch.hpp"
+#include "maya/kernels/glm_batch.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -72,9 +72,9 @@ int main() {
     CHECK(hipMemcpy(d_cells, cells.data(), cells.size() * sizeof(int), hipMemcpyHostToDevice));
     CHECK(hipMemcpy(d_counts, counts.data(), counts.size() * sizeof(int), hipMemcpyHostToDevice));
     CHECK(hipMemset(d_out, 0xff, q.size() * sizeof(float))); // catch unwritten outputs
-    strata::kernels::glmb::mla_attn(d_q, d_lat, d_cells, d_counts, stride, H, KV, scale, T, d_out, nullptr);
+    maya::kernels::glmb::mla_attn(d_q, d_lat, d_cells, d_counts, stride, H, KV, scale, T, d_out, nullptr);
     CHECK(hipDeviceSynchronize());
-    if (strata::kernels::glmb::launch_errors()) return 3;
+    if (maya::kernels::glmb::launch_errors()) return 3;
     CHECK(hipMemcpy(got.data(), d_out, got.size() * sizeof(float), hipMemcpyDeviceToHost));
 
     double worst = 0.0;
@@ -117,7 +117,7 @@ int main() {
     // The rocWMMA kernel (FP16 Q) against the F32 kernel on the same FP16-rounded Q: random data, many cells.
     // Same guard as glm_prefill.cu's mla_attn_path(): on a card without WMMA (gfx908, gfx1030) the f16q device
     // pass compiles to a trap - the engine never takes that path, so there is nothing to compare here.
-    if (!strata::kernels::glmb::mla_wmma2_supported()) {
+    if (!maya::kernels::glmb::mla_wmma2_supported()) {
         std::puts("GLM prefill WMMA attention: skipped (unsupported architecture)");
     } else {
         constexpr int T2 = 48, H2 = 32, rows2 = 2048, stride2 = 700;
@@ -153,10 +153,10 @@ int main() {
             CHECK(hipMemcpy(dl, q8 ? (const void*) lat8.data() : (const void*) lat16.data(),
                             q8 ? lat8.size() : lat16.size() * 2, hipMemcpyHostToDevice));
             CHECK(hipMemset(da, 0xff, q2.size() * 4));
-            strata::kernels::glmb::mla_attn_f16q(dq16, dl, dc, dn, stride2, H2, KV, scale, T2, da, nullptr, q8 != 0);
-            strata::kernels::glmb::mla_attn(dq, dl, dc, dn, stride2, H2, KV, scale, T2, db, nullptr, q8 != 0);
+            maya::kernels::glmb::mla_attn_f16q(dq16, dl, dc, dn, stride2, H2, KV, scale, T2, da, nullptr, q8 != 0);
+            maya::kernels::glmb::mla_attn(dq, dl, dc, dn, stride2, H2, KV, scale, T2, db, nullptr, q8 != 0);
             CHECK(hipDeviceSynchronize());
-            if (strata::kernels::glmb::launch_errors()) return 3;
+            if (maya::kernels::glmb::launch_errors()) return 3;
             CHECK(hipMemcpy(a.data(), da, a.size() * 4, hipMemcpyDeviceToHost));
             CHECK(hipMemcpy(b.data(), db, b.size() * 4, hipMemcpyDeviceToHost));
             double num = 0, den = 0, worst_head = 0;
@@ -180,7 +180,7 @@ int main() {
 
     // The wave32 WMMA kernel (F32 Q, FP16 high/residual) against the F32 kernel: random data, partial 16/32-cell
     // chunks, masked cells, multiple head groups, and zero/tiny/large queries
-    if (!strata::kernels::glmb::mla_wmma2_supported()) {
+    if (!maya::kernels::glmb::mla_wmma2_supported()) {
         std::puts("GLM prefill WMMA2 attention: skipped (unsupported architecture)");
     } else {
         constexpr int T3 = 12, H3 = 32, rows3 = 256, stride3 = 70;
@@ -217,10 +217,10 @@ int main() {
             CHECK(hipMemcpy(dl3, q8 ? (const void*) lat8.data() : (const void*) lat3.data(),
                             q8 ? lat8.size() : lat3.size() * 2, hipMemcpyHostToDevice));
             CHECK(hipMemset(dc3, 0xff, q3.size() * 4));
-            strata::kernels::glmb::mla_attn_wmma2(dq3, dl3, dcl3, dn3, stride3, H3, KV, scale, T3, dc3, nullptr, q8 != 0);
-            strata::kernels::glmb::mla_attn(dq3, dl3, dcl3, dn3, stride3, H3, KV, scale, T3, dd3, nullptr, q8 != 0);
+            maya::kernels::glmb::mla_attn_wmma2(dq3, dl3, dcl3, dn3, stride3, H3, KV, scale, T3, dc3, nullptr, q8 != 0);
+            maya::kernels::glmb::mla_attn(dq3, dl3, dcl3, dn3, stride3, H3, KV, scale, T3, dd3, nullptr, q8 != 0);
             CHECK(hipDeviceSynchronize());
-            if (strata::kernels::glmb::launch_errors()) return 3;
+            if (maya::kernels::glmb::launch_errors()) return 3;
             CHECK(hipMemcpy(c.data(), dc3, c.size() * 4, hipMemcpyDeviceToHost));
             CHECK(hipMemcpy(d.data(), dd3, d.size() * 4, hipMemcpyDeviceToHost));
             double num3 = 0, den3 = 0, worst3 = 0;

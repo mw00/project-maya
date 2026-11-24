@@ -37,8 +37,8 @@ See [AMD_RDNA4.md](AMD_RDNA4.md) for build and validation commands.
 | Shared component | Upstream change and integration requirement |
 | --- | --- |
 | `cmake/hip_backend.cmake` | Applied: upstream architecture lists, semicolon/space parsing, and compiled architecture metadata. Normalization also removes empty entries and duplicates before compiler use. |
-| `src/core/device.cu` and `include/strata/core/device.hpp` | Applied: exact base-architecture checks against the compiled list, wave32 check, and actual/build architecture diagnostics. Broader upstream device-list helpers are separate. |
-| `include/strata/hip_compat/` | Use the upstream headers as the base, retaining Maya's GLM mappings for occupancy, stream legacy, profiling, SGEMM/batched SGEMM, error codes and `__grid_constant__`. Replacing them without those additions breaks GLM compilation. |
+| `src/core/device.cu` and `include/maya/core/device.hpp` | Applied: exact base-architecture checks against the compiled list, wave32 check, and actual/build architecture diagnostics. Broader upstream device-list helpers are separate. |
+| `include/maya/hip_compat/` | Use the upstream headers as the base, retaining Maya's GLM mappings for occupancy, stream legacy, profiling, SGEMM/batched SGEMM, error codes and `__grid_constant__`. Replacing them without those additions breaks GLM compilation. |
 | `intrinsics.hpp` | Applied: upstream RDNA4 dot4 guard, byte permutation, SWAR byte operations and older-HIP warp synchronization. Packed-byte and GLM reference checks pass on both discrete cards. |
 | AMD setup detection | Applied: gfx1201 eligibility and fallback name; Maya uses the shared supported-architecture list. Unified-memory detection and wider installer helper consolidation are separate. |
 | hipBLASLt table loader and tables | Added upstream gfx1201 tables for versions 100202/100500. The loader keeps its architecture/version checks. Maya's GLM prompt projections now reuse that loader with separate per-architecture GLM tables. |

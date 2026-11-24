@@ -1,7 +1,7 @@
 #include "../src/kernels/cuda/exl3_hip_scalar.hpp"
 #include <cstdio>
 #include <initializer_list>
-namespace s = strata::kernels::exl3::hip_scalar;
+namespace s = maya::kernels::exl3::hip_scalar;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 int main() {
     CHECK(s::mode(nullptr) == 8);

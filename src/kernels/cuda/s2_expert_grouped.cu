@@ -13,22 +13,22 @@
 // partials are reduced through shuffle; the CPU walks every chunk in order with its own accumulator shape.
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
-#include "strata/kernels/s2_expert_grouped.hpp"
+#include "maya/kernels/s2_expert_grouped.hpp"
 
-#include "strata/kernels/quantize_act.hpp"
+#include "maya/kernels/quantize_act.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
+#include "maya/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
-// THE BLOB'S OWN GEOMETRY, from `include/strata/kernels/cpu/expert.hpp`.  Restated as literals because that
+// THE BLOB'S OWN GEOMETRY, from `include/maya/kernels/cpu/expert.hpp`.  Restated as literals because that
 // header is the CPU path's and this file must not silently follow it if the two ever disagree: the sizes below
 // are what the CPU kernel's indexing computes, and `moe_hit_parity` compares the two end to end.
 constexpr int H = 2560;
@@ -783,4 +783,4 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
     check("cpu_order/down", stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

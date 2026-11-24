@@ -1,25 +1,25 @@
 // tests/glm_dsa/glm_idx_fp16_test.cpp - glm-dsa B10.8 (CPU only): FP16 index keys in the state descriptor, the split
 // planner and the slot fingerprint, GLM-5.3 744B geometry.
-//   1. without STRATA_GLM_IDX_FP16: F32 keys (ik_pp 128 floats, ik_bytes 4, fingerprint 4; full layer row 1664 B);
-//   2. with STRATA_GLM_IDX_FP16=1: FP16 / INT8 carves store 64 floats (128 halves) per key, every region stays 16-byte
+//   1. without MAYA_GLM_IDX_FP16: F32 keys (ik_pp 128 floats, ik_bytes 4, fingerprint 4; full layer row 1664 B);
+//   2. with MAYA_GLM_IDX_FP16=1: FP16 / INT8 carves store 64 floats (128 halves) per key, every region stays 16-byte
 //      aligned, the 32K arena shrinks by exactly 22 x 256 x 32768 B (~0.18 GB, the plan's B10.8 figure), the
 //      planner prices 1152 + 256 B on full layers, the fingerprint records 2 bytes per element (a slot saved with
 //      F32 keys is refused by a FP16 build and back), slot runs cover n * 64 floats per full layer;
 //   3. the slow F32 reference carve keeps F32 keys either way.
-#include "strata/core/glm_dsa_split.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_dsa_split.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include "glm_test_env.hpp"   // setenv / unsetenv / getpid (<unistd.h> on POSIX; mapped on Windows)
 
-using strata::core::GlmArch;
-using strata::core::GlmIdxKind;
-using strata::core::GlmStateLayout;
-using strata::core::GlmStateMode;
-using strata::core::Glm5Geometry;
+using maya::core::GlmArch;
+using maya::core::GlmIdxKind;
+using maya::core::GlmStateLayout;
+using maya::core::GlmStateMode;
+using maya::core::Glm5Geometry;
 
 namespace {
 
@@ -59,7 +59,7 @@ Glm5Geometry glm53() {
 
 bool carve(const Glm5Geometry& g, GlmStateMode mode, int64_t ctx, GlmStateLayout& L) {
     std::string err;
-    const bool ok = strata::core::glm_state_carve(g, 0, g.n_layers, g.n_layers, ctx, mode, 0, L, err);
+    const bool ok = maya::core::glm_state_carve(g, 0, g.n_layers, g.n_layers, ctx, mode, 0, L, err);
     if (!ok) std::printf("carve: %s\n", err.c_str());
     return ok;
 }
@@ -69,20 +69,20 @@ bool carve(const Glm5Geometry& g, GlmStateMode mode, int64_t ctx, GlmStateLayout
 int main() {
     const Glm5Geometry g = glm53();
     const int64_t ctx = 32768;
-    unsetenv("STRATA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_FP16");
     GlmStateLayout F, F8, S;
-    check(!strata::core::glm_state_idx_fp16(), "default: F32 index keys");
+    check(!maya::core::glm_state_idx_fp16(), "default: F32 index keys");
     check(carve(g, GlmStateMode::Fp16, ctx, F) && carve(g, GlmStateMode::Int8, ctx, F8) &&
               carve(g, GlmStateMode::SlowF32, ctx, S),
           "default carves");
     check(F.ik_pp == 128 && F.ik_bytes == 4, "default: ik_pp 128 floats, 4 B per element");
-    check(strata::core::glm_dsa_state_row_bytes(g, 0, false) == 1152 + 512, "default planner: full layer 1664 B");
-    const auto fp_f32 = strata::core::glm_state_fingerprint(g, F);
+    check(maya::core::glm_dsa_state_row_bytes(g, 0, false) == 1152 + 512, "default planner: full layer 1664 B");
+    const auto fp_f32 = maya::core::glm_state_fingerprint(g, F);
     check(fp_f32[10] == 4, "default fingerprint: 4 B per key element");
 
-    setenv("STRATA_GLM_IDX_FP16", "1", 1);
+    setenv("MAYA_GLM_IDX_FP16", "1", 1);
     GlmStateLayout H, H8, HS;
-    check(strata::core::glm_state_idx_fp16(), "STRATA_GLM_IDX_FP16=1 read");
+    check(maya::core::glm_state_idx_fp16(), "MAYA_GLM_IDX_FP16=1 read");
     check(carve(g, GlmStateMode::Fp16, ctx, H) && carve(g, GlmStateMode::Int8, ctx, H8) &&
               carve(g, GlmStateMode::SlowF32, ctx, HS),
           "FP16-key carves");
@@ -100,17 +100,17 @@ int main() {
     const uint64_t saved = (uint64_t) 22 * 256 * (uint64_t) ctx;
     check(F.bytes - H.bytes == saved && F8.bytes - H8.bytes == saved, "32K arena: -22 x 256 B x 32768 per FP16 key cache");
     std::printf("     saved at 32K: %.3f GB\n", saved / 1e9);
-    check(strata::core::glm_dsa_state_row_bytes(g, 0, false) == 1152 + 256 &&
-              strata::core::glm_dsa_state_row_bytes(g, 3, false) == 1152 &&
-              strata::core::glm_dsa_state_row_bytes(g, 0, false, true) == 2304 + 512,
+    check(maya::core::glm_dsa_state_row_bytes(g, 0, false) == 1152 + 256 &&
+              maya::core::glm_dsa_state_row_bytes(g, 3, false) == 1152 &&
+              maya::core::glm_dsa_state_row_bytes(g, 0, false, true) == 2304 + 512,
           "planner: full layer 1408 B with FP16 keys, F32 slow path 2816 B");
-    const auto fp_f16 = strata::core::glm_state_fingerprint(g, H);
+    const auto fp_f16 = maya::core::glm_state_fingerprint(g, H);
     check(fp_f16[10] == 2 && fp_f16 != fp_f32, "fingerprint: 2 B per key element, differs from the F32-key build");
     bool runs = true;
     for (const auto& r : H.slot_runs(100)) runs &= r.second == 100 * H.lat_pp || r.second == 100 * H.kpe_pp ||
                                                   r.second == 100 * H.ik_pp;
     check(runs, "slot runs: n * ik_pp floats per index cache");
-    unsetenv("STRATA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_FP16");
     std::printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }

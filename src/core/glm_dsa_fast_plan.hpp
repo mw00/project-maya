@@ -13,9 +13,9 @@
 #include <functional>
 #include <string>
 
-namespace strata::core::glmdsa {
+namespace maya::core::glmdsa {
 
-// The weight types the binder hands to gf::mv (mirrors strata::kernels::glmf::kTypeF32 / kTypeBF16; glm_dsa_fast.cu
+// The weight types the binder hands to gf::mv (mirrors maya::kernels::glmf::kTypeF32 / kTypeBF16; glm_dsa_fast.cu
 // static_asserts they agree).
 constexpr int kTypeF32 = 0;
 constexpr int kTypeBF16 = 30;
@@ -72,7 +72,7 @@ Pick pick_mv(const Tables& t, const std::string& name);
 /// native slot is not accepted (the consumers read float rows).
 Pick pick_float(const Tables& t, const std::string& name);
 /// B10.7: W_kb / W_vb for the headwise GEMVs (glmd::headwise, Mla2 / FusedMla w_type): a native Q8_0 slot (ggml type
-/// 8, served when the pack keeps them native: tools/strata/glm_dsa_pack.py with STRATA_PACK_NATIVE32=1), else
+/// 8, served when the pack keeps them native: tools/strata/glm_dsa_pack.py with MAYA_PACK_NATIVE32=1), else
 /// pick_float's BF16 / F32.  The binder passes Pick::type to Mla2::w_type (8 Q8_0, 30 BF16).
 constexpr int kTypeQ8_0 = 8;
 Pick pick_headwise(const Tables& t, const std::string& name);
@@ -122,4 +122,4 @@ void q8_1_quantize_host(const float* x, int64_t n, void* xq);
 float half_to_float(uint16_t h);
 uint16_t float_to_half(float f);
 
-}  // namespace strata::core::glmdsa
+}  // namespace maya::core::glmdsa

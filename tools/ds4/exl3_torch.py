@@ -1,6 +1,6 @@
 """tools/ds4/exl3_torch.py - EXL3 (exllamav3) matrices decoded on the GPU with torch, for the DeepSeek-V4.1 reference.
 
-The format is include/strata/kernels/exl3.hpp's; this is tools/exl3_pack.py's numpy decoder (exl3_states, exl3_values,
+The format is include/maya/kernels/exl3.hpp's; this is tools/exl3_pack.py's numpy decoder (exl3_states, exl3_values,
 exl3_rows) on torch tensors.  decode(st, prefix) returns the full weight as [n, k] (out x in, F.linear's layout):
 W = diag(suh) H W' H diag(svh), so x W is H(H(x * suh) W') * svh.
 """

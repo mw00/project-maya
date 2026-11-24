@@ -12,15 +12,15 @@
 #include "glm_dsa_fast.hpp"
 #include "glm_fast_state.hpp"
 
-#include "strata/core/glm_env.hpp"
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cstdio>
 #include <string>
 
-namespace strata::core {
+namespace maya::core {
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 static_assert(glmdsa::kTypeF32 == gf::kTypeF32 && glmdsa::kTypeBF16 == gf::kTypeBF16, "glmdsa type ids mirror gf's");
 static_assert(glmdsa::kMaxMvJobs == gf::kMaxMvJobs, "one fallback row per mv job");
 
@@ -73,14 +73,14 @@ void q8_1_to_f32(const void* xq, int n, float* y, cudaStream_t s) {
 }
 
 // L1-4: glm-dsa's GEMVs through gf::mv_dsa (bit for bit gf::mv's outputs, more loads in flight) where the device's
-// default has it (glm_fast.hpp: kMvDsaAuto); STRATA_GLMD_MV_DSA=0: gf::mv itself (A/Bs), =1: on any device.  Only a
+// default has it (glm_fast.hpp: kMvDsaAuto); MAYA_GLMD_MV_DSA=0: gf::mv itself (A/Bs), =1: on any device.  Only a
 // glm-dsa engine has a GlmDsaFast (fast_bind_dsa / fast_dsa_arena): Flash (ext == nullptr: its NextN eh_proj in
 // fast_mtp and mtp_cache_rows, its dense FFN) calls gf::mv exactly as v1.1.56 did - the same kernels on every device.
 static bool run_mv(const GlmDsaFast* ext, const gf::MvJob* jobs, int n, cudaStream_t s) {
     if (ext == nullptr) return gf::mv(jobs, n, s);
     static const int cfg = [] {
-        const int v = strata::glmenv::env_switch("STRATA_GLMD_MV_DSA", strata::glmenv::kAuto, true);
-        return v == strata::glmenv::kOff ? gf::kMvDsaOff : v == strata::glmenv::kOn ? gf::kMvDsaOn : gf::kMvDsaAuto;
+        const int v = maya::glmenv::env_switch("MAYA_GLMD_MV_DSA", maya::glmenv::kAuto, true);
+        return v == maya::glmenv::kOff ? gf::kMvDsaOff : v == maya::glmenv::kOn ? gf::kMvDsaOn : gf::kMvDsaAuto;
     }();
     return gf::mv_dsa(jobs, n, s, cfg);
 }
@@ -194,7 +194,7 @@ void Glm5Model::fast_bind_dsa(int il, std::string& missing) {
         if (it == w_.end()) { missing += P + n + " (f32) "; return nullptr; }
         return it->second;
     };
-    // B10.7: W_kb / W_vb through pick_headwise: a native Q8_0 slot (an STRATA_PACK_NATIVE32 pack) is served as it is
+    // B10.7: W_kb / W_vb through pick_headwise: a native Q8_0 slot (an MAYA_PACK_NATIVE32 pack) is served as it is
     // (the mixer passes the slot type as Mla2 / FusedMla w_type); a default pack holds only the BF16 copy, unchanged
     const auto hw = [&](const char* n, int64_t n_in, int64_t n_out) -> WSlot {
         const glmdsa::Pick p = glmdsa::pick_headwise(T, P + n);
@@ -361,4 +361,4 @@ bool Glm5Model::fast_dsa_arena(std::string& err) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

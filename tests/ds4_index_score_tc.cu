@@ -17,7 +17,7 @@
 #include <random>
 #include <vector>
 
-using namespace strata::ds4;
+using namespace maya::ds4;
 
 static float fp4h(unsigned c) {   // (fp4v on the host)
     static const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
@@ -35,7 +35,7 @@ int main() {
     cudaDeviceProp prop{};
     cudaGetDevice(&dev);
     cudaGetDeviceProperties(&prop, dev);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     std::printf("device %d: %s (%s)\n", dev, prop.name, prop.gcnArchName);
 #else
     std::printf("device %d: %s (compute capability %d.%d)\n", dev, prop.name, prop.major, prop.minor);
@@ -43,7 +43,7 @@ int main() {
     struct Case { int n, T; bool cand, edge = false; };
     std::vector<Case> cases = {Case{1000, 1, false}, Case{65536, 3, false}, Case{131072, 6, false}, Case{20000, 64, false},
                                Case{65536, 3, true}, Case{40000, 16, true}, Case{131072, 64, false}};
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // (edge: a quarter of the key blocks' scale bytes 0 - a zero block, as ue8m0_val reads it - 1 (the cache's for an
     // all-zero block) or 2, beside ordinary blocks in the same rows: RDNA 3's kernel takes the scales as ue8m0_val
     // does; the sm80 kernel's 2^(ea + eq) assumes normal powers of two)

@@ -1,15 +1,15 @@
-// src/kernels/cuda/kv_q4.cu - see include/strata/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
+// src/kernels/cuda/kv_q4.cu - see include/maya/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
 // (from PR #21 by code-martin; KV-streaming integration and the deterministic group maximum added on merge).
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/kv_stream.hpp"
+#include "maya/kernels/kv_q4.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/kv_stream.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 void check(const char* what) {
@@ -228,4 +228,4 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
     check("kv_gather_q4 launch");
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

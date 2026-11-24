@@ -11,7 +11,7 @@
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23), and the K-quants Q4_K (12)
 // and Q5_K (13) (with ggml's min terms from the activations' block sums).  IQ1_M stays on ggml-cpu (no shipped model
 // has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
-#include "strata/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -24,7 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
@@ -33,12 +33,12 @@ inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); retur
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
 // E-2: the IQ3 grids by one AVX-512 gather (the same words, the same results) - measured 3-5% SLOWER than the scalar
-// lookups on a Ryzen 5 7600 (Zen 4 gathers are microcoded), so opt-in: STRATA_IQ_GATHER=1
-const bool gather = std::getenv("STRATA_IQ_GATHER") != nullptr;
-// E-2: software prefetch distance in bytes (STRATA_IQ_PREFETCH; 0 = off): -2-3% gate/up time on IQ3_S decode
+// lookups on a Ryzen 5 7600 (Zen 4 gathers are microcoded), so opt-in: MAYA_IQ_GATHER=1
+const bool gather = std::getenv("MAYA_IQ_GATHER") != nullptr;
+// E-2: software prefetch distance in bytes (MAYA_IQ_PREFETCH; 0 = off): -2-3% gate/up time on IQ3_S decode
 // (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the pool is memory-bound)
 const int prefetch_ahead = [] {
-    const char* v = std::getenv("STRATA_IQ_PREFETCH");
+    const char* v = std::getenv("MAYA_IQ_PREFETCH");
     return v ? std::atoi(v) : 2048;
 }();
 
@@ -406,4 +406,4 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

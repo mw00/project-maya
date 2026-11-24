@@ -39,6 +39,9 @@ TIERS_DS4 = (("cpu", "On the CPU", INFO_TEXT, "/tok"), ("disk_mb", "Disk reads",
 # MiniMax's (maya-mm3): GLM's keys, but the experts VRAM does not hold are computed on the CPU from pinned RAM
 TIERS_MM3 = (("ram_fetch", "On the CPU", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN, "/tok"),
              ("promo", "Promoted", ACCENT, "/tok"))
+# Hy4-Flash's (maya-hy4): the experts VRAM does not hold are computed on the CPU from RAM, and its n-gram table's read
+# time (DeepSeek's key names; no RAM tier, no promotions)
+TIERS_HY4 = (("cpu", "On the CPU", INFO_TEXT, "/tok"), ("engram_ms", "N-gram memory", ACCENT, " ms/tok"))
 TIPS = {   # the Monitor's advice under the tiers, said shorter as the box narrows (one line: the longest that fits)
     "disk": ("Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context "
              "makes answers faster.", "Many experts come from the SSD: more RAM or a shorter context is faster.",
@@ -194,10 +197,18 @@ def tiers(m: dict, width: int):
     t, eng = m.get("tiers") or {}, m.get("engine") or {}
     n, h = t.get("now"), t.get("history") or {}
     if not n:
+        if eng.get("engine_kind") == "ik2":            # (maya-ik2 writes no STAT lines: nothing comes later)
+            return Text("Inkling 2 Mini's engine keeps its experts in VRAM where the card holds them; it reports no "
+                        "tiers.", f"italic {MUTED}")
         return Text("The engine tells where its experts live while it writes an answer.", f"italic {MUTED}")
     ds4 = eng.get("engine_kind") == "ds4"
+    hy4 = eng.get("engine_kind") == "hy4"
     tier = ds4 and int(eng.get("ram_experts") or 0) > 0
-    if ds4:   # DeepSeek: the VRAM slots, the RAM tier's (when on), the rest read in place from the model's files
+    if hy4:   # Hy4-Flash: the experts in VRAM (INFO vram_slots), the others in RAM for the CPU lane - none on the SSD
+        vu = int(eng.get("vram_slots") or 0)
+        total = max(1, int(eng.get("experts") or 0), vu)
+        ru, disk = total - vu, 0
+    elif ds4:   # DeepSeek: the VRAM slots, the RAM tier's (when on), the rest read in place from the model's files
         vu = int(eng.get("expert_slots") or 0)
         ru = int(eng.get("ram_experts") or 0) if tier else int(eng.get("cpu_experts") or 0)
         disk = max(0, int(eng.get("cpu_experts") or 0) - ru) if tier else 0
@@ -211,7 +222,8 @@ def tiers(m: dict, width: int):
     cols.append(min(width - cols[0], round(width * ru / whole)))
     line = Text.assemble(gradient("█" * cols[0]), ("█" * cols[1], INFO_TEXT), ("█" * max(0, width - sum(cols)), WARN))
     legend = Table.grid(padding=(0, 1))
-    parts = (((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "Pinned RAM", ru, ""), (WARN, "SSD only", disk, "")) if tier else
+    parts = ((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "RAM (run on the CPU)", ru, "")) if hy4 else \
+        (((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "Pinned RAM", ru, ""), (WARN, "SSD only", disk, "")) if tier else
              ((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "RAM cache / SSD (in place)", ru, ""))) if ds4 else \
         ((ACCENT, "VRAM", vu, f" · {fmt(n.get('vram_gb'), 1)} GB"),
          (INFO_TEXT, "Pinned RAM", ru, f" · {fmt(n.get('ram_gb'), 1)} GB"), (WARN, "SSD only", disk, ""))
@@ -219,11 +231,13 @@ def tiers(m: dict, width: int):
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))
     mm3 = eng.get("engine_kind") in ("mm3", "qwen")   # (CYBER-FROST's Qwen path too: the CPU computes the others)
-    for key, name, color, unit in TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
+    for key, name, color, unit in TIERS_HY4 if hy4 else TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
         rows.add_row(Text(name, MUTED), Text.assemble((fmt(n.get(key), 2), f"bold {INK}"), (unit, MUTED)),
                      spark(h.get(key), max(8, width - 32), color=color))
     stale = time.time() - (n.get("time") or 0) > 30
-    if ds4:
+    if hy4:
+        tips = () if stale or (n.get("vram_hit") or 1) >= 0.5 else TIPS["ds4_cpu"]
+    elif ds4:
         tips = () if stale else TIPS["ds4_disk"] if (n.get("disk_mb") or 0) >= 500 else \
             TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
     elif mm3:
@@ -296,6 +310,8 @@ def hardware(m: dict, width: int) -> Table:
               f"to GPU {rate(hw.get('gpu_pcie_rx_mb'))}", h.get("gpu_pcie_rx_mb"), None),
              ("CPU", fmt(hw.get("cpu")), "%", f"{st.get('cores')} cores · {st.get('threads')} threads"
               if st.get("threads") else "", h.get("cpu"), 100),
+             ("CPU temp", fmt(hw.get("cpu_temp")), "°C", "the hottest sensor" if hw.get("cpu_temp") is not None
+              else "no CPU sensor", h.get("cpu_temp"), 100),
              ("RAM", gb(hw.get("ram_used")), f"/ {gb(hw.get('ram_total'), 0)} GB",
               f"{fmt(eng.get('ram_gb'), 1)} GB pinned for experts" if eng.get("ram_gb") else "", h.get("ram_used"),
               hw.get("ram_total")),
@@ -356,6 +372,9 @@ def banners(m: dict, fails: int) -> Text:
     for g in (m.get("hardware") or {}).get("gpus") or []:
         if (g.get("temp") or 0) >= 87:
             out.append((f"GPU {g.get('index')} is at {fmt(g['temp'])} °C: it may slow itself down to cool off.", WARN))
+    cpu_t = (m.get("hardware") or {}).get("cpu_temp")
+    if (cpu_t or 0) >= 95:
+        out.append((f"The CPU is at {fmt(cpu_t)} °C: it may slow itself down to cool off.", WARN))
     if fails >= 3:
         out.append(("The server does not answer: these numbers are from before.", DANGER))
     return Text("\n").join(Text.assemble(("! ", f"bold {tone}"), (msg, tone)) for msg, tone in out)
@@ -369,7 +388,11 @@ def loading(w: LoadWatch, width: int):
     def gpu(k):
         return f"GPU {w.gpus[k]}" if k < n else f"part {k + 1}"
     now = [k for k in sorted(parts) if parts[k][0] < parts[k][1]]   # (the GPU warming now; before it starts: the next)
-    if not parts:
+    if getattr(w, "measuring", False):                  # (Hy4-Flash's first start on this PC, before it is ready)
+        left = getattr(w, "measure_left", None)
+        what = (f"measuring this PC once, {w.measuring if isinstance(w.measuring, str) else 'its choices'}" +
+                (f" (about {clock(left)} more)" if left else "") + " - the next starts skip this")
+    elif not parts:
         what = "reading the model's weights"
     elif len(parts) >= n and not now:
         what = "the engine's last checks - almost ready"

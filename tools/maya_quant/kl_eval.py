@@ -1,8 +1,8 @@
 """tools/maya_quant/kl_eval.py - a pack against the FP8 reference: KL, same-top-token rate, NLL on the eval set.
 
 calib.py's reference() keeps the FP8 model's top-k log-probs of every eval position (ref_topk.npz).  Each chosen
-sequence is scored by the engine (STRATA_GLM_SCORE, the one-token decode path) after a context of --ctx tokens, with
-the matching rows of the reference in the engine's compact form (STRATA_GLM_SCORE_TOPK).
+sequence is scored by the engine (MAYA_GLM_SCORE, the one-token decode path) after a context of --ctx tokens, with
+the matching rows of the reference in the engine's compact form (MAYA_GLM_SCORE_TOPK).
 
     python kl_eval.py --pack PACK --eval eval.npy --ref ref_topk.npz [--seqs 0,5,10] [--ctx 64] [--len 1024]
 """
@@ -43,7 +43,7 @@ def main():
                 f.write(ids[s, i].astype(np.int32).tobytes())
                 f.write(lp[s, i].astype(np.float32).tobytes())
             path = f.name
-        env = dict(os.environ, STRATA_GLM_SCORE=str(c), STRATA_GLM_SCORE_TOPK=path, STRATA_GLM_USAGE="0")
+        env = dict(os.environ, MAYA_GLM_SCORE=str(c), MAYA_GLM_SCORE_TOPK=path, MAYA_GLM_USAGE="0")
         r = subprocess.run([a.exe, "--glm-pack", a.pack, "--max-context", str(a.max_context), "--greedy",
                             "--tokens", ",".join(map(str, toks.tolist()))], capture_output=True, text=True, env=env,
                            cwd=pathlib.Path(a.exe).parents[1])

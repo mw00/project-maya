@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_mtp_state_test.cpp - glm-dsa B15.3 (CPU): the NextN carrier's sequence state, the MTP1 slot
-// trailer, the block identity and the draft budget (include/strata/core/glm_mtp_state.hpp).
+// trailer, the block identity and the draft budget (include/maya/core/glm_mtp_state.hpp).
 //
 // A toy twin of the engine's MTP data flow runs the engine's own state machine (glmmtp::HostCarrier, the trailer
 // functions, spec_budget) next to "legacy", Maya's behaviour (one shared scratch row per card, written by every
@@ -9,15 +9,15 @@
 //   2. reset at pos 0 (#28333): a prompt whose last row reaches the draft without a token-path note (the batched
 //      prompt path) drafts from zeros exactly like a fresh process, even when the previous request had the same
 //      length (the position check alone would accept its row); legacy differs;
-//   3. two interleaved sequences (STRATA_GLM_SEQS): each drafts from its own carrier; legacy differs;
+//   3. two interleaved sequences (MAYA_GLM_SEQS): each drafts from its own carrier; legacy differs;
 //   4. snapshot round trip: the first draft after snapshot_restore equals the one at the snapshot;
 //   5. the MTP1 trailer: round trip; truncated, wrong magic / width / block / position / checksum are refused and
 //      leave the state untouched; a slot written before B15.3 (no trailer) reads as Absent;
 //   6. the draft budget (#28473): draft_budget's table, and decode_spec's loop (simulated) issues no speculative
 //      verify row past n_predict or the context, with the same tokens (counted for every max_new and context);
 //   7. the block identity: order-independent, changes with a tensor type or the source, never 0; fingerprint words.
-#include "strata/core/glm_mtp_state.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_mtp_state.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -36,7 +36,7 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-using namespace strata::core;
+using namespace maya::core;
 
 constexpr int E = 16, V = 23;
 
@@ -253,7 +253,7 @@ void test_reset_pos0() {
 }
 
 void test_two_sequences() {
-    std::printf("[3. two interleaved sequences (STRATA_GLM_SEQS)]\n");
+    std::printf("[3. two interleaved sequences (MAYA_GLM_SEQS)]\n");
     for (int legacy = 0; legacy < 2; ++legacy) {
         int ya = 0, yb = 0;
         int want_a = 0, want_b = 0;
@@ -416,7 +416,7 @@ void test_block_id() {
                    id = glmmtp::block_id(a, "gguf:mtp.gguf:123");
     check(ia == ib, "order-independent");
     check(ia != ic, "another tensor type, another id");
-    check(ia != id, "another source (STRATA_GLM_MTP_GGUF), another id");
+    check(ia != id, "another source (MAYA_GLM_MTP_GGUF), another id");
     check(ia != 0 && ia <= 0x7fffffffu && glmmtp::block_id({}, "") != 0, "never 0, 31 bits");
     check(glmmtp::fp_block_word(ia) == (int32_t) ia && glmmtp::fp_carrier_word(true, ia, 6144) == 24576 &&
               glmmtp::fp_carrier_word(true, 0, 6144) == 0 && glmmtp::fp_carrier_word(false, ia, 6144) == 0,

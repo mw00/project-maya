@@ -7,10 +7,10 @@ ggml type, which engine path serves it:
   routed experts (blk.N.ffn_{gate,up,down}_exps)
     decode GPU   the MoE kernels' instantiations (glm_fast.cu moe_supported)
     CPU lane     ggml-cpu's vec_dot for the type (the native lane computes with ggml's dot products; native_fmt)
-    prefill      the MMQ instances (strata_mmq: CMakeLists.txt mmq-instance-<t>.cu)
+    prefill      the MMQ instances (maya_mmq: CMakeLists.txt mmq-instance-<t>.cu)
   non-routed tensors
     pack         tools/strata/glm_dsa_pack.py plan_tensor: served natively, copied, dequantized to BF16/F32, or
-                 refused (with STRATA_PACK_NATIVE32 or --native32: the B10.7 types stay native)
+                 refused (with MAYA_PACK_NATIVE32 or --native32: the B10.7 types stay native)
     decode GPU   the device GEMV (glm_fast.cu mv_type_ok, glmd_mv_dots.cuh type_ok) on what the pack serves
     prefill      the FP16 dequant of the batched prompt (glm_prefill_dsa.cu f16_covers: dequant_bf16.cu geometry
                  plus the i-quants) or the float copy
@@ -24,7 +24,7 @@ classes (distinct (gate/up row bytes, down row bytes) pairs; the slow path's poo
 
 Inputs (one): GGUF shards (any shard: the siblings are found), a header dump (tools/strata/gguf_audit.py
 --dump-header), or an audit TSV (<name>_audit.tsv).  The engine tables are parsed from this source tree; ggml's
-vec_dot table from --ggml-dir (default $STRATA_GGML_DIR, else third_party/ggml).
+vec_dot table from --ggml-dir (default $MAYA_GGML_DIR, else third_party/ggml).
 
     python3 tools/strata/type_coverage.py /data/models/GLM-5.3-GGUF/UD-IQ2_M/GLM-5.3-UD-IQ2_M-00001-of-00006.gguf \
         --out docs/strata/volta3/type-coverage.md
@@ -38,6 +38,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys as _sys   # (an older MAYA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+_sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+import maya_names  # noqa: E402,F401
 import pathlib
 import re
 import sys
@@ -125,8 +128,8 @@ def engine_tables(root: pathlib.Path, ggml_dir: pathlib.Path | None) -> dict:
     vec = set()
     gd = ggml_dir
     cands = [gd] if gd else []
-    if os.environ.get("STRATA_GGML_DIR"):
-        cands.append(pathlib.Path(os.environ["STRATA_GGML_DIR"]))
+    if os.environ.get("MAYA_GGML_DIR"):
+        cands.append(pathlib.Path(os.environ["MAYA_GGML_DIR"]))
     cands.append(root / "third_party" / "ggml")
     try:   # the llama.cpp tree whose gguf-py is on the path (strata-env.sh: ~/ggml-pin/gguf-py)
         import gguf
@@ -306,7 +309,7 @@ def markdown(cov: dict, tab: dict, source: str, native32: bool) -> str:
             "## Runtime check (on the test PC)", "",
             "Every routed type: float reference vs ggml-cpu vs GPU, max rel err < 1e-3 (BUILD-PLAN B5.3):", "",
             "```sh",
-            "cmake -S . -B build -DSTRATA_REAL_SHARD=\"<the shards holding layers 3, 26, 54, 77, 78>\"",
+            "cmake -S . -B build -DMAYA_REAL_SHARD=\"<the shards holding layers 3, 26, 54, 77, 78>\"",
             "ctest --test-dir build -R native_expert_parity_real --output-on-failure",
             "# or directly: build/native_expert_parity <shard> 3 26 54 77 78",
             "```", "", "| Layer | gate/up type | down type | max rel err | Result |", "|---|---|---|---|---|",
@@ -320,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("inputs", nargs="+", help="GGUF shard(s), a header dump .json, or an audit .tsv")
     ap.add_argument("--out", help="write the markdown here (default: stdout)")
     ap.add_argument("--ggml-dir", help="llama.cpp checkout for ggml-cpu's vec_dot table")
-    ap.add_argument("--native32", action="store_true", default=None, help="the pack's STRATA_PACK_NATIVE32 mode")
+    ap.add_argument("--native32", action="store_true", default=None, help="the pack's MAYA_PACK_NATIVE32 mode")
     ap.add_argument("--root", default=str(ROOT), help="the source tree whose tables are read")
     a = ap.parse_args(argv)
     try:

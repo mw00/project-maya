@@ -176,7 +176,7 @@ class _Server(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        env_patch = mock.patch.dict(os.environ, {"STRATA_GPU_RELEASE_S": "0"})
+        env_patch = mock.patch.dict(os.environ, {"MAYA_GPU_RELEASE_S": "0"})
         env_patch.start()
         cls.addClassCleanup(env_patch.stop)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=WIN)
@@ -624,7 +624,7 @@ class MainStart(unittest.TestCase):
         cfg["args"] = [str(CONTEXT) if a == "65536" else a for a in cfg["args"]]
         cfg.update(exe=fake_exe(d), tokenizer=str(tok_dir), cwd=str(d), log=str(d / "engine.log"), reasoning_effort="max",
                    model_name="glm-5.3" if glm_dsa else "glm-5.3-flash")
-        cfg["env"] = dict(cfg["env"], FAKE_ENGINE_DIR=str(d), STRATA_GPU_RELEASE_S="0",
+        cfg["env"] = dict(cfg["env"], FAKE_ENGINE_DIR=str(d), MAYA_GPU_RELEASE_S="0",
                           FAKE_ENGINE_GEN_LOG=str(d / "gen.txt"),
                           FAKE_ENGINE_IDS=",".join(map(str, tok.encode("Some thought.</think>Hello."))))
         cfg_edit(cfg)

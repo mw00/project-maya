@@ -16,7 +16,7 @@
 //      truncating integer dots and their f32 sums can move them).
 #include "glm_tier_numa.hpp"
 
-#include "strata/core/glm_arch.hpp"
+#include "maya/core/glm_arch.hpp"
 
 #include "ggml.h"
 
@@ -31,12 +31,12 @@
 #include <string>
 #include <vector>
 
-namespace gt = strata::core::glmtier;
-namespace kc = strata::kernels::cpu;
-namespace gfk = strata::kernels::glmf;
-using strata::core::Glm5Geometry;
-using strata::core::Glm5Model;
-using strata::core::GlmArch;
+namespace gt = maya::core::glmtier;
+namespace kc = maya::kernels::cpu;
+namespace gfk = maya::kernels::glmf;
+using maya::core::Glm5Geometry;
+using maya::core::Glm5Model;
+using maya::core::GlmArch;
 
 namespace {
 

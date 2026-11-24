@@ -3,7 +3,7 @@
 
 Each case of a spec file (default data/glm-dsa/parity/specs.json) becomes <out>/<case>.tokens (the prompt ids, then
 the reference's greedy continuation ids, comma-separated), <out>/<case>.ctx (the prompt length, i.e. the
-STRATA_GLM_SCORE context: positions ctx .. n-2 are scored) and a line of <out>/cases.txt ("<case> short|long"), the
+MAYA_GLM_SCORE context: positions ctx .. n-2 are scored) and a line of <out>/cases.txt ("<case> short|long"), the
 inputs of tools/strata/parity_run.sh and tools/strata/volta3_gate.sh.  The server must be llama.cpp aa94f208 serving the
 GGUF under test (llama-server -m $M -ngl 999 --ot exps=CPU, or the CPU build for R_cpu, whose greedy tokens are the
 teacher text).
@@ -52,7 +52,7 @@ def render(url: str, messages: list[dict], tools: list | None) -> str:
 
 def topk_rows(r: dict, k: int) -> list[tuple[list[int], list[float]]]:
     """The /completion response's per-token top-k log-probs (n_probs > 0), best first: one row per continuation token,
-    i.e. the distribution each greedy token was picked from - the rows STRATA_GLM_SCORE_TOPK reads."""
+    i.e. the distribution each greedy token was picked from - the rows MAYA_GLM_SCORE_TOPK reads."""
     rows = []
     for e in r.get("completion_probabilities", []):
         top = e.get("top_logprobs") or e.get("probs") or []
@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="data/glm-dsa/parity")
     ap.add_argument("--cases", help="comma list: only these cases")
     ap.add_argument("--n-probs", type=int, default=0,
-                    help="also write <case>.topk (STRATA_GLM_SCORE_TOPK format) with the server's top-N log-probs")
+                    help="also write <case>.topk (MAYA_GLM_SCORE_TOPK format) with the server's top-N log-probs")
     a = ap.parse_args(argv)
     spec_path = pathlib.Path(a.spec)
     out = pathlib.Path(a.out)

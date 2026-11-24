@@ -249,7 +249,7 @@ class VisionBf16(unittest.TestCase):
             s = st.SafeTensors(m)
             self.assertEqual(s.t["vision.patch_embed.proj.weight"][:3], (self.QUANT, "F16", (4, 12)))
             line = pack.vision_bf16(s, m, m.parent / "vision")
-            self.assertIn("2 tensors in BF16 from %s" % pack.SHARD1, line)
+            self.assertIn("3 tensors in BF16 from %s" % pack.SHARD1, line)   # (its whole tower)
             self.assertIn("F16", line)
             fn, dt, shape, off, nb = s.t["vision.patch_embed.proj.weight"]
             self.assertEqual((fn, dt, shape, nb), (pack.SHARD1, "BF16", (4, 12), 96))
@@ -273,6 +273,63 @@ class VisionBf16(unittest.TestCase):
             self.assertIn("../vision/vision.bin", s.files)
             self.assertEqual(s.t["vision.patch_embed.proj.weight"], ("../vision/vision.bin", "BF16", (4, 12), 256, 96))
             self.assertEqual(s.t["aligner.w1.bias"], ("../vision/vision.bin", "BF16", (4,), 0, 8))
+
+    def exl3_tower(self, root: pathlib.Path, shard1: bool = False) -> pathlib.Path:
+        """turboderp's 2.25 bpw: the tower's matrices in EXL3 (.trellis / .suh / .svh / .mul1), its biases F16."""
+        m = root / "quant"
+        m.mkdir()
+        own = {"vision.blocks.0.attn.q_proj.trellis": ("I16", [1, 1, 16], bytes(32)),
+               "vision.blocks.0.attn.q_proj.suh": ("F16", [4], bytes(8)),
+               "vision.blocks.0.attn.q_proj.svh": ("F16", [4], bytes(8)),
+               "vision.blocks.0.attn.q_proj.mul1": ("I32", [1], bytes(4)),
+               "vision.blocks.0.attn.q_proj.bias": ("F16", [4], bytes(8)),
+               "vision.blocks.0.attn.k_proj.bias": ("F16", [4], bytes(8)),   # (a name DeepSeek's tower has not: wqkv)
+               "layers.0.attn.wq_a.trellis": ("I16", [2, 2], bytes(8))}
+        write_st(m / self.QUANT, own)
+        (m / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: self.QUANT for k in own}}))
+        if shard1:
+            write_st(m / pack.SHARD1, {"vision.blocks.0.attn.q_proj.weight": ("BF16", [4, 4], bytes(32)),
+                                       "vision.blocks.0.attn.q_proj.bias": ("BF16", [4], bytes(8))})
+        return m
+
+    def test_an_exl3_tower_from_the_vision_folder(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.exl3_tower(pathlib.Path(td))
+            v = pathlib.Path(td) / "vision"
+            v.mkdir()
+            (v / "vision.bin").write_bytes(bytes(512))
+            (v / "vision.json").write_text(json.dumps({"tensors": [
+                ["vision.blocks.0.attn.q_proj.bias", "BF16", 0, 8, [4]],
+                ["vision.blocks.0.attn.q_proj.weight", "BF16", 64, 32, [4, 4]]]}))
+            s = st.SafeTensors(m)
+            line = pack.vision_bf16(s, m, v)
+            self.assertIn("2 tensors in BF16 from ../vision/vision.bin", line)
+            self.assertEqual(s.t["vision.blocks.0.attn.q_proj.weight"], ("../vision/vision.bin", "BF16", (4, 4), 64, 32))
+            self.assertEqual(s.t["vision.blocks.0.attn.q_proj.bias"][:2], ("../vision/vision.bin", "BF16"))
+            for p in (".trellis", ".suh", ".svh", ".mul1"):   # (the quant's EXL3 pieces of it: not in the pack)
+                self.assertNotIn("vision.blocks.0.attn.q_proj" + p, s.t)
+            self.assertNotIn("vision.blocks.0.attn.k_proj.bias", s.t)          # (the quant's own layout: left out)
+            self.assertEqual(s.t["layers.0.attn.wq_a.trellis"][0], self.QUANT)   # (the model's own EXL3 stays)
+
+    def test_an_exl3_tower_from_shard1(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.exl3_tower(pathlib.Path(td), shard1=True)
+            s = st.SafeTensors(m)
+            line = pack.vision_bf16(s, m, None)
+            self.assertIn("2 tensors in BF16 from %s" % pack.SHARD1, line)
+            self.assertEqual(s.t["vision.blocks.0.attn.q_proj.weight"][:2], (pack.SHARD1, "BF16"))
+            self.assertNotIn("vision.blocks.0.attn.q_proj.trellis", s.t)
+            self.assertNotIn("vision.blocks.0.attn.k_proj.bias", s.t)
+
+    def test_an_exl3_tower_without_a_copy_warns(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.exl3_tower(pathlib.Path(td))
+            s = st.SafeTensors(m)
+            self.assertIn("WARNING", pack.vision_bf16(s, m, pathlib.Path(td) / "vision"))
+            self.assertIn("vision.blocks.0.attn.q_proj.trellis", s.t)   # (nothing removed: pictures off, said)
 
     def test_a_warning_without_a_bf16_copy(self):
         import st

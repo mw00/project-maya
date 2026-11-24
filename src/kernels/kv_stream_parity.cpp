@@ -9,11 +9,11 @@
 //   3. no call overflowed, and the hit/miss counters add up;
 //   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
 // INT8, FP16 and Q4_0 (PR #21) pools.
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/kv_stream.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_decode_attn.hpp"
+#include "maya/kernels/kv_q4.hpp"
+#include "maya/kernels/kv_q8.hpp"
+#include "maya/kernels/kv_stream.hpp"
+#include "maya/kernels/qsa.hpp"
+#include "maya/kernels/qsa_decode_attn.hpp"
 
 #include <cuda_runtime.h>
 
@@ -25,7 +25,7 @@
 #include <set>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = maya::kernels;
 
 namespace {
 int g_fail = 0;

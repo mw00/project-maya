@@ -17,14 +17,14 @@
 #include <string>
 #include <vector>
 
-using strata::ds4::kTopLogprobs;
-using strata::ds4::logprob_row_host;
-using strata::ds4::LogprobRow;
-using strata::ds4::lp_before;
-using strata::ds4::lp_line;
-using strata::ds4::lp_penalized;
-using strata::ds4::LpStride;
-using strata::ds4::lse_merge;
+using maya::ds4::kTopLogprobs;
+using maya::ds4::logprob_row_host;
+using maya::ds4::LogprobRow;
+using maya::ds4::lp_before;
+using maya::ds4::lp_line;
+using maya::ds4::lp_penalized;
+using maya::ds4::LpStride;
+using maya::ds4::lse_merge;
 
 namespace {
 

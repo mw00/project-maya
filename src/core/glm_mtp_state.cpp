@@ -1,13 +1,13 @@
 // src/core/glm_mtp_state.cpp - glm-dsa B15.3: the NextN carrier's bookkeeping, the MTP1 slot trailer, the block
-// identity and the draft budget (include/strata/core/glm_mtp_state.hpp).  Plain C++.
-#include "strata/core/glm_mtp_state.hpp"
+// identity and the draft budget (include/maya/core/glm_mtp_state.hpp).  Plain C++.
+#include "maya/core/glm_mtp_state.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <istream>
 #include <ostream>
 
-namespace strata::core::glmmtp {
+namespace maya::core::glmmtp {
 
 int draft_budget(int n_max, int64_t remaining_predict, int64_t remaining_ctx) {
     const int64_t b = std::min<int64_t>({(int64_t) n_max, remaining_predict, remaining_ctx});
@@ -141,4 +141,4 @@ Trailer read_trailer(std::istream& f, int n_embd, int64_t n, uint32_t block, int
     return Trailer::Ok;
 }
 
-}  // namespace strata::core::glmmtp
+}  // namespace maya::core::glmmtp

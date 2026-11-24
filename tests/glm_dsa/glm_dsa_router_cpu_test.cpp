@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_dsa_router_cpu_test.cpp - glm-dsa B5.1 on the CPU (no GPU, runs in CI): the decode router's CPU
-// twin (include/strata/kernels/glmd_route.hpp, moe_route_kernel's arithmetic) against the F64 HF oracle.
+// twin (include/maya/kernels/glmd_route.hpp, moe_route_kernel's arithmetic) against the F64 HF oracle.
 //
 //   1. 10^5 random router rows at 256 experts, top-8, x2.5, HF normalisation: ids equal the oracle's outside near-ties
 //      (biased-score gap < 1e-6), weights' relative error < 1e-6;
@@ -8,7 +8,7 @@
 //      still sums to 2.5 where the clamp (Maya / Flash) scales the weights down - Flash keeps the clamp;
 //   4. no SwiGLU clamp: with limit +INF the clamped SwiGLU equals the plain silu(g) * u bit for bit (also at +-INF and
 //      +-FLT_MAX), where Flash's limit 10 cuts large activations.
-#include "strata/kernels/glmd_route.hpp"
+#include "maya/kernels/glmd_route.hpp"
 
 #include "glm_dsa_router_oracle.hpp"
 

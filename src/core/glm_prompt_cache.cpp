@@ -1,6 +1,6 @@
 // src/core/glm_prompt_cache.cpp - glm-dsa B14.14: the content-addressed prompt-cache store
-// (include/strata/core/glm_prompt_cache.hpp).
-#include "strata/core/glm_prompt_cache.hpp"
+// (include/maya/core/glm_prompt_cache.hpp).
+#include "maya/core/glm_prompt_cache.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -9,7 +9,7 @@
 #include <filesystem>
 #include <fstream>
 
-namespace strata::core::glmpc {
+namespace maya::core::glmpc {
 
 namespace fs = std::filesystem;
 
@@ -75,10 +75,10 @@ size_t restore_len(size_t lcp, size_t n_entry, size_t n_prompt) {
 
 StoreConfig config_env(const std::string& identity) {
     StoreConfig c;
-    if (const char* d = std::getenv("STRATA_GLM_PROMPT_CACHE_DIR")) c.dir = d;
-    c.cap_bytes = (uint64_t) (std::max(0.0, env_num("STRATA_GLM_PROMPT_CACHE_GB", 64.0)) * 1073741824.0);
-    c.max_entries = (size_t) std::max(1.0, env_num("STRATA_GLM_PROMPT_CACHE_MAX", 64.0));
-    c.min_tokens = (size_t) std::max(1.0, env_num("STRATA_GLM_PROMPT_CACHE_MIN", 512.0));
+    if (const char* d = std::getenv("MAYA_GLM_PROMPT_CACHE_DIR")) c.dir = d;
+    c.cap_bytes = (uint64_t) (std::max(0.0, env_num("MAYA_GLM_PROMPT_CACHE_GB", 64.0)) * 1073741824.0);
+    c.max_entries = (size_t) std::max(1.0, env_num("MAYA_GLM_PROMPT_CACHE_MAX", 64.0));
+    c.min_tokens = (size_t) std::max(1.0, env_num("MAYA_GLM_PROMPT_CACHE_MIN", 512.0));
     c.min_free_bytes = kMinFreeBytes;
     c.identity = identity;
     return c;
@@ -355,4 +355,4 @@ bool Store::put(const std::vector<int32_t>& tokens, const SaveFn& save, std::str
     return true;
 }
 
-}  // namespace strata::core::glmpc
+}  // namespace maya::core::glmpc

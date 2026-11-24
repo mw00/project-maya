@@ -212,11 +212,11 @@ class GlmDsaLists(unittest.TestCase):
             self.assertEqual(P("blk.7.%s.weight" % n, "Q8_0", headwise=False), ("convert", "BF16"), n)
             self.assertEqual(P("blk.7.%s.weight" % n, "BF16"), ("copy", "BF16"), n)
         # Q8_0 W_kb / W_vb stay native by default (headwise MLA GEMVs); the other BF16-list tensors convert as before
-        with patch.dict("os.environ", {"STRATA_PACK_NATIVE32": ""}):
+        with patch.dict("os.environ", {"MAYA_PACK_NATIVE32": ""}):
             for n in ("attn_k_b", "attn_v_b"):
                 self.assertEqual(P("blk.7.%s.weight" % n, "Q8_0"), ("native", "Q8_0"), n)
             self.assertEqual(P("blk.7.indexer.attn_k.weight", "Q8_0"), ("convert", "BF16"))
-        with patch.dict("os.environ", {"STRATA_PACK_NATIVE32": "0"}):
+        with patch.dict("os.environ", {"MAYA_PACK_NATIVE32": "0"}):
             self.assertEqual(P("blk.7.attn_k_b.weight", "Q8_0"), ("convert", "BF16"))
         for n in ("attn_norm.weight", "ffn_norm.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
                   "indexer.k_norm.weight", "indexer.k_norm.bias", "nextn.enorm.weight", "nextn.hnorm.weight",

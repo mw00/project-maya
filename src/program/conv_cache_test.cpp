@@ -13,13 +13,13 @@
 //   4. a one-slot budget has no room for root and leaf, so the pin is off and the oldest leaves (the
 //      newest point stays, as before);
 //   5. the policy is pure: the same stamps, the same victim.
-#include "strata/program/conv_cache.hpp"
+#include "maya/program/conv_cache.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <vector>
 
-using strata::program::conv_cache::eviction_victim;
+using maya::program::conv_cache::eviction_victim;
 
 namespace {
 int g_fail = 0;

@@ -12,7 +12,7 @@
 
 namespace {
 
-struct RefParams {   // the fields of strata::kernels::SamplerParams the reference reads
+struct RefParams {   // the fields of maya::kernels::SamplerParams the reference reads
     int top_k = 20;
     float top_p = 0.95f;
     float min_p = 0.0f;

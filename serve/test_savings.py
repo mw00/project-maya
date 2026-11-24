@@ -34,6 +34,13 @@ class Prices(unittest.TestCase):
         self.assertEqual((mm["api"], mm["input"], mm["cached"], mm["output"], mm.get("peak")),
                          ("MiniMax", 0.15, 0.015, 0.60, None))
         self.assertEqual(SV.reference("MiniMax-M3.1-Flash")["api"], "MiniMax")
+        hy = SV.reference("hy4-flash")                                # (Tencent's: flat, no peak hours)
+        self.assertEqual((hy["api"], hy["input"], hy["cached"], hy["output"], hy.get("peak")),
+                         ("Tencent", 0.07, 0.003, 0.281, None))
+        for name in ("Hy4-Flash", "tencent/Hy4-flash", "hy4_flash", "Hy4-Flash-Maya-GGUF"):
+            self.assertEqual((SV.reference(name) or {}).get("api"), "Tencent", name)
+        for name in ("why4-flash", "hy4", "hy4-pro"):
+            self.assertIsNone(SV.reference(name), name)
         self.assertIsNone(SV.reference("qwen3.8-flash-next"))
 
     def test_peak_hours(self):
@@ -78,6 +85,15 @@ class Counting(unittest.TestCase):
         self.assertEqual(r["models"][1]["tokens"], {"input": 1_100_000, "cached": 900_000, "output": 500_000, "requests": 2})
         self.assertAlmostEqual(r["start"]["usd"], glm, places=6)
         self.assertEqual({p["model"] for p in r["prices"]}, {"deepseek-v4.1-flash", "glm-5.3-flash"})
+
+    def test_hy4_flash_is_priced(self):
+        # (the sidebar shows Saved only for a priced model: Hy4-flash had none, so its line never showed)
+        h = SV.Ledger(self.path, "maya-hy4.json", "hy4-flash", "hy4")
+        h.add(1_000_000, 400_000, 100_000, now=TUE_PEAK)              # (Tencent has no peak hours: the base price)
+        s = h.summary()
+        self.assertTrue(s["priced"])
+        self.assertAlmostEqual(s["start_usd"], 0.6 * 0.07 + 0.4 * 0.003 + 0.1 * 0.281, places=6)
+        self.assertEqual(h.report()["prices"][0]["api"], "Tencent")
 
     def test_reused_never_above_the_prompt_and_unknown_models(self):
         q = SV.Ledger(self.path, "x.json", "qwen3.8-flash-next")

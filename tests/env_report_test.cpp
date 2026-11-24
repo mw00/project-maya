@@ -1,14 +1,14 @@
-// The engine's start-up line of the GLM settings set in the environment (include/strata/platform/env_report.hpp,
+// The engine's start-up line of the GLM settings set in the environment (include/maya/platform/env_report.hpp,
 // #6): only when one is set, each under the name it was set by, and the value used when the engine clamps it.
 // Host code only: a made-up environment table, no GPU.
-#include "strata/platform/env_report.hpp"
+#include "maya/platform/env_report.hpp"
 
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using strata::platform::EnvRange;
-using strata::platform::env_report;
+using maya::platform::EnvRange;
+using maya::platform::env_report;
 
 static int failures = 0;
 
@@ -27,7 +27,7 @@ int main() {
     expect({}, "");
     // set, in the order of the setting's name past MAYA_ / STRATA_, each under the name used
     expect({"STRATA_GLM_SLOTS=0", "MAYA_GLM_PREFETCH_N=1"}, "glm env: MAYA_GLM_PREFETCH_N=1, STRATA_GLM_SLOTS=0");
-    // both names (env_aliases copies MAYA_X to STRATA_X): said once, by the MAYA_ name, whichever comes first
+    // both names (env_aliases copies STRATA_X to MAYA_X): said once, by the MAYA_ name, whichever comes first
     expect({"STRATA_GLM_SLOTS=4", "MAYA_GLM_SLOTS=4"}, "glm env: MAYA_GLM_SLOTS=4");
     expect({"MAYA_GLM_SLOTS=4", "STRATA_GLM_SLOTS=4"}, "glm env: MAYA_GLM_SLOTS=4");
     // clamped: the value used and why

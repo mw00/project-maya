@@ -13,9 +13,9 @@
 //                                         DS4_IQ512=1, DS4_IQ512=0 and DS4_IQ_OWN=0 to compare the rows; --bench --glm
 //                                         also times the GLM lane's AVX-512 multi-token rows against its AVX2 ones
 #include "../src/ds4/ds4_gguf_cpu.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/iq_avx2.hpp"
-#include "strata/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/iq_avx2.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
+namespace gg = maya::ds4::gguf;
 
 namespace {
 
@@ -232,11 +232,11 @@ int main(int argc, char** argv) {
             for (int nt : {1, 2, 4}) bench(type, nt);
         // (the GLM lane's multi-token rows, AVX-512 against AVX2, on the same rows: what one thread says about 512-bit
         // integer code on this CPU)
-        if (argc > 2 && std::string(argv[2]) == "--glm" && strata::kernels::cpu::cpu_avx512bw_ok())
+        if (argc > 2 && std::string(argv[2]) == "--glm" && maya::kernels::cpu::cpu_avx512bw_ok())
             for (int type : {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS})
                 for (int nt : {2, 4}) {
-                    bench(type, nt, strata::kernels::cpu::iq512_rows, "glm-avx512");
-                    bench(type, nt, strata::kernels::cpu::iq256_rows, "glm-avx2");
+                    bench(type, nt, maya::kernels::cpu::iq512_rows, "glm-avx512");
+                    bench(type, nt, maya::kernels::cpu::iq256_rows, "glm-avx2");
                 }
         return 0;
     }

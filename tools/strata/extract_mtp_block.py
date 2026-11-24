@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """tools/strata/extract_mtp_block.py - cut the NextN (MTP) draft block out of a glm-dsa GGUF into a standalone GGUF
-the engine reads through STRATA_GLM_MTP_GGUF (BUILD-PLAN B15.4).
+the engine reads through MAYA_GLM_MTP_GGUF (BUILD-PLAN B15.4).
 
 Why: the engine's MTP gain (M4, first-position acceptance >= 0.6) depends on the draft head's precision.  llama.cpp
 #28351 measured teacher-forced head-vs-trunk agreement 0.718 with a Q4_0 head vs 0.724 bf16, and a collapse with an
 IQ2_XS head.  A UD-IQ2_M file quantizes blk.78 like its trunk (tools/strata/gguf_audit.py check A9 reports the types
 and WARNs).  The draft block reads only the trunk's hidden state and the token embedding, so a block from a larger quant
-of the SAME model (Q4_K_M, Q5_K_M, Q8_0) drops in: the engine looks it up in STRATA_GLM_MTP_GGUF first.
+of the SAME model (Q4_K_M, Q5_K_M, Q8_0) drops in: the engine looks it up in MAYA_GLM_MTP_GGUF first.
 
 The copy is byte-exact (no requantization): every blk.<N>.* tensor of the source, in its own type, plus the source's
 key/values (minus split.*, tokenizer.* and general.name, which says where the block came from).  Only the block's
@@ -23,8 +23,8 @@ bytes are read, so a remote source costs about the block's size (Q4_K_M: about 5
     # list the block's types and the B15.4 verdict, write nothing
     python3 tools/strata/extract_mtp_block.py /data/GLM-5.3-UD-IQ2_M-00001-of-00006.gguf --list
 
-Then: STRATA_GLM_MTP_GGUF=glm53-mtp-q4km.gguf (the engine logs "glm mtp: CUDAn the draft block from ... (instead of
-the model's own)"), and measure tools/glm_dsa_mtp_probe.py --agree and the engine's acceptance (STRATA_GLM_SPEC_LOG).
+Then: MAYA_GLM_MTP_GGUF=glm53-mtp-q4km.gguf (the engine logs "glm mtp: CUDAn the draft block from ... (instead of
+the model's own)"), and measure tools/glm_dsa_mtp_probe.py --agree and the engine's acceptance (MAYA_GLM_SPEC_LOG).
 --check-against MODEL refuses a block from another model (arch, block index, embedding, attention, expert geometry).
 
 Exit status: 0 written (or listed), 1 refused (no block, missing tensors, geometry mismatch), 2 usage or read error.
@@ -272,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, EOFError) as e:
         print("extract_mtp_block: %s" % e, file=sys.stderr)
         return 2
-    print("wrote %s: blk.%d, %d tensors, %.2f GB of tensor data; use STRATA_GLM_MTP_GGUF=%s" % (
+    print("wrote %s: blk.%d, %d tensors, %.2f GB of tensor data; use MAYA_GLM_MTP_GGUF=%s" % (
         a.out, block, len(items), n / 1e9, a.out))
     return 0
 

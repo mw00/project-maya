@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-using namespace strata::core::glmdsa;
+using namespace maya::core::glmdsa;
 
 static int g_fail = 0;
 #define CHECK(c)                                                                \

@@ -222,7 +222,7 @@ class TemplateAtStart(unittest.TestCase):
         cfg["tokenizer"] = str(tok_dir)
         cfg["cwd"] = str(d)
         cfg["log"] = str(d / "engine.log")
-        cfg["env"] = dict(cfg["env"], FAKE_ENGINE_DIR=str(d), STRATA_GPU_RELEASE_S="0",
+        cfg["env"] = dict(cfg["env"], FAKE_ENGINE_DIR=str(d), MAYA_GPU_RELEASE_S="0",
                           FAKE_ENGINE_IDS=",".join(map(str, tok.encode("Some thought.</think>Hello from glm-5.3."))),
                           **(extra_env or {}))
         p = d / "strata-test.json"
@@ -533,7 +533,7 @@ class ContractTestOnTheFake(unittest.TestCase):
 
     def test_contract_checks_pass_on_the_fake(self):
         with tempfile.TemporaryDirectory() as d:
-            env = dict(os.environ, STRATA_TEST_ENGINE=fake_exe(Path(d)), STRATA_TEST_PACK=d, FAKE_ENGINE_REPEAT="1",
+            env = dict(os.environ, MAYA_TEST_ENGINE=fake_exe(Path(d)), MAYA_TEST_PACK=d, FAKE_ENGINE_REPEAT="1",
                        FAKE_ENGINE_IDS="104,101,108,108,111,154827")
             r = subprocess.run([sys.executable, "-m", "unittest", "serve.test_engine_contract"], cwd=str(ROOT),
                                env=env, capture_output=True, text=True, timeout=120)
@@ -549,7 +549,7 @@ class HistoryReuse(unittest.TestCase):
 
     def chat(self, send_reasoning: bool, turns: int = 10) -> list[tuple[int, int]]:
         with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()), \
-                mock.patch.dict(os.environ, {"STRATA_GPU_RELEASE_S": "0"}):
+                mock.patch.dict(os.environ, {"MAYA_GPU_RELEASE_S": "0"}):
             tok = glm_tokenizer(Path(d) / "tok")
             answer = "Let me think about this for a while.</think>Here is the answer, with some detail."
             env = dict(os.environ, FAKE_ENGINE_IDS=",".join(map(str, tok.encode(answer))), FAKE_ENGINE_DIR=d)

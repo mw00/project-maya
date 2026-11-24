@@ -22,6 +22,15 @@
 .set-page { max-width: 660px; display: flex; flex-direction: column; gap: 22px; }
 .set-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0; }
 .set-head__text { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 280px; }
+/* Chat defaults: "Saved" after the title once a change is saved (at once), then it fades; it keeps its room on the
+   title's line, so nothing moves */
+.set-saved { position: relative; display: inline-flex; vertical-align: middle; margin-left: 10px; }
+.set-saved__mark { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px 3px 7px; border-radius: var(--st-r-pill);
+                   font-size: var(--st-fs-xs); font-weight: var(--st-fw-medium); color: var(--st-ok-text); background: var(--st-ok-tint);
+                   opacity: 0; transform: translateY(2px); pointer-events: none;
+                   transition: opacity .45s var(--st-ease), transform .45s var(--st-ease); }
+.set-saved.is-on .set-saved__mark { opacity: 1; transform: none; transition-duration: .12s; }
+.set-saved__say { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .set-body h3 { margin: 0; font-size: var(--st-fs-xl); font-weight: 600; letter-spacing: -.01em; line-height: 1.25; }
 .set-intro { margin: 0; font-size: var(--st-fs-md); line-height: 1.45; color: var(--st-ink-muted); }
 /* supporting Maya: one warm line on About; under an update its own violet-tinted row, a little larger */

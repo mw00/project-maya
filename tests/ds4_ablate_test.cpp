@@ -21,7 +21,7 @@
 #include <vector>
 
 namespace {
-using strata::ds4::ablate::load_direction;
+using maya::ds4::ablate::load_direction;
 
 int g_fail = 0;
 void check(bool ok, const char* what) {
@@ -90,7 +90,7 @@ std::filesystem::path write(const char* tag, const std::vector<Kv>& kvs, const s
     b.resize(data + off, 0);
     for (size_t i = 0; i < ts.size(); ++i) std::memcpy(b.data() + data + offs[i], ts[i].v.data(), ts[i].v.size() * 4);
     if (cut) b.resize(b.size() - cut);
-    const auto path = std::filesystem::temp_directory_path() / (std::string("strata_ds4_ablate_") + tag + ".gguf");
+    const auto path = std::filesystem::temp_directory_path() / (std::string("maya_ds4_ablate_") + tag + ".gguf");
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize) b.size());
     return path;
 }
@@ -193,9 +193,9 @@ int main() {
         T past{"direction.1", {kDim}, dir(1.0f)};
         past.force_off = 1u << 20;
         check(!loads(mk(write("cvpast", {}, {past})), 1, 2, 0.0f), "a tensor offset past the end: refused");
-        check(!loads("/nonexistent/strata_ds4_ablate.gguf", 1, 2, 0.0f), "a missing file: refused");
+        check(!loads("/nonexistent/maya_ds4_ablate.gguf", 1, 2, 0.0f), "a missing file: refused");
         std::vector<uint8_t> junk(64, 0x41);
-        const auto jp = mk(std::filesystem::temp_directory_path() / "strata_ds4_ablate_junk.gguf");
+        const auto jp = mk(std::filesystem::temp_directory_path() / "maya_ds4_ablate_junk.gguf");
         std::ofstream(jp, std::ios::binary).write(reinterpret_cast<const char*>(junk.data()), (std::streamsize) junk.size());
         check(!loads(jp, 1, 2, 0.0f), "not a GGUF: refused");
     }

@@ -1,6 +1,6 @@
 // tests/glm_dsa/glm_random_route_cpu_test.cpp - glm-dsa B15.7 on the CPU: the random-routing id generator.
 //
-// glmd::random_route_ids / random_route_apply (include/strata/kernels/glmd_random_route.hpp, the same code the
+// glmd::random_route_ids / random_route_apply (include/maya/kernels/glmd_random_route.hpp, the same code the
 // glm_fast.cu route kernel runs):
 //   - k distinct ids in [0, E) for every (seed, layer, counter), at E = 256 / k = 8 (GLM-5.3), E = 8 / k = 8 (a full
 //     permutation) and small shapes; refusals for k > 8 or E < k;
@@ -9,9 +9,9 @@
 //     never repeats an id;
 //   - apply keeps the router's weights: rank i's probability moves to its new id, so the route's weights
 //     w_i = p[ids[i]] * inv are the router's, in rank order; the other probabilities are untouched;
-//   - the switch is off unless STRATA_GLM_RANDOM_ROUTING is set (random_routing_seed() == 0: Flash and every normal
+//   - the switch is off unless MAYA_GLM_RANDOM_ROUTING is set (random_routing_seed() == 0: Flash and every normal
 //     run route as before).
-#include "strata/kernels/glmd_random_route.hpp"
+#include "maya/kernels/glmd_random_route.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -151,7 +151,7 @@ int main() {
     determinism();
     uniform();
     apply_keeps_weights();
-    CHECK(std::getenv("STRATA_GLM_RANDOM_ROUTING") != nullptr || glmd::random_routing_seed() == 0,
+    CHECK(std::getenv("MAYA_GLM_RANDOM_ROUTING") != nullptr || glmd::random_routing_seed() == 0,
           "off by default");
     std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;

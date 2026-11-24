@@ -10,8 +10,8 @@ routed experts (78 + 1 = 79 layers x 256 experts on the published GGUF).  This t
 
     python3 tools/strata/glm_dsa_profile.py <pack_dir> [INPUT ...] [--out PATH] [--equal] [--base PROFILE]
 
-INPUT: what tools/make_profile.py --glm reads - `--dump-routing` traces (binary), usage files (STRATA_GLM_USAGE,
-"layer e:count ..."), expert_counts.txt ("layer c0 c1 ... c255", tools/glm_expert_prior.py) and STRATA_GLM_TRACE
+INPUT: what tools/make_profile.py --glm reads - `--dump-routing` traces (binary), usage files (MAYA_GLM_USAGE,
+"layer e:count ..."), expert_counts.txt ("layer c0 c1 ... c255", tools/glm_expert_prior.py) and MAYA_GLM_TRACE
 records ("layer expert").  Without any INPUT the pack's own expert_counts.txt is used.  The ranking: the inputs'
 pairs, most routed first (--equal: each input weighed the same), then --base's order (a previous profile of the same
 layout, e.g. one --expert-profile-save learned), then every pair still missing, interleaved across the layers.  The
@@ -68,7 +68,7 @@ def build(pack: Path, inputs: list[Path], n_layer: int, n_expert: int, lead: int
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("pack", type=Path, help="the glm-dsa pack (tools/strata/glm_dsa_pack.py's output)")
-    ap.add_argument("inputs", nargs="*", type=Path, help="traces, usage files, expert_counts.txt, STRATA_GLM_TRACE")
+    ap.add_argument("inputs", nargs="*", type=Path, help="traces, usage files, expert_counts.txt, MAYA_GLM_TRACE")
     ap.add_argument("--out", type=Path, default=None, help=f"default <pack>/{maya_sync.PACK_PROFILE}")
     ap.add_argument("--equal", action="store_true", help="weigh every input the same")
     ap.add_argument("--base", type=Path, default=None, help="a previous profile of the same layout, ranked after "

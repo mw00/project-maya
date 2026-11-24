@@ -29,9 +29,9 @@
 #include <sched.h>
 #endif
 
-#include "strata/kernels/cpu/pool.hpp"
+#include "maya/kernels/cpu/pool.hpp"
 
-namespace kc = strata::kernels::cpu;
+namespace kc = maya::kernels::cpu;
 
 namespace mm3 {
 

@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 // a 0 / 1 switch: -1 when it is not set (or empty), else whether it is non-zero
 inline int tri_of(const char* v) { return v == nullptr || *v == 0 ? -1 : std::atoi(v) != 0; }
@@ -96,4 +96,17 @@ inline uint64_t uma_free(uint64_t driver_free, uint64_t total, uint64_t mem_avai
     return std::min(std::max(driver_free, mem_available - headroom), std::max(total, driver_free));
 }
 
-}  // namespace strata::ds4
+// ---- #794 (Windows, NVIDIA, several GPUs): with the CPU lane's RAM copies pinned (cp_pin) every GPU read "0 MiB
+// free" after the load and the first request failed with out of memory on CUDA0; without the pin (DS4_COPY_PIN=0) the
+// same load had ~1.4 GB free on each GPU and ran.  pre / post: a GPU's free VRAM in MiB just before and just after the
+// pin (-1: the driver's read failed).  It took the GPU's room when its read failed after a good one, or when it had at
+// least floor_mib free before and under floor_mib after - page-locked host memory takes no VRAM by itself, so a GPU
+// the pin leaves near empty is that failure.  A GPU already under floor_mib before is not the pin's doing; floor_mib
+// <= 0: the check is off
+inline bool pin_took_vram(long long pre, long long post, long long floor_mib) {
+    if (floor_mib <= 0 || pre < 0) return false;
+    if (post < 0) return true;
+    return pre >= floor_mib && post < floor_mib;
+}
+
+}  // namespace maya::ds4

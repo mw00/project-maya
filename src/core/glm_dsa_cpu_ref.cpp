@@ -1,9 +1,9 @@
 // src/core/glm_dsa_cpu_ref.cpp - the CPU twin of the glm-dsa F32 reference kernels (B3.4).
 //
-// Same contracts as glmd::ref_* (include/strata/kernels/glmd_ref.hpp), plain loops, every dot product, norm
+// Same contracts as glmd::ref_* (include/maya/kernels/glmd_ref.hpp), plain loops, every dot product, norm
 // statistic and softmax sum accumulated in double and rounded to float once.  The rope is the shared header's
 // float rotation, so the GPU kernels and this file rotate with the same arithmetic.
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include "../kernels/cuda/glmd_rope.cuh"
 

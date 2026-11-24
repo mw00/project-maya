@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <string>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 /// The types the engine's kernels take, asked of the kernels themselves rather than a copy of their lists: a ggml type
 /// id's name ("?" or null: none), whether the routed experts' kernels take it, whether the dense GEMVs do, and whether
@@ -26,4 +26,4 @@ struct KernelTypes {
 /// does not read).
 int pack_info(const std::string& dir, const std::string& profile, const KernelTypes& kt, std::FILE* out);
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

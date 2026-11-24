@@ -25,7 +25,7 @@
 // Built out-of-tree against a llama.cpp build:
 //   g++ -O2 -std=c++17 -I <llama.cpp>/include -I <llama.cpp>/ggml/include llm_logits_dump.cpp -o llm_logits_dump \
 //       -L <build>/bin -L <build>/src -llama -L <build>/ggml/src -lggml -lggml-base -lggml-cpu -lm -pthread
-// (tools/strata/llama_to_score_ref.py turns <out.bin> into the engine's STRATA_GLM_SCORE reference files.)
+// (tools/strata/llama_to_score_ref.py turns <out.bin> into the engine's MAYA_GLM_SCORE reference files.)
 #include "llama.h"
 
 #include <algorithm>

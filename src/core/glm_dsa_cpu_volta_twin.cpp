@@ -1,5 +1,5 @@
 // src/core/glm_dsa_cpu_volta_twin.cpp - CPU twins of the Volta glm-dsa decode kernels (glm-dsa B10.2-B10.4, B10.7,
-// B10.8); see include/strata/kernels/glmd_volta.hpp.
+// B10.8); see include/maya/kernels/glmd_volta.hpp.
 //
 // Each twin runs the kernel's algorithm on host arrays: the same FP16 staging and saturation, the same tiling and
 // split ranges, the same k-quarter partial sums and their combination order, the same online softmax with fp16 P
@@ -8,7 +8,7 @@
 // index order there, so twin and kernel agree to f32 rounding, not bit for bit (the selector is exact).
 // Plain C++, no CUDA: the CPU test links this file directly; the default-path helpers (fused_mla_enabled & co.)
 // live in the .cu files.
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include <algorithm>
 #include <cmath>

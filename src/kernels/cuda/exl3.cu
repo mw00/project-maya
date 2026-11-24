@@ -1,4 +1,4 @@
-// src/kernels/cuda/exl3.cu - the EXL3 device kernels (the format: include/strata/kernels/exl3.hpp).
+// src/kernels/cuda/exl3.cu - the EXL3 device kernels (the format: include/maya/kernels/exl3.hpp).
 //
 // The codebooks and the trellis window arithmetic follow exllamav3 (MIT, turboderp - exllamav3_ext/quant/
 // codebook.cuh, exl3_dq.cuh, hadamard_inner.cuh), and so does decoding a tile straight into tensor-core fragments
@@ -17,17 +17,17 @@
 // NVIDIA GPUs before sm_80 (V100, T4, RTX 20) decode with v1.1.8's kernels instead (exl3_legacy.cu, use_legacy
 // below): this file's CUDA-core fallback was slower there (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  The
 // prompt path below is this file's on every GPU.
-#include "strata/kernels/exl3.hpp"
+#include "maya/kernels/exl3.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <mma.h>
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #include "exl3_hip_scalar.hpp"
 #endif
-#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
+#include "maya/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <algorithm>
 #include <atomic>
@@ -40,8 +40,8 @@
 #include <type_traits>
 #include <utility>
 
-#if !defined(STRATA_USE_HIP)
-namespace strata::kernels::exl3::legacy {   // exl3_legacy.cu: v1.1.8's decode kernels
+#if !defined(MAYA_USE_HIP)
+namespace maya::kernels::exl3::legacy {   // exl3_legacy.cu: v1.1.8's decode kernels
 int launch_errors();
 bool prepare(cudaStream_t s);
 bool several_ok();
@@ -50,7 +50,7 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const WinArgs& a, cudaStream_t s);
 void decode_table(int cb, bool f32, float* d_out, cudaStream_t s);
-}  // namespace strata::kernels::exl3::legacy
+}  // namespace maya::kernels::exl3::legacy
 #define EXL3_LEGACY(call) \
     if (use_legacy()) return legacy::call
 // ... the experts' kernels only where v1.1.8's cover the model: their rotated input slice is at most 4096 wide (GLM's);
@@ -63,7 +63,7 @@ void decode_table(int cb, bool f32, float* d_out, cudaStream_t s);
 #define EXL3_LEGACY_MOE(a, call) (void) 0
 #endif
 
-namespace strata::kernels::exl3 {
+namespace maya::kernels::exl3 {
 namespace {
 
 constexpr int kThreads = 256, kWarps = 8;
@@ -91,20 +91,30 @@ void launch_check(const char* what) {
 
 // ---------------------------------------------------------------- the codebooks
 __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return __builtin_amdgcn_sad_u8(x, 0u, acc);   // (v_sad_u8: the bytes' |x - 0| summed onto acc, one instruction)
 #else
     return __dp4a(x, 0x01010101u, acc);
 #endif
 }
 
+// codebook 2's two products -> the half2 (0x6400 + bytes of x0, 0x6400 + bytes of x1): on AMD the second byte sum goes
+// straight into the high half (v_sad_hi_u8: its sum << 16 onto the first's 0x6400 + sum : 0x6400) - no mask, no pack,
+// the same bits (a sum of 4 bytes is at most 1020: nothing carries into the high half)
+__device__ __forceinline__ __half2 bytesum2h(uint32_t x0, uint32_t x1) {
+#if defined(MAYA_USE_HIP)
+    const uint32_t pk = __builtin_amdgcn_sad_hi_u8(x1, 0u, __builtin_amdgcn_sad_u8(x0, 0u, 0x64006400u));
+    return *reinterpret_cast<const __half2*>(&pk);
+#else
+    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
+    return __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+#endif
+}
 // two states -> two values, FP16 arithmetic as exllamav3's decode_3inst_2 (the tensor-core kernels take the half2)
 template <int cb>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
     if constexpr (cb == 2) {
-        const uint32_t a = bytesum_plus(s0 * 0x83DCD12Du, 0x6400u);
-        const uint32_t b = bytesum_plus(s1 * 0x83DCD12Du, 0x6400u);
-        const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+        const __half2 h = bytesum2h(s0 * 0x83DCD12Du, s1 * 0x83DCD12Du);
         return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
     } else {
         uint32_t x0 = cb == 1 ? s0 * 0xCBAC1FEDu : s0 * 89226354u + 64248484u;
@@ -118,6 +128,28 @@ __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
         return __hadd2(lo, hi);
     }
 }
+#if defined(MAYA_USE_HIP)
+// codebook 2's products s 0x83DCD12D (mod 2^32) of two 16-bit states - the LOW halves of s0 and s1, their high halves
+// not read - at full rate (AMD's 32-bit multiply is quarter rate): s 0x83DCD12D = s 0xD12D + (s 0x83DC mod 2^16) 2^16.
+// One byte permute packs the two states, two packed 16-bit multiplies by (0x83DC : 0) give each state's high part
+// already in the high half, and a 16 x 16 multiply-add each adds the low part.  The same products, so the same bits
+__device__ __forceinline__ void mul_3inst2(uint32_t s0, uint32_t s1, uint32_t& x0, uint32_t& x1) {
+    const uint32_t p = __builtin_amdgcn_perm(s1, s0, 0x05040100u);   // s1's low half : s0's low half
+    uint32_t h0, h1;
+    asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(h0) : "v"(p), "s"(0x83DC0000u));   // s0 0x83DC : 0
+    asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(h1) : "v"(p), "s"(0x83DC0000u));                   // s1 0x83DC : 0
+    asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(x0) : "v"(p), "s"(0xD12Du), "v"(h0));
+    asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x1) : "v"(p), "s"(0xD12Du), "v"(h1));
+}
+// decode2h<2> through mul_3inst2: the decode GEMV's (block_gemv's) - in the prompt's WMMA kernels it measured slower
+// than v_mul_lo_u32 (exl3_test --bench-set), so they keep decode2h
+__device__ __forceinline__ __half2 decode2h_pk(uint32_t s0, uint32_t s1) {
+    uint32_t x0, x1;
+    mul_3inst2(s0, s1, x0, x1);
+    const __half2 h = bytesum2h(x0, x1);   // (v_sad_hi_u8: no mask, no pack - the same bits)
+    return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
+}
+#endif
 template <int cb>
 __device__ __forceinline__ float2 decode2(uint32_t s0, uint32_t s1) {
     return __half22float2(decode2h<cb>(s0, s1));
@@ -130,6 +162,14 @@ __device__ __forceinline__ __half2 u2h(uint32_t u) { return *reinterpret_cast<__
 __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
     return (uint32_t) ((((uint64_t) hi << 32) | (uint64_t) lo) >> s);
 }
+// the same for 0 <= s < 32: on AMD one funnel shift, v_alignbit_b32 at full rate (RDNA 3's 64-bit shift is half rate)
+__device__ __forceinline__ uint32_t fsh32(uint32_t lo, uint32_t hi, int s) {
+#if defined(MAYA_USE_HIP)
+    return __builtin_amdgcn_alignbit(hi, lo, (uint32_t) s);
+#else
+    return fsh(lo, hi, s);
+#endif
+}
 
 // Step p's state is the 16-bit window ending at bit S(p) of the tile's MSB-first bit stream (w: its 4 K2 words, K2 =
 // 2 K), wrapping around the tile: S(p) = (p + 1) K for an integer K, floor((p + 1) K2 / 2) for exllamav3 1.6's
@@ -138,14 +178,22 @@ __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
 // exllamav3's grouping per K (exl3_dq.cuh: dq8_aligned_*bits, dq8, dq4, dq2x2, dq8_half), which the steps' fixed
 // offsets keep within two words.  f[i]: steps 2i, 2i + 1 as FP16 values.
 // Step lane * 8 + j sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column (lane >> 2) + 8 (j >> 2).
-template <int cb>
+// Pk: codebook 2 through decode2h_pk on AMD (the decode GEMV's; its states unmasked - it reads their low halves only)
+template <int cb, bool Pk = false>
 __device__ __forceinline__ void decode_states(const uint32_t (&s)[8], uint32_t (&f)[4]) {
+#if defined(MAYA_USE_HIP)
+    if constexpr (Pk && cb == 2) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h_pk(s[2 * i], s[2 * i + 1]));
+        return;
+    }
+#endif
 #pragma unroll
     for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h<cb>(s[2 * i] & 0xffffu, s[2 * i + 1] & 0xffffu));
 }
 // K = 4: the lane's steps end in its own word b (word lane), the first three reach into a (word lane - 1)
 __device__ __forceinline__ void states4(uint32_t a, uint32_t b, uint32_t (&s)[8]) {
-    const uint32_t x = fsh(b, a, 20);
+    const uint32_t x = fsh32(b, a, 20);
     s[0] = x >> 8;
     s[1] = x >> 4;
     s[2] = x;
@@ -162,11 +210,14 @@ __device__ __forceinline__ void states_group(const uint32_t* w, int p, uint32_t*
     const int b0 = (p + 257) * K - 16, b2 = b0 + (G - 1) * K + 16;
     const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
     const uint32_t a = w[i0 % NW], b = w[i2 % NW];
+    // (a : b) >> (s2 + j K): (a : b) >> s2 once (s2 < 32: its low word t, its high word h), then shifts of (h : t) by
+    // j K < 32 - funnel shifts under 32 only, the same words
+    const uint32_t t = fsh32(b, a, s2), h = a >> s2;
 #pragma unroll
-    for (int j = 0; j < G; ++j) s[G - 1 - j] = fsh(b, a, s2 + j * K);
+    for (int j = 0; j < G; ++j) s[G - 1 - j] = j == 0 ? t : fsh32(t, h, j * K);
 }
 // an integer K
-template <int K, int cb>
+template <int K, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     const int p = lane * 8;
     uint32_t s[8];
@@ -176,7 +227,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         // the 8 windows overlap in one 32-bit window: steps p + j end 8 - 1 - j K bits apart
         constexpr int NW = 8 * K, per = 32 / (8 * K);   // lanes per word
         const int i1 = lane / per, i0 = (i1 + NW - 1) % NW;
-        const uint32_t b = fsh(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
+        const uint32_t b = fsh32(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * K);
     } else if constexpr (K == 3) {
@@ -185,7 +236,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         const int b1 = (p + 257) * 3, b0 = b1 - 16, b2 = b1 + 21;
         const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
         const uint32_t a = w[i0 % NW], b = w[i2 % NW];
-        const uint32_t hi = fsh(b, a, s2), lo = fsh(b, a, s2 + 12);
+        const uint32_t hi = fsh32(b, a, s2), lo = fsh32(hi, a >> s2, 12);   // (s2 < 32; lo: (a : b) >> (s2 + 12))
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             s[7 - j] = hi >> (3 * j);
@@ -198,12 +249,12 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         states_group<K, 4>(w, p, s);
         states_group<K, 4>(w, p + 4, s + 4);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, Pk>(s, f);
 }
 // a half-integer K (K2 = 2 KA + 1, mul1): exllamav3's dq8_half.  The lane's steps start even, so their windows end at
 // S(p + 7) = (p / 2 + 4) K2 and then KA + 1, KA, KA + 1, ... bits earlier; four windows span 18 + 3 KA <= 27 bits, one
 // funnel shift of two words each (steps 4..7 from window 7's end, 0..3 from window 3's, 2 K2 bits earlier)
-template <int K2, int cb>
+template <int K2, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
     const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // one ring on: no negative bit index
@@ -212,22 +263,22 @@ __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t
     for (int g = 0; g < 2; ++g) {
         const int e = e7 - (1 - g) * 2 * K2;
         const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
-        const uint32_t x = fsh(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits
+        const uint32_t x = fsh32(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits (sh < 32)
         s[4 * g + 3] = x;
         s[4 * g + 2] = x >> (KA + 1);
         s[4 * g + 1] = x >> (2 * KA + 1);
         s[4 * g + 0] = x >> (3 * KA + 2);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, Pk>(s, f);
 }
 // K2 = 2 K: an even K2 is the integer K2 / 2, an odd one a half-integer K (mul1 only: exllamav3 has no other)
-template <int K2, int cb>
+template <int K2, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     if constexpr ((K2 & 1) != 0) {
         static_assert(cb == 2 && K2 >= 3 && K2 <= 7, "a half-integer K: 1.5, 2.5 or 3.5, mul1");
-        frag8_half<K2, cb>(w, lane, f);
+        frag8_half<K2, cb, Pk>(w, lane, f);
     } else {
-        frag8_int<K2 / 2, cb>(w, lane, f);
+        frag8_int<K2 / 2, cb, Pk>(w, lane, f);
     }
 }
 
@@ -246,25 +297,64 @@ __device__ __forceinline__ void decode8(const uint32_t* w, int lane, float* v) {
 
 // ---------------------------------------------------------------- the rotation
 // the 128-point transform of the 128 values a warp holds 4 per lane (value lane * 4 + i), over sqrt(128)
+// a lane's value from lane ^ M (32-lane waves): on RDNA (gfx10 and later) in registers - DPP for 1 and 2 (quad_perm)
+// and 4 and 8 (row_xmask), v_permlanex16 for 16 - instead of ds_bpermute's LDS round trip each.  The same value moved,
+// so the same bits.  EXL3_XOR_BPERMUTE: the shuffle, as before
+template <int M>
+__device__ __forceinline__ float xor_lane(float v) {
+#if defined(MAYA_USE_HIP) && !defined(MAYA_HIP_WAVE64) && !defined(EXL3_XOR_BPERMUTE) &&                          \
+    (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    const int x = __builtin_bit_cast(int, v);
+    int r;
+    if constexpr (M == 1) r = __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, false);         // quad_perm [1,0,3,2]
+    else if constexpr (M == 2) r = __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, false);    // quad_perm [2,3,0,1]
+    else if constexpr (M == 4) r = __builtin_amdgcn_update_dpp(0, x, 0x164, 0xF, 0xF, false);   // row_xmask:4
+    else if constexpr (M == 8) r = __builtin_amdgcn_update_dpp(0, x, 0x168, 0xF, 0xF, false);   // row_xmask:8
+    else {
+        static_assert(M == 16, "xor_lane: 1, 2, 4, 8 or 16");
+        r = (int) __builtin_amdgcn_permlanex16((unsigned) x, (unsigned) x, 0x76543210u, 0xFEDCBA98u, false, false);
+    }
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, M);
+#endif
+}
+template <int M>
+__device__ __forceinline__ void had_stage(float* v, int lane) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float o = xor_lane<M>(v[i]);
+        v[i] = (lane & M) ? o - v[i] : v[i] + o;
+    }
+}
 __device__ __forceinline__ void had128(float* v, int lane) {
     const float s0 = v[0] + v[1], d0 = v[0] - v[1], s1 = v[2] + v[3], d1 = v[2] - v[3];
     v[0] = s0 + s1;
     v[1] = d0 + d1;
     v[2] = s0 - s1;
     v[3] = d0 - d1;
-#pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float o = __shfl_xor_sync(0xffffffffu, v[i], m);
-            v[i] = (lane & m) ? o - v[i] : v[i] + o;
-        }
-    }
+    had_stage<1>(v, lane);
+    had_stage<2>(v, lane);
+    had_stage<4>(v, lane);
+    had_stage<8>(v, lane);
+    had_stage<16>(v, lane);
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] *= kHad;
 }
 
 __device__ __forceinline__ float h2f(uint16_t b) { return __half2float(__ushort_as_half(b)); }
+
+// an expert's blob from its address in the plan / group / expert tables (an integer) - on AMD straight into the global
+// address space, then generic: the loads through it stay global (vmcnt).  From a plain integer cast they were flat
+// loads, which count on lgkmcnt too, so every LDS wait of block_gemv's slice loop also waited for the next chunk's tile
+// loads it had issued ahead.  Expert blobs are never LDS or scratch: the same addresses, the same bits
+__device__ __forceinline__ const uint8_t* blob_at(unsigned long long v) {
+#if defined(MAYA_USE_HIP)
+    return (const uint8_t*) (const __attribute__((address_space(1))) uint8_t*) v;
+#else
+    return (const uint8_t*) v;
+#endif
+}
 
 // the activation a warp rotates into its block's FP16 chunks: F32 (f) or the engine's q8_1 blocks (q)
 struct Xin {
@@ -320,12 +410,12 @@ __device__ __forceinline__ void chunk_store(float (&v)[4], const float (&s)[4], 
 // with a __syncthreads (out complete).
 constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if !defined(MAYA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define EXL3_TC 1
 #endif
 
 // RDNA 3 / 4: v_dot2_f32_f16 - two FP16 products and their FP32 sum onto c in one instruction (no conversions)
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+#if defined(MAYA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
 #define EXL3_DOT2 1
 typedef _Float16 exl3_h2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ float dot2_acc(uint32_t a, uint32_t b, float c) {
@@ -348,7 +438,7 @@ __device__ __forceinline__ void mma_f32(float (&c)[4], uint32_t a0, uint32_t a1,
 }
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // Preserve the scalar fallback rounding tree when one-row specialization changes compiler scheduling.
 // Empty VGPR constraints prevent reassociation without adding arithmetic instructions.
 __device__ __forceinline__ float dot4_acc_exact(float a, const float* v, float x0, float x1, float x2, float x3) {
@@ -379,16 +469,22 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int i = lane + 32 * r;
+#if defined(MAYA_USE_HIP)
+            // (AMD: every lane loads - a lane past the tile's words its last word again, a value no path reads - so no
+            //  exec mask around each load and no select after it)
+            w[s][r] = __ldg(tile0 + (size_t) s * sstride + ((W % 32 == 0 || i < W) ? i : W - 1));
+#else
             w[s][r] = (W % 32 == 0 || i < W) ? __ldg(tile0 + (size_t) s * sstride + i) : 0u;
+#endif
         }
 }
 
 // one slice's fragment from the lane's words: K = 4 straight from the registers (the lane's steps end in its own word,
 // the first three reach into the previous lane's), other K (a half-integer one too) through the warp's stage (4 K2
 // words)
-template <int K2, int cb, bool Perm = false>
+template <int K2, int cb, bool Perm = false, bool Pk = false>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
-#if defined(STRATA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+#if defined(MAYA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
     if constexpr (Perm && K2 == 4) {
         // K = 2 without the stage: lane l's steps are in words l / 2 and l / 2 - 1 (the tile's last for l < 2), which
         // lanes 0-15 hold - v_permlane16 within a row of 16 lanes, v_permlanex16 from the other row for lanes 16-31;
@@ -399,7 +495,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         const uint32_t b0 = __builtin_amdgcn_permlane16(v, v, 0x221100FFu, 0x66554433u, false, false);
         const uint32_t b1 = __builtin_amdgcn_permlanex16(v, v, 0xAA998877u, 0xEEDDCCBBu, false, false);
         const bool row1 = lane >= 16;
-        const uint32_t b = fsh(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
+        const uint32_t b = fsh32(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
         uint32_t s[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * 2);
@@ -419,7 +515,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
             const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
             const uint32_t whi = (uint32_t) __builtin_amdgcn_ds_bpermute((hi % NW) << 2, v);
             const uint32_t wlo = (uint32_t) __builtin_amdgcn_ds_bpermute((lo % NW) << 2, v);
-            const uint32_t x = fsh(whi, wlo, sh);
+            const uint32_t x = fsh32(whi, wlo, sh);   // (sh < 32)
             s[4 * g + 3] = x;
             s[4 * g + 2] = x >> (KA + 1);
             s[4 * g + 1] = x >> (2 * KA + 1);
@@ -432,7 +528,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
     if constexpr (K2 == 8) {
         uint32_t s[8];
         states4(__shfl_sync(0xffffffffu, w[0], (lane + 31) & 31), w[0], s);
-        decode_states<cb>(s, f);
+        decode_states<cb, Pk>(s, f);
     } else {
         constexpr int W = Words<K2>::W, R = Words<K2>::R;
         __syncwarp();
@@ -440,7 +536,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         for (int r = 0; r < R; ++r)
             if (W % 32 == 0 || lane + 32 * r < W) st[lane + 32 * r] = w[r];
         __syncwarp();
-        frag8<K2, cb>(st, lane, f);
+        frag8<K2, cb, Pk>(st, lane, f);
     }
 }
 
@@ -462,15 +558,16 @@ constexpr int kMinBlocksMv = K2 <= 8 ? 2 : 3;
 template <int K2>
 constexpr int kMinBlocksMv = 2;
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads)
 #else
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads, n)
 #endif
-// HIP: the decode kernels' block_gemv (moe_*, win_*) inlined into the kernel.  Left to the compiler it can stay a call
-// - it did in v1.1.52 - and a call's arguments arrive in vector registers, so the block's activation count reads as
-// per-lane and every `cc < nc` of the token loop is a branch on the lane mask.  The same arithmetic, the same bits.
-#if defined(STRATA_USE_HIP)
+// HIP: the decode kernels' block_gemv (moe_*, win_*, and mv_kernel's for the dense matrices) inlined into the kernel.
+// Left to the compiler it can stay a call - it did in v1.1.52, and mv_kernel's still was in v1.1.57 - and a call's
+// arguments arrive in vector registers, so the block's activation count reads as per-lane and every `cc < nc` of the
+// token loop is a branch on the lane mask.  The same arithmetic, the same bits.
+#if defined(MAYA_USE_HIP)
 #define EXL3_DECODE_INLINE [[clang::always_inline]]
 #else
 #define EXL3_DECODE_INLINE
@@ -484,12 +581,25 @@ struct BlockSmem {
     float out[Tokens * kCols];
 };
 
+// the block's warp index - on AMD with 32-lane waves the wave's, read into a scalar register: block_gemv's tile
+// addresses (tc0 + warp) are then the wave's too, a slice's load a scalar base and the lane's word offset instead of a
+// 64-bit vector address each, and `warp < nc` a scalar branch.  The same values: the same bits
+#if defined(MAYA_USE_HIP) && !defined(MAYA_HIP_WAVE64)
+#define EXL3_WARP() __builtin_amdgcn_readfirstlane((int) (threadIdx.x >> 5))
+#else
+#define EXL3_WARP() ((int) (threadIdx.x >> 5))
+#endif
+
+// The next chunk's input is loaded before its tile words: a wave's loads complete in issue order for its waits
+// (vmcnt), so the rotating warp's wait for its input - before the chunk store and the barrier every warp waits at -
+// no longer waits for its 8 slices of tile words too; those are needed only by the products after the barrier.
+// The same loads, the same bits
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
 template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
                            const uint16_t* __restrict__ suh, int nc, BlockSmem<K2, Tokens>& sm) {
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const int lane = threadIdx.x & 31, warp = EXL3_WARP(), g = lane >> 2, t = lane & 3;
     const size_t sstride = (size_t) ld * W;
     const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
     uint32_t* st = sm.stage + warp * W;
@@ -497,8 +607,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
+    if (rot) chunk_load(x, suh, k0, lane, xv, xs4);   // (the input's loads first: block_gemv's note on their order)
     load_tiles<K2>(tile, sstride, lane, wc);
-    if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #else
@@ -511,13 +621,13 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb>(wc[s], st, lane, f);
+            slice_frags<K2, cb, false, true>(wc[s], st, lane, f);   // (Pk: the decode GEMV's multiply)
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -552,7 +662,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
                     const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
                     const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
                     const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
-                    #if defined(STRATA_USE_HIP)
+                    #if defined(MAYA_USE_HIP)
                     if constexpr (Tokens == 1) {
                         acc[cc][0] = dot4_acc_exact(acc[cc][0], v, x0, x1, x2, x3);
                         acc[cc][1] = dot4_acc_exact(acc[cc][1], v + 4, x0, x1, x2, x3);
@@ -588,8 +698,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+                acc[cc][h] += xor_lane<1>(acc[cc][h]);
+                acc[cc][h] += xor_lane<2>(acc[cc][h]);
             }
             if (t == 0) {
                 sm.out[cc * kCols + o] = acc[cc][0];
@@ -642,7 +752,7 @@ struct KBatch {
 // of their own after the GEMVs (mv_reduce_kernel's note), and the experts' input split (EXL3_XSPLIT) is offered - the
 // device code of those GPUs (EXL3_SEP_DEV) and the host's choice per GPU (sep_sums) go together.  Every other GPU keeps
 // the last block's hand-off (on a Radeon 8060S, gfx1151, the same bits but not faster: the routed experts ~4% slower)
-#if defined(STRATA_USE_HIP) && (defined(__gfx942__) || defined(__gfx950__))
+#if defined(MAYA_USE_HIP) && (defined(__gfx942__) || defined(__gfx950__))
 #define EXL3_SEP_DEV 1
 #endif
 
@@ -669,7 +779,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
-    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
+    EXL3_DECODE_INLINE block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
         if (warp < nc)
@@ -701,7 +811,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (threadIdx.x == 0) J.cnt[g] = 0u;
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // AMD: a split launch's sums, added up by a second kernel.  mv_kernel's last-block hand-off costs a fence per block,
 // and at agent scope that is a write-back and an invalidate of the XCD's whole L2 (buffer_wbl2 / buffer_inv: on a
 // MI350X most of a 6-bit attention GEMV's time - DeepSeek-V4.1's wq_b, 512 blocks: 77.7 -> 30.1 us, wo_b 125.8 -> 40.9
@@ -757,7 +867,7 @@ struct KMoe {
     int k, n_embd, n_ff;
     float limit;
     const int* skip;     // set_skip's flag (nullptr: none)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     float* xp;           // gS / dS > 1: the input splits' partial sums (xsplit, AMD)
     int gS, gkr, dS, dkr;   // gate / up and down: the input splits and their width (1, the whole input: none)
 #endif
@@ -816,7 +926,7 @@ __device__ __forceinline__ float combine(const float* plan_w, const float* p, in
     if (cpu_part != nullptr) m = __fadd_rn(m, *cpu_part);
     return __fadd_rn(m, sh);
 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // an input split's sums for one output in split order (p: split 0's, the next split's `stride` floats on), the loads
 // 8 at a time ahead of their adds
 __device__ __forceinline__ float split_sum(const float* p, int S, size_t stride) {
@@ -853,7 +963,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     const unsigned long long ptr = a.plan_ptr[ei];
     if (ptr == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
@@ -892,7 +1002,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
     if (a.dS > 1 && ptr == 0ull) return;        // (moe_down_red_kernel writes its zeros)
 #endif
     if (ptr != 0ull) {
-        const uint8_t* blob = (const uint8_t*) ptr;
+        const uint8_t* blob = blob_at(ptr);
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
 #if defined(EXL3_SEP_DEV)
@@ -954,7 +1064,7 @@ struct KWin {
     size_t suh[3], svh[3], tr[3];
     int k, n_embd, n_ff;
     float limit;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     float* xp;           // (KMoe's)
     int gS, gkr, dS, dkr;
 #endif
@@ -962,9 +1072,9 @@ struct KWin {
 
 // grid (n_ff / 128, groups at most, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
 // each of its entries, kTok entries a pass; the pair's second block to finish turns them into the clamped swiglu
-template <int K2, int cb>
+template <int K2, int cb, int Tok = kTok>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
     __shared__ int last;
 #if defined(EXL3_SEP_DEV)
     const int grp = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
@@ -972,16 +1082,16 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
 #endif
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
-    for (int mm = m0; mm < m1; mm += kTok) {
-        const int nc = min(kTok, m1 - mm);
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
 #if defined(EXL3_SEP_DEV)
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
+        block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (a.gS > 1)   // (win_gu_red_kernel)
             split_store(sm.out, nc, [&](int c) {
@@ -989,7 +1099,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+        EXL3_DECODE_INLINE block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                                              (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
 #endif
@@ -1006,23 +1116,23 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
 }
 
 // grid (n_embd / 128, groups at most): group blockIdx.y's down rows for 128 outputs of each entry into its part rows
-template <int K2, int cb>
+template <int K2, int cb, int Tok = kTok>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
     const int grp = blockIdx.y, g = blockIdx.x;
 #if defined(EXL3_SEP_DEV)
     const int sp = blockIdx.z;
 #endif
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
-    for (int mm = m0; mm < m1; mm += kTok) {
-        const int nc = min(kTok, m1 - mm);
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
 #if defined(EXL3_SEP_DEV)
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
+        block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
                           min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (a.dS > 1)   // (win_down_red_kernel)
             split_store(sm.out, nc, [&](int c) {
@@ -1030,7 +1140,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+        EXL3_DECODE_INLINE block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
                                              (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
 #endif
@@ -1054,7 +1164,7 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // AMD: the pieces the last block of a pair / an output block runs elsewhere, as kernels of their own after the GEMVs
 // (mv_reduce_kernel's note: a fence a block is a write-back of the XCD's L2) - the same arithmetic, the same bits.
 // grid (n_ff / 128, k): moe_gate_up_kernel's clamped swiglu
@@ -1109,7 +1219,7 @@ static bool sep_sums() {
 #define EXL3_WIN_SWIGLU(a, groups, s) (void) 0
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // an input split's (xsplit) sums, added up in split order and then on as the unsplit kernels: block_out into h / u
 // (gate / up) or the part rows (down).  grid (n_ff / 128, k): moe_gate_up_kernel's
 __global__ void __launch_bounds__(kCols) moe_gu_red_kernel(const KMoe a) {
@@ -1122,7 +1232,7 @@ __global__ void __launch_bounds__(kCols) moe_gu_red_kernel(const KMoe a) {
         red[r][threadIdx.x] =
             split_sum(a.xp + ((size_t) ei * 2 + r) * a.gS * a.n_ff + g * kCols + threadIdx.x, a.gS, a.n_ff);
     __syncthreads();
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     if (warp < 2)
         block_out(red[warp], (const uint16_t*) (blob + a.svh[warp]) + g * kCols,
                   (warp == 0 ? a.h : a.u) + (size_t) ei * a.n_ff + g * kCols);
@@ -1140,14 +1250,14 @@ __global__ void __launch_bounds__(kCols) moe_down_red_kernel(const KMoe a) {
     }
     red[threadIdx.x] = split_sum(a.xp + (size_t) ei * a.dS * a.n_embd + g * kCols + threadIdx.x, a.dS, a.n_embd);
     __syncthreads();
-    if (threadIdx.x < 32) block_out(red, (const uint16_t*) ((const uint8_t*) ptr + a.svh[2]) + g * kCols, part);
+    if (threadIdx.x < 32) block_out(red, (const uint16_t*) (blob_at(ptr) + a.svh[2]) + g * kCols, part);
 }
 // grid (n_ff / 128, groups at most): win_gu_kernel's, each entry of the group
 __global__ void __launch_bounds__(kCols) win_gu_red_kernel(const KWin a) {
     __shared__ float red[2][kCols];
     const int grp = blockIdx.y, g = blockIdx.x, warp = threadIdx.x >> 5;
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
         const size_t e = (size_t) a.grp_ent[m];
         for (int r = 0; r < 2; ++r)
@@ -1164,7 +1274,7 @@ __global__ void __launch_bounds__(kCols) win_down_red_kernel(const KWin a) {
     __shared__ float red[kCols];
     const int grp = blockIdx.y, g = blockIdx.x;
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
         const size_t e = (size_t) a.grp_ent[m];
         red[threadIdx.x] = split_sum(a.xp + e * a.dS * a.n_embd + g * kCols + threadIdx.x, a.dS, a.n_embd);
@@ -1237,7 +1347,7 @@ __global__ void EXL3_BOUNDS(2) moe_gate_up_mix_kernel(const KMoe a, const KMix m
     if (ptr == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][r];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
@@ -1263,7 +1373,7 @@ __global__ void EXL3_BOUNDS(2) moe_down_mix_kernel(const KMoe a, const KMix mx) 
     if (a.skip != nullptr && *a.skip) return;
     if (ptr != 0ull) {
         const int c = mix_cls(mx, ptr), k2 = mx.k2[c][2];
-        const uint8_t* blob = (const uint8_t*) ptr;
+        const uint8_t* blob = blob_at(ptr);
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
         mix_gemv<cb>(k2, (const uint32_t*) (blob + mx.tr[c][2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
@@ -1300,7 +1410,7 @@ __global__ void EXL3_BOUNDS(2) win_gu_mix_kernel(const KWin a, const KMix mx) {
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][r];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
@@ -1329,7 +1439,7 @@ __global__ void EXL3_BOUNDS(2) win_down_mix_kernel(const KWin a, const KMix mx) 
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][2];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     for (int mm = m0; mm < m1; mm += kTok) {
@@ -1505,7 +1615,7 @@ __global__ void rows_f16_kernel(const float* __restrict__ x, int ldx, const int*
 // straight into mma.m16n8k16's B fragments - a lane's 8 steps ARE the fragment order (steps 0,1 / 2,3 rows 2t+{0,1} /
 // 2t+8+{0,1} of column g, steps 4..7 the same of column g + 8) - and multiplies every m-tile of the block with them.
 // The output rotation and svh run on the F32 tile in shared memory.
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 namespace tc {
 
 constexpr int BM = 32, MT = BM / 16, AP = 136;   // rows a block, its m-tiles, the A rows' pitch (halves)
@@ -1781,7 +1891,7 @@ __global__ void __launch_bounds__(kThreads) hip_set_kernel(SetArgs a, const floa
     }
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // Wider scalar tiles reuse each decoded fragment across more routed rows.
 // Keep DOT2/FMA order, rotations and output rounding identical to block_gemv.
 template <int K2, int NR> struct HipScalarSmem {
@@ -1801,9 +1911,9 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[(NR + 7) / 8][4], xs4[(NR + 7) / 8][4];
-    load_tiles<K2>(tile, sstride, lane, wc);
-    for (int j = 0; j < (NR + 7) / 8; ++j)
+    for (int j = 0; j < (NR + 7) / 8; ++j)   // (the input's loads first: block_gemv's note on their order)
         if (warp + j * 8 < nc) chunk_load(x[j], suh, k0, lane, xv[j], xs4[j]);
+    load_tiles<K2>(tile, sstride, lane, wc);
     float acc[NR][2];
 #pragma unroll
     for (int cc = 0; cc < NR; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
@@ -1814,9 +1924,9 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
             if (warp + j * 8 < nc) chunk_store(xv[j], xs4[j], lane, xq + (warp + j * 8) * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             for (int j = 0; j < (NR + 7) / 8; ++j)
                 if (warp + j * 8 < nc) chunk_load(x[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs4[j]);
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
@@ -1864,8 +1974,8 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+                acc[cc][h] += xor_lane<1>(acc[cc][h]);
+                acc[cc][h] += xor_lane<2>(acc[cc][h]);
             }
             if (t == 0) {
                 sm.out[cc * kCols + o] = acc[cc][0];
@@ -1958,7 +2068,7 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
     const int nc = min(kTok, end - start - (int) blockIdx.x * kTok);
     if (nc <= 0) return;
     const unsigned long long ptr = a.eptr[e];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int c = mix_cls(mx, ptr);
     if constexpr (gate_up) {
         Xin in;
@@ -2010,9 +2120,9 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
 // B 16 activations' slice from xb (col-major: an activation's inputs in a row), D stored col-major into out - the same
 // operands as gfx11's, the fragments loaded by the library instead of by hand (wt's pitch 12 words: wmma's ldm is a
 // multiple of 8 halves; the 8 rows a store takes stay on distinct banks).  wmma_now(): sm_7x unless
-// STRATA_EXL3_WMMA=0 (MAYA_EXL3_WMMA=0).
+// MAYA_EXL3_WMMA=0.
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 constexpr int kWtP = 9;          // wt's pitch, words a decoded output row (8 + 1: banks)
 #else
 constexpr int kWtP = 12;
@@ -2041,17 +2151,17 @@ struct WmmaSmem11 {
     uint32_t wt[kWarps * 16 * kWtP11];
     uint32_t stage[kWarps * 4 * K2];
 };
-#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+#if defined(MAYA_USE_HIP) && defined(__GFX11__)
 #define EXL3_WMMA 1
 typedef _Float16 exl3_h16 __attribute__((ext_vector_type(16)));
 typedef float exl3_f8 __attribute__((ext_vector_type(8)));
 typedef uint32_t exl3_u8 __attribute__((ext_vector_type(8)));
 #endif
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800
+#if !defined(MAYA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800
 #define EXL3_WMMA_V70 1
 #endif
 // CDNA 4 (gfx950): v_mfma_f32_16x16x16_f16 on the wave64 - the wave's two logical warps' tiles are two products
-#if defined(STRATA_USE_HIP) && defined(__gfx950__)
+#if defined(MAYA_USE_HIP) && defined(__gfx950__)
 #define EXL3_MFMA 1
 typedef _Float16 exl3_h4 __attribute__((ext_vector_type(4)));
 typedef float exl3_f4 __attribute__((ext_vector_type(4)));
@@ -2067,7 +2177,7 @@ typedef uint32_t exl3_u2 __attribute__((ext_vector_type(2)));
 // low output bits can differ. Full-model routing can amplify those differences in later layers.
 // Bitwise equality with the DOT2 path is therefore not the accuracy contract; the existing
 // CPU-reference tolerances, finite checks and output guards remain the operator contract.
-#if defined(STRATA_USE_HIP) && defined(__GFX12__)
+#if defined(MAYA_USE_HIP) && defined(__GFX12__)
 #define EXL3_WMMA_RDNA4 1
 typedef _Float16 rdna4_h8 __attribute__((ext_vector_type(8)));
 typedef float rdna4_f8 __attribute__((ext_vector_type(8)));
@@ -2454,7 +2564,7 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
                                                          uint16_t* h, int ldh, float* y, int ldy) {
     wmma_set_body<K2, cb, gate_up, NR, Perm>(a, x, ldx, idx, h, ldh, y, ldy);
 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // gfx11's shaped prompt kernels (wmma_shape): the same, with the compiler fitting the registers to 8 waves a SIMD
 template <int K2, int cb, bool gate_up, int NR, bool Perm>
 __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
@@ -2486,7 +2596,7 @@ __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix 
     const int nc = min(NR, end - start - (int) blockIdx.x * NR);
     if (nc <= 0) return;
     const unsigned long long ptr = a.eptr[e];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int c = mix_cls(mx, ptr);
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;
@@ -2526,7 +2636,7 @@ __global__ void __launch_bounds__(kThreads) hip_rows_kernel(Mat m, const uint16_
         }
     }
 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 static const char* hip_scalar_env(const char* internal, const char* maya, const char* native) {
     const char* v = std::getenv(internal);
     if (v == nullptr) v = std::getenv(maya);
@@ -2549,14 +2659,14 @@ static bool hip_scalar_set(const SetArgs& a, const float* x, int ldx, const int*
                             float* y, int ldy, cudaStream_t s) {
     // Only the tested integer 3/4-bit mul1 layouts. Mixed and other layouts retain their original path.
     if constexpr ((K2 == 6 || K2 == 8) && cb == 2) {
-        const int mode = hip_scalar::mode(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_ROWS",
+        const int mode = hip_scalar::mode(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_ROWS",
             "MAYA_EXL3_HIP_SCALAR_ROWS", "EXL3_HIP_SCALAR_ROWS"));
         if (mode == 8 || !hip_scalar_device()) return false;
         int gu_min = 48, down_min = 128;
         if (mode == -1) {
-            gu_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
+            gu_min = hip_scalar::cutoff(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
                 "MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS", "EXL3_HIP_SCALAR_GU_MIN_ROWS"), gu_min);
-            down_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
+            down_min = hip_scalar::cutoff(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
                 "MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS", "EXL3_HIP_SCALAR_DOWN_MIN_ROWS"), down_min);
         }
         const int nr = hip_scalar::rows(mode, GU, a.max_rows, gu_min, down_min);
@@ -2572,7 +2682,7 @@ static bool hip_scalar_set(const SetArgs& a, const float* x, int ldx, const int*
 #endif
 template <int K2, int cb> struct RunHipGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (hip_scalar_set<K2, cb, true>(a, x, ldx, idx, h, ldh, nullptr, 0, s)) return;
 #endif
         hip_set_kernel<K2, cb, true><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_ff / kCols, a.n_exp), kThreads, 0, s>>>
@@ -2581,7 +2691,7 @@ template <int K2, int cb> struct RunHipGateUp {
 };
 template <int K2, int cb> struct RunHipDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (hip_scalar_set<K2, cb, false>(a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy, s)) return;
 #endif
         hip_set_kernel<K2, cb, false><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_embd / kCols, a.n_exp), kThreads, 0, s>>>
@@ -2623,7 +2733,7 @@ bool dispatch(int K2, int cb, A&&... args) {
 
 template <int K2, int cb> struct RunMv {
     static void run(const KBatch& b, int blocks, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         // A one-row batch needs only one row of accumulators/scratch. Keep the input-split planner
         // and reduction order unchanged; a mixed/multi-row batch always uses the generic kernel.
         // Enabled by default on HIP; DS4_EXL3_MV1=0 is the explicit rollback.
@@ -2636,7 +2746,7 @@ template <int K2, int cb> struct RunMv {
     }
 };
 // AMD: the experts' launches with their input split (xsplit) - its blocks' z and the kernel that adds them up
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #define EXL3_XS(n) (n)
 #define EXL3_XS_RED(on, kernel, grid, a, s) \
     if (on) kernel<<<grid, kCols, 0, s>>>(a)
@@ -2644,16 +2754,32 @@ template <int K2, int cb> struct RunMv {
 #define EXL3_XS(n) 1u
 #define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
 #endif
+// (HIP) a window's groups hold at most its T entries: blocks sized for 2 or 4 activations when T is that small - the
+// unrolled per-activation code and its registers for 8 go unused otherwise (the same arithmetic each, the same bits)
+template <int K2, int cb, class F> void win_tok(int T, F&& f) {
+#if defined(MAYA_USE_HIP)
+    if (T <= 2) return f(std::integral_constant<int, 2>{});
+    if (T <= 4) return f(std::integral_constant<int, 4>{});
+#endif
+    (void) T;
+    f(std::integral_constant<int, kTok>{});
+}
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        win_tok<K2, cb>(groups / a.k, [&](auto tk) {
+            win_gu_kernel<K2, cb, decltype(tk)::value>
+                <<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        });
         EXL3_XS_RED(a.gS > 1, win_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), a, s);
         EXL3_WIN_SWIGLU(a, groups, s);
     }
 };
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        win_tok<K2, cb>(groups / a.k, [&](auto tk) {
+            win_down_kernel<K2, cb, decltype(tk)::value>
+                <<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        });
         EXL3_XS_RED(a.dS > 1, win_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), a, s);
     }
 };
@@ -2677,7 +2803,7 @@ template <int K2, int cb> struct RunRows {
             m.trellis, m.ld > 0 ? m.ld : m.n / 16, m.suh, m.svh, m.k, dst, bf16);
     }
 };
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 template <int K2, int cb> struct RunGemm {
     static void run(const tc::GArgs& a, dim3 grid, cudaStream_t s) { tc::gemm_kernel<K2, cb><<<grid, kThreads, 0, s>>>(a); }
 };
@@ -2706,7 +2832,7 @@ constexpr size_t kCounters = 16384;
 constexpr size_t kCntGU = 8192;                    // the counters from here on: the experts' gate / up pairs
 constexpr size_t kHFloats = (size_t) 8 * 8192;     // the experts' h
 constexpr size_t kUFloats = (size_t) 128 * 4096;   // the experts' up values: a window's 16 tokens x 8, n_ff <= 4096
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 constexpr size_t kXPFloats = (size_t) 6 << 20;     // the experts' input split partials (xsplit, AMD): 24 MB
 // the split EXL3_XSPLIT asks for (1: none) - on gfx942 / gfx950 only (sep_sums: elsewhere the device code has no split)
 int xsplit_want() {
@@ -2718,7 +2844,7 @@ int xsplit_want() {
 }
 #endif
 struct Scratch {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     float* xp = nullptr;   // (xsplit_want() > 1 only)
 #endif
     float* part = nullptr;
@@ -2753,7 +2879,7 @@ Scratch* scratch(cudaStream_t s) {
         cudaMalloc(&sc.cnt, kCounters * sizeof(unsigned)) != cudaSuccess ||
         cudaMalloc(&sc.h, kHFloats * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&sc.u, kUFloats * sizeof(float)) != cudaSuccess ||
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         (xsplit_want() > 1 && cudaMalloc(&sc.xp, kXPFloats * sizeof(float)) != cudaSuccess) ||
 #endif
         cudaMemsetAsync(sc.cnt, 0, kCounters * sizeof(unsigned), s) != cudaSuccess) {
@@ -2773,14 +2899,14 @@ int sm_count() {
 
 // A device's decode kernels: 1 v1.1.8's (exl3_legacy.cu), 2 this file's, 3 v1.1.8's with the weights decoded in F32
 // (legacy_f32).  NVIDIA before sm_80 takes v1.1.8's, where this file's tiles run on the CUDA cores and were slower;
-// STRATA_GLM_EXL3_DECODE=legacy | new | legacy-f32 picks one on every GPU (A/B), STRATA_GLM_EXL3_DECODE<n> on CUDA<n>
+// MAYA_GLM_EXL3_DECODE=legacy | new | legacy-f32 picks one on every GPU (A/B), MAYA_GLM_EXL3_DECODE<n> on CUDA<n>
 // alone (its ordinal as this process sees it), over the first: a Pascal expert helper on legacy-f32 beside an RTX 20
 // trunk on legacy.  Neither set: the engine's default for the device (prefer_legacy_f32), else by its architecture.
 // legacy-f32 on sm_6x only: its kernels are built for Pascal alone (exl3_legacy.cu's EXL3_F32_KERNEL), so sm_70 and
 // newer take v1.1.8's FP16 decode for it, the same bits.  The token path and the verify windows take the same family
 // on a device, so a window stays bit for bit its token path.  Asked once per device.
-#if !defined(STRATA_USE_HIP)
-// a decode-kernel name (STRATA_GLM_EXL3_DECODE's values) -> its number; 0 for none of them (unset, empty, other)
+#if !defined(MAYA_USE_HIP)
+// a decode-kernel name (MAYA_GLM_EXL3_DECODE's values) -> its number; 0 for none of them (unset, empty, other)
 int decode_choice(const char* v) {
     return v == nullptr                         ? 0
            : std::strcmp(v, "legacy") == 0     ? 1
@@ -2788,10 +2914,10 @@ int decode_choice(const char* v) {
            : std::strcmp(v, "legacy-f32") == 0 ? 3
                                                : 0;
 }
-// an explicit choice for CUDA<dev>: STRATA_GLM_EXL3_DECODE<dev>, else STRATA_GLM_EXL3_DECODE (0: none)
+// an explicit choice for CUDA<dev>: MAYA_GLM_EXL3_DECODE<dev>, else MAYA_GLM_EXL3_DECODE (0: none)
 int decode_env(int dev) {
-    const int c = decode_choice(std::getenv(("STRATA_GLM_EXL3_DECODE" + std::to_string(dev)).c_str()));
-    return c != 0 ? c : decode_choice(std::getenv("STRATA_GLM_EXL3_DECODE"));
+    const int c = decode_choice(std::getenv(("MAYA_GLM_EXL3_DECODE" + std::to_string(dev)).c_str()));
+    return c != 0 ? c : decode_choice(std::getenv("MAYA_GLM_EXL3_DECODE"));
 }
 std::atomic<int> g_decode_cache[64];     // a device's kernels once asked (0: not asked)
 std::atomic<int> g_decode_default[64];   // the engine's default where no setting picks (0: by architecture)
@@ -2820,7 +2946,7 @@ int decode_kernels_of(int dev) {
 #endif
 // the current device's
 int decode_kernels() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return 2;
 #else
     int dev = 0;
@@ -2914,7 +3040,7 @@ int mv_splits(const Mat& m) {
 
 int mv_cols(const Mat& m) {
     if (!supported(m)) return 0;
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (use_legacy()) return 4;   // (v1.1.8's kernels: the runs of four their callers have always used)
 #endif
     const int S = mv_splits(m);
@@ -2926,7 +3052,7 @@ int mv_cols(const Mat& m) {
 bool legacy_f32() { return decode_kernels() == 3; }
 
 bool prefer_legacy_f32(int dev) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) dev;
     return false;
 #else
@@ -2937,7 +3063,7 @@ bool prefer_legacy_f32(int dev) {
 }
 
 void legacy_decode_table(int cb, bool f32, float* d_out, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -2950,7 +3076,7 @@ void legacy_decode_table(int cb, bool f32, float* d_out, cudaStream_t s) {
 }
 
 int launch_errors() {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     return g_launch_errors.load(std::memory_order_relaxed) + legacy::launch_errors();
 #else
     return g_launch_errors.load(std::memory_order_relaxed);
@@ -3052,7 +3178,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         b.n = nb;
         b.skip = g_skip;
         if (!dispatch<RunMv>(m0.k2, m0.cb, b, blocks, s)) return false;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         int rblocks = 0, rnc = 0;
         for (int j = 0; j < nb; ++j)
             if (b.j[j].S > 1) rblocks += b.j[j].n / kCols, rnc = std::max(rnc, b.j[j].nc);
@@ -3063,7 +3189,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     return true;
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // the routed experts' input split for an input of k (EXL3_XSPLIT, default 1 - the whole input a block): S blocks of
 // kr inputs, their partial sums added up in split order by the *_red kernels
 static void xsplit(int k, int& S, int& kr) {
@@ -3112,7 +3238,7 @@ static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     m.n_ff = a.n_ff;
     m.limit = a.limit;
     m.skip = g_skip;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return xsplit_set(a.k, a.n_embd, a.n_ff, sc->xp, m.xp, m.gS, m.gkr, m.dS, m.dkr);
 #else
     return true;
@@ -3244,7 +3370,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_embd = a.n_embd;
     w.n_ff = a.n_ff;
     w.limit = a.limit;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (!xsplit_set(a.T * 8, a.n_embd, a.n_ff, sc->xp, w.xp, w.gS, w.gkr, w.dS, w.dkr)) return false;
 #endif
     if (a.mix.n > 0) {
@@ -3266,7 +3392,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
 
 // mma_supported() for the current device, cached (the prompt path's launches ask it each time)
 bool mma_now() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static int known[64];   // 0: not asked yet, 1: no, 2: yes
@@ -3285,7 +3411,7 @@ bool mma_now() {
 // with the same weight and operand formats. Decode/verify kernels keep their arithmetic;
 // a changed prefill state can still change later routing or generated tokens.
 static bool wmma_now() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const bool off = std::getenv("EXL3_WMMA") != nullptr && std::atoi(std::getenv("EXL3_WMMA")) == 0;
     static int known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
@@ -3305,7 +3431,7 @@ static bool wmma_now() {
     return known[dev] == 2;
 #else
     // sm_7x: the Volta / Turing wmma kernels (sm_80 and later take the mma.m16n8k16 ones)
-    static const bool off = std::getenv("STRATA_EXL3_WMMA") != nullptr && std::atoi(std::getenv("STRATA_EXL3_WMMA")) == 0;
+    static const bool off = std::getenv("MAYA_EXL3_WMMA") != nullptr && std::atoi(std::getenv("MAYA_EXL3_WMMA")) == 0;
     static int known[64];
     int dev = 0;
     cudaGetDevice(&dev);
@@ -3327,7 +3453,7 @@ static int wmma_rows() {
 }
 template <class F>
 static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{}))
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     if (wmma_rows() == 16) f(std::integral_constant<int, 16>{});
     else f(std::integral_constant<int, 32>{});
 #else
@@ -3341,7 +3467,7 @@ static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{
 // -15 %); from 128 rows a set, 64-row blocks at 6 waves (another -7 / -12 % at K2 4 / 5).  The same bits.  Other K2,
 // other GPUs, EXL3_WMMA_ROWS set or EXL3_WMMA_SHAPE=0: the uniform blocks
 static bool wmma_shape() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const bool off = std::getenv("EXL3_WMMA_ROWS") != nullptr ||
                             (std::getenv("EXL3_WMMA_SHAPE") != nullptr && std::atoi(std::getenv("EXL3_WMMA_SHAPE")) == 0);
     static signed char known[64] = {};
@@ -3361,7 +3487,7 @@ static bool wmma_shape() {
 }
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
                 auto go = [&](auto nr, auto w6) {
@@ -3389,7 +3515,7 @@ template <int K2, int cb> struct RunWmmaGateUp {
 };
 template <int K2, int cb> struct RunWmmaDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
                 auto go = [&](auto nr, auto w6) {
@@ -3417,7 +3543,7 @@ template <int K2, int cb> struct RunWmmaDown {
 };
 
 bool prompt_tc() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     return mma_supported() || wmma_now();
@@ -3427,7 +3553,7 @@ bool prompt_tc() {
 bool prompt_wmma() { return wmma_now(); }
 
 bool mma_supported() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     int dev = 0, major = 0;
@@ -3443,7 +3569,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_gate_up")) return;
         const KMix k = kmix(sa.mix);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (wmma_now()) {
             mix_launch(sa.mix, [&](auto cb) {
                 with_rows([&](auto nr) {
@@ -3465,7 +3591,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         launch_check("set_gate_up (mixed)");
         return;
     }
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (!mma_now()) {   // (before sm_80: the portable kernels - on sm_7x the wmma ones)
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (wmma_now() && sa.lay.k2[0] == sa.lay.k2[1] &&
@@ -3531,7 +3657,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_down")) return;
         const KMix k = kmix(sa.mix);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (wmma_now()) {
             mix_launch(sa.mix, [&](auto cb) {
                 with_rows([&](auto nr) {
@@ -3553,7 +3679,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         launch_check("set_down (mixed)");
         return;
     }
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mma_now()) {   // (before sm_80: the portable kernels - on sm_7x the wmma ones)
         if (wmma_now() && dispatch<RunWmmaDown>(sa.lay.k2[2], sa.lay.cb, sa, h16, ldh, y, ldy, s)) {
@@ -3600,7 +3726,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
 }
 
 void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (rows <= 0) return;
     if (!mma_now()) {   // (before sm_80: the portable kernels)
         if (!supported(m) || !dispatch<RunHipRows>(m.k2, m.cb, m, x16, ldx, rows, y, ldy, beta, s))
@@ -3690,4 +3816,4 @@ void reconstruct_inner(const Mat& m, uint16_t* dst, cudaStream_t s) {
     launch_check("reconstruct_inner");
 }
 
-}  // namespace strata::kernels::exl3
+}  // namespace maya::kernels::exl3

@@ -354,12 +354,86 @@ class OtherQuantsTest(unittest.TestCase):
                 self.assertIn(a.mm3_quant, maya.MM3_QUANTS)
             self.assertIsNone(maya.model_option(a), ident)
 
+    def test_hy4_only_its_published_sizes_on_nvidia(self):
+        """Hy4-Flash: a size is listed once its files are uploaded (the setup's data), on NVIDIA from V100 on - not on
+        AMD or a Mac; pulled by its setup id."""
+        hy4 = lambda rows: {m["id"]: m for m in rows if m["family"] == "hy4"}   # noqa: E731
+        with mock.patch.object(model_pull, "_hy4_downloads", return_value={}):
+            self.assertEqual(hy4(self.cat()), {})                              # (nothing uploaded: nothing offered)
+            with self.assertRaises(ValueError):
+                model_pull.Puller(self.root, lambda i, c: []).start("hy4-flash-maya-xs", None)
+        up = {"maya-xs": {"download_gb": 78.44, "memory_gb": 84, "files": {"a.gguf": 1}, "sha256": {"a.gguf": "0" * 64},
+                          "repo": "peasantsmith/Hy4-Flash-Maya-GGUF", "revision": "abc"}}
+        with mock.patch.object(model_pull, "_hy4_downloads", return_value=up):
+            got = hy4(self.cat())
+            self.assertEqual(list(got), ["hy4-flash-maya-xs"])                 # (S, M, L: not uploaded)
+            self.assertEqual(got["hy4-flash-maya-xs"], {
+                "id": "hy4-flash-maya-xs", "family": "hy4", "name": "Hy4-Flash · Maya-XS", "group": "maya", "by": "Maya",
+                "note": "text only", "installed": False, "size_gb": 78.4})
+            self.assertIn("hy4-flash-maya-xs", hy4(self.cat(ccs=(70,))))
+            self.assertIn("hy4-flash-maya-xs", hy4(self.cat(ccs=())))          # (no GPU readable: the setup's check says)
+            self.assertEqual(hy4(self.cat(ccs=(61,))), {})                     # (Pascal: before maya-hy4's kernels)
+            self.assertEqual(hy4(self.cat("hip", ())), {})
+            self.assertEqual(hy4(self.cat("metal", ())), {})
+            (self.root / "maya-hy4-flash-maya-xs.json").write_text(json.dumps(
+                {"exe": "maya-hy4", "args": ["--pack", "p"], "installer": {"family": "hy4", "hy4_quant": "maya-xs"}}))
+            self.assertTrue(hy4(self.cat())["hy4-flash-maya-xs"]["installed"])
+        cmd = model_pull.setup_command("hy4-flash-maya-xs", {"installer": {"models_dir": "/m"}})
+        self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "hy4-flash-maya-xs"])
+
+    def test_hy4_downloads_read_from_the_setup(self):
+        """_hy4_downloads: maya.py's own table - the published sizes only; a setup without it offers none."""
+        sys.path.insert(0, str(model_pull.ROOT))
+        import maya
+        entry = {"download_gb": 78.4, "memory_gb": 84, "files": {}, "sha256": {}, "repo": "r", "revision": "c"}
+        with mock.patch.object(maya, "HY4_QUANTS", {"maya-xs": "Hy4-Flash-Maya-XS", "maya-s": "Hy4-Flash-Maya-S"},
+                               create=True), \
+                mock.patch.object(maya, "hy4_published", lambda k: k == "maya-xs", create=True), \
+                mock.patch.object(maya, "hy4_entry", lambda k: dict(entry, key=k), create=True):
+            self.assertEqual(model_pull._hy4_downloads(), {"maya-xs": dict(entry, key="maya-xs")})
+        with mock.patch.object(maya, "HY4_QUANTS", {"maya-xs": "x"}, create=True), \
+                mock.patch.object(maya, "hy4_published", mock.Mock(side_effect=SystemExit(1)), create=True):
+            self.assertEqual(model_pull._hy4_downloads(), {})
+
     def test_pull_takes_an_other_id(self):
         slot = model_pull.Puller(self.root, lambda ident, cfg: [sys.executable, "-c", "print('ok')"])
         p = slot.start("deepseek-exl3", {"backend": "cuda"})
         p.proc.wait(10)
         with self.assertRaises(ValueError):
             model_pull.Puller(self.root, lambda i, c: []).start("deepseek-gguf-q4", None)
+
+    def test_inkling_2_mini_preview(self):
+        """Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
+        said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux or Windows (never AMD or
+        a Mac); its setup id on the command line; the size the setup's manifest says."""
+        with mock.patch.object(model_pull.sys, "platform", "linux"):
+            c = {m["id"]: m for m in self.cat()}
+            ik = c["inkling-2-mini"]
+            self.assertEqual((ik["family"], ik["group"], ik["by"]), ("ik2", "other", "unsloth"))
+            self.assertEqual(ik["name"], "Inkling 2 Mini · unsloth UD-Q4_K_XL")
+            self.assertIn("experimental preview", ik["note"])
+            self.assertIn("24 GB", ik["note"])
+            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
+            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
+            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70, 89))})
+            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=())})       # (not read: the setup says)
+            for backend in ("hip", "metal"):
+                self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(backend, ())})
+        with mock.patch.object(model_pull.sys, "platform", "win32"):   # (Windows + NVIDIA: as on Linux)
+            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat()})
+            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat("hip", ())})
+        with mock.patch.object(model_pull.sys, "platform", "darwin"):
+            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat()})
+        cmd = model_pull.setup_command("inkling-2-mini", {"installer": {"models_dir": "/m"}})
+        self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "inkling-2-mini"])
+        sys.path.insert(0, str(model_pull.ROOT))
+        import maya
+        self.assertEqual(model_pull.IK2_MIN_CC, maya.IK2_MIN_CC)
+        model_pull._other_gb.clear()
+        try:
+            self.assertAlmostEqual(model_pull._other_sizes()["inkling-2-mini"], 18.7, places=1)   # (the GGUF + mmproj + drafter)
+        finally:
+            model_pull._other_gb.clear()
 
     def test_qwen_unsloth_ud_iq2_xs(self):
         """unsloth's Qwen3.8-Flash-Next GGUFs: UD-IQ2_XS only, under "Other quants" by unsloth (CYBER-FROST stays

@@ -1,5 +1,5 @@
 // Actual-pack logits and recurrent snapshot parity; not a speed benchmark.
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -10,9 +10,9 @@
 
 static void graph_mode(bool on) {
 #ifdef _WIN32
-    _putenv_s("STRATA_GLM_KDA_GRAPH", on ? "1" : "0");
+    _putenv_s("MAYA_GLM_KDA_GRAPH", on ? "1" : "0");
 #else
-    setenv("STRATA_GLM_KDA_GRAPH", on ? "1" : "0", 1);
+    setenv("MAYA_GLM_KDA_GRAPH", on ? "1" : "0", 1);
 #endif
 }
 static void require(bool ok, const std::string& msg) {
@@ -20,7 +20,7 @@ static void require(bool ok, const std::string& msg) {
 }
 int main(int argc, char** argv) {
     if (argc != 3) { std::fprintf(stderr, "usage: glm_pack_graph_test PACK CAPACITY\n"); return 2; }
-    strata::core::Glm5Model model;
+    maya::core::Glm5Model model;
     std::string err;
     graph_mode(false);
     require(model.load_pack_env(argv[1], std::atoll(argv[2]), err), err);

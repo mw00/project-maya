@@ -8,8 +8,8 @@
 //      exactly as the twin computes it;
 //   3. the shared expert's SwiGLU (moe_route's extra blocks) with limit +INF equals the unclamped one bit for bit (the
 //      same q8_1 as limit FLT_MAX), where Flash's 10 changes it; swiglu_q8 likewise.
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glmd_route.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glmd_route.hpp"
 
 #include "glm_dsa_router_oracle.hpp"
 
@@ -24,7 +24,7 @@
 #include <random>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 using namespace router_oracle;
 
 static_assert(gf::kRouteNormClamp == glmd::kRouteNormClamp && gf::kRouteNormHf == glmd::kRouteNormHf,

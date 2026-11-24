@@ -11,7 +11,7 @@
 #define HAR_X86 1
 #endif
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 namespace {
 
@@ -82,4 +82,4 @@ void ar_host_sum(const uint16_t* const* rows, int nm, uint16_t* out, size_t i0, 
     }
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

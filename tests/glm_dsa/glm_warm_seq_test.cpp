@@ -1,7 +1,7 @@
 // tests/glm_dsa/glm_warm_seq_test.cpp - glm-dsa B8.1 (warm, CPU): the file-order expert warm-up's host side
-// (include/strata/core/glm_warm_seq.hpp, src/core/glm_warm_seq.cpp).
-//   1. the switches: STRATA_GLM_WARM_SEQ defaults on for glm-dsa and off for Flash, both ways settable, an unknown
-//      value keeps the default; STRATA_GLM_WARM_SUM defaults off;
+// (include/maya/core/glm_warm_seq.hpp, src/core/glm_warm_seq.cpp).
+//   1. the switches: MAYA_GLM_WARM_SEQ defaults on for glm-dsa and off for Flash, both ways settable, an unknown
+//      value keeps the default; MAYA_GLM_WARM_SUM defaults off;
 //   2. file_order: a stable permutation into (shard, offset) order - ties keep their order, a later shard comes after
 //      any offset of an earlier one;
 //   3. read_order and runs: a batch's reads sorted into file order, adjacent reads one run, a shard change a new run;
@@ -15,7 +15,7 @@
 //   6. the counters: note() adds up, busy_enter / busy_leave keep the most warm-ups streaming at once; the kept warm
 //      digests fold in part order whatever order the parts finished in, another assignment of parts folds differently,
 //      a failed part makes the load's digest not ok, stats_reset clears them.
-#include "strata/core/glm_warm_seq.hpp"
+#include "maya/core/glm_warm_seq.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -35,24 +35,24 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-using namespace strata::core::glmwarm;
+using namespace maya::core::glmwarm;
 
 void test_switches() {
     std::printf("[1. switches]\n");
-    unsetenv("STRATA_GLM_WARM_SEQ");
-    unsetenv("STRATA_GLM_WARM_SUM");
-    check(seq_on(true) && !seq_on(false), "STRATA_GLM_WARM_SEQ unset: on for glm-dsa, off for Flash");
-    setenv("STRATA_GLM_WARM_SEQ", "0", 1);
-    check(!seq_on(true) && !seq_on(false), "STRATA_GLM_WARM_SEQ=0: off for both (Maya's slot order)");
-    setenv("STRATA_GLM_WARM_SEQ", "on", 1);
-    check(seq_on(true) && seq_on(false), "STRATA_GLM_WARM_SEQ=on: on for both");
-    setenv("STRATA_GLM_WARM_SEQ", "sideways", 1);
+    unsetenv("MAYA_GLM_WARM_SEQ");
+    unsetenv("MAYA_GLM_WARM_SUM");
+    check(seq_on(true) && !seq_on(false), "MAYA_GLM_WARM_SEQ unset: on for glm-dsa, off for Flash");
+    setenv("MAYA_GLM_WARM_SEQ", "0", 1);
+    check(!seq_on(true) && !seq_on(false), "MAYA_GLM_WARM_SEQ=0: off for both (Maya's slot order)");
+    setenv("MAYA_GLM_WARM_SEQ", "on", 1);
+    check(seq_on(true) && seq_on(false), "MAYA_GLM_WARM_SEQ=on: on for both");
+    setenv("MAYA_GLM_WARM_SEQ", "sideways", 1);
     check(seq_on(true) && !seq_on(false), "an unknown value keeps each arch's default");
-    unsetenv("STRATA_GLM_WARM_SEQ");
-    check(!sum_on(), "STRATA_GLM_WARM_SUM unset: off");
-    setenv("STRATA_GLM_WARM_SUM", "1", 1);
-    check(sum_on(), "STRATA_GLM_WARM_SUM=1: on");
-    unsetenv("STRATA_GLM_WARM_SUM");
+    unsetenv("MAYA_GLM_WARM_SEQ");
+    check(!sum_on(), "MAYA_GLM_WARM_SUM unset: off");
+    setenv("MAYA_GLM_WARM_SUM", "1", 1);
+    check(sum_on(), "MAYA_GLM_WARM_SUM=1: on");
+    unsetenv("MAYA_GLM_WARM_SUM");
 }
 
 void test_file_order() {

@@ -23,9 +23,9 @@
 #include <string>
 #include <vector>
 
-#include "strata/artifact/gguf_reader.hpp"
+#include "maya/artifact/gguf_reader.hpp"
 
-namespace strata::ds4::ablate {
+namespace maya::ds4::ablate {
 
 // the integer `key` of g, in [lo, hi]; absent -> true with `out` untouched
 inline bool meta_int(const GgufFile& g, const std::string& path, const char* key, long long lo, long long hi,
@@ -66,7 +66,7 @@ inline bool meta_pos(const GgufFile& g, const std::string& path, const char* key
 // the F32 tensor `name` (its first `want` values; 0: all, up to 2^20), every byte of it inside the file
 inline bool read_f32(const GgufFile& g, const std::string& path, const std::string& name, uint64_t want,
                      std::vector<float>& out, std::string& err) {
-    const strata::TensorInfo* t = g.find(name);
+    const maya::TensorInfo* t = g.find(name);
     if (t == nullptr) { err = path + ": no " + name; return false; }
     if (t->type != 0) { err = path + ": " + name + " is not F32"; return false; }
     const uint64_t cap = want != 0 ? (1ull << 32) : (1ull << 20);   // (a routed lora_b is [1, dim, n_exp]: 2M at 384)
@@ -104,7 +104,7 @@ inline bool load_direction(const std::string& path, int layer, int n_layer, floa
                 err += " (not a rank-1 abliteration adapter)";
                 return false;
             }
-            const strata::TensorInfo* t0 = g.find(b0);
+            const maya::TensorInfo* t0 = g.find(b0);
             if (t0->shape.size() != 2 || t0->shape[0] != 1) { err = path + ": " + b0 + " is not rank 1"; return false; }
             // the same -r on every writer of every block, or this is not a whole-model projection
             std::vector<float> b;
@@ -188,4 +188,4 @@ inline bool load_direction(const std::string& path, int layer, int n_layer, floa
     }
 }
 
-}  // namespace strata::ds4::ablate
+}  // namespace maya::ds4::ablate

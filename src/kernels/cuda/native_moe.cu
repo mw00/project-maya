@@ -20,7 +20,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "strata/kernels/native_moe.hpp"
+#include "maya/kernels/native_moe.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -28,7 +28,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 __global__ void combine(const float* __restrict__ parts, const float* __restrict__ weights,

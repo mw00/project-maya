@@ -8,9 +8,9 @@
 #pragma once
 
 #include "glm_dsa_fast_plan.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cuda_runtime.h>
 
@@ -20,14 +20,14 @@
 #include <string>
 #include <vector>
 
-namespace strata::core::glmdsa {
+namespace maya::core::glmdsa {
 
 /// One glm-dsa layer's attention weights, resolved at load (device pointers; never looked up per token).
 ///
 /// Every matrix is a WSlot: {q: the weight rows, type: its gf::mv type, n_in, n_out; f32 is set for type F32}.  type is
 /// a native ggml type (mv dots it against a q8_1 input), kTypeBF16 or kTypeF32 (mv reads the FLOAT input: pass xf, or
 /// call glmdsa::mv, which dequantizes the q8_1 input when only that is at hand).  Layouts are ggml's (first dimension
-/// contiguous, the same as include/strata/kernels/glmd_ref.hpp documents): a weight W[o * n_in + i].
+/// contiguous, the same as include/maya/kernels/glmd_ref.hpp documents): a weight W[o * n_in + i].
 struct GlmDsaLayerW {
     bool bound = false;       // this part holds the layer (l0_ <= il < lt_)
     bool mtp = false;         // the NextN block (il == n_layers)
@@ -103,7 +103,7 @@ inline bool float_type(int type) { return type == kTypeF32 || type == kTypeBF16;
 /// gets that input dequantized into ext->act first (one row per distinct input).  Jobs that need no fallback pass
 /// through unchanged, so on glm5-next (ext null) this IS gf::mv.  False when gf::mv refuses, or a fallback is needed
 /// and there is no ext.
-bool mv(GlmDsaFast* ext, const strata::kernels::glmf::MvJob* jobs, int n, cudaStream_t s);
+bool mv(GlmDsaFast* ext, const maya::kernels::glmf::MvJob* jobs, int n, cudaStream_t s);
 
 /// The shared expert's down when moe_gate_up's fused shared down cannot dot its type (!shexp_fused_ok: BF16 / F32, or a
 /// B10.7 type - F16, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL): the down runs here instead (glmdsa::mv into sh_out: BF16 / F32 on
@@ -117,7 +117,7 @@ bool shexp_down_apart(GlmDsaFast* ext, const WSlot& sh_down, const void* sh_hq, 
 /// Glm5Model::fast_dsa_arena after the arena and every layer are bound.
 bool mixer_setup(GlmDsaFast& X, const Glm5Geometry& g, int64_t max_ctx, std::string& err);
 
-/// B10.1 / B14.4: the per-part decode graph of the glm-dsa layer loop (STRATA_GLM_DSA_GRAPHS=1; glm_dsa_mixer.cu, a
+/// B10.1 / B14.4: the per-part decode graph of the glm-dsa layer loop (MAYA_GLM_DSA_GRAPHS=1; glm_dsa_mixer.cu, a
 /// no-op stub without CUDA).  Per token, fast_layers_plain calls graph_prepare; when pg.on it runs its layer loop as
 /// graph_run's body (captured the first time and whenever pg.key changes, replayed otherwise), else directly.
 struct PartGraph {
@@ -125,7 +125,7 @@ struct PartGraph {
     glmd::GraphKey key;            // part / bounds / CPU-lane plan / fixed addresses / kernel bits / regime / capacity
     uint64_t requests = 0;         // the CPU-lane requests one pass of the body posts (one per MoE layer)
 };
-/// Decide for the token at p: on only with STRATA_GLM_DSA_GRAPHS=1, host_off null (the caller's host-side conditions:
+/// Decide for the token at p: on only with MAYA_GLM_DSA_GRAPHS=1, host_off null (the caller's host-side conditions:
 /// no profiling, dumps, expert prefetch or lookahead; else it names the one that keeps graphs off, logged once per
 /// part and counted, see host_off_reason) and without the dense switch.  When on, it writes the part's glmd::DevPos
 /// for p (one launch on s, outside any capture) and fills the key from the dispatch policy and the bound layout.
@@ -137,12 +137,12 @@ bool graph_prepare(GlmDsaFast& X, const GlmStateLayout& lay, int l0, int l1, int
 /// fast_layers_plain's host-side conditions for a decode graph: null when the body is pure device work, else the
 /// switch that keeps graphs off (the first of: profiling, GLM_CB_DIR dumps, expert prefetch, lookahead, GLM_DUMP_H,
 /// and a request that asks for none: GEN graphs=0, glm_req_knobs.hpp).  max_pf is the request's prefetch count
-/// (GEN prefetch_n=, else STRATA_GLM_PREFETCH_N), so a prefetch request runs eagerly while a plain one replays.
+/// (GEN prefetch_n=, else MAYA_GLM_PREFETCH_N), so a prefetch request runs eagerly while a plain one replays.
 inline const char* host_off_reason(bool prof_on, bool dumps, int max_pf, int n_ahead, bool dump_h,
                                    bool request_off = false) {
-    return prof_on ? "profiling (STRATA_GLM_PROF)" : dumps ? "GLM_CB_DIR dumps" :
-           max_pf > 0 ? "expert prefetch (STRATA_GLM_PREFETCH_N > 0, or the request's GEN prefetch_n=)" :
-           n_ahead > 0 ? "lookahead (STRATA_GLM_AHEAD > 0)" :
+    return prof_on ? "profiling (MAYA_GLM_PROF)" : dumps ? "GLM_CB_DIR dumps" :
+           max_pf > 0 ? "expert prefetch (MAYA_GLM_PREFETCH_N > 0, or the request's GEN prefetch_n=)" :
+           n_ahead > 0 ? "lookahead (MAYA_GLM_AHEAD > 0)" :
            dump_h ? "GLM_DUMP_H" : request_off ? "the request (GEN graphs=0)" : nullptr;
 }
 /// Capture or replay the body (every layer of the part at p) on s; expected advances by pg.requests either way.
@@ -165,4 +165,4 @@ bool win_rows_begin(GlmDsaFast& X, int64_t p0, int T, int cap, cudaStream_t s, s
 /// y[i] = q8_1 value i (n a multiple of 32): the device twin of q8_1_to_f32_host.
 void q8_1_to_f32(const void* xq, int n, float* y, cudaStream_t s);
 
-}  // namespace strata::core::glmdsa
+}  // namespace maya::core::glmdsa

@@ -7,42 +7,42 @@
 //   prep          glmd::dsa_prep_rows: qr (+FP16), latent / k_pe / index keys at p0 + t
 //   queries       q = W_q_b qr (64 x 256), iq = W_idx_q_b qr (32 x 128), roped at p0 + t (dsa_rope_q_rows)
 //   selection     full layers, once the sub-batch sees more than 2048 keys: index_score_tile_wmma over 16K-key blocks
-//                 (FP16 queries / keys on tensor cores, F32 sums; STRATA_GLMD_IDX_WMMA=0 or a device without its 80 KB
+//                 (FP16 queries / keys on tensor cores, F32 sums; MAYA_GLMD_IDX_WMMA=0 or a device without its 80 KB
 //                 of opt-in shared memory: index_score_tile_keys, F32) merged into per-row running sets
 //                 (topk_merge_tile), the final tile writing the chunk's selection rows `sel` (kept in io.keep), which
 //                 the shared layers after it read as they are (A-96).  On a 7.7K prompt the two scorers' selections
 //                 share 99.97% of their cells (mean of 63 layer sub-batches; the worst row 99.71%).
-//                 STRATA_GLMD_IDX_CHECK=1 prints that agreement per layer and sub-batch (a debug aid)
-//   q_abs         W_kb_h^T q_nope per head: FP16 strided-batched GEMM (B9.7; STRATA_GLMD_PF_F16=0: F32)
-//   attention     glmd::mla_prompt_h64 (a block per row and 64 heads; STRATA_GLMD_PF_H64=0: mla_prompt_wmma, a block
-//                 per row and 16 heads, B9.5; STRATA_GLMD_PF_WMMA=0 or no opt-in: mla_prompt_f32), the walk by
+//                 MAYA_GLMD_IDX_CHECK=1 prints that agreement per layer and sub-batch (a debug aid)
+//   q_abs         W_kb_h^T q_nope per head: FP16 strided-batched GEMM (B9.7; MAYA_GLMD_PF_F16=0: F32)
+//   attention     glmd::mla_prompt_h64 (a block per row and 64 heads; MAYA_GLMD_PF_H64=0: mla_prompt_wmma, a block
+//                 per row and 16 heads, B9.5; MAYA_GLMD_PF_WMMA=0 or no opt-in: mla_prompt_f32), the walk by
 //                 glmd::attn_walk (B14.12: dense below 2049 keys, dense-masked below ratio x 2048, else gather; the
 //                 ratio is 1 for the 64-head kernel - it gathers from 2049 keys on -, 4 for CUDA's 16-head ones).
-//                 HIP: mla_prompt_rdna on gfx11 / gfx12 (B9.5's arithmetic on RDNA WMMA; STRATA_GLMD_PF_RDNA=0: off),
-//                 else mla_prompt_f32 - both gather from 2049 keys on (ratio 1; STRATA_GLMD_GATHER_RATIO overrides)
+//                 HIP: mla_prompt_rdna on gfx11 / gfx12 (B9.5's arithmetic on RDNA WMMA; MAYA_GLMD_PF_RDNA=0: off),
+//                 else mla_prompt_f32 - both gather from 2049 keys on (ratio 1; MAYA_GLMD_GATHER_RATIO overrides)
 //   out           W_vb ctx per head (FP16 strided-batched), then attn_output into the mixer rows
 // The scale is glmd::attn_scale(qk_head) (1/16 for GLM-5.3), never Flash's 1/sqrt(qk_nope).
 // glm-dsa wave 5: the caches are the decode mixer's, byte for byte in layout - latent / k_pe / index keys at the state
 // layout's offsets, cell s = position s, the index keys in the layout's dtype (GlmStateLayout::ik_bytes: F32, or FP16
-// with STRATA_GLM_IDX_FP16, B10.8) for both the write (dsa_prep_rows) and the score (index_score_tile_keys); a native
-// Q8_0 W_kb / W_vb (B10.7, STRATA_PACK_NATIVE32 packs) is dequantized to FP16 for the absorbed products.
-#include "strata/core/glm_env.hpp"
+// with MAYA_GLM_IDX_FP16, B10.8) for both the write (dsa_prep_rows) and the score (index_score_tile_keys); a native
+// Q8_0 W_kb / W_vb (B10.7, MAYA_PACK_NATIVE32 packs) is dequantized to FP16 for the absorbed products.
+#include "maya/core/glm_env.hpp"
 #include "glm_prefill_dsa.hpp"
-#include "strata/kernels/kv_stream.hpp"
-#include "strata/kernels/glm_kv_stream.hpp"
+#include "maya/kernels/kv_stream.hpp"
+#include "maya/kernels/glm_kv_stream.hpp"
 #include "glm_prefill_types.hpp"
 
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/glm_batch.hpp"
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_f16_guard.hpp"
-#include "strata/kernels/glmd_forward.hpp"
-#include "strata/kernels/glmd_route.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#if defined(STRATA_USE_HIP)
-#include "strata/prefill/gemm.hpp"   // (the hipBLASLt projections, S7)
+#include "maya/kernels/dequant_bf16.hpp"
+#include "maya/kernels/glm_batch.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_f16_guard.hpp"
+#include "maya/kernels/glmd_forward.hpp"
+#include "maya/kernels/glmd_route.hpp"
+#include "maya/kernels/iq_kernels.hpp"
+#if defined(MAYA_USE_HIP)
+#include "maya/prefill/gemm.hpp"   // (the hipBLASLt projections, S7)
 #endif
-#include "strata/prefill/moe_mmq_strata.hpp"
+#include "maya/prefill/moe_mmq_strata.hpp"
 
 #include "../kernels/cuda/glmd_rope.cuh"
 
@@ -54,17 +54,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #include <mutex>
 #endif
 
-namespace strata::core::glmpf {
+namespace maya::core::glmpf {
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 bool f16_covers(int type, bool dsa) {
     // Maya v1.1.3's prefill_setup set: BF16 and the dequant_bf16 table
-    if (type == gf::kTypeBF16 || strata::kernels::dequant_bf16_supported(type)) return true;
+    if (type == gf::kTypeBF16 || maya::kernels::dequant_bf16_supported(type)) return true;
     if (!dsa) return false;                              // Flash: Maya's set, unchanged (no i-quant)
     // dequant_f16 (dequant_bf16.cu) also sends the i-quants to iq_dequant_f16: glm-dsa only
     if (type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29) return true;
@@ -145,12 +145,14 @@ glmd::PromptDims dims(const Glm5Geometry& g, size_t T, int64_t max_ctx) {
 size_t scratch_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx) {
     return glmd::prompt_tiling(dims(g, T, max_ctx)).sub_bytes + 4096;
 }
-size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx) {
-    return glmd::prompt_tiling(dims(g, T, max_ctx)).keep_bytes + 4096;
+size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx, bool halves) {
+    const auto one = [&](size_t t) { return glmd::prompt_tiling(dims(g, t, max_ctx)).keep_bytes + 4096; };
+    // (halves: room for the staggered prompt pipeline's two chunk halves too, each up to T / 2 + 128 rows)
+    return halves ? std::max(one(T), 2 * one(T / 2 + 128)) : one(T);
 }
 
 // Every GPU backend runs the code below: HIP through hip_compat (hipBLAS for the cuBLAS calls, the F32 prompt attention
-// - mla_prompt_wmma_ok() is false there - and the MMQ clamp on HIP's strata_mmq).
+// - mla_prompt_wmma_ok() is false there - and the MMQ clamp on HIP's maya_mmq).
 
 namespace {
 // glm-dsa's extra FP16 types (glm_prefill_types.hpp): one thread per 32-value group, ggml's decode order
@@ -170,7 +172,7 @@ __global__ void dequant_ext_kernel(int type, const uint8_t* __restrict__ blocks,
 void dequant16(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                cudaStream_t stream) {
     if (!ext_f16_type(type)) {   // Maya's types: dequant_f16 unchanged (every Flash weight)
-        strata::kernels::dequant_f16(type, blocks, row0, rows, cols, out, stream);
+        maya::kernels::dequant_f16(type, blocks, row0, rows, cols, out, stream);
         return;
     }
     int be = 0, bb = 0;
@@ -182,7 +184,7 @@ void dequant16(int type, const void* blocks, int64_t row0, int64_t rows, int64_t
     }
     const int64_t row_bytes = cols / be * bb;
     if (type == 19) {   // IQ1_S: Maya's i-quant dequantizer serves it (dequant_f16 does not route it)
-        strata::kernels::iq_dequant_f16(type, (const uint8_t*) blocks + (size_t) row0 * row_bytes, rows * cols, out,
+        maya::kernels::iq_dequant_f16(type, (const uint8_t*) blocks + (size_t) row0 * row_bytes, rows * cols, out,
                                         stream);
         return;
     }
@@ -197,7 +199,7 @@ bool built() { return true; }
 
 bool mmq_ok(const Glm5Geometry& g, int type) {
     if (g.arch != GlmArch::GlmDsa) return true;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // B14.2's check is about CUDA's sm_70 instances (NO_DEVICE_CODE stubs on Volta); a HIP build's MMQ instances are
     // the ones Maya's prompt path multiplies Flash's experts with (mmq::supported, which the caller checks first)
     (void) type;
@@ -212,7 +214,7 @@ bool mmq_ok(const Glm5Geometry& g, int type) {
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         std::string why;
-        const bool ok = strata::prefill::mmq_strata::sm70_check(type, 100 * major + 10 * minor, optin, 32768, why);
+        const bool ok = maya::prefill::mmq_strata::sm70_check(type, 100 * major + 10 * minor, optin, 32768, why);
         if (!ok) std::fprintf(stderr, "glm-dsa prefill: MMQ type %d on CUDA%d: %s\n", type, dev, why.c_str());
         cache[type] = ok ? 1 : 2;
     }
@@ -229,7 +231,7 @@ void blas_ck(cublasStatus_t st, const char* what, bool& ok) {
 }
 
 bool env_on(const char* name, bool dflt) {
-    return strata::glmenv::env_flag(name, dflt);
+    return maya::glmenv::env_flag(name, dflt);
 }
 
 const float* f32_of(const WSlot& w) { return w.f32 ? w.f32 : (const float*) w.q; }
@@ -238,7 +240,7 @@ const float* f32_of(const WSlot& w) { return w.f32 ? w.f32 : (const float*) w.q;
 bool weight16(const WSlot& w, int64_t rows, int64_t cols, uint16_t* dst, cudaStream_t s) {
     if (w.type == glmdsa::kTypeQ8_0) {
         if (w.q == nullptr || cols % 32) return false;
-        strata::kernels::dequant_f16(w.type, w.q, 0, rows, cols, dst, s);
+        maya::kernels::dequant_f16(w.type, w.q, 0, rows, cols, dst, s);
         return cudaPeekAtLastError() == cudaSuccess;
     }
     return glmd::weight_f16(w.type == gf::kTypeF32 ? (const void*) f32_of(w) : w.q, w.type, rows * cols, dst, s);
@@ -273,7 +275,7 @@ bool gemm(const Io& io, const WSlot& w, int N, int K, const float* X32, const ui
         const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, io.w32_elems / K));
         for (int r0 = 0; r0 < N; r0 += rows) {
             const int n = std::min(rows, N - r0);
-            strata::kernels::glmb::bf16_to_f32((const uint16_t*) w.q + (size_t) r0 * K, io.w32, (int64_t) n * K, io.s);
+            maya::kernels::glmb::bf16_to_f32((const uint16_t*) w.q + (size_t) r0 * K, io.w32, (int64_t) n * K, io.s);
             blas_ck(cublasSgemm(io.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, T, K, &alpha, io.w32, K, X32, ldx, &zero, Y + r0, ldy),
                     "sgemm bf16", ok);
         }
@@ -283,10 +285,10 @@ bool gemm(const Io& io, const WSlot& w, int N, int K, const float* X32, const ui
     for (int r0 = 0; r0 < N; r0 += rows) {
         const int n = std::min(rows, N - r0);
         if (w.type == gf::kTypeBF16)
-            strata::kernels::glmb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * K, io.w16, (int64_t) n * K, io.s);
+            maya::kernels::glmb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * K, io.w16, (int64_t) n * K, io.s);
         else
             dequant16(w.type, w.q, r0, n, K, io.w16, io.s);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         // HIP (S7): hipBLASLt with its tuning tables' row for the shape (glm_prefill.cu hands the prompt path's GEMM
         // over when a table is set; a shape without a row runs plain hipBLAS inside it) - plain hipBLAS here for a
         // strided X or a scaled product
@@ -320,7 +322,7 @@ Keep keep_of(const Io& io, const glmd::PromptTiling& t) {
     k.idx_inv = b.take<float>((size_t) std::max(1, g.idx_rope / 2));
     return k;
 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // HIP: the tables' host source is pinned and written once per geometry.  A copy from pageable memory makes HIP stage
 // it (a host wait per copy, two a layer), and Windows' HIP runtime submits queued work only when the host waits, so a
 // copy may read its source late: this one never changes once written.  (Never freed: a few hundred bytes a geometry.)
@@ -350,7 +352,7 @@ const float* rope_host(const Glm5Geometry& g, size_t n) {
 
 void upload_rope(const Io& io, const Keep& k) {
     const Glm5Geometry& g = *io.g;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const float* h = rope_host(g, (size_t) std::max(1, g.qk_rope / 2) + (size_t) std::max(1, g.idx_rope / 2));
     cudaMemcpyAsync(k.inv, h, (size_t) std::max(1, g.qk_rope / 2) * 4, cudaMemcpyHostToDevice, io.s);
     cudaMemcpyAsync(k.idx_inv, h + std::max(1, g.qk_rope / 2), (size_t) std::max(1, g.idx_rope / 2) * 4,
@@ -367,7 +369,7 @@ void upload_rope(const Io& io, const Keep& k) {
 #endif
 }
 
-// STRATA_GLMD_IDX_CHECK=1 (a debug aid): the other scorer's selection of the same sub-batch (F32 vs WMMA), compared on
+// MAYA_GLMD_IDX_CHECK=1 (a debug aid): the other scorer's selection of the same sub-batch (F32 vs WMMA), compared on
 // the host with the one the layer uses - the per-row overlap of the 2,048-cell sets, one line per layer and sub-batch.
 // The layer goes on with its own selection.
 template <typename Select>
@@ -498,7 +500,7 @@ bool kv_stage_out(const Io& io, int il, int64_t n, bool with_kpe, std::string& e
         err = "glm-dsa prefill: the KV write-back";
         return false;
     }
-    strata::kernels::kv_stream_reset(k.map[il], (void*) io.s);
+    maya::kernels::kv_stream_reset(k.map[il], (void*) io.s);
     return true;
 }
 
@@ -534,15 +536,15 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         err = "glm-dsa prefill: layer " + std::to_string(il) + " lacks its k_pe or index-key cache";
         return false;
     }
-    static const bool f16_env = env_on("STRATA_GLMD_PF_F16", true);
+    static const bool f16_env = env_on("MAYA_GLMD_PF_F16", true);
     // a native Q8_0 W_kb / W_vb has no F32 path here: its products always run on the FP16 dequant
     const bool f16_products = f16_env || L.k_b.type == glmdsa::kTypeQ8_0 || L.v_b.type == glmdsa::kTypeQ8_0;
-    static const bool want_wmma = env_on("STRATA_GLMD_PF_WMMA", true);
-    static const bool want_h64 = env_on("STRATA_GLMD_PF_H64", true);   // 0: the (row, 16 heads) WMMA kernel
+    static const bool want_wmma = env_on("MAYA_GLMD_PF_WMMA", true);
+    static const bool want_h64 = env_on("MAYA_GLMD_PF_H64", true);   // 0: the (row, 16 heads) WMMA kernel
     const bool wmma = want_wmma && KV == 512 && (R == 0 || R == 64) && glmd::mla_prompt_wmma_ok();
-    // the indexer's score tiles on tensor cores (FP16 queries / keys, F32 sums; STRATA_GLMD_IDX_WMMA=0: the F32 scorer)
-    static const bool want_idx_tc = env_on("STRATA_GLMD_IDX_WMMA", true);
-    static const bool idx_check = env_on("STRATA_GLMD_IDX_CHECK", false);
+    // the indexer's score tiles on tensor cores (FP16 queries / keys, F32 sums; MAYA_GLMD_IDX_WMMA=0: the F32 scorer)
+    static const bool want_idx_tc = env_on("MAYA_GLMD_IDX_WMMA", true);
+    static const bool idx_check = env_on("MAYA_GLMD_IDX_CHECK", false);
     const bool idx_tc_ok = full && ((uintptr_t) ik_cache & 15u) == 0 && glmd::index_score_wmma_fits(ik_f16, IH, ID);
     const bool idx_tc = want_idx_tc && idx_tc_ok;
     // whether the 64-head kernel takes this layer (shape, the caches' alignment, the device): it sets the crossover
@@ -570,7 +572,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
                          il, H, KV, R, (((uintptr_t) lat | (uintptr_t) k_pe) & 15u) == 0 ? "yes" : "no");
         }
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // RDNA 3 / 3.5 / 4: the WMMA kernel (S7).  Every HIP kernel gathers from 2049 keys on, as the 64-head one: a tile
     // costs the same whichever cells fill it, and the gather walk's are the row's selection packed - never more tiles
     // than the dense-masked walk's (Radeon 8065S, 2,048 queries: RDNA 66-79 ms at any context against 75-898 dense-
@@ -732,7 +734,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         } else {
             const float* wkb = f32_of(L.k_b);
             if (L.k_b.type == gf::kTypeBF16) {
-                strata::kernels::glmb::bf16_to_f32((const uint16_t*) L.k_b.q, io.w32, (int64_t) H * KV * NOPE, io.s);
+                maya::kernels::glmb::bf16_to_f32((const uint16_t*) L.k_b.q, io.w32, (int64_t) H * KV * NOPE, io.s);
                 wkb = io.w32;
             }
             blas_ck(cublasSgemmStridedBatched(io.blas, CUBLAS_OP_T, CUBLAS_OP_N, KV, tn, NOPE, &one, wkb, NOPE,
@@ -777,7 +779,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         } else {
             const float* wvb = f32_of(L.v_b);
             if (L.v_b.type == gf::kTypeBF16) {
-                strata::kernels::glmb::bf16_to_f32((const uint16_t*) L.v_b.q, io.w32, (int64_t) H * VH * KV, io.s);
+                maya::kernels::glmb::bf16_to_f32((const uint16_t*) L.v_b.q, io.w32, (int64_t) H * VH * KV, io.s);
                 wvb = io.w32;
             }
             blas_ck(cublasSgemmStridedBatched(io.blas, CUBLAS_OP_T, CUBLAS_OP_N, VH, tn, KV, &one, wvb, KV,
@@ -847,7 +849,7 @@ bool mtp_fill(const Io& io, const MtpIo& m, std::string& err) {
         glmd::f16_guard_reset(io.s);
         // h = RMS(R) * output_norm (R unchanged), [enorm(emb) | hnorm(h)] in FP16
         ok = ok && glmd::res_rows(io.R + (size_t) t0 * E, nullptr, m.output_norm, g.norm_eps, tn, E, h, nullptr, io.s);
-        strata::kernels::glmb::mtp_in_rows(emb, h, m.enorm, m.hnorm, g.norm_eps, tn, E, cat16, io.s);
+        maya::kernels::glmb::mtp_in_rows(emb, h, m.enorm, m.hnorm, g.norm_eps, tn, E, cat16, io.s);
         ok = ok && gemm(io, m.eh, E, 2 * E, nullptr, cat16, 2 * E, hid, E, tn, 1.0f, false);
         ok = ok && glmd::res_rows(hid, nullptr, m.attn_norm, g.norm_eps, tn, E, x, x16, io.s);
         ok = ok && glmd::f16_guard_rows(x, E, 0, 1, E, tn, x16, io.s);   // B15.1
@@ -896,10 +898,10 @@ bool mtp_fill(const Io& io, const MtpIo& m, std::string& err) {
 
 void mmq_clamp(bool on, void* xq, int64_t rows, int64_t cols, int type, cudaStream_t s) {
     if (!on || rows <= 0) return;
-    const int halves = strata::prefill::mmq_strata::ds_halves(type);
+    const int halves = maya::prefill::mmq_strata::ds_halves(type);
     if (halves <= 0) return;
-    glmd::q8_mmq_clamp(xq, strata::prefill::mmq_strata::blocks(rows, cols), strata::prefill::mmq_strata::block_bytes(),
+    glmd::q8_mmq_clamp(xq, maya::prefill::mmq_strata::blocks(rows, cols), maya::prefill::mmq_strata::block_bytes(),
                        halves, s);
 }
 
-}  // namespace strata::core::glmpf
+}  // namespace maya::core::glmpf

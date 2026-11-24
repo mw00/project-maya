@@ -3,7 +3,7 @@
 // kernels Glm5Model::fast_dsa_glm launches (dsa_prep, dsa_rope_q, idx_score, topk, mla2) in the GPU-shaped MID
 // geometry, FP16 and INT8 latents: the draft writes only row p of each cache, the redo is bit-identical to the
 // token-at-a-time run, and a shared layer after the rollback refuses the rejected selection.  Then decode_spec's step
-// order (spec_rb::schedule) with STRATA_GLM_SPEC_DRAFT_EARLY off and on: every part's and every NextN draft's output
+// order (spec_rb::schedule) with MAYA_GLM_SPEC_DRAFT_EARLY off and on: every part's and every NextN draft's output
 // bit-identical to the token-at-a-time run in both orders.
 #include <cuda_runtime.h>
 
@@ -80,7 +80,7 @@ int main() {
     }
     spec_rb::suite<GpuBe>("MID", mixfx::mid_dims(64), 36, 0);
     spec_rb::suite<GpuBe>("MID", mixfx::mid_dims(64), 36, 1);
-    // glm-dsa B11.2: decode_spec's step order with STRATA_GLM_SPEC_DRAFT_EARLY off (today's) and on (the draft after
+    // glm-dsa B11.2: decode_spec's step order with MAYA_GLM_SPEC_DRAFT_EARLY off (today's) and on (the draft after
     // the tail's front parts, plus the wrong-order control)
     spec_rb::schedule<GpuBe>("MID", mixfx::mid_dims(64), 36, 0, false);
     spec_rb::schedule<GpuBe>("MID", mixfx::mid_dims(64), 36, 0, true);

@@ -52,12 +52,28 @@ class AblateStep(unittest.TestCase):
         f = self.models / "refusal-directions" / "DeepSeek-V4.1-Flash-refusal-direction.gguf"
         self.assertTrue(f.is_file())
         self.assertEqual(self.urls, ["https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/resolve/main/"
-                                     "DeepSeek-V4.1-Flash-refusal-direction.gguf"])
+                                     "refusal-directions/DeepSeek-V4.1-Flash-refusal-direction.gguf"])
         self.assertEqual(cfg["ablate"], {"file": str(f), "model": "DeepSeek-V4.1-Flash", "fitted_on": "Maya-S"})
         a = cfg["args"]
         self.assertEqual(a[a.index("--ablate") + 1], str(f))
         self.assertEqual(a[a.index("--ablate-default") + 1], "off")
         self.assertFalse(list(f.parent.glob("*.part")))
+
+    def test_a_repo_with_it_at_its_top_still_works(self):
+        """The repo's refusal-directions/ folder first; a repo that has the file at its top (as before) still serves it."""
+        def run(cmd, **kw):
+            self.urls.append(cmd[-1])
+            if "/refusal-directions/" in cmd[-1]:
+                return subprocess.CompletedProcess(cmd, 22, "", "")
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(self.good.read_bytes())
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with patch.object(maya.subprocess, "run", side_effect=run), patch.object(maya.shutil, "which", return_value="curl"), \
+                patch.object(maya, "ok"):
+            maya.ablate_step(self.cfg, "deepseek", self.models)
+        base = "https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/resolve/main/"
+        self.assertEqual(self.urls, [base + "refusal-directions/DeepSeek-V4.1-Flash-refusal-direction.gguf",
+                                     base + "DeepSeek-V4.1-Flash-refusal-direction.gguf"])
+        self.assertIn("ablate", json.loads(self.cfg.read_text()))
 
     def test_a_repo_without_one_changes_nothing(self):
         cfg = self.step(None, 22)

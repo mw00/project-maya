@@ -9,7 +9,7 @@
 //   tiling    B9.1 / B14.6: an 8K chunk at a 64K context stays within the 2.2 GB lend; sizes past 2^31 bytes;
 //   lane      B14.7: a 200-token turn computes RAM-tier experts on the lane, an 8K chunk uploads them;
 //   stream    B9.9: three links concurrently take a third of the serial time.
-#include "strata/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_batch.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 
@@ -279,10 +279,10 @@ void test_lane() {
     const int rm = glmd::upload_rows_min_measured(2.1, 0.3, 0.056);
     expect(rm == 33 && glmd::upload_rows_min_measured(0.2, 0.3, 0.056) == 0,
            "lane: measured threshold ceil((2.1 - 0.3) / 0.056) = 33 rows; a lane slower than the link forces none");
-    setenv("STRATA_GLM_UPLOAD_MIN_ROWS", "5", 1);
+    setenv("MAYA_GLM_UPLOAD_MIN_ROWS", "5", 1);
     expect(glmd::upload_rows_min(l) == 5 && glmd::upload_rows_min_measured(2.1, 0.3, 0.056) == 5,
-           "lane: STRATA_GLM_UPLOAD_MIN_ROWS overrides both forms");
-    unsetenv("STRATA_GLM_UPLOAD_MIN_ROWS");
+           "lane: MAYA_GLM_UPLOAD_MIN_ROWS overrides both forms");
+    unsetenv("MAYA_GLM_UPLOAD_MIN_ROWS");
 }
 
 void test_stream() {

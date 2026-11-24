@@ -9,7 +9,7 @@ Recipe: `tools/maya_quant/recipes/maya-s-v1.json`. Made in 280 min on the 1x V10
 
 The FP8 model's own top-64 log-probabilities (calib.py's reference: its forward in PyTorch, `hc_head` = the mean of
 the four streams as in the official modelling code) against Maya-S run through the engine's one-token decode path
-(`STRATA_GLM_SCORE_TOPK`, `tools/maya_quant/kl_eval.py`): 8 eval sequences never used for calibration, positions
+(`MAYA_GLM_SCORE_TOPK`, `tools/maya_quant/kl_eval.py`): 8 eval sequences never used for calibration, positions
 64-1022, 7,672 tokens. KL is KL(FP8 || Maya-S) over the top 64 plus one bucket for the rest (the top 64 hold 98-99% of
 FP8's probability). FP8's perplexity counts a token outside its top 64 at the 64th log-prob (a lower bound).
 

@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 // The prompt-size classes used by the path predictor: 2-31, 32-127, 128-511, and 512+ tokens.
 inline int path_size_class(int tokens) {
@@ -42,4 +42,4 @@ inline bool should_use_flow_path(double predicted_flow_seconds, double predicted
              (resident_share >= resident_threshold || 2.0 * predicted_window_seconds <= predicted_flow_seconds));
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

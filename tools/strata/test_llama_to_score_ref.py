@@ -1,5 +1,5 @@
 """tools/strata/test_llama_to_score_ref.py - the score-reference converter against a Python port of the engine's
-STRATA_GLM_SCORE comparison (src/program/generate.cpp), on synthetic logits (B7.3)."""
+MAYA_GLM_SCORE comparison (src/program/generate.cpp), on synthetic logits (B7.3)."""
 from __future__ import annotations
 
 import contextlib
@@ -18,7 +18,7 @@ import llama_to_score_ref as conv  # noqa: E402
 
 
 def engine_score_topk(ref_path, logits, tokens, c):
-    """generate.cpp's STRATA_GLM_SCORE_TOPK loop, transcribed: mean KL(ref top-k + rest || engine), same-top %."""
+    """generate.cpp's MAYA_GLM_SCORE_TOPK loop, transcribed: mean KL(ref top-k + rest || engine), same-top %."""
     with open(ref_path, "rb") as f:
         k = struct.unpack("<i", f.read(4))[0]
         kl, same, n = 0.0, 0, 0

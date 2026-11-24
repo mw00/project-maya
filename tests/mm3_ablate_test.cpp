@@ -94,7 +94,7 @@ std::filesystem::path write(const char* tag, const std::vector<Kv>& kvs, const s
             std::memcpy(b.data() + data + offs[i], ts[i].v.data(), ts[i].v.size() * 4);
     }
     if (cut) b.resize(b.size() - cut);
-    const auto path = std::filesystem::temp_directory_path() / (std::string("strata_mm3_ablate_") + tag + ".gguf");
+    const auto path = std::filesystem::temp_directory_path() / (std::string("maya_mm3_ablate_") + tag + ".gguf");
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize) b.size());
     return path;
 }
@@ -176,7 +176,7 @@ int main() {
 
     const auto cut = write("cut", cvec_kv(1), {{"direction.1", dir(1.0f)}}, 16);
     check(!loads(cut, 0, 0.0f), "a truncated file: refused");
-    check(!loads(std::filesystem::temp_directory_path() / "strata_mm3_ablate_missing.gguf", 0, 0.0f),
+    check(!loads(std::filesystem::temp_directory_path() / "maya_mm3_ablate_missing.gguf", 0, 0.0f),
           "a missing file: refused");
 
     for (const auto& p : {one, many, wide, rows, l37, llama, align, zero, adapter, cut}) {

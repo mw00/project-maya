@@ -12,13 +12,13 @@
 // runs Glm5Model::fast_layers_plain (glm_residual.cu) instead, so it never calls head_prep, embed_streams or hc.
 #pragma once
 
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 
-namespace strata::core::glmres {
+namespace maya::core::glmres {
 
 /// y[i] += x[i] for i < n (the new plain-residual add; any n > 0).
 void add(float* y, const float* x, int n, cudaStream_t s);
@@ -35,4 +35,4 @@ void res_head(const Glm5Geometry& g, const float* R, const float* norm_w, float*
 /// Bytes of the residual a part hands to the next one (and the speculative hop slots hold).
 inline size_t res_hop_bytes(const Glm5Geometry& g) { return (size_t) g.residual_floats() * sizeof(float); }
 
-}  // namespace strata::core::glmres
+}  // namespace maya::core::glmres

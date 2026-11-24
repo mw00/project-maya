@@ -1,7 +1,7 @@
 # tests/glm_dsa/glm_residual_hooks_lint.cmake - W6 runtime fix (B2.3): every decode path of the fast engine reaches
 # the residual through glmres (glm_residual.hpp), never Maya's mHC calls directly.  gf::embed_streams writes
 # 4 x n_embd floats and gf::head_prep refuses n_embd > 4096, so a direct call on glm-dsa (one stream, n_embd 6144)
-# overwrites the first DSA cache region and fails the head (the STRATA_GLM_SEQS multi decode did, glm_multi.cu).
+# overwrites the first DSA cache region and fails the head (the MAYA_GLM_SEQS multi decode did, glm_multi.cu).
 # Usage: cmake -DSRC=<repo root> -P glm_residual_hooks_lint.cmake
 if(NOT DEFINED SRC)
   message(FATAL_ERROR "SRC (the repository root) is not set")

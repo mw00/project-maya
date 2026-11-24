@@ -138,6 +138,10 @@ public:
     bool ablate_loaded() const;
     void set_ablate(bool on);
     bool ablating() const;
+    /// (#1026) every GPU's free VRAM against its reserve, once loaded (`loaded`) and before each request: what the
+    /// start and the requests allocate after the experts' residency is kept for the next start (the pack's
+    /// vram-late.txt); > 0: this start came out short - the MiB the next one keeps beside it (the layer split only)
+    int late_check(bool loaded);
     /// One token of each of R conversations together (R <= 16, distinct sequences): ids[r] at position pos[r] of
     /// sequence seq[r], whose cache holds its positions before it; logits_out [R][vocab].  Each row is the same bits as
     /// that token's forward alone: the dense matrices on the token kernels' several columns, the routed experts on the

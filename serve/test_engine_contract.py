@@ -2,17 +2,17 @@
 the setup's screen, the calibration and --report read from `strata --serve --glm-pack <pack>`.  Opt-in, it needs the
 GPU(s) and a pack:
 
-    STRATA_TEST_ENGINE=build/strata STRATA_TEST_PACK=/data/models/GLM-5.3-GGUF/UD-IQ2_M/pack \\
+    MAYA_TEST_ENGINE=build/strata MAYA_TEST_PACK=/data/models/GLM-5.3-GGUF/UD-IQ2_M/pack \\
         python -m unittest serve.test_engine_contract -v
 
-Optional: STRATA_TEST_CONTEXT (default 8192), STRATA_TEST_ARGS (more engine arguments, e.g. "--layer-split 26,54"),
-STRATA_TEST_READY_S (how long the start may take, default 900), STRATA_TEST_LOG (keep the engine log there),
-STRATA_TEST_TEXT_ONLY=0 (a model with images: VLEND is not expected to fail), STRATA_TEST_REQUIRE_A29=1 (INFO must
-carry arch / vision / spec), STRATA_TEST_EXPERTS (the INFO experts total to expect),
-STRATA_TEST_SPLIT=1 (several GPUs: the log names the layer split).  The engine's own environment (STRATA_GLM_*,
+Optional: MAYA_TEST_CONTEXT (default 8192), MAYA_TEST_ARGS (more engine arguments, e.g. "--layer-split 26,54"),
+MAYA_TEST_READY_S (how long the start may take, default 900), MAYA_TEST_LOG (keep the engine log there),
+MAYA_TEST_TEXT_ONLY=0 (a model with images: VLEND is not expected to fail), MAYA_TEST_REQUIRE_A29=1 (INFO must
+carry arch / vision / spec), MAYA_TEST_EXPERTS (the INFO experts total to expect),
+MAYA_TEST_SPLIT=1 (several GPUs: the log names the layer split).  The engine's own environment (MAYA_GLM_*,
 CUDA_VISIBLE_DEVICES) is passed through.
 
-Without STRATA_TEST_ENGINE and STRATA_TEST_PACK every test is skipped.  serve/glm_dsa_fake_engine.py stands in for
+Without MAYA_TEST_ENGINE and MAYA_TEST_PACK every test is skipped.  serve/glm_dsa_fake_engine.py stands in for
 the engine to check this file itself (no GPU): that proves the checks, not the engine.
 
 Checked: READY (context, stop, pause), the INFO keys, the start-log phrases (_context_cost's VRAM line, the serve
@@ -38,11 +38,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-ENGINE = os.environ.get("STRATA_TEST_ENGINE", "")
-PACK = os.environ.get("STRATA_TEST_PACK", "")
-CONTEXT = int(os.environ.get("STRATA_TEST_CONTEXT", "8192"))
-READY_S = float(os.environ.get("STRATA_TEST_READY_S", "900"))
-TEXT_ONLY = os.environ.get("STRATA_TEST_TEXT_ONLY", "1") == "1"
+ENGINE = os.environ.get("MAYA_TEST_ENGINE", "")
+PACK = os.environ.get("MAYA_TEST_PACK", "")
+CONTEXT = int(os.environ.get("MAYA_TEST_CONTEXT", "8192"))
+READY_S = float(os.environ.get("MAYA_TEST_READY_S", "900"))
+TEXT_ONLY = os.environ.get("MAYA_TEST_TEXT_ONLY", "1") == "1"
 THINK_END = 154842                              # </think> (GLM-5.x's vocabulary)
 GLM_EOS = (154820, 154827, 154829)              # <|endoftext|>, <|user|>, <|observation|>
 # INFO keys of the GLM fast path (src/program/generate.cpp, the serve start): the Monitor, the calibration and the TUI
@@ -59,7 +59,7 @@ def kv(line: str) -> dict:
     return dict(x.split("=", 1) for x in line.split()[1:] if "=" in x)
 
 
-@unittest.skipUnless(ENGINE and PACK, "set STRATA_TEST_ENGINE and STRATA_TEST_PACK to run the engine contract test "
+@unittest.skipUnless(ENGINE and PACK, "set MAYA_TEST_ENGINE and MAYA_TEST_PACK to run the engine contract test "
                                       "(needs the GPU(s) and a pack)")
 class EngineContract(unittest.TestCase):
     """One engine for the whole class (GLM-5.3's start takes minutes); the tests run in name order."""
@@ -67,11 +67,11 @@ class EngineContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.log_path = Path(os.environ.get("STRATA_TEST_LOG") or Path(cls.tmp.name) / "engine.log")
+        cls.log_path = Path(os.environ.get("MAYA_TEST_LOG") or Path(cls.tmp.name) / "engine.log")
         cls.log = open(cls.log_path, "a", encoding="utf-8")
         cls.log_start = cls.log_path.stat().st_size
         args = [ENGINE, "--serve", "--glm-pack", PACK, "--max-context", str(CONTEXT), "--prefill", "auto",
-                *shlex.split(os.environ.get("STRATA_TEST_ARGS", ""))]
+                *shlex.split(os.environ.get("MAYA_TEST_ARGS", ""))]
         cls.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=cls.log, text=True,
                                     encoding="utf-8", bufsize=1)
         cls.lines: queue.Queue = queue.Queue()
@@ -178,12 +178,12 @@ class EngineContract(unittest.TestCase):
         for k in ("vram_gb", "ram_gb", "pcie_share"):
             float(self.info[k])
         self.assertGreater(int(self.info["experts"]), 0)
-        if os.environ.get("STRATA_TEST_EXPERTS"):
-            self.assertEqual(int(self.info["experts"]), int(os.environ["STRATA_TEST_EXPERTS"]))
+        if os.environ.get("MAYA_TEST_EXPERTS"):
+            self.assertEqual(int(self.info["experts"]), int(os.environ["MAYA_TEST_EXPERTS"]))
         self.assertIn(self.info["mtp"], ("0", "1"))
         if TEXT_ONLY:
             self.assertEqual(int(self.info["vision_lend"]), 0)
-        if os.environ.get("STRATA_TEST_REQUIRE_A29") == "1":
+        if os.environ.get("MAYA_TEST_REQUIRE_A29") == "1":
             self.assertFalse([k for k in A29_KEYS if k not in self.info], f"INFO lacks the arch / vision keys: {self.info}")
         if "arch" in self.info:
             self.assertIn(self.info["arch"], ("glm-dsa", "glm5-next", "glm5next"))
@@ -205,7 +205,7 @@ class EngineContract(unittest.TestCase):
                 self.assertRegex(line, WARMING)
             if " tiers warm:" in line:
                 self.assertRegex(line, WARMED)
-        if os.environ.get("STRATA_TEST_SPLIT") == "1":
+        if os.environ.get("MAYA_TEST_SPLIT") == "1":
             self.assertRegex(text, r"glm split: layers ")
 
     # ---------------------------------------------------------------- requests
@@ -236,8 +236,8 @@ class EngineContract(unittest.TestCase):
         self.assertRegex(self.log_text(), r"glm stat: decode [\d.]+ ms/tok")   # maya.py --bench reads it
 
     def test_05_conversation_cache(self):
-        if os.environ.get("STRATA_GLM_NO_REUSE") == "1":
-            self.skipTest("STRATA_GLM_NO_REUSE=1")
+        if os.environ.get("MAYA_GLM_NO_REUSE") == "1":
+            self.skipTest("MAYA_GLM_NO_REUSE=1")
         done = self.gen(8)["DONE"]
         self.assertGreater(int(done[7]), 0, "the same prompt again reused nothing (DONE field 8)")
 
@@ -268,7 +268,7 @@ class EngineContract(unittest.TestCase):
 
     def test_09_vlend_on_a_text_only_model(self):
         if not TEXT_ONLY:
-            self.skipTest("STRATA_TEST_TEXT_ONLY=0")
+            self.skipTest("MAYA_TEST_TEXT_ONLY=0")
         if "vision" not in self.info:
             self.skipTest("INFO has no vision key yet: VLEND may still lend memory")
         self.send("VLEND")
@@ -279,7 +279,7 @@ class EngineContract(unittest.TestCase):
     def test_99_quit(self):
         self.send("QUIT")
         try:
-            rc = self.proc.wait(timeout=float(os.environ.get("STRATA_ENGINE_QUIT_S", "50") or 50) + 10)
+            rc = self.proc.wait(timeout=float(os.environ.get("MAYA_ENGINE_QUIT_S", "50") or 50) + 10)
         except subprocess.TimeoutExpired:
             self.fail("QUIT did not end the engine in time")
         self.assertEqual(rc, 0)

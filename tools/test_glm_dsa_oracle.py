@@ -17,7 +17,7 @@ nothing large is committed; data/glm-dsa/ holds only hashes and reference logits
 Gate values (BUILD-PLAN B3.5/B3.6): logits max abs error 1e-4; KL p99 1e-4 with KL taken over the
 reference's top-64 tokens plus a rest bucket.
 
-Opt-in (not part of CI): STRATA_SYNTH_LARGE=1 also generates BIG (~2.3 GB) and WIDE (~1 GB) and runs
+Opt-in (not part of CI): MAYA_SYNTH_LARGE=1 also generates BIG (~2.3 GB) and WIDE (~1 GB) and runs
 the oracle on BIG; tools/strata/glm_dsa_hf_xcheck.py compares against transformers when torch is
 installed.
 
@@ -39,6 +39,12 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "ref"))
+
+from _paths import add_gguf_py  # noqa: E402
+try:                            # (the fixtures and the loader need llama.cpp's gguf-py: without it this file
+    add_gguf_py()               #  skips, instead of its setUpClass's SystemExit ending the whole test run)
+except SystemExit as e:
+    raise unittest.SkipTest(str(e))
 
 import glm_dsa_synth_gguf as synth  # noqa: E402
 from glm_dsa import (MUTATIONS, COVER, GlmDsa, GlmDsaConfig, Options, apply_rope, hadamard,  # noqa: E402
@@ -508,7 +514,7 @@ class HFTransformers(unittest.TestCase):
 
 
 # ============================================================================ large presets (opt-in)
-@unittest.skipUnless(os.environ.get("STRATA_SYNTH_LARGE") == "1", "set STRATA_SYNTH_LARGE=1 (writes ~3.3 GB)")
+@unittest.skipUnless(os.environ.get("MAYA_SYNTH_LARGE") == "1", "set MAYA_SYNTH_LARGE=1 (writes ~3.3 GB)")
 class LargePresets(unittest.TestCase):
     def test_big_and_wide(self):
         with tempfile.TemporaryDirectory() as d:

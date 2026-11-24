@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_dsa_spec_rollback_test.cpp - glm-dsa B11.2: a rejected draft on glm-dsa needs no copy-back, and
-// leaves no stale selection (CPU twins; runs anywhere); decode_spec's step order with STRATA_GLM_SPEC_DRAFT_EARLY off
+// leaves no stale selection (CPU twins; runs anywhere); decode_spec's step order with MAYA_GLM_SPEC_DRAFT_EARLY off
 // and on.  The checks are described in glm_dsa_spec_rollback.hpp.
 #include <cstdio>
 #include <memory>
@@ -50,7 +50,7 @@ int main() {
     spec_rb::suite<CpuBe>("SMALL", mixfx::small_dims(64), 40, 0);
     spec_rb::suite<CpuBe>("SMALL", mixfx::small_dims(64), 40, 1);
     spec_rb::suite<CpuBe>("MID", mixfx::mid_dims(64), 36, 0);
-    // glm-dsa B11.2: decode_spec's step order, STRATA_GLM_SPEC_DRAFT_EARLY off and on (glm_dsa_spec_rollback.hpp)
+    // glm-dsa B11.2: decode_spec's step order, MAYA_GLM_SPEC_DRAFT_EARLY off and on (glm_dsa_spec_rollback.hpp)
     spec_rb::schedule<CpuBe>("SMALL", mixfx::small_dims(64), 40, 0, false);
     spec_rb::schedule<CpuBe>("SMALL", mixfx::small_dims(64), 40, 0, true);
     spec_rb::schedule<CpuBe>("SMALL", mixfx::small_dims(64), 40, 1, true);

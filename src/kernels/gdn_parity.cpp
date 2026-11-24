@@ -18,7 +18,7 @@
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
-#include "strata/kernels/gdn.hpp"
+#include "maya/kernels/gdn.hpp"
 
 #include <cuda_runtime.h>
 
@@ -174,8 +174,8 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(d_g, gate.data(), gate.size() * 4, cudaMemcpyHostToDevice), "cg");
         check(cudaMemcpy(d_b, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice), "cb");
 
-        strata::kernels::GdnShapes sh{S, h_k, h_v};
-        strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
+        maya::kernels::GdnShapes sh{S, h_k, h_v};
+        maya::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
 
         std::vector<float> got_o((size_t) h_v * S), got_st(st_dev.size());
         check(cudaMemcpy(got_o.data(), d_o, got_o.size() * 4, cudaMemcpyDeviceToHost), "cgo");
@@ -207,7 +207,7 @@ int main(int argc, char** argv) {
             check(cudaMemcpy(d_st, zero.data(), zero.size() * 4, cudaMemcpyHostToDevice), "z0");
             check(cudaMemcpy(d_g, zg.data(), zg.size() * 4, cudaMemcpyHostToDevice), "z1");
             check(cudaMemcpy(d_b, zb.data(), zb.size() * 4, cudaMemcpyHostToDevice), "z2");
-            strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
+            maya::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
             std::vector<float> zz(zero.size());
             check(cudaMemcpy(zz.data(), d_st, zz.size() * 4, cudaMemcpyDeviceToHost), "z3");
             double nz = 0;
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(d_cs, cs.data(), cs.size() * 4, cudaMemcpyHostToDevice), "ccs");
         check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "ccx");
         check(cudaMemcpy(d_w, kW.data(), kW.size() * 4, cudaMemcpyHostToDevice), "ccw");
-        strata::kernels::gdn_conv_step(d_cs, d_x, d_w, d_o, C, dc, nullptr);
+        maya::kernels::gdn_conv_step(d_cs, d_x, d_w, d_o, C, dc, nullptr);
         std::vector<float> got((size_t) C), got_cs(cs.size());
         check(cudaMemcpy(got.data(), d_o, got.size() * 4, cudaMemcpyDeviceToHost), "cgo");
         check(cudaMemcpy(got_cs.data(), d_cs, got_cs.size() * 4, cudaMemcpyDeviceToHost), "cgs");
@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
         float* d_x = nullptr;
         check(cudaMalloc(&d_x, x.size() * 4), "lx");
         check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "lcx");
-        strata::kernels::gdn_l2_norm(d_x, rows, cols, eps, nullptr);
+        maya::kernels::gdn_l2_norm(d_x, rows, cols, eps, nullptr);
         std::vector<float> got(x.size());
         check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "lcg");
         const double rel = rel_l1(x_ref, got);
@@ -364,7 +364,7 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(d_o, o.data(), o.size() * 4, cudaMemcpyHostToDevice), "nco");
         check(cudaMemcpy(d_z, z.data(), z.size() * 4, cudaMemcpyHostToDevice), "ncz");
         check(cudaMemcpy(d_sn, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice), "ncs");
-        strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
+        maya::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
         std::vector<float> got(y_ref.size());
         check(cudaMemcpy(got.data(), d_y, got.size() * 4, cudaMemcpyDeviceToHost), "ncy");
         const double rel = rel_l1(y_ref, got);

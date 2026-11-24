@@ -7,14 +7,14 @@ Two subcommands:
              python3 tools/strata/parity_compare.py compare --ref ref.topk@2048 --test engine.lsm@2048 \
                  --name chat --out chat.a_vs_r.json
            Row files (SPEC = PATH[@FIRST], FIRST = the absolute position of the file's row 0):
-             *.topk   tools/strata/llama_to_score_ref.py --format topk (STRATA_GLM_SCORE_TOPK): int32 k, then per
+             *.topk   tools/strata/llama_to_score_ref.py --format topk (MAYA_GLM_SCORE_TOPK): int32 k, then per
                       position k int32 ids and k float32 log-probs
-             others   float32 rows of n_vocab: the engine's STRATA_GLM_SCORE_DUMP (log-softmax rows, positions
+             others   float32 rows of n_vocab: the engine's MAYA_GLM_SCORE_DUMP (log-softmax rows, positions
                       c .. n-2), llm_logits_dump's raw logits (positions 0 .. n-1) or llama_to_score_ref.py
                       --format full; every row is log-softmaxed here, so logits and log-probs mix freely
            KL(ref || test) per position over the reference's top-k tokens (--topk, default 64; a topk file's own k)
            plus one bucket for the rest of the vocabulary: the KL of every BUILD-PLAN gate (and of the engine's
-           STRATA_GLM_SCORE line).  Reports mean, p50, p99, max, the top-1 agreement (reference best token vs the
+           MAYA_GLM_SCORE line).  Reports mean, p50, p99, max, the top-1 agreement (reference best token vs the
            test's argmax), the near-ties (reference top-2 log-prob gap < 1e-3) and the misses outside them.
            --positions a:b limits the range (absolute positions, b exclusive), e.g. criterion (d)'s first 512.
   gate     the B7.4a / M2 / M2-alt verdict from a manifest of compare results:
@@ -101,7 +101,7 @@ def topk_ids(ls: np.ndarray, k: int) -> np.ndarray:
 
 
 def kl_top_rest(ref_ids: np.ndarray, ref_lp: np.ndarray, test_ls: np.ndarray) -> float:
-    """generate.cpp's STRATA_GLM_SCORE_TOPK KL: over the reference's ids plus the rest bucket."""
+    """generate.cpp's MAYA_GLM_SCORE_TOPK KL: over the reference's ids plus the rest bucket."""
     p = np.exp(ref_lp)
     k = float((p * (ref_lp - test_ls[ref_ids])).sum())
     pr, pt = float(p.sum()), float(np.exp(test_ls[ref_ids]).sum())
@@ -275,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("compare", help="KL(ref || test) over the scored positions")
     c.add_argument("--ref", required=True, help="PATH[@FIRST]: .topk or float32 rows")
-    c.add_argument("--test", required=True, help="PATH[@FIRST]: float32 rows (engine STRATA_GLM_SCORE_DUMP, ...)")
+    c.add_argument("--test", required=True, help="PATH[@FIRST]: float32 rows (engine MAYA_GLM_SCORE_DUMP, ...)")
     c.add_argument("--n-vocab", type=int, default=DEFAULT_VOCAB, help="row width of both files")
     c.add_argument("--ref-vocab", type=int, help="row width of the reference when it differs")
     c.add_argument("--test-vocab", type=int, help="row width of the test when it differs")

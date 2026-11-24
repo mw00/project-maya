@@ -1,12 +1,12 @@
 // src/core/graph.cpp - P2.S5: the GraphRegistry implementation.
-#include "strata/core/graph.hpp"
+#include "maya/core/graph.hpp"
 
-#include "strata/platform/cpu_relax.hpp"
+#include "maya/platform/cpu_relax.hpp"
 
 #include <chrono>
 #include <cstdio>
 
-namespace strata::core {
+namespace maya::core {
 namespace {
 
 /// Fills `err` from the CUDA runtime, naming the call that failed.  A bare "invalid argument" with no call
@@ -97,7 +97,7 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
         if (q == cudaSuccess) return true;
         if (q != cudaErrorNotReady) return false;   // a real error, not "not finished"
         if (std::chrono::steady_clock::now() >= deadline) return false;
-        for (int i = 0; i < 64; ++i) strata_cpu_pause();
+        for (int i = 0; i < 64; ++i) maya_cpu_pause();
     }
 }
 
@@ -143,4 +143,4 @@ bool GraphRegistry::launch(LayerType type, int n_tokens, int timeout_ms, std::st
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

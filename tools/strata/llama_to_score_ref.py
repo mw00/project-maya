@@ -3,19 +3,19 @@
 
 `tools/llm_logits_dump` (built against llama.cpp aa94f208) writes the raw logits of every position of a token list:
 n_tokens rows of n_vocab float32, row i = the logits after token i (predicting token i + 1).  The engine scores the
-same token list with `STRATA_GLM_SCORE=<c>` (src/program/generate.cpp): positions i = c .. n-2, each against token
+same token list with `MAYA_GLM_SCORE=<c>` (src/program/generate.cpp): positions i = c .. n-2, each against token
 i + 1, and compares against one of two reference files:
 
-* `STRATA_GLM_SCORE_TOPK=<file>` (`--format topk`, default): int32 k, then per scored position k int32 token ids
+* `MAYA_GLM_SCORE_TOPK=<file>` (`--format topk`, default): int32 k, then per scored position k int32 token ids
   (best first) and their k float32 log-probabilities.  The engine's KL is over those k tokens plus one bucket for
   the rest of the vocabulary: the "top-64 + rest" KL every BUILD-PLAN gate uses (section 6).
-* `STRATA_GLM_SCORE_REF=<file>` (`--format full`): per scored position n_vocab float32 log-softmax values (the
-  engine's own `STRATA_GLM_SCORE_DUMP` layout).  `--engine-vocab` pads llama.cpp's vocabulary to the engine's with
+* `MAYA_GLM_SCORE_REF=<file>` (`--format full`): per scored position n_vocab float32 log-softmax values (the
+  engine's own `MAYA_GLM_SCORE_DUMP` layout).  `--engine-vocab` pads llama.cpp's vocabulary to the engine's with
   -inf (probability 0) when the two differ.
 
     llm_logits_dump --ngl 999 --ot exps=CPU --ubatch 512 $M ref.bin @tokens.txt
     python3 tools/strata/llama_to_score_ref.py --dump ref.bin --tokens tokens.txt --context 2048 --out ref.topk
-    STRATA_GLM_SCORE=2048 STRATA_GLM_SCORE_TOPK=ref.topk build/strata --glm-pack <pack> --tokens-file tokens.txt
+    MAYA_GLM_SCORE=2048 MAYA_GLM_SCORE_TOPK=ref.topk build/strata --glm-pack <pack> --tokens-file tokens.txt
 
 It also prints the reference's own NLL, perplexity and top-1 agreement with the teacher tokens over the scored
 positions (100% top-1 on a greedy continuation the reference itself generated).
@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dump", required=True, help="llm_logits_dump output (n_tokens x n_vocab float32)")
     ap.add_argument("--n-vocab", type=int, default=DEFAULT_VOCAB)
     ap.add_argument("--tokens", help="the token ids given to llm_logits_dump (whitespace or JSON list)")
-    ap.add_argument("--context", type=int, required=True, help="STRATA_GLM_SCORE value: positions context..n-2 scored")
+    ap.add_argument("--context", type=int, required=True, help="MAYA_GLM_SCORE value: positions context..n-2 scored")
     ap.add_argument("--format", choices=["topk", "full"], default="topk")
     ap.add_argument("--topk", type=int, default=64)
     ap.add_argument("--engine-vocab", type=int, help="pad full-format rows to the engine's vocabulary")
@@ -112,8 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     if r["nll"] is not None:
         msg += "; reference nll %.5f ppl %.4f top1 %.2f%% vs the teacher tokens" % (r["nll"], np.exp(r["nll"]), r["top1"])
     print(msg)
-    env = "STRATA_GLM_SCORE_TOPK" if a.format == "topk" else "STRATA_GLM_SCORE_REF"
-    print("engine: STRATA_GLM_SCORE=%d %s=%s strata --glm-pack <pack> --tokens-file <the same ids>" % (a.context, env, a.out))
+    env = "MAYA_GLM_SCORE_TOPK" if a.format == "topk" else "MAYA_GLM_SCORE_REF"
+    print("engine: MAYA_GLM_SCORE=%d %s=%s strata --glm-pack <pack> --tokens-file <the same ids>" % (a.context, env, a.out))
     return 0
 
 
