@@ -36,6 +36,9 @@ struct Options {
     int cpu_threads = 0;
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
     bool profile_readonly = false;    // (--profile-readonly) the profile is read, never written back
+    // read at the load in place of `profile` while that file does not exist yet (a pack set up by hand or mounted
+    // read-only has none): the shipped data/expert-profile-ds4.bin.  What the run learns is still written to `profile`
+    std::string profile_seed;
     // (--profile-out) where save_profile() also writes what this run routed alone: the counts read at the load taken off
     std::string profile_out;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used

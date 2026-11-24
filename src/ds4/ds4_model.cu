@@ -4771,12 +4771,32 @@ struct Model::Impl {
         }
         prof.assign((size_t) (g.nl + g.n_mtp) * g.n_exp, 0u);
         if (!o.profile.empty()) {
-            std::FILE* f = std::fopen(o.profile.c_str(), "rb");
-            if (f != nullptr) {
+            std::string from = o.profile;
+            std::FILE* f = std::fopen(from.c_str(), "rb");
+            if (f == nullptr && !o.profile_seed.empty()) {   // (the pack has none yet: the shipped one, as setup copies)
+                from = o.profile_seed;
+                f = std::fopen(from.c_str(), "rb");
+            }
+            if (f == nullptr) {
+                std::fprintf(stderr, "ds4: no expert profile (%s not found): VRAM starts with the experts in their order, "
+                                     "not the most-routed first\n", o.profile.c_str());
+            } else {
                 std::vector<uint32_t> p(prof.size());
                 const size_t n = std::fread(p.data(), 4, p.size(), f);
-                if (n == p.size() || n == (size_t) g.nl * g.n_exp) std::copy(p.begin(), p.begin() + (long) n, prof.begin());
                 std::fclose(f);
+                if (n == p.size() || n == (size_t) g.nl * g.n_exp) {
+                    std::copy(p.begin(), p.begin() + (long) n, prof.begin());
+                    if (from == o.profile)
+                        std::fprintf(stderr, "ds4: expert profile %s\n", from.c_str());
+                    else
+                        std::fprintf(stderr, "ds4: expert profile %s (the shipped one: %s does not exist yet%s)\n",
+                                     from.c_str(), o.profile.c_str(),
+                                     o.profile_readonly ? "" : "; what this run learns is saved there if it can be written");
+                } else {
+                    std::fprintf(stderr, "ds4: expert profile %s ignored: %zu counts, this model takes %zu (%d layers x %d "
+                                         "experts%s)\n", from.c_str(), n, prof.size(), g.nl + g.n_mtp, g.n_exp,
+                                 g.n_mtp > 0 ? ", or the trunk's alone" : "");
+                }
             }
         }
         prof_load = prof;
