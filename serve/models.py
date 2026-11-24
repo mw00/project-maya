@@ -367,9 +367,10 @@ def mm3_pack_has(cfg: dict, key: str) -> bool:
 
 # ------------------------------------------------------------------ refusal ablation (an optional direction file)
 # The engines that project a direction out per request (GEN ablate=1; loaded with --ablate FILE --ablate-default off):
-# maya-ds4, maya-mm3 and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac engine).  Qwen
+# maya-ds4, maya-mm3, maya-ik2 (Inkling-2-Mini) and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac
+# engine).  Qwen
 # (CYBER-FROST) has none; without a direction file the dashboard shows no switch.
-ABLATE_FAMILIES = ("deepseek", "minimax", "glm")
+ABLATE_FAMILIES = ("deepseek", "minimax", "glm", "ik2")
 # a model repo's direction file (phase 2: fitted and shipped by us): <Model>-refusal-direction.gguf - a control vector
 # GGUF (general.architecture "controlvector", direction.1 F32 [n_embd]) with maya.ablate.scale / .fit_layer / .model
 # / .fitted_on / .version metadata; the setup downloads it with the model and records it as cfg["ablate"]["file"]

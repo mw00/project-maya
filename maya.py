@@ -4338,7 +4338,8 @@ def fetch(url: str, dst: Path, want: str | None) -> None:
 ABLATE_DIRECTIONS = {"glm": ("GLM-5.3-Flash", "peasantsmith/GLM-5.3-Flash-Maya-GGUF"),
                      "glm-dsa": ("GLM-5.3", "peasantsmith/GLM-5.3-Maya-GGUF"),
                      "deepseek": ("DeepSeek-V4.1-Flash", "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"),
-                     "minimax": ("MiniMax-M3.1-Flash", "peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF")}
+                     "minimax": ("MiniMax-M3.1-Flash", "peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"),
+                     "ik2": ("Inkling-2-Mini", "peasantsmith/Inkling-2-Mini-Maya-GGUF")}
 ABLATE_DIR = "refusal-directions"
 ABLATE_MAX_BYTES = 1 << 20
 
@@ -4371,6 +4372,16 @@ def fetch_ablate_direction(key: str, models: Path) -> Path | None:
     dst = models / ABLATE_DIR / name
     part = dst.with_name(name + ".part")
     why = ""
+    pin = ablate_pin(key, name)
+    if pin is not None:   # (a pinned file - Inkling's, once its manifest names the revision: that revision, its size and sha256)
+        got = _fetch_ablate_file(hf_url(repo, pin[0], ABLATE_DIR, name), dst, part, model, repo, name, pin[1:])
+        if got is True:
+            return dst
+        why = got
+        if dst.is_file() and not ablate_direction_check(dst, model) and sha256_ok(dst, pin[2]):
+            ok(f"refusal ablation: the {name} from an earlier setup ({why})")
+            return dst
+        return None
     # the file sits in the repo's refusal-directions/ folder (at the repo's top the Hub took it for the model and showed
     # its few thousand values as the parameter count); a repo that still has it at the top is read there
     for url in (hf_url(repo, "main", ABLATE_DIR, name), hf_url(repo, "main", "", name)):
@@ -4387,8 +4398,24 @@ def fetch_ablate_direction(key: str, models: Path) -> Path | None:
     return None
 
 
-def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, name: str):
-    """One try of fetch_ablate_direction's download: True (checked, in place) or why it failed."""
+def ablate_pin(key: str, name: str):
+    """(revision, size, sha256) of a direction file the model's manifest pins (tools/ik2/download.json's "ablate"),
+    or None: no entry, or its revision / sha256 still a PLACEHOLDER (the file is not uploaded yet: the repo's main,
+    checked by its shape alone, as every other model's)."""
+    if key != "ik2":
+        return None
+    ent = read_json(IK2_MANIFEST).get("ablate") or {}
+    f = (ent.get("files") or {}).get(name)
+    rev = ent.get("revision")
+    if not (isinstance(rev, str) and re.fullmatch(r"[0-9a-f]{40}", rev) and isinstance(f, list) and len(f) == 2 and
+            isinstance(f[0], int) and isinstance(f[1], str) and re.fullmatch(r"[0-9a-f]{64}", f[1])):
+        return None
+    return rev, f[0], f[1]
+
+
+def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, name: str, pin=None):
+    """One try of fetch_ablate_direction's download: True (checked, in place) or why it failed.  pin: (size, sha256)
+    the file must have."""
     why = ""
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -4411,6 +4438,8 @@ def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, n
                 why = str(e)
         if not why:
             why = ablate_direction_check(part, model)
+            if not why and pin is not None and (part.stat().st_size != pin[0] or not sha256_ok(part, pin[1])):
+                why = "not the pinned file (size or sha256)"
             if not why:
                 os.replace(part, dst)
                 ok(f"refusal ablation: {name} from https://huggingface.co/{repo} (off until you switch it on: the "
@@ -11934,7 +11963,9 @@ def set_up_ik2(a, prev: dict) -> Path | None:
         drafter = ik2_drafter_step(a, d, vram, ctx, kv, amd)   # (5: its drafter)
     tok = ik2_tokenizer_step(a, d, gguf)              # 6
     vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
-    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
+    cfg_path = write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
+    ablate_step(cfg_path, "ik2", models, a)            # (its refusal direction, loaded and off by default, when the repo has one)
+    return cfg_path
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:
@@ -12000,7 +12031,7 @@ def main() -> int:
                          "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--ablation", choices=["on", "off"],
-                    help="GLM, DeepSeek and MiniMax: the model's refusal direction loaded (on - each request still "
+                    help="GLM, DeepSeek, MiniMax and Inkling-2-Mini: the model's refusal direction loaded (on - each request still "
                          "asks for it, off by default) or left out (off). Not given: a new config loads it, a setup "
                          "again keeps what its config had")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")

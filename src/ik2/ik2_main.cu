@@ -3830,7 +3830,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         if (ex) exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
         else tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
-        const bool ab = abl::cur();   // (--ablate: as the token path's - the conv alone, projected, the stream added)
+        bool ab = abl::cur();   // (--ablate: as the token path's - the conv alone, projected, the stream added)
         k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first || ab ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
         if (ab) abl_write(W.r, first ? nullptr : W.h, T, C);
@@ -3899,7 +3899,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
         //  tokens' picks - it took 9.4 us where the two take 7)
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
-        const bool ab = abl::cur();
+        ab = abl::cur();   // (the MoE write, as the attention write above)
         k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, ab ? nullptr : W.r, C, W.h, C, Ly.rec_old[3],
                       Ly.rec_x[3], g_s);
         if (ab) abl_write(W.h, W.r, T, C);
