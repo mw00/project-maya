@@ -37,14 +37,15 @@
 namespace maya::core::glmlink {
 
 enum Role : int { kNone = 0, kFront = 1, kBack = 2 };
-enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kCtl = 7, kBegin = 8, kEnd = 9, kAck = 10,
+enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kSpec = 6, kCtl = 7, kBegin = 8, kEnd = 9, kAck = 10,
                     kChunk = 13 };
 // kEnd's val (front -> back): bit 0 PAUSE, bit 1 its keep, bit 2 the request was cancelled (a STOP, a client gone)
 // kChunk (both ways, at the start of a prompt-path call): pos = the call's first position, n = its tokens, val = the
 // chunk this side laid out for it, in tokens (0: this side has no prompt path now - both read the call token by
 // token; -1: the layout does not fit - the request fails on both, unless the other side says 0).  Both read the
 // call in the smaller one's chunks
-// kCtl (front -> back): pos = the position the step is for, val = 1 go on / 0 the end
+// kSpec (back -> front, the pipelined spec decode): pos = the tail's position, val = its token y, n = the draft d for
+// the position after (-1: none).  kCtl (front -> back): pos = the position the step is for, val = 1 go on / 0 the end
 
 struct Hdr {
     uint32_t magic;   // kMagic
@@ -80,7 +81,7 @@ bool send_tok(Type t, int64_t pos, int32_t tok);
 // the back failed a request: tell the front why (an ERR in place of what it waits for) and take the link down
 void abort_link(const std::string& why);
 bool recv_tok(Type t, int64_t pos, int32_t& tok, std::string& err);
-bool send_pair(Type t, int64_t pos, int32_t val, int32_t n);                          // kCtl
+bool send_pair(Type t, int64_t pos, int32_t val, int32_t n);                          // kSpec / kCtl
 bool recv_pair(Type t, int64_t pos, int32_t& val, int32_t& n, std::string& err);
 
 // control channel: the front sends each line it reads; the back reads them as its stdin (ctl_fd: -1 off)

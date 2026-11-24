@@ -807,6 +807,8 @@ public:
     bool spec_plain_turn();
     void spec_plain_end(int64_t produced);
     bool spec_plain_live_ = false;
+    bool decode_spec_link(maya::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                          int64_t& produced, std::string& err);   // the two-rig split's (glm_link.hpp)
     uint64_t spec_steps_ = 0, spec_hits_ = 0;              // speculative positions, accepted
     double spec_t_[4] = {0, 0, 0, 0};                      // MAYA_GLM_SPEC_PROF host phases of spec_head/tail
     int64_t spec_n_ = 0;

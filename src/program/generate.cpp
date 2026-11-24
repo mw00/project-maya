@@ -2607,7 +2607,8 @@ static int glm_pack_generate(const Options& o) {
             // MAYA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
             int64_t n_spec = 0;
             // (unset: on for a split of three or more Volta GPUs - Glm5Model::spec_win_mode)
-            const bool piped = model.spec_win_mode() != 0;
+            // (the two-rig split: the link carries decode_spec's pipelined rounds only - decode_spec_link)
+            const bool piped = model.spec_win_mode() != 0 && gl::role() == gl::kNone;
             maya::core::glmng::set_history(&model, prompt);   // glm-dsa B14.13 (no-op unless MAYA_GLM_NGRAM_DRAFT)
             const bool done_ok = piped ? model.decode_spec_pipe(sp, max_new, on_token, n_spec, err)
                                        : model.decode_spec(sp, max_new, on_token, n_spec, err);

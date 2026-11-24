@@ -23,14 +23,17 @@ hop per token.
 
 Measured on two machines with 2× RTX 3060 12 GB each (PCIe 3.0, 1 GbE between them, one CPU with AVX2 and one
 without; the cards power-limited to 130 W and 110 W), Maya-XS, `--prefill 2048`, one conversation, 128-token greedy
-answers, on v1.1.75. The decode over the link is plain in this build (no MTP drafts):
+answers, on v1.1.75:
 
-| | decode: short / summary / 2K-token prompt | expert reads from VRAM |
-|---|---|---|
-| one machine, 2× RTX 3060 | 12.8 / 11.8 / 11.2 tok/s | 62–67% |
-| two machines, 2 + 2× RTX 3060 | 21.2 / 21.1 / 18.9 tok/s | 85–91% |
+| | with MTP: short / summary / 2K-token prompt | without MTP: short / summary / 2K | expert reads from VRAM |
+|---|---|---|---|
+| one machine, 2× RTX 3060 | 18.8 / 16.3 / 13.5 tok/s | 12.8 / 11.8 / 11.2 tok/s | 60–71% |
+| two machines, 2 + 2× RTX 3060 | 32.6 / 32.0 / 26.0 tok/s | 21.2 / 21.1 / 18.9 tok/s | 85–91% |
 
-Nothing was read from the SSD in either case.
+Over the link, 86–87% of the MTP drafts were accepted on the short prompts and 71% on the 2K prompt (one machine:
+84–89% and 66%). Nothing was read from the SSD in either case. Earlier, on two machines with 4× RTX 3060 each and
+Maya-S24, the split decoded at 38–42 tok/s against 42–45 tok/s for the same 8 GPUs in one machine: there the experts
+fit in VRAM either way, and the hop costs the difference.
 
 ## Setup
 
@@ -172,6 +175,18 @@ it at once.
 | `MAYA_GLM_LINK_DEAD_S` | 30 s | both sides: a peer that is gone without a word (its power, a cable) ends the request after this long (TCP keepalive and `TCP_USER_TIMEOUT`); 0: off |
 | `MAYA_GLM_LINK_STALL_S` | 60 s | both sides: a peer that is connected but sends or takes nothing for this long (a stuck process) ends the request and the link; 0: off. Keep it under the server's `MAYA_ENGINE_STALL_S` (90 s) and the engine's `MAYA_WATCHDOG_S` (180 s), which end the engine instead |
 
+## Speculative decoding over the link
+
+The NextN (MTP) drafts work over the link, pipelined: while the back verifies the draft for one position, the front
+already runs its layers for the next two (the confirmed token's and the draft's), so neither machine waits for the
+other's whole step. The back sends each step's token and the next draft; the front sends its verdict and its rows in
+the order the back reads them. A wrong draft costs the front one recomputed row, not a round trip.
+
+A request is decoded this way when both sides would draft: the back has the NextN block (the default), neither
+side runs with `MAYA_GLM_NO_SPEC=1`, and the request does not ask for a plain decode (`"spec": 1`). Otherwise both
+decode it plainly, and a log line names the side that does not draft.
+`MAYA_GLM_SPEC_WIN` (the verify window of a one-machine split) is not used over the link.
+
 ## Checking it: single process vs two rigs
 
 `tools/glm_split_check.py` runs the same build, pack and prompts once in one process (the reference) and once split,
@@ -183,20 +198,19 @@ over each prompt plus the reference's answer (the prompt through the prompt path
 On one machine with two GPUs or more, the split can run with exactly the reference's placement: the reference with
 `--layer-split K` puts layers `[0, K)` on GPU 0 and the rest on the later GPUs; the split puts its front on GPU 0
 and its back on GPU 1 over loopback. With the fp32 hop and the CPU lane off on every run, the split must be
-**bit-identical** to the reference (`--no-spec` on the split side: this build decodes plainly over the link, so
-the split's answer is compared with the reference's answer without MTP):
+**bit-identical** to the reference:
 
 ```sh
 export MAYA_GLM_LINK_BF16=0 MAYA_GLM_CPU_LANE=0
 ENG="build/maya --glm-pack <pack> --max-context 8192 --expert-cache auto --prefill 2048 --kv-streaming on"
 python3 tools/glm_split_check.py prompts --pack <pack> --dir check
 python3 tools/glm_split_check.py run --mode ref --dir check -- $ENG --layer-split 24
-CUDA_VISIBLE_DEVICES=1 python3 tools/glm_split_check.py run --mode back --dir check --no-spec -- $ENG \
+CUDA_VISIBLE_DEVICES=1 python3 tools/glm_split_check.py run --mode back --dir check -- $ENG \
     --layer-split 24 --role back --link 127.0.0.1:7711 &
-CUDA_VISIBLE_DEVICES=0 python3 tools/glm_split_check.py run --mode front --dir check --no-spec -- $ENG \
+CUDA_VISIBLE_DEVICES=0 python3 tools/glm_split_check.py run --mode front --dir check -- $ENG \
     --layer-split 24 --role front --link 127.0.0.1:7711
 wait
-python3 tools/glm_split_check.py compare --dir check --exact --no-spec      # exit code 0 = PASS
+python3 tools/glm_split_check.py compare --dir check --exact      # exit code 0 = PASS
 ```
 
 Give each side enough `MAYA_GLM_RAM_GB` that no expert is read from the SSD (as the reference): an expert read from
@@ -215,16 +229,16 @@ python3 tools/glm_split_check.py run --mode ref --dir check -- $ENG --layer-spli
 # 2. copy check/ to both machines (rsync -a check/ <other>:check/), then
 #    on the back (start it first):
 MAYA_GLM_LINK_KEY_FILE=link.key MAYA_GLM_LINK_ALLOW=<front-ip> \
-  python3 tools/glm_split_check.py run --mode back --dir check --no-spec -- $ENG \
+  python3 tools/glm_split_check.py run --mode back --dir check -- $ENG \
     --layer-split 24:35 --role back --link <back-ip>:7710
 #    on the front (it waits for the back):
 MAYA_GLM_LINK_KEY_FILE=link.key \
-  python3 tools/glm_split_check.py run --mode front --dir check --no-spec -- $ENG \
+  python3 tools/glm_split_check.py run --mode front --dir check -- $ENG \
     --layer-split 24:12 --role front --link <back-ip>:7710
 
 # 3. the back wrote the logits and the front the answers: bring them together and compare
 rsync -a <back>:check/split/ check/split/
-python3 tools/glm_split_check.py compare --dir check --no-spec          # exit code 0 = inside the tolerance below
+python3 tools/glm_split_check.py compare --dir check          # exit code 0 = inside the tolerance below
 ```
 
 Without `--exact`, `compare` allows a tolerance, because the two machines place the experts differently (more of
@@ -245,13 +259,13 @@ pass limits a little above what it shows:
 MAYA_GLM_CPU_LANE=0 python3 tools/glm_split_check.py run --mode ref --name ref2 --dir check -- $ENG --layer-split 24
 python3 tools/glm_split_check.py compare --dir check --against ref2
 # the split against the reference, with limits a little above that floor (these numbers are an example)
-python3 tools/glm_split_check.py compare --dir check --no-spec --max-kl 0.12 --min-top1 85 --tie 2
+python3 tools/glm_split_check.py compare --dir check --max-kl 0.12 --min-top1 85 --tie 2
 ```
 
 The exact check above is what shows the split computes what one process computes. This comparison shows what your
 quant and your placement do to the answers.
 
-Each check is one engine start (`maya generate`, no server): 4 a prompt for the reference, 2 for the split.
+Each check is one engine start (`maya generate`, no server): 4 a prompt for the reference, 3 for the split.
 `--only code` runs one prompt. Run the script with the Python the setup made (`.venv/bin/python`):
 `prompts` needs the tokenizer's packages and `compare` needs numpy; `run` needs neither.
 
@@ -261,10 +275,9 @@ Maya-XS, 2K-token code prompt (and two short ones), on RTX 3060s. The exact chec
 `--role` ran on v1.1.76; the two-machine logit comparison on v1.1.74, the same split code before the strata →
 maya rename.
 
-- **The exact check** (one machine, 2 GPUs): bit-identical logits over the 2K-token prompt, and the identical
-  greedy answer (128 of 128 tokens).
-- **Across two machines** (2 + 2 GPUs, 1 GbE, bf16 hop; these runs drafted with MTP, which this build
-  leaves out over the link):
+- **The exact check** (one machine, 2 GPUs): bit-identical logits over the 2K-token prompt, and identical greedy
+  answers with MTP (the pipelined decode) and without it (128 of 128 tokens each).
+- **Across two machines** (2 + 2 GPUs, 1 GbE, bf16 hop):
   - **Short prompts:** the greedy answers first differ at near-ties (0.002–0.24 nats apart in the reference's
     logits), as two single-process runs do. KL is 9.9e-3–2.8e-2, top-1 95–96%.
   - **The 2K-token prompt:** they first differ at token 14, where the reference put the two tokens 1.7 nats apart.
@@ -301,5 +314,5 @@ maya rename.
   runs one connection's handshake at a time (10 s at most each, 2 s for one that sends nothing).
 - The front resolves the `--link` host once, when it starts.
 - `MAYA_GLM_SCORE` does not run with `--role` (`tools/glm_split_check.py` compares a split's logits).
-- The decode over the link is plain, one token at a time: no MTP drafts (the back loads the NextN block, which
-  the pipelined decode will use), no DFlash2 drafter, and one conversation at a time (`--parallel 1`).
+- One conversation at a time (`--parallel 1`): `--parallel` above 1 is refused with `--role`.
+- No DFlash2 drafter over the link.
