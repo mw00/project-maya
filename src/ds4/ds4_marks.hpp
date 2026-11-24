@@ -70,6 +70,17 @@ inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t 
     return out;
 }
 
+// A scheduled piece can carry a short stretch past the tail mark without
+// changing its endpoint. The mark must be strictly before the last token
+// of the read, and the part before it must already fill a prompt chunk.
+inline bool batch_tail_in_piece(size_t before_mark, size_t piece_rows, size_t remaining,
+                                size_t feed_unit, size_t chunk) {
+    constexpr size_t max_tail_rows = 512;
+    return chunk > 0 && before_mark >= chunk && before_mark < piece_rows &&
+           piece_rows < remaining && piece_rows <= feed_unit &&
+           piece_rows - before_mark >= 2 && piece_rows - before_mark <= max_tail_rows;
+}
+
 // The tail point's cost on this PC (the server's tail=<pos>, MAYA_DS4_RESTORE_TAIL; #668).  The read stops there, so
 // the tokens after it are a run of their own: where most experts are not in VRAM, that short run costs nearly a whole
 // pass over them (each expert's weights read for a few rows - on the CPU lane, or lent to the GPU's prompt path one

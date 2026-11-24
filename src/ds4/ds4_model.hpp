@@ -193,7 +193,7 @@ public:
     /// instead of a run up to each.  marks_inside(): whether n tokens read so, the points at rows `rel` of them, cost
     /// at most a chunk's rows more than stopping at each (a long prompt's skip: the one read runs the rows before its
     /// first point through every layer, where the reads after it would have skipped theirs) - else the caller stops the
-    /// read at the points, as before
+    /// read at the points, as before. With slot < 0, keep just the inner points and omit the final checkpoint.
     bool feed_marks(const int* tokens, int n, int logits_rows, int slot,
                     const std::vector<std::pair<int64_t, bool>>& inner, std::string& err);
     bool marks_inside(int n, const std::vector<int64_t>& rel) const;

@@ -23819,7 +23819,8 @@ bool Model::feed_mark_(const int* tokens, int n, int logits_rows, int slot, std:
 }
 bool Model::feed_marks(const int* tokens, int n, int logits_rows, int slot,
                        const std::vector<std::pair<int64_t, bool>>& inner, std::string& err) {
-    if (inner.empty()) return feed_mark(tokens, n, logits_rows, slot, err);
+    if (inner.empty())
+        return slot >= 0 ? feed_mark(tokens, n, logits_rows, slot, err) : feed(tokens, n, logits_rows, err);
     Impl& p = *p_;
     const int64_t p0 = p.pos;
     return pool_guard(p, p0, false, err, [&] { return feed_marks_(tokens, n, logits_rows, slot, inner, err); });
@@ -23852,11 +23853,14 @@ bool Model::feed_marks_(const int* tokens, int n, int logits_rows, int slot,
         done = to;
         p.mark(m.second);
     }
-    if (n - 1 > done && !p.feed_windows(tokens + done, n - 1 - done, 0, err)) return false;
-    p.checkpoint(slot);
-    const bool ok = p.feed_windows(tokens + n - 1, 1, logits_rows, err);
-    if (ok) p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
-    return ok;
+    const int until = slot >= 0 ? n - 1 : n;
+    if (until > done && !p.feed_windows(tokens + done, until - done, slot >= 0 ? 0 : logits_rows, err)) return false;
+    if (slot >= 0) {
+        p.checkpoint(slot);
+        if (!p.feed_windows(tokens + n - 1, 1, logits_rows, err)) return false;
+    }
+    p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
+    return true;
 }
 bool Model::marks_inside(int n, const std::vector<int64_t>& rel) const {
     const Impl& p = *p_;
