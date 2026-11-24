@@ -4484,6 +4484,47 @@ def ablate_step(cfg_path: Path, key: str, models: Path, a=None) -> None:
 VISION_BUILD_TIME = "1 to 6 minutes, up to about 10 minutes on a small PC"   # (measured clean installs; the engine: 1.5-4)
 
 
+def vision_build_backend(build: Path) -> str | None:
+    """"hip", "cuda" or "cpu" (Metal / CPU only) - which backend a picture-reader build folder was configured for (its
+    CMakeCache.txt), None when it has no configuration."""
+    try:
+        cache = (build / "CMakeCache.txt").read_text(errors="replace")
+    except OSError:
+        return None
+    if re.search(r"^MAYA_VISION_HIP:BOOL=ON\s*$", cache, re.M):
+        return "hip"
+    if re.search(r"^MAYA_VISION_CUDA:BOOL=ON\s*$", cache, re.M):
+        return "cuda"
+    return "cpu"
+
+
+def vision_build_for(backend: str) -> None:
+    """One install folder set up with --backend hip and then --backend cuda (or back): build-vision keeps its CMake
+    cache, whose compilers, generator and MAYA_VISION_HIP / _CUDA switches belong to the other backend - the configure
+    stopped at "MAYA_VISION_CUDA and MAYA_VISION_HIP are mutually exclusive" and the model read text only.  The old
+    folder is set aside as build-vision-<its backend> (the one set aside before for this backend comes back), so
+    each backend keeps its own build and nothing is deleted."""
+    old = vision_build_backend(VBUILD)
+    if old is None or old == backend:
+        return
+    aside = VBUILD.with_name(f"{VBUILD.name}-{old}")
+    back = VBUILD.with_name(f"{VBUILD.name}-{backend}")
+    try:
+        n = 1
+        while aside.exists():                          # (one set aside before: this one gets a number, nothing is deleted)
+            n += 1
+            aside = VBUILD.with_name(f"{VBUILD.name}-{old}-{n}")
+        VBUILD.rename(aside)
+        if back.exists() and vision_build_backend(back) == backend:
+            back.rename(VBUILD)
+    except OSError as e:
+        warn(f"the picture reader's build folder of the {old} backend could not be set aside ({e}): "
+             f"build-vision is configured again")
+        return
+    say(f"  The picture reader was built for {old} before: its folder is kept as {aside.name}, this one is built "
+        f"fresh for {backend}.")
+
+
 def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's and Inkling 2's vision towers added
     (tools/vision/glm5next_patch.py, inkling2v_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
@@ -4492,6 +4533,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         return False
     run([sys.executable, str(ROOT / "tools" / "vision" / "glm5next_patch.py"), str(llama)])
     run([sys.executable, str(ROOT / "tools" / "vision" / "inkling2v_patch.py"), str(llama)])
+    vision_build_for("hip" if pc.get("backend") == "hip" else "cpu" if pc.get("backend") == "metal" else "cuda")
     gen = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.*)$", (VBUILD / "CMakeCache.txt").read_text(errors="replace"), re.M) \
         if (VBUILD / "CMakeCache.txt").exists() else None
     ninja = venv_tool("ninja") or shutil.which("ninja")
@@ -4505,7 +4547,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     hip = pc.get("backend") == "hip"
     env = vcvars = bindir = None
     if hip:
-        conf += ["-DMAYA_VISION_HIP=ON",
+        conf += ["-DMAYA_VISION_HIP=ON", "-DMAYA_VISION_CUDA=OFF",
                  "-DMAYA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs)]
@@ -4521,7 +4563,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         if S.ARM and S.arm_cpu_arch():
             conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     elif not metal:                                    # (macOS: ggml builds its Metal backend by default, no CUDA)
-        conf += ["-DMAYA_VISION_CUDA=ON",
+        conf += ["-DMAYA_VISION_CUDA=ON", "-DMAYA_VISION_HIP=OFF",
                  "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
                  f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
                  *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
