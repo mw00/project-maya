@@ -9665,9 +9665,10 @@ void attn_flash_q8(const uint16_t* q16, int q_ld, KvQ8 kc, KvQ8 vc, int kv_cap, 
     static bool attr[16] = {};
     int dev = 0;
     cudaGetDevice(&dev);
+    constexpr int kFaSmemGqa3 = 2 * kFaBN * kFaLd * (int) sizeof(uint16_t) + 12 * 16 * kFaBld * (int) sizeof(float);
     if (dev < 16 && !attr[dev]) {
         cudaFuncSetAttribute(attn_flash_q8_kernel<kFaNW>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmem);
-        cudaFuncSetAttribute(attn_flash_q8_gqa3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmem);
+        cudaFuncSetAttribute(attn_flash_q8_gqa3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmemGqa3);
         check("attn_flash_q8 (shared memory)");
         attr[dev] = true;
     }
@@ -9677,7 +9678,7 @@ void attn_flash_q8(const uint16_t* q16, int q_ld, KvQ8 kc, KvQ8 vc, int kv_cap, 
     float2* ml_part = (float2*) (scratch + (size_t) n_split * Tq * H * kFaD);
     if (H == KV * 3 && (!getenv("IK2_FA_GQA") || std::atoi(getenv("IK2_FA_GQA")) != 0)) {
         const dim3 grid((unsigned) ((Tq + 63) / 64), (unsigned) KV, (unsigned) n_split);
-        attn_flash_q8_gqa3_kernel<<<grid, 12 * 32, kFaSmem, s>>>(
+        attn_flash_q8_gqa3_kernel<<<grid, 12 * 32, kFaSmemGqa3, s>>>(
             q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window, n_split, o_part, ml_part);
     } else {
         const dim3 grid((unsigned) ((Tq + 16 * kFaNW - 1) / (16 * kFaNW)), (unsigned) H, (unsigned) n_split);
