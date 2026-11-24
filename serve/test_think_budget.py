@@ -1,9 +1,11 @@
-"""The thinking budget: GLM's default 8192 (others 32768, a user's value kept) and the dashboard's field (live + saved)."""
+"""The thinking budget: GLM's default 8192 (others 32768, a user's value kept), the dashboard's field (live + saved)
+and a request's own."""
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / "serve"), str(ROOT / "tools"), str(ROOT)]
@@ -14,6 +16,38 @@ import server  # noqa: E402
 GLM = {"exe": "x/maya", "args": ["--glm-pack", "p"], "installer": {"quant": "Maya-XS-IQ1_S"}}
 GLM_S24 = {"exe": "x/maya", "args": ["--glm-pack", "p"], "installer": {"quant": "Maya-S24"}}
 DS = {"exe": "x/maya-ds4", "args": ["--pack", "p"]}
+
+
+class PerRequest(unittest.TestCase):
+    def test_a_valid_budget_is_kept(self):
+        for value, want in ((8192, 8192), ("8192", 8192), (8192.0, 8192), (0, 0), ("  512 ", 512), ("512.0", 512)):
+            req = {"thinking_budget": value}
+            server.check_request_sampling(req)
+            self.assertEqual(req["thinking_budget"], want)
+
+    def test_out_of_range_is_taken_to_the_nearest_end_never_refused(self):
+        for value, want in ((100, 256), (1, 256), (262145, 262144), (10**9, 262144), ("100", 256), (10**400, 262144),
+                            ("9" * 5000, 262144), (1e300, 262144)):
+            req = {"thinking_budget": value}
+            with patch("builtins.print") as said:
+                server.check_request_sampling(req)
+            self.assertEqual(req["thinking_budget"], want, repr(value))
+            self.assertIn("thinking_budget", said.call_args[0][0])
+
+    def test_anything_else_is_left_out_and_the_config_applies(self):
+        for bad in (-1, -10**400, 1.5, "1.5", "lots", True, float("inf"), float("nan"), [8192]):
+            req = {"thinking_budget": bad}
+            with patch("builtins.print") as said:
+                server.check_request_sampling(req)
+            self.assertNotIn("thinking_budget", req, repr(bad))
+            self.assertIn("left out", said.call_args[0][0])
+            self.assertEqual(server.request_think_budget(3000, req), 3000)
+
+    def test_the_request_wins_for_itself(self):
+        self.assertEqual(server.request_think_budget(3000, {"thinking_budget": 8192}), 8192)
+        self.assertEqual(server.request_think_budget(3000, {"thinking_budget": 0}), 0)
+        self.assertEqual(server.request_think_budget(3000, {"temperature": 1.0}), 3000)
+        self.assertEqual(server.request_think_budget(3000, None), 3000)
 
 
 class Default(unittest.TestCase):
