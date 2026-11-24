@@ -31,6 +31,8 @@
 #include "maya/artifact/gguf_reader.hpp"
 #include "maya/spec/suffix_drafter.hpp"
 #include "../ds4/ds4_watchdog.hpp"   // (--serve's heartbeat rule, maya-ds4's)
+#include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: tools/ablate_fit.py's read-out)
+#include "../mm3/mm3_ablate.hpp"   // (--ablate's direction file: the control vector's loader)
 #ifdef MAYA_USE_HIP
 #include "ds4_lt.hpp"   // (AMD: the prompt's FP16 GEMMs on hipBLASLt, the kernel a shape measured and kept)
 #endif
@@ -1307,6 +1309,59 @@ void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, in
     CU(cudaMemcpyAsync(Ly.rec_x[which], x, (size_t) T * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
 }
 
+// ---- refusal ablation (--ablate FILE, docs/SETTINGS.md "Refusal ablation per request"): a unit direction r [C]
+// projected out of every residual write of every layer VISIT - the attention's (the short conv's output, before it
+// joins the stream or starts a block) and the MoE's - y <- y - scale * r (r . y), so a looped core's three passes each
+// project their own writes.  Per conversation (GEN ablate=0|1; a --parallel slot each): a conversation that does not
+// ask runs the launches it always did.  The drafter only proposes, the main layers check every draft.
+int g_slot_cur = 0;   // (--parallel: the conversation bound to the visits)
+int g_cur = -1;       // (the GPU in use: use_dev)
+namespace abl {
+constexpr int kSlots = 16;
+bool loaded = false;                 // a direction is loaded (INFO ablate=1)
+bool on[kSlots] = {};                // per conversation slot: its forwards project it out
+bool dflt = true;                    // --ablate-default (the server starts the engine with off)
+float scale = 1.0f;
+std::vector<float> dir;
+std::vector<float*> dev;             // a copy on each GPU
+std::string what;
+std::string path;                    // --ablate FILE (empty: none)
+int layer = 0;                       // --ablate-layer N (0: the file's only direction)
+float want_scale = 0.0f;             // --ablate-scale F (0: the file's)
+inline bool cur() { return loaded && on[g_slot_cur]; }
+inline bool row(int slot) { return loaded && slot >= 0 && slot < kSlots && on[slot]; }
+}  // namespace abl
+inline const float* abl_r() { return abl::dev.empty() ? nullptr : abl::dev[(size_t) std::max(0, g_cur)]; }
+// y [T][C] is a residual write (the conv's output, res not added): project it (or, in a fitting run, read it out and
+// add res alone - the plain model's answer), then add res (null: none).  In place.
+void abl_write(float* y, const float* res, int T, int C, bool ablating = true) {
+    if (!ablating) {
+        if (res != nullptr) k::project_res(y, abl_r(), 0.0f, res, T, C, g_s);
+        return;
+    }
+    if (maya::ablcap::on()) {
+        maya::ablcap::put(y, T, C, g_s);
+        k::project_res(y, abl_r(), 0.0f, res, T, C, g_s);
+        return;
+    }
+    k::project_res(y, abl_r(), abl::scale, res, T, C, g_s);
+}
+// the short conv with its residual (res null: none) into out [T][C]; ablating: the conv alone, projected, then the
+// residual added (the fused kernel's sum split in two where the write must be seen)
+void conv_write(const float* x, float* hist, const float* w, int T, int C, const float* res, float* out) {
+    if (!abl::cur()) {
+        k::conv4_res(x, hist, w, nullptr, 0, T, C, res, out, g_s);
+        return;
+    }
+    k::conv4_res(x, hist, w, nullptr, 0, T, C, nullptr, out, g_s);
+    abl_write(out, res, T, C);
+}
+// one token's MoE write: the combine and the conv after it (W.y32 -> W.h, the stream W.r added), `ablating` as above
+void combine_write(const Work& W, const Layer& Ly, int K, int C, bool ablating) {
+    k::moe_combine_conv(W.y32, W.inv, W.wt, K, C, Ly.h_mlp, Ly.sc_mlp, ablating ? nullptr : W.r, W.h, g_s);
+    if (ablating) abl_write(W.h, W.r, 1, C);
+}
+
 // The pictures of the request running (GENI): the image encoder's rows (maya-vision's SVE1 records, [n][C] F32), each
 // in place of one image token of the prompt - the model reads them as they are, without the embedding's norm.
 struct Pictures {
@@ -1382,7 +1437,6 @@ struct DevCtx {
     ExpertCache EC;
 };
 std::vector<DevCtx> g_dev;
-int g_cur = -1;
 Work& dev_work(int d) { return g_dev[d].W; }
 ExpertCache& dev_cache(int d) { return g_dev[d].EC; }
 void use_dev(int d) {
@@ -1837,9 +1891,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
-        k::conv4(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, r_out, g_s);
+        conv_write(W.tmp, Ly.h_attn, Ly.sc_attn, T, C, nullptr, r_out);
     } else {
-        k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
+        conv_write(W.tmp, Ly.h_attn, Ly.sc_attn, T, C, h_in, r_out);
     }
 }
 
@@ -2348,7 +2402,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     g_pf.lap(g_pf.experts);
     t_exp += now() - te0;
     conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-    k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
+    conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, r_in, h_out);
 }
 
 void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
@@ -2445,7 +2499,8 @@ bool graph_exec(FastGraph& G) {
     g_graph_full = true;
     return false;
 }
-int g_slot_cur = 0, g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits, the one g_fgraph holds)
+int g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits (g_slot_cur above), the one g_fgraph holds)
+bool g_fgraph_abl = false, g_bgraph_abl = false;   // (--ablate: the projection the graphs were recorded with)
 
 // ---- two GPUs (--gpus 2, the split): GPU 0 runs the offload path (the dense weights, the K / V cache, every prompt,
 // its tier of the experts, the misses fetched from host memory); GPU 1 holds the next experts by the profile's picks a
@@ -2747,7 +2802,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         // stream joins the blocks and starts again)
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
-        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
+        const bool ab = abl::cur();   // (--ablate: the conv's output alone, projected, then the stream added)
+        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first || ab ? nullptr : W.h, W.r});
+        if (ab) abl_write(W.r, first ? nullptr : W.h, 1, C);
         if (first) ++nb;
         // the MoE: its input, the router and the picks' tables on the device, the experts
         {
@@ -2790,7 +2847,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                  c.up_cap, g_offs.hx, g_s);
                 k::off_down_x(W.blob, g_offs.cls, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], g_offs.hx, C, c.F, W.y32, g_s);
                 k::off_lane_wait(g_offs.ls, g_offs.done_d, C, W.y32, g_s);
-                k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+                combine_write(W, Ly, c.K, C, abl::cur());
                 continue;
             }
             k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
@@ -2807,7 +2864,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
         if (g_two.on) two_take(M, W);
-        k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+        combine_write(W, Ly, c.K, C, abl::cur());
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head
@@ -3393,10 +3450,10 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     kv_swing(M, false, pos);
-    if (g_graph && g_fgraph_slot != g_slot_cur) {   // (--parallel: the graphs hold a conversation's state pointers)
-        for (auto& G : g_fgraph)
+    if (g_graph && (g_fgraph_slot != g_slot_cur || g_fgraph_abl != abl::cur())) {   // (--parallel: the graphs hold a
+        for (auto& G : g_fgraph)                                  //  conversation's state pointers; --ablate: its launches)
             if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
-        g_fgraph_slot = g_slot_cur;
+        g_fgraph_slot = g_slot_cur, g_fgraph_abl = abl::cur();
     }
     if (!g_graph || g_kv_streaming) {   // (streamed visits: the copies follow the position - launched as they go)
         fast_token_launches(M, W, out_mode);
@@ -3773,8 +3830,10 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         if (ex) exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
         else tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
-        k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
+        const bool ab = abl::cur();   // (--ablate: as the token path's - the conv alone, projected, the stream added)
+        k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first || ab ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
+        if (ab) abl_write(W.r, first ? nullptr : W.h, T, C);
         if (first) ++nb;
         // the MoE: its input, the router, the picks grouped by expert on the device, the experts
         {
@@ -3840,8 +3899,10 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
         //  tokens' picks - it took 9.4 us where the two take 7)
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
-        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
-                      g_s);
+        const bool ab = abl::cur();
+        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, ab ? nullptr : W.r, C, W.h, C, Ly.rec_old[3],
+                      Ly.rec_x[3], g_s);
+        if (ab) abl_write(W.h, W.r, T, C);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits
@@ -3892,6 +3953,12 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     if (!g_graph || g_kv_streaming) {   // (the swing visit's rows move between RAM and VRAM: no recorded pointers)
         fast_block_launches(M, W, T, out_mode);
     } else {
+        if (g_bgraph_abl != abl::cur()) {   // (--ablate: the windows' graphs hold the launches of one setting)
+            for (auto& row : g_bgraph)
+                for (auto& G : row)
+                    if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
+            g_bgraph_abl = abl::cur();
+        }
         FastGraph& G = g_bgraph[T][(int) out_mode];
         if (!G.exec && !g_graph_full) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
@@ -4194,9 +4261,12 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
-        for (int t = 0; t < T; ++t)
+        for (int t = 0; t < T; ++t) {
+            const bool ab = abl::row(sl[t]);   // (--ablate: this row's conversation asks)
             k::conv_block(W.tmp + (size_t) t * C, C, g_slots[sl[t]][vis].h_attn, Ly.sc_attn, nullptr, 0, 0, 1, C,
-                          first ? nullptr : W.h + (size_t) t * C, C, W.r + (size_t) t * C, C, nullptr, nullptr, g_s);
+                          first || ab ? nullptr : W.h + (size_t) t * C, C, W.r + (size_t) t * C, C, nullptr, nullptr, g_s);
+            if (ab) abl_write(W.r + (size_t) t * C, first ? nullptr : W.h + (size_t) t * C, 1, C);
+        }
         if (first) ++nb;
         // the MoE: its input and the router for all rows, then each row's experts as the one-token path's
         {
@@ -4232,8 +4302,10 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
                                           c.gate_cap, c.up_cap, W.h16, g_s);
                 k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             }
-            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, g_slots[sl[t]][vis].h_mlp, Ly.sc_mlp, W.r + (size_t) t * C,
-                                W.h + (size_t) t * C, g_s);
+            const bool ab = abl::row(sl[t]);
+            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, g_slots[sl[t]][vis].h_mlp, Ly.sc_mlp,
+                                ab ? nullptr : W.r + (size_t) t * C, W.h + (size_t) t * C, g_s);
+            if (ab) abl_write(W.h + (size_t) t * C, W.r + (size_t) t * C, 1, C);
         }
     }
     {   // the head: every row's argmax (on the raw logits, as the token path's), and with cand its candidates
@@ -4270,6 +4342,7 @@ void par_step(Model& M, int T, const int* tok, const int* pos, const int* sl, bo
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_parb.emb_h + (size_t) t * c.C);
         g_parb.pos_h[t] = pos[t];
         key |= 2 << sl[t];
+        if (abl::row(sl[t])) key |= 1 << (12 + sl[t]);   // (--ablate: the rows that project - their launches)
     }
     if (!g_graph) {
         par_launches(M, W, T, sl, cand);
@@ -5090,7 +5163,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -5180,7 +5253,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -5246,7 +5319,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -5443,7 +5516,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -6182,6 +6255,24 @@ int main(int argc, char** argv) {
         else if (a == "--kv-resident") g_kv_resident = std::max(0, std::atoi(next().c_str()));
         else if (a == "--parallel") g_par = std::clamp(std::atoi(next().c_str()), 1, kParMax);
         else if (a == "--dump") dump = next();
+        else if (a == "--ablate") {   // (a control vector: the refusal direction, projected out per conversation)
+            abl::path = next();
+            if (abl::path.empty()) die("--ablate needs a file (a control vector GGUF)");
+        }
+        else if (a == "--ablate-layer") {
+            abl::layer = std::atoi(next().c_str());
+            if (abl::layer < 1 || abl::layer > 4096) die("--ablate-layer takes 1..4096");
+        }
+        else if (a == "--ablate-scale") {
+            const double v = std::atof(next().c_str());
+            if (!(v >= 1e-6 && v <= 1e6)) die("--ablate-scale takes 1e-6..1e6");
+            abl::want_scale = (float) v;
+        }
+        else if (a == "--ablate-default") {   // on (every conversation, as a startup flag) | off (GEN ablate=1 turns it on)
+            const std::string v = next();
+            if (v != "on" && v != "off" && v != "1" && v != "0") die("--ablate-default: on or off");
+            abl::dflt = v == "on" || v == "1";
+        }
         else if (a == "--drafting") {   // (auto: measured once on this PC; on: the drafter and the prompt lookup; off)
             drafting = next();
             if (drafting != "auto" && drafting != "on" && drafting != "off") die("--drafting: auto, on or off");
@@ -6446,6 +6537,27 @@ int main(int argc, char** argv) {
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
+    if (abl::path.empty() && (abl::layer != 0 || abl::want_scale != 0.0f))
+        die(std::string(abl::layer != 0 ? "--ablate-layer" : "--ablate-scale") + " without --ablate FILE: nothing to project out");
+    if (!abl::path.empty() && dual()) {   // (the expert-parallel / tensor-parallel modes sum the residual on the other GPU)
+        std::fprintf(stderr, "NOTE: IK2_EP / IK2_TP: no --ablate (those modes do not project; the layer split does)
+");
+    } else if (!abl::path.empty()) {   // (the direction read once, a copy on every GPU)
+        abl::scale = abl::want_scale;
+        std::string err;
+        if (!::mm3::ablate::load(abl::path, abl::layer, c.C, abl::scale, abl::dir, abl::what, err, "maya-ik2")) die(err);
+        abl::dev.assign((size_t) n_gpu, nullptr);
+        for (int d = 0; d < n_gpu; ++d) {
+            CU(cudaSetDevice(d));
+            CU(cudaMalloc(&abl::dev[(size_t) d], abl::dir.size() * 4));
+            CU(cudaMemcpy(abl::dev[(size_t) d], abl::dir.data(), abl::dir.size() * 4, cudaMemcpyHostToDevice));
+        }
+        CU(cudaSetDevice(0));
+        abl::loaded = true;
+        for (bool& o : abl::on) o = abl::dflt;
+        std::fprintf(stderr, "%s (default %s)
+", abl::what.c_str(), abl::dflt ? "on" : "off");
+    }
     if (dual()) {
         // (their copies are the runtime's peer copies: peer access only where mm3_link.cuh's test copy passes, and
         //  not at all where the IOMMU translates - those modes have no host-memory hand-off: refused there)
@@ -6513,7 +6625,7 @@ int main(int argc, char** argv) {
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
-    g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+    g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH"))) && !maya::ablcap::on();   // (a fitting run reads each write out on the host)
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_block_exact = !(getenv("IK2_BLOCK_EXACT") && !std::atoi(getenv("IK2_BLOCK_EXACT")));
     g_window_check = getenv("IK2_WINDOW_CHECK") ? std::atoi(getenv("IK2_WINDOW_CHECK")) : 0;
@@ -8213,6 +8325,9 @@ int main(int argc, char** argv) {
                             g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes());
             }
             use_dev(0);
+            if (abl::loaded)   // (--ablate: GEN ablate=0|1 turns its projection off / on for a request)
+                std::printf("INFO ablate=1 ablate_default=%d
+", abl::dflt ? 1 : 0);
             // (the split's GPU 1 was made current above without use_dev: back to GPU 0 - else the first request's
             //  launches met GPU 1's context, "invalid resource handle": two GPUs through the server since v1.1.74)
             if (g_two.on) CU(cudaSetDevice(0));
@@ -8318,6 +8433,7 @@ int main(int argc, char** argv) {
                 double temp = 0, top_p = 1;
                 std::mt19937_64 rng;
                 int slot = -1, phase = 0;   // 1: reading its prompt, 2: writing
+                bool abl = false;           // --ablate: this request projects the direction out (GEN ablate=, else the default)
                 size_t p0 = 0;
                 int cached = 0, n_out = 0, tok = -1;
                 double t0 = 0, t1 = 0;
@@ -8331,6 +8447,7 @@ int main(int argc, char** argv) {
                 std::vector<float> last;
                 double used = 0;
                 bool busy = false;
+                bool abl = false;   // (--ablate: the setting its kept state was read with)
             };
             std::vector<SlotH> sh(g_par);
             std::deque<Req> waiting;
@@ -8424,8 +8541,8 @@ int main(int argc, char** argv) {
                     if (sh[i].busy) continue;
                     size_t L = 0;
                     const auto& H = sh[i].hist;
-                    while (L < H.size() && L < rq.ids.size() && H[L] == rq.ids[L] &&
-                           (L < sh[i].sig.size() ? sh[i].sig[L] : 0) == rq.sig[L])
+                    while (sh[i].abl == rq.abl && L < H.size() && L < rq.ids.size() && H[L] == rq.ids[L] &&
+                           (L < sh[i].sig.size() ? sh[i].sig[L] : 0) == rq.sig[L])   // (another setting's cache: no prefix)
                         ++L;
                     if (s < 0 || L > bestL || (L == bestL && sh[i].used < sh[s].used)) s = i, bestL = L;
                 }
@@ -8435,6 +8552,7 @@ int main(int argc, char** argv) {
                 sh[s].busy = true;
                 bind_slot(M, s);
                 SlotH& S = sh[s];
+                if (abl::loaded) abl::on[s] = r.abl, S.abl = r.abl;   // (the slot's conversation from here on)
                 size_t L = bestL;
                 if (L < S.hist.size() || L == r.ids.size()) {
                     int best = -1;
@@ -8486,6 +8604,7 @@ int main(int argc, char** argv) {
                 const bool geni = cmd == "GENI";
                 if (cmd != "GEN" && !geni) return;
                 Req r;
+                r.abl = abl::loaded && abl::dflt;   // (--ablate: GEN ablate= overrides)
                 std::string w, ids_s, emb_path;
                 long long seed = -1;
                 in >> r.max_new;
@@ -8506,6 +8625,7 @@ int main(int argc, char** argv) {
                     else if (k == "rid") r.rid = std::atoi(v.c_str());
                     else if (k == "starts") r.starts.parse(v, c.n_vocab);
                     else if (think_key(r.tc, k, v, c.n_vocab)) {}
+                    else if (k == "ablate") r.abl = abl::loaded && std::atoi(v.c_str()) != 0;
                 }
                 r.ids = parse_ints(ids_s);
                 r.rng.seed(seed >= 0 ? (uint64_t) seed : rng_g());
@@ -8673,7 +8793,7 @@ int main(int argc, char** argv) {
         while (next_line(line)) {
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
-            int max_new = 0, top_k = 0, spec_key = 0;
+            int max_new = 0, top_k = 0, spec_key = 0, abl_key = -1;   // (abl_key: GEN ablate=0|1, -1 as started)
             double temp = 0, top_p = 1;
             long long seed = -1;
             in >> cmd;
@@ -8714,6 +8834,7 @@ int main(int argc, char** argv) {
                     else if (k == "spec") spec_key = std::atoi(v.c_str());   // (1: no drafting; 2 .. 8: the widest window)
                     else if (k == "starts") starts.parse(v, c.n_vocab);
                     else if (think_key(tc, k, v, c.n_vocab)) {}
+                    else if (k == "ablate") abl_key = std::atoi(v.c_str()) != 0 ? 1 : 0;   // (--ablate: this request's)
                 }
                 stops = eos_ids;
             } else {
@@ -8780,6 +8901,11 @@ int main(int argc, char** argv) {
                 stat_n = made, stat_t = t_now;
             };
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
+            if (abl::loaded) {   // (--ablate: the conversation's setting; the state kept was read with one - the other starts over)
+                const bool want = abl_key >= 0 ? abl_key != 0 : abl::dflt;
+                if (want != abl::on[g_slot_cur]) reset();
+                abl::on[g_slot_cur] = want;
+            }
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
             if (L < hist.size() || L == ids.size()) {

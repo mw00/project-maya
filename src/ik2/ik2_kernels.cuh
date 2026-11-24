@@ -623,4 +623,9 @@ void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, 
 /// splits the same: IK2_EXPERT_MMA_SPLIT 8, _DOWN 4, the defaults).
 bool experts_block_exact();
 
+/// Refusal ablation: y [T][C], in place, a residual write (the short conv's output, the residual not yet added)
+/// loses its component along the unit direction r - y -= scale * r (r . y) - and then res [T][C] (null: none) is
+/// added.  A row's bits do not depend on T.  Zero scale: y + res as the fused conv adds it (the capture runs).
+void project_res(float* y, const float* r, float scale, const float* res, int T, int C, cudaStream_t s);
+
 }  // namespace ik2::k
