@@ -119,5 +119,47 @@ bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off
                   const uint16_t* k_pe, int n_sel_cap, const int* n_sel_dev, int T, int n_head, int kv_lora,
                   int qk_rope, float scale, float* part, float* ctx, cudaStream_t s);
 
+
+/// Windowed KDA prep (W <= 4): snapshots conv_state into conv_bak (if non-null) and processes W sequential tokens.
+void kda_prep_window(const float* q_in, const float* k_in, const float* v_in, const float* f_in, const float* conv_q,
+                     const float* conv_k, const float* conv_v, float* conv_state, float* conv_bak, const float* ssm_a,
+                     float lb, float eps, int W, int n_head, int head_dim, int d_conv, float* q_out, float* k_out,
+                     float* v_out, float* g1_out, cudaStream_t s);
+
+/// Roll back KDA conv_state from conv_bak to exact post-step-a state (1 <= a < W).
+void kda_conv_rollback(const float* conv_bak, const float* q_in, const float* k_in, const float* v_in, int a,
+                       int n_head, int head_dim, int d_conv, float* conv_state, cudaStream_t s);
+
+/// Windowed register-resident KDA recurrence (W <= 4): reads state once, writes final W-step state to state_tmp
+/// (leaving state untouched for exact rollback), writes W rows of quantized gated outputs to (xq_out, xd_out).
+void kda_rec_window_q8(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw,
+                       const float* state, float* state_tmp, const float* g2, const float* norm_w, float eps, int W,
+                       int n_head, int head_dim, int8_t* xq_out, float* xd_out, cudaStream_t s);
+
+/// Commit KDA recurrent state for `a` accepted tokens (1 <= a <= W): D2D copy state_tmp->state if a==W,
+/// else exact in-register replay of steps 0..a-1 from untouched state.
+void kda_commit_window(const float* k, const float* v, const float* g1, const float* beta_raw, float* state,
+                       const float* state_tmp, int a, int W, int n_head, int head_dim, cudaStream_t s);
+
+/// Pack routing outputs for a window W <= 4 into one contiguous device struct for single D2H transfer in kCpu mode.
+struct RoutePackWin {
+    int ids[32];
+    float w[32];
+    int who[32];
+};
+void pack_route_win_cpu(const int* ids, const float* w, const int* who, int n_ent, RoutePackWin* dst, cudaStream_t s);
+
+/// Fast 2-stage on-device top-1 + softmax confidence probability for a single logit row (writes 2 floats: {bits(id), prob}).
+void top1_prob_f32(const float* logits, int n, float* scratch_val, int* scratch_idx, float* out_pair, cudaStream_t s);
+
+/// Fast batched on-device argmax for W logit rows [W][n] -> out_ids[W].
+void argmax_rows_f32(const float* logits, int W, int n, float* scratch_val, int* scratch_idx, int* out_ids,
+                     cudaStream_t s);
+
+/// Copy W contiguous rows from src [W][E] into ring buffer ring [R][E] at positions (pos0 + t) % R.
+void store_hring(const float* src, int W, int E, float* ring, int R, int pos0, cudaStream_t s);
+void set_step(int* d_step, int tok, int pos, int n_kv, cudaStream_t s);
+void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, cudaStream_t s);
+
 }  // namespace ling::k
 

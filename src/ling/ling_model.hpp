@@ -107,6 +107,21 @@ public:
     // Returns MTP logits (vocab F32 on output_dev()).
     const float* mtp_step(const float* h_nextn_dev, int next_token, int pos);
 
+    // Batched token-window verify (1 <= W <= kMaxWin): returns [W][vocab] logits on output_dev().
+    static constexpr int kMaxWin = 4;
+    const float* step_window(const int* tokens, int W, int pos0);
+    void commit_window(int n_accept, int W, int pos0, const int* tokens);
+
+    // Batched greedy argmax for W rows of logits [W][vocab] -> fills out_ids[0..W-1].
+    void argmax_rows(const float* logits_dev, int W, int* out_ids);
+
+    // Autoregressively draft up to max_k tokens via blk.42 MTP after accepted (base_tok, base_pos).
+    void mtp_draft(int base_tok, int base_pos, int max_k, float floor, std::vector<int>& drafts,
+                   std::vector<float>& confs, float floor0 = 0.0f);
+
+    // Fraction of trunk MoE experts resident in VRAM (0.0 .. 1.0).
+    double vram_res_frac() const { return vram_res_frac_; }
+
     // Greedy argmax on output_dev() logits -> token id on host.
     int argmax_logits(const float* logits_dev);
 
@@ -143,7 +158,8 @@ private:
         const float* ssm_a_neg = nullptr;   // -exp(A_log) for glmb::kda_rec_split
         const float* ssm_norm = nullptr;
         float* conv_state = nullptr;        // [3][d_inner][d_conv - 1]
-        float* state = nullptr;             // [n_head][kda_head][kda_head]
+        float* state = nullptr;
+        float *conv_bak = nullptr, *state_tmp = nullptr, *w_kda_buf = nullptr;             // [n_head][kda_head][kda_head]
         // MLA
         Mat wqm, wkva, wkb, wvb, wgate, wom;
         const float* kv_a_norm = nullptr;
@@ -219,7 +235,21 @@ private:
         int* h_arg_out = nullptr;
         k::RoutePack* d_route_pack = nullptr;
         k::RoutePack* h_route_pack = nullptr;
+        k::RoutePackWin* d_route_win = nullptr;
+        k::RoutePackWin* h_route_win = nullptr;
         int* h_neg1 = nullptr;
+        int* d_pos_win = nullptr;
+        int* h_pos_win = nullptr;
+        int* d_tok_win = nullptr;
+        int* h_tok_win = nullptr;
+        int8_t* x2q = nullptr;
+        float* x2d = nullptr;
+        unsigned long long* grp_ptr = nullptr;
+        int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
+        int* d_arg_rows = nullptr;
+        int* h_arg_rows = nullptr;
+        float* d_top_pair = nullptr;
+        float* h_top_pair = nullptr;
         hy4::k::FetchScratch fxs;
         // pinned host buffers
         int* h_step = nullptr;
@@ -245,13 +275,18 @@ private:
         float* h_pf_w = nullptr;
         int h_pf_cap = 0;
         int* h_pf_pmap[kPfPmapRing] = {};
+        cudaEvent_t ev_pmap[kPfPmapRing] = {};
+        uint64_t pf_pmap_seq = 0;
         int* d_max_rows = nullptr;
         int* h_max_rows = nullptr;
         uint8_t* h_pf_stage[2] = {nullptr, nullptr};
-        // CUDA graph for single-token decode
+        // CUDA graphs for single-token and windowed verify decode (index W - 1 for W = 1..kMaxWin)
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t graph_exec = nullptr;
         bool graph_ready = false;
+        cudaGraph_t wgraph[kMaxWin] = {};
+        cudaGraphExec_t wgraph_exec[kMaxWin] = {};
+        bool wgraph_ready[kMaxWin] = {};
     };
 
     struct MtpWeights {
@@ -263,6 +298,9 @@ private:
         float* emb_buf = nullptr;
         int8_t* eh_q = nullptr;
         float* eh_d = nullptr;
+        float* hring = nullptr;
+        float* h_tmp = nullptr;
+        static constexpr int kRing = 256;
     };
 
     Config c_;
@@ -285,6 +323,9 @@ private:
     int tok_promo_budget_ = 0;
     int promo_rr_ = 0;
     double last_warm_s_ = 0.0;
+    double vram_res_frac_ = 1.0;
+    int mtp_done_ = 0;
+    std::vector<int> mtp_tokens_;
 
     void* dev_alloc(Gpu& g, size_t bytes);
     void* host_alloc(Gpu& g, size_t bytes);
@@ -296,6 +337,11 @@ private:
     void transfer_bytes(int g_from, int g_to, const void* p_src, void* p_dst, size_t bytes);
 
     void decode_segment(int gi, bool capture_safe);
+    void kda_decode_win(Gpu& gp, Layer& l, int il, int W, bool add_to_x);
+    void mla_decode_win(Gpu& gp, Layer& l, int il, int W, bool add_to_x);
+    void ffn_dense_decode_win(Gpu& gp, Layer& l, int il, int W, const float* next_norm);
+    void ffn_moe_decode_win(Gpu& gp, Layer& l, int il, int W, const float* next_norm);
+    void decode_segment_win(int gi, int W, bool capture_safe);
     void kda_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x = true);
     void mla_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x = true);
     void ffn_dense_decode(Gpu& gp, Layer& l, int il, bool seam, const float* next_norm = nullptr);

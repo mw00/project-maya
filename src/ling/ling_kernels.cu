@@ -147,15 +147,18 @@ __global__ void __launch_bounds__(256)
     sacc[half][j] = O;
     __syncthreads();
 
+    float o_val = 0.0f;
     if (half == 0) {
-        const float o = (sacc[0][j] + sacc[1][j]) * rsqrtf((float) HD);
-        if (raw_o_opt != nullptr) raw_o_opt[h * HD + j] = o;
-        const float wsum = warp_sum_f(o * o);
+        o_val = (sacc[0][j] + sacc[1][j]) * rsqrtf((float) HD);
+        if (raw_o_opt != nullptr) raw_o_opt[h * HD + j] = o_val;
+        const float wsum = warp_sum_f(o_val * o_val);
         if ((j & 31) == 0) sred[j >> 5] = wsum;
-        __syncthreads();
+    }
+    __syncthreads();
+    if (half == 0) {
         const float ss = sred[0] + sred[1] + sred[2] + sred[3];
         const float inv = rsqrtf(ss / (float) HD + eps);
-        const float gv = o * inv * norm_w[j] * sigmoid_exact(g2[h * HD + j]);
+        const float gv = o_val * inv * norm_w[j] * sigmoid_exact(g2[h * HD + j]);
         q8_store_warp(gv, (size_t) h * HD + j, xq_out, xd_out);
     }
 }
@@ -1437,6 +1440,378 @@ static int mla_dec_wmma_tile_ok() {
     return 0;
 }
 
+// ---- Windowed KDA prep + rollback + register-resident recurrence + exact commit (W <= 4) ----
+__global__ void __launch_bounds__(128)
+    kda_prep_window_kernel(const float* __restrict__ q_in, const float* __restrict__ k_in,
+                           const float* __restrict__ v_in, const float* __restrict__ f_in,
+                           const float* __restrict__ conv_q, const float* __restrict__ conv_k,
+                           const float* __restrict__ conv_v, float* __restrict__ conv_state,
+                           float* __restrict__ conv_bak, const float* __restrict__ ssm_a, float lb, float eps, int W,
+                           int n_head, int head_dim, int d_conv, float* __restrict__ q_out, float* __restrict__ k_out,
+                           float* __restrict__ v_out, float* __restrict__ g1_out) {
+    const int h = blockIdx.x;
+    const int role = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int d_inner = n_head * head_dim;
+    if (tid >= head_dim) return;
+    const int c = h * head_dim + tid;
+
+    if (role == 3) {
+        const float sa = ssm_a[h];
+        for (int t = 0; t < W; ++t) {
+            const float v = f_in[(size_t) t * d_inner + c] * sa;
+            g1_out[(size_t) t * d_inner + c] = lb * sigmoid_exact(v);
+        }
+        return;
+    }
+
+    const float* in = role == 0 ? q_in : (role == 1 ? k_in : v_in);
+    const float* cw = role == 0 ? conv_q : (role == 1 ? conv_k : conv_v);
+    float* out = role == 0 ? q_out : (role == 1 ? k_out : v_out);
+    const int hist = d_conv - 1;
+    const size_t st_off = (size_t) role * d_inner * hist + (size_t) hist * c;
+    float* st = conv_state + st_off;
+    const float* w = cw + (size_t) d_conv * c;
+
+    float sh[4];
+    for (int tap = 0; tap < hist; ++tap) {
+        sh[tap] = st[tap];
+        if (conv_bak != nullptr) conv_bak[st_off + tap] = sh[tap];
+    }
+    float wt[4];
+    for (int tap = 0; tap < d_conv; ++tap) wt[tap] = w[tap];
+
+    __shared__ double ssum[4];
+    for (int t = 0; t < W; ++t) {
+        const float xp = in[(size_t) t * d_inner + c];
+        float acc = 0.0f;
+        for (int tap = 0; tap < hist; ++tap) acc += wt[tap] * sh[tap];
+        acc += wt[hist] * xp;
+        float y = acc * sigmoid_exact(acc);
+        for (int j = 0; j + 1 < hist; ++j) sh[j] = sh[j + 1];
+        sh[hist - 1] = xp;
+
+        if (role < 2) {
+            const double wv = warp_sum_d((double) y * (double) y);
+            if ((tid & 31) == 0) ssum[tid >> 5] = wv;
+            __syncthreads();
+            const double total = ssum[0] + ssum[1] + ssum[2] + ssum[3];
+            y *= 1.0f / fmaxf(sqrtf((float) total), eps);
+            __syncthreads();
+        }
+        out[(size_t) t * d_inner + c] = y;
+    }
+    for (int tap = 0; tap < hist; ++tap) st[tap] = sh[tap];
+}
+
+__global__ void __launch_bounds__(128)
+    kda_conv_rollback_kernel(const float* __restrict__ conv_bak, const float* __restrict__ q_in,
+                             const float* __restrict__ k_in, const float* __restrict__ v_in, int a, int n_head,
+                             int head_dim, int d_conv, float* __restrict__ conv_state) {
+    const int h = blockIdx.x;
+    const int role = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int d_inner = n_head * head_dim;
+    if (tid >= head_dim) return;
+    const int c = h * head_dim + tid;
+    const int hist = d_conv - 1;
+    const size_t st_off = (size_t) role * d_inner * hist + (size_t) hist * c;
+    const float* in = role == 0 ? q_in : (role == 1 ? k_in : v_in);
+
+    float sh[4];
+    for (int tap = 0; tap < hist; ++tap) sh[tap] = conv_bak[st_off + tap];
+    for (int t = 0; t < a; ++t) {
+        for (int j = 0; j + 1 < hist; ++j) sh[j] = sh[j + 1];
+        sh[hist - 1] = in[(size_t) t * d_inner + c];
+    }
+    for (int tap = 0; tap < hist; ++tap) conv_state[st_off + tap] = sh[tap];
+}
+
+__global__ void __launch_bounds__(256)
+    kda_rec_window_q8_kernel(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                             const float* __restrict__ g1, const float* __restrict__ beta_raw,
+                             const float* __restrict__ state, float* __restrict__ state_tmp,
+                             const float* __restrict__ g2, const float* __restrict__ norm_w, float eps, int W,
+                             int n_head, int8_t* __restrict__ xq_out, float* __restrict__ xd_out) {
+    constexpr int HD = 128;
+    const int h = blockIdx.x;
+    const int t_idx = threadIdx.x;
+    const int j = t_idx & (HD - 1);
+    const int half = t_idx >> 7;
+    const int DI = n_head * HD;
+
+    __shared__ float sq[HD], sk[HD], sdec[HD], sdel[HD];
+    __shared__ float sacc[2][HD];
+    __shared__ float sred[4];
+
+    const float* Sh = state + (size_t) h * HD * HD;
+    float reg[64];
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) reg[ii] = Sh[(half * 64 + ii) * HD + j];
+
+    for (int step = 0; step < W; ++step) {
+        const size_t base = (size_t) step * DI + (size_t) h * HD;
+        if (t_idx < HD) {
+            sq[t_idx] = q[base + t_idx];
+            sk[t_idx] = k[base + t_idx];
+            sdec[t_idx] = expf(g1[base + t_idx]);
+        }
+        const float b = sigmoid_exact(beta_raw[(size_t) step * n_head + h]);
+        __syncthreads();
+
+        float A = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 64; ++ii) {
+            const int i = half * 64 + ii;
+            const float sv = reg[ii] * sdec[i];
+            reg[ii] = sv;
+            A += sv * sk[i];
+        }
+        sacc[half][j] = A;
+        __syncthreads();
+
+        if (half == 0) sdel[j] = b * (v[base + j] - (sacc[0][j] + sacc[1][j]));
+        __syncthreads();
+
+        const float dl = sdel[j];
+        float O = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 64; ++ii) {
+            const int i = half * 64 + ii;
+            const float s2 = reg[ii] + sk[i] * dl;
+            reg[ii] = s2;
+            O += s2 * sq[i];
+        }
+        sacc[half][j] = O;
+        __syncthreads();
+
+        float o_val = 0.0f;
+        if (half == 0) {
+            o_val = (sacc[0][j] + sacc[1][j]) * rsqrtf((float) HD);
+            const float wsum = warp_sum_f(o_val * o_val);
+            if ((j & 31) == 0) sred[j >> 5] = wsum;
+        }
+        __syncthreads();
+        if (half == 0) {
+            const float ss = sred[0] + sred[1] + sred[2] + sred[3];
+            const float inv = rsqrtf(ss / (float) HD + eps);
+            const float gv = o_val * inv * norm_w[j] * sigmoid_exact(g2[base + j]);
+            q8_store_warp(gv, base + j, xq_out, xd_out);
+        }
+        __syncthreads();
+    }
+
+    float* Sd = state_tmp + (size_t) h * HD * HD;
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) Sd[(half * 64 + ii) * HD + j] = reg[ii];
+}
+
+__global__ void __launch_bounds__(256)
+    kda_replay_state_kernel(const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ g1,
+                            const float* __restrict__ beta_raw, float* __restrict__ state, int a, int n_head) {
+    constexpr int HD = 128;
+    const int h = blockIdx.x;
+    const int t_idx = threadIdx.x;
+    const int j = t_idx & (HD - 1);
+    const int half = t_idx >> 7;
+    const int DI = n_head * HD;
+
+    __shared__ float sk[HD], sdec[HD], sdel[HD];
+    __shared__ float sacc[2][HD];
+
+    float* Sh = state + (size_t) h * HD * HD;
+    float reg[64];
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) reg[ii] = Sh[(half * 64 + ii) * HD + j];
+
+    for (int step = 0; step < a; ++step) {
+        const size_t base = (size_t) step * DI + (size_t) h * HD;
+        if (t_idx < HD) {
+            sk[t_idx] = k[base + t_idx];
+            sdec[t_idx] = expf(g1[base + t_idx]);
+        }
+        const float b = sigmoid_exact(beta_raw[(size_t) step * n_head + h]);
+        __syncthreads();
+
+        float A = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 64; ++ii) {
+            const int i = half * 64 + ii;
+            const float sv = reg[ii] * sdec[i];
+            reg[ii] = sv;
+            A += sv * sk[i];
+        }
+        sacc[half][j] = A;
+        __syncthreads();
+
+        if (half == 0) sdel[j] = b * (v[base + j] - (sacc[0][j] + sacc[1][j]));
+        __syncthreads();
+
+        const float dl = sdel[j];
+#pragma unroll
+        for (int ii = 0; ii < 64; ++ii) {
+            const int i = half * 64 + ii;
+            reg[ii] += sk[i] * dl;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) Sh[(half * 64 + ii) * HD + j] = reg[ii];
+}
+
+__global__ void __launch_bounds__(32)
+    pack_route_win_cpu_kernel(const int* __restrict__ ids, const float* __restrict__ w, const int* __restrict__ who,
+                              int n_ent, RoutePackWin* __restrict__ dst) {
+    const int i = threadIdx.x;
+    if (i < n_ent) {
+        dst->ids[i] = ids[i];
+        dst->w[i] = w[i];
+        dst->who[i] = who[i];
+    }
+}
+
+// 2-stage on-device top-1 + softmax probability (grid 128 -> grid 1; scratch_val needs 256 floats: [0..127] max, [128..255] sumexp)
+__global__ void __launch_bounds__(256)
+    top1_prob_s1_kernel(const float* __restrict__ x, int n, float* __restrict__ pval, int* __restrict__ pidx) {
+    __shared__ float sm[8], ss[8];
+    __shared__ int si[8];
+    const int tid = threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    float bm = -INFINITY;
+    int bi = 0;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += stride) {
+        const float v = x[i];
+        if (v > bm) {
+            bm = v;
+            bi = i;
+        }
+    }
+    // Online softmax sumexp alongside max inside each thread pass? Two-pass over registers is unnecessary; compute sumexp vs local max
+    float bm_w = bm;
+    int bi_w = bi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffffu, bm_w, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi_w, o);
+        if (om > bm_w || (om == bm_w && oi < bi_w)) {
+            bm_w = om;
+            bi_w = oi;
+        }
+    }
+    if ((tid & 31) == 0) {
+        sm[tid >> 5] = bm_w;
+        si[tid >> 5] = bi_w;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m = sm[0];
+        int id = si[0];
+        for (int k = 1; k < 8; ++k) {
+            if (sm[k] > m || (sm[k] == m && si[k] < id)) {
+                m = sm[k];
+                id = si[k];
+            }
+        }
+        sm[0] = m;
+        si[0] = id;
+    }
+    __syncthreads();
+    const float bmax = sm[0];
+    float lsum = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += stride) {
+        lsum += expf(x[i] - bmax);
+    }
+    lsum = warp_sum_f(lsum);
+    if ((tid & 31) == 0) ss[tid >> 5] = lsum;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int k = 0; k < 8; ++k) tot += ss[k];
+        pval[blockIdx.x] = bmax;
+        pval[gridDim.x + blockIdx.x] = tot;
+        pidx[blockIdx.x] = si[0];
+    }
+}
+
+__global__ void __launch_bounds__(128)
+    top1_prob_s2_kernel(const float* __restrict__ pval, const int* __restrict__ pidx, int nb, float* __restrict__ out) {
+    __shared__ float sm[4], ss[4];
+    __shared__ int si[4];
+    const int tid = threadIdx.x;
+    float bm = tid < nb ? pval[tid] : -INFINITY;
+    int bi = tid < nb ? pidx[tid] : 0;
+    float bs = tid < nb ? pval[nb + tid] : 0.0f;
+    float wm = bm;
+    int wi = bi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffffu, wm, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, wi, o);
+        if (om > wm || (om == wm && oi < wi)) {
+            wm = om;
+            wi = oi;
+        }
+    }
+    if ((tid & 31) == 0) {
+        sm[tid >> 5] = wm;
+        si[tid >> 5] = wi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m = sm[0];
+        int id = si[0];
+        for (int k = 1; k < 4; ++k) {
+            if (sm[k] > m || (sm[k] == m && si[k] < id)) {
+                m = sm[k];
+                id = si[k];
+            }
+        }
+        sm[0] = m;
+        si[0] = id;
+    }
+    __syncthreads();
+    const float gmax = sm[0];
+    float adj = tid < nb ? bs * expf(bm - gmax) : 0.0f;
+    adj = warp_sum_f(adj);
+    if ((tid & 31) == 0) ss[tid >> 5] = adj;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = ss[0] + ss[1] + ss[2] + ss[3];
+        const int best_id = si[0];
+        out[0] = __int_as_float(best_id);
+        out[1] = tot > 0.0f ? (1.0f / tot) : 0.0f;
+    }
+}
+
+__global__ void set_step_kernel(int* __restrict__ d_step, int tok, int pos, int n_kv) {
+    d_step[0] = tok;
+    d_step[1] = pos;
+    d_step[2] = n_kv;
+}
+
+__global__ void set_step_win_kernel(int* __restrict__ d_step, int* __restrict__ d_tok, int* __restrict__ d_pos,
+                                    int t0, int t1, int t2, int t3, int W, int pos0) {
+    d_step[0] = t0;
+    d_step[1] = pos0;
+    d_step[2] = pos0 + W;
+    const int ts[4] = {t0, t1, t2, t3};
+    for (int i = 0; i < W; ++i) {
+        d_tok[i] = ts[i];
+        d_pos[i] = pos0 + i;
+    }
+}
+
+__global__ void __launch_bounds__(256)
+    store_hring_kernel(const float* __restrict__ src, int E, float* __restrict__ ring, int R, int pos0) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < E) {
+        const int slot = (pos0 + t) % R;
+        ring[(size_t) slot * E + i] = src[(size_t) t * E + i];
+    }
+}
+
+
 }  // namespace
 
 void kda_prep_full(const float* q_in, const float* k_in, const float* v_in, const float* f_in, const float* conv_q,
@@ -1620,6 +1995,74 @@ bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off
     mla_dec_wmma_combine_kernel<<<dim3((unsigned) n_head, (unsigned) T), 256, 0, s>>>(part, n_sel_cap, n_sel_dev, T,
                                                                                       n_head, tile, s_max, ctx);
     return true;
+}
+
+
+void kda_prep_window(const float* q_in, const float* k_in, const float* v_in, const float* f_in, const float* conv_q,
+                     const float* conv_k, const float* conv_v, float* conv_state, float* conv_bak, const float* ssm_a,
+                     float lb, float eps, int W, int n_head, int head_dim, int d_conv, float* q_out, float* k_out,
+                     float* v_out, float* g1_out, cudaStream_t s) {
+    if (W <= 0) return;
+    kda_prep_window_kernel<<<dim3((unsigned) n_head, 4u), 128, 0, s>>>(
+        q_in, k_in, v_in, f_in, conv_q, conv_k, conv_v, conv_state, conv_bak, ssm_a, lb, eps, W, n_head, head_dim,
+        d_conv, q_out, k_out, v_out, g1_out);
+}
+
+void kda_conv_rollback(const float* conv_bak, const float* q_in, const float* k_in, const float* v_in, int a,
+                       int n_head, int head_dim, int d_conv, float* conv_state, cudaStream_t s) {
+    kda_conv_rollback_kernel<<<dim3((unsigned) n_head, 3u), 128, 0, s>>>(
+        conv_bak, q_in, k_in, v_in, a, n_head, head_dim, d_conv, conv_state);
+}
+
+void kda_rec_window_q8(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw,
+                       const float* state, float* state_tmp, const float* g2, const float* norm_w, float eps, int W,
+                       int n_head, int head_dim, int8_t* xq_out, float* xd_out, cudaStream_t s) {
+    (void) head_dim;
+    if (W <= 0) return;
+    kda_rec_window_q8_kernel<<<(unsigned) n_head, 256, 0, s>>>(
+        q, k, v, g1, beta_raw, state, state_tmp, g2, norm_w, eps, W, n_head, xq_out, xd_out);
+}
+
+void kda_commit_window(const float* k, const float* v, const float* g1, const float* beta_raw, float* state,
+                       const float* state_tmp, int a, int W, int n_head, int head_dim, cudaStream_t s) {
+    if (a == W) {
+        const size_t bytes = (size_t) n_head * (size_t) head_dim * (size_t) head_dim * sizeof(float);
+        cudaMemcpyAsync(state, state_tmp, bytes, cudaMemcpyDeviceToDevice, s);
+        return;
+    }
+    kda_replay_state_kernel<<<(unsigned) n_head, 256, 0, s>>>(k, v, g1, beta_raw, state, a, n_head);
+}
+
+void pack_route_win_cpu(const int* ids, const float* w, const int* who, int n_ent, RoutePackWin* dst, cudaStream_t s) {
+    pack_route_win_cpu_kernel<<<1, 32, 0, s>>>(ids, w, who, n_ent, dst);
+}
+
+void top1_prob_f32(const float* logits, int n, float* scratch_val, int* scratch_idx, float* out_pair, cudaStream_t s) {
+    constexpr int kBlocks = 128;
+    top1_prob_s1_kernel<<<kBlocks, 256, 0, s>>>(logits, n, scratch_val, scratch_idx);
+    top1_prob_s2_kernel<<<1, 128, 0, s>>>(scratch_val, scratch_idx, kBlocks, out_pair);
+}
+
+void argmax_rows_f32(const float* logits, int W, int n, float* scratch_val, int* scratch_idx, int* out_ids,
+                     cudaStream_t s) {
+    constexpr int kBlocks = 128;
+    for (int t = 0; t < W; ++t) {
+        argmax_stage1_kernel<<<kBlocks, 256, 0, s>>>(logits + (size_t) t * n, n, scratch_val, scratch_idx);
+        argmax_stage2_kernel<<<1, 128, 0, s>>>(scratch_val, scratch_idx, kBlocks, out_ids + t);
+    }
+}
+
+void store_hring(const float* src, int W, int E, float* ring, int R, int pos0, cudaStream_t s) {
+    if (W <= 0) return;
+    store_hring_kernel<<<dim3((unsigned) ((E + 255) / 256), (unsigned) W), 256, 0, s>>>(src, E, ring, R, pos0);
+}
+
+void set_step(int* d_step, int tok, int pos, int n_kv, cudaStream_t s) {
+    set_step_kernel<<<1, 1, 0, s>>>(d_step, tok, pos, n_kv);
+}
+
+void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, cudaStream_t s) {
+    set_step_win_kernel<<<1, 1, 0, s>>>(d_step, d_tok, d_pos, t0, t1, t2, t3, W, pos0);
 }
 
 }  // namespace ling::k

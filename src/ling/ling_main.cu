@@ -133,6 +133,8 @@ int main(int argc, char** argv) {
     int top_k = 40;
     unsigned seed = 42;
     bool print_text = false, no_stop = false, mtp_check = false;
+    int spec_k = 0;           // 0=off, 1..3=fixed max drafts, -1=auto
+    float draft_floor = 0.50f;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -175,6 +177,17 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-check") {
             opt.load_mtp = true;
             mtp_check = true;
+        } else if (a == "--spec-k") {
+            const std::string v = val("--spec-k");
+            if (v == "auto") {
+                spec_k = -1;
+                opt.load_mtp = true;
+            } else {
+                spec_k = std::max(0, std::min(ling::Model::kMaxWin - 1, std::atoi(v.c_str())));
+                if (spec_k > 0) opt.load_mtp = true;
+            }
+        } else if (a == "--draft-floor") {
+            draft_floor = (float) std::atof(val("--draft-floor").c_str());
         } else if (a == "--temp") temp = (float) std::atof(val("--temp").c_str());
         else if (a == "--top-k") top_k = std::atoi(val("--top-k").c_str());
         else if (a == "--top-p") top_p = (float) std::atof(val("--top-p").c_str());
@@ -191,7 +204,7 @@ int main(int argc, char** argv) {
                      "          [--offload auto|gpu|mix|cpu] [--mix-k-gpu N] [--kv fp16|q8]\n"
                      "          [--expert-vram-gib F] [--pin-ram-gib F] [--no-graph] [--no-cache-warm]\n"
                      "          [--temp F] [--top-k N] [--top-p F] [--seed N] [--print-text] [--no-stop]\n"
-                     "          [--mtp] [--mtp-check]\n");
+                     "          [--mtp] [--mtp-check] [--spec-k 0|1|2|3|auto] [--draft-floor F] [--cpu-threads N]\n");
         return 1;
     }
 
@@ -269,34 +282,127 @@ int main(int argc, char** argv) {
         if (temp > 0.0f || lf != nullptr) h_logits.resize((size_t) c.vocab);
         std::mt19937 rng(seed);
         int pos = (int) ids.size();
+        unsigned long long spec_drafted = 0, spec_accepted = 0, spec_steps = 0;
+        const bool use_spec = (spec_k != 0) && model.has_mtp() && lf == nullptr;
         const auto t_dec0 = std::chrono::steady_clock::now();
-        for (int g = 0; g < n_predict; ++g) {
-            int next_id = 0;
-            if (temp <= 0.0f) {
-                next_id = model.argmax_logits(logits);
-            } else {
-                cudaSetDevice(model.output_dev());
-                cudaMemcpyAsync(h_logits.data(), logits, (size_t) c.vocab * 4, cudaMemcpyDeviceToHost,
-                                model.output_stream());
-                cudaStreamSynchronize(model.output_stream());
-                next_id = sample_host(h_logits, temp, top_k, top_p, rng);
-            }
-            if (!no_stop && next_id == c.eos_id) break;
-            out.push_back(next_id);
+
+        auto pick_token = [&](const float* lg_row) -> int {
+            if (temp <= 0.0f) return model.argmax_logits(lg_row);
+            cudaSetDevice(model.output_dev());
+            cudaMemcpyAsync(h_logits.data(), lg_row, (size_t) c.vocab * 4, cudaMemcpyDeviceToHost,
+                            model.output_stream());
+            cudaStreamSynchronize(model.output_stream());
+            return sample_host(h_logits, temp, top_k, top_p, rng);
+        };
+        auto emit_tok = [&](int tok) -> bool {
+            if (!no_stop && tok == c.eos_id) return false;
+            out.push_back(tok);
             if (print_text) {
-                const std::string piece = model.detokenize_one(next_id);
+                const std::string piece = model.detokenize_one(tok);
                 std::fwrite(piece.data(), 1, piece.size(), stdout);
                 std::fflush(stdout);
             }
-            if (g + 1 < n_predict || lf != nullptr) {
-                logits = model.step(next_id, pos++);
-                if (lf != nullptr) {
-                    cudaSetDevice(model.output_dev());
-                    cudaMemcpyAsync(h_logits.data(), logits, (size_t) c.vocab * 4, cudaMemcpyDeviceToHost,
-                                    model.output_stream());
-                    cudaStreamSynchronize(model.output_stream());
-                    std::fwrite(h_logits.data(), 4, (size_t) c.vocab, lf);
+            return true;
+        };
+
+        if (!use_spec) {
+            for (int g = 0; g < n_predict; ++g) {
+                const int next_id = pick_token(logits);
+                if (!emit_tok(next_id)) break;
+                if (g + 1 < n_predict || lf != nullptr) {
+                    logits = model.step(next_id, pos++);
+                    if (lf != nullptr) {
+                        cudaSetDevice(model.output_dev());
+                        cudaMemcpyAsync(h_logits.data(), logits, (size_t) c.vocab * 4, cudaMemcpyDeviceToHost,
+                                        model.output_stream());
+                        cudaStreamSynchronize(model.output_stream());
+                        std::fwrite(h_logits.data(), 4, (size_t) c.vocab, lf);
+                    }
                 }
+            }
+        } else {
+            // Adaptive speculative window controller (Playbook ch. 08: Extra streak + break-even backoff)
+            const bool auto_spec = (spec_k < 0);
+            const bool high_vram = model.vram_res_frac() >= 0.65;
+            const int base_k = auto_spec ? (high_vram ? 1 : 2) : spec_k;
+            const int max_k_lim = auto_spec ? 2 : spec_k;
+            const float f0 = auto_spec ? 0.25f : 0.0f;
+            int streak = 0, pause = 0, wait_p = 16;
+            double acc_ema = 0.65;
+
+            int cur_tok = pick_token(logits);
+            bool alive = (n_predict > 0) && emit_tok(cur_tok);
+            std::vector<int> drafts;
+            std::vector<float> confs;
+            while (alive && (int) out.size() < n_predict && pos < opt.ctx - 1) {
+                const int rem = std::min(n_predict - (int) out.size(), opt.ctx - 1 - pos);
+                int want_k = base_k;
+                if (auto_spec) {
+                    if (pause > 0) {
+                        --pause;
+                        want_k = 0;
+                    } else {
+                        want_k = std::min(max_k_lim, base_k + (streak >= 2 ? 1 : 0));
+                    }
+                }
+                want_k = std::min(want_k, std::min(ling::Model::kMaxWin - 1, rem - 1));
+                drafts.clear();
+                if (want_k > 0) {
+                    model.mtp_draft(cur_tok, pos, want_k, draft_floor, drafts, confs, f0);
+                }
+                const int K = (int) drafts.size();
+                if (K == 0) {
+                    logits = model.step(cur_tok, pos++);
+                    cur_tok = pick_token(logits);
+                    alive = emit_tok(cur_tok);
+                    ++spec_steps;
+                    continue;
+                }
+                int win_toks[ling::Model::kMaxWin];
+                win_toks[0] = cur_tok;
+                for (int i = 0; i < K; ++i) win_toks[1 + i] = drafts[(size_t) i];
+                const int W = 1 + K;
+                const float* wlogits = model.step_window(win_toks, W, pos);
+
+                int pred[ling::Model::kMaxWin];
+                if (temp <= 0.0f) {
+                    model.argmax_rows(wlogits, W, pred);
+                } else {
+                    for (int t = 0; t < W; ++t) pred[t] = pick_token(wlogits + (size_t) t * c.vocab);
+                }
+
+                int kept = 0;
+                while (kept < K && pred[kept] == drafts[(size_t) kept]) ++kept;
+                const int n_accept = 1 + kept;  // trunk positions [pos .. pos + kept] accepted
+                model.commit_window(n_accept, W, pos, win_toks);
+                pos += n_accept;
+
+                spec_drafted += (unsigned long long) K;
+                spec_accepted += (unsigned long long) kept;
+                ++spec_steps;
+
+                if (auto_spec) {
+                    streak = (kept == K) ? (streak + 1) : 0;
+                    const double step_rate = (double) kept / (double) K;
+                    acc_ema = 0.85 * acc_ema + 0.15 * step_rate;
+                    const double be = 0.25;
+                    if (acc_ema < be) {
+                        pause = wait_p;
+                        wait_p = std::min(wait_p * 2, 128);
+                        acc_ema = 0.55;
+                    } else if (kept > 0) {
+                        wait_p = 16;
+                    }
+                }
+
+                // Emit accepted drafts + bonus token pred[kept]
+                for (int i = 0; i < kept && (int) out.size() < n_predict; ++i) {
+                    alive = emit_tok(drafts[(size_t) i]);
+                    if (!alive) break;
+                }
+                if (!alive || (int) out.size() >= n_predict) break;
+                cur_tok = pred[kept];
+                alive = emit_tok(cur_tok);
             }
         }
         cudaSetDevice(model.output_dev());
@@ -317,6 +423,12 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (use_spec && spec_steps > 0) {
+            std::fprintf(stderr, "speculative (MTP): %llu/%llu drafts accepted (%.1f%%), avg %.2f tok/step (%llu steps)\n",
+                         spec_accepted, spec_drafted,
+                         spec_drafted > 0 ? 100.0 * (double) spec_accepted / (double) spec_drafted : 0.0,
+                         (double) out.size() / (double) spec_steps, spec_steps);
+        }
         const ling::TierStats st = model.stats();
         if (st.picks > 0) {
             std::fprintf(stderr,
