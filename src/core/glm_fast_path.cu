@@ -27,6 +27,7 @@
 #include "maya/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
 #include "maya/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
 #include "maya/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
+#include "maya/core/glm_numa_diag.hpp"
 #include "maya/kernels/glmd_graph.hpp"   // glm-dsa B15.6
 #include "maya/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
 #include "maya/core/glm_mtp_state.hpp"   // glm-dsa B15.3
@@ -490,6 +491,13 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
                 }
                 std::fprintf(stderr, "glm fast: CUDA%d RAM arena %.2f GB in row halves (nodes %d / %d, %zu slots)\n", dev,
                              bytes / 1073741824.0, n0, n1, bytes / rl->stride);
+                static std::atomic<bool> nb_warned{false};
+                if (!nb_warned.load(std::memory_order_relaxed) && maya::core::glmnuma::proc_numa_balancing_enabled() &&
+                    !nb_warned.exchange(true, std::memory_order_relaxed)) {
+                    std::fprintf(stderr, "glm fast: note - kernel.numa_balancing=1 is active while MAYA_GLM_ROW_HALVES=1 "
+                                         "pins row halves across NUMA nodes (auto-migration can erode node-local placement; "
+                                         "consider sysctl kernel.numa_balancing=0)\n");
+                }
                 return p;
             }
             std::fprintf(stderr, "glm fast: CUDA%d row halves: mbind refused - interleaved\n", dev);
