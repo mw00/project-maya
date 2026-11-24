@@ -2818,6 +2818,35 @@ __host__ __device__ __forceinline__ int iq4nl_at(int i) {
     return ik2_iq::host::kvalues_iq4nl[i];
 #endif
 }
+// IQ2_XXS / IQ2_XS / IQ2_S / IQ3_S grids: ggml's tables too (8 values a uint64, IQ3_S's 4 a uint32)
+__host__ __device__ __forceinline__ uint64_t iq2xxs_grid_at(int i) {
+#ifdef __CUDA_ARCH__
+    return __ldg(ik2_iq::dev::iq2xxs_grid + i);
+#else
+    return ik2_iq::host::iq2xxs_grid[i];
+#endif
+}
+__host__ __device__ __forceinline__ uint64_t iq2xs_grid_at(int i) {
+#ifdef __CUDA_ARCH__
+    return __ldg(ik2_iq::dev::iq2xs_grid + i);
+#else
+    return ik2_iq::host::iq2xs_grid[i];
+#endif
+}
+__host__ __device__ __forceinline__ uint64_t iq2s_grid_at(int i) {
+#ifdef __CUDA_ARCH__
+    return __ldg(ik2_iq::dev::iq2s_grid + i);
+#else
+    return ik2_iq::host::iq2s_grid[i];
+#endif
+}
+__host__ __device__ __forceinline__ uint32_t iq3s_grid_at(int i) {
+#ifdef __CUDA_ARCH__
+    return __ldg(ik2_iq::dev::iq3s_grid + i);
+#else
+    return ik2_iq::host::iq3s_grid[i];
+#endif
+}
 // ggml's ksigns_iq2xs[s]: the 7 sign bits plus an 8th that makes the count of set bits even
 __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
 #ifdef __CUDA_ARCH__
@@ -2828,6 +2857,16 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
     p ^= p >> 1;
     return s7 | (p & 1) << 7;
 #endif
+}
+// Q4_K's packaged 6-bit scale and min (ggml's get_scale_min_k4), q: the block's scales [12]
+__host__ __device__ __forceinline__ void q4k_scale(const uint8_t* q, int j, int& d, int& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
 }
 
 __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, size_t v) {
@@ -2893,6 +2932,69 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const int hb = (b[16 + l] >> (2 * j64 + half)) & 1;
         const int val = (half ? (lo >> 4) : (lo & 0xF)) + (hb ? 16 : 0);
         return d * (float) sc * (float) val - mn * (float) m;
+    }
+    if (type == kQ4_K) {   // d, dmin, scales [12] (6 bits), qs [128] (nibbles)
+        const uint8_t* b = blocks + (v / 256) * 144;
+        const int i = (int) (v % 256), j64 = i / 64, half = (i % 64) / 32, l = i % 32;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float mn = half_bits_to_float((uint16_t) (b[2] | (b[3] << 8)));
+        int sc, m;
+        q4k_scale(b + 4, 2 * j64 + half, sc, m);
+        const uint8_t lo = b[16 + 32 * j64 + l];
+        const int val = half ? (lo >> 4) : (lo & 0xF);
+        return d * (float) sc * (float) val - mn * (float) m;
+    }
+    if (type == kIQ2_XXS) {   // d, qs [64]: 4 x (4 grid bytes, then 3 sign bytes and a 4-bit scale in the top nibble)
+        const uint8_t* b = blocks + (v / 256) * 66;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t aux = (uint32_t) q[4] | ((uint32_t) q[5] << 8) | ((uint32_t) q[6] << 16) |
+                             ((uint32_t) q[7] << 24);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (0.5f + (float) (aux >> 28)) * 0.25f;
+        const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
+        const uint64_t g = iq2xxs_grid_at(q[l]);
+        return db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ2_XS) {   // d, qs [64] (4 x 16-bit: a 9-bit grid index and 7 sign bits), scales [8] (a nibble a half)
+        const uint8_t* b = blocks + (v / 256) * 74;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const uint8_t* q = b + 2 + 8 * ib + 2 * l;
+        const uint32_t q16 = (uint32_t) q[0] | ((uint32_t) q[1] << 8);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (0.5f + (float) ((b[66 + ib] >> (l < 2 ? 0 : 4)) & 0xF)) * 0.25f;
+        const uint32_t sg = iq_signs8(q16 >> 9);
+        const uint64_t g = iq2xs_grid_at((int) (q16 & 511u));
+        return db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ2_S) {   // d, grid bytes [32], sign bytes [32], qh [8] (their 2 top bits), scales [8] (a nibble a half)
+        const uint8_t* b = blocks + (v / 256) * 82;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const int idx = (int) b[2 + 4 * ib + l] | (int) (((uint32_t) b[66 + ib] << (8 - 2 * l)) & 0x300u);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (0.5f + (float) ((b[74 + ib] >> (l < 2 ? 0 : 4)) & 0xF)) * 0.25f;
+        const uint32_t sg = b[34 + 4 * ib + l];
+        const uint64_t g = iq2s_grid_at(idx);
+        return db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ3_S) {   // d, qs [64], qh [8] (the 9th index bit), signs [32], scales [4] (a nibble a 32-value half)
+        const uint8_t* b = blocks + (v / 256) * 110;
+        const int i = (int) (v % 256), ib = i / 32, il = (i % 32) / 8, jj = i % 8;
+        const uint32_t h = b[66 + ib];
+        const int i1 = (int) b[2 + 8 * ib + 2 * il] | (int) ((h << (8 - 2 * il)) & 256u);
+        const int i2 = (int) b[2 + 8 * ib + 2 * il + 1] | (int) ((h << (7 - 2 * il)) & 256u);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float dl = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF));
+        const uint32_t g = iq3s_grid_at(jj < 4 ? i1 : i2);
+        const uint32_t sg = b[74 + 4 * ib + il];
+        return dl * (float) ((g >> (8 * (jj & 3))) & 0xFFu) * ((sg >> jj) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ4_NL) {   // d, qs [16]: value j < 16 the low nibble of byte j, value j + 16 its high one
+        const uint8_t* b = blocks + (v / 32) * 18;
+        const int i = (int) (v % 32), j = i % 16;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t q = b[2 + j];
+        return d * (float) iq4nl_at(i < 16 ? (int) (q & 0xF) : (int) (q >> 4));
     }
     return 0.0f;
 }
@@ -3015,6 +3117,193 @@ __device__ __forceinline__ void load_xv8(const float* x, float4 (&xv)[8]) {
     for (int k = 0; k < 8; ++k) xv[k] = *(const float4*) (x + 4 * k);
 }
 
+// ---- IQ2_XXS / IQ2_XS / IQ2_S / IQ3_S / IQ4_NL / Q4_K: their 32-value sub-blocks against 32 inputs (xv: 8 float4)
+
+// four bytes as a uint32 from any address (the odd block sizes, 18 / 66 / 74 / 82 / 110, put rows at any alignment)
+__device__ __forceinline__ uint32_t ld4u(const uint8_t* p) {
+    if (((uintptr_t) p & 3) == 0) return __ldg((const uint32_t*) p);
+    return (uint32_t) __ldg(p) | ((uint32_t) __ldg(p + 1) << 8) | ((uint32_t) __ldg(p + 2) << 16) |
+           ((uint32_t) __ldg(p + 3) << 24);
+}
+__device__ __forceinline__ float sum_f4x8(const float4 (&xv)[8]) {
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) s += xv[k].x + xv[k].y + xv[k].z + xv[k].w;
+    return s;
+}
+// the types whose 32-value sub-blocks the two helpers below read (an IQ4_NL block: one of them)
+__device__ __host__ __forceinline__ bool sub32_type(int type) {
+    return type == kIQ2_XXS || type == kIQ2_XS || type == kIQ2_S || type == kIQ3_S || type == kIQ4_NL ||
+           type == kQ4_K;
+}
+// sub-block sb of a row of `type` from w against those 32 inputs: the sum of the products.  Block layouts (ggml's):
+// IQ2_XXS, 66 bytes: d, 8 x (4 grid bytes, 3 sign bytes, a 4-bit scale in the top nibble); IQ2_XS, 74: d, 8 x 4
+// 16-bit grid indices with 7 sign bits, scales [8] (a nibble a half); IQ2_S, 82: d, grid bytes [32], sign bytes [32],
+// qh [8], scales [8]; IQ3_S, 110: d, qs [64], qh [8], signs [32], scales [4]; IQ4_NL, 18: d, qs [16]; Q4_K, 144: d,
+// dmin, scales [12], qs [128].
+__device__ __forceinline__ float sub32_dot(int type, const uint8_t* w, int sb, const float4 (&xv)[8]) {
+    if (type == kIQ2_XXS) {
+        const uint8_t* b = w + (size_t) (sb >> 3) * 66;
+        const uint8_t* q = b + 2 + 8 * (sb & 7);
+        const uint32_t aux = ld4u(q + 4);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        float a = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = iq2xxs_grid_at(q[l]);
+            const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
+            a += sdot4_u8((uint32_t) g, sg, xv[2 * l]) + sdot4_u8((uint32_t) (g >> 32), sg >> 4, xv[2 * l + 1]);
+        }
+        return d * (0.5f + (float) (aux >> 28)) * 0.25f * a;
+    }
+    if (type == kIQ2_XS || type == kIQ2_S) {   // (a 4-bit scale a half: l < 2 the low nibble)
+        const bool xs = type == kIQ2_XS;
+        const uint8_t* b = w + (size_t) (sb >> 3) * (xs ? 74 : 82);
+        const int ib = sb & 7;
+        const uint8_t* q = b + 2 + (xs ? 8 * ib : 4 * ib);
+        const uint32_t sc = b[xs ? 66 + ib : 74 + ib];
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            uint64_t g;
+            uint32_t sg;
+            if (xs) {   // a 16-bit entry: a 9-bit grid index and 7 sign bits
+                const uint32_t q16 = (uint32_t) q[2 * l] | ((uint32_t) q[2 * l + 1] << 8);
+                g = iq2xs_grid_at((int) (q16 & 511u));
+                sg = iq_signs8(q16 >> 9);
+            } else {   // a grid byte and its 2 top bits in qh, the signs a byte
+                g = iq2s_grid_at((int) q[l] | (int) (((uint32_t) b[66 + ib] << (8 - 2 * l)) & 0x300u));
+                sg = b[34 + 4 * ib + l];
+            }
+            const float v = sdot4_u8((uint32_t) g, sg, xv[2 * l]) + sdot4_u8((uint32_t) (g >> 32), sg >> 4, xv[2 * l + 1]);
+            (l < 2 ? a0 : a1) += v;
+        }
+        return d * 0.25f * ((0.5f + (float) (sc & 15)) * a0 + (0.5f + (float) (sc >> 4)) * a1);
+    }
+    if (type == kIQ3_S) {   // 4 grid bytes and the 9th index bits in qh, 4 sign bytes, the scale 1 + 2 s a 32-value half
+        const uint8_t* b = w + (size_t) (sb >> 3) * 110;
+        const int ib = sb & 7;
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t h = b[66 + ib];
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float dl = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF));
+        float a = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g1 = iq3s_grid_at((int) q[2 * l] | (int) ((h << (8 - 2 * l)) & 256u));
+            const uint32_t g2 = iq3s_grid_at((int) q[2 * l + 1] | (int) ((h << (7 - 2 * l)) & 256u));
+            const uint32_t sg = b[74 + 4 * ib + l];
+            a += sdot4_u8(g1, sg, xv[2 * l]) + sdot4_u8(g2, sg >> 4, xv[2 * l + 1]);
+        }
+        return dl * a;
+    }
+    if (type == kIQ4_NL) {   // as IQ4_XS's sub-block, a block of its own
+        const uint8_t* b = w + (size_t) sb * 18;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        float a = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t q4 = ld4u(b + 2 + 4 * k);
+            a += dot_u32_f4(iq4nl_lut4(q4, false), xv[k]) + dot_u32_f4(iq4nl_lut4(q4, true), xv[4 + k]);
+        }
+        return d * a;
+    }
+    {   // Q4_K: sub-block ib, the low (even ib) or the high nibbles (odd) of its 32 bytes
+        const uint8_t* b = w + (size_t) (sb >> 3) * 144;
+        const int ib = sb & 7;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float mn = half_bits_to_float((uint16_t) (b[2] | (b[3] << 8)));
+        int sc, m;
+        q4k_scale(b + 4, ib, sc, m);
+        const int sh = 4 * (ib & 1);
+        const uint8_t* q = b + 16 + 32 * (ib >> 1);
+        float aq = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) aq += dot_u32_f4((ld4u(q + 4 * k) >> sh) & 0x0F0F0F0Fu, xv[k]);
+        return d * (float) sc * aq - mn * (float) m * sum_f4x8(xv);
+    }
+}
+// ... and the same sub-block's 32 values in y (the FP16 decode)
+__device__ __forceinline__ void sub32_values(int type, const uint8_t* w, int sb, float* y) {
+    if (type == kIQ2_XXS) {
+        const uint8_t* b = w + (size_t) (sb >> 3) * 66;
+        const uint8_t* q = b + 2 + 8 * (sb & 7);
+        const uint32_t aux = ld4u(q + 4);
+        const float db = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8))) * (0.5f + (float) (aux >> 28)) * 0.25f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
+            const uint64_t g = iq2xxs_grid_at(q[l]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                y[8 * l + j] = db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+        }
+    } else if (type == kIQ2_XS || type == kIQ2_S) {
+        const bool xs = type == kIQ2_XS;
+        const uint8_t* b = w + (size_t) (sb >> 3) * (xs ? 74 : 82);
+        const int ib = sb & 7;
+        const uint8_t* q = b + 2 + (xs ? 8 * ib : 4 * ib);
+        const uint32_t sc = b[xs ? 66 + ib : 74 + ib];
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db[2] = {d * (0.5f + (float) (sc & 15)) * 0.25f, d * (0.5f + (float) (sc >> 4)) * 0.25f};
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            uint64_t g;
+            uint32_t sg;
+            if (xs) {
+                const uint32_t q16 = (uint32_t) q[2 * l] | ((uint32_t) q[2 * l + 1] << 8);
+                g = iq2xs_grid_at((int) (q16 & 511u));
+                sg = iq_signs8(q16 >> 9);
+            } else {
+                g = iq2s_grid_at((int) q[l] | (int) (((uint32_t) b[66 + ib] << (8 - 2 * l)) & 0x300u));
+                sg = b[34 + 4 * ib + l];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                y[8 * l + j] = db[l / 2] * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+        }
+    } else if (type == kIQ3_S) {
+        const uint8_t* b = w + (size_t) (sb >> 3) * 110;
+        const int ib = sb & 7;
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t h = b[66 + ib];
+        const float dl = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8))) *
+                         (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF));
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g1 = iq3s_grid_at((int) q[2 * l] | (int) ((h << (8 - 2 * l)) & 256u));
+            const uint32_t g2 = iq3s_grid_at((int) q[2 * l + 1] | (int) ((h << (7 - 2 * l)) & 256u));
+            const uint32_t sg = b[74 + 4 * ib + l];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                y[8 * l + j] = dl * (float) ((g1 >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+                y[8 * l + 4 + j] = dl * (float) ((g2 >> (8 * j)) & 0xFFu) * ((sg >> (4 + j)) & 1u ? -1.0f : 1.0f);
+            }
+        }
+    } else if (type == kIQ4_NL) {
+        const uint8_t* b = w + (size_t) sb * 18;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t q = b[2 + j];
+            y[j] = d * (float) iq4nl_at(q & 0xF), y[16 + j] = d * (float) iq4nl_at(q >> 4);
+        }
+    } else {
+        const uint8_t* b = w + (size_t) (sb >> 3) * 144;
+        const int ib = sb & 7;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float mn = half_bits_to_float((uint16_t) (b[2] | (b[3] << 8)));
+        int sc, m;
+        q4k_scale(b + 4, ib, sc, m);
+        const float dsc = d * (float) sc, mnm = mn * (float) m;
+        const uint8_t* q = b + 16 + 32 * (ib >> 1);
+#pragma unroll
+        for (int l = 0; l < 32; ++l)
+            y[l] = dsc * (float) ((ib & 1) ? (q[l] >> 4) : (q[l] & 0xF)) - mnm;
+    }
+}
+
 // a warp's dot of one row of K values (blocks of `type` from w) with xs (shared, padded: xp), every lane gets it
 __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
     const int lane = threadIdx.x & 31;
@@ -3134,6 +3423,12 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
             load_xv8(xs + sb * 36, xv);
             acc += iq3 ? iq3xxs_sub_dot(w + (size_t) (sb >> 3) * 98, sb & 7, xv)
                        : iq4xs_sub_dot(w + (size_t) (sb >> 3) * 136, sb & 7, xv);
+        }
+    } else if (sub32_type(type)) {
+        for (int sb = lane; sb < K / 32; sb += 32) {
+            float4 xv[8];
+            load_xv8(xs + sb * 36, xv);
+            acc += sub32_dot(type, w, sb, xv);
         }
     } else {
         for (int i = lane; i < K; i += 32) acc += decode_value(type, w, (size_t) i) * xs[xp(i)];
@@ -3309,6 +3604,13 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
             const size_t off = (size_t) (sb >> 3) * bb;
             ag += iq3 ? iq3xxs_sub_dot(wg + off, sb & 7, xv) : iq4xs_sub_dot(wg + off, sb & 7, xv);
             au += iq3 ? iq3xxs_sub_dot(wu + off, sb & 7, xv) : iq4xs_sub_dot(wu + off, sb & 7, xv);
+        }
+    } else if (sub32_type(type)) {
+        for (int sb = lane; sb < K / 32; sb += 32) {
+            float4 xv[8];
+            load_xv8(xs + sb * 36, xv);
+            ag += sub32_dot(type, wg, sb, xv);
+            au += sub32_dot(type, wu, sb, xv);
         }
     } else {
         for (int i = lane; i < K; i += 32) {
@@ -5399,6 +5701,16 @@ __global__ void decode_f16_k_kernel(int type, const uint8_t* blocks, size_t nblk
 __global__ void decode_f16_kernel(int type, const uint8_t* blocks, size_t n, uint16_t* out) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = f2h(decode_value(type, blocks, i));
+}
+// one thread per 32-value sub-block of the types sub32_values reads -> 32 FP16
+__global__ void decode_f16_sub32_kernel(int type, const uint8_t* blocks, size_t nsub, uint16_t* out) {
+    const size_t sb = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= nsub) return;
+    float y[32];
+    sub32_values(type, blocks, (int) sb, y);
+    uint16_t* o = out + sb * 32;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) store_f16x4(o + 4 * j, y[4 * j], y[4 * j + 1], y[4 * j + 2], y[4 * j + 3]);
 }
 __global__ void decode_f32_kernel(int type, const uint8_t* blocks, size_t n, float* out) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -7592,12 +7904,16 @@ void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base,
 }
 
 int block_values(int type) {
-    return type == kNVFP4 ? 64 : type == kQ8_0 ? 32
-         : type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS ? 256 : 0;
+    return type == kNVFP4 ? 64 : type == kQ8_0 || type == kIQ4_NL ? 32
+         : type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_XXS || type == kIQ2_XS ||
+                  type == kIQ3_XXS || type == kIQ3_S || type == kIQ2_S || type == kIQ4_XS
+             ? 256
+             : 0;
 }
 size_t block_bytes(int type) {
-    return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kQ5_K ? 176 : type == kQ6_K ? 210
-         : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : 0;
+    return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kIQ4_NL ? 18 : type == kQ4_K ? 144
+         : type == kQ5_K ? 176 : type == kQ6_K ? 210 : type == kIQ2_XXS ? 66 : type == kIQ2_XS ? 74
+         : type == kIQ3_XXS ? 98 : type == kIQ3_S ? 110 : type == kIQ2_S ? 82 : type == kIQ4_XS ? 136 : 0;
 }
 
 template <int WARPS, int ROWS>
@@ -8131,6 +8447,11 @@ void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaSt
     if ((type == kQ5_K || type == kQ6_K) && n % 256 == 0) {
         decode_f16_k_kernel<<<grid(n / 256, kBlk / 32), kBlk, 0, s>>>(type, blocks, n / 256, out);
         check("decode_f16_k");
+        return;
+    }
+    if (sub32_type(type) && n % 32 == 0) {
+        decode_f16_sub32_kernel<<<grid(n / 32), kBlk, 0, s>>>(type, blocks, n / 32, out);
+        check("decode_f16_sub32");
         return;
     }
     decode_f16_kernel<<<grid(n), kBlk, 0, s>>>(type, blocks, n, out);

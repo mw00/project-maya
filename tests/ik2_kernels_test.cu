@@ -544,9 +544,11 @@ double nvfp4_def(const uint8_t* blocks, size_t v) {
 }
 
 void test_decode() {
-    const int types[] = {k::kNVFP4, k::kQ8_0, k::kQ5_K, k::kQ6_K, k::kIQ3_XXS, k::kIQ4_XS};
-    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS"};
-    for (int ti = 0; ti < 6; ++ti) {
+    const int types[] = {k::kNVFP4,    k::kQ8_0,    k::kQ5_K,     k::kQ6_K,    k::kIQ3_XXS, k::kIQ4_XS,
+                         k::kQ4_K,     k::kIQ2_XXS, k::kIQ2_XS,   k::kIQ2_S,   k::kIQ3_S,   k::kIQ4_NL};
+    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS",
+                           "Q4_K",  "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_S", "IQ4_NL"};
+    for (int ti = 0; ti < 12; ++ti) {
         const int type = types[ti], bv = k::block_values(type);
         const size_t bb = k::block_bytes(type), nblk = 777, n = nblk * bv;
         std::vector<uint8_t> raw(nblk * bb);
@@ -563,6 +565,10 @@ void test_decode() {
             if (type == k::kQ5_K) fix(0), fix(2);
             if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
+            if (type == k::kQ4_K) fix(0), fix(2);
+            if (type == k::kIQ2_XXS || type == k::kIQ2_XS || type == k::kIQ2_S || type == k::kIQ3_S ||
+                type == k::kIQ4_NL)
+                fix(0);
         }
         std::vector<float> hostv(n);
         k::decode_host(type, raw.data(), n, hostv.data());
@@ -611,6 +617,10 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
         if (type == k::kQ5_K) fix(0), fix(2);
         if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
+        if (type == k::kQ4_K) fix(0), fix(2);
+        if (type == k::kIQ2_XXS || type == k::kIQ2_XS || type == k::kIQ2_S || type == k::kIQ3_S ||
+            type == k::kIQ4_NL)
+            fix(0);
     }
     return raw;
 }
@@ -666,15 +676,162 @@ void ggml_iq4_xs(const uint8_t* x, float* y, size_t k) {
         }
     }
 }
+// ggml's ksigns_iq2xs[v]: the 7 sign bits of v, bit 7 their parity (folded here: portable)
+uint32_t ksigns_host(uint32_t v) {
+    v &= 127u;
+    uint32_t p = v ^ (v >> 4);
+    p ^= p >> 2;
+    p ^= p >> 1;
+    return v | ((p & 1u) << 7);
+}
+static const uint64_t* const g_iq2xxs_grid = ik2_iq::host::iq2xxs_grid;
+static const uint64_t* const g_iq2xs_grid = ik2_iq::host::iq2xs_grid;
+static const uint64_t* const g_iq2s_grid = ik2_iq::host::iq2s_grid;
+static const uint32_t* const g_iq3s_grid = ik2_iq::host::iq3s_grid;
+// ggml's dequantize_row_iq2_xxs, transcribed
+void ggml_iq2_xxs(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 66;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        uint32_t aux32[2];
+        const uint8_t* aux8 = (const uint8_t*) aux32;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            std::memcpy(aux32, b + 2 + 8 * ib32, 8);
+            const float db = d * (0.5f + (float) (aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* grid = (const uint8_t*) (g_iq2xxs_grid + aux8[l]);
+                const uint8_t signs = (uint8_t) ksigns_host(aux32[1] >> (7 * l));
+                for (int j = 0; j < 8; ++j)
+                    y[i * 256 + ib32 * 32 + 8 * l + j] = db * (float) grid[j] * (signs & (1 << j) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq2_xs (qs: uint16_t[32] past d, each a 9-bit grid index and 7 sign bits)
+void ggml_iq2_xs(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 74;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db[2] = {d * (0.5f + (float) (b[66 + ib32] & 0xF)) * 0.25f,
+                                 d * (0.5f + (float) (b[66 + ib32] >> 4)) * 0.25f};
+            for (int l = 0; l < 4; ++l) {
+                uint16_t q16 = 0;
+                std::memcpy(&q16, b + 2 + 8 * ib32 + 2 * l, 2);
+                const uint8_t* grid = (const uint8_t*) (g_iq2xs_grid + (q16 & 511));
+                const uint8_t signs = (uint8_t) ksigns_host(q16 >> 9);
+                for (int j = 0; j < 8; ++j)
+                    y[i * 256 + ib32 * 32 + 8 * l + j] =
+                        db[l / 2] * (float) grid[j] * (signs & (1 << j) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq2_s (qs [64]: 32 grid bytes then 32 sign bytes; qh [8]; scales [8])
+void ggml_iq2_s(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 82;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t* qs = b + 2;
+        const uint8_t* qh = b + 66;
+        const uint8_t* signs = b + 34;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db[2] = {d * (0.5f + (float) (b[74 + ib32] & 0xF)) * 0.25f,
+                                 d * (0.5f + (float) (b[74 + ib32] >> 4)) * 0.25f};
+            for (int l = 0; l < 4; ++l) {
+                const int idx = qs[4 * ib32 + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+                const uint8_t* grid = (const uint8_t*) (g_iq2s_grid + idx);
+                const uint8_t sg = signs[4 * ib32 + l];
+                for (int j = 0; j < 8; ++j)
+                    y[i * 256 + ib32 * 32 + 8 * l + j] =
+                        db[l / 2] * (float) grid[j] * (sg & (1 << j) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq3_s (a scale a 32-value half: 1 + 2 s)
+void ggml_iq3_s(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 110;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t* scales = b + 106;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db = d * (float) (1 + 2 * ((scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xF));
+            const uint8_t* qs = b + 2 + 8 * ib32;
+            const uint8_t h = b[66 + ib32];
+            const uint8_t* sg = b + 74 + 4 * ib32;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* g1 = (const uint8_t*) (g_iq3s_grid + (qs[2 * l + 0] | ((h << (8 - 2 * l)) & 256)));
+                const uint8_t* g2 = (const uint8_t*) (g_iq3s_grid + (qs[2 * l + 1] | ((h << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[i * 256 + ib32 * 32 + 8 * l + j + 0] = db * (float) g1[j] * (sg[l] & (1 << j) ? -1.f : 1.f);
+                    y[i * 256 + ib32 * 32 + 8 * l + j + 4] =
+                        db * (float) g2[j] * (sg[l] & (1 << (j + 4)) ? -1.f : 1.f);
+                }
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq4_nl
+void ggml_iq4_nl(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 32; ++i) {
+        const uint8_t* b = x + i * 18;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        for (int j = 0; j < 16; ++j) {
+            y[i * 32 + j + 0] = d * (float) g_iq4nl[b[2 + j] & 0xF];
+            y[i * 32 + j + 16] = d * (float) g_iq4nl[b[2 + j] >> 4];
+        }
+    }
+}
+// ggml's get_scale_min_k4 and dequantize_row_q4_K
+void get_scale_min_k4_host(int j, const uint8_t* q, int& d, int& m) {
+    if (j < 4) {
+        d = q[j] & 63, m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+void ggml_q4_K(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 144;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        const float mn = h2f_host((uint16_t) (b[2] | (b[3] << 8)));
+        const uint8_t* q = b + 16;
+        float* yy = y + i * 256;
+        int v = 0, is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            int sc, m;
+            get_scale_min_k4_host(is + 0, b + 4, sc, m);
+            const float d1 = d * (float) sc, m1 = mn * (float) m;
+            get_scale_min_k4_host(is + 1, b + 4, sc, m);
+            const float d2 = d * (float) sc, m2 = mn * (float) m;
+            for (int l = 0; l < 32; ++l) yy[v++] = d1 * (float) (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) yy[v++] = d2 * (float) (q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
 void test_iq_ref() {
-    for (int type : {k::kIQ3_XXS, k::kIQ4_XS}) {
+    struct Ref {
+        int type;
+        void (*fn)(const uint8_t*, float*, size_t);
+        const char* name;
+    };
+    const Ref refs[] = {{k::kIQ3_XXS, ggml_iq3_xxs, "IQ3_XXS"}, {k::kIQ4_XS, ggml_iq4_xs, "IQ4_XS"},
+                        {k::kQ4_K, ggml_q4_K, "Q4_K"},         {k::kIQ2_XXS, ggml_iq2_xxs, "IQ2_XXS"},
+                        {k::kIQ2_XS, ggml_iq2_xs, "IQ2_XS"},   {k::kIQ2_S, ggml_iq2_s, "IQ2_S"},
+                        {k::kIQ3_S, ggml_iq3_s, "IQ3_S"},     {k::kIQ4_NL, ggml_iq4_nl, "IQ4_NL"}};
+    for (const Ref& r : refs) {
         const size_t n = 256 * 333;
-        auto raw = rand_blocks(type, n);
+        auto raw = rand_blocks(r.type, n);
         std::vector<float> want(n), got(n);
-        (type == k::kIQ3_XXS ? ggml_iq3_xxs : ggml_iq4_xs)(raw.data(), want.data(), n);
-        k::decode_host(type, raw.data(), n, got.data());
-        expect(type == k::kIQ3_XXS ? "decode_host IQ3_XXS = ggml" : "decode_host IQ4_XS = ggml", got,
-               std::vector<double>(want.begin(), want.end()), 0.0, 0.0);
+        r.fn(raw.data(), want.data(), n);
+        k::decode_host(r.type, raw.data(), n, got.data());
+        char name[64];
+        std::snprintf(name, sizeof name, "decode_host %s = ggml", r.name);
+        expect(name, got, std::vector<double>(want.begin(), want.end()), 0.0, 0.0);
     }
 }
 
@@ -688,7 +845,14 @@ void test_experts_mv() {
                           {k::kQ5_K, k::kQ5_K, k::kQ6_K, "Q5_K / Q6_K"},
                           {k::kQ8_0, k::kNVFP4, k::kQ6_K, "mixed"},
                           {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4, "IQ3_XXS / NVFP4"},
-                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"}};
+                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"},
+                          {k::kIQ2_XXS, k::kIQ2_XXS, k::kNVFP4, "IQ2_XXS / NVFP4"},
+                          {k::kIQ2_XS, k::kIQ2_XS, k::kNVFP4, "IQ2_XS / NVFP4"},
+                          {k::kIQ2_S, k::kIQ2_S, k::kIQ4_NL, "IQ2_S / IQ4_NL"},
+                          {k::kIQ3_S, k::kIQ3_S, k::kNVFP4, "IQ3_S / NVFP4"},
+                          {k::kIQ3_XXS, k::kIQ3_XXS, k::kIQ4_NL, "IQ3_XXS / IQ4_NL"},
+                          {k::kIQ4_NL, k::kIQ4_NL, k::kNVFP4, "IQ4_NL / NVFP4"},
+                          {k::kQ4_K, k::kQ4_K, k::kNVFP4, "Q4_K / NVFP4"}};
     for (const Case& cs : cases) {
         const int E = 3;
         auto g = rand_blocks(cs.tg, (size_t) E * F * C), u = rand_blocks(cs.tu, (size_t) E * F * C),
@@ -767,9 +931,13 @@ void test_experts_grouped() {
                             {k::kQ8_0, k::kQ8_0, k::kQ8_0},
                             {k::kQ8_0, k::kNVFP4, k::kQ6_K},
                             {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4},
-                            {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K}};
-    const char* tnames[] = {"NVFP4", "Q5_K/Q6_K", "Q8_0", "Q8_0/NVFP4/Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K"};
-    for (int ti = 0; ti < 6; ++ti) {
+                            {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K},
+                            {k::kIQ2_XXS, k::kIQ2_XS, k::kNVFP4},
+                            {k::kIQ2_S, k::kIQ3_S, k::kIQ4_NL},
+                            {k::kQ4_K, k::kQ4_K, k::kNVFP4}};
+    const char* tnames[] = {"NVFP4", "Q5_K/Q6_K", "Q8_0", "Q8_0/NVFP4/Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K",
+                            "IQ2_XXS/IQ2_XS/NVFP4", "IQ2_S/IQ3_S/IQ4_NL", "Q4_K/NVFP4"};
+    for (int ti = 0; ti < 9; ++ti) {
         const auto& ty = types[ti];
         auto g = rand_blocks(ty[0], (size_t) E * F * C), u = rand_blocks(ty[1], (size_t) E * F * C),
              d = rand_blocks(ty[2], (size_t) E * C * F);
@@ -888,6 +1056,12 @@ void test_mv_blocks() {
         {k::kQ5_K, 513, 4608, "Q5_K N=513"},
         {k::kIQ3_XXS, 1031, 4608, "IQ3_XXS N=1031"},
         {k::kIQ4_XS, 513, 4608, "IQ4_XS N=513"},
+        {k::kQ4_K, 513, 4608, "Q4_K N=513"},
+        {k::kIQ2_XXS, 1031, 4608, "IQ2_XXS N=1031"},
+        {k::kIQ2_XS, 513, 4608, "IQ2_XS N=513"},
+        {k::kIQ2_S, 1031, 4608, "IQ2_S N=1031"},
+        {k::kIQ3_S, 513, 4608, "IQ3_S N=513"},
+        {k::kIQ4_NL, 1031, 4608, "IQ4_NL N=1031"},
     };
     for (const Case& cs : cases) {
         const int N = cs.N, K = cs.K;
@@ -1729,6 +1903,11 @@ void test_round2_fused() {
             {k::kQ8_0, k::kNVFP4, 0, true, "Q8_0/NVFP4 mixed"},
             {k::kIQ3_XXS, k::kIQ3_XXS, 0, true, "IQ3_XXS scaled"},
             {k::kIQ4_XS, k::kIQ4_XS, 0, false, "IQ4_XS unscaled"},
+            {k::kIQ2_XXS, k::kIQ2_XXS, 0, true, "IQ2_XXS scaled"},
+            {k::kIQ2_XS, k::kIQ2_S, 0, true, "IQ2_XS/IQ2_S mixed"},
+            {k::kIQ3_S, k::kIQ3_S, 0, false, "IQ3_S unscaled"},
+            {k::kIQ4_NL, k::kIQ4_NL, 0, true, "IQ4_NL scaled"},
+            {k::kQ4_K, k::kQ4_K, 0, true, "Q4_K scaled"},
         };
         for (const Case& cs : cases) {
             auto g = rand_blocks(cs.tg, (size_t) E * F * C), u = rand_blocks(cs.tu, (size_t) E * F * C);
@@ -1787,10 +1966,15 @@ void test_round2_fused() {
                                 {k::kQ8_0, k::kQ8_0},
                                 {k::kQ8_0, k::kNVFP4},
                                 {k::kIQ3_XXS, k::kIQ3_XXS},
-                                {k::kIQ4_XS, k::kIQ4_XS}};
-        const char* tnames[] = {"NVFP4", "Q5_K", "Q6_K", "Q8_0", "Q8_0/NVFP4", "IQ3_XXS", "IQ4_XS"};
+                                {k::kIQ4_XS, k::kIQ4_XS},
+                                {k::kIQ2_XXS, k::kIQ2_XS},
+                                {k::kIQ2_S, k::kIQ3_S},
+                                {k::kIQ4_NL, k::kIQ4_NL},
+                                {k::kQ4_K, k::kQ4_K}};
+        const char* tnames[] = {"NVFP4",    "Q5_K",    "Q6_K",          "Q8_0",    "Q8_0/NVFP4", "IQ3_XXS",
+                                "IQ4_XS",   "IQ2_XXS/IQ2_XS", "IQ2_S/IQ3_S", "IQ4_NL", "Q4_K"};
         const int want_ng[E] = {1, 2, 3, 5, 8};
-        for (int ti = 0; ti < 7; ++ti) {
+        for (int ti = 0; ti < 11; ++ti) {
             const int tg = types[ti][0], tu = types[ti][1];
             auto g = rand_blocks(tg, (size_t) E * F * C), u = rand_blocks(tu, (size_t) E * F * C);
             const size_t eb0 = g.size() / E, eb1 = u.size() / E, slot = (eb0 + eb1 + 255) / 256 * 256;
@@ -2446,9 +2630,13 @@ void test_round6() {
                                 {k::kQ5_K, k::kQ5_K, k::kQ5_K},
                                 {k::kQ6_K, k::kQ6_K, k::kQ6_K},
                                 {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4},
-                                {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K}};
-        const char* tnames[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K"};
-        for (int ti = 0; ti < 6; ++ti) {
+                                {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K},
+                                {k::kIQ2_XXS, k::kIQ2_XS, k::kNVFP4},
+                                {k::kIQ2_S, k::kIQ3_S, k::kIQ4_NL},
+                                {k::kQ4_K, k::kQ4_K, k::kNVFP4}};
+        const char* tnames[] = {"NVFP4",         "Q8_0",         "Q5_K",         "Q6_K",    "IQ3_XXS/NVFP4",
+                                "IQ4_XS/Q6_K", "IQ2_XXS/IQ2_XS/NVFP4", "IQ2_S/IQ3_S/IQ4_NL", "Q4_K/NVFP4"};
+        for (int ti = 0; ti < 9; ++ti) {
             const int tg = types[ti][0], tu = types[ti][1], td = types[ti][2];
             const int Cin = 512;   // weight row width for gate/up (multiple of 256 for Q5_K/Q6_K)
             auto g = rand_blocks(tg, (size_t) E * F * Cin), u = rand_blocks(tu, (size_t) E * F * Cin),
@@ -2729,7 +2917,7 @@ void test_window_exact(bool mma) {
             for (void* p : {(void*) dqb, (void*) ddb, (void*) yb}) CU(cudaFree(p));
         }
     }
-    for (const int ty : {k::kNVFP4, k::kQ8_0}) {   // the experts: a window of T tokens' picks grouped by expert
+    for (const int ty : {k::kNVFP4, k::kQ8_0, k::kIQ4_NL}) {   // the experts: a window of T tokens' picks grouped by expert
         const size_t mb = (size_t) C * F / k::block_values(ty) * k::block_bytes(ty);
         auto pool = rand_blocks(ty, (size_t) E * 3 * C * F);
         auto* dpool = dev(pool);
@@ -2873,7 +3061,7 @@ void test_window_exact(bool mma) {
                 for (void* p : {(void*) dbls[t], (void*) dsgs[t], (void*) dsus[t]}) CU(cudaFree(p));
             char name[160];
             std::snprintf(name, sizeof name, "window experts %s (%s), %d tokens: h and y the one-token path's to the bit",
-                          ty == k::kNVFP4 ? "NVFP4" : "Q8_0", tc ? "tensor cores" : "row dots", T);
+                          ty == k::kNVFP4 ? "NVFP4" : ty == k::kQ8_0 ? "Q8_0" : "IQ4_NL", tc ? "tensor cores" : "row dots", T);
             expect_true(name, h_same && y_same);
             for (void* p : {(void*) dtop, (void*) dx, (void*) dw, (void*) gblob, (void*) gn, (void*) gtok, (void*) grow,
                             (void*) ginv, (void*) gsg, (void*) gsu, (void*) gwt, (void*) h_win, (void*) y_win,
