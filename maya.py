@@ -7122,6 +7122,8 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
                                                  base, version, ctx, args, gpu_text, t_quiet, t_all, SV)
         if tokens_file:                          # (--bench-tokens: every request's greedy tokens, for saved answers)
             first = runs["this"][0]["tokens"]
+            for k, v in MB.choice_files(ROOT, cfg).items():   # (a first start's measurements: part of the state too)
+                choices.setdefault(k, v)
             Path(tokens_file).write_text(json.dumps(dict(
                 base, config=str(cfg_path), family=config_family(cfg), backend=backend, gpu_index=gpus or [],
                 context=ctx, commit=MB.commit_of(ROOT), version=version, text_ref=text_ref or "",

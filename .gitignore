@@ -71,4 +71,5 @@ build-vision.bat
 /maya-nightly-status.txt
 /maya-nightly.lock
 /maya-nightly-*.log
+/maya-nightly-*.tokens.json
 /data/golden/
