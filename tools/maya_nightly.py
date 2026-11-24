@@ -6,7 +6,7 @@
 
 For each model in maya-nightly.json (the machine's own list, not in git):
   1. quiet check and locks - the machine has to be free (GPU, CPU load, heat flag, the GPU locks and the model's own
-     extra locks); a busy model is skipped with BUSY, nothing is waited on for long and nothing is disturbed;
+     extra locks); a model whose machine stays busy for "wait_min" minutes is skipped with BUSY: nothing is disturbed;
   2. ./maya.sh --bench --compare <previous release tag> on this checkout (main): exactness first, then speed, with
      the prompts cut from the release's docs (--bench-text-ref: the same prompts every night);
   3. the saved answers (tools/maya_golden.py --check) from the same run's tokens - no second engine start;
@@ -237,7 +237,10 @@ def run_model(root: Path, m: dict, base: str, st: dict, say, bench=run_bench, bu
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         return dict(out, why=[f"config {cfg_path.name}: {e}"])
-    why = busy(cfg, m)
+    why = busy(cfg, m)                           # (a passing load - a build's last step - gets "wait_min" to go away)
+    while why and time.time() - t < float(st["wait_min"]) * 60:
+        time.sleep(15)
+        why = busy(cfg, m)
     if why:
         return dict(out, status="BUSY", why=why[:3], secs=time.time() - t)
     note = f"maya nightly pid {os.getpid()} on {socket.gethostname()} {time.strftime('%Y-%m-%d %H:%M')} {m['name']}"

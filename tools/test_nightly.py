@@ -90,7 +90,7 @@ class Night(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         (self.root / "maya-a.json").write_text(json.dumps(CFG))
-        self.doc = {"base": "v1.1.76", "models": [{"name": "A", "config": "maya-a.json", "layout": "one",
+        self.doc = {"base": "v1.1.76", "wait_min": 0, "models": [{"name": "A", "config": "maya-a.json", "layout": "one",
                                                    "locks": [str(self.root / "lock-v100")]}]}
         self.said = []
         self.tok = tokens(config=str(self.root / "maya-a.json"), records=[LINE.replace("-8.6%", "-0.6%")])
@@ -167,7 +167,7 @@ class Night(unittest.TestCase):
         self.assertEqual(self.night(dry=True), 0)
         self.assertFalse((self.root / N.RESULTS).exists() or (self.root / N.STATUS).exists())
         text = "\n".join(self.said)
-        self.assertIn("--bench --bench-tokens <tokens> --bench-wait 2 --bench-text-ref v1.1.76 --compare v1.1.76", text)
+        self.assertIn("--bench --bench-tokens <tokens> --bench-wait 0 --bench-text-ref v1.1.76 --compare v1.1.76", text)
         self.assertIn("time budget: 6 of 20 min for 1 model(s)", text)
         self.assertIn("dry run: nothing started", text)
 
