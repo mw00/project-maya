@@ -549,7 +549,117 @@ def input_hashes(chats, prompts, warm) -> dict:
     return out
 
 
-def run_session(start, chats, prompts, warm, label, say, decode_tokens: int = DECODE_TOKENS) -> dict:
+# ------------------------------------------------------------------------------------------------ layout fingerprint
+KEEP_DIR = ".bench-logs"      # each round's engine log: <side>-r<N>.log - only this run's, emptied at the next run
+_DEV = r"((?:CUDA|HIP)\d+)"
+_INFO_KEYS = ("engine_kind", "vram_slots", "ram_slots", "mtp", "dflash")
+
+
+def layout_facts(lines, drafting: str = "") -> dict:
+    """{fact: text} - what an engine log states that decides placement and speed: the GPUs used, the layer split, the
+    expert slots a layer, the RAM tier, the CPU lane (its mode, where its times come from, what it takes), what was
+    loaded and the VRAM left, the drafting.  Times of the start itself (warm-up seconds ...) are not in it."""
+    f, gpus = {}, set()
+    pool, tier, free, warm, lane = {}, {}, {}, {}, {}
+    for x in lines:
+        x = x.strip()
+        m = re.match(r"glm split(?: auto)?: (layers .+?)(?: - | \(|$)", x)
+        if m:
+            f["split"] = m.group(1).removeprefix("layers ")
+            gpus.update(re.findall(_DEV, x))
+        m = re.match(r"layer split across GPUs (.+)$", x) or re.match(r"\[maya\] layer split across GPUs (.+)$", x)
+        if m:
+            f.setdefault("split", m.group(1))
+        m = re.match(r"glm fast: " + _DEV + r" layers \[(\d+),(\d+)\) expert pool [\d.]+ GB, ([\d-]+) slots/layer", x)
+        if m:
+            pool[m.group(1)] = f"{m.group(4)}"
+            gpus.add(m.group(1))
+        m = re.match(r"glm fast: " + _DEV + r" RAM tier [\d.]+ GB pinned, (\d+) slots", x)
+        if m:
+            tier[m.group(1)] = m.group(2)
+        m = re.match(r"glm fast: " + _DEV + r" tiers warm: (\d+) experts", x)
+        if m:
+            warm[m.group(1)] = m.group(2)
+        m = re.match(r"(?:maya serve|glm fast): " + _DEV + r": (\d+) MiB of VRAM free", x)
+        if m:
+            free[m.group(1)] = m.group(2)
+        m = re.match(r"glm fast: " + _DEV + r" CPU lane off: (.+)$", x)
+        if m:
+            lane[m.group(1)] = "off"
+        m = re.match(r"glm fast: " + _DEV + r" CPU lane: (\d+) threads.*takes ([\d ]+)$", x)
+        if m:
+            lane[m.group(1)] = f"{m.group(2)} threads, takes {m.group(3).strip()}"
+        m = re.match(r"glm fast: " + _DEV + r" CPU lane: those times from .*\((not timed|timed[^)]*)\)", x)
+        if m:
+            f["lane times"] = "read from the saved file" if "not" in m.group(2) else "timed at this start"
+        m = re.match(r"glm tier: " + _DEV + r" CPU lane pool mode: (.+?) \(", x)
+        if m:
+            f["lane pool"] = m.group(2)
+        if x.startswith("INFO ") and "engine_kind=" in x:
+            kv = dict(re.findall(r"(\w+)=(\S+)", x))
+            f["engine"] = " ".join(f"{k}={kv[k]}" for k in _INFO_KEYS if k in kv)
+        m = re.match(r"VRAM dev=(\d+) ", x)
+        if m:
+            gpus.add("dev" + m.group(1))
+    gpus = {g for g in gpus if not (g.startswith("dev") and any(h[-1] == g[3:] for h in gpus if h != g))}
+    if gpus:
+        f = {"GPUs": ",".join(sorted(gpus))} | f
+    for k, d in (("slots a layer", pool), ("RAM-tier slots", tier), ("warmed experts", warm), ("lane", lane),
+                 ("VRAM free MiB", free)):
+        if d:
+            f[k] = " / ".join(f"{a} {b}" for a, b in sorted(d.items()))
+    if drafting:
+        f["drafting"] = drafting
+    return f
+
+
+def layout_line(f: dict) -> str:
+    """The one short line a start prints: its facts, in order."""
+    return " | ".join(f"{k}: {v}" for k, v in f.items()) if f else "no placement facts in the engine log"
+
+
+def layout_diff(a: dict, b: dict) -> list:
+    """Which facts differ between two starts (both sides' text), in the order of a's keys."""
+    out = []
+    for k in list(a) + [k for k in b if k not in a]:
+        if a.get(k) != b.get(k):
+            out.append(f"{k}: {a.get(k, '-')} -> {b.get(k, '-')}")
+    return out
+
+
+def layout_report(runs: dict) -> list:
+    """Lines for --compare when tokens differ: round 1 against each later round of a build, and the two builds' round 1,
+    naming the facts that differ (or saying they are the same, so the cause is not placement)."""
+    out = []
+    pairs = [(f"{s} build, round 1 vs round {i + 1}", r[0], r[i]) for s, r in runs.items() for i in range(1, len(r))]
+    if runs.get("this") and runs.get("other"):
+        pairs.append(("this vs other build, round 1", runs["this"][0], runs["other"][0]))
+    for name, a, b in pairs:
+        d = layout_diff(a.get("facts", {}), b.get("facts", {}))
+        out.append(f"  layout, {name}: " + ("; ".join(d) if d else "same facts") +
+                   (f" (logs: {a['log_kept']}, {b['log_kept']})" if a.get("log_kept") and b.get("log_kept") else ""))
+    return out
+
+
+def keep_log(src: Path, keep: Path | None):
+    """Copies a round's engine log to its own file (the next round overwrites `src`)."""
+    if keep is None:
+        return None
+    try:
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, keep)
+        return str(keep)
+    except OSError:
+        return None
+
+
+def clean_kept_logs(root: Path):
+    """The kept logs of the run before - only the current run's stay."""
+    shutil.rmtree(root / KEEP_DIR, ignore_errors=True)
+
+
+def run_session(start, chats, prompts, warm, label, say, decode_tokens: int = DECODE_TOKENS, keep: Path | None = None,
+                drafting_info=None) -> dict:
     """Everything one round measures, in one engine session: the warm-up answer, the decode answers and the prompts.
     Returns the samples, the greedy tokens of every request (exactness) and the wall time of each phase."""
     ph = {}
@@ -582,8 +692,12 @@ def run_session(start, chats, prompts, warm, label, say, decode_tokens: int = DE
     finally:
         ph["stop"] = s.close()
     lines = lines + s.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    kept = keep_log(s.log_path, keep)
+    facts = layout_facts(lines, drafting_choice(drafting_info[0], drafting_info[1], lines, [], drafting_info[2])
+                         if drafting_info else "")
+    say(f"  {label}layout: {layout_line(facts)}" + (f"  (engine log kept: {kept})" if kept else ""))
     return {"answers": answers, "reads": reads, "tokens": toks, "phases": ph, "engine_lines": lines,
-            "reused": reused}
+            "reused": reused, "facts": facts, "log_kept": kept}
 
 
 # ------------------------------------------------------------------------------------------------ learned files

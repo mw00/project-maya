@@ -47,6 +47,7 @@ td.log
 /maya-bench.txt
 /maya-bench-results.txt
 /.bench-builds/
+/.bench-logs/
 /build-strata.bat
 /build-maya*.bat
 /build-engine.log

@@ -7182,10 +7182,13 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         base = {"machine": socket.gethostname().split(".")[0], "gpus": gpu_text, "driver": driver,
                 "model": bench_model_name(cfg), "date": time.strftime("%Y-%m-%d")}
         choices = MB.choice_files(ROOT, cfg) if tokens_file else {}   # (the saved per-PC choices this run starts from)
+        MB.clean_kept_logs(ROOT)                 # (each round's engine log is kept in .bench-logs: this run's only)
+        info = (args, cfg.get("env") or {}, config_family(cfg))
         if not compare:
             before = MB.learned_listing(ROOT, cfg)
             run = MB.run_session(here, chats, prompts, warm, "", say,
-                                 MB.SMOKE_TOKENS if smoke else MB.DECODE_TOKENS)
+                                 MB.SMOKE_TOKENS if smoke else MB.DECODE_TOKENS,
+                                 keep=ROOT / MB.KEEP_DIR / "this-r1.log", drafting_info=info)
             runs = {"this": [run]}
             res = MB.summarize([run], prompts)
             drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"],
@@ -7199,6 +7202,8 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
                        note="; ".join(x for x in ("first start: rough" if new else "",
                                                   "prompt reuse seen" if run["reused"] else "") if x))
             lines = bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, [run], t_quiet, t_all)
+            lines.insert(len(lines) - 1, "layout: " + MB.layout_line(run["facts"]) +
+                         (f" (engine log kept: {run['log_kept']})" if run["log_kept"] else ""))
             records = [MB.record_line(rec)]
             if smoke and any(a["produced"] == 0 for a in run["answers"]):
                 fail("the model answered nothing (0 tokens) in the smoke run",
@@ -7299,7 +7304,9 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
                 learned.restore(other if side == "other" else None)
                 say(f"  round {r + 1} of {rounds}: {side} build")
                 runs[side].append(MB.run_session(here if side == "this" else there, chats, prompts, warm,
-                                                 f"[{side}] ", say))
+                                                 f"[{side}] ", say,
+                                                 keep=ROOT / MB.KEEP_DIR / f"{side}-r{r + 1}.log",
+                                                 drafting_info=(args, cfg.get("env") or {}, config_family(cfg))))
                 if r == 0 and side == "this":
                     learned = learned.adopt(cfg)  # (learned at a first start: kept, so no later round learns again)
     finally:
@@ -7319,6 +7326,7 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
         lines += [f"{side} build {names[side]}: {root}"] + [
             "  " + x for x in bench_text(ver, cfg_path, cfg, ctx, gpu_text, res[side], drafting, runs[side],
                                          t_quiet, t_all)[2:]]
+        lines += [f"  start {i + 1} layout: " + MB.layout_line(r["facts"]) for i, r in enumerate(runs[side])]
     lines.append("exactness (greedy tokens of every bench request, this vs other, every pairing of rounds): " +
                  verdict + ("" if not exact else " - " + "; ".join(exact)))
     for side, d in again.items():
@@ -7326,6 +7334,8 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
     if any(again.values()):
         lines.append("  (a build that differs from itself between starts: this engine is not repeatable start to "
                      "start on this PC, so a difference between the builds is not proof of an answer change)")
+    if exact or any(again.values()):             # (tokens differ: which start's engine log states something different)
+        lines += ["the starts' engine logs, compared (facts the logs state about placement and speed):"] +             MB.layout_report(runs)
     lines.append(f"wall time all: {time.time() - t_all:.0f} s (quiet check {t_quiet:.0f} s)")
     records.append(MB.compare_line(res["other"], res["this"], names["other"], names["this"], verdict))
     return lines, records, runs
