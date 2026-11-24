@@ -320,12 +320,8 @@ struct Vision::Impl {
     bool pinned = false;
     size_t host_b = 0, last_b = 0;
     bool last_lent = false;
-    bool fp16 = false;   // FP16 GEMMs on GPUs without hardware BF16 BLAS (gfx906/gfx10/pre-Ampere; HY4_VISION_FP16=0|1)
-#if defined(STRATA_USE_HIP)
-    bool tf32 = std::getenv("HY4_VISION_F32") != nullptr && std::atoi(std::getenv("HY4_VISION_F32")) == 0;
-#else
+    bool fp16 = false;   // FP16 GEMMs on HIP GPUs without hardware BF16 BLAS (gfx906/gfx10; HY4_VISION_FP16=0|1)
     bool tf32 = std::getenv("HY4_VISION_F32") == nullptr;   // (attention's products in TF32; =1: plain F32)
-#endif
 
     ~Impl() {
         if (dev >= 0) cudaSetDevice(dev);
@@ -422,15 +418,16 @@ struct Vision::Impl {
             cudaDeviceProp pr{};
             const char* fv = std::getenv("HY4_VISION_FP16");
             bool need_fp16 = false;
+#if defined(STRATA_USE_HIP)
             if (cudaGetDeviceProperties(&pr, dev) == cudaSuccess) {
-#if !defined(STRATA_USE_HIP)
-                need_fp16 = pr.major < 8;
-#else
                 need_fp16 = std::strstr(pr.gcnArchName, "gfx906") != nullptr ||
                             std::strstr(pr.gcnArchName, "gfx10") != nullptr;
-#endif
             }
+#else
+            (void) pr;
+#endif
             fp16 = fv != nullptr ? std::atoi(fv) != 0 : need_fp16;
+            if (need_fp16 && std::getenv("HY4_VISION_F32") == nullptr) tf32 = false;
         }
         VK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
         VK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
