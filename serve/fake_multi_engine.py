@@ -83,6 +83,7 @@ def read_piece():
 threading.Thread(target=reader, daemon=True).start()
 out("INFO engine=fake-multi")
 out("INFO logprobs=20")
+time.sleep(float(os.environ.get("FAKE_ENGINE_LOAD_S", "0") or 0))   # (a slow load: a stop signal arrives in it)
 out(f"READY 4096 stop pause multi={n}")
 while not quit_.is_set():
     read_piece()

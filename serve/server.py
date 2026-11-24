@@ -24,6 +24,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import contextlib
 import dataclasses
@@ -1118,6 +1119,7 @@ class StrataEngine:
             models.hy4_note_before_start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        track_spawned(self.proc)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
@@ -2066,6 +2068,7 @@ class Vision:
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=self.log or subprocess.DEVNULL, text=True, encoding="utf-8",
                                          bufsize=1, env=env)
+            track_spawned(self.proc)
             line = self.proc.stdout.readline()
             if not line.startswith("READY"):
                 raise RuntimeError("the vision encoder did not start: " + line.strip())
@@ -7660,10 +7663,72 @@ def wait_for_stop(stop: threading.Event, step: float = 0.5) -> None:
         time.sleep(step)
 
 
+# The programs this server started that must not outlive it (the engine, the vision encoder).  A server that ends -
+# a signal while the engine loads, an exception, sys.exit - ends them on the way out (#1181: a SIGTERM during the load
+# left the engine alone, holding the GPUs and the RAM tier).
+_SPAWNED: list = []
+_STARTING = [True]          # until main() has the server up: a stop signal ends the engine and the server at once
+
+
+def track_spawned(proc) -> None:
+    """Register a program the server started (engine.stop / close still end it the usual way)."""
+    _SPAWNED[:] = [p for p in _SPAWNED if p.poll() is None]
+    _SPAWNED.append(proc)
+
+
+def end_spawned(grace: float = 5.0) -> None:
+    """End every program this server started that still runs, with what it started in turn: asked first (SIGTERM),
+    killed after `grace` seconds; on Windows the whole tree (taskkill /T) at once."""
+    procs = [p for p in _SPAWNED if p.poll() is None]
+    if not procs:
+        return
+    if os.name == "nt":
+        for p in procs:
+            try:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            try:
+                p.kill()
+            except OSError:
+                pass
+    else:
+        import signal
+        kids = []
+        for p in procs:
+            try:
+                import psutil
+                kids += psutil.Process(p.pid).children(recursive=True)
+            except Exception:  # noqa: BLE001 - no psutil: the child alone
+                pass
+        for p in procs:
+            with contextlib.suppress(OSError):
+                p.send_signal(signal.SIGTERM)
+        end = time.monotonic() + grace
+        for p in procs:
+            with contextlib.suppress(Exception):
+                p.wait(timeout=max(0.1, end - time.monotonic()))
+            if p.poll() is None:
+                with contextlib.suppress(OSError):
+                    p.kill()
+        for k in kids:
+            with contextlib.suppress(Exception):
+                if k.is_running():
+                    k.kill()
+    for p in procs:
+        with contextlib.suppress(Exception):
+            p.wait(timeout=10)
+
+
+atexit.register(end_spawned)
+
+
 def stop_signals(stop: threading.Event) -> None:
     """SIGTERM, SIGINT (Ctrl+C), SIGHUP (the terminal closed) and Windows' SIGBREAK (Ctrl+Break) stop the server
     (request_stop).  A later one is ignored while it stops - but a second Ctrl+C raises KeyboardInterrupt: at once.  A
-    signal that is ignored (nohup) stays ignored."""
+    signal that is ignored (nohup) stays ignored.  main() installs them before it starts the engine: one that comes
+    while the engine loads (nothing is serving yet, nothing to wrap up) ends the engine and the server right there."""
     import signal
 
     def on(signum, frame):
@@ -7672,6 +7737,9 @@ def stop_signals(stop: threading.Event) -> None:
                 raise KeyboardInterrupt
             return
         request_stop(stop, signal.Signals(signum).name)
+        if _STARTING[0]:
+            end_spawned()
+            raise SystemExit(128 + int(signum))
     for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
         sig = getattr(signal, name, None)
         try:
@@ -7831,6 +7899,8 @@ def main() -> int:
                          "when it closes - that program ended, however it ended - the server stops as on Ctrl+C "
                          "(on Linux also when its parent process ends)")
     a = ap.parse_args()
+    stop = threading.Event()
+    stop_signals(stop)                                  # before any engine starts (#1181); ends it if one comes then
     if a.engine == "strata":
         a.engine = "maya"
     maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
@@ -8124,8 +8194,7 @@ def main() -> int:
     # conversation.  A second signal while that runs (systemd signals the whole group, then the supervisor again) is
     # ignored instead of cutting it short - except a second Ctrl+C, which ends the server at once (the engine then ends
     # when its input closes).
-    stop = threading.Event()
-    stop_signals(stop)
+    _STARTING[0] = False                                # (the signals were installed before the engine started)
     if a.parent_pipe:
         watch_parent(lambda why: request_stop(stop, why))
     try:
