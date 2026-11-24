@@ -241,6 +241,13 @@ histories are a visit's. `ref/inkling2.py` and `maya-ik2` keep a list of visits;
 not folded, gate and up merged into `ffn_gate_up_exps`); the reference and the engine read both layouts.
 UD-Q4_K_XL (17.6 GB) holds the experts of layers 0-19 in NVFP4 - their original bits - and those of layers 20-23
 and the dense weights in Q8_0. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
+UD-IQ3_XXS (11.7 GB) holds gate and up in IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS, down in NVFP4 (IQ4_NL in layers 20-23),
+its embedding and three `attn_q` in Q4_K: read since the IQ2 / IQ3_S / IQ4_NL / Q4_K blocks joined the decoded ones
+(their 32-value sub-blocks against the inputs, as IQ3_XXS's and IQ4_XS's). On an RTX 5080 (16 GB, Windows, FP8 cache,
+32,768 context) every expert stays in VRAM (9.6 GiB) and a token goes at 63 tok/s: its dense weights are of mixed
+types, so the fused projections are not kept as blocks and the token takes the cache path (the resident one stays
+off, #1173). Its head in Q5_K gives the drafter's fold no rows to read, so `--drafting auto` leaves the drafter out
+with a NOTE and keeps the prompt lookup.
 Against llama.cpp (b12590 with the Inkling 2 PRs) the reference agrees on 47 of 47 top-1 tokens, KL 2.5e-3; the
 engine against the reference on 45-46 of 47, KL 6e-3..7e-3 - near ties of the router, as section 6.1 found; with
 the messages left out the KL is 0.56.

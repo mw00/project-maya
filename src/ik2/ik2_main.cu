@@ -6873,6 +6873,15 @@ int main(int argc, char** argv) {
             if (model_drafter ? draft_path.empty() : !g_lookup) continue;
             const auto* head = S.info("output.weight");
             const int head_rows = head ? (int) (head->elements() / c.C) : 201024;
+            // (the fold reads an FP16 head or a planar Q8_0 one: on the layout that keeps the dense weights as their blocks,
+            //  a head of another type - UD-IQ3_XXS's is Q5_K - has no rows for it, and the drafter is left out)
+            if (model_drafter && g_dense_q8 && !(head && (int) head->type == k::kQ8_0 && c.C % 128 == 0)) {
+                std::printf("NOTE maya-ik2: the drafter left out: the output head is %s, and the fold reads an FP16 or a "
+                            "planar Q8_0 one\n",
+                            head ? head->type_name() : "missing");
+                draft_path.clear();
+                continue;
+            }
             // (the drafter: its context rows in FP16, else in FP8 - IK2_DRAFT_KV takes one; the load below measures)
             const char* kv_env = getenv("IK2_DRAFT_KV");
             const bool only16 = kv_env && std::string(kv_env) == "f16", only8 = kv_env && std::string(kv_env) == "fp8";
@@ -7096,7 +7105,9 @@ int main(int argc, char** argv) {
             const int nr = (int) pr.second.size();
             if (ti->elements() != (uint64_t) c.E * c.F * C * nr) die(n + ": shape");
             if (!k::block_values((int) ti->type)) die(n + ": type " + ti->type_name() + " not decoded here");
-            if (C % k::block_values((int) ti->type) || c.F % k::block_values((int) ti->type))
+            // (a row: C values of gate / up and of a fused gate_up, F of down - the width this tensor is read with)
+            const int row_w = pr.first == "down" ? c.F : C;
+            if (row_w % k::block_values((int) ti->type))
                 die(n + ": a row is not whole " + ti->type_name() + " blocks");
             const size_t per = tensor_bytes(*ti) / c.E;
             std::vector<float> sc;
