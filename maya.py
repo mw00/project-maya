@@ -39,7 +39,7 @@ no tuning step - it balances its own split):
      Maya-S, Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits or the
      self-calibrated one at 4.10: NVIDIA from V100, and AMD)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
-  4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): 10-30 minutes, once
+  4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): a few minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
@@ -2850,7 +2850,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     targets = [target] + [t for t in also if t != target]
     build = [cmake, "--build", str(BUILD), "--target", *targets, "-j", str(jobs)]
     say("  Compiling the engine" + ("s " + ", ".join(targets) if len(targets) > 1 else "") + " for " +
-        ", ".join(f"sm_{x}" for x in archs) + " (10-30 minutes the first time, a few minutes after an update) ...")
+        ", ".join(f"sm_{x}" for x in archs) + " (a few minutes) ...")
     stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
@@ -4511,7 +4511,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
-        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") +
+        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: a few minutes") +
         ", once) ...")
     def steps(more=()) -> bool:
         return not cmake_steps(conf + list(more), [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j",
