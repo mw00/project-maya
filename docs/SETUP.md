@@ -209,6 +209,7 @@ WantedBy=multi-user.target
 | `--env KEY=VALUE` | an engine setting kept in the config (see [Tuning](SETTINGS.md)) |
 | `--host-compiler g++-12` | when your g++ is newer than your CUDA accepts ("unsupported GNU version") |
 | `--rebuild`, `--repack` | compile the engine / build the pack again |
+| `--full-build-output` | every line of the compilers on the screen. Without it each compile step shows one progress line and writes the compilers' output to `build-engine.log` / `build-vision.log` in the install folder (its last lines are shown when a step stops). `MAYA_BUILD_OUTPUT=full` does the same |
 | `--calibrate` | tune the engine for this PC (see [Tuning](SETTINGS.md)): GLM's CPU lane, DeepSeek's `--tp` and CPU threads, MiniMax's [prefill calibration](SETTINGS.md#minimax-m31-flash) (the chunk and the matrix products' library a prompt is read with); then start; with `--no-start` only tune |
 | `--speed-calibration` | measure again whether the drafter (DFlash2, or DeepSeek's or MiniMax's DSpark) decodes faster on this PC ([how](SETTINGS.md#the-speed-calibration); 5-30 minutes, with Maya stopped) and keep the faster, then start; with `--no-start` only measure |
 | `--drafting measure\|on\|off` | the drafter without the question: `measure` = the speed calibration (the default with `--yes`), `on` = draft with it, `off` = no drafting - both skip the measuring |

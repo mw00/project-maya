@@ -86,5 +86,33 @@ class Progress(unittest.TestCase):
             m.file.close()
 
 
+class OnTheSetupScreen(unittest.TestCase):
+    """With the setup's screen (setup.UI, a Bridge) a compile step's lines go to the BuildLog, not to the screen's
+    output or its summary: the screen gets progress events."""
+
+    def test_the_bridge_hands_the_lines_to_the_log(self):
+        import threading
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from setup_bridge import Bridge
+        with tempfile.TemporaryDirectory() as t:
+            ui = Bridge(Path(t) / "setup.log")
+            ui.thread = threading.current_thread()
+            with patch.object(S, "UI", ui):
+                steps = S.BuildLog(Path(t) / "build-engine.log", "the engine")
+                rc = steps.run(py("print('[1/2] Building a.o'); print('[2/2] Building whisper-enc.cpp.o')"))
+                steps.close(None)
+            ui.log.close()
+            kinds = []
+            while not ui.events.empty():
+                kinds.append(ui.events.get()[0])
+            self.assertEqual(rc, 0)
+            self.assertEqual((steps.done, steps.total), (2, 2))
+            self.assertNotIn("out", kinds)
+            self.assertIn("progress", kinds)
+            self.assertIn("whisper-enc", (Path(t) / "build-engine.log").read_text(encoding="utf-8"))
+            self.assertNotIn("whisper-enc", (Path(t) / "setup.log").read_text(encoding="utf-8"))
+            self.assertEqual([k for _, k, _ in ui.entries if k == "out"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
