@@ -360,8 +360,9 @@ drafter and both answers fastest (a chat, a code and a tool-call request, `IK2_D
 `data/ik2-drafting.txt` (per GPU, driver, model files, context and cache; `maya --speed-calibration` measures again);
 **on** drafts with the drafter and the prompt lookup, the controller choosing each step; **off** loads neither. A
 request's `spec=1` asks for no drafting. The drafter takes room only where the start plan stays as it is without it
-(every expert in VRAM, the same context and cache, and not the free VRAM the pictures' encoder would start in on the
-GPU - `IK2_VISION_GIB`, the server's), else it is left out with a NOTE. It is loaded last before the expert cache and
+(every expert in VRAM, the same context and cache), else it is left out with a NOTE. Pictures take nothing from it:
+the plan is the same with images on or off, and the image encoder runs on the CPU whenever the VRAM free beside the
+model and the drafter does not hold it. It is loaded last before the expert cache and
 what is left is measured: where the context rows of its layer without a window do not fit in FP16 (4 KiB a
 position) they are kept in FP8 (2 KiB; `IK2_DRAFT_KV=f16|fp8` decides instead), so a 24 GB card keeps the drafter at
 262,144 tokens with the FP8 cache (1.0 GiB; `tools/ik2_fit.py` `draft_gib`: 0.86 GiB + 4 KiB a token for FP16
