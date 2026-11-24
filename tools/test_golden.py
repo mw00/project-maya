@@ -93,15 +93,15 @@ class Locks(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"MAYA_GPU_LOCKS": d}), \
                 patch.object(MB, "LOCK_DIRS", ()):
-            a = MB.take_locks("cuda", [0, 1, 2], "run A")
-            b = MB.take_locks("cuda", [2], "run B")           # (the file is A's already: not taken, not rewritten)
-            self.assertEqual(([p.name for p in a], b), (["gpu0", "gpu1", "gpu2"], []))
-            self.assertEqual(MB.held_locks(["gpu2"], "run B"), [(str(Path(d) / "gpu2"), "run A")])
-            self.assertEqual(MB.held_locks(["gpu0", "gpu1", "gpu2"], "run A"), [])
-            MB.release_locks(b, "run B")
-            self.assertTrue((Path(d) / "gpu2").exists())
+            a = MB.take_locks("cuda", [0, 1], "run A")
+            self.assertEqual([p.name for p in a], ["gpu0", "gpu1"])
+            with self.assertRaisesRegex(RuntimeError, r"another run took .*gpu1 \(run A\) first"):
+                MB.take_locks("cuda", [1, 2], "run B")        # (gpu1 is A's: B backs off ...)
+            self.assertEqual(sorted(os.listdir(d)), ["gpu0", "gpu1"])   # (... and gives gpu2 back)
+            self.assertEqual((Path(d) / "gpu1").read_text(), "run A\n")
+            self.assertEqual([p.name for p in MB.take_locks("cuda", [2], "run B")], ["gpu2"])
             MB.release_locks(a, "run A")
-            self.assertEqual(os.listdir(d), [])
+            self.assertEqual(os.listdir(d), ["gpu2"])
 
 
 class Sets(unittest.TestCase):

@@ -381,10 +381,10 @@ def wait_quiet(backend, gpus, wait_min: float, say, lock_note="") -> list:
 
 
 def take_locks(backend, gpus, note) -> list:
-    """Create our lock files - each only if nobody has it (created in one step: of two runs that found the machine
-    quiet in the same second, one gets the file).  Returns the ones taken; held_locks(names, note) then lists any
-    that went to the other run."""
-    taken = []
+    """Create our lock files, each in one step and only if nobody has it: of two runs that found the machine quiet
+    in the same second, one gets the file.  The run that lost one gives back what it took and raises RuntimeError
+    (it must not start beside the other).  Returns the files taken."""
+    taken, lost = [], []
     for d in lock_dirs():
         for n in lock_names(backend, gpus):
             p = d / n
@@ -392,8 +392,14 @@ def take_locks(backend, gpus, note) -> list:
                 with open(p, "x", encoding="utf-8") as f:
                     f.write(note + "\n")
                 taken.append(p)
-            except OSError:                      # (somebody's already: theirs)
+            except FileExistsError:              # (somebody's already)
+                who = p.read_text(errors="replace").strip().splitlines()[:1] if p.is_file() else []
+                lost.append(f"{p} ({who[0] if who else 'no note'})")
+            except OSError:                      # (a folder we cannot write: no lock there, as before)
                 pass
+    if lost:
+        release_locks(taken, note)
+        raise RuntimeError("another run took " + ", ".join(lost) + " first")
     return taken
 
 

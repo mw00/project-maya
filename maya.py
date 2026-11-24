@@ -7083,12 +7083,10 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         fail("this machine is not quiet enough for a speed number: " + "; ".join(why),
              f"wait for it (or give it longer: {ME} --bench --bench-wait <minutes>), then run --bench again")
     t_quiet = time.time() - t_all
-    locks = MB.take_locks(backend, gpus, note)
-    lost = MB.held_locks(MB.lock_names(backend, gpus), note)   # (another run that found it quiet in the same second)
-    if lost:
-        MB.release_locks(locks, note)
-        fail("this machine is not quiet enough for a speed number: another run took " +
-             ", ".join(f"{p} ({who or 'no note'})" for p, who in lost) + " first", "run --bench again")
+    try:
+        locks = MB.take_locks(backend, gpus, note)
+    except RuntimeError as e:                    # (another run that found it quiet in the same second took one first)
+        fail(f"this machine is not quiet enough for a speed number: {e}", "run --bench again")
     try:
         tok = ST.Tokenizer.from_dir(tp)
         ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
@@ -12019,8 +12017,8 @@ def main() -> int:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if not have:
             fail("Maya is not set up here yet", f"run {ME} first")
-        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait),
-                     a.bench_tokens, a.bench_text_ref)
+        more = {k: v for k, v in (("tokens_file", a.bench_tokens), ("text_ref", a.bench_text_ref)) if v}
+        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait), **more)
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
     if a.backend:
