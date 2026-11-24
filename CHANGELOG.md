@@ -4,6 +4,23 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.78 - 2026-11-24
+
+The full GLM-5.3 runs again, Inkling 2 Mini keeps its drafter with pictures on, and the setup is shorter and quieter.
+
+- **Fix: the full GLM-5.3 failed every request since v1.1.75 (#1200, #1191)** with "kernel launch(es) failed". It answers again. GLM-5.3-Flash was not affected. Maya now checks this at load, and every release is tested with the full model too.
+- **Fix: Inkling 2 Mini lost its drafter on 24 GB cards when pictures were on** (the setup's default), so it decoded at plain speed. The drafter now always loads; the picture reader uses the GPU when there is room at that moment and the CPU otherwise. Verified on a card limited to 24 GB - if you have a 24 GB RTX card, please report your `./maya.sh --bench` line.
+- **Fix: DeepSeek could end a turn empty after thinking (#1206, #1207).** The turn now gets its answer, and a tool call written inside the thinking is read out of it.
+- **Fix: stopping the server while a model was loading left the engine running (#1181).** The engine now ends with the server, on Linux and Windows.
+- **Fix: temporary picture folders piled up (#1180).** They are removed when the server ends, and old ones are cleaned at start.
+- **Fix: GLM on Linux kept several GB of file mappings in memory after loading (#1182).** They are released once the model is in VRAM: about 6.4 GB less on GLM-5.3-Flash, the same answers and speed.
+- **Fix: the DeepSeek speed calibration could be fooled by a kept conversation (#1203);** it now measures on a clean slot.
+- **DeepSeek across PCs on a slow link (#1143):** the choice near the 1 ms mark no longer flips between starts (`MAYA_DS4_RING_FAST_LINK=0` keeps the old mark).
+- **Setup: shorter and quieter.** The picture reader compiles only what Maya's models use (19-28% less time for that step, identical results), and each compile step shows one progress line; the full output goes to `build-engine.log` / `build-vision.log` (`--full-build-output` shows it as before). If the lean build fails, the setup falls back to the full one.
+- **A note at start** when NVIDIA-only DeepSeek switches are set on a single AMD GPU, where they do not apply (#1120).
+- **Benchmark:** `--bench` now starts the engine exactly as the server does, and `--bench --bench-smoke` gives a short check.
+- **Credits.** #1191 was contributed by @Cass67, and #1207 by @lmh555168. The rest of this release is by @mw00 (peasantsmith).
+
 ## v1.1.77 - 2026-11-24
 
 Fixes for PCs that could not run Maya, steadier answers, and a batch of same-answer speed-ups from the community.
