@@ -16,6 +16,7 @@
 // The DSA caches are append-only (latent column per token; a pool's key when its last member
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
+#include "maya/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 #include "maya/core/glm_dsa_split.hpp"   // glm-dsa B6.1 / B6.2
 #include "maya/core/glm_dsa_spec.hpp"   // glm-dsa B11.2
@@ -1086,6 +1087,29 @@ int Glm5Model::sample_token(maya::kernels::SamplerParams& sp, std::string& err) 
     // the fast path already ran the greedy argmax on the device at the end of the forward (an unbiased one)
     if (fast_ != nullptr && sp.greedy && sp.logit_bias == nullptr && sp.penalty_last_n <= 0 && last_tok_ >= 0)
         return last_tok_;
+    // the two-rig split: the back samples (it has the logits), the front reads its pick
+    if (maya::core::glmlink::role() == maya::core::glmlink::kFront) {
+        int32_t tk = -1;
+        if (!maya::core::glmlink::recv_tok(maya::core::glmlink::kSample, pos_, tk, err)) return -1;
+        if (tk < 0 || tk >= g_.n_vocab) {   // (the next token's embedding row is read by this id)
+            err = "glm link: the back sent " + std::to_string(tk) + ", which is no token id";
+            maya::core::glmlink::abort_link(err);
+            return -1;
+        }
+        return tk;
+    }
+    if (maya::core::glmlink::role() == maya::core::glmlink::kBack) {
+        Glm5Model* tl = this;   // (several local parts: the last one holds the logits)
+        while (tl->split_next_) tl = tl->split_next_.get();
+        const int tok = tl->fast_ != nullptr ? tl->fast_sample(sp, err) : -1;
+        cudaSetDevice(dev_);
+        if (tok < 0) maya::core::glmlink::abort_link(err.empty() ? "the sampler failed" : err);
+        else if (!maya::core::glmlink::send_tok(maya::core::glmlink::kSample, pos_, tok)) {
+            err = "glm link: down";
+            return -1;
+        }
+        return tok;
+    }
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     if (tail->d_tok_ == nullptr) {
@@ -1245,7 +1269,7 @@ bool Glm5Model::head_split_link(Glm5Model* helper, std::string& err) {
 }
 
 bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
-                                const std::vector<int>& devs, std::string& err) {
+                                const std::vector<int>& devs, std::string& err, int first, int last) {
     const int n = (int) devs.size();
     if (n < 2 || n > kMaxParts || (int) bounds.size() != n - 1) {
         err = "glm split: " + std::to_string(n) + " devices need " + std::to_string(std::max(0, n - 1)) +
@@ -1276,7 +1300,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         std::vector<char> ok((size_t) n, 0);
         std::vector<std::thread> th;
         for (int i = 0; i < n; ++i) {
-            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+            const int l0 = i == 0 ? first : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : last;
             Glm5Model* p = parts[(size_t) i];
             p->n_parts_ = n;
             p->part_ = i;
@@ -1313,8 +1337,8 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
                 split_next_.reset();
                 return false;
             }
-            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
-            where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
+            const int l0 = i == 0 ? first : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : last;
+            where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(l1 > 0 ? l1 : g_.n_layers) +
                      ") on CUDA" + std::to_string(devs[(size_t) i]);
         }
         ram_left_check();
@@ -1322,7 +1346,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
     Glm5Model* prev = nullptr;
     Glm5Model* m = this;
     for (int i = 0; i < n; ++i) {
-        const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+        const int l0 = i == 0 ? first : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : last;
         if (prev != nullptr) {
             prev->split_next_.reset(new Glm5Model());
             m = prev->split_next_.get();
@@ -1337,7 +1361,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             if (prev != nullptr) prev->split_next_.reset();
             return false;
         }
-        where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
+        where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(l1 > 0 ? l1 : g_.n_layers) +
                  ") on CUDA" + std::to_string(devs[(size_t) i]);
         prev = m;
     }
@@ -2067,6 +2091,41 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
     return dflash_bind(err);
 }
 
+// The two-rig split's model check - both sides of the link must have loaded the same model.  What is compared is
+// the pack's metadata: the geometry, a hash of the tensor index (index.txt, native_experts.txt and an EXL3 pack's
+// exl3.txt, their comment lines left out: every tensor's type, size and place in the model's files) and the GGUF
+// shards' names and sizes as the setup recorded them (sources.json).  The weights themselves are not hashed.
+static std::string glm_link_model_id(const std::string& pack_dir, const Glm5Geometry& g) {
+    std::string id = "layers=" + std::to_string(g.n_layers) + ",embd=" + std::to_string(g.n_embd) + ",hc=" +
+                     std::to_string(g.hc);
+    uint64_t h = 14695981039346656037ull;   // FNV-1a, 64 bits
+    for (const char* name : {"/index.txt", "/native_experts.txt", "/exl3.txt"}) {
+        std::ifstream in(pack_dir + name);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            line += '\n';
+            for (const unsigned char c : line) h = (h ^ c) * 1099511628211ull;
+        }
+    }
+    char hex[20];
+    std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) h);
+    id += std::string(",index=") + hex;
+    std::ifstream in(pack_dir + "/sources.json");
+    const std::string js((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string files;
+    for (size_t at = js.find("\"name\""); at != std::string::npos; at = js.find("\"name\"", at + 1)) {
+        const size_t q0 = js.find('"', js.find(':', at) + 1), q1 = q0 == std::string::npos ? q0 : js.find('"', q0 + 1);
+        const size_t sz = js.find("\"size\"", at), next = js.find("\"name\"", at + 1);
+        if (q1 == std::string::npos || sz == std::string::npos || (next != std::string::npos && sz > next)) break;
+        const size_t d0 = js.find_first_of("0123456789", js.find(':', sz));
+        const size_t d1 = d0 == std::string::npos ? d0 : js.find_first_not_of("0123456789", d0);
+        if (d0 == std::string::npos) break;
+        files += (files.empty() ? "" : ";") + js.substr(q0 + 1, q1 - q0 - 1) + ":" + js.substr(d0, d1 - d0);
+    }
+    return id + ",files=" + (files.empty() ? "?" : files);
+}
+
 bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, std::string& err,
                                 const std::string& layer_split) {
     // the layer split is the DEFAULT on multi-GPU hosts (measured at steady state, 640-token GEN on
@@ -2077,6 +2136,10 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     if (!glm_pack_geometry(pack_dir, g_, err)) return false;   // glm-dsa B1.5: bounds checked against this pack
     // MAYA_GLM_TP=N (opt-in): tensor parallel over the first N GPUs of MAYA_GLM_DEVS (else 0..N-1) - glm_tp.cu
     if (const char* tp = getenv("MAYA_GLM_TP"); tp != nullptr && std::atoi(tp) >= 2) {
+        if (maya::core::glmlink::role() != maya::core::glmlink::kNone) {   // (its loader knows no roles)
+            err = "glm link: the two-rig split (--role) does not run with MAYA_GLM_TP";
+            return false;
+        }
         std::vector<int> devs;
         if (const char* dv = getenv("MAYA_GLM_DEVS"); dv != nullptr && dv[0] != '\0') {
             std::stringstream ss(dv);
@@ -2091,6 +2154,94 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     const bool kv_auto = glm_dsa_kv_auto(g_, max_ctx);       // decision 36 (glm-dsa only; Flash: false)
     const char* sp = getenv("MAYA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
+    // the two-rig split (maya/core/glm_link.hpp, --role front|back): this process loads ONE part of a two-part split
+    // at layer K on its first visible GPU, and the link carries the boundary
+    if (maya::core::glmlink::role() != maya::core::glmlink::kNone) {
+        if (!maya::core::glmlink::key_ready(err)) return false;   // (a set but bad link key: refuse before loading)
+        if (getenv("MAYA_GLM_SLOW") != nullptr) {   // (the hop is in the fast path's decode and prompt path only)
+            err = "glm link: the two-rig split (--role) runs on the fast path only (unset MAYA_GLM_SLOW)";
+            return false;
+        }
+        if (!g_.mhc()) {   // (the link hooks sit in GLM-5.3-Flash's mHC decode and prompt paths)
+            err = "glm link: the two-rig split (--role) runs GLM-5.3-Flash packs only, not this one";
+            return false;
+        }
+        if (!dflash_path_.empty()) {   // (the drafter reads the trunk's hidden states from both sides' layers)
+            err = "glm link: no DFlash2 drafter over the two-rig split (leave out --dflash / MAYA_GLM_DFLASH)";
+            return false;
+        }
+        std::fprintf(stderr, "glm link: the two-rig split is EXPERIMENTAL (docs/TWO-RIG-SPLIT.md)\n");
+        // --layer-split K: one part on the first visible GPU; K:b1,b2,..: this side's layers over several local GPUs
+        // (b = the first layer of each later local part - the front's lie below K, the back's above), each local
+        // boundary an ordinary in-process hop, the link between the front's last part and the back's first
+        const size_t colon = spec.find(':');
+        const std::string ks = spec.substr(0, colon);
+        const int K = std::atoi(ks.c_str());
+        if (ks.empty() || ks.find_first_not_of("0123456789") != std::string::npos || K < 1) {
+            err = "glm link: --role needs --layer-split K or K:b1,b2,.. (K the back's first layer)";
+            return false;
+        }
+        const bool front = maya::core::glmlink::role() == maya::core::glmlink::kFront;
+        maya::core::glmlink::set_split(K);
+        maya::core::glmlink::set_model(glm_link_model_id(pack_dir, g_));
+        std::vector<int> lb;
+        if (colon != std::string::npos) {
+            std::stringstream ss(spec.substr(colon + 1));
+            std::string t;
+            while (std::getline(ss, t, ','))
+                if (t.empty() || t.find_first_not_of("0123456789 ") != std::string::npos) {
+                    err = "glm link: not a layer list after K: " + spec;
+                    return false;
+                } else {
+                    lb.push_back(std::atoi(t.c_str()));
+                }
+        }
+        bool ok = true;
+        for (size_t i = 0; ok && i < lb.size(); ++i)
+            ok = (front ? lb[i] >= 1 && lb[i] < K : lb[i] > K && lb[i] < g_.n_layers) && (i == 0 || lb[i] > lb[i - 1]);
+        if (!ok) {
+            err = "glm link: the local boundaries must rise inside this side's layers (" + spec + ")";
+            return false;
+        }
+        if (lb.empty()) {
+            n_parts_ = 2;
+            part_ = front ? 0 : 1;
+            if (!load_pack(pack_dir, max_ctx, err, 0, front ? 0 : K, front ? K : 0)) return false;
+        } else {
+            int n_dev = 0;
+            if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+            cudaGetLastError();
+            std::vector<int> devs;
+            for (int i = 0; i <= (int) lb.size(); ++i) devs.push_back(i);
+            if (n_dev < (int) devs.size()) {
+                err = "glm link: " + std::to_string(devs.size()) + " local parts need as many visible GPUs (" +
+                      std::to_string(n_dev) + ")";
+                return false;
+            }
+            if (!load_pack_split(pack_dir, max_ctx, lb, devs, err, front ? 0 : K, front ? K : 0)) return false;
+        }
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (m->fast_ == nullptr) {
+                err = "glm link: the two-rig split needs the fast path on every local GPU";
+                return false;
+            }
+        // the prompt path's chunk: the smaller side's as a start (none if either has none).  A front that connects
+        // later may come with another; every prompt-path call agrees on its chunk again (Glm5Model::prefill)
+        int peer = 0;
+        if (!maya::core::glmlink::open(K, max_ctx, prefill_chunk(), peer, err)) return false;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (peer <= 0 || prefill_chunk() <= 0) {
+                if (m->pf_ != nullptr) m->prefill_destroy();
+            } else if (peer < m->prefill_chunk()) {
+                m->prefill_cap(peer, "the other rig's");
+            }
+        }
+        cudaSetDevice(dev_);
+        std::fprintf(stderr, "glm split: layers [%d, %d) on %d local GPU(s), the %s of a two-rig split over the link\n",
+                     front ? 0 : K, front ? K : g_.n_layers, (int) lb.size() + 1, maya::core::glmlink::role_name());
+        return true;
+    }
     // MAYA_GLM_EXPERT_HELPER=<device>: the expert helper - alone beside one trunk GPU (no split: dense, state and
     // MTP stay on device 0), or beside a layer split, which then leaves the helper's device out and gives each part
     // its own share of the helper over its own layers (fast_helper_setup): two cards and a Ryzen AI Max APU

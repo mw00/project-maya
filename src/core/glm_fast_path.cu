@@ -15,6 +15,7 @@
 // Victims come only from the requesting layer's own slot partition, so no kernel can be reading a
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
+#include "maya/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 #include "vram_late.hpp"   // (#1026: the reserve held for the whole run)
 #include "glm_dsa_fast.hpp"   // glm-dsa B2.4
@@ -1990,9 +1991,17 @@ bool Glm5Model::fast_setup(std::string& err) {
                 remaining = total;
                 remaining_layers =
                     g.n_layers - g.dense_lead + (maya::platform::env_switch("MAYA_GLM_NO_MTP") ? 0 : g.nextn);
+                // the two-rig split: this side's MoE layers only (the other rig has its own RAM)
+                if (const int K = maya::core::glmlink::split_at();
+                    K > 0 && maya::core::glmlink::role() == maya::core::glmlink::kFront)
+                    remaining_layers = std::max(1, K - g.dense_lead);
+                else if (K > 0 && maya::core::glmlink::role() == maya::core::glmlink::kBack)
+                    remaining_layers = g.n_layers - std::max(K, g.dense_lead) +
+                                       (maya::platform::env_switch("MAYA_GLM_NO_MTP") ? 0 : g.nextn);
             }
             // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
-            budget = l1_ >= g.n_layers ? remaining
+            budget = l1_ >= g.n_layers || (maya::core::glmlink::role() == maya::core::glmlink::kFront &&
+                                           l1_ >= maya::core::glmlink::split_at()) ? remaining
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
             // a later part: no more than is free now, less what is still to come and half the headroom (a parallel
@@ -7423,6 +7432,15 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         last->mtp_hx_pos_ = -1;
     }
     cudaSetDevice(dev_);
+    namespace gl = maya::core::glmlink;
+    const gl::Role lrole = gl::role();
+    const size_t link_b = (size_t) g.hc * g.n_embd * sizeof(float);
+    if (lrole == gl::kBack) {
+        // the two-rig split's back: the residual comes over the link (the front ran the embedding and its layers)
+        if (!gl::recv_hop(p, 1, F->hop_h, link_b, err)) return false;
+        cudaMemcpyAsync(state_, F->hop_h, link_b, cudaMemcpyHostToDevice, F->cs);
+        if (!fast_layers(p, true, err)) return false;
+    } else {
     // ---- the embedding row (host-dequantized from the shard mapping) -> the 4 streams
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
@@ -7435,6 +7453,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     glmres::res_embed(g, F->emb, state_, F->cs);   // glm-dsa B2.3 (mHC: gf::embed_streams)
     if (!fast_layers(p, false, err)) return false;
+    }
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
     Glm5Model* tail = this;
@@ -7454,6 +7473,42 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
+    if (lrole == gl::kFront) {
+        // the two-rig split's front: the residual goes over the link once it is on the host (from the front's last
+        // local part), the back's token comes back
+        cudaMemcpyAsync(FT->hop_h, tail->state_, link_b, cudaMemcpyDeviceToHost, FT->cs);
+        cudaEventRecord(FT->ev_done, FT->cs);
+        cudaError_t dn;
+        while ((dn = cudaEventQuery(FT->ev_done)) == cudaErrorNotReady) std::this_thread::yield();
+        if (!glmfast::cuda_ok(dn, "glm link hop out", err)) return false;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (!m->fast_->route_ok(err)) return false;
+        // (the checks a token ends with below, before the row leaves: a failed launch must not cross the link)
+        if (const cudaError_t fe = cudaGetLastError(); fe != cudaSuccess) {
+            err = std::string("glm fast: ") + cudaGetErrorString(fe);
+            return false;
+        }
+        if (gf::launch_errors() > 0) {
+            err = "glm fast: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
+            return false;
+        }
+        if (!gl::send_hop(p, 1, FT->hop_h, link_b, err)) return false;
+        int32_t tk = -1;
+        if (!gl::recv_tok(gl::kTok, p, tk, err)) return false;
+        if (tk < 0 || tk >= g.n_vocab) {   // (the next token's embedding row is read by this id)
+            err = "glm link: the back sent " + std::to_string(tk) + ", which is no token id";
+            gl::abort_link(err);
+            return false;
+        }
+        last_tok_ = tk;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (m->fast_ && m->fast_->prof_on) {
+                cudaSetDevice(m->dev_);
+                m->fast_->collect();
+            }
+        cudaSetDevice(dev_);
+        return true;
+    }
     glmres::res_head(g, tail->state_, tail->w_.at("output_norm.weight"), FT->head_x, FT->head_xq, FT->cs);   // glm-dsa B2.3
     tail->mtp_carry_note(p, FT->head_x, FT->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
@@ -7509,6 +7564,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     if (gf::launch_errors() > 0) {
         err = "glm fast: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
+        return false;
+    }
+    if (lrole == gl::kBack && !gl::send_tok(gl::kTok, p, FT->tok_h[0])) {
+        err = "glm link: down";
         return false;
     }
     last_tok_ = FT->tok_h[0];
@@ -8094,6 +8153,7 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // position with the real token.  Only the head speculates - the tail, the NextN block and the sampler see confirmed
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
+    if (maya::core::glmlink::role() != maya::core::glmlink::kNone) return false;   // (the two-rig split: plain decode)
     if (fast_ == nullptr || split_next_ == nullptr || maya::platform::env_switch("MAYA_GLM_NO_SPEC")) return false;
     if (glmspec::spec_bench_off()) return false;   // glm-dsa B15.7: no MTP drafts under random routing (bench mode)
     const Glm5Model* last = this;
@@ -9737,9 +9797,17 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
     FastState* F = fast_;
     for (int32_t t : tokens) {
         const auto t0 = std::chrono::steady_clock::now();
-        if (!fast_token(t, err)) return false;
+        if (!fast_token(t, err)) {
+            if (maya::core::glmlink::role() == maya::core::glmlink::kBack && !maya::core::glmlink::cancelled())
+                maya::core::glmlink::abort_link(err);   // (the front waits for this token; a cancel is not a failure)
+            return false;
+        }
         F->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++F->tokens;
+    }
+    if (host_logits_ && maya::core::glmlink::role() == maya::core::glmlink::kFront) {   // (the logits are the back's)
+        logits_out.assign((size_t) g_.n_vocab, 0.0f);
+        return true;
     }
     if (host_logits_) {
         Glm5Model* tail = this;
