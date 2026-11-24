@@ -3828,6 +3828,100 @@ static std::string cal_vals(double c, double p, double ps, double ref) {
     return v;
 }
 
+// The one-pool lane (one GPU's pool, or the pool a split's GPUs share) on a PC with two NUMA nodes or more.  Left to
+// the OS, its threads landed differently from start to start: a 2 x 20-core Xeon's 36 threads timed 0.131 ms an expert
+// on some starts and 0.233 on others, nothing between (each timing its own plan, greedy answers and speed).  So the
+// pool is pinned, one of two fixed ways:
+//   spread  a thread a physical core, the same count on every node (cpus[i] is worker i's CPU; the rule)
+//   packed  every thread on the CPUs of one node (the GPU's) - kept only where the timing measured it clearly faster
+// lane_pin_cpus fills both; `rest` = one CPU of every core spread leaves free (the callers: the service threads).
+// Empty lists (nothing is pinned, as before): one node, no NUMA, not Linux, too few cores, MAYA_GLM_CPU_PIN=0.
+struct LanePin {
+    std::vector<int> spread, packed, rest;
+};
+static LanePin lane_pin_cpus(int threads, int gpu_node) {
+    LanePin P;
+#ifdef __linux__
+    if (const char* v = getenv("MAYA_GLM_CPU_PIN"); v != nullptr && v[0] != '\0' && std::atoi(v) == 0) return P;
+    const auto groups = cpu_groups();
+    if (groups.size() < 2 || threads < 2) return P;
+    std::vector<std::vector<int>> first;   // by node: one CPU of each physical core
+    for (const auto& g : groups) {
+        std::vector<std::pair<int, int>> seen;
+        first.emplace_back();
+        for (int c : g.second)
+            if (const auto k = cpu_core(c); std::find(seen.begin(), seen.end(), k) == seen.end()) {
+                seen.push_back(k);
+                first.back().push_back(c);
+            }
+    }
+    for (int i = 0; i < threads; ++i) {
+        const auto& f = first[(size_t) i % first.size()];
+        if ((size_t) i / first.size() >= f.size()) return LanePin{};   // a node without the cores for its share
+        P.spread.push_back(f[(size_t) i / first.size()]);
+    }
+    for (const auto& f : first)
+        for (int c : f)
+            if (std::find(P.spread.begin(), P.spread.end() - 1, c) == P.spread.end() - 1) P.rest.push_back(c);
+    const auto* pk = &groups[0];
+    for (const auto& g : groups)
+        if (g.first == gpu_node) pk = &g;
+    if ((int) pk->second.size() >= threads) P.packed = pk->second;
+#else
+    (void) threads, (void) gpu_node;
+#endif
+    return P;
+}
+// the shared pool's placement is one for the process: 0 not set yet, 1 spread, 2 packed
+static std::atomic<int> g_shared_lane_pin{0};
+
+// MAYA_GLM_LANE_WHERE=1 (a test's log line, Linux): where the lane's threads run right now - each takes one job that
+// reads sched_getcpu() and holds its CPU for 3 ms, so every thread of the pool answers - and the NUMA nodes the
+// timed experts' pages sit on (move_pages as a query).  One line: threads a node, cores holding two threads, pages a node.
+static void lane_where(int dev, glmfast::Workers& pool, int threads, const std::vector<const uint8_t*>& blobs,
+                       size_t blob, const char* when) {
+#ifdef __linux__
+    std::vector<int> at((size_t) threads, -1);
+    pool.run(threads, [&](int i) {
+        at[(size_t) i] = sched_getcpu();
+        for (const auto t0 = std::chrono::steady_clock::now();
+             std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(3);) {}
+    });
+    const auto groups = cpu_groups();
+    std::string per_node, cpus;
+    std::vector<std::pair<int, int>> cores;
+    for (const auto& [node, list] : groups) {
+        int n = 0;
+        for (int c : at) n += std::find(list.begin(), list.end(), c) != list.end();
+        per_node += " node " + std::to_string(node) + ": " + std::to_string(n);
+    }
+    for (int c : at) {
+        cpus += " " + std::to_string(c);
+        if (c >= 0) cores.push_back(cpu_core(c));
+    }
+    std::sort(cores.begin(), cores.end());
+    const int distinct = (int) (std::unique(cores.begin(), cores.end()) - cores.begin());
+    std::vector<void*> pages;
+    for (const uint8_t* b : blobs)
+        for (size_t off = 0; off < blob; off += blob / 8 + 1) pages.push_back((void*) ((uintptr_t) (b + off) & ~(uintptr_t) 4095));
+    std::vector<int> status(pages.size(), -1);
+    std::string mem = " ?";
+    if (!pages.empty() && syscall(SYS_move_pages, 0, (unsigned long) pages.size(), pages.data(), nullptr, status.data(), 0) == 0) {
+        mem.clear();
+        for (const auto& g : groups) {
+            int n = 0;
+            for (int st : status) n += st == g.first;
+            mem += " node " + std::to_string(g.first) + ": " + std::to_string(n);
+        }
+    }
+    std::fprintf(stderr, "glm fast: CUDA%d CPU lane where (%s): %d threads -%s | %d cores, %d threads share one | timed "
+                         "experts' pages -%s | CPUs%s\n", dev, when, threads, per_node.c_str(), distinct,
+                 (int) cores.size() - distinct, mem.c_str(), cpus.c_str());
+#else
+    (void) dev, (void) pool, (void) threads, (void) blobs, (void) blob, (void) when;
+#endif
+}
+
 // THE SAVED TIMING BELONGS TO THE PC, NOT TO THE BUILD.  Its key's first field used to be the build stamp, so every
 // update timed the lane again; the timing wobbles with whatever else the PC does (one quiet V100 box: 0.13 ms an
 // expert one start, 0.24 another), the expert split follows it, and a user's greedy answers changed once after each
@@ -4079,10 +4173,12 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (exl3_)   // (fast_cpu_experts' EXL3 rows, per expert)
         F->cpu_x3.assign(8 * X3Rows::floats(g.n_embd, g.n_ff_exp), 0.0f);
     // the service thread is the pool's last worker; idle workers spin 20 ms (a decode's routes come ~1 ms apart)
+    LanePin lpin;
     if (glmtier::lane_pools(*F, g, n_parts_, part_, own_count, lv != nullptr, threads, gpu_numa_node(dev_), dev_)) {
         // glm-dsa B8.3 / B8.4: a pinned pool per socket (MAYA_GLM_CPU_SHARED=socket) or the node-split pools
     } else if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
+        if (getenv("MAYA_GLM_POOL_CPUS") == nullptr) lpin = lane_pin_cpus(threads, gpu_numa_node(dev_));
     } else {
         // MAYA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's
         // count active (the rest sleep), so a request's cpu_threads can try up to N without a restart - the setup's
@@ -4097,7 +4193,24 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         }
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
+        // one GPU's pool: only on request (MAYA_GLM_CPU_PIN=1) and without a drafter's two verify lanes (below) - its
+        // unpinned pool is the same lottery on paper, but the pin was measured on a split's shared pool only
+        if (n_parts_ == 1 && pin_cpus.empty() && pool_n == threads && !dflash_on_ && pin_env != nullptr &&
+            pin_env[0] != '\0' && std::atoi(pin_env) != 0)
+            lpin = lane_pin_cpus(threads, gpu_numa_node(dev_));
     }
+    // the one-pool lane's fixed placement (lane_pin_cpus): spread, or what the shared pool already took
+    // (decided: by this PC's saved line or its timing - the shared pool's other parts follow)
+    if (lpin.packed.empty() && shared && g_shared_lane_pin.load() == 2) lpin = LanePin{};   // (cannot follow: as it is)
+    bool lane_decided = lpin.spread.empty() || (shared && g_shared_lane_pin.load() != 0);
+    const auto lane_place = [&](bool packed, bool decided) {
+        F->cpu_pool->pin(packed ? lpin.packed : lpin.spread, !packed);
+        F->cpu_pin = packed ? lpin.packed : lpin.rest;
+        F->lane_packed = packed;
+        if (shared && decided) g_shared_lane_pin.store(packed ? 2 : 1);
+        lane_decided = lane_decided || decided;
+    };
+    if (!lpin.spread.empty()) lane_place(shared && g_shared_lane_pin.load() == 2, false);
     // one GPU with a DFlash drafter on two NUMA nodes or more: a verify window's tokens on both sockets (win_lane) - the
     // pool then pinned to the GPU's node, a second one on another node.  A decode's one token keeps its node's pool
     // (one token's experts across both sockets measured no faster); a window's tokens are separate answers, so the
@@ -4153,7 +4266,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const char* calf = getenv("MAYA_GLM_CPU_CAL");
     std::string cal_key;
     double c_ms = 0.0, p_ms = 0.0, ps_ms = 0.0;
-    bool cached = false, redo = false, taken_over = false, redo_as_it_is = false;
+    bool cached = false, redo = false, taken_over = false, redo_as_it_is = false, saved_packed = false;
     if (calf != nullptr && *calf != '\0') {
         char bus[32] = "?";
         if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev_) != cudaSuccess) cudaGetLastError();
@@ -4187,6 +4300,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                 own = mine;
                 taken_over = !mine;
                 redo = mine && std::strstr(tab + 1, "redo") != nullptr;
+                saved_packed = std::strstr(tab + 1, " node") != nullptr;
             }
             std::fclose(cf);
         }
@@ -4194,8 +4308,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             redo = redo || (cached && std::atoi(rv) != 0);
             redo_as_it_is = std::atoi(rv) == 2;
         }
+        // a saved line is this PC's choice of placement too (" node": packed, measured faster here)
+        if (cached && !lane_decided) lane_place(saved_packed && !lpin.packed.empty(), true);
         if (cached && taken_over) {
-            cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, F->cal_ref));
+            cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, F->cal_ref) + (F->lane_packed ? " node" : ""));
             std::fprintf(stderr, "glm fast: CUDA%d CPU lane: the timing an earlier version saved on this PC is kept "
                                  "(%.4f / %.4f / %.4f ms)\n", dev_, c_ms, p_ms, ps_ms);
         }
@@ -4225,21 +4341,54 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
              std::chrono::steady_clock::now() - tw < std::chrono::milliseconds(ms);)
             fast_cpu_experts(il_cal, n_cal, cal_set(set++), w4, x.data(), out.data());
     };
-    busy(100);
     std::array<double, 16> runs{};
-    double best = 0.0;
-    for (int round = 0; round < 5; ++round) {
-        if (round > 0) busy(100);
-        for (int rep = 0; rep < 16; ++rep) {
-            const uint8_t* const* cals = cal_set(set++);
-            const auto t0 = std::chrono::steady_clock::now();
-            fast_cpu_experts(il_cal, n_cal, cals, w4, x.data(), out.data());
-            runs[(size_t) rep] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto time_c = [&] {
+#ifdef __linux__
+        // a pinned one-pool lane: this thread is the pool's last one while it times, so it sits where the service
+        // threads will (left free, it shared a core with a pinned worker on some starts)
+        cpu_set_t self;
+        const bool held = !lpin.spread.empty() && !F->cpu_pin.empty() &&
+                          pthread_getaffinity_np(pthread_self(), sizeof self, &self) == 0;
+        if (held) glmfast::pin_thread(pthread_self(), F->cpu_pin);
+        struct Back {
+            bool on;
+            cpu_set_t* set;
+            ~Back() {
+                if (on) pthread_setaffinity_np(pthread_self(), sizeof *set, set);
+            }
+        } back{held, &self};
+#endif
+        busy(100);
+        double best = 0.0;
+        for (int round = 0; round < 5; ++round) {
+            if (round > 0) busy(100);
+            for (int rep = 0; rep < 16; ++rep) {
+                const uint8_t* const* cals = cal_set(set++);
+                const auto t0 = std::chrono::steady_clock::now();
+                fast_cpu_experts(il_cal, n_cal, cals, w4, x.data(), out.data());
+                runs[(size_t) rep] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            }
+            const double med = median16(runs);
+            best = round == 0 ? med : std::min(best, med);
         }
-        const double med = median16(runs);
-        best = round == 0 ? med : std::min(best, med);
+        return best / n_cal;   // an expert's share of a call
+    };
+    c_ms = time_c();
+    // the one-pool lane on two NUMA nodes or more, once a PC (the saved line keeps the choice): timed spread (the rule)
+    // and packed on the GPU's node; packed stays only where it is clearly faster (10%)
+    if (!lane_decided) {
+        double c_packed = 0.0;
+        if (!lpin.packed.empty()) {
+            lane_place(true, false);
+            c_packed = time_c();
+        }
+        const bool packed = c_packed > 0.0 && c_packed < c_ms / 1.10;
+        lane_place(packed, true);
+        std::fprintf(stderr, "glm fast: CUDA%d CPU lane pinned: a thread a core over %zu NUMA nodes %.4f ms an expert, on "
+                             "one node %.4f - %s (MAYA_GLM_CPU_PIN=0: left to the OS)\n",
+                     dev_, cpu_groups().size(), c_ms, c_packed,packed ? "one node" : "over the nodes");
+        if (packed) c_ms = c_packed;
     }
-    c_ms = best / n_cal;   // an expert's share of a call
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
@@ -4292,8 +4441,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         c_ms = now[0], p_ms = now[1], ps_ms = now[2];
         if (!same) F->cal_ref = 0.0;
     }
-    if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, cached ? F->cal_ref : 0.0));
+    if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, cached ? F->cal_ref : 0.0) + (F->lane_packed ? " node" : ""));
     }
+    if (const char* wv = getenv("MAYA_GLM_LANE_WHERE"); wv != nullptr && std::atoi(wv) != 0)
+        lane_where(dev_, *F->cpu_pool, F->cpu_pool->size(), cal_all, blob, !cached || redo ? "timed" : "not timed");
     // repeatable answers: every plan that splits experts between the CPU lane and PCIe (the decode's lane plan, the
     // prompts' staged split and prestage) sees the timing in coarse steps - powers of two - so two builds or installs
     // whose timing of the same CPU and link differs by a few percent (0.1072 vs 0.1112 ms an expert, one build to the
@@ -5100,7 +5251,7 @@ void Glm5Model::lane_drift_check() {
         F->drift_e0 = e, F->drift_us0 = us;
         if (F->cal_ref <= 0.0) {   // first window after timing: the reference
             F->cal_ref = ms;
-            cal_put(F->cal_file, F->cal_key, cal_vals(F->cpu_c_ms, F->cpu_p_ms, F->cpu_ps_ms, ms));
+            cal_put(F->cal_file, F->cal_key, cal_vals(F->cpu_c_ms, F->cpu_p_ms, F->cpu_ps_ms, ms) + (F->lane_packed ? " node" : ""));
             continue;
         }
         const int dir = ms > 1.15 * F->cal_ref ? 1 : ms < F->cal_ref / 1.15 ? -1 : 0;

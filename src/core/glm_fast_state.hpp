@@ -259,6 +259,11 @@ public:
         while (done_.load(std::memory_order_acquire) < n) cpu_relax();
     }
     int size() const { return (int) th_.size() + 1; }
+    // the workers' CPUs from now on, as the constructor's cpus / one_to_one (an empty list changes nothing; Linux)
+    void pin(const std::vector<int>& cpus, bool one_to_one) {
+        for (size_t i = 0; i < th_.size(); ++i)
+            pin_thread(th_[i].native_handle(), one_to_one && i < cpus.size() ? std::vector<int>{cpus[i]} : cpus);
+    }
     // only the caller and the first n - 1 workers take jobs (fewer threads without a restart: setup's calibration);
     // a batch's job count should be active() for one job a thread.  The workers left out wait on idle_cv_, which only
     // this wakes (under mu_, so none misses it)
@@ -964,6 +969,7 @@ struct Glm5Model::FastState {
     int64_t pf_end = -1;                     // the prompt's end while one runs (the drafter takes its last positions)
     int cpu_node = -1;                         // the NUMA node the pool is pinned to (-1: unpinned) ...
     std::vector<int> cpu_pin;                  // ... and its CPUs (the service thread runs there too)
+    bool lane_packed = false;                  // the one-pool lane sits on one NUMA node (lane_pin; saved as " node")
     std::string cal_file, cal_key;             // MAYA_GLM_CPU_CAL
     double cal_ref = 0.0;                      // decode's CPU ms an expert after calibrating (0: not measured yet)
     uint64_t drift_e0 = 0, drift_us0 = 0;
