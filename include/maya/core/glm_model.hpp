@@ -972,6 +972,36 @@ public:
     bool split_rows_ok() const;
     bool multi_issue_rows(const int* seqs, const int32_t* tokens, const maya::kernels::SamplerParams* sps, int n,
                           std::string& err);
+    /// THE TWO-RIG SPLIT (glm_link.hpp) with several conversations.  The front's multi_issue_rows queues each row's
+    /// residual (its last local part's pinned hop buffer and event) for the link instead of a head; its messages to
+    /// the back (link_send_pair: the scheduler's kSched / kAdmit / kVerd) queue behind those rows, so the back reads them in
+    /// the order both schedulers make their calls, while the front goes on.  link_pump sends what is ready, in order
+    /// (a row once its copy is done; `all`: waits for every row); multi_take polls for its token meanwhile.  The back
+    /// takes the rows from the link and sends each token as soon as it is picked (link_tok_pump, also while it waits
+    /// for the front's next message), in the order the rows came.
+    bool link_pump(bool all, std::string& err);
+    bool link_flush(std::string& err) { return link_pump(true, err); }
+    bool link_send_pair(uint32_t type, int64_t pos, int32_t val, int32_t n, std::string& err);
+    bool link_tok_pump(bool wait_head, std::string& err);
+    struct LinkOut {
+        uint32_t type;                                     // glmlink::kHop: sequence seq's row at pos; else a pair
+        int seq;
+        int64_t pos;
+        int32_t val, n;
+    };
+    std::vector<LinkOut> link_out_;                        // the front: what is not sent yet (oldest first)
+    std::vector<int> link_tok_q_;                          // the back: sequences whose token is not sent yet (oldest first)
+    std::vector<int32_t> link_tok_;                        // the back: each sequence's token once sent (-1: not yet, or it failed)
+    std::vector<int64_t> link_pos_;                        // a sequence's last issued row's position (its TOK's)
+    std::string link_tok_err_;                             // the back: why a token was not sent (link_tok_pump)
+    /// A link's session ends (a failure, a new link): nothing queued or remembered of it stays.
+    void link_reset() {
+        link_out_.clear();
+        link_tok_q_.clear();
+        link_tok_.assign(link_tok_.size(), -1);
+        link_pos_.assign(link_pos_.size(), -1);
+        link_tok_err_.clear();
+    }
     // ---- several conversations drafting with the NextN block at once (src/core/glm_mtp_rows.cu,
     // MAYA_GLM_MULTI_MTP=<drafts>, off by default).  A conversation's WINDOW - its last written token and its drafts
     // - goes through the split's batched rows as consecutive rows of one group; the last part's head picks every

@@ -45,6 +45,15 @@ The engine is `maya generate` (no server), one start per prompt and check: 4 sta
 some of the prompts.  The engine args go after `--`, the same on every run except --layer-split / --role / --link.
 A step whose engine run fails writes no result, `run` exits 1, and `compare` fails on what is missing.
 
+Several conversations at once (--parallel over the link): `run --parallel N` with each mode, then
+`compare --parallel N [--exact]`.  It runs that step alone: the engine as a server (--serve --parallel N, started by
+this script, no HTTP) and N conversations over DIR's prompts in three turns - greedy, one alone first (a request
+alone drafts with MTP) and the others while it writes; a second turn of each (the prompt, the reference's answer
+and a tail: the state kept from the first turn is continued); then other prompts, half of them sampled with a seed
+and half greedy with the first token of the greedy answer banned (logit_bias).  The reference is one process with
+--parallel N; the split must give the same tokens for every conversation (--exact), and both sides need the same
+MAYA_GLM_SPLIT_ROWS.
+
 How far a model moves on its own (to set --max-kl / --min-top1 / --tie for a two-machine comparison): a second
 reference run with one setting changed, `run --mode ref --name ref2 -- <engine args>` (for example with
 MAYA_GLM_CPU_LANE=0), then `compare --against ref2`.
@@ -54,9 +63,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
+import random
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -87,6 +99,26 @@ def code_prompt() -> str:
     return "Here is some code:\n" + text[off:off + n] + "\n\nExplain what this code does, in detail."
 
 
+SYSTEM_TOKENS = 1500        # the "system" prompt: a system prompt of about this many tokens, then a user turn
+SYSTEM_ASK = ("Go through the code in your instructions and list the functions it defines. For each one say in a "
+              "sentence what it takes, what it returns and what it is for, and name the two you would read first to "
+              "understand the rest. Then say in a few sentences how the pieces fit together, which data they share, "
+              "and what you would check before changing any of them. Keep to what the code shows; where the excerpt "
+              "starts or ends in the middle of a function, say so instead of guessing.")
+
+
+def system_prompt() -> list:
+    """A long system prompt (this repository's sources again, another part of them) and a user turn after it: the
+    engine ends a prompt-path call at the system prompt's end (a conversation checkpoint, or the slots' prefix cut),
+    so this prompt is read in two calls - the split must cut it where one process does."""
+    src = sorted((ROOT / "src" / "core").glob("glm_*.cu"))
+    text = "".join(p.read_text(errors="replace") for p in src)
+    n = int(SYSTEM_TOKENS * 3.3)
+    off = 2 * len(text) // 3
+    return [{"role": "system", "content": "You answer questions about this code:\n" + text[off:off + n]},
+            {"role": "user", "content": SYSTEM_ASK}]
+
+
 def load_tokenizer(pack: Path):
     import strata_tokenizer as ST
     from serve.frontend import ChatTemplate, effort_kwargs
@@ -104,10 +136,11 @@ def cmd_prompts(a) -> int:
     d = Path(a.dir)
     d.mkdir(parents=True, exist_ok=True)
     tok, tpl, effort_kwargs = load_tokenizer(Path(a.pack))
-    prompts = dict(PROMPTS, code=code_prompt())
+    prompts = dict(PROMPTS, code=code_prompt(), system=system_prompt())
     meta = {}
-    for name, text in prompts.items():
-        ids = tok.encode(tpl.render([{"role": "user", "content": text}], **effort_kwargs("none")), parse_special=True)
+    for name, text in prompts.items():   # (a text is one user turn; "system" is a list of messages)
+        msgs = text if isinstance(text, list) else [{"role": "user", "content": text}]
+        ids = tok.encode(tpl.render(msgs, **effort_kwargs("none")), parse_special=True)
         (d / f"{name}.prompt.tok").write_text(" ".join(map(str, ids)) + "\n")
         meta[name] = {"prompt_tokens": len(ids)}
         print(f"{name}: {len(ids)} prompt tokens")
@@ -136,6 +169,243 @@ def parse_gen(out: str) -> list[int]:
         if len(f) == 2 and f[0] == "T":
             ids.append(int(f[1]))
     return ids
+
+
+def par_run(a, d: Path, names: list[str], exe: list[str], sub: Path, max_new: int) -> int:
+    """`run --parallel N`: N conversations at once through `maya generate --serve --parallel N` (see the top)."""
+    n = a.parallel
+    out_f = sub / f"par{n}.gen.json"
+    ref_f = d / "ref" / f"par{n}.gen.json"
+    writes = a.mode != "back"   # (the front and a single process emit the tokens)
+    back_ok = sub / f"par{n}.back.ok"   # the back's run ended in order: `compare` asks for it beside the front's result
+    if writes:
+        out_f.unlink(missing_ok=True)
+    else:
+        back_ok.unlink(missing_ok=True)
+    primary = a.mode == "ref" and sub.name == "ref"
+    ref = None
+    if not primary:   # the second turn continues the reference's answers, so every run reads the same prompts
+        try:
+            ref = json.loads(ref_f.read_text())
+            assert ref["n"] == n and len(ref["rounds"]) == 3 and len(ref["rounds"][0]) == n
+        except (OSError, ValueError, KeyError, AssertionError, IndexError, TypeError):
+            print(f"{a.mode} par{n}: no usable {ref_f} (the reference's `run --parallel {n}` first, and DIR/ref copied "
+                  f"here) - FAILED", flush=True)
+            return 1
+    prompts = [[int(t) for t in (d / f"{names[i % len(names)]}.prompt.tok").read_text().split()] for i in range(n)]
+    log = sub / f"par{n}.{a.mode}.log"
+    env = dict(os.environ)
+    if a.mode == "back":
+        env["MAYA_GLM_BACK_STAY"] = "0"   # (this back ends with its front: the script waits for it)
+    print(f"{a.mode} par{n}: {n} conversations at once, 3 turns each", flush=True)
+    t0 = time.time()
+    # (the back writes its own T / PP / DONE lines: to a file - a pipe nobody reads would fill and stop it)
+    with open(log, "wb") as lf, open(sub / f"par{n}.back.out", "wb") if a.mode == "back" else open(os.devnull, "wb") as bo:
+        p = subprocess.Popen(exe + ["--serve", "--parallel", str(n)], env=env, stderr=lf,
+                             stdout=bo if a.mode == "back" else subprocess.PIPE,
+                             stdin=subprocess.DEVNULL if a.mode == "back" else subprocess.PIPE)
+        if a.mode == "back":   # it reads its front's lines from the link and ends with it
+            try:
+                rc = p.wait(timeout=a.timeout)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                rc = -9
+            print(f"  rc={rc} {time.time() - t0:.0f} s  (log {log})", flush=True)
+            if rc == 0:
+                # what this back computed, by request id (its own T / DONE lines): the front's run numbers its
+                # requests from a random base, so `compare` can tell this run's marker from an earlier run's
+                seen: dict = {}
+                ended = set()
+                for ln in (sub / f"par{n}.back.out").read_text(errors="replace").splitlines():
+                    f = ln.split()
+                    if len(f) == 3 and f[0] == "T":
+                        seen[f[1]] = seen.get(f[1], 0) + 1
+                    elif len(f) > 6 and f[0] == "DONE":
+                        ended.add(f[1])
+                back_ok.write_text(json.dumps({"tokens": {r: c for r, c in seen.items() if r in ended}}) + "\n")
+            return 0 if rc == 0 else 1
+        lines: queue.Queue = queue.Queue()
+
+        def pump():
+            for raw in p.stdout:
+                lines.put(raw.decode(errors="replace").rstrip("\n"))
+            lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+        toks: dict[int, list[int]] = {}
+        done: dict[int, str] = {}
+        order: list[int] = []   # the requests' ids in the order their tokens came
+        why = ""
+
+        def together(rids) -> bool:   # each of them wrote in turns with another: a token of another between two of its
+            last: dict[int, int] = {}
+            mixed = set()
+            for k, r in enumerate(order):
+                if r in last and any(x != r for x in order[last[r] + 1:k]):
+                    mixed.add(r)
+                last[r] = k
+            return all(r in mixed for r in rids)
+
+        base = 100 * random.randrange(10, 20000)   # this run's request ids start here (see the back's marker)
+
+        def send(rid: int, ids: list[int], keys: str = "temperature=0"):
+            toks[rid] = []
+            p.stdin.write(f"GEN {max_new} rid={base + rid} {keys} {','.join(map(str, ids))}\n".encode())
+            p.stdin.flush()
+
+        def take(until) -> bool:   # read the engine's lines until until() holds; False: it failed or ended
+            nonlocal why
+            while not until():
+                try:
+                    ln = lines.get(timeout=max(1.0, a.timeout - (time.time() - t0)))
+                except queue.Empty:
+                    why = "timed out"
+                    return False
+                if ln is None:
+                    why = "the engine ended"
+                    return False
+                f = ln.split()
+                if not f:
+                    continue
+                if f[0] == "ERR":
+                    why = ln
+                    return False
+                if f[0] == "T" and len(f) == 3:
+                    toks[int(f[1]) - base].append(int(f[2]))
+                    order.append(int(f[1]) - base)
+                elif f[0] == "DONE" and len(f) > 6:
+                    done[int(f[1]) - base] = f[6]   # (its finish: length / stop / cancel)
+            return True
+
+        ok = True
+        # READY first (the model's load), then the turns
+        while ok:
+            try:
+                ln = lines.get(timeout=max(1.0, a.timeout - (time.time() - t0)))
+            except queue.Empty:
+                ok, why = False, "timed out before READY"
+                break
+            if ln is None:
+                ok, why = False, "the engine ended before READY"
+            elif ln.startswith("READY"):
+                if f"multi={n}" not in ln.split():
+                    ok, why = False, f"the engine does not run {n} conversations: {ln}"
+                break
+        rounds = []
+        if ok:
+            # turn 1: conversation 0 alone until it has written 16 tokens, then the others at once
+            send(0, prompts[0])
+            ok = take(lambda: len(toks[0]) >= min(16, max_new) or 0 in done)
+            if ok and 0 in done:   # (it must still write when the others come)
+                ok, why = False, "the first conversation ended before the others started (a larger --max-new)"
+            for i in range(1, n):
+                if ok:
+                    send(i, prompts[i])
+            ok = ok and take(lambda: all(i in done for i in range(n)))
+            if ok and not together(range(n)):
+                ok, why = False, "turn 1: the conversations did not all decode together"
+            if ok:
+                rounds.append([{"prompt": names[i % len(names)], "tokens": toks[i], "finish": done[i]} for i in range(n)])
+        if ok:
+            # turn 2: every conversation again - its prompt, the reference's answer to it, a tail
+            first = (ref["rounds"][0] if ref is not None else rounds[0])
+            order.clear()
+            for i in range(n):
+                send(n + i, prompts[i] + list(first[i]["tokens"]) + prompts[i][-24:])
+            ok = take(lambda: all(n + i in done for i in range(n)))
+            if ok and not together(range(n, 2 * n)):
+                ok, why = False, "turn 2: the conversations did not all decode together"
+            if ok:
+                rounds.append([{"prompt": names[i % len(names)], "tokens": toks[n + i], "finish": done[n + i]}
+                               for i in range(n)])
+        if ok:
+            # turn 3: the next conversation's prompt, read anew - sampled with a seed (the back's sampler), or greedy
+            # with the first token of that prompt's greedy answer banned (the request's logit_bias on the back)
+            banned = {}
+            order.clear()
+            for i in range(n):
+                j = (i + 1) % n
+                keys = f"temperature=0.8 top_p=0.95 seed={100 + i}"
+                if i % 2:
+                    banned[i] = first[j]["tokens"][0]
+                    keys = f"temperature=0 logit_bias={banned[i]}:-100"
+                send(2 * n + i, prompts[j], keys)
+            ok = take(lambda: all(2 * n + i in done for i in range(n)))
+            if ok and not together(range(2 * n, 3 * n)):
+                ok, why = False, "turn 3: the conversations did not all decode together"
+            if ok and any(toks[2 * n + i][:1] == [t] for i, t in banned.items()):
+                ok, why = False, "a banned token was written (logit_bias)"
+            if ok:
+                rounds.append([{"prompt": names[(i + 1) % n % len(names)], "tokens": toks[2 * n + i],
+                                "finish": done[2 * n + i], "sampling": "banned" if i in banned else "seeded"}
+                               for i in range(n)])
+        try:
+            p.stdin.write(b"QUIT\n")
+            p.stdin.flush()
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            rc = p.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = -9
+    print(f"  rc={rc} {time.time() - t0:.0f} s  (log {log})", flush=True)
+    if ok and rc != 0:   # (it crashed after its last DONE, or did not end on QUIT: not a run to compare)
+        ok, why = False, f"the engine ended with rc {rc}"
+    if not ok or any(not c["tokens"] for r in rounds for c in r):
+        print(f"  FAILED ({why or 'a conversation wrote nothing'}) - no result written", flush=True)
+        return 1
+    out_f.write_text(json.dumps({"n": n, "max_new": max_new, "rid_base": base, "rounds": rounds}) + "\n")
+    print(f"  {sum(len(c['tokens']) for r in rounds for c in r)} tokens in {len(rounds)} turns of {n} conversations")
+    return 0
+
+
+def par_compare(a, d: Path, other: Path) -> int:
+    """`compare --parallel N`: every conversation's tokens, the reference's against the split's."""
+    n = a.parallel
+
+    def load(f):
+        try:
+            x = json.loads(f.read_text())
+            return x if x["n"] == n and len(x["rounds"]) == 3 and all(len(r) == n for r in x["rounds"]) else None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    r, s = load(d / "ref" / f"par{n}.gen.json"), load(other / f"par{n}.gen.json")
+    if r is None or s is None:
+        print(f"par{n}: no result from the {'reference' if r is None else a.against} (its run failed or was not made) "
+              f"- FAIL\nFAIL")
+        return 1
+    if a.against == "split":
+        # (a back that crashed after its last token leaves the front's result whole: not a run to accept.  Its
+        # marker must be this run's: the same request ids, each ended, with as many tokens as the front got)
+        want = {str(s.get("rid_base", 0) + t * n + i): len(s["rounds"][t][i]["tokens"]) for t in range(3) for i in range(n)}
+        try:
+            got = json.loads((other / f"par{n}.back.ok").read_text())["tokens"]
+        except (OSError, ValueError, KeyError, TypeError):
+            got = None
+        if got != want:
+            print(f"par{n}: {other / f'par{n}.back.ok'} is missing or not this run's - the back did not end in order, "
+                  f"or its DIR/split was not copied here after this run - FAIL\nFAIL")
+            return 1
+    ok_all = True
+    for t in range(3):
+        for i in range(n):
+            rt, st = r["rounds"][t][i]["tokens"], s["rounds"][t][i]["tokens"]
+            name = f"par{n} turn {t + 1} conversation {i} ({r['rounds'][t][i]['prompt']})"
+            k = next((j for j in range(min(len(rt), len(st))) if rt[j] != st[j]), None)
+            if k is None and len(rt) == len(st):
+                print(f"{name}: IDENTICAL ({len(rt)} tokens)")
+            elif a.exact:
+                print(f"{name}: differs at token {k if k is not None else min(len(rt), len(st))} - FAIL (--exact)")
+                ok_all = False
+            else:
+                # (no logits along a parallel answer: without --exact a difference is reported, not judged)
+                print(f"{name}: same {k if k is not None else min(len(rt), len(st))} of {len(rt)} tokens, then "
+                      f"different (not judged without --exact)")
+    print("PASS" if ok_all else "FAIL")
+    return 0 if ok_all else 1
 
 
 def pick(meta: dict, only: str) -> list[str]:
@@ -173,6 +443,8 @@ def cmd_run(a) -> int:
     primary = a.mode == "ref" and sub.name == "ref"
     sub.mkdir(exist_ok=True)
     max_new = meta.get("max_new", MAX_NEW)
+    if a.parallel:
+        return par_run(a, d, names, exe, sub, max_new)
     failed = []
     for name in names:
         prompt = d / f"{name}.prompt.tok"
@@ -249,11 +521,13 @@ def logsoftmax(x):
 
 
 def cmd_compare(a) -> int:
-    import numpy as np
     d = Path(a.dir)
     other = d / a.against
     meta = json.loads((d / "prompts.json").read_text())
     names = pick(meta, a.only)
+    if a.parallel:   # (token lists only: no numpy needed)
+        return par_compare(a, d, other)
+    import numpy as np
     ok_all = True
     report = []
 
@@ -362,6 +636,9 @@ def main() -> int:
                    help="--mode ref: write DIR/NAME instead of DIR/ref - a second single-process run (with one setting "
                         "changed) to compare with the first: `compare --against NAME` shows how far this model moves "
                         "on its own")
+    r.add_argument("--parallel", type=int, default=0, metavar="N",
+                   help="run the several-conversations step alone: N conversations at once through --serve "
+                        "--parallel N (2-8; the split needs MAYA_GLM_SPLIT_ROWS on both sides)")
     r.add_argument("engine", nargs=argparse.REMAINDER)
     c = sp.add_parser("compare", help="compare DIR/ref with DIR/split (or DIR/NAME)")
     c.add_argument("--dir", required=True)
@@ -370,6 +647,8 @@ def main() -> int:
                    help="what to compare the reference with: split (the default), or a second reference run's --name")
     c.add_argument("--no-spec", action="store_true",
                    help="do not compare the greedy answers with MTP (the split side ran with --no-spec)")
+    c.add_argument("--parallel", type=int, default=0, metavar="N",
+                   help="compare the several-conversations step (`run --parallel N`) alone")
     c.add_argument("--max-kl", type=float, default=2.5e-2, help="mean KL(reference || other) allowed, nats")
     c.add_argument("--min-top1", type=float, default=93.0, help="top-1 agreement needed, percent")
     c.add_argument("--tie", type=float, default=0.5,
@@ -381,6 +660,8 @@ def main() -> int:
     a = ap.parse_args()
     if a.cmd == "run" and a.engine[:1] == ["--"]:
         a.engine = a.engine[1:]
+    if a.cmd in ("run", "compare") and a.parallel and not 2 <= a.parallel <= 8:
+        ap.error("--parallel takes 2 to 8 conversations")
     return {"prompts": cmd_prompts, "run": cmd_run, "compare": cmd_compare}[a.cmd](a)
 
 

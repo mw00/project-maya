@@ -751,7 +751,12 @@ in RAM need few threads, so it matters most for Engram tables on an SSD.
 `--role front|back` with `--link host:port` and `--layer-split K` runs one GLM-5.3-Flash model on two machines: the
 front runs layers `[0, K)` and the server, the back the rest and the sampler. It is off without `--role`, and
 nothing below is read then. The setup, the correctness check and the limits are in
-[TWO-RIG-SPLIT.md](TWO-RIG-SPLIT.md).
+[TWO-RIG-SPLIT.md](TWO-RIG-SPLIT.md). `--parallel` above 1 works over the link with `MAYA_GLM_SPLIT_ROWS` set on
+both sides; the two sides must then share `--parallel`, `MAYA_GLM_SEQ_CTX`, `MAYA_GLM_SPLIT_ROWS`,
+`MAYA_GLM_EVEN_GROUPS`, `MAYA_GLM_MULTI_BOUNDARY`, `MAYA_GLM_MULTI_SPEC` and `MAYA_GLM_MULTI_ROOM` (checked at
+connect), and `MAYA_GLM_PREFILL_GAPS`, `MAYA_GLM_PREFILL_INTERLEAVE` and `MAYA_GLM_MULTI_MTP` are not used.
+How a prompt's read is cut into calls (the conversation checkpoints, the slots' prefix cut, `MAYA_GLM_SNAP_GEN`)
+is the front's choice: the back reads every prompt in the front's calls.
 
 | Setting | Default | |
 | --- | --- | --- |

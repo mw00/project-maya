@@ -13,10 +13,14 @@
 // for the oldest sequence's token (multi_take), and issues that sequence's next one right away.
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa B2.3 (W6 fix)
+#include "maya/core/glm_link.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace maya::core {
 
@@ -275,7 +279,156 @@ bool Glm5Model::multi_issue(int s, int32_t token, const maya::kernels::SamplerPa
     return true;
 }
 
+bool Glm5Model::link_pump(bool all, std::string& err) {
+    namespace gl = maya::core::glmlink;
+    if (link_out_.empty()) return true;
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
+    size_t i = 0;
+    bool ok = true;
+    for (; ok && i < link_out_.size(); ++i) {
+        const LinkOut& o = link_out_[i];
+        if (o.type != gl::kHop) {
+            ok = gl::send_pair((gl::Type) o.type, o.pos, o.val, o.n);
+            if (!ok) err = "glm link: down";
+            continue;
+        }
+        SeqCtx& ct = tail->seq_[(size_t) o.seq];
+        cudaSetDevice(tail->dev_);
+        if (!all) {   // (not done yet: it and what follows wait for the next call)
+            const cudaError_t q = cudaEventQuery(ct.ev_hop);
+            if (q == cudaErrorNotReady) break;
+            ok = glmfast::cuda_ok(q, "glm link rows out", err);
+        } else {
+            ok = glmfast::wait_event(ct.ev_hop, "glm link rows out", err);
+        }
+        for (Glm5Model* m = this; ok && m != nullptr; m = m->split_next_.get()) ok = m->fast_->route_ok(err);
+        // (what a token ends with in fast_token, before the row leaves: a failed launch or copy must not become a
+        // row on the back)
+        if (ok)
+            if (const cudaError_t fe = cudaGetLastError(); fe != cudaSuccess) {
+                err = std::string("glm multi: ") + cudaGetErrorString(fe);
+                ok = false;
+            }
+        if (ok && gf::launch_errors() > 0) {
+            err = "glm multi: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
+            ok = false;
+        }
+        ok = ok && gl::send_hop(o.pos, 1, ct.hop_h, hop, err);
+    }
+    cudaSetDevice(dev_);
+    // (a failure: the link is down and the requests fail - nothing queued goes later)
+    if (!ok) link_out_.clear();
+    else link_out_.erase(link_out_.begin(), link_out_.begin() + (long) i);
+    return ok;
+}
+
+bool Glm5Model::link_send_pair(uint32_t type, int64_t pos, int32_t val, int32_t n, std::string& err) {
+    link_out_.push_back({type, -1, pos, val, n});
+    return link_pump(false, err);
+}
+
+bool Glm5Model::link_tok_pump(bool wait_head, std::string& err) {
+    namespace gl = maya::core::glmlink;
+    if (link_tok_q_.empty()) return true;
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    if (link_tok_.size() != seq_.size()) link_tok_.assign(seq_.size(), -1);
+    size_t i = 0;
+    bool ok = true;
+    for (; ok && i < link_tok_q_.size(); ++i) {
+        const int s = link_tok_q_[i];
+        SeqCtx& ct = tail->seq_[(size_t) s];
+        cudaSetDevice(tail->dev_);
+        if (!wait_head || i > 0) {
+            const cudaError_t q = cudaEventQuery(ct.ev_done);
+            if (q == cudaErrorNotReady) break;
+            ok = glmfast::cuda_ok(q, "glm multi token", err);
+        } else {
+            ok = glmfast::wait_event(ct.ev_done, "glm multi token", err);
+        }
+        for (Glm5Model* m = this; ok && m != nullptr; m = m->split_next_.get()) ok = m->fast_->route_ok(err);
+        // (a failed launch or copy leaves the token of the step before in tok_h: it must not go out as this one's)
+        if (ok)
+            if (const cudaError_t fe = cudaGetLastError(); fe != cudaSuccess) {
+                err = std::string("glm multi: ") + cudaGetErrorString(fe);
+                ok = false;
+            }
+        if (ok && gf::launch_errors() > 0) {
+            err = "glm multi: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
+            ok = false;
+        }
+        if (ok && (ct.tok_h[0] < 0 || ct.tok_h[0] >= g_.n_vocab)) {
+            err = "glm multi: the head picked " + std::to_string(ct.tok_h[0]) + ", which is no token id";
+            ok = false;
+        }
+        if (!ok) break;
+        link_tok_[(size_t) s] = ct.tok_h[0];
+        if (!gl::send_tok(gl::kTok, link_pos_[(size_t) s], ct.tok_h[0])) {
+            err = "glm link: down";
+            ok = false;
+        }
+    }
+    cudaSetDevice(dev_);
+    if (!ok) {
+        // (none of the queued tokens goes out: multi_take must not hand a sequence the token of its step before)
+        for (const int s : link_tok_q_) link_tok_[(size_t) s] = -1;
+        link_tok_q_.clear();
+        link_tok_err_ = err;
+    } else {
+        link_tok_q_.erase(link_tok_q_.begin(), link_tok_q_.begin() + (long) i);
+    }
+    return ok;
+}
+
 int Glm5Model::multi_take(int s, std::string& err) {
+    namespace gl = maya::core::glmlink;
+    const gl::Role lrole = gl::role();
+    if (lrole != gl::kNone && (s < 0 || (size_t) s >= link_pos_.size() || link_pos_[(size_t) s] < 0)) {
+        err = "glm link: no row was issued for sequence " + std::to_string(s);
+        return -1;
+    }
+    if (lrole == gl::kFront) {
+        // the two-rig split's front: what is queued goes out as it gets ready (the back takes it in this order) while
+        // this sequence's token is waited for - the back sends it as soon as it is picked.  (A row that is not ready
+        // after 5 s: the rest is waited for under the engine's own watchdog - wait_event - instead of polled)
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            if (!link_pump(false, err)) return -1;
+            if (link_out_.empty() || gl::readable()) break;
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+                if (!link_pump(true, err)) return -1;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        int32_t tk = -1;
+        if (!gl::recv_tok(gl::kTok, link_pos_[(size_t) s], tk, err)) return -1;
+        if (tk < 0 || tk >= g_.n_vocab) {   // (the next token's embedding row is read by this id)
+            err = "glm link: the back sent " + std::to_string(tk) + ", which is no token id";
+            gl::abort_link(err);
+            return -1;
+        }
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (!m->fast_->route_ok(err)) return -1;
+        if (s == cur_seq_) last_tok_ = tk;
+        else seq_[(size_t) s].last_tok = tk;
+        return tk;
+    }
+    if (lrole == gl::kBack) {
+        // the back: this sequence's token went out already (link_tok_pump), or goes now with those before it
+        while (std::find(link_tok_q_.begin(), link_tok_q_.end(), s) != link_tok_q_.end())
+            if (!link_tok_pump(true, err)) return -1;
+        const int tok = link_tok_.size() > (size_t) s ? link_tok_[(size_t) s] : -1;
+        if (tok < 0) {   // (its token failed, here or while this side waited for the front - link_tok_pump)
+            err = !link_tok_err_.empty() ? link_tok_err_ : "glm link: no token for sequence " + std::to_string(s);
+            return -1;
+        }
+        if (s == cur_seq_) last_tok_ = tok;
+        else seq_[(size_t) s].last_tok = tok;
+        return tok;
+    }
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     SeqCtx& ct = tail->seq_[(size_t) s];

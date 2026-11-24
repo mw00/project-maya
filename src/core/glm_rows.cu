@@ -29,6 +29,7 @@
 // bit for bit (glm_rows_attn_test compares them).
 #include "glm_rows_state.hpp"
 
+#include "maya/core/glm_link.hpp"
 #include "maya/core/mtp_rows.hpp"
 #include "maya/kernels/exl3.hpp"
 #include "maya/kernels/sampler.hpp"
@@ -950,14 +951,29 @@ bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
         ++prof_off.n;
     }
 
+    namespace gl = maya::core::glmlink;
+    const gl::Role lrole = gl::role();
+    const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
+    if (lrole != gl::kNone && link_pos_.size() != seq_.size()) link_pos_.assign(seq_.size(), -1);
     RowSeq cur[gf::kMaxMvNt];
-    if (!rows_bind(seqs, n, cur, err) || !rows_embed(cur, tokens, n, err) || !rows_layers(cur, n, err))
+    if (!rows_bind(seqs, n, cur, err)) return false;
+    if (lrole == gl::kBack) {
+        // the two-rig split's back: each row's residual from the link (the front ran the embedding and its layers),
+        // into this sequence's own pinned hop row - its last step has completed (multi_take), nothing reads it now
+        cudaSetDevice(dev_);
+        for (int i = 0; i < n; ++i) {
+            SeqCtx& c = seq_[(size_t) seqs[i]];
+            if (!gl::recv_hop(cur[i].p, 1, c.hop_h, hop, err)) return false;
+            cudaMemcpyAsync(cur[i].state, c.hop_h, hop, cudaMemcpyHostToDevice, fast_->cs);
+        }
+    } else if (!rows_embed(cur, tokens, n, err)) {
         return false;
+    }
+    if (!rows_layers(cur, n, err)) return false;
     int64_t p0[gf::kMaxMvNt];
     for (int i = 0; i < n; ++i) p0[i] = cur[i].p;
 
     Glm5Model* tail = this;
-    const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
     for (Glm5Model* B = split_next_.get(); B != nullptr; B = B->split_next_.get()) {
         RowSeq nxt[gf::kMaxMvNt];
         if (!B->rows_bind(seqs, n, nxt, err)) return false;
@@ -984,12 +1000,34 @@ bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
         tail = B;
     }
 
-    if (!tail->rows_head(cur, sps, n, err)) return false;
-    cudaSetDevice(tail->dev_);
-    for (int i = 0; i < n; ++i) {
-        SeqCtx& ct = tail->seq_[(size_t) seqs[i]];
-        cudaMemcpyAsync(ct.tok_h, tail->rows_->tok + i, sizeof(int), cudaMemcpyDeviceToHost, tail->fast_->cs);
-        cudaEventRecord(ct.ev_done, tail->fast_->cs);
+    if (lrole == gl::kFront) {
+        // the two-rig split's front: no head here - each row's residual to its sequence's pinned hop row on the last
+        // local part, queued for the link (link_flush sends it once the copy is done; the back's token comes back
+        // in multi_take)
+        cudaSetDevice(tail->dev_);
+        for (int i = 0; i < n; ++i) {
+            SeqCtx& ct = tail->seq_[(size_t) seqs[i]];
+            cudaMemcpyAsync(ct.hop_h, cur[i].state, hop, cudaMemcpyDeviceToHost, tail->fast_->cs);
+            cudaEventRecord(ct.ev_hop, tail->fast_->cs);
+            link_out_.push_back({(uint32_t) gl::kHop, seqs[i], p0[i], 0, 0});
+        }
+    } else {
+        if (!tail->rows_head(cur, sps, n, err)) return false;
+        cudaSetDevice(tail->dev_);
+        for (int i = 0; i < n; ++i) {
+            SeqCtx& ct = tail->seq_[(size_t) seqs[i]];
+            cudaMemcpyAsync(ct.tok_h, tail->rows_->tok + i, sizeof(int), cudaMemcpyDeviceToHost, tail->fast_->cs);
+            cudaEventRecord(ct.ev_done, tail->fast_->cs);
+        }
+    }
+    if (lrole != gl::kNone)
+        for (int i = 0; i < n; ++i) link_pos_[(size_t) seqs[i]] = p0[i];
+    if (lrole == gl::kBack) {   // (their tokens go out as soon as they are picked: link_tok_pump)
+        if (link_tok_.size() != seq_.size()) link_tok_.assign(seq_.size(), -1);
+        for (int i = 0; i < n; ++i) {
+            link_tok_[(size_t) seqs[i]] = -1;   // (the token of the step before is not this step's)
+            link_tok_q_.push_back(seqs[i]);
+        }
     }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         for (int i = 0; i < n; ++i) {

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -43,6 +44,9 @@ bool g_bf16 = true;
 bool g_pack = true;   // MAYA_GLM_LINK_PACK: the bf16 rows' high bytes nibble-coded (lossless)
 std::mutex g_ctl_mu;
 std::string g_model_id;   // set_model: the model this side loaded (the HELLO compares it)
+std::string g_sched = "1";   // set_sched: several conversations' scheduler settings ("1": one conversation)
+std::atomic<uint64_t> g_gen{0};       // generation(): links made
+std::function<bool()> g_wait_hook;    // set_wait_hook
 // stats
 uint64_t s_hops = 0, s_hop_bytes = 0, s_toks = 0;
 double s_send_ms = 0, s_recv_ms = 0;
@@ -613,6 +617,9 @@ bool up() { return g_up.load(); }
 int ctl_fd() { return role() == kBack ? g_ctl : -1; }
 void set_split(int split_at) { g_split = split_at; }
 void set_model(const std::string& id) { g_model_id = id; }
+void set_sched(const std::string& cfg) { g_sched = cfg.empty() ? "1" : cfg; }
+uint64_t generation() { return g_gen.load(); }
+void set_wait_hook(std::function<bool()> hook) { g_wait_hook = std::move(hook); }
 int split_at() { return g_split; }
 void set_stay(bool stay) { g_stay = stay; }
 void stop_hint() {   // (the first STOP of a request starts its budget; later ones leave it)
@@ -656,7 +663,10 @@ bool bf16() { return false; }
 bool idle_check() { return false; }
 bool reopen(std::string& err) { err = "glm link: not on Windows"; return false; }
 void wake() {}
+void hangup() {}
 bool reaccept(std::string& err) { err = "glm link: not on Windows"; return false; }
+bool readable() { return false; }
+int stall_seconds() { return 0; }
 void term() {}
 long ctl_read(char*, size_t) { return 0; }
 #else
@@ -667,7 +677,7 @@ static std::string link_config() {
     const char* pm = std::getenv("MAYA_GLM_PREFILL_MIN");   // (below it a prompt goes token by token: both or neither)
     return std::string("bf16=") + (g_bf16 ? "1" : "0") + " pack=" + (g_bf16 && g_pack ? "1" : "0") +
            " min_chunks=" + (mc != nullptr ? mc : "") + " prefill_min=" + (pm != nullptr ? pm : "") +
-           " model=" + g_model_id;
+           " parallel=" + g_sched + " model=" + g_model_id;
 }
 
 // (all of it by `by`, sent and read: a side that connected but hangs, or sends a byte now and then, must not hold
@@ -705,9 +715,17 @@ static bool hello(std::string& err, Deadline by) {
     }
     if (pcfg != cfg) {
         const size_t a = pcfg.find(" model="), b = cfg.find(" model=");
+        const size_t pa = pcfg.find(" parallel="), pb = cfg.find(" parallel=");
         if (a != std::string::npos && b != std::string::npos && pcfg.substr(a) != cfg.substr(b))
             err = "glm link: the other side loaded another model (" + pcfg.substr(a + 7) + ") than this one (" +
                   cfg.substr(b + 7) + ") - both need the same pack";
+        else if (pa != std::string::npos && pb != std::string::npos && a != std::string::npos && b != std::string::npos &&
+                 pa < a && pb < b && pcfg.substr(pa, a - pa) != cfg.substr(pb, b - pb))
+            // (the two schedulers run in lock step: their settings must be the same)
+            err = "glm link: the other side runs --parallel with '" + pcfg.substr(pa + 10, a - pa - 10) +
+                  "', this one with '" + cfg.substr(pb + 10, b - pb - 10) + "' - both sides need the same --parallel "
+                  "and the same MAYA_GLM_SEQ_CTX, MAYA_GLM_SPLIT_ROWS, MAYA_GLM_EVEN_GROUPS, MAYA_GLM_MULTI_BOUNDARY, "
+                  "MAYA_GLM_MULTI_SPEC and MAYA_GLM_MULTI_ROOM";
         else
             err = "glm link: the other side runs with '" + pcfg + "', this one with '" + cfg + "'";
         return false;
@@ -1006,6 +1024,7 @@ bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::str
         return false;
     }
     peer_chunk = g_peer_chunk;
+    g_gen.fetch_add(1);
     g_up.store(true);
     std::fprintf(stderr, "glm link: %s up in %.1f s (boundary layer %d, context %lld, prompt chunks %d / %d, %s)\n",
                  role_name(), ms_since(t0) / 1000.0, split_at, (long long) max_ctx, my_chunk, peer_chunk,
@@ -1049,6 +1068,7 @@ bool reopen(std::string& err) {
         }
         std::fprintf(stderr, "glm link: front connected again in %.1f s\n", ms_since(t0) / 1000.0);
     }
+    g_gen.fetch_add(1);
     g_up.store(true);
     return true;
 }
@@ -1056,6 +1076,13 @@ bool reopen(std::string& err) {
 void wake() {
     g_up.store(false);
     if (g_data >= 0) ::shutdown(g_data, SHUT_RDWR);
+}
+
+// (the descriptors are not closed here: the reader thread, which owns the next accept, closes them in reaccept)
+void hangup() {
+    g_up.store(false);
+    if (g_data >= 0) ::shutdown(g_data, SHUT_RDWR);
+    if (g_ctl >= 0) ::shutdown(g_ctl, SHUT_RDWR);
 }
 
 // (from a signal handler: atomics and _exit only.  Nothing is woken from here - every wait of this side looks at
@@ -1105,6 +1132,7 @@ bool reaccept(std::string& err) {
         err = "glm link: told to stop";
         return false;
     }
+    g_gen.fetch_add(1);
     g_up.store(true);
     std::fprintf(stderr, "glm link: back up again\n");
     return true;
@@ -1248,7 +1276,24 @@ static bool read_err(const Hdr& h, std::string& why) {
     return true;
 }
 
+int stall_seconds() { return stall_s(); }
+
+bool readable() {
+    if (g_data < 0) return true;
+    struct pollfd pf {g_data, POLLIN, 0};
+    return ::poll(&pf, 1, 0) != 0;
+}
+
 static bool recv_hdr(Hdr& h, uint32_t want, std::string& err) {
+    // (several conversations, the back: its picked tokens go out while it waits - the hook says when none is left.
+    // Not for longer than a wait on the link may last: then the read below waits, under its own bounds)
+    if (g_wait_hook) {
+        const int64_t t0 = now_ms();
+        while (!readable() && g_wait_hook()) {
+            if (g_term.load() || (stall_s() > 0 && now_ms() - t0 >= (int64_t) stall_s() * 1000)) break;
+            std::this_thread::yield();
+        }
+    }
     if (!read_all(g_data, &h, sizeof h) || h.magic != kMagic) {
         fail(err, "the connection is lost");
         return false;

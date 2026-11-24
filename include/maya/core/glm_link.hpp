@@ -32,20 +32,33 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace maya::core::glmlink {
 
 enum Role : int { kNone = 0, kFront = 1, kBack = 2 };
 enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kSpec = 6, kCtl = 7, kBegin = 8, kEnd = 9, kAck = 10,
-                    kChunk = 13 };
+                    kSched = 11, kVerd = 12, kChunk = 13, kAdmit = 14, kPlan = 15 };
 // kEnd's val (front -> back): bit 0 PAUSE, bit 1 its keep, bit 2 the request was cancelled (a STOP, a client gone)
 // kChunk (both ways, at the start of a prompt-path call): pos = the call's first position, n = its tokens, val = the
 // chunk this side laid out for it, in tokens (0: this side has no prompt path now - both read the call token by
 // token; -1: the layout does not fit - the request fails on both, unless the other side says 0).  Both read the
 // call in the smaller one's chunks
+// kPlan (front -> back, after BEGIN): how the front reads this prompt, so the back reads it in the same calls whatever
+// its own checkpoint / slot / snapshot settings and states are.  pos = the position both go on from (BEGIN's);
+// first val = the number of marks (positions where a prompt-path call ends), n = the snapshot's position - pos;
+// then one message a mark: val = -(its index + 1), n = the mark - pos
 // kSpec (back -> front, the pipelined spec decode): pos = the tail's position, val = its token y, n = the draft d for
 // the position after (-1: none).  kCtl (front -> back): pos = the position the step is for, val = 1 go on / 0 the end
+// SEVERAL CONVERSATIONS AT ONCE (--parallel over the link; generate.cpp's scheduler runs on both sides in lock step,
+// and what the front decides from its input, its timing or its own state goes to the back), front -> back only:
+// kSched: pos = the scheduler's iteration number, val = 1 the front takes a control line now / 0 one scheduler step;
+// kAdmit: pos = the request's id, val = the context the front put it in (-1: it waits for one, -2: refused);
+// kVerd: pos = the request's written-token count, val = the front's verdict on its last token (bit 0 go on, bits 1-2
+// the finish 0 length / 1 stop / 2 cancel, bit 3 pause, bit 4 keep, bit 5 a spec stint interrupted by input), n = the
+// token forced next (-1: none).  The batched rows cross as one HOP per row (its position, n = 1) and come back as one
+// TOK per row, in the order both schedulers issue and take them
 
 struct Hdr {
     uint32_t magic;   // kMagic
@@ -56,7 +69,7 @@ struct Hdr {
     uint64_t bytes;   // payload bytes that follow; HELLO: max context
 };
 constexpr uint32_t kMagic = 0x4b4e4c4d;   // "MLNK"
-constexpr int64_t kVersion = 3;
+constexpr int64_t kVersion = 4;
 
 Role role();                          // from MAYA_GLM_ROLE / MAYA_GLM_ROLE (cached)
 const char* role_name();
@@ -71,6 +84,9 @@ bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::str
 void set_split(int split_at);
 /// What both sides must have loaded (glm_model.cu: the pack's geometry and GGUF shards); the HELLO compares it.
 void set_model(const std::string& id);
+/// Several conversations (--parallel): the scheduler settings both sides must share, as one word without spaces
+/// (generate.cpp, before the model loads); the HELLO compares it.  Unset: one conversation.
+void set_sched(const std::string& cfg);
 int split_at();
 
 // data channel
@@ -112,6 +128,8 @@ bool reopen(std::string& err);
 // all (then it drops; the next command connects again).  stop_clear: the front takes up a GEN
 void stop_hint();
 void stop_clear();
+/// MAYA_GLM_LINK_STALL_S (60; 0: off): how long a wait for a peer that sends nothing may last.
+int stall_seconds();
 // the back's SIGTERM / SIGINT handler (async-signal-safe: a flag): it stops in order - every wait on the link looks
 // at the flag once a second, nothing more is accepted, reaccept fails - or at once on a second signal or before it
 // listens
@@ -122,7 +140,13 @@ void set_stay(bool stay);
 // the back's reader thread: the control connection's next bytes (0: its end, or the back was told to stop)
 long ctl_read(char* p, size_t n);
 void wake();                          // the back: the old link's data socket shut (a main thread blocked on it returns)
+void hangup();                        // the back: the control connection shut too (its reader sees the front as gone)
 bool reaccept(std::string& err);      // the back: accept the front's next connection and HELLO
+uint64_t generation();                // links made so far (a new one: the requests of the one before are gone)
+// several conversations: the front polls for a token while rows still wait to go out; the back, while it waits for
+// a message, sends each token as soon as it is picked (the hook returns false once nothing is left to watch)
+bool readable();                      // a message (or the link's end) is there to read now
+void set_wait_hook(std::function<bool()> hook);
 
 // stats (stderr at exit): hops, bytes, time blocked in send/recv
 void report();

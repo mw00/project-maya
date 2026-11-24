@@ -187,11 +187,57 @@ side runs with `MAYA_GLM_NO_SPEC=1`, and the request does not ask for a plain de
 decode it plainly, and a log line names the side that does not draft.
 `MAYA_GLM_SPEC_WIN` (the verify window of a one-machine split) is not used over the link.
 
+## Several conversations at once (`--parallel`)
+
+`--parallel N` (2–8) works over the link when both sides start with it and with `MAYA_GLM_SPLIT_ROWS`, the same
+values on both:
+
+```sh
+# the back's command line and the front's config ("args" and "env")
+--parallel 4        MAYA_GLM_SPLIT_ROWS=4 MAYA_GLM_EVEN_GROUPS=1
+```
+
+- **What crosses the link.** The conversations decode in batched steps of up to `MAYA_GLM_SPLIT_ROWS` rows. The
+  front runs a group's rows through its layers and sends one residual per conversation; the back finishes them and
+  sends one token per conversation, each as soon as it is picked. While the back works on one group, the front
+  runs the next.
+- **Cut the requests into groups** (`MAYA_GLM_EVEN_GROUPS=1`). With one group the two machines take turns: the
+  front waits while the back finishes the group. Cut evenly into two groups or more, one machine works on a
+  group while the other works on the next. Measured on two machines with 2× RTX 3060 each (Maya-XS, 32K
+  context, four conversations writing at once): 23.8 tok/s in all as one group of four, 38.9 tok/s as two groups
+  of two; one conversation alone wrote 29 tok/s there.
+- **Who decides.** Both sides run the engine's scheduler for several conversations, in step. The front decides
+  what depends on its input, its timing or its own state, and tells the back: when it takes a new command and
+  when a decode step, which conversation state a request goes to, and after each token whether the request goes
+  on (a stop, a cancel, a pause, a forced token).
+- **A request alone** still drafts with the pipelined MTP decode (above). From the second request on, all of them
+  decode in batched steps, without drafts.
+- **A new prompt is read whole** while the other conversations wait: `MAYA_GLM_PREFILL_GAPS`,
+  `MAYA_GLM_PREFILL_INTERLEAVE` and `MAYA_GLM_MULTI_MTP` are not used over the link (a log line says so), and
+  `MAYA_GLM_MULTI_BENCH` does not run with `--role`.
+- **Settings both sides must share**, checked at connect: `--parallel`, `MAYA_GLM_SEQ_CTX`,
+  `MAYA_GLM_SPLIT_ROWS`, `MAYA_GLM_EVEN_GROUPS`, `MAYA_GLM_MULTI_BOUNDARY`, `MAYA_GLM_MULTI_SPEC` and
+  `MAYA_GLM_MULTI_ROOM`. A side that differs is refused with a message that names them. `--parallel` above 1
+  with `--role` and without `MAYA_GLM_SPLIT_ROWS` does not start.
+- **Stops.** A `STOP` for one request ends it on both sides, at its next token or in the middle of its prompt's
+  read; the others go on. A request that is stopped before the engine takes it up, or while it waits for a free
+  conversation state, ends without a token once it is taken up.
+- **Failures.** A failure on either side, or a link that drops while requests run, ends every request that runs
+  or waits with an error, and both sides reset the conversation states the engine holds; states kept in slots
+  stay. The same happens to requests a front left behind when another front (or the same one, started again)
+  connects. A link that is made again while nothing runs keeps the states. What each side still holds of a
+  conversation is compared at its next request, as with one conversation: where they differ, both read the
+  prompt from the start.
+- **Memory.** Each conversation state takes VRAM on both sides, out of the expert pools (the start-up line
+  `glm multi: ... sequence states` says how much), so more conversations mean fewer experts in VRAM.
+
 ## Checking it: single process vs two rigs
 
 `tools/glm_split_check.py` runs the same build, pack and prompts once in one process (the reference) and once split,
 and compares the greedy answers (token ids, with MTP on and off) and the teacher-forced logits (`MAYA_GLM_KL_DUMP`)
 over each prompt plus the reference's answer (the prompt through the prompt path, the answer one token at a time).
+Its four prompts are two short ones, about 2K tokens of code, and one with a 1.4K-token system prompt, whose read
+the engine cuts at the system prompt's end (`--only NAME[,NAME]` runs some of them).
 
 ### The exact check (one machine, two GPUs)
 
@@ -215,6 +261,26 @@ python3 tools/glm_split_check.py compare --dir check --exact      # exit code 0 
 
 Give each side enough `MAYA_GLM_RAM_GB` that no expert is read from the SSD (as the reference): an expert read from
 the SSD instead of the RAM tier is rounded differently.
+
+Several conversations at once are a step of their own (`--parallel N`): the engine runs as a server under the
+script and `N` conversations over the same prompts in three turns: one alone first and the others while it
+writes; a second turn of each that continues the first; then other prompts, half sampled with a seed and half
+greedy with a token banned (`logit_bias`). A run counts only when the conversations decoded together. The
+reference is one process with `--parallel N`:
+
+```sh
+export MAYA_GLM_SPLIT_ROWS=4       # with the two settings above
+python3 tools/glm_split_check.py run --mode ref --parallel 4 --dir check -- $ENG --layer-split 24
+CUDA_VISIBLE_DEVICES=1 python3 tools/glm_split_check.py run --mode back --parallel 4 --dir check -- $ENG \
+    --layer-split 24 --role back --link 127.0.0.1:7711 &
+CUDA_VISIBLE_DEVICES=0 python3 tools/glm_split_check.py run --mode front --parallel 4 --dir check -- $ENG \
+    --layer-split 24 --role front --link 127.0.0.1:7711
+wait
+python3 tools/glm_split_check.py compare --dir check --parallel 4 --exact    # every conversation: the same tokens
+```
+
+`compare` also asks for `check/split/par4.back.ok`, which the back's run writes when it ends in order, with the
+request ids of that run (on two machines, copy the back's `check/split/` to the front after each run).
 
 ### Across two machines
 
@@ -288,6 +354,27 @@ maya rename.
     check above removes all three and is bit-identical.
 - **Without `--role`:** greedy answers identical to an unmodified build (128 of 128 tokens on both prompts, CPU lane
   off so that runs repeat exactly), and the same decode speed (within 1% on both prompts, on v1.1.76).
+- **Several conversations at once** (`--parallel 4`, v1.1.76):
+  - **The exact check** (one machine, 2 GPUs, run on each of two machines): all 12 conversation turns of the
+    `--parallel 4` step give the tokens of one process with `--parallel 4` (1,530 tokens: greedy, sampled with a
+    seed, with a token banned). The same with a back that keeps no slots, a back without the NextN block, the
+    requests in two groups of two, and two conversations. Without `--role`, one process writes the tokens of an
+    unmodified build at the same speed.
+  - **`tools/agent_bench.py`** (4 clients, 900 s, each setting twice, no failed request; a 32K context, so
+    without the bench's 30K-token checks and with system prompts of 8K / 4K / 2K tokens;
+    `MAYA_GLM_SPLIT_ROWS=4 MAYA_GLM_EVEN_GROUPS=1`):
+
+    | | two machines, `--parallel 1` | two machines, `--parallel 4` | one machine, `--parallel 4` |
+    |---|---|---|---|
+    | tokens a second, all conversations | 5.4 | 9.2 | 1.5 |
+    | a turn's first token, median | 123 s | 10 s | 175 s |
+    | a turn's last token, median | 130 s | 64 s | 450 s |
+    | decode of one request, median | 26.8 tok/s | 3.9 tok/s | 0.8 tok/s |
+    | expert reads from VRAM | 87% | 77% | 35% |
+
+    With `--parallel 1` the conversations take turns: each request decodes fast, with MTP, and waits for the
+    others' whole reads and answers. With `--parallel 4` they share the engine. One machine alone cannot keep
+    four conversations' states and the experts in its VRAM.
 
 ## Limits
 
@@ -298,10 +385,14 @@ maya rename.
 - Both sides must run the same build and the same pack. The protocol version, the split's settings and the model
   are checked at connect, and the per-request settings (decode mode, prompt chunks, reuse) at every request. A
   back that serves turns a front whose settings differ away and waits for the next one.
+- The front decides how a prompt's read is cut into calls (where its conversation checkpoints and the prefix cut
+  end one, where the snapshot is taken) and the back reads it the same way, whatever its own checkpoint and slot
+  settings are. Two sides with different such settings (`MAYA_GLM_CKPTS`, `MAYA_GLM_SLOTS`, ...) keep different
+  states, so they reuse less of a conversation: that costs prompt reads, not correctness.
 - The prompt cache on both sides must agree; when they differ (one side restarted, a slot only one side has), both
   read the prompt again from the start, which costs time, not correctness.
-- A failure on either side ends the running request on both. The link drops and the front reconnects at its next
-  request.
+- A failure on either side ends the running request on both (with `--parallel`, all of them). The link drops and
+  the front reconnects at its next request.
 - Text requests only: images (`GENI`), `LOGP` scoring and the vision lend (`VLEND` / `VRECLAIM`) are refused on
   the front with an error.
 - `MAYA_GLM_WARM_PROMPT` is not used over the link (the first prompt warms both sides), and `--role` does not run
@@ -314,5 +405,7 @@ maya rename.
   runs one connection's handshake at a time (10 s at most each, 2 s for one that sends nothing).
 - The front resolves the `--link` host once, when it starts.
 - `MAYA_GLM_SCORE` does not run with `--role` (`tools/glm_split_check.py` compares a split's logits).
-- One conversation at a time (`--parallel 1`): `--parallel` above 1 is refused with `--role`.
+- `--parallel` over the link needs `MAYA_GLM_SPLIT_ROWS` on both sides and reads a new prompt whole (see
+  [Several conversations at once](#several-conversations-at-once---parallel)). A failure ends all the running
+  requests, not one.
 - No DFlash2 drafter over the link.
