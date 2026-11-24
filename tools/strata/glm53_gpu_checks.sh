@@ -151,14 +151,14 @@ kld() {
 
 loop() {
     need --pack "$PACK"
-    local py=${STRATA_PYTHON3:-$HOME/project-maya/.venv/bin/python3}
+    local py=${MAYA_PYTHON3:-$HOME/project-maya/.venv/bin/python3}
     (cd "$ROOT" && "$py" tools/maya_quant/loop_test.py --exe "$PORT/maya" --pack "$PACK" ${TOK:+--tok "$TOK"} --max-new "$MAXNEW" \
         --runs "$RUNS" > "$OUT/loop.log" 2>&1) && pass "loop: $(tail -1 "$OUT/loop.log")" || fail "loop (see $OUT/loop.log)"
 }
 
 long_gate() {
     need --pack "$PACK"; need --long-tokens "$LONGTOK"
-    local py=${STRATA_PYTHON3:-$HOME/project-maya/.venv/bin/python3} f i=0
+    local py=${MAYA_PYTHON3:-$HOME/project-maya/.venv/bin/python3} f i=0
     for f in ${LONGTOK//,/ }; do
         i=$((i + 1))
         if "$py" "$ROOT/tools/strata/glm53_long_gate.py" --exe "$PORT/maya" --pack "$PACK" --tokens "$f" \

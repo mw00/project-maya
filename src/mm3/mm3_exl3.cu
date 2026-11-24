@@ -23,11 +23,11 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <cublas_v2.h>
 #include <mma.h>   // (sm_70 / sm_75: nvcuda::wmma - V100, T4 and RTX 20's tensor cores)
 #endif
-#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
+#include "maya/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <algorithm>
 #include <atomic>
@@ -43,7 +43,7 @@
 #define EXL3_LEGACY(call) (void) 0
 #define EXL3_LEGACY_MOE(a, call) (void) 0
 
-namespace strata::mm3::exl3 {
+namespace maya::mm3::exl3 {
 namespace {
 
 constexpr int kThreads = 256, kWarps = 8;
@@ -71,7 +71,7 @@ void launch_check(const char* what) {
 
 // ---------------------------------------------------------------- the codebooks
 __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return __builtin_amdgcn_sad_u8(x, 0u, acc);   // (v_sad_u8: the bytes' |x - 0| summed onto acc, one instruction)
 #else
     return __dp4a(x, 0x01010101u, acc);
@@ -300,7 +300,7 @@ __device__ __forceinline__ void chunk_store(float (&v)[4], const float (&s)[4], 
 // with a __syncthreads (out complete).
 constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if !defined(MAYA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define EXL3_TC 1
 #endif
 // Volta and Turing (sm_70, sm_75: V100, T4, RTX 20): the tiles on the tensor cores through nvcuda::wmma's
@@ -309,7 +309,7 @@ constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 // holds: their outputs are never written), F32 accumulation.  The token path and a window's take it alike (each
 // activation's column is its own: a window's token keeps the token path's bits).  MM3_EXL3_V100_FMA (a build define):
 // the CUDA cores' F32 product instead, as before.
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800 && \
+#if !defined(MAYA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800 && \
     !defined(MM3_EXL3_V100_FMA)
 #define EXL3_WM70 1
 #endif
@@ -321,7 +321,7 @@ constexpr int kTokB = kTok;
 constexpr int kWtPitch = 12;   // (EXL3_WM70) a decoded tile's row in shared memory: 8 words of its 16 inputs + 4
 
 // RDNA 3 / 4: v_dot2_f32_f16 - two FP16 products and their FP32 sum onto c in one instruction (no conversions)
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+#if defined(MAYA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
 #define EXL3_DOT2 1
 typedef _Float16 exl3_h2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ float dot2_acc(uint32_t a, uint32_t b, float c) {
@@ -402,7 +402,7 @@ constexpr int kMinBlocksMv = K2 <= 8 ? 2 : 3;
 template <int K2>
 constexpr int kMinBlocksMv = 2;
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads)
 #else
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads, n)
@@ -1023,7 +1023,7 @@ __device__ unsigned g_win_timeouts = 0;
 __global__ void win_wait_kernel(const unsigned* p, unsigned v, unsigned long long limit) {
     if (threadIdx.x != 0) return;
     unsigned long long t0, t;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     t0 = wall_clock64();   // (limit: 120 s of its ticks - win_wait_limit)
 #else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
@@ -1032,7 +1032,7 @@ __global__ void win_wait_kernel(const unsigned* p, unsigned v, unsigned long lon
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         t = wall_clock64();
 #else
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -1045,7 +1045,7 @@ __global__ void win_wait_kernel(const unsigned* p, unsigned v, unsigned long lon
     __threadfence_system();
 }
 unsigned long long win_wait_limit() {   // 120 s in win_wait_kernel's clock
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const unsigned long long l = [] {
         int dev = 0, khz = 0;
         if (hipGetDevice(&dev) != hipSuccess || hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) !=
@@ -1252,7 +1252,7 @@ __global__ void rows_f16_kernel(const float* __restrict__ x, int ldx, const int*
 // straight into mma.m16n8k16's B fragments - a lane's 8 steps ARE the fragment order (steps 0,1 / 2,3 rows 2t+{0,1} /
 // 2t+8+{0,1} of column g, steps 4..7 the same of column g + 8) - and multiplies every m-tile of the block with them.
 // The output rotation and svh run on the F32 tile in shared memory.
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 namespace tc {
 
 constexpr int BM = 32, MT = BM / 16, AP = 136;   // rows a block, its m-tiles, the A rows' pitch (halves)
@@ -1585,7 +1585,7 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(SetArgs a, KMix mx, c
 // takes it on gfx11 only (wmma_now; EXL3_WMMA_ROWS 16 or 32, by default 16); the decode and verify kernels keep
 // block_gemv (their bits are the token path's).
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 constexpr int kWtW = 9;          // a warp's decoded tile by output, 8 words a row + 1 (banks)
 #else
 constexpr int kWtW = kWtPitch;   // (nvcuda::wmma: a row 16-byte aligned - 8 words + 4)
@@ -1597,7 +1597,7 @@ struct __align__(32) WmmaSmem {   // (out, xb and wt at the same offsets for eve
     uint32_t wt[kWarps * 16 * kWtW];
     uint32_t stage[kWarps * 4 * K2];
 };
-#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+#if defined(MAYA_USE_HIP) && defined(__GFX11__)
 #define EXL3_WMMA 1
 typedef _Float16 exl3_h16 __attribute__((ext_vector_type(16)));
 typedef float exl3_f8 __attribute__((ext_vector_type(8)));
@@ -1968,7 +1968,7 @@ template <int K2, int cb> struct RunRows {
             m.trellis, m.ld > 0 ? m.ld : m.n / 16, m.suh, m.svh, m.k, dst, bf16);
     }
 };
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 template <int K2, int cb> struct RunGemm {
     static void run(const tc::GArgs& a, dim3 grid, cudaStream_t s) { tc::gemm_kernel<K2, cb><<<grid, kThreads, 0, s>>>(a); }
 };
@@ -2432,7 +2432,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
 
 // mma_supported() for the current device, cached (the prompt path's launches ask it each time)
 bool mma_now() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     static int known[64];   // 0: not asked yet, 1: no, 2: yes
@@ -2446,7 +2446,7 @@ bool mma_now() {
 
 // the prompt path on the matrix cores (wmma_set_kernel): an RDNA 3 GPU (gfx11), unless EXL3_WMMA=0 - cached a device
 static bool wmma_now() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     static const bool off = std::getenv("EXL3_WMMA") != nullptr && std::atoi(std::getenv("EXL3_WMMA")) == 0;
     static int known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
@@ -2462,7 +2462,7 @@ static bool wmma_now() {
     return false;
 #endif
 }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // the matrix-core prompt kernels' rows a block: 16 (EXL3_WMMA_ROWS=32: each weight tile decoded once for 32 rows -
 // slower on a Radeon 8065S, 167 against 208 tokens/s on a 4K prompt: twice the shared memory, half the blocks a CU)
 static int wmma_rows() {
@@ -2495,7 +2495,7 @@ template <int K2, int cb> struct RunWmmaDown {
 };
 #endif
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 // Volta / Turing (cc 7.x): the prompt path's tile kernels on the tensor cores (EXL3_WM70: wmma_set_kernel,
 // wm_rows_kernel) - cached a device; MM3_EXL3_WM70=0: the CUDA cores' portable kernels instead (A/B)
 static bool wm70_now() {
@@ -2651,7 +2651,7 @@ bool blas_down(BlasCtx& c, const SetArgs& sa, int e, int lr0, int n, const uint1
 #endif
 
 bool mma_supported() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     int dev = 0, major = 0;
@@ -2668,7 +2668,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_gate_up")) return;
         const KMix k = kmix(sa.mix);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (wmma_now()) {
             mix_launch(sa.mix, [&](auto cb) {
                 with_rows([&](auto nr) {
@@ -2690,7 +2690,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         launch_check("set_gate_up (mixed)");
         return;
     }
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (!mma_now()) {   // (before sm_80: Volta / Turing's tensor cores, else the portable kernels)
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         SetArgs sb = sa;
@@ -2774,7 +2774,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_down")) return;
         const KMix k = kmix(sa.mix);
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         if (wmma_now()) {
             mix_launch(sa.mix, [&](auto cb) {
                 with_rows([&](auto nr) {
@@ -2796,7 +2796,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         launch_check("set_down (mixed)");
         return;
     }
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mma_now()) {   // (before sm_80: Volta / Turing's tensor cores, else the portable kernels)
         SetArgs sb = sa;
@@ -2860,7 +2860,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
 
 void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s) {
     if (m.fmt == ::mm3::gg::kFmtGG) return ::mm3::gg::gemm_rows(m, x16, ldx, rows, y, ldy, beta, s);
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     if (rows <= 0) return;
     if (!mma_now()) {   // (before sm_80: the FP16 GEMM for many rows, Volta / Turing's tiles, the portable kernels)
         if (!supported(m)) {
@@ -2911,7 +2911,7 @@ void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, i
 }
 
 bool blas_enable(cudaStream_t s, size_t scratch_mb) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) s, (void) scratch_mb;
     return false;
 #else
@@ -2946,7 +2946,7 @@ bool blas_enable(cudaStream_t s, size_t scratch_mb) {
 }
 
 size_t blas_bytes(cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) s;
     return 0;
 #else
@@ -2956,7 +2956,7 @@ size_t blas_bytes(cudaStream_t s) {
 }
 
 bool blas_wanted() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     return !mma_now() && blas_rows_env() > 0;
@@ -3013,4 +3013,4 @@ void reconstruct_inner(const Mat& m, uint16_t* dst, cudaStream_t s) {
     launch_check("reconstruct_inner");
 }
 
-}  // namespace strata::mm3::exl3
+}  // namespace maya::mm3::exl3

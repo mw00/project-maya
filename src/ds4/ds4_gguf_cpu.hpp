@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::ds4::gguf {
+namespace maya::ds4::gguf {
 
 constexpr int kMxCpuMaxN = 8;   // activations a call
 
@@ -17,7 +17,7 @@ constexpr int kMxCpuMaxN = 8;   // activations a call
 void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float* const* x, int n, float* const* y);
 
 /// A GGUF's low-bit experts (ds4_iq.cuh's types) on the CPU lane - ggml-cpu's arithmetic through the GLM CPU lane's
-/// native experts (strata::kernels::cpu::native_*: its AVX-512 / AVX2 multi-token rows where they are ggml's bit for bit,
+/// native experts (maya::kernels::cpu::native_*: its AVX-512 / AVX2 multi-token rows where they are ggml's bit for bit,
 /// ggml's dots otherwise; ds4_iq_cpu.cpp): an activation quantized once to the weight type's vec_dot_type (Q8_K: an F32
 /// scale per 256 values - the device takes one per 32, so the two sides agree to that rounding), each row one dot.
 struct IqCpu {
@@ -75,6 +75,21 @@ const char* mx_tier_name(int t);
 /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512: ggml-cpu's numbers bit for bit, checked against its dot on first use;
 /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
+/// IQ2_XXS experts re-coded at 4 bits a weight (maya-hy4's CPU lane keeps its hottest experts so in spare RAM): the
+/// same integer sums and float steps as ggml-cpu's dot, bit for bit, from a nibble mask and a byte shuffle instead of
+/// the grid's index and table work.  q4x_ok: this CPU runs them and they give ggml's bits (checked once; DS4_IQ_Q4X=0
+/// never); q4x_row_bytes: a row of n values; q4x_convert: rows of IQ2_XXS (src_row bytes apart) into the form;
+/// q4x_gate_up / q4x_down: iq_cpu_gate_up / iq_cpu_down on rows of the form (the same epilogue).
+bool iq_cpu_q4x_ok(int type);
+size_t iq_cpu_q4x_row_bytes(int n);
+void iq_cpu_q4x_convert(const uint8_t* src, size_t src_row, int rows, int n, uint8_t* dst);
+void iq_cpu_q4x_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                        float* const* ff, int r0, int r1, float limit);
+void iq_cpu_q4x_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0,
+                     int r1);
+/// The length of the rows the lane will run (its experts' inputs), before its first call: the choice between this
+/// CPU's row forms (own()) is timed on rows of it - the first one said is kept
+void iq_cpu_row_hint(int n);
 /// Load-time preparation of the same guarded one/multi CPU row selection/parity checks.
 void iq_cpu_prepare_rows(int type);
 /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
@@ -90,4 +105,4 @@ bool dense_requant(const uint8_t* q8, int n, int k, int type, std::vector<uint8_
 /// on the CPU lane as in VRAM (up to their order), whichever side the expert cache puts it on.
 void q8_round(const float* x, int k, float* out);
 
-}  // namespace strata::ds4::gguf
+}  // namespace maya::ds4::gguf

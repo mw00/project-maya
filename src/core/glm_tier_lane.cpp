@@ -1,7 +1,7 @@
 // src/core/glm_tier_lane.cpp - the glm-dsa port B8.4 node-split CPU lane arithmetic (see glm_tier_lane.hpp).
 #include "glm_tier_lane.hpp"
 
-namespace strata::core::glmtier {
+namespace maya::core::glmtier {
 
 bool half_fmt(const kc::NativeFmt& full, kc::NativeFmt& half, std::string& why) {
     if (full.n_ff <= 0 || full.n_ff % 2 != 0) {
@@ -43,4 +43,4 @@ void half_experts_serial(const kc::NativeFmt& half, const SplitLayout& L, int ne
     }
 }
 
-}  // namespace strata::core::glmtier
+}  // namespace maya::core::glmtier

@@ -10,9 +10,9 @@
 //      f32 instead is a 2^-9 = 1.95e-03 relative change, which is above any 1e-3 tolerance.  An fp16
 //      activation is the rival reading, computed and required to differ, because it is what the engine did
 //      before `docs/activation-contract.md` settled the question and it produces perfectly plausible output.
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/bf16_bits.hpp"
+#include "maya/kernels/bf16_gemv.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -25,8 +25,8 @@
 
 namespace {
 
-using strata::kernels::bf16_from_f32;
-using strata::kernels::f32_from_bf16;
+using maya::kernels::bf16_from_f32;
+using maya::kernels::f32_from_bf16;
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -102,11 +102,11 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(d_w, w.data(), w.size() * 2, cudaMemcpyHostToDevice), "cw");
 
         std::vector<float> naive((size_t) s.n_out), warp((size_t) s.n_out), split((size_t) s.n_out);
-        strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
+        maya::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
         check(cudaMemcpy(naive.data(), d_y, naive.size() * 4, cudaMemcpyDeviceToHost), "cy1");
-        strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 32, nullptr);
+        maya::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 32, nullptr);
         check(cudaMemcpy(warp.data(), d_y, warp.size() * 4, cudaMemcpyDeviceToHost), "cy2");
-        strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 256, nullptr);
+        maya::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 256, nullptr);
         check(cudaMemcpy(split.data(), d_y, split.size() * 4, cudaMemcpyDeviceToHost), "cy3");
 
         const double rn = rel_l1(want, naive), rw = rel_l1(want, warp), rs = rel_l1(want, split);
@@ -122,15 +122,15 @@ int main(int argc, char** argv) {
             std::vector<float> fp16_as_f32((size_t) s.n_in);
             std::vector<uint16_t> x16((size_t) s.n_in);
             for (size_t i = 0; i < fx.size(); ++i) {
-                x16[i] = strata::kernels::f16_from_f32(fx[i]);
-                fp16_as_f32[i] = strata::kernels::f32_from_f16(x16[i]);
+                x16[i] = maya::kernels::f16_from_f32(fx[i]);
+                fp16_as_f32[i] = maya::kernels::f32_from_f16(x16[i]);
             }
             // Round the fp16 value to bf16 - i.e. give the kernel a bf16 activation whose VALUES came through
             // fp16.  That is the whole difference between the two contracts at this call site.
             for (size_t i = 0; i < fp16_as_f32.size(); ++i) x[i] = bf16_from_f32(fp16_as_f32[i]);
             check(cudaMemcpy(d_x, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "cx2");
             std::vector<float> rival((size_t) s.n_out);
-            strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
+            maya::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
             check(cudaMemcpy(rival.data(), d_y, rival.size() * 4, cudaMemcpyDeviceToHost), "cy4");
             const double r = rel_l1(want, rival);
             const bool visible = r > 1e-4;

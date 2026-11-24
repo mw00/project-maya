@@ -13,8 +13,8 @@
 //   mla2     q_abs, the rope-tail logits at scale 1/16, the chunked softmax, ctx and W_vb vs the reference absorbed
 //            attention (cpu::mla_absorb_q + cpu::mla_attention on the same stored values): rel L2 < 1e-4 at
 //            n_sel 1, 37 (with padding), 2048, both latent formats; the Flash scale 1/sqrt(192) must fail.
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 

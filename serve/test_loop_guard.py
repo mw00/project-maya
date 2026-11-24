@@ -1056,6 +1056,75 @@ class GuardedUsage(unittest.TestCase):
         self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 5000}, 1000)["reused"], 1000)
 
 
+class LastEngine(ScriptEngine):
+    """ScriptEngine with a DONE line's figures (`last`, a new dict a call, set as the engine's drain sets it - also when
+    the call is closed early): the first call found `CACHED` of its prompt in the cache, a later one all but the last 3
+    tokens of its prompt (the request's prompt plus what was written)."""
+    CACHED = 5
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        k, call = 0, len(self.prompts) + 1
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                k += 1
+                yield t
+        finally:
+            self.last = {"generated": k, "prompt_tokens": len(ids),
+                         "reused": self.CACHED if call == 1 else len(ids) - 3, "prompt_ms": 100.0 * call,
+                         "decode_ms": 10.0 * k, "finish": "stop", "drafts_accepted": k // 2, "drafts_offered": k,
+                         "hits": call, "lookups": 2 * call}
+
+
+class RequestFigures(unittest.TestCase):
+    """#1058: a request that runs the engine more than once (after a blocked tool call, a keep, a thinking resume)
+    reports its figures over all its calls - its row in /metrics and the totals took the last call's DONE alone:
+    reused > the prompt (53,069 of 20,288), 689 of 33,471 tokens written, ~2850 tok/s for ~80."""
+
+    def test_merge_calls(self):
+        from serve.server import merge_calls
+        calls = [{"generated": 32782, "prompt_tokens": 20288, "reused": 120, "prompt_ms": 9000.0,
+                  "decode_ms": 405000.0, "drafts_accepted": 9000, "drafts_offered": 12000, "finish": "stop"},
+                 {"generated": 689, "prompt_tokens": 53100, "reused": 53069, "prompt_ms": 40.0, "decode_ms": 10368.0,
+                  "drafts_accepted": 200, "drafts_offered": 300, "finish": "stop"}]
+        got = merge_calls(calls)
+        self.assertEqual((got["prompt_tokens"], got["reused"], got["prompt_ms"]), (20288, 120, 9000.0))  # the first's
+        self.assertEqual((got["generated"], got["decode_ms"]), (33471, 415368.0))                          # summed
+        self.assertEqual((got["drafts_accepted"], got["drafts_offered"]), (9200, 12300))
+        self.assertNotIn("hits", got)                                   # (no call reported it: not made up)
+        self.assertEqual(merge_calls(calls[:1]), calls[0])              # one call: its own figures
+        self.assertEqual(merge_calls([]), {})
+
+    def test_a_blocked_call_continuation_counts_every_call(self):
+        other = "nmcli -f 802-11-wireless-security.key-mgmt connection show Smulnet"
+        eng = LastEngine(Tok(), call_text(NMCLI[0]), "Checking the key management.\n" + call_text(other))
+        eng.last = {}
+        svc, eng, kw, calls, text, done = ToolBlock().answer(engine=eng)
+        self.assertEqual((calls, len(eng.prompts)), ([other], 2))       # two engine calls
+        row = svc.metrics()["requests"][0]
+        self.assertEqual(row["prompt_tokens"], len(eng.prompts[0]))
+        self.assertEqual(row["reused"], LastEngine.CACHED)              # the request's prompt, not the 2nd call's
+        self.assertEqual(row["prompt_ms"], 100.0)                       # its own prompt read (one scope with reused)
+        self.assertEqual(row["engine_generated"], eng.made)             # every call's tokens ...
+        self.assertEqual(row["decode_ms"], 10.0 * eng.made)             # ... and decode time
+        self.assertEqual(row["decode_tok_s"], 100.0)
+        self.assertEqual(row["drafts_offered"], eng.made)
+        self.assertEqual(row["hit_rate"], 0.5)                          # (1 + 2) of (2 + 4)
+        t = svc.metrics()["totals"]
+        self.assertEqual((t["reused"], t["decode_ms"]), (LastEngine.CACHED, 10.0 * eng.made))
+        self.assertGreaterEqual(t["prompt_tokens"] - t["reused"], 0)     # (llamacpp:prompt_tokens_total never < 0)
+        self.assertEqual(done["timings"]["cache_n"], LastEngine.CACHED)
+        self.assertEqual(done["timings"]["predicted_per_second"], 100.0)
+
+    def test_one_call_is_as_before(self):
+        eng = LastEngine(Tok(), "Done.")
+        eng.last = {}
+        svc, eng, kw, calls, text, done = ToolBlock().answer(engine=eng)
+        self.assertEqual(len(eng.prompts), 1)
+        row = svc.metrics()["requests"][0]
+        self.assertEqual((row["reused"], row["engine_generated"], row["prompt_ms"]), (LastEngine.CACHED, eng.made,
+                                                                                      100.0))
+
+
 # DeepSeek-V4.1's turn markers, as its vocabulary has them (one CONTROL token each): built from code points, so this
 # file never spells them out (an agent's own stream through the server must not read as the marker)
 DS_USER = chr(0x3c) + chr(0xff5c) + "User" + chr(0xff5c) + chr(0x3e)
@@ -1221,6 +1290,43 @@ class ThinkingMarkers(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
         self.assertIn("x = 1", text)
         self.assertNotIn("y = 2", text)
+
+
+
+class Hy4(unittest.TestCase):
+    """Hy4-Flash (its public template, its tags one token each as its pack's tokenizer has them): the guard is on for it
+    as for every model, and its thinking is closed with the template's own suffixed </think:..> token."""
+
+    def service(self, engine):
+        from serve.test_hy4_frontend import PUBLIC
+        return Service(engine, engine.tok, ChatTemplate(PUBLIC))
+
+    def test_a_loop_in_the_answer_is_dropped_and_penalised(self):
+        from serve.test_hy4_frontend import Hy4Tok
+        eng = LoopingEngine(Hy4Tok(), HEAD, BLOCK, escape=ESCAPE)
+        svc = self.service(eng)
+        self.assertTrue(svc.loop_guard)
+        _, content, done, _ = run(svc, sampling={"temperature": 0})
+        kept_block(self, content, after=ESCAPE)
+        self.assertEqual((done["finish"], len(eng.calls)), ("stop", 2))
+        self.assertEqual(eng.calls[1][2]["repetition_penalty"], LG.LOOP_PENALTY)
+        self.assertEqual({k: svc.loop_guard_counts[k] for k in ("detected", "penalised", "stopped")},
+                         {"detected": 1, "penalised": 1, "stopped": 0})
+
+    def test_a_third_loop_in_the_thinking_closes_it(self):
+        from serve.test_hy4_frontend import CLOSE, Hy4Tok
+        tok = Hy4Tok()
+        think_end = tok.special_tokens[CLOSE]
+        eng = LoopingEngine(tok, "I need to list them:\n", BLOCK, answer="\n\nThe numbers: 1017, 245, 26.",
+                            think_end=think_end)
+        svc = self.service(eng)
+        self.assertEqual(svc.think_end_id, think_end)
+        reasoning, content, done, _ = run(svc, thinking=True)
+        kept_block(self, reasoning, head="I need to list them:\n")
+        self.assertEqual(content.strip(), "The numbers: 1017, 245, 26.")
+        self.assertEqual(done["finish"], "stop")
+        self.assertEqual(eng.calls[-1][0][-1], think_end)          # the thinking closed by the model's own token
+        self.assertEqual(svc.loop_guard_counts["thinking_closed"], 1)
 
 
 if __name__ == "__main__":

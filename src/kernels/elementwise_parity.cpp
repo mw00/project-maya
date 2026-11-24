@@ -12,8 +12,8 @@
 //      instead of decaying, so the sign is checked as a property and not assumed.
 //   3. `silu` IS COMPUTED IN DOUBLE then cast, because `ref/gdn.py`'s numpy does.  f32 `expf` differs in the
 //      last bits, and the test measures that rather than asserting it away.
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/elementwise.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(d_a, alpha.data(), n * 4, cudaMemcpyHostToDevice), "ca");
         check(cudaMemcpy(d_dt, dt.data(), n * 4, cudaMemcpyHostToDevice), "cd");
         check(cudaMemcpy(d_sa, a.data(), n * 4, cudaMemcpyHostToDevice), "cs");
-        strata::kernels::gdn_gate(d_a, d_dt, d_sa, d_g, 1, H_V, nullptr);
+        maya::kernels::gdn_gate(d_a, d_dt, d_sa, d_g, 1, H_V, nullptr);
         std::vector<float> got((size_t) n);
         check(cudaMemcpy(got.data(), d_g, n * 4, cudaMemcpyDeviceToHost), "cg");
 
@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
         float* d_x = nullptr;
         check(cudaMalloc(&d_x, n * 4), "sx");
         check(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice), "csx");
-        strata::kernels::silu_inplace(d_x, n, nullptr);
+        maya::kernels::silu_inplace(d_x, n, nullptr);
         std::vector<float> got((size_t) n);
         check(cudaMemcpy(got.data(), d_x, n * 4, cudaMemcpyDeviceToHost), "csg");
         const double rel = rel_l1(want, got);
@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
         check(cudaMalloc(&d_x, n * 4), "ex");
         check(cudaMalloc(&d_h, n * 2), "eh");
         check(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice), "cex");
-        strata::kernels::scale_inplace(d_x, n, s, nullptr);
+        maya::kernels::scale_inplace(d_x, n, s, nullptr);
         std::vector<float> got((size_t) n);
         check(cudaMemcpy(got.data(), d_x, n * 4, cudaMemcpyDeviceToHost), "ceg");
         int diff = 0;
@@ -198,12 +198,12 @@ int main(int argc, char** argv) {
         std::printf("  %-44s %d of %d differ\n", "scale_inplace is exact", diff, n);
         if (diff) ++bad;
 
-        strata::kernels::f32_to_f16_bulk(d_x, d_h, n, nullptr);
+        maya::kernels::f32_to_f16_bulk(d_x, d_h, n, nullptr);
         std::vector<uint16_t> h((size_t) n);
         check(cudaMemcpy(h.data(), d_h, n * 2, cudaMemcpyDeviceToHost), "ceh");
         int hbad = 0;
         for (int i = 0; i < n; ++i)
-            if (h[(size_t) i] != strata::kernels::f16_from_f32(got[(size_t) i])) ++hbad;
+            if (h[(size_t) i] != maya::kernels::f16_from_f32(got[(size_t) i])) ++hbad;
         std::printf("  %-44s %d of %d differ\n", "f32_to_f16_bulk uses the shared conversion", hbad, n);
         if (hbad) ++bad;
         cudaFree(d_x); cudaFree(d_h);
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
         check(cudaMalloc(&d_w, w.size() * 4), "m rmsw");
         check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "c rmsx");
         check(cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice), "c rmsw");
-        strata::kernels::rms_norm_weighted(d_x, d_w, rows, cols, eps, nullptr);
+        maya::kernels::rms_norm_weighted(d_x, d_w, rows, cols, eps, nullptr);
         std::vector<float> got((size_t) (rows * cols));
         check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "c rmsg");
 
@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
         // sides were never looking at the same input.
         const std::vector<float> want_null = ref(false, false);
         check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "c rmsx2");
-        strata::kernels::rms_norm_weighted(d_x, nullptr, rows, cols, eps, nullptr);
+        maya::kernels::rms_norm_weighted(d_x, nullptr, rows, cols, eps, nullptr);
         check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "c rmsn");
         int null_bad = 0;
         for (size_t i = 0; i < got.size(); ++i)
@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
                                 if (std::memcmp(&fused, &want[(size_t) i], sizeof(float)) != 0) ++fma_diff;
                             }
                             check(cudaMemcpyAsync(out, got.data(), got.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "embedding output guards");
-                            strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
+                            maya::kernels::embedding_gather(dc + (size_t) row * row_bytes,
                                 ds + (size_t) row * row_groups,
                                 with_offset ? dof + (size_t) row * row_groups : nullptr,
                                 n, bits, bias, group, out + 1, stream);
@@ -379,11 +379,11 @@ int main(int argc, char** argv) {
                                 cudaGraph_t graph;
                                 cudaGraphExec_t exec;
                                 check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "embedding capture");
-                                strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
+                                maya::kernels::embedding_gather(dc + (size_t) row * row_bytes,
                                     ds + (size_t) row * row_groups,
                                     with_offset ? dof + (size_t) row * row_groups : nullptr,
                                     n, bits, bias, group, out + 1, stream);
-                                strata::kernels::scale_inplace(out + 1, n, 2.0f, stream);
+                                maya::kernels::scale_inplace(out + 1, n, 2.0f, stream);
                                 check(cudaStreamEndCapture(stream, &graph), "embedding capture end");
                                 check(cudaGraphInstantiate(&exec, graph, 0), "embedding instantiate");
                                 check(cudaGraphLaunch(exec, stream), "embedding replay");

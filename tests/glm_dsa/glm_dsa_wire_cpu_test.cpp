@@ -1,7 +1,7 @@
 // tests/glm_dsa/glm_dsa_wire_cpu_test.cpp - glm-dsa wave 5: the Volta kernels wired into the glm-dsa decode mixer, on the
 // CPU twins (plain C++: runs on any build, no GPU).
 //
-//   1. the dispatch policy (include/strata/kernels/glmd_decode_policy.hpp): switch parsing, the documented thresholds
+//   1. the dispatch policy (include/maya/kernels/glmd_decode_policy.hpp): switch parsing, the documented thresholds
 //      (WMMA scorer above 16K cells, radix top-k above 32K, both forced by 1 and disabled by 0, fused MLA only on), and
 //      the graph rule: within one policy_regime() every decision is the same (a captured part never straddles a kernel
 //      switch);
@@ -19,9 +19,9 @@
 //      matches the decode path's (decode_score + decode_topk) row by row outside near ties.
 #include "glm_dsa_mixer_fixture.hpp"
 
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_decode_policy.hpp"
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_decode_policy.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cstdio>
 #include <memory>

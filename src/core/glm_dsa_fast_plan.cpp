@@ -5,7 +5,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace strata::core::glmdsa {
+namespace maya::core::glmdsa {
 
 const char* src_name(Src s) {
     switch (s) {
@@ -191,4 +191,4 @@ void q8_1_quantize_host(const float* x, int64_t n, void* xq) {
     }
 }
 
-}  // namespace strata::core::glmdsa
+}  // namespace maya::core::glmdsa

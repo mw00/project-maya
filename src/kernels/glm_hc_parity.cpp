@@ -20,8 +20,8 @@
 // The positive comparison holds the f32 kernel to ref/glm.py's f64 arithmetic.  Two fixtures: the
 // structural one (hc_eps 1e-2, so the eps readings separate) and the real-epsilon one (1e-6, the released
 // value - the floor and guards vanish below the f32 noise there, which is itself worth knowing).
-#include "strata/kernels/glm_hc.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_hc.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
 
@@ -211,16 +211,16 @@ void run_kernels(const Fixture& f, std::vector<float>& mixed, std::vector<float>
     check(cudaMemcpy(d_residual, f.R.data(), hc_dim * sizeof(float), cudaMemcpyHostToDevice), "residual");
     check(cudaMemcpy(d_block, block_out.data(), f.n_embd * sizeof(float), cudaMemcpyHostToDevice), "block");
 
-    strata::kernels::GlmHcShapes s;
+    maya::kernels::GlmHcShapes s;
     s.n_embd = f.n_embd;
     s.hc = hc;
     s.sinkhorn_iters = f.iters;
-    strata::kernels::GlmHcWorkspace ws;
-    strata::kernels::glm_hc_workspace_init(s, d_inv, ws);
-    strata::kernels::glm_hc_pre(R, w_fn, w_scale, w_base, f.norm_eps, f.hc_eps, s, ws, d_mixed, d_pre, d_post,
+    maya::kernels::GlmHcWorkspace ws;
+    maya::kernels::glm_hc_workspace_init(s, d_inv, ws);
+    maya::kernels::glm_hc_pre(R, w_fn, w_scale, w_base, f.norm_eps, f.hc_eps, s, ws, d_mixed, d_pre, d_post,
                                 d_comb, nullptr);
     check(cudaGetLastError(), "glm_hc_pre launch");
-    strata::kernels::glm_hc_post(d_block, d_residual, d_post, d_comb, s, d_post_out, nullptr);
+    maya::kernels::glm_hc_post(d_block, d_residual, d_post, d_comb, s, d_post_out, nullptr);
     check(cudaGetLastError(), "glm_hc_post launch");
     check(cudaDeviceSynchronize(), "kernel run");
     if (getenv("GLM_HC_DEBUG")) {
@@ -317,7 +317,7 @@ void test_fixture(int n_embd, int hc, int iters, float hc_eps, bool structural) 
 // barriers and publication loads. Exercise the 4096-wide path and the in-place
 // post/comb updates, independently of the full-model download.
 void test_fast_fixture() {
-    namespace fast = strata::kernels::glmf;
+    namespace fast = maya::kernels::glmf;
     constexpr int E = 4096, H = 4;
     Fixture f = make_fixture(E, H, 20, 1e-5f, 1e-6f, 43);
     std::vector<uint16_t> weights(f.w_fn.size());

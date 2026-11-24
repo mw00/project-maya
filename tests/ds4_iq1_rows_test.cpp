@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
+namespace gg = maya::ds4::gguf;
 
 namespace {
 

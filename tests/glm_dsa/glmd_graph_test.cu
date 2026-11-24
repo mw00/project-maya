@@ -10,10 +10,10 @@
 // identical, the rows past p untouched), the selection and both layers' outputs (bit identical); the capture count,
 // replays, invalidations; the launches per token (graph nodes vs 2 = set_dev_pos + the graph launch).
 // Needs a GPU; exits 77 without one.
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_graph.hpp"
-#include "strata/kernels/glmd_ref.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_graph.hpp"
+#include "maya/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include "../../src/core/glm_dsa_graphs.hpp"
 #include "../../src/kernels/cuda/glmd_rope.cuh"
@@ -227,7 +227,7 @@ int main() {
         cudaFree(kv_all);
         cudaFree(ik_all);
     }
-    strata::core::glmdsa::DsaGraphs graphs;
+    maya::core::glmdsa::DsaGraphs graphs;
     uint64_t expected = 0;
     int dummy_arena = 0;
     for (int p : {3000, 3001, 3002, 4096, 4097}) {

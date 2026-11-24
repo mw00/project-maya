@@ -1,14 +1,14 @@
 // src/kernels/cuda/bf16_gemv.cu - the BF16 GEMV.  See the header for why it is not `s_gemv`.
-#include "strata/kernels/bf16_gemv.hpp"
+#include "maya/kernels/bf16_gemv.hpp"
 
-#include "strata/kernels/bf16_bits.hpp"
+#include "maya/kernels/bf16_bits.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -138,4 +138,4 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
     finish(stream, "bf16_gemv_split");
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

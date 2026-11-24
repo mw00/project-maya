@@ -14,9 +14,9 @@
 // indistinguishable from a fast one.
 //
 // Layout: activations are (n_in/32) ggml Q8_0 blocks, 34 bytes each - `fp16 d` then `int8 qs[32]` - produced by
-// `strata::kernels::quantize_q8_0`.  A quad of four elements lies inside one 32-element block, so the block
+// `maya::kernels::quantize_q8_0`.  A quad of four elements lies inside one 32-element block, so the block
 // scale is constant across it and is loaded once.
-#include "strata/kernels/s2_gemv_q8.hpp"
+#include "maya/kernels/s2_gemv_q8.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -24,7 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int QK_S2 = 64;
@@ -93,4 +93,4 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

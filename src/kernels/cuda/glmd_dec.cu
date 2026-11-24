@@ -1,10 +1,10 @@
 // src/kernels/cuda/glmd_dec.cu - glm-dsa L1-4: the decode attention of mla2 shaped for the GPU (see
-// include/strata/kernels/glmd_dec.hpp).  glm-dsa only: mla2 (glmd_fast.cu) calls it.  CUDA and HIP builds; on HIP the
+// include/maya/kernels/glmd_dec.hpp).  glm-dsa only: mla2 (glmd_fast.cu) calls it.  CUDA and HIP builds; on HIP the
 // warps are hip_compat's 32-lane ones (wave64 cards: the half-wavefront mapping), and dev_cfg's device policy decides
 // where it runs (S7b).
-#include "strata/kernels/glmd_dec.hpp"
+#include "maya/kernels/glmd_dec.hpp"
 
-#include "strata/core/glm_env.hpp"
+#include "maya/core/glm_env.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -268,7 +268,7 @@ struct DevCfg {
 // other AMD arch until someone measures it there (it builds and fits on all of them: 55 KB of LDS a block).
 // MAYA_GLMD_MLA_DEC=1 takes it on any device it fits; =0 keeps mla2's kernels everywhere (decode_mla's legacy_attn).
 bool auto_device(int dev) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     hipDeviceProp_t prop{};
     if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
     return std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
@@ -312,8 +312,8 @@ const DevCfg& dev_cfg() {
         }
         cudaGetLastError();
     }
-    const int sw = strata::glmenv::parse(std::getenv("MAYA_GLMD_MLA_DEC"));
-    c.on = c.hpw > 0 && (sw == strata::glmenv::kOn || auto_device(dev));
+    const int sw = maya::glmenv::parse(std::getenv("MAYA_GLMD_MLA_DEC"));
+    c.on = c.hpw > 0 && (sw == maya::glmenv::kOn || auto_device(dev));
     return c;
 }
 

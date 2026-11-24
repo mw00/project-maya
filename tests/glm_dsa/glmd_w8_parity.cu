@@ -5,9 +5,9 @@
 //   B14.11  dsa_prep with ik_had (F32 and FP16 keys) writes the twin's key bits; dsa_rope_q with iq_had gives the
 //           twin's query within float rounding; dsa_prep_rows / dsa_rope_q_rows (the prompt path) write the token
 //           path's bits; the token scores with and without the rotation agree within 2e-5 relative.
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_mixer.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_mixer.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 

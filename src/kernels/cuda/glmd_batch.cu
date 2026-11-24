@@ -1,5 +1,5 @@
 // src/kernels/cuda/glmd_batch.cu - the glm-dsa batched prompt kernels (glm-dsa B9.2-B9.5); see
-// include/strata/kernels/glmd_batch.hpp.
+// include/maya/kernels/glmd_batch.hpp.
 //
 // The per-row arithmetic of the prep and rope kernels is glmd_fast.cu's (the same expressions in the same order), so
 // a row written here equals the token path's bytes.  The rope is glmd_rope.cuh: no --use_fast_math (the header
@@ -19,12 +19,12 @@
 // HIP builds compile every kernel here; B9.5's nvcuda::wmma one is GLMD_WMMA's (glmd_arch.cuh: 0 on HIP, its body
 // traps) and is never launched there: mla_prompt_wmma_ok() is false on HIP, so the prompt attention is the RDNA WMMA
 // kernel on gfx11 / gfx12 (mla_prompt_rdna, S7) and the F32 kernel (mla_prompt_f32) on every other AMD device.
-#include "strata/kernels/glmd_batch.hpp"
-#include "strata/kernels/glmd_f16_guard.hpp"
+#include "maya/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_f16_guard.hpp"
 
-#include "strata/kernels/glmd_route.hpp"
+#include "maya/kernels/glmd_route.hpp"
 
-#include "glmd_arch.cuh"   // STRATA_GRID_CONSTANT, GLMD_WMMA (Pascal pass)
+#include "glmd_arch.cuh"   // MAYA_GRID_CONSTANT, GLMD_WMMA (Pascal pass)
 #include "glmd_had.cuh"
 #include "glmd_rope.cuh"
 
@@ -122,7 +122,7 @@ __device__ __forceinline__ unsigned score_key(float f) {
 
 // ---------------------------------------------------------------- B9.2 prep for T rows
 // glmd_fast.cu dsa_prep_kernel with blockIdx.y the row: the same code per row (bytes equal the token path's)
-__global__ void __launch_bounds__(512) dsa_prep_rows_kernel(const STRATA_GRID_CONSTANT DsaPrepRows r) {
+__global__ void __launch_bounds__(512) dsa_prep_rows_kernel(const MAYA_GRID_CONSTANT DsaPrepRows r) {
     __shared__ float sred[32];
     __shared__ float s_y[512];
     const DsaPrep& a = r.a;
@@ -195,7 +195,7 @@ __global__ void __launch_bounds__(512) dsa_prep_rows_kernel(const STRATA_GRID_CO
     }
 }
 
-__global__ void __launch_bounds__(256) dsa_rope_q_rows_kernel(const STRATA_GRID_CONSTANT DsaRopeQRows r) {
+__global__ void __launch_bounds__(256) dsa_rope_q_rows_kernel(const MAYA_GRID_CONSTANT DsaRopeQRows r) {
     const DsaRopeQ& a = r.a;
     const int t = blockIdx.y;
     const int p = a.p_dev ? a.p_dev[t] : a.p + t;
@@ -275,11 +275,11 @@ __global__ void __launch_bounds__(256) index_score_kernel(const float* __restric
 // nvcuda::wmma: CUDA builds only (HIP: index_score_wmma_fits is false there and the F32 scorer runs), and in CUDA the
 // host pass and sm_70+ device passes only (<mma.h> has no nvcuda for a Pascal pass, where the kernel body traps - it is
 // never launched there: the device cannot give its 80 KB of shared memory).
-#ifndef STRATA_GRID_CONSTANT   // (glm_fast.cu's spelling: __grid_constant__ is compute_70+ only)
+#ifndef MAYA_GRID_CONSTANT   // (glm_fast.cu's spelling: __grid_constant__ is compute_70+ only)
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
-#define STRATA_GRID_CONSTANT __grid_constant__
+#define MAYA_GRID_CONSTANT __grid_constant__
 #else
-#define STRATA_GRID_CONSTANT
+#define MAYA_GRID_CONSTANT
 #endif
 #endif
 #ifndef GLMD_WMMA
@@ -295,7 +295,7 @@ constexpr size_t kKeyBytes = (size_t) 8 * kN * 16 * 2;   // 32,768
 constexpr size_t kQBytes = (size_t) 8 * kQ * 16 * 2;     // 16,384 a buffer
 constexpr size_t smem_bytes(int H) { return kKeyBytes + 2 * kQBytes + 2 * (size_t) kQ * 4 + (size_t) kQ * H * 4; }
 }  // namespace sw
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 namespace sw {
 constexpr int kThreads = 256;
 }  // namespace sw
@@ -440,7 +440,7 @@ __global__ void __launch_bounds__(sw::kThreads, 1) index_score_wmma_kernel(const
         }
 #endif  // GLMD_WMMA
 }
-#endif  // !STRATA_USE_HIP (the WMMA score tile)
+#endif  // !MAYA_USE_HIP (the WMMA score tile)
 
 // ---------------------------------------------------------------- B9.3 the multi-row merge (one row a block)
 constexpr int kSelThreads = 1024;
@@ -452,7 +452,7 @@ __device__ __forceinline__ void scan_incl(int* s, int tid) {
         __syncthreads();
     }
 }
-__global__ void __launch_bounds__(kSelThreads) topk_merge_kernel(const STRATA_GRID_CONSTANT TopkMerge m) {
+__global__ void __launch_bounds__(kSelThreads) topk_merge_kernel(const MAYA_GRID_CONSTANT TopkMerge m) {
     __shared__ unsigned s_hist[256];
     __shared__ unsigned s_prefix, s_mask;
     __shared__ int s_need;
@@ -593,7 +593,7 @@ __device__ __forceinline__ bool walk_chunk(const MlaPrompt& a, int t, int64_t& c
 
 // F32 arithmetic over the FP16 / INT8 cache: a block per (row, 16 heads), a warp per 2 heads, online softmax
 template <int R>
-__global__ void __launch_bounds__(256) mla_prompt_f32_kernel(const STRATA_GRID_CONSTANT MlaPrompt a) {
+__global__ void __launch_bounds__(256) mla_prompt_f32_kernel(const MAYA_GRID_CONSTANT MlaPrompt a) {
     constexpr int CH = 32, HPB = 16;
     extern __shared__ uint16_t smem_f32[];
     uint16_t* sL = smem_f32;              // CH x kv_lora
@@ -698,7 +698,7 @@ static_assert(kWmSmem <= 98304, "V100: at most 96 KB of shared memory per block 
 static_assert(kWmQ % 32 == 0 && kWmKt % 32 == 0 && kWmO % 32 == 0 && kWmS % 32 == 0, "WMMA tiles 256-bit aligned");
 
 template <int R>
-__global__ void __launch_bounds__(256) mla_prompt_wmma_kernel(const STRATA_GRID_CONSTANT MlaPrompt a) {
+__global__ void __launch_bounds__(256) mla_prompt_wmma_kernel(const MAYA_GRID_CONSTANT MlaPrompt a) {
 #if !GLMD_WMMA
     __trap();   // Pascal (no tensor cores): never launched - mla_prompt_wmma_ok() refuses its 89 KB (48 KB a block there)
 #else
@@ -856,7 +856,7 @@ constexpr size_t smem_bytes(int R) {
 }  // namespace h64
 static_assert(h64::smem_bytes(64) == kMlaH64Smem, "the header's constant is the H64 kernel's dynamic shared memory");
 static_assert(h64::smem_bytes(64) + 64 <= 98304, "V100: at most 96 KB of shared memory per block (opt-in)");
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 namespace h64 {
 constexpr int kThreads = 256;
 #if GLMD_WMMA
@@ -967,7 +967,7 @@ __device__ __forceinline__ bool tile_at(const MlaPrompt& a, int t, int64_t pos, 
 }  // namespace h64
 
 template <int R, bool LQ8>
-__global__ void __launch_bounds__(h64::kThreads, 1) mla_prompt_h64_kernel(const STRATA_GRID_CONSTANT MlaPrompt a) {
+__global__ void __launch_bounds__(h64::kThreads, 1) mla_prompt_h64_kernel(const MAYA_GRID_CONSTANT MlaPrompt a) {
 #if !GLMD_WMMA
     __trap();   // a Pascal device pass: never launched (mla_prompt_h64_fits refuses the device)
 #else
@@ -1155,9 +1155,9 @@ __global__ void __launch_bounds__(h64::kThreads, 1) mla_prompt_h64_kernel(const 
     }
 #endif  // GLMD_WMMA
 }
-#endif  // !STRATA_USE_HIP (the H64 kernel)
+#endif  // !MAYA_USE_HIP (the H64 kernel)
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // ---- RDNA 3 / 3.5 / 4 (gfx11 / gfx12, wave32 WMMA): B9.5's arithmetic - Q in FP16 with the scale folded in and the
 // B15.1 guard, the cells in FP16, F32 accumulation, the online softmax in F32, P in FP16 - within RDNA's 64 KiB of LDS
 // a workgroup (the CUDA kernels take 89-97 KB).  A block per (16 heads, query row), the four head blocks of a row next
@@ -1221,7 +1221,7 @@ __device__ __forceinline__ uint4 lat_h8(const void* lat, int lat_q8, int kv_lora
 }  // namespace rw
 
 template <int R>
-__global__ void __launch_bounds__(256) mla_prompt_rdna_kernel(const STRATA_GRID_CONSTANT MlaPrompt a) {
+__global__ void __launch_bounds__(256) mla_prompt_rdna_kernel(const MAYA_GRID_CONSTANT MlaPrompt a) {
 #if !GLMD_RDNA_WMMA
     __builtin_trap();   // (no WMMA on this pass: never launched, mla_prompt_rdna_ok() refuses the device)
 #else
@@ -1489,7 +1489,7 @@ __global__ void __launch_bounds__(256) index_score_rdna_kernel(const float* __re
         }
 #endif  // GLMD_RDNA_WMMA
 }
-#endif  // STRATA_USE_HIP (the RDNA kernels)
+#endif  // MAYA_USE_HIP (the RDNA kernels)
 
 // ---------------------------------------------------------------- router, residual, packing
 __global__ void __launch_bounds__(256) route_rows_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
@@ -1653,7 +1653,7 @@ bool index_score_tile_keys(const float* iq, const float* w, const void* keys, in
 }
 
 // the WMMA scorer's opt-in, once per device and key dtype
-#ifndef STRATA_USE_HIP
+#ifndef MAYA_USE_HIP
 template <bool KF16>
 static bool sw_attr_ok(size_t need) {
     int dev = 0;
@@ -1682,13 +1682,13 @@ template <bool KF16>
 static bool sw_attr_ok(size_t) { return false; }
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 bool rdna_wmma_device();   // (below: the RDNA kernels' devices)
 #endif
 
 bool index_score_wmma_fits(int key_f16, int idx_heads, int idx_dim) {
     if (idx_dim != sw::kD || idx_heads <= 0 || idx_heads > 64) return false;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     // HIP: the RDNA scorer (index_score_rdna_kernel, S7) on gfx11 / gfx12, up to 32 heads (its LDS holds 64 x 32 weights)
     (void) key_f16;
     return idx_heads <= kRsMaxH && rdna_wmma_device();
@@ -1703,7 +1703,7 @@ bool index_score_tile_wmma(const float* iq, const float* w, const void* keys, in
     if (!index_score_wmma_fits(key_f16, idx_heads, idx_dim) || ld < nk || k0 < 0 || !iq || !w || !keys || !score ||
         ((uintptr_t) iq & 15u) || ((uintptr_t) keys & 15u) || (T + sw::kQ - 1) / sw::kQ > 65535)
         return refuse("index_score_tile_wmma");
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     const dim3 grid((unsigned) ((nk + sw::kN - 1) / sw::kN), (unsigned) ((T + sw::kQ - 1) / sw::kQ));
     const size_t smem = sw::smem_bytes(idx_heads);
     if (key_f16)
@@ -1764,7 +1764,7 @@ bool mla_prompt_f32(const MlaPrompt& a, void* stream) {
 }
 
 // the opt-in and the attribute check, once per device (R6: a missing cudaFuncSetAttribute is a silent no-attention bug)
-#ifndef STRATA_USE_HIP   // the WMMA kernel is CUDA's (HIP: never ok, the F32 kernel runs); keeps check_hip_compat exact
+#ifndef MAYA_USE_HIP   // the WMMA kernel is CUDA's (HIP: never ok, the F32 kernel runs); keeps check_hip_compat exact
 template <int R>
 static bool wmma_attr_ok() {
     int dev = 0;
@@ -1802,7 +1802,7 @@ bool mla_prompt_wmma(const MlaPrompt& a, void* stream) {
     if (!mla_args_ok(a, 512) || a.kv_lora != kWmK) return refuse("mla_prompt_wmma");
     const bool ok = a.qk_rope == 64 ? wmma_attr_ok<64>() : wmma_attr_ok<0>();
     if (!ok) return false;
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     const dim3 grid((unsigned) a.T, (unsigned) (a.n_head / kWmH));
     if (a.qk_rope == 64)
         mla_prompt_wmma_kernel<64><<<grid, 256, kWmSmem, (cudaStream_t) stream>>>(a);
@@ -1815,7 +1815,7 @@ bool mla_prompt_wmma(const MlaPrompt& a, void* stream) {
 }
 
 // the H64 kernel's opt-in, once per device and instance (as wmma_attr_ok)
-#ifndef STRATA_USE_HIP
+#ifndef MAYA_USE_HIP
 template <int R, bool LQ8>
 static bool h64_attr_ok() {
     int dev = 0;
@@ -1859,7 +1859,7 @@ bool mla_prompt_h64_fits(const MlaPrompt& a) {
 bool mla_prompt_h64(const MlaPrompt& a, void* stream) {
     if (a.T <= 0) return true;
     if (!mla_prompt_h64_fits(a)) return refuse("mla_prompt_h64");
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     const dim3 grid((unsigned) a.T, (unsigned) (a.n_head / h64::kH));
     const cudaStream_t s = (cudaStream_t) stream;
     if (a.qk_rope == 64) {
@@ -1880,7 +1880,7 @@ bool mla_prompt_h64(const MlaPrompt& a, void* stream) {
 #endif
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // the RDNA WMMA kernels' devices: the gfx11 / gfx12 archs whose device pass has their bodies (GLMD_RDNA_WMMA's list),
 // once per device
 bool rdna_wmma_device() {

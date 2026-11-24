@@ -119,14 +119,14 @@ paths instead.
 
 | File | Change | Why |
 | --- | --- | --- |
-| `include/strata/platform/cpu_relax.hpp` | **new**: `strata_cpu_pause()` and `strata_store_fence()` | the doorbell spin used `_mm_pause` and the store fence `_mm_sfence`, both x86-only. aarch64 takes `yield` and `dmb oshst` - the outer-shareable store barrier is what makes host stores visible to a coherent device before the doorbell it polls |
+| `include/maya/platform/cpu_relax.hpp` | **new**: `maya_cpu_pause()` and `maya_store_fence()` | the doorbell spin used `_mm_pause` and the store fence `_mm_sfence`, both x86-only. aarch64 takes `yield` and `dmb oshst` - the outer-shareable store barrier is what makes host stores visible to a coherent device before the doorbell it polls |
 | `src/core/graph.cpp`, `session.cpp`, `verify.cpp`, `src/kernels/cpu/pool.cpp` | use the two helpers above | four spin loops and three store fences, all previously x86-only |
 | `src/kernels/cpu/portable.cpp` | **new**: stubs for every x86 kernel (Q2_0, i-quant, k-quant, EXL3, the IQ4_NL multi-token kernel) | a build must not silently compute something else. Each stub prints what is missing and stops; the engine refuses a Q2_0 pack at startup (`cpu_require_expert_support()`) instead of crashing at token 4000 |
-| `include/strata/kernels/cpu/expert_layout.hpp`, `src/kernels/cpu/expert_layout.cpp` | `q2_own_kernels()`; the AVX-512 checks answer "no" on non-x86 | the same refusal, and no CPUID on ARM |
+| `include/maya/kernels/cpu/expert_layout.hpp`, `src/kernels/cpu/expert_layout.cpp` | `q2_own_kernels()`; the AVX-512 checks answer "no" on non-x86 | the same refusal, and no CPUID on ARM |
 | `src/kernels/cpu/native_expert.cpp`, `src/core/expert_source.cpp` | gate the Q2_0 and IQ4_NL kernels on x86 | the native packs go through ggml-cpu's NEON dot products instead |
 | `src/ds4/ds4_iq_cpu.cpp` | `IQ_X86` guard around the timing/variant code | the AVX-512 variants are x86-only |
 | `src/core/glm_fast_path.cu`, `glm_fast_state.hpp` | **the unified-memory policy for CUDA**: a device whose memory is the system's sizes its pool from `MemAvailable`, and the RAM-tier headroom is 16 GB there | the runtime's free figure counts the model's page cache as used - it read ~2 GB free with the 90 GB pack cached, so the pool came out at 5 slots a layer and the start failed. `cudaDevAttrIntegrated` is 1 on a GB10, so this is now a device property, not an AMD-only branch |
-| `CMakeLists.txt` | `STRATA_CPU_X86`; the x86-only sources, flags, tests and benchmarks gated on it; `GGML_NATIVE` off on ARM with `GGML_CPU_ARM_ARCH` | the x86 kernels are compiled with `-mavx512f...`; on aarch64 ggml-cpu needs its own arch string |
+| `CMakeLists.txt` | `MAYA_CPU_X86`; the x86-only sources, flags, tests and benchmarks gated on it; `GGML_NATIVE` off on ARM with `GGML_CPU_ARM_ARCH` | the x86 kernels are compiled with `-mavx512f...`; on aarch64 ggml-cpu needs its own arch string |
 | `setup.py` | `ARM`, `arm_cpu_arch()` (from `/proc/cpuinfo`'s features), `cpu_info()`, and `unified_memory_pci_ids()` (a GPU with no memory BAR of its own) | the installer must recognise the machine, pick ggml's `-march` (`armv8.6-a+dotprod+i8mm+fp16` on the GB10) and report "120 GB shared with the system" instead of "120 GB of VRAM" |
 | `maya.py` | the ARM branch in `check_pc`, the GPU label, and `-DGGML_CPU_ARM_ARCH` passed to the engine and vision builds | the setup's checks and messages |
 | `tools/vision/CMakeLists.txt` | the same ggml arch handling | the image encoder builds for aarch64 too (verified: `build-vision/bin/maya-vision`) |
@@ -169,7 +169,7 @@ lendable region and only printed a warning** - an out-of-bounds pointer.
 
 | File | Change |
 | --- | --- |
-| `include/strata/prefill/failure.hpp` | **new**: `strata::prefill::Failure` (a `std::runtime_error`), `fail()`, and `is_allocation_failure()` |
+| `include/maya/prefill/failure.hpp` | **new**: `maya::prefill::Failure` (a `std::runtime_error`), `fail()`, and `is_allocation_failure()` |
 | `src/prefill/kernels.cu`, `moe_mmq.cu`, `gemm.cu` | every `std::exit(1)` becomes a thrown `Failure` |
 | `src/prefill/ggml_cuda_host.cu` | the scratch pool's `cudaMalloc` failure throws (with the bytes it wanted and the bytes free) instead of aborting |
 | `src/core/glm_prefill.cu` | `prefill_carve` returns false when the layout does not fit; `Glm5Model::prefill` reads the prompt again with a **smaller chunk** (down to 256 tokens) when it does not; `prefill_run` is guarded so the expert pool's tail is given back either way |

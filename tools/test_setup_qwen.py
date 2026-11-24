@@ -71,12 +71,17 @@ class Names(unittest.TestCase):
         a = type("A", (), {"model": None, "gguf_dir": None, "draft": None, "model_dir": None, "yes": True})()
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             maya.choose_family(a, {})
-        (label, note, about) = rows[3]
-        self.assertEqual(label, "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M (113 GB)")
-        self.assertTrue(about.startswith("Qwen-3.8-Flash-Next (CYBER-FROST): 180B"), about)
+        self.assertEqual(rows[1][0], "GLM-5.3 (744B)")    # (its own row, after GLM-5.3-Flash)
+        self.assertIn("text only", rows[1][2])
+        (label, note, about) = rows[4]
+        self.assertEqual(label, "Qwen-3.8-Flash-Next")
+        self.assertIsNone(note)
+        self.assertIsNone(rows[3][1])                     # (MiniMax: no "new" either)
+        self.assertTrue(about.startswith("Qwen-3.8-Flash-Next: 180B"), about)
+        self.assertNotIn("CYBER-FROST", about)
         self.assertNotIn("CYBER-FROST-3.8-PS", about)
-        self.assertIn("UD-Q8_K_XL", rows[1][2])
-        self.assertNotIn("UD-Q4_K_XL", rows[1][2])
+        self.assertIn("UD-Q8_K_XL", rows[2][2])
+        self.assertNotIn("UD-Q4_K_XL", rows[2][2])
 
     def test_family(self):
         with tempfile.TemporaryDirectory() as t:
@@ -260,6 +265,24 @@ class Vision(unittest.TestCase):
                                            self.d, self.d, vision)
                 c = json.loads(p.read_text())
                 self.assertEqual((c.get("vision"), "--vision" in c["args"]), (vision, vision is not None))
+
+    def test_config_again_keeps_the_servers_own_settings(self):
+        # #1089: "model_management": false (and the port, the idle unload, ...) came back as the defaults after a setup
+        pack = self.d / "pack"
+        (pack / "tokenizer").mkdir(parents=True)
+        own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}
+        a = type("A", (), dict(port=None, env=[], host=None, api_key=None))()
+        ports = []
+        with patch.object(maya, "ROOT", self.d), \
+                patch.object(maya, "write_run_script", lambda p, port: ports.append(port) or self.d / "run"):
+            old = self.d / (maya.Q.config_stem("qwen", "q5_k_m") + ".json")
+            old.write_text(json.dumps({"args": ["--pack", str(pack)], **own}))
+            p = maya.write_config_qwen(a, {"gpus": [{"index": 0}]}, {}, pack, self.d / "x.gguf", 65536, self.d, self.d,
+                                       None)
+        c = json.loads(p.read_text())
+        self.assertEqual(({k: c.get(k) for k in own}, ports), (own, [9001]))
 
 
 UD = "ud-iq2_xs"

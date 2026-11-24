@@ -1,13 +1,13 @@
 // src/core/glm_req_knobs.cpp - glm-dsa (speed plan, code change 2): a request's decode knobs, applied between
-// requests (include/strata/core/glm_req_knobs.hpp), and the speculative head's own CPU-lane split.  generate.cpp's GEN
+// requests (include/maya/core/glm_req_knobs.hpp), and the speculative head's own CPU-lane split.  generate.cpp's GEN
 // line calls apply() after set_pcie_share / set_cpu_lane_threads / set_read_chunks (one-line hooks, STRATA-EDITS.txt).
-#include "strata/core/glm_req_knobs.hpp"
+#include "maya/core/glm_req_knobs.hpp"
 
 #include "glm_fast_state.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/glmd_graph.hpp"
-#if defined(STRATA_NATIVE_EXPERTS)   // (strata_kernels_cpu's PUBLIC define: the row4 lane exists only with ggml-cpu)
-#include "strata/kernels/cpu/glm_lane_row4.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/glmd_graph.hpp"
+#if defined(MAYA_NATIVE_EXPERTS)   // (maya_kernels_cpu's PUBLIC define: the row4 lane exists only with ggml-cpu)
+#include "maya/kernels/cpu/glm_lane_row4.hpp"
 #endif
 
 #include <algorithm>
@@ -16,7 +16,7 @@
 #include <cstdio>
 #include <string>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -62,9 +62,9 @@ void apply(Glm5Model& model, const Request& r) {
     // the lane's row4 switch, only on a change (a request without it calls nothing): lane_row4_override(-1) is
     // MAYA_GLM_LANE_ROW4 as the engine started, 0 off, 1 on
     if (g_row4.exchange(r.lane_row4) != r.lane_row4) {
-#if defined(STRATA_NATIVE_EXPERTS)
-        strata::kernels::cpu::lane_row4_override(r.lane_row4);
-        if (r.lane_row4 == 1 && !strata::kernels::cpu::lane_row4_on())   // (its kernels are x86-64 only)
+#if defined(MAYA_NATIVE_EXPERTS)
+        maya::kernels::cpu::lane_row4_override(r.lane_row4);
+        if (r.lane_row4 == 1 && !maya::kernels::cpu::lane_row4_on())   // (its kernels are x86-64 only)
             std::fprintf(stderr, "glm knobs: lane_row4 ignored (this build has no 4-row lane)\n");
 #else
         if (r.lane_row4 >= 0) std::fprintf(stderr, "glm knobs: lane_row4 ignored (no native experts)\n");
@@ -80,4 +80,4 @@ void apply(Glm5Model& model, const Request& r) {
 
 }  // namespace glmknob
 
-}  // namespace strata::core
+}  // namespace maya::core

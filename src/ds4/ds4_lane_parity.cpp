@@ -33,7 +33,7 @@
 #define PAR_AVX2
 #endif
 
-namespace strata::ds4::par {
+namespace maya::ds4::par {
 namespace {
 
 constexpr int kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ3_S = 21, kIQ2_S = 22;
@@ -667,4 +667,4 @@ float row_ref(int type, const uint8_t* row, int k, const void* act, int lpr) {
     return s[0][0];
 }
 
-}  // namespace strata::ds4::par
+}  // namespace maya::ds4::par

@@ -41,12 +41,15 @@
 #include "mm3_gguf_host.hpp"
 #include "mm3_kernels.cuh"
 #include "mm3_lane_plan.hpp"
+#include "mm3_link.cuh"
 #include "mm3_os.hpp"
 #include "mm3_tp.hpp"
 #include "mm3_vision.hpp"
+#include "mm3_wscan.hpp"
+#include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
 
 namespace mm3 {
-namespace x3 = strata::mm3::exl3;
+namespace x3 = maya::mm3::exl3;
 
 #define CK(call)                                                                       \
     do {                                                                               \
@@ -333,7 +336,7 @@ std::string tune_key_of(const std::vector<int>& gpus) {
     for (int id : gpus) {
         cudaDeviceProp pr{};
         if (cudaGetDeviceProperties(&pr, id) != cudaSuccess) continue;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         std::string arch = pr.gcnArchName;
         if (arch.find(':') != std::string::npos) arch.resize(arch.find(':'));
 #else
@@ -416,6 +419,10 @@ struct Model::Impl {
     int chunk_run = 0;               // (the prefill calibration: a forward's chunk, at most o.chunk - 0: o.chunk)
     int run_chunk() const { return chunk_run > 0 ? std::min(chunk_run, o.chunk) : o.chunk; }
     std::string tkey, tfile;         // (the prefill calibration's key of this PC and its file)
+    // (#1026) the reserve held for the whole run: what each GPU's start and requests allocate after the residency,
+    // read from the pack's vram-late.txt at the residency and kept free beside the reserve (src/core/vram_late.hpp;
+    // MAYA_MM3_LATE_FILE / MAYA_MM3_LATE_MB or MAYA_VRAM_LATE_*)
+    maya::vramlate::Tracker late;
     std::unique_ptr<Vision> vis;     // the vision tower (Options::vision)
     std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
@@ -442,7 +449,7 @@ struct Model::Impl {
         if (d.abl_r == nullptr || abl_on.empty()) return;
         if (rseq.empty() || (int) rseq.size() != T) {
             if (!abl_row(bound)) return;
-            if (strata::ablcap::on()) return strata::ablcap::put(y, T, g.dim, d.s);   // (a fitting run: read out)
+            if (maya::ablcap::on()) return maya::ablcap::put(y, T, g.dim, d.s);   // (a fitting run: read out)
             k::project_out(y, d.abl_r, abl_scale, T, g.dim, d.s);
             return;
         }
@@ -902,7 +909,12 @@ struct Model::Impl {
     // logits are NaN (no expert compares better), and the host indexed its per-expert tables with it - an access
     // violation with nothing in the log (#672: Windows, an RTX 4070 Ti SUPER + 5070 Ti, the first request).  Such a
     // request now ends with an error that says where.
-    bool routes_ok(const int* top, int n, size_t li, std::string& err) const {
+    // l, d, T given (the router's T rows of input in d.xn, its logits in d.logit): the error also says where the NaN
+    // came from - the router's input and logits, the layer's gate and bias on the GPU against the model's files, and
+    // the first NaN / Inf the files hold in the layers up to this one (a damaged download keeps its size; #672: the
+    // same layer on every GPU and split).  MAYA_MM3_DUMP_ROUTER=<file>: the input and logits rows written there too.
+    bool routes_ok(const int* top, int n, size_t li, std::string& err, const Layer* l = nullptr, Dev* d = nullptr,
+                   int T = 0) const {
         for (int i = 0; i < n; ++i)
             if (top[i] < 0 || top[i] >= g.n_exp) {
                 const cudaError_t e = cudaGetLastError();
@@ -910,9 +922,94 @@ struct Model::Impl {
                       " of " + std::to_string(g.n_exp) + " (row " + std::to_string(i / std::max(1, g.k_exp)) +
                       ") - the layer's input holds NaN/Inf or its routing did not run (last CUDA error: " +
                       cudaGetErrorString(e) + ")";
+                if (l != nullptr && d != nullptr && T > 0) err += route_diag(*l, *d, T, li);
                 return false;
             }
         return true;
+    }
+    std::string route_diag(const Layer& l, Dev& d, int T, size_t li) const {
+        namespace ws = ::mm3::wscan;
+        const auto num = [](double v) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%.4g", v);
+            return std::string(b);
+        };
+        const auto stats = [&](const char* what, const ws::Stats& s) {
+            std::string r = std::string(what) + ": " + std::to_string(s.bad()) + " of " + std::to_string(s.n) +
+                            " not finite (" + std::to_string(s.nan) + " NaN, " + std::to_string(s.inf) + " Inf)";
+            if (s.bad() < s.n) r += ", the finite ones " + num(s.lo) + " .. " + num(s.hi);
+            return r;
+        };
+        std::string r;
+        int cur = 0;
+        (void) cudaGetDevice(&cur);
+        (void) cudaSetDevice(d.id);
+        (void) cudaDeviceSynchronize();   // (the router's side stream too)
+        (void) cudaSetDevice(cur);
+        std::vector<float> xn((size_t) T * g.dim), lg((size_t) T * g.n_exp), gw((size_t) g.n_exp * g.dim),
+            bw((size_t) g.n_exp);
+        const bool got = cudaMemcpy(xn.data(), d.xn, xn.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                         cudaMemcpy(lg.data(), d.logit, lg.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                         l.gate != nullptr && l.bias != nullptr &&
+                         cudaMemcpy(gw.data(), l.gate, gw.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                         cudaMemcpy(bw.data(), l.bias, bw.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        if (!got) return std::string(" [no read-back: ") + cudaGetErrorString(cudaGetLastError()) + "]";
+        const ws::Stats sx = ws::finite_stats(xn.data(), xn.size()), sl = ws::finite_stats(lg.data(), lg.size());
+        r += " [" + stats("router input", sx);
+        if (sx.first_bad >= 0) r += ", first in row " + std::to_string(sx.first_bad / g.dim);
+        r += "; " + stats("logits", sl);
+        // the gate and bias on the GPU against the model's files (F32 as stored: the same bytes, or the VRAM's copy
+        // changed)
+        const std::string M = P + "layers." + std::to_string(li) + ".block_sparse_moe.";
+        for (int w = 0; w < 2; ++w) {
+            const std::vector<float>& v = w == 0 ? gw : bw;
+            const Tensor* t = pk.get(M + (w == 0 ? "gate.weight" : "e_score_correction_bias"));
+            r += std::string("; ") + (w == 0 ? "gate" : "bias") + ": " +
+                 std::to_string(ws::finite_stats(v.data(), v.size()).bad()) + " not finite on the GPU";
+            if (t != nullptr && t->dtype == "F32" && t->bytes == v.size() * 4)
+                r += std::memcmp(pk.data(*t), v.data(), t->bytes) == 0 ? ", the same bytes as the file"
+                                                                        : ", NOT the file's bytes";
+        }
+        r += "]";
+        // the model's files: the first NaN / Inf in the embedding and layers 0..li as stored (read once a run - its
+        // time is the error's, a few seconds for the experts)
+        static std::atomic<bool> scanned{false};
+        if (!scanned.exchange(true)) {
+            std::fprintf(stderr, "maya-mm3: layer %zu's router: reading the model's files for NaN/Inf (layers 0-%zu) ...\n",
+                         li, li);
+            std::string hit;
+            int unread = 0;
+            for (const auto& [name, t] : pk.t) {
+                if (name.rfind(P, 0) != 0) continue;
+                bool want = name == P + "embed_tokens.weight";
+                for (size_t j = 0; j <= li && !want; ++j)
+                    want = name.rfind(P + "layers." + std::to_string(j) + ".", 0) == 0;
+                if (!want) continue;
+                const ws::Hit h = ws::scan_blocks(t.dtype, pk.data(t), t.bytes);
+                if (!h.known) ++unread;
+                if (h.found) {
+                    hit = name + " (" + t.dtype + ", its " + h.what + " at byte " + std::to_string(h.at) + ", file " +
+                          pk.files[(size_t) t.file] + " offset " + std::to_string(t.off + h.at) + ")";
+                    break;
+                }
+            }
+            r += hit.empty() ? " [the model's files: no NaN/Inf in layers 0-" + std::to_string(li) + "'s weights" +
+                                   (unread ? " (" + std::to_string(unread) + " tensors of types not read)" : "") +
+                                   " - it arose on the GPU]"
+                             : " [the model's files hold NaN/Inf: " + hit +
+                                   " - a damaged download; check the shards' sha256 against the published ones]";
+        }
+        if (const char* dp = ::mm3::env("MM3_DUMP_ROUTER")) {   // header: layer, T, dim, n_exp (int32); then xn, logits
+            if (std::FILE* f = std::fopen(dp, "wb")) {
+                const int hdr[4] = {(int) li, T, g.dim, g.n_exp};
+                std::fwrite(hdr, 4, 4, f);
+                std::fwrite(xn.data(), 4, xn.size(), f);
+                std::fwrite(lg.data(), 4, lg.size(), f);
+                std::fclose(f);
+                r += " [router input and logits written to " + std::string(dp) + "]";
+            }
+        }
+        return r;
     }
     // a layer's expert blob (the plan's estimate before expert_layout reads it): EXL3's three trellises with their
     // scales, a GGUF's three matrices aligned
@@ -1095,7 +1192,7 @@ struct Model::Impl {
             CK(cudaSetDevice(id));
             CK(cudaStreamCreateWithFlags(&d.s, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.hop, cudaEventDisableTiming));
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
             if (const char* sv = ::mm3::env("MM3_SIDE"); sv == nullptr || std::atoi(sv) != 0) {
                 CK(cudaStreamCreateWithFlags(&d.s2, cudaStreamNonBlocking));
                 CK(cudaEventCreateWithFlags(&d.fev, cudaEventDisableTiming));
@@ -1482,6 +1579,22 @@ struct Model::Impl {
                 }
                 if (!err.empty()) return false;
             }
+            // (#1026) ... beside it what this PC's start and requests allocated after the residency before (the default
+            // reserve keeps v1.1.73's residency unless the measured figure uses it up)
+            {
+                const size_t di = (size_t) (&d - D.data());
+                if (late.gpus.size() != D.size()) late.init("mm3", o.pack, "MAYA_MM3_LATE_FILE", "MAYA_MM3_LATE_MB", D.size());
+                cudaDeviceProp pr{};
+                if (cudaGetDeviceProperties(&pr, d.id) != cudaSuccess) (void) cudaGetLastError();
+                char kb[256];
+                std::snprintf(kb, sizeof kb, "|gpu %d %s %x:%x %zu MiB|ctx %d seqs %d staging %d cap %d dspark %d vision %d",
+                              d.id, pr.name, (unsigned) pr.pciBusID, (unsigned) pr.pciDeviceID, tot >> 20, o.max_ctx,
+                              o.seqs, d.n_slots, o.resident_cap, (int) o.dspark, vis != nullptr ? 1 : 0);
+                reserve += late.read(di, "mm3 late|" + tkey + "|pack " + o.pack + kb, reserve,
+                                     maya::vramlate::asked(o.reserve_gb >= 0, reserve), d.id);
+                late.set_reserve(di, reserve - late.gpus[di].g.late);
+                late.set_room(di, fr > reserve ? fr - reserve : 0);   // (the experts' room: all of it can give way)
+            }
             size_t budget = fr > reserve ? fr - reserve : 0;
             std::vector<int> nres(moe_layers.size(), 0);
             const int cap = o.resident_cap < 0 ? g.n_exp : std::min(o.resident_cap, g.n_exp);
@@ -1706,28 +1819,31 @@ struct Model::Impl {
                                " MoE layers host-free (every expert in VRAM: the routing stays on the GPU)");
             // a token's and a window's whole forward as a graph (graph_ready): one GPU, every MoE layer host-free
             const char* gv = ::mm3::env("MM3_GRAPH");
-            // (several GPUs: peer access between them all - the forward's copies across them plain device copies)
+            // (several GPUs: the copies between them - mm3_link.cuh: a peer copy only where the driver offers it, the
+            //  IOMMU translates neither GPU and a test copy arrives intact, else through host memory; every pair a
+            //  tested peer copy: the forward's copies across them plain device copies.  MM3_HOST_STAGE=1: host memory
+            //  for all; MM3_PEER=1: peer copies tried (and tested) where the IOMMU translates too)
             if (D.size() > 1) {
-                bool all = true;
-                for (Dev& a : D)
-                    for (Dev& b : D) {
-                        if (&a == &b) continue;
-                        int can = 0;
-                        if (cudaDeviceCanAccessPeer(&can, a.id, b.id) != cudaSuccess || !can) {
-                            all = false;
-                            continue;
-                        }
-                        cudaSetDevice(a.id);
-                        const cudaError_t pe = cudaDeviceEnablePeerAccess(b.id, 0);
-                        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) all = false;
-                        cudaGetLastError();
-                    }
-                p2p_all = all;
+                const size_t n = D.size();
+                std::vector<int> ids(n);
+                std::vector<char> used(n * n, 1);   // (the hops, the head's rows, the prompt's stages, the draft's taps)
+                std::vector<void*> tb(n);
+                std::vector<cudaStream_t> ss(n);
+                for (size_t i = 0; i < n; ++i) ids[i] = D[i].id, tb[i] = D[i].h, ss[i] = D[i].s, used[i * n + i] = 0;
+                const char* hs = ::mm3::env("MM3_HOST_STAGE");
+                const char* hp = ::mm3::env("MM3_PEER");
+                const char* sm = ::mm3::env("MM3_STAGE_MB");
+                const size_t hb = (size_t) o.chunk * g.dim * 4;
+                if (!links.setup(ids, used, tb, hb, ss, hs && std::atoi(hs) != 0, hp && std::atoi(hp) != 0, hb,
+                                 (size_t) std::max(1, sm ? std::atoi(sm) : 8) << 20, "MM3_HOST_STAGE", err))
+                    return false;
+                p2p_all = links.all_peer;
+                info.push_back("hand-offs between GPUs: " + links.say);
             }
             graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
                        !o.verbose &&
                        ::mm3::env("MM3_DUMP_HS") == nullptr &&
-                       !strata::ablcap::on();   // (a fitting run's read-out waits on the host: not in a capture)
+                       !maya::ablcap::on();   // (a fitting run's read-out waits on the host: not in a capture)
             if (graph_on) info.push_back("decode: a token's and a verify window's forward replayed as a graph");
         }
         for (Dev& d : D) {
@@ -2044,7 +2160,7 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(d.s));
         st.t_sync += now() - ts;
         const size_t li = (size_t) (&l - L.data());
-        if (!routes_ok(rtop, T * g.k_exp, li, err)) return false;
+        if (!routes_ok(rtop, T * g.k_exp, li, err, &l, &d, T)) return false;
         // the plan: each token's experts (its 8 slots, k used), their pointers (0: the CPU lane's), the groups
         unsigned long long* pp = (unsigned long long*) d.win_plan_h;
         float* pw = (float*) (pp + (size_t) kWin * 8);
@@ -2300,7 +2416,7 @@ struct Model::Impl {
             return c;
         }
         for (int r = 0; r < 3; ++r) {
-            strata::kernels::cpu::Exl3Part& m = c.p[r];
+            maya::kernels::cpu::Exl3Part& m = c.p[r];
             if (blob) {
                 m.trellis = (const uint32_t*) (blob + l.lay.trellis[r]);
                 m.suh = (const uint16_t*) (blob + l.lay.suh[r]);
@@ -2432,7 +2548,7 @@ struct Model::Impl {
         std::memcpy(top, d.plan_h, (size_t) g.k_exp * 4);
         std::memcpy(w, d.plan_h + 4, (size_t) g.k_exp * 4);
         const size_t li = (size_t) (&l - L.data());
-        if (!routes_ok(top, g.k_exp, li, err)) return false;
+        if (!routes_ok(top, g.k_exp, li, err, &l, &d, 1)) return false;
         for (int i = 0; i < g.k_exp; ++i) ++prof[li * g.n_exp + top[i]];
         st.profiled += g.k_exp;
         std::vector<char> busy((size_t) d.n_slots, 0);
@@ -2689,7 +2805,7 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(d.top_h, d.top, (size_t) T * g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
         CK(cudaStreamSynchronize(d.s));
         const std::vector<int> top(d.top_h, d.top_h + (size_t) T * g.k_exp);
-        if (!routes_ok(top.data(), (int) top.size(), (size_t) li, err)) return false;
+        if (!routes_ok(top.data(), (int) top.size(), (size_t) li, err, &l, &d, T)) return false;
         for (int e : top) ++prof[(size_t) li * g.n_exp + e];
         st.profiled += (long) top.size();
         pmark(d, kPSync);
@@ -2794,7 +2910,7 @@ struct Model::Impl {
     // event, the host goes on enqueueing (CUDA; HIP - whose queued work Windows submits only at a host wait - and
     // MAYA_MM3_HOP_EVENTS=0: the host waits for a's stream first, as before)
     bool hop_events = [] {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
         return false;
 #else
         const char* v = ::mm3::env("MM3_HOP_EVENTS");
@@ -2813,13 +2929,16 @@ struct Model::Impl {
         }
         return copy_peer(dst, b, a.h, a, bytes, b.s, err);
     }
-    // peer access between every two of the GPUs where they have it (load): the forward's copies across then a plain
-    // device copy - one a graph can hold - else the runtime's peer copy (through the host where the GPUs cannot)
+    // the copies between the GPUs (load: links.setup): every pair a tested peer copy - a plain device copy, one a graph
+    // can hold; else each pair's own (mm3_link.cuh: a peer or driver copy on s, or through host memory - out on the
+    // source's stream, in on the destination's)
+    gpulink::Links links;
     bool p2p_all = false;
     bool copy_peer(void* dst, const Dev& db, const void* src, const Dev& sb, size_t bytes, cudaStream_t s,
                    std::string& err) {
         if (p2p_all) CK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s));
-        else CK(cudaMemcpyPeerAsync(dst, db.id, src, sb.id, bytes, s));
+        else if (!links.copy((int) (&sb - D.data()), sb.s, src, (int) (&db - D.data()), db.s, dst, bytes, s, err))
+            return false;
         return true;
     }
 
@@ -3337,7 +3456,7 @@ bool Model::write_tune(const std::string& settings, std::string& err) const {
             return false;
         }
     }
-    if (!strata::ds4::os::replace_file(tmp, p->tfile)) {
+    if (!maya::ds4::os::replace_file(tmp, p->tfile)) {
         err = p->tfile + ": cannot replace";
         return false;
     }
@@ -3478,6 +3597,21 @@ void Model::set_ablate(bool on) {
     if (ablate_loaded() && p->bound >= 0 && p->bound < (int) p->abl_on.size()) p->abl_on[(size_t) p->bound] = on ? 1 : 0;
 }
 bool Model::ablating() const { return ablate_loaded() && p->abl_row(p->bound); }
+int Model::late_check(bool loaded) {
+    if (tpe != nullptr) return 0;   // (the tensor-parallel path: its plan keeps its own reserve)
+    int cur = 0;
+    if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+    for (size_t i = 0; i < p->D.size() && i < p->late.gpus.size(); ++i) {
+        size_t fr = 0, tot = 0;
+        if (cudaSetDevice(p->D[i].id) != cudaSuccess || cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        p->late.check(i, fr, tot, loaded, p->D[i].id);
+    }
+    cudaSetDevice(cur);
+    return loaded ? p->late.short_mib : 0;
+}
 
 bool Model::forward_rows(const int* ids, const int* seq, const int* pos, int R, float* logits_out, std::string& err) {
     if (R <= 0) return true;

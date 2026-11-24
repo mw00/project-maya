@@ -1,7 +1,7 @@
 // exl3_mma_rows (MAYA_GLM_EXL3_MMA_ROWS_SHORT): the parse, and the rows an expert takes through the tensor-core
 // kernels by chunk length - the base (MAYA_GLM_EXL3_MMA_ROWS) unless the chunk is short and the setting is on.
 // CPU only.
-#include "strata/core/exl3_mma_rows.hpp"
+#include "maya/core/exl3_mma_rows.hpp"
 
 #include <cstdio>
 
@@ -15,7 +15,7 @@ void expect(bool ok, const char* what) {
 }  // namespace
 
 int main() {
-    using namespace strata::core;
+    using namespace maya::core;
     const MmaRowsShort off = mma_rows_short_parse(nullptr), on = mma_rows_short_parse("192"),
                        at = mma_rows_short_parse("256,2048");
     expect(off.rows == 0 && mma_rows_short_parse("").rows == 0 && mma_rows_short_parse("0").rows == 0 &&

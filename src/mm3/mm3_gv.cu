@@ -204,7 +204,7 @@ __device__ __forceinline__ float dot(const Sub& s, const int4& xa, const int4& x
 }
 
 __device__ __forceinline__ float warp_sum(float v) {   // (ds4_iq.cu's butterfly)
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(MAYA_USE_HIP) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -415,7 +415,7 @@ size_t block_bytes(int t) {
 }  // namespace
 
 bool enabled() {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;   // (CUDA only: HIP's compiler fuses these kernels' multiplies and adds unlike ds4_iq's mv - other bits)
 #else
     static const bool on = [] {
@@ -429,7 +429,7 @@ bool enabled() {
 bool needs_sums(int type) { return type == kQ4_K || type == kQ5_K; }
 
 bool covered(const Job& j) {
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     (void) j;
     return false;
 #endif

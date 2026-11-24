@@ -6,14 +6,14 @@
 // the whole head's rows (markov_add_q8), byte for byte.
 #pragma once
 
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 constexpr int kMarkovQ8Bytes = 34;   // a block: the F16 scale, 32 int8
 enum MarkovSrc { kMarkovF16 = 0, kMarkovBF16 = 1, kMarkovF32 = 2 };   // the pack's tensor's type
@@ -29,7 +29,7 @@ inline void markov_q8_block(const float* x, uint8_t* out) {
     }
     const float d = amax / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    const uint16_t dh = strata::kernels::f16_from_f32(d);   // (round to nearest even, as GGML_FP32_TO_FP16)
+    const uint16_t dh = maya::kernels::f16_from_f32(d);   // (round to nearest even, as GGML_FP32_TO_FP16)
     std::memcpy(out, &dh, 2);
     for (int j = 0; j < 32; ++j) out[2 + j] = (uint8_t) (int8_t) std::round(x[j] * id);
 }
@@ -50,7 +50,7 @@ inline void markov_q8_rows(const void* src, int fmt, size_t n, int R, uint8_t* o
                     const uint32_t u = (uint32_t) h << 16;
                     std::memcpy(&x[j], &u, 4);
                 } else
-                    x[j] = strata::kernels::f32_from_f16(h);
+                    x[j] = maya::kernels::f32_from_f16(h);
             }
         }
         markov_q8_block(x, out + b * kMarkovQ8Bytes);
@@ -62,7 +62,7 @@ inline float markov_q8_value(const uint8_t* row, int i) {
     const uint8_t* b = row + (size_t) (i / 32) * kMarkovQ8Bytes;
     uint16_t dh;
     std::memcpy(&dh, b, 2);
-    return strata::kernels::f32_from_f16(dh) * (float) (int8_t) b[2 + i % 32];
+    return maya::kernels::f32_from_f16(dh) * (float) (int8_t) b[2 + i % 32];
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

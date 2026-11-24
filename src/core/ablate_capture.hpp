@@ -16,7 +16,7 @@
 #include <mutex>
 #include <vector>
 
-namespace strata::ablcap {
+namespace maya::ablcap {
 
 inline std::FILE* file() {
     static std::FILE* f = [] {
@@ -47,4 +47,4 @@ inline void put(const float* y, int T, int dim, cudaStream_t s) {
     std::fflush(f);
 }
 
-}  // namespace strata::ablcap
+}  // namespace maya::ablcap

@@ -1,14 +1,14 @@
-// The engine's start-up line of the GLM settings set in the environment (include/strata/platform/env_report.hpp,
+// The engine's start-up line of the GLM settings set in the environment (include/maya/platform/env_report.hpp,
 // #6): only when one is set, each under the name it was set by, and the value used when the engine clamps it.
 // Host code only: a made-up environment table, no GPU.
-#include "strata/platform/env_report.hpp"
+#include "maya/platform/env_report.hpp"
 
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using strata::platform::EnvRange;
-using strata::platform::env_report;
+using maya::platform::EnvRange;
+using maya::platform::env_report;
 
 static int failures = 0;
 

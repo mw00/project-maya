@@ -25,9 +25,9 @@
 // nodes and leaves its pool unpinned, so run it the same way, e.g. on the test PC with the first IQ1_S gate/up layer:
 //   L=$(awk '!/^#/ && $2 == 19 {print $1; exit}' $P/native_experts.txt)
 //   numactl --interleave=all build/glm_cpu_bench $P $L 18 27 36 48 60 72 --row4 both
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/cpu/glm_lane_row4.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/cpu/glm_lane_row4.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
 #include <array>
@@ -105,16 +105,16 @@ struct Geo {
 
 bool pack_geo(const std::string& gguf, Geo& g, std::string& err) {
     try {
-        const strata::GgufFile f(gguf);
-        const strata::MetaValue* a = f.get("general.architecture");
-        if (a == nullptr || a->type != strata::MetaType::STRING) {
+        const maya::GgufFile f(gguf);
+        const maya::MetaValue* a = f.get("general.architecture");
+        if (a == nullptr || a->type != maya::MetaType::STRING) {
             err = gguf + " has no general.architecture";
             return false;
         }
         // a key under the file's own arch prefix (glm-dsa., glm5-next., glm5next.); a per-layer array gives its first
         const auto num = [&](const char* key, double def) -> double {
-            const strata::MetaValue* v = f.get(a->s + "." + key);
-            if (v != nullptr && v->type == strata::MetaType::ARRAY) v = v->items.empty() ? nullptr : &v->items[0];
+            const maya::MetaValue* v = f.get(a->s + "." + key);
+            if (v != nullptr && v->type == maya::MetaType::ARRAY) v = v->items.empty() ? nullptr : &v->items[0];
             return v != nullptr && v->is_num() ? v->num() : def;
         };
         g.arch = a->s;
@@ -140,7 +140,7 @@ bool pack_geo(const std::string& gguf, Geo& g, std::string& err) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    namespace kc = strata::kernels::cpu;
+    namespace kc = maya::kernels::cpu;
     std::vector<std::string> pos;
     std::string row4 = "env";
     int n_call = 4;
@@ -314,8 +314,8 @@ int main(int argc, char** argv) {
     }
     std::printf("layer %d (%s, n_embd %d, n_ff %d, swiglu clamp %g) gate/up %s (%d) down %s (%d): expert %.2f MB "
                 "(gate/up %.2f, down %.2f), %d experts cycled from DRAM, %d activation(s) a row\n",
-                layer, geo.arch.c_str(), n_embd, n_ff, (double) geo.limit, strata::ggml_type_name((uint32_t) gu), gu,
-                strata::ggml_type_name((uint32_t) dt), dt, (double) eb / 1e6, 2.0 * gub / 1e6, dnb / 1e6, n_exp, K);
+                layer, geo.arch.c_str(), n_embd, n_ff, (double) geo.limit, maya::ggml_type_name((uint32_t) gu), gu,
+                maya::ggml_type_name((uint32_t) dt), dt, (double) eb / 1e6, 2.0 * gub / 1e6, dnb / 1e6, n_exp, K);
     std::printf("row4: MAYA_GLM_LANE_ROW4 %s, --row4 %s; a 4-row kernel for gate/up %s, down %s%s\n",
                 kc::lane_row4_on() ? "on" : "off", row4.c_str(), kc::row4_supported(gu) ? "yes" : "no (ggml's dots)",
                 kc::row4_supported(dt) ? "yes" : "no (ggml's dots)", K > 1 ? " (unused: k > 1)" : "");

@@ -2,7 +2,7 @@
 // B14.7, B14.12): the scratch tiling, the attention walk crossover, the upload-or-lane rule, the per-part upload
 // schedule, and the CPU twins of the batched kernels in src/kernels/cuda/glmd_batch.cu.  Plain C++: the CPU tests
 // (tests/glm_dsa/glmd_batch_cpu_test.cpp) link it with glm_dsa_cpu_fast_twin.cpp and nothing else.
-#include "strata/kernels/glmd_batch.hpp"
+#include "maya/kernels/glmd_batch.hpp"
 
 #include "../kernels/cuda/glmd_rope.cuh"
 

@@ -1,10 +1,10 @@
 // src/kernels/cuda/glmd_ref.cu - glm-dsa F32 reference kernels (B3.4).
 //
-// Contracts, layouts and the GLM-5.3 attention scale derivation: include/strata/kernels/glmd_ref.hpp.  The CPU
+// Contracts, layouts and the GLM-5.3 attention scale derivation: include/maya/kernels/glmd_ref.hpp.  The CPU
 // twin is src/core/glm_dsa_cpu_ref.cpp.  Everything here is plain F32 with simple launch shapes (a warp per output
 // row, a block per (head, token)) and no fast math: these kernels are the yardstick for the fast path, so they
 // favour being easy to read over being quick.
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include "glmd_rope.cuh"
 

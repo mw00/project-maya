@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_flash_attn.hpp"
+#include "maya/kernels/native_flash_attn.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cfloat>
@@ -28,7 +28,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 template<int Width> __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
@@ -209,4 +209,4 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
     if (result != cudaSuccess)
         throw std::runtime_error(std::string("native FlashAttention launch: ") + cudaGetErrorString(result));
 }
-} // namespace strata::kernels
+} // namespace maya::kernels

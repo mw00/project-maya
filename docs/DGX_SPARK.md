@@ -259,7 +259,7 @@ the size): with four running, the VRAM hit was 99.8% and a token saw 0.67 disk r
 
 | | | |
 | --- | --- | --- |
-| DFlash2 drafter | **done** | +8% sampled / +26% greedy decode, the same answers; the default config drafts now |
+| DFlash2 drafter | **done** | +8% sampled / +26% greedy decode, every token checked by the model; the default config drafts now |
 | `--parallel 4` | **done** | 1.80x for four at once, identical tokens; the second config |
 | Vision | not used | `--no-vision`: the encoder builds for sm_121, but its 1.1 GB of files and ~320 MB on the GPU buy nothing here |
 | The 27-29 s load | skipped | agreed not worth the work: only the first start is slower, the steady state is not |

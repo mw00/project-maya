@@ -13,12 +13,12 @@
 // honest move is to say so than to half-build it.
 //
 // THE REFERENCE IS THE CHAIN: for each type the CPU side reconstructs the RAW GGUF block from the canonical
-// planes and decodes it with that type's scalar dequantizer from include/strata/artifact/dequant.hpp - the
+// planes and decodes it with that type's scalar dequantizer from include/maya/artifact/dequant.hpp - the
 // ones `bench/micro/dequant_xcheck` checks against **ggml's own** dequantizers.  Reconstructing raw from
 // canonical is the inverse of what the packer does, and it is written here independently of the packer so the
 // two are not the same code.
-#include "strata/artifact/dequant.hpp"
-#include "strata/kernels/s_gemv.hpp"
+#include "maya/artifact/dequant.hpp"
+#include "maya/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 
@@ -49,7 +49,7 @@ const uint16_t kScales[] = {0x3E00, 0x3555, 0x3C01, 0x4248, 0x4123, 0x2AAA, 0x4A
 
 struct Case {
     const char* name;
-    strata::kernels::SForm form;
+    maya::kernels::SForm form;
     int raw_bytes;        // one block
     // Reconstruct the raw GGUF block for one group from the canonical codes/scales, and return the number of
     // elements the block decodes to (which may exceed group_elems: Q8_0's block IS one group, Q2_0's too).
@@ -73,7 +73,7 @@ int q2_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, siz
     return 64;
 }
 double q2_0_deq(const uint8_t* raw, float* out) {
-    strata::dequantize_q2_0(raw, out);
+    maya::dequantize_q2_0(raw, out);
     return 64;
 }
 
@@ -87,7 +87,7 @@ int q4_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, siz
     return 32;
 }
 double q4_0_deq(const uint8_t* raw, float* out) {
-    strata::dequantize_q4_0(raw, out);
+    maya::dequantize_q4_0(raw, out);
     return 32;
 }
 
@@ -96,7 +96,7 @@ int iq4_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, size
     return q4_0_to_raw(codes, co, scale_bits, so, raw);
 }
 double iq4_deq(const uint8_t* raw, float* out) {
-    strata::dequantize_iq4_nl(raw, out);
+    maya::dequantize_iq4_nl(raw, out);
     return 32;
 }
 
@@ -116,7 +116,7 @@ int q8_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, siz
     return 32;
 }
 double q8_0_deq(const uint8_t* raw, float* out) {
-    strata::dequantize_q8_0(raw, out);
+    maya::dequantize_q8_0(raw, out);
     return 32;
 }
 
@@ -128,8 +128,8 @@ double q8_0_deq(const uint8_t* raw, float* out) {
 // generates d, dmin and the eight (sc, m) pairs, derives the planes exactly as the packer does, and writes a
 // raw block from the SAME parameters.  Inverting those products instead would be ambiguous.
 void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
-    using strata::kernels::Codebook;
-    using strata::kernels::SForm;
+    using maya::kernels::Codebook;
+    using maya::kernels::SForm;
     const SForm form{4, 0, 32, Codebook::Affine, true};
 
     std::mt19937 rng(777);
@@ -162,8 +162,8 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
             r.sc[g] = (uint8_t) (rng() & 0x3F);
             r.m[g] = (uint8_t) (rng() & 0x3F);
             for (long long sb = 0; sb < n_in / 256; ++sb) {
-                scales[(size_t) (o * n_groups + sb * 8 + g)] = strata::fp16_to_fp32(r.d) * (float) r.sc[g];
-                offsets[(size_t) (o * n_groups + sb * 8 + g)] = -(strata::fp16_to_fp32(r.dmin) * (float) r.m[g]);
+                scales[(size_t) (o * n_groups + sb * 8 + g)] = maya::fp16_to_fp32(r.d) * (float) r.sc[g];
+                offsets[(size_t) (o * n_groups + sb * 8 + g)] = -(maya::fp16_to_fp32(r.dmin) * (float) r.m[g]);
             }
         }
     }
@@ -206,9 +206,9 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
                         (uint8_t) ((codes_el[(size_t) e0] & 0x0F) | (codes_el[(size_t) e1] << 4));
                 }
             }
-            strata::dequantize_q4_K(blk.data(), dec.data());
+            maya::dequantize_q4_K(blk.data(), dec.data());
             for (int j = 0; j < 256; ++j) {
-                const float term = dec[(size_t) j] * strata::fp16_to_fp32(x[(size_t) (sb * 256 + j)]);
+                const float term = dec[(size_t) j] * maya::fp16_to_fp32(x[(size_t) (sb * 256 + j)]);
                 acc += term;
                 sum_abs += std::fabs((double) term);      // the CONDITION of this dot product
 
@@ -245,7 +245,7 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
           "copy scales");
     check(cudaMemcpy(d_offsets, offsets.data(), offsets.size() * sizeof(float), cudaMemcpyHostToDevice),
           "copy offsets");
-    strata::kernels::s_gemv(d_x, d_codes, d_scales, d_offsets, d_y, n_in, n_out, form);
+    maya::kernels::s_gemv(d_x, d_codes, d_scales, d_offsets, d_y, n_in, n_out, form);
     std::vector<float> got((size_t) n_out);
     check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
 
@@ -300,8 +300,8 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
 // (the first launch pays module load and page faults) and the MINIMUM is reported alongside the mean, because
 // the minimum is the one not polluted by another process on the machine.
 void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
-    using strata::kernels::Codebook;
-    using strata::kernels::SForm;
+    using maya::kernels::Codebook;
+    using maya::kernels::SForm;
     const SForm form{2, -1, 64, Codebook::Affine, false};
     const long long n_groups = n_in / 64;
     const long long codes_per_row = n_in / 4;
@@ -322,12 +322,12 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
           "bench copy scales");
 
-    for (int i = 0; i < 3; ++i) strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
+    for (int i = 0; i < 3; ++i) maya::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
 
     std::vector<double> ms;
     for (int i = 0; i < iters; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
-        strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
+        maya::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
         const auto t1 = std::chrono::steady_clock::now();
         ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
@@ -356,7 +356,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     // The NAIVE kernel's output is the reference for the split one.  `s_gemv` is checked against the scalar
     // dequantizer by this file's parity cases, so its result here is a validated value, and the split kernel
     // sums in a different order - so this is a relative comparison, not bit equality.
-    strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
+    maya::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
     std::vector<float> ref_naive((size_t) n_out);
     check(cudaMemcpy(ref_naive.data(), d_y, ref_naive.size() * sizeof(float), cudaMemcpyDeviceToHost),
           "copy naive reference");
@@ -366,12 +366,12 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     for (int tpr : {32, 64, 128, 256}) {
         if (tpr > n_in) continue;
         for (int i = 0; i < 3; ++i) {
-            strata::kernels::s_gemv_split(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form, tpr);
+            maya::kernels::s_gemv_split(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form, tpr);
         }
         std::vector<double> sms;
         for (int i = 0; i < iters; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
-            strata::kernels::s_gemv_split(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form, tpr);
+            maya::kernels::s_gemv_split(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form, tpr);
             sms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
                               .count());
         }
@@ -400,12 +400,12 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
         if (form.code_bits == 2 && (n_in % 64) == 0) {
             for (int t2 : {32, 64, 128}) {
                 for (int i = 0; i < 3; ++i) {
-                    strata::kernels::s2_gemv_quads(d_x, d_codes, d_scales, d_y, n_in, n_out, t2);
+                    maya::kernels::s2_gemv_quads(d_x, d_codes, d_scales, d_y, n_in, n_out, t2);
                 }
                 std::vector<double> qms;
                 for (int i = 0; i < iters; ++i) {
                     const auto q0 = std::chrono::steady_clock::now();
-                    strata::kernels::s2_gemv_quads(d_x, d_codes, d_scales, d_y, n_in, n_out, t2);
+                    maya::kernels::s2_gemv_quads(d_x, d_codes, d_scales, d_y, n_in, n_out, t2);
                     qms.push_back(std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - q0).count());
                 }
@@ -432,12 +432,12 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
             for (int staged = 0; staged < 2; ++staged) {
                 for (int t3 : {32, 64, 128}) {
                     for (int i = 0; i < 3; ++i) {
-                        strata::kernels::s2_gemv_fast(d_x, d_codes, d_scales, d_y, n_in, n_out, t3, staged != 0);
+                        maya::kernels::s2_gemv_fast(d_x, d_codes, d_scales, d_y, n_in, n_out, t3, staged != 0);
                     }
                     std::vector<double> fms;
                     for (int i = 0; i < iters; ++i) {
                         const auto q0 = std::chrono::steady_clock::now();
-                        strata::kernels::s2_gemv_fast(d_x, d_codes, d_scales, d_y, n_in, n_out, t3, staged != 0);
+                        maya::kernels::s2_gemv_fast(d_x, d_codes, d_scales, d_y, n_in, n_out, t3, staged != 0);
                         fms.push_back(std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - q0).count());
                     }
@@ -493,8 +493,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    using strata::kernels::Codebook;
-    using strata::kernels::SForm;
+    using maya::kernels::Codebook;
+    using maya::kernels::SForm;
     std::vector<Case> cases;
     cases.push_back({"S2/Q2_0", SForm{2, -1, 64, Codebook::Affine, false}, 18, q2_0_to_raw, q2_0_deq});
     cases.push_back({"S4/Q4_0", SForm{4, -8, 32, Codebook::Affine, false}, 18, q4_0_to_raw, q4_0_deq});
@@ -538,7 +538,7 @@ int main(int argc, char** argv) {
         std::vector<uint16_t> scale_bits((size_t) n_out * n_groups);
         for (size_t i = 0; i < scales.size(); ++i) {
             scale_bits[i] = kScales[rng() % n_scales];
-            scales[i] = strata::fp16_to_fp32(scale_bits[i]);
+            scales[i] = maya::fp16_to_fp32(scale_bits[i]);
         }
 
         // CPU reference
@@ -556,7 +556,7 @@ int main(int argc, char** argv) {
                 const int n = tc.to_raw(codes_el.data(), co, scale_bits.data(), so, raw.data());
                 tc.dequant(raw.data(), dec.data());
                 for (long long j = 0; j < (long long) n; ++j) {
-                    acc += dec[(size_t) j] * strata::fp16_to_fp32(x[(size_t) (g * G + j)]);
+                    acc += dec[(size_t) j] * maya::fp16_to_fp32(x[(size_t) (g * G + j)]);
                 }
             }
             ref[(size_t) o] = acc;
@@ -574,7 +574,7 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
         check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
               "copy scales");
-        strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, tc.form);
+        maya::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, tc.form);
         std::vector<float> got((size_t) n_out);
         check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
 

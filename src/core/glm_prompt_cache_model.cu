@@ -1,5 +1,5 @@
 // src/core/glm_prompt_cache_model.cu - glm-dsa B14.14: the model side of the NVMe prompt cache
-// (include/strata/core/glm_prompt_cache.hpp).
+// (include/maya/core/glm_prompt_cache.hpp).
 //
 //   Glm5Model::slot_load_prefix(path, n_file, n_use, err): Maya's slot_load for a PREFIX of a saved state.  The file is
 //   Maya's MAYALST3 slot file (slot_save) of n_file positions; this reads the first n_use positions of every cache run
@@ -16,8 +16,8 @@
 //
 // Portable runtime calls only (cudaMemcpy, cudaSetDevice, cudaStreamSynchronize): a HIP build compiles this file
 // through hip_compat like every src/*.cu.
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include "glm_fast_state.hpp"
 
@@ -29,7 +29,7 @@
 #include <sstream>
 #include <vector>
 
-namespace strata::core {
+namespace maya::core {
 
 bool Glm5Model::slot_load_prefix(const std::string& path, int64_t n_file, int64_t n_use, std::string& err) {
     if (!lay_.glm_dsa()) {
@@ -119,8 +119,8 @@ bool Glm5Model::slot_load_prefix(const std::string& path, int64_t n_file, int64_
 std::string Glm5Model::pcache_identity() const {
     std::ostringstream id;
     id << "strata-pcache-1";
-#ifdef STRATA_VERSION
-    id << " engine=" << STRATA_VERSION;
+#ifdef MAYA_VERSION
+    id << " engine=" << MAYA_VERSION;
 #endif
     id << " fp=";
     const GlmStateFingerprint fp = state_fp();   // B15.3: words 12-13 name the NextN block and its carrier
@@ -141,4 +141,4 @@ std::string Glm5Model::pcache_identity() const {
     return id.str();
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

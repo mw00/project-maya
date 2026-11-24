@@ -42,11 +42,11 @@ expert lane falls back to ggml-cpu's VSX kernels):
 The numbers on this page come from a from-source build:
 
 ```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=70 -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMAYA_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=70 -DMAYA_NATIVE_EXPERTS=ON -DMAYA_BUILD_TESTS=OFF \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.4/bin/nvcc \
   -DCMAKE_CUDA_HOST_COMPILER=/opt/rh/gcc-toolset-13/root/usr/bin/g++ \
-  -DSTRATA_GGML_DIR=$HOME/builds/env/llama.cpp-3cf0325
+  -DMAYA_GGML_DIR=$HOME/builds/env/llama.cpp-3cf0325
 cmake --build build --target maya -j 16
 ```
 
@@ -58,10 +58,10 @@ That is about five minutes on 16 jobs. The other engines build the same way with
 | file | why |
 | --- | --- |
 | `setup.py` | `PPC` detection, and `cpu_info()` returns POWER's `cpu` line: POWER9's `/proc/cpuinfo` has no `flags:` line, so the x86 probe raised `AttributeError` before anything ran |
-| `CMakeLists.txt` | `STRATA_CPU_PPC64` / `STRATA_CPU_ARM64`; the ARM `-march=armv8.6-a` flags are gated on aarch64 (GCC on POWER rejects them). ppc64le then takes the `GGML_NATIVE` path, where ggml-cpu reads `/proc/cpuinfo` and builds with `-mcpu=power9` itself |
+| `CMakeLists.txt` | `MAYA_CPU_PPC64` / `MAYA_CPU_ARM64`; the ARM `-march=armv8.6-a` flags are gated on aarch64 (GCC on POWER rejects them). ppc64le then takes the `GGML_NATIVE` path, where ggml-cpu reads `/proc/cpuinfo` and builds with `-mcpu=power9` itself |
 | `CMakeLists.txt` | `CXX_EXTENSIONS ON` for `ggml-cpu`: its PowerPC quants use the `vector` keyword the file-scope C++20 extensions-off would remove |
 | `maya.py` | EXL3 quants are refused on POWER as on ARM: their expert kernels are x86 AVX2/AVX-512 |
-| `include/strata/platform/cpu_relax.hpp`, `src/ds4/ds4_pool.hpp` | POWER branches: `or 27,27,27` as the spin hint and `lwsync` as the store fence before a GPU polls a doorbell in pinned memory |
+| `include/maya/platform/cpu_relax.hpp`, `src/ds4/ds4_pool.hpp` | POWER branches: `or 27,27,27` as the spin hint and `lwsync` as the store fence before a GPU polls a doorbell in pinned memory |
 
 ## The one setting that is not optional
 

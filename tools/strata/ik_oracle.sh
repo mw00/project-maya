@@ -60,7 +60,7 @@ usage: tools/strata/ik_oracle.sh <command> [options]
         Exit 0 when they agree (GLM-5.3: 21 full layers of 78), 1 when ik's numbers are not comparable.
 
   deviations      prints the deviation table.
-  selftest        the CPU checks ctest runs (strata_ik_oracle_help); 77 only if nothing could be checked.
+  selftest        the CPU checks ctest runs (maya_ik_oracle_help); 77 only if nothing could be checked.
 EOF
 }
 
@@ -121,7 +121,7 @@ cmd_build() {
     mkdir -p "$wrap"
     cat > "$wrap/CMakeLists.txt" <<EOF
 cmake_minimum_required(VERSION 3.14)
-project(strata_ik_oracle C CXX)
+project(maya_ik_oracle C CXX)
 set(LLAMA_BUILD_EXAMPLES ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)

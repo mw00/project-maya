@@ -4,7 +4,7 @@
 #include <array>
 #include <cstddef>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 struct RamSlice {
     int part;
     size_t source, destination, bytes;
@@ -25,4 +25,4 @@ inline int ram_slices(size_t part_bytes, int parts, size_t offset, size_t bytes,
     }
     return count;
 }
-}  // namespace strata::ds4
+}  // namespace maya::ds4

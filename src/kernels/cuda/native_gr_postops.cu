@@ -22,7 +22,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_gr_postops.hpp"
+#include "maya/kernels/native_gr_postops.hpp"
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 constexpr int THREADS = 256;
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
@@ -112,4 +112,4 @@ void native_gr_post(const float* residual, const float* block_out, const float* 
         residual, block_out, inject, output, n_embd, hc, 1.0f / float(hc));
     check_launch();
 }
-} // namespace strata::kernels
+} // namespace maya::kernels

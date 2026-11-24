@@ -14,7 +14,7 @@
 #include <random>
 #include <vector>
 
-using namespace strata::ds4;
+using namespace maya::ds4;
 
 int main() {
     std::mt19937 rng(7);

@@ -5,8 +5,8 @@
 // the way Glm5Model::slot_save does (chunked device-to-host copies, runs in file order), overwrites the arena, loads
 // the runs back the way slot_load does and checks every byte the slot covers is restored and nothing else is touched.
 // A real-model save/restore (next 32 greedy tokens identical) is B6.4's PACK fixture.  Exit 77 without a device.
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include <cuda_runtime.h>
 
@@ -17,11 +17,11 @@
 #include <string>
 #include <vector>
 
-using strata::core::GlmArch;
-using strata::core::GlmIdxKind;
-using strata::core::GlmStateLayout;
-using strata::core::GlmStateMode;
-using strata::core::Glm5Geometry;
+using maya::core::GlmArch;
+using maya::core::GlmIdxKind;
+using maya::core::GlmStateLayout;
+using maya::core::GlmStateMode;
+using maya::core::Glm5Geometry;
 
 namespace {
 
@@ -125,7 +125,7 @@ int main() {
         const Glm5Geometry g = small_dsa();
         for (GlmStateMode m : {GlmStateMode::Fp16, GlmStateMode::Int8}) {
             GlmStateLayout L;
-            const bool ok = strata::core::glm_state_carve(g, 0, 10, 10, ctx, m, 0, L, err);
+            const bool ok = maya::core::glm_state_carve(g, 0, 10, 10, ctx, m, 0, L, err);
             check(ok && L.snap_pool_floats() == 0, "glm-dsa carve, pool-less snapshot");
             for (int64_t n : {(int64_t) 1, (int64_t) 2049, ctx - 1})
                 round_trip(L, n, std::string("glm-dsa ") + (m == GlmStateMode::Int8 ? "INT8" : "FP16") + " n " +
@@ -135,8 +135,8 @@ int main() {
     {
         const Glm5Geometry g = small_flash();
         GlmStateLayout L;
-        const bool ok = strata::core::glm_state_carve(g, 0, 6, 6, ctx, GlmStateMode::Fp16,
-                                                      strata::core::glm_state_fast_ik_ring(ctx), L, err);
+        const bool ok = maya::core::glm_state_carve(g, 0, 6, 6, ctx, GlmStateMode::Fp16,
+                                                      maya::core::glm_state_fast_ik_ring(ctx), L, err);
         check(ok, "Flash carve");
         for (int64_t n : {(int64_t) 1, (int64_t) 1023, ctx - 1}) round_trip(L, n, "Flash FP16 n " + std::to_string(n));
     }

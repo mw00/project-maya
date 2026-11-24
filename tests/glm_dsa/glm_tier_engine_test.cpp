@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_tier_engine_test.cpp - glm-dsa B8.3 / B8.4 through the engine's own entry points, on the CPU (links
-// strata_engine; calls nothing that needs a device, so it runs without a GPU).
+// maya_engine; calls nothing that needs a device, so it runs without a GPU).
 //
 //   1. glmtier::cpu_experts - the node-split lane as fast_cpu_experts calls it: two NodeLane pools (one per socket,
 //      here unpinned), each computing its half of every expert of the call and a partial y, the partials added -
@@ -12,7 +12,7 @@
 //      NUMA nodes are online and MAYA_GLM_CPU_SHARED=socket) and its log line.
 #include "glm_tier_numa.hpp"
 
-#include "strata/core/glm_arch.hpp"
+#include "maya/core/glm_arch.hpp"
 
 #include "ggml.h"
 
@@ -28,11 +28,11 @@
 #include <vector>
 #include "glm_test_env.hpp"   // setenv / unsetenv / getpid (<unistd.h> on POSIX; mapped on Windows)
 
-namespace gt = strata::core::glmtier;
-namespace kc = strata::kernels::cpu;
-using strata::core::Glm5Model;
-using strata::core::Glm5Geometry;
-using strata::core::GlmArch;
+namespace gt = maya::core::glmtier;
+namespace kc = maya::kernels::cpu;
+using maya::core::Glm5Model;
+using maya::core::Glm5Geometry;
+using maya::core::GlmArch;
 
 namespace {
 

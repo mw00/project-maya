@@ -33,10 +33,10 @@
 #include <string>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
-using strata::ds4::Exl3Lane;
-using strata::ds4::LaneEnt;
-using strata::ds4::Pool;
+namespace kc = maya::kernels::cpu;
+using maya::ds4::Exl3Lane;
+using maya::ds4::LaneEnt;
+using maya::ds4::Pool;
 
 static int g_fail = 0;
 
@@ -71,7 +71,7 @@ static void test_runs() {
         {20, 30, 9, 3},      // two parts' gate / up (9 bands): 1 round of 20 -> 2 of a third (ideal 0.67)
     };
     for (const C& c : cs) {
-        const int got = strata::ds4::exl3_split_runs(c.jobs, c.threads, c.bands);
+        const int got = maya::ds4::exl3_split_runs(c.jobs, c.threads, c.bands);
         expect(got == c.want, "exl3_split_runs(" + std::to_string(c.jobs) + ", " + std::to_string(c.threads) + ", " +
                                   std::to_string(c.bands) + ") = " + std::to_string(got) + ", want " +
                                   std::to_string(c.want));
@@ -80,8 +80,8 @@ static void test_runs() {
     for (int w = 1; w <= 64; ++w)
         for (int j = 1; j <= 300; ++j)
             for (int b : {1, 2, 7, 9, 18, 20, 40}) {
-                const int s = strata::ds4::exl3_split_runs(j, w, b);
-                if (s < 1 || b % s != 0 || (s > 1 && (long) j * s > (long) strata::ds4::kSplitJobs * w)) {
+                const int s = maya::ds4::exl3_split_runs(j, w, b);
+                if (s < 1 || b % s != 0 || (s > 1 && (long) j * s > (long) maya::ds4::kSplitJobs * w)) {
                     expect(false, "exl3_split_runs(" + std::to_string(j) + ", " + std::to_string(w) + ", " +
                                       std::to_string(b) + ") = " + std::to_string(s) + ": not a divisor or too many");
                     return;
@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
                             poison();
                             batches.clear();
                             c.split_w = split_w;
-                            strata::ds4::exl3_experts(c, x.data(), (size_t) E, ents.data(), ne, part, nodes, nophase, flow);
+                            maya::ds4::exl3_experts(c, x.data(), (size_t) E, ents.data(), ne, part, nodes, nophase, flow);
                             c.split_w = 0;
                             return std::vector<float>(yd.begin(), yd.begin() + (size_t) rows * E);
                         };
@@ -219,8 +219,8 @@ int main(int argc, char** argv) {
                         bool finite = true;
                         for (float v : ref) finite = finite && std::isfinite(v);
                         expect(finite, what + ": the reference has non-finite outputs (the synthetic weights' scale)");
-                        const int R0 = strata::ds4::exl3_split_runs(ne * 2 * GQ, W, GB);
-                        const int R2 = strata::ds4::exl3_split_runs(ne * DQ, W, DB);
+                        const int R0 = maya::ds4::exl3_split_runs(ne * 2 * GQ, W, GB);
+                        const int R2 = maya::ds4::exl3_split_runs(ne * DQ, W, DB);
                         cut_gu += R0 > 1;
                         cut_dn += R2 > 1;
                         const int J0 = ne * 2 * GQ * R0, J1 = ne * GB, J2 = ne * DQ * R2, J3 = ne * DB;

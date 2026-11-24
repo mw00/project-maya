@@ -1,12 +1,12 @@
-// The NO_* on/off switches (include/strata/platform/env_switch.hpp, #860): unset, empty, 0, false, off and no are
+// The NO_* on/off switches (include/maya/platform/env_switch.hpp, #860): unset, empty, 0, false, off and no are
 // OFF; 1 and any other value ON, as before.  Host code only, no GPU.
-#include "strata/platform/env_switch.hpp"
+#include "maya/platform/env_switch.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
-using strata::platform::env_switch;
-using strata::platform::env_switch_value;
+using maya::platform::env_switch;
+using maya::platform::env_switch_value;
 
 static int failures = 0;
 

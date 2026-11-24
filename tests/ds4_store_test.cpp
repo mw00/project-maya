@@ -10,6 +10,7 @@
 
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <sys/mman.h>
 #endif
 
 #include <algorithm>
@@ -27,8 +28,8 @@
 #include <utility>
 #include <vector>
 
-using strata::ds4::ExpertStore;
-namespace os = strata::ds4::os;
+using maya::ds4::ExpertStore;
+namespace os = maya::ds4::os;
 
 namespace {
 
@@ -199,11 +200,11 @@ std::vector<uint8_t> ask(ExpertStore& st, const Model& m, int l, const std::vect
 
 void test_auto_size() {
     const uint64_t G = 1ull << 30;
-    EXPECT(strata::ds4::store_auto_bytes(64 * G, 12 * G, 100 * G, 4 * G) == 52 * G);
-    EXPECT(strata::ds4::store_auto_bytes(64 * G, 12 * G, 30 * G, 4 * G) == 30 * G);
-    EXPECT(strata::ds4::store_auto_bytes(14 * G, 12 * G, 100 * G, 4 * G) == 0);
-    EXPECT(strata::ds4::store_auto_bytes(10 * G, 12 * G, 100 * G, 4 * G) == 0);
-    EXPECT(strata::ds4::store_auto_bytes(~0ull, 12 * G, 100 * G, 4 * G) == 0);
+    EXPECT(maya::ds4::store_auto_bytes(64 * G, 12 * G, 100 * G, 4 * G) == 52 * G);
+    EXPECT(maya::ds4::store_auto_bytes(64 * G, 12 * G, 30 * G, 4 * G) == 30 * G);
+    EXPECT(maya::ds4::store_auto_bytes(14 * G, 12 * G, 100 * G, 4 * G) == 0);
+    EXPECT(maya::ds4::store_auto_bytes(10 * G, 12 * G, 100 * G, 4 * G) == 0);
+    EXPECT(maya::ds4::store_auto_bytes(~0ull, 12 * G, 100 * G, 4 * G) == 0);
 }
 
 void test_reads(const Model& m, bool direct) {
@@ -257,6 +258,35 @@ void test_direct_refused(const Model& m) {
     for (os::fd_t f : bad.plain.direct) os::close_fd(f);
     bad.paths.clear();   // (m's files: m removes them)
     bad.files = ExpertStore::Files{};
+#else
+    (void) m;
+#endif
+}
+
+// EFAULT is the destination's doing: that call fails, the descriptor's next read (good memory) still goes through;
+// any other errno closes the descriptor (#1076)
+void test_direct_efault(const Model& m) {
+#if !defined(_WIN32)
+    const int fd = ::open(m.paths[0].c_str(), O_RDONLY);
+    EXPECT(fd >= 0);
+    void* good = nullptr;
+    EXPECT(posix_memalign(&good, os::kDirectAlign, 2 * os::kDirectAlign) == 0);
+    void* unmapped = ::mmap(nullptr, os::kDirectAlign, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    EXPECT(unmapped != MAP_FAILED);
+    EXPECT(!os::pread_direct(os::fd_t(fd), unmapped, 16, 0));   // (EFAULT)
+    EXPECT(!os::direct_is_refused(fd));
+    EXPECT(os::pread_direct(os::fd_t(fd), good, 16, 0));          // (same descriptor, good memory: still read)
+    EXPECT(!os::pread_direct(os::fd_t(fd), unmapped, 16, 0));
+    EXPECT(!os::direct_is_refused(fd));
+    EXPECT(os::pread_direct(os::fd_t(fd), good, 16, 0));
+    os::close_fd(os::fd_t(fd));
+    const int wfd = ::open(m.paths[0].c_str(), O_WRONLY);   // (EBADF: the file's)
+    EXPECT(wfd >= 0);
+    EXPECT(!os::pread_direct(os::fd_t(wfd), good, 16, 0));
+    EXPECT(os::direct_is_refused(wfd));
+    os::close_fd(os::fd_t(wfd));
+    ::munmap(unmapped, os::kDirectAlign);
+    free(good);
 #else
     (void) m;
 #endif
@@ -566,6 +596,7 @@ int main(int argc, char** argv) {
     test_reads(m, true);
     test_reads(m, false);
     test_direct_refused(m);
+    test_direct_efault(m);
     test_lru(m);
     test_lfu(m);
     test_pinned(m);

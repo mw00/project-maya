@@ -2,16 +2,16 @@
 # B15.9 the adaptive draft depth.  Every behaviour change is behind a switch that defaults off, except B15.3's state
 # hygiene, which only touches glm-dsa with a NextN block (Flash reads FastState::head_x as before).
 
-if(TARGET strata_engine)
-  target_sources(strata_engine PRIVATE src/core/glm_mtp_state.cpp src/core/glm_heat_evict.cpp)
+if(TARGET maya_engine)
+  target_sources(maya_engine PRIVATE src/core/glm_mtp_state.cpp src/core/glm_heat_evict.cpp)
   # Maya-owned glm_fast_path.cu / glm_multi.cu call its members on every GPU backend (HIP: through hip_compat; a
   # no-op off glm-dsa, as on CUDA)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-    target_sources(strata_engine PRIVATE src/core/glm_mtp_state_model.cu)
+  if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
+    target_sources(maya_engine PRIVATE src/core/glm_mtp_state_model.cu)
   endif()
 endif()
 
-if(STRATA_BUILD_TESTS)
+if(MAYA_BUILD_TESTS)
   enable_testing()
   # B15.3 (CPU): the carrier state machine, the MTP1 trailer, the block identity and the draft budget, in a toy twin
   # of the engine's MTP data flow (first draft after a restore / reset == a fresh run; Maya's shared row differs).
@@ -34,24 +34,24 @@ endif()
 
 # B15.4 (Python, CPU): tools/strata/extract_mtp_block.py on synthetic PACK / SMALL GGUFs (whole and sharded), and the
 # engine's GGUF reader (strata-gguf) on its output.
-if(STRATA_BUILD_TESTS)
-  if(NOT STRATA_PYTHON3)
-    find_program(STRATA_PYTHON3 python3)
+if(MAYA_BUILD_TESTS)
+  if(NOT MAYA_PYTHON3)
+    find_program(MAYA_PYTHON3 python3)
   endif()
-  if(STRATA_PYTHON3)
-    add_test(NAME strata_py_test_extract_mtp_block
-             COMMAND ${STRATA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/strata/test_extract_mtp_block.py
+  if(MAYA_PYTHON3)
+    add_test(NAME maya_py_test_extract_mtp_block
+             COMMAND ${MAYA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/strata/test_extract_mtp_block.py
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-    set_tests_properties(strata_py_test_extract_mtp_block PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+    set_tests_properties(maya_py_test_extract_mtp_block PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
     set(_emb_env "")
-    if(DEFINED STRATA_GGML_DIR AND EXISTS "${STRATA_GGML_DIR}/gguf-py")
-      list(APPEND _emb_env "PYTHONPATH=${STRATA_GGML_DIR}/gguf-py")
+    if(DEFINED MAYA_GGML_DIR AND EXISTS "${MAYA_GGML_DIR}/gguf-py")
+      list(APPEND _emb_env "PYTHONPATH=${MAYA_GGML_DIR}/gguf-py")
     endif()
     if(TARGET strata-gguf)
       list(APPEND _emb_env "MAYA_GGUF_BIN=$<TARGET_FILE:strata-gguf>")
     endif()
     if(_emb_env)
-      set_property(TEST strata_py_test_extract_mtp_block APPEND PROPERTY ENVIRONMENT "${_emb_env}")
+      set_property(TEST maya_py_test_extract_mtp_block APPEND PROPERTY ENVIRONMENT "${_emb_env}")
     endif()
   endif()
 endif()

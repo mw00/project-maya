@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 namespace {
 
 namespace fs = std::filesystem;
@@ -615,4 +615,4 @@ int pack_info(const std::string& dir, const std::string& profile_path, const Ker
     return ok ? 0 : 2;
 }
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

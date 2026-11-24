@@ -1,14 +1,14 @@
 // src/prefill/moe_mmq_strata.cu - glm-dsa's view of the vendored MMQ (B9.8, B14.1, B14.2); see
-// include/strata/prefill/moe_mmq_strata.hpp.  Compiled into strata_mmq (cmake/strata.d/50-glm-dsa-prefill.cmake)
+// include/maya/prefill/moe_mmq_strata.hpp.  Compiled into maya_mmq (cmake/strata.d/50-glm-dsa-prefill.cmake)
 // with moe_mmq.cu's include paths and flags, so the configs below are the ones the instances were built from.
-#include "strata/prefill/moe_mmq_strata.hpp"
+#include "maya/prefill/moe_mmq_strata.hpp"
 
 #include "common.cuh"
 #include "mmq.cuh"
 
 #include <climits>
 
-namespace strata::prefill::mmq_strata {
+namespace maya::prefill::mmq_strata {
 
 int block_bytes() { return (int) sizeof(block_q8_1_mmq); }
 
@@ -31,7 +31,7 @@ static bool same(const ggml_cuda_mmq_config& a, const ggml_cuda_mmq_config& b) {
 
 bool sm70_check(int t, int cc, int64_t smpbo, int max_cols, std::string& why) {
 #if defined(GGML_USE_HIP)
-    // (HIP's strata_mmq builds this file for the B14.1 layout above; the sm_70 instance rule is CUDA's, and the HIP
+    // (HIP's maya_mmq builds this file for the B14.1 layout above; the sm_70 instance rule is CUDA's, and the HIP
     // prompt path never asks it - glmpf::mmq_ok)
     (void) t;
     (void) cc;
@@ -82,4 +82,4 @@ bool sm70_check(int t, int cc, int64_t smpbo, int max_cols, std::string& why) {
 #endif
 }
 
-}  // namespace strata::prefill::mmq_strata
+}  // namespace maya::prefill::mmq_strata

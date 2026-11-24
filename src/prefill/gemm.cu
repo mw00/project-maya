@@ -1,12 +1,12 @@
-// src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
-#include "strata/prefill/gemm.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/prefill/failure.hpp"
+// src/prefill/gemm.cu - see include/maya/prefill/gemm.hpp.
+#include "maya/prefill/gemm.hpp"
+#include "maya/kernels/dequant_bf16.hpp"
+#include "maya/prefill/failure.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
 // The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
 // hipBLASLt's public headers declare native HIP shuffle functions, so keep
 // those declarations from being macro-expanded in this translation unit.
@@ -23,7 +23,7 @@
 #include <cstring>
 #include <memory>
 
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
 #include <hip/hip_runtime_api.h>
 #include <hipblaslt/hipblaslt.h>
@@ -33,21 +33,21 @@
 #include <tuple>
 #endif
 
-namespace strata::prefill {
+namespace maya::prefill {
 namespace {
 
 // A failed cuBLAS call (an allocation, most of the time) ends this request, not the process: the reason is thrown
-// and the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
+// and the caller turns it into an error for the request (include/maya/prefill/failure.hpp).
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
-        strata::prefill::fail(std::string("prefill gemm: ") + what + ": cuBLAS status " + std::to_string((int) s));
+        maya::prefill::fail(std::string("prefill gemm: ") + what + ": cuBLAS status " + std::to_string((int) s));
     }
 }
 
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
 struct HipLtCallKey {
-    strata::prefill::hipblaslt::InputType type;
+    maya::prefill::hipblaslt::InputType type;
     int t;
     int n;
     int k;
@@ -76,13 +76,13 @@ struct HipLtState {
     // version), so a shape takes the first table whose solution this build accepts, then plain hipBLAS.
     struct NamedTable {
         std::string path;
-        strata::prefill::hipblaslt::TuningTable table;
+        maya::prefill::hipblaslt::TuningTable table;
         bool announced = false;
     };
     std::vector<NamedTable> tables;
     uint64_t lt_launches = 0;
     uint64_t fallbacks = 0;
-    std::set<std::tuple<strata::prefill::hipblaslt::InputType, int, int, int, int>> fallback_shapes;
+    std::set<std::tuple<maya::prefill::hipblaslt::InputType, int, int, int, int>> fallback_shapes;
 
     ~HipLtState() {
         if (std::getenv("MAYA_HIPBLASLT_VERBOSE")) {
@@ -91,7 +91,7 @@ struct HipLtState {
             for (const auto& shape : fallback_shapes) {
                 const auto type = std::get<0>(shape);
                 std::fprintf(stderr, "prefill gemm: fallback shape dtype=%s T=%d N=%d K=%d ldy=%d\n",
-                             type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16",
+                             type == maya::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16",
                              std::get<1>(shape), std::get<2>(shape), std::get<3>(shape), std::get<4>(shape));
             }
         }
@@ -162,8 +162,8 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     // hipBLASLt build accepts).
     std::string error;
     size_t rows = 0;
-    for (const std::string& one : strata::prefill::hipblaslt::split_table_list(path)) {
-        strata::prefill::hipblaslt::TuningTable table;
+    for (const std::string& one : maya::prefill::hipblaslt::split_table_list(path)) {
+        maya::prefill::hipblaslt::TuningTable table;
         std::string e;
         if (table.load(one, arch, version, e)) {
             rows += table.rows().size();
@@ -186,7 +186,7 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     return state;
 }
 
-HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipblaslt::InputType type, int t,
+HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, maya::prefill::hipblaslt::InputType type, int t,
                                        int n, int k, int ldy, float beta) {
     uint32_t beta_bits = 0;
     static_assert(sizeof(beta_bits) == sizeof(beta));
@@ -206,7 +206,7 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
         if (!row) continue;
         any_row = true;
         if (!desc_ready) {
-            const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
+            const hipDataType input_type = type == maya::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
             if (!desc.init(input_type, t, n, k, ldy)) {
                 return state.cache.emplace(key, resolved).first->second;
             }
@@ -248,7 +248,7 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
         if (verbose) {
             std::fprintf(stderr,
                          "prefill gemm: Lt solution=%d dtype=%s T=%d N=%d K=%d ldy=%d beta=%.9g workspace=%zu\n",
-                         row->solution_id, type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t,
+                         row->solution_id, type == maya::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t,
                          n, k, ldy, beta, required_workspace);
         }
         return state.cache.emplace(key, resolved).first->second;
@@ -260,12 +260,12 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
         // The cache above means this prints once per distinct shape.
         std::fprintf(stderr, "prefill gemm: Lt fallback; no calibration for dtype=%s T=%d N=%d K=%d ldy=%d "
                              "(tune it: tune_hipblaslt --shape %d,%d,%d)\n",
-                     type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k, ldy, t, n, k);
+                     type == maya::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k, ldy, t, n, k);
     }
     return state.cache.emplace(key, resolved).first->second;
 }
 
-bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType type, const uint16_t* x,
+bool try_hipblaslt(void* opaque_state, maya::prefill::hipblaslt::InputType type, const uint16_t* x,
                    const uint16_t* w, float* y, int64_t t, int64_t n, int64_t k, int64_t ldy, float beta,
                    void* stream) {
     auto* state = static_cast<HipLtState*>(opaque_state);
@@ -290,7 +290,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     }
 
     HipLtDescriptors desc;
-    const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
+    const hipDataType input_type = type == maya::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
     if (!desc.init(input_type, (int) t, (int) n, (int) k, (int) ldy)) return false;
     const float alpha = 1.0f;
     const hipblasStatus_t status = hipblasLtMatmul(state->handle, desc.op, &alpha, w, desc.a, x, desc.b, &beta, y,
@@ -304,7 +304,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
     if (beta != 0.0f) {
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
-        strata::prefill::fail("prefill gemm: hipBLASLt launch failed with nonzero beta");
+        maya::prefill::fail("prefill gemm: hipBLASLt launch failed with nonzero beta");
     }
     auto* mutable_state = static_cast<HipLtState*>(opaque_state);
     uint32_t beta_bits = 0;
@@ -320,7 +320,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 }  // namespace
 
 Gemm::~Gemm() {
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
@@ -343,7 +343,7 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
 #endif
     return true;
@@ -354,7 +354,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
     cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
     if (hipblaslt_state_) {
         auto* state = static_cast<HipLtState*>(hipblaslt_state_);
         state->workspace = workspace_;
@@ -374,7 +374,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     if (cudaMalloc(&workspace_, ws) != cudaSuccess) { err = "prefill gemm: workspace"; return false; }
     cublasSetWorkspace(h, workspace_, ws);
     cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
 #endif
     if (scratch_elems > 0 && cudaMalloc((void**) &scratch_, (size_t) scratch_elems * 2) != cudaSuccess) {
@@ -390,8 +390,8 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     const float alpha = 1.0f;
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
-    if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
+    if (try_hipblaslt(hipblaslt_state_, maya::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
                       beta, stream_)) {
         return;
     }
@@ -408,8 +408,8 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     const float alpha = 1.0f;
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
-    if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,
+#if defined(__HIPCC__) && defined(MAYA_HIPBLASLT_AVAILABLE)
+    if (try_hipblaslt(hipblaslt_state_, maya::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,
                       beta, stream_)) {
         return;
     }
@@ -427,18 +427,18 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         const int64_t rows = scratch_elems_ / K;
         if (rows <= 0) {
             std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K);
-            strata::prefill::fail("prefill gemm: the scratch is too small for K=" + std::to_string((long long) K));
+            maya::prefill::fail("prefill gemm: the scratch is too small for K=" + std::to_string((long long) K));
         }
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            maya::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         return;
     }
-    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    maya::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 
-}  // namespace strata::prefill
+}  // namespace maya::prefill

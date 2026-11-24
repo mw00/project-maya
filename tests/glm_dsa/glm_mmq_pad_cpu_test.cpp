@@ -9,7 +9,7 @@
 //   - the expert bytes themselves are untouched.
 // Plus the allocation and capacity arithmetic: mmq_padded, mmq_slots_fit keeps 512 bytes free, the ring's group
 // offsets at any layer stride fit the ring sized with the largest stride.
-#include "strata/kernels/glmd_mmq_pad.hpp"
+#include "maya/kernels/glmd_mmq_pad.hpp"
 
 #include <cstdio>
 #include <cstring>

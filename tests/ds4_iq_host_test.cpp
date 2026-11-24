@@ -26,8 +26,8 @@
 #include <string>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
-namespace iq = strata::ds4::gguf::iq;
+namespace gg = maya::ds4::gguf;
+namespace iq = maya::ds4::gguf::iq;
 
 namespace {
 

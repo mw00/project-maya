@@ -8,8 +8,8 @@
 //                                dense_down, head)
 // On a gfx11 other than the APUs (gfx115x) the RDNA3 kernel runs only with MAYA_GLM_MV_RDNA=1.
 // Every launch is far below a second (the head, the largest, reads 0.52 GB); the device holds < 1 GB at once.
-#include "strata/kernels/glm_expert_bench.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_expert_bench.hpp"
+#include "maya/kernels/glm_fast.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #define GGML_COMMON_DECL_CPP
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 namespace {
 void check(hipError_t e, const char* what) {
     if (e != hipSuccess) {

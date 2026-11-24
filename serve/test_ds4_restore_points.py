@@ -6,7 +6,9 @@ shared=), computed from the chat as the template renders it - no GPU, no engine 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import unittest
 import unittest.mock
@@ -176,6 +178,26 @@ class RestorePoints(unittest.TestCase):
         self.assertEqual(sampling["_restore"]["tail"], len(self.engine.last_prompt) - 100)
         self.assertNotIn("marks", sampling["_restore"])
         self.assertIn(f"tail={len(self.engine.last_prompt) - 100}", StrataEngine.sampling_keys(sampling).split())
+
+    def test_a_prompt_with_pictures_gets_them_too(self):
+        # #1007: a client that sends only its newest picture leaves the history at the one before's place, near the
+        # end; with no point before it, every picture's prompt was read again from token 0.  The engine moves a point
+        # inside a picture's span to the span's start and gives up the points past a picture that changed
+        request = {"messages": self.chat()}
+        msgs, schemas, kw = openai_to_messages(request, deepseek=True)
+        ids, thinking, max_new = self.svc.prepare(msgs, schemas, kw, 50)
+        folder = Path(tempfile.mkdtemp())
+        self.svc.embeddings.path = str(folder / "req.dsi")        # (as prepare sets it for a prompt's pictures)
+        try:
+            with unittest.mock.patch.dict(os.environ, {ON: "4"}):
+                openai_collect(openai_chunks(self.svc, request, ids, thinking, schemas, max_new, threading.Event()))
+        finally:
+            self.svc.embeddings.path = None
+            shutil.rmtree(folder, ignore_errors=True)
+        sampling = self.engine.last_sampling
+        self.assertEqual(sampling["_restore"], self.points(ids))
+        self.assertIn("marks=" + ",".join(str(p) for p in self.points(ids)["marks"]),
+                      StrataEngine.sampling_keys(sampling).split())
 
     def test_off_with_0_and_never_the_clients_own(self):
         _, on = self.run_request(self.chat(), {})   # (on by default)

@@ -13,9 +13,9 @@
 //   4. the glm-dsa rollback rows on GLM-5.3's layout for the test PC head groups {[0,26)} and {[0,26), [26,54)}, FP16 and
 //      INT8 latents and FP16 index keys: one latent + one k_pe row per DSA layer and an index-key row exactly on the
 //      full-indexer layers, all disjoint across positions and inside the arena, none on the NextN block unless asked.
-#include "strata/core/glm_dsa_spec.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/glm_state_layout.hpp"
+#include "maya/core/glm_dsa_spec.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/glm_state_layout.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -24,12 +24,12 @@
 #include <vector>
 #include "glm_test_env.hpp"   // setenv / unsetenv / getpid (<unistd.h> on POSIX; mapped on Windows)
 
-using strata::core::GlmArch;
-using strata::core::GlmIdxKind;
-using strata::core::GlmStateLayout;
-using strata::core::GlmStateMode;
-using strata::core::Glm5Geometry;
-namespace gs = strata::core::glmspec;
+using maya::core::GlmArch;
+using maya::core::GlmIdxKind;
+using maya::core::GlmStateLayout;
+using maya::core::GlmStateMode;
+using maya::core::Glm5Geometry;
+namespace gs = maya::core::glmspec;
 
 namespace {
 
@@ -315,7 +315,7 @@ void test_rows() {
         GlmStateLayout lay;
         std::string err;
         const int mtp = c.l1 == 78 ? 78 : -1;
-        if (!strata::core::glm_state_carve(g, c.l0, c.l1, mtp, ctx, c.mode, (int) ctx, lay, err)) {
+        if (!maya::core::glm_state_carve(g, c.l0, c.l1, mtp, ctx, c.mode, (int) ctx, lay, err)) {
             check(false, std::string(c.name) + ": carve: " + err);
             continue;
         }

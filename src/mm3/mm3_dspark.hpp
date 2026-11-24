@@ -44,7 +44,7 @@ public:
 
     /// Loads the draft (the pack's dspark.* tensors) onto device dev, sharing the target's head (on dev) and its
     /// embeddings (emb: the mapped BF16 table).  max_rows: the most context rows one call takes.
-    bool load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, const strata::mm3::exl3::Mat* head,
+    bool load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, const maya::mm3::exl3::Mat* head,
               const uint16_t* emb, int max_rows, std::string& err);
     /// (before load) the target's token rows from f(id, dst: D BF16 values) instead of emb - a GGUF's table, in its
     /// block type: the mask row once, each proposal's anchor row

@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4::evt {
+namespace maya::ds4::evt {
 
 using Closure = std::function<void()>;
 
@@ -159,4 +159,4 @@ private:
     int idle_ms_ = 0;
 };
 
-}  // namespace strata::ds4::evt
+}  // namespace maya::ds4::evt

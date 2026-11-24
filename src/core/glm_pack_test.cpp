@@ -5,7 +5,7 @@
 // Teacher-forces token ids 1..n (streaming, one forward per token) through the pack-backed
 // runner and writes the (T, vocab) float32 logits.  The cross-check is llama.cpp on the same
 // GGUF (llm_logits_dump) - docs/GLM5-FLASH.md §9.
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
     const int n_tok = std::atoi(argv[2]);
     const char* out_path = argc > 3 ? argv[3] : nullptr;
 
-    strata::core::Glm5Model model;
+    maya::core::Glm5Model model;
     std::string err;
     if (!model.load_pack_env(pack, 4096, err)) {
         std::fprintf(stderr, "glm_pack_test: %s\n", err.c_str());
@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
     // turn, so the rejected-token path (the recurrent state restored and the kept tokens replayed) runs as often as the
     // full one; the next window starts after the kept ones.
     if (const char* wt = getenv("GLM_TEST_WINDOW")) {
-        const int T = std::max(1, std::min(strata::core::Glm5Model::kWinMax, std::atoi(wt)));
+        const int T = std::max(1, std::min(maya::core::Glm5Model::kWinMax, std::atoi(wt)));
         std::vector<int> am((size_t) n_tok, -1);
         for (int t = t_first; t < n_tok; ++t) {
             const float* lg = all.data() + (size_t) (t - t_first) * V;
@@ -201,7 +201,7 @@ int main(int argc, char** argv) {
         for (int t = t_first; t < n_tok && early;) {
             const int n = std::min(T, n_tok - t);
             const int keep = 1 + windows % n;
-            int32_t out[strata::core::Glm5Model::kWinMax];
+            int32_t out[maya::core::Glm5Model::kWinMax];
             bool ok = model.win_pipe_begin(id_at(t), err, nullptr, windows == 0);
             for (int i = 1; i < n && ok; ++i) ok = model.win_pipe_push(id_at(t + i), err);
             for (int i = 0; i < keep && ok; ++i) ok = model.win_pipe_pick(i, out[i], err);
@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
         }
         for (int t = t_first; t < n_tok && !early;) {
             const int n = std::min(T, n_tok - t);
-            int32_t tok[strata::core::Glm5Model::kWinMax], out[strata::core::Glm5Model::kWinMax];
+            int32_t tok[maya::core::Glm5Model::kWinMax], out[maya::core::Glm5Model::kWinMax];
             for (int i = 0; i < n; ++i) tok[i] = id_at(t + i);
             if (!win(tok, n, out)) {
                 std::fprintf(stderr, "glm_pack_test: window at %d: %s\n", t, err.c_str());
@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
                     }
                 } else {
                     while (done + Tw <= nt) {
-                        int32_t tok[strata::core::Glm5Model::kWinMax], out[strata::core::Glm5Model::kWinMax];
+                        int32_t tok[maya::core::Glm5Model::kWinMax], out[maya::core::Glm5Model::kWinMax];
                         for (int i = 0; i < Tw; ++i) tok[i] = id_at(at + done + i);
                         if (!win(tok, Tw, out) || !model.window_commit(Tw, err)) return false;
                         done += Tw;
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
             if (const char* ts = getenv("GLM_TEST_WINDOW_TS")) {
                 for (const char* c = ts; *c;) {
                     const int v = std::atoi(c);
-                    if (v >= 1 && v <= strata::core::Glm5Model::kWinMax) tws.push_back(v);
+                    if (v >= 1 && v <= maya::core::Glm5Model::kWinMax) tws.push_back(v);
                     while (*c && *c != ',') ++c;
                     if (*c == ',') ++c;
                 }

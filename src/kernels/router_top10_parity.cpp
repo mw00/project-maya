@@ -9,7 +9,7 @@
 // logit distributions including ties (where the "smallest index wins" rule is the only thing that decides) and
 // near-ties (where a float difference decides).  It also asserts that the 2**-14 CLAMP CANNOT TRIGGER for this
 // model's geometry - see below - so the absence of a clamp test is a proven fact rather than an omission.
-#include "strata/kernels/router_top10.hpp"
+#include "maya/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
 
@@ -76,7 +76,7 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     check(cudaMalloc(&d_ids, h_ids.size() * sizeof(int)), "malloc ids");
     check(cudaMalloc(&d_w, h_w.size() * sizeof(float)), "malloc w");
     check(cudaMemcpy(d_l, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "copy");
-    strata::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
+    maya::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
     check(cudaMemcpy(h_ids.data(), d_ids, h_ids.size() * sizeof(int), cudaMemcpyDeviceToHost), "back ids");
     check(cudaMemcpy(h_w.data(), d_w, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost), "back w");
 

@@ -29,7 +29,7 @@
 #include "mm3_vision.hpp"
 
 namespace mm3 {
-namespace x3 = strata::mm3::exl3;
+namespace x3 = maya::mm3::exl3;
 
 #define TK(call)                                                                       \
     do {                                                                               \

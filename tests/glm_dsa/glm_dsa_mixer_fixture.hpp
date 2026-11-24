@@ -14,10 +14,10 @@
 #pragma once
 
 #include "glm_dsa_mixer.hpp"
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_mixer.hpp"
-#include "strata/kernels/glmd_ref.hpp"
-#include "strata/kernels/glmd_volta.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_mixer.hpp"
+#include "maya/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_volta.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 
@@ -32,13 +32,13 @@
 
 namespace mixfx {
 
-using strata::core::glmdsa::Gemv;
-using strata::core::glmdsa::MixerBufs;
-using strata::core::glmdsa::MixerCache;
-using strata::core::glmdsa::MixerDims;
-using strata::core::glmdsa::MixerLayer;
-using strata::core::glmdsa::Proj;
-using strata::core::glmdsa::SelState;
+using maya::core::glmdsa::Gemv;
+using maya::core::glmdsa::MixerBufs;
+using maya::core::glmdsa::MixerCache;
+using maya::core::glmdsa::MixerDims;
+using maya::core::glmdsa::MixerLayer;
+using maya::core::glmdsa::Proj;
+using maya::core::glmdsa::SelState;
 
 // ---------------------------------------------------------------- geometry presets
 /// SMALL of tools/glm_dsa_synth_gguf.py (n_embd 128, 4 heads, kv_lora 32 + rope 16, indexer 16 x 64, top-k 8).
@@ -328,7 +328,7 @@ struct Harness {
         b.attn_out = f((size_t) H * d.v_head);
         b.attn_out_q = be.alloc((size_t) H * d.v_head / 32 * 36);
         b.mixer = f(E);
-        b.work_bytes = strata::core::glmdsa::mixer_work_bytes(d, dense);
+        b.work_bytes = maya::core::glmdsa::mixer_work_bytes(d, dense);
         b.work = be.alloc(b.work_bytes);
         b.inv_freq = up(m.inv_q);
         b.idx_inv_freq = up(m.inv_idx);
@@ -444,7 +444,7 @@ struct Harness {
         w.w_type = w_type;
         MixerCache c = cache[(size_t) il];
         if (!w.full) c.ik = nullptr;
-        if (!strata::core::glmdsa::mixer_layer(*this, d, b, c, w, il, p, dense, st, err)) return false;
+        if (!maya::core::glmdsa::mixer_layer(*this, d, b, c, w, il, p, dense, st, err)) return false;
         be.sync();
         out.resize((size_t) d.n_embd);
         be.get(out.data(), b.mixer, out.size() * 4);
@@ -482,7 +482,7 @@ RunStats run_stack(H& h, const Model& m, bool dense_ref) {
             sum += e;
             ++rs.n;
             const bool full_here = m.L[(size_t) il].full;
-            if (full_here && h.st.n_sel_last != strata::core::glmdsa::sel_count(p, m.d.top_k, h.dense)) ++rs.sel_count_bad;
+            if (full_here && h.st.n_sel_last != maya::core::glmdsa::sel_count(p, m.d.top_k, h.dense)) ++rs.sel_count_bad;
             if (full_here && !h.dense && p + 1 > m.d.top_k) {
                 ++rs.sel_checked;
                 std::set<int> a(h.cells_h.begin(), h.cells_h.end()), b(sel_ref.begin(), sel_ref.end());

@@ -1,16 +1,16 @@
 // src/kernels/cuda/glmd_fast.cu - glm-dsa decode attention kernels (B4.3, B4.4, B4.5); see
-// include/strata/kernels/glmd_fast.hpp.
+// include/maya/kernels/glmd_fast.hpp.
 //
 // The small helpers (warp/block reductions, the q8_1 store, the BF16 row dot, Maya's INT8 latent record) repeat
 // glm_fast.cu's expressions, so a latent written here reads back through glmf's lat_any unchanged, and the q8_1
 // blocks are the ones quantize.cu writes.  The rope is glmd_rope.cuh: this file must not be built with
 // --use_fast_math (the header refuses).
-#include "strata/kernels/glmd_fast.hpp"
-#include "strata/kernels/glmd_dec.hpp"
-#include "strata/kernels/glmd_volta.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_dec.hpp"
+#include "maya/kernels/glmd_volta.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
-#include "glmd_arch.cuh"   // STRATA_GRID_CONSTANT (Pascal pass)
+#include "glmd_arch.cuh"   // MAYA_GRID_CONSTANT (Pascal pass)
 #include "glmd_had.cuh"
 #include "glmd_rope.cuh"
 #include "glmd_topk.cuh"
@@ -24,8 +24,8 @@
 namespace glmd {
 namespace {
 
-static_assert(glmd::lat8_rec_bytes(512) == strata::kernels::glmf::lat8_rec_bytes(512) &&
-                  glmd::lat8_rec_bytes(256) == strata::kernels::glmf::lat8_rec_bytes(256),
+static_assert(glmd::lat8_rec_bytes(512) == maya::kernels::glmf::lat8_rec_bytes(512) &&
+                  glmd::lat8_rec_bytes(256) == maya::kernels::glmf::lat8_rec_bytes(256),
               "the INT8 latent record must stay Maya's");
 
 std::atomic<int> g_launch_errors{0};
@@ -113,7 +113,7 @@ __device__ __forceinline__ float row_dot_bf16(const uint16_t* row, const float* 
 
 // ---------------------------------------------------------------- B4.3 prep
 // block 0: q_a RMS -> qr / qr_q;  block 1: c_kv RMS -> latent record, k_pe rope -> FP16;  block 2: the index key
-__global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTANT DsaPrep a) {
+__global__ void __launch_bounds__(512) dsa_prep_kernel(const MAYA_GRID_CONSTANT DsaPrep a) {
     __shared__ float sred[32];
     __shared__ float s_y[512];
     const int tid = threadIdx.x, lane = tid & 31;
@@ -202,7 +202,7 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTAN
 }
 
 // one NORM pair per thread: the MLA q_pe pairs of every head, then the indexer query pairs
-__global__ void __launch_bounds__(256) dsa_rope_q_kernel(const STRATA_GRID_CONSTANT DsaRopeQ a) {
+__global__ void __launch_bounds__(256) dsa_rope_q_kernel(const MAYA_GRID_CONSTANT DsaRopeQ a) {
     const int p = a.p_dev ? *a.p_dev : a.p;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int nq = a.n_head * (a.n_rot / 2);

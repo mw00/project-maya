@@ -35,7 +35,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 /// --ssd-cache auto's size: the RAM free now less `room` (the system's and the owner's programs), at most `cap` (every
 /// expert it could hold); 0 below `min` (too little to be worth a store)
@@ -808,4 +808,4 @@ private:
     Counts counts_;
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

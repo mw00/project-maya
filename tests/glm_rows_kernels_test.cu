@@ -6,7 +6,7 @@
 //    kda_prep + kda_rec for each row alone: the conv outputs, g1 / g2, both states and the q8_1 output;
 //  - mv_nt for 2 .. kMaxMvNt activations (past 8: in groups of 8) against mv() for each activation alone, BF16 and
 //    Q8_0 weights.
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@
 #include <random>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 namespace {
 

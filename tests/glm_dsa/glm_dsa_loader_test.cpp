@@ -17,11 +17,11 @@
 //   6. load_pack_env reads the pack's geometry before the split bounds: 26,54 is a valid 78-layer split, 25 is not
 //      a full-indexer layer (B1.5);
 //   7. the NextN lists, the prompt gate, the derived constants (B1.8, B1.9, B2.6).
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/core/glm_arch.hpp"
-#include "strata/core/glm_dsa_split.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/core/glm_arch.hpp"
+#include "maya/core/glm_dsa_split.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/kernels/dequant_bf16.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -40,11 +40,11 @@
 
 namespace fs = std::filesystem;
 
-namespace strata::core::glmpf {
+namespace maya::core::glmpf {
 bool f16_covers(int type, bool dsa);   // src/core/glm_prefill_dsa.hpp (an internal header: CUDA / cuBLAS includes)
 }
-using strata::core::Glm5Geometry;
-using strata::core::GlmArch;
+using maya::core::Glm5Geometry;
+using maya::core::GlmArch;
 
 namespace {
 
@@ -146,7 +146,7 @@ struct Writer {
     }
     static uint64_t nbytes(const Tensor& t) {
         int el = 1, by = 4;
-        if (!strata::block_geometry(t.type, el, by)) return 0;
+        if (!maya::block_geometry(t.type, el, by)) return 0;
         uint64_t n = 1;
         for (auto d : t.shape) n *= d;
         return n / (uint64_t) el * (uint64_t) by;
@@ -378,7 +378,7 @@ std::string meta_file(const fs::path& dir, const std::function<void(Writer&)>& m
 
 bool parse(const std::string& path, Glm5Geometry& g, std::string& err) {
     try {
-        strata::GgufFile f(path);
+        maya::GgufFile f(path);
         return Glm5Geometry::from_gguf(f, g, err);
     } catch (const std::exception& e) {
         err = e.what();
@@ -397,7 +397,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);   // in step with the loader's stderr notes
 #endif
     std::printf("glm_dsa_loader_test\n");
-    const fs::path dir = fs::temp_directory_path() / ("strata_glm_dsa_loader_" + std::to_string((long) getpid()));
+    const fs::path dir = fs::temp_directory_path() / ("maya_glm_dsa_loader_" + std::to_string((long) getpid()));
     fs::create_directories(dir);
     unsetenv("MAYA_GLM_IDX_LN_EPS");
     unsetenv("MAYA_GLM_SPLIT");
@@ -413,24 +413,24 @@ int main() {
             w.arr_i32("test.i32_65536", big);
             w.arr_i32("test.i32_154880", std::vector<int>(154880, 1));
         });
-        strata::GgufFile f(path);
+        maya::GgufFile f(path);
         // Maya v1.1.55 keeps a 64-item sample in metadata() and reads a whole array through get_full (the glm-dsa
         // geometry reader does that for every truncated array); the round trips go through it
-        strata::MetaValue b79, t78, i65;
-        const strata::MetaValue* b = f.get_full("test.bool79", b79) ? &b79 : nullptr;
+        maya::MetaValue b79, t78, i65;
+        const maya::MetaValue* b = f.get_full("test.bool79", b79) ? &b79 : nullptr;
         bool same = b && b->count == 79 && b->items.size() == 79;
         const auto want = glm53_types(79);
         for (size_t i = 0; same && i < 79; ++i) same = b->items[i].u == (uint64_t) want[i];
         check(same, "a 79-entry bool array round-trips (count 79, 79 items, every value)");
-        const strata::MetaValue* it = f.get_full("glm-dsa.attention.indexer.types", t78) ? &t78 : nullptr;
+        const maya::MetaValue* it = f.get_full("glm-dsa.attention.indexer.types", t78) ? &t78 : nullptr;
         check(it && it->items.size() == 78, "indexer.types keeps its 78 entries (was cut to 64)");
-        const strata::MetaValue* big = f.get_full("test.i32_65536", i65) ? &i65 : nullptr;
+        const maya::MetaValue* big = f.get_full("test.i32_65536", i65) ? &i65 : nullptr;
         check(big && big->items.size() == 65536 && (int64_t) big->items[65535].u == 65535LL * 3 - 7,
               "a 65536-entry i32 array keeps every item, signed values intact");
-        const strata::MetaValue* voc = f.get("test.i32_154880");
+        const maya::MetaValue* voc = f.get("test.i32_154880");
         check(voc && voc->count == 154880 && voc->items.size() == 64,
               "a vocabulary-sized numeric array (154880) keeps the 64-item sample");
-        const strata::MetaValue* toks = f.get("tokenizer.ggml.tokens");
+        const maya::MetaValue* toks = f.get("tokenizer.ggml.tokens");
         check(toks && toks->count == 100 && toks->items.size() == 64 && toks->items[63].s == "tok63",
               "string arrays keep their 64-item sample (count 100)");
     }
@@ -442,7 +442,7 @@ int main() {
         std::string err;
         const bool ok = parse(meta_file(dir, [](Writer&) {}), g, err);
         check(ok, "the GLM-5.3 header parses" + (err.empty() ? std::string() : " (" + err + ")"));
-        check(g.arch == GlmArch::GlmDsa && std::string(strata::core::glm_arch_name(g.arch)) == "glm-dsa", "arch glm-dsa");
+        check(g.arch == GlmArch::GlmDsa && std::string(maya::core::glm_arch_name(g.arch)) == "glm-dsa", "arch glm-dsa");
         check(g.n_layers == 78 && g.nextn == 1, "78 trunk layers + 1 NextN");
         check(g.n_embd == 6144 && g.n_head == 64 && g.n_vocab == 154880, "n_embd 6144, 64 heads, vocab 154880");
         check(g.q_lora == 2048 && g.kv_lora == 512, "q_lora 2048, kv_lora 512");
@@ -452,7 +452,7 @@ int main() {
         check(g.rope_theta == 8e6, "rope theta 8e6");
         check(g.idx_heads == 32 && g.idx_key == 128 && g.idx_top_k == 2048 && g.idx_rope == 64,
               "indexer 32 x 128, top-2048, rope on the first 64 dims");
-        check(g.idx_kind == strata::core::GlmIdxKind::Token && g.idx_kpool == 1 && g.idx_select_tail == 0,
+        check(g.idx_kind == maya::core::GlmIdxKind::Token && g.idx_kpool == 1 && g.idx_select_tail == 0,
               "token indexer: no k-pool, no tail");
         check(g.idx_ln_eps == 1e-6f, "indexer LayerNorm eps 1e-6 (HF)");
         check(g.n_ctx_train == 1048576, "n_ctx_train 1048576");
@@ -593,7 +593,7 @@ int main() {
                     g.n_head == d.n_head && g.q_lora == d.q_lora && g.kv_lora == d.kv_lora && g.qk_nope == 256 &&
                     g.v_head == 256 && g.idx_kpool == 4 && g.idx_select_tail == 1 && g.hc == 4 && g.n_expert == 288 &&
                     g.swiglu_exp == 10.0f && g.swiglu_shexp == 10.0f && g.w_scale == 1.0f && g.n_vocab == 154880 &&
-                    g.qk_rope == 0 && g.rope_theta == 0 && g.idx_kind == strata::core::GlmIdxKind::KPool;
+                    g.qk_rope == 0 && g.rope_theta == 0 && g.idx_kind == maya::core::GlmIdxKind::KPool;
         for (int il = 0; same && il < 45; ++il) same = g.is_recr(il) == (hkv[(size_t) il] == 0) && g.idx_full(il);
         check(same, pre + " header: Maya's values (45 + 1 layers, kpool 4, hc 4, 288 experts, clamp 10)" +
                         (err.empty() ? "" : " [" + err + "]"));
@@ -604,10 +604,10 @@ int main() {
         for (int il = 1; il < 45; ++il) all = all && g.boundary_ok(il);
         check(all && !g.boundary_ok(45), pre + " any trunk layer 1..44 may start a part");
         Glm5Geometry g2 = g;
-        check(strata::core::glm_geometry_check(g2, [](const std::string&) { return nullptr; }, 0, 0, err),
+        check(maya::core::glm_geometry_check(g2, [](const std::string&) { return nullptr; }, 0, 0, err),
               pre + " shape check is a no-op for Flash");
         std::string e2;
-        check(strata::core::glm_forward_available(g, e2) && strata::core::glm_split_bounds_ok(g, {7}, e2),
+        check(maya::core::glm_forward_available(g, e2) && maya::core::glm_split_bounds_ok(g, {7}, e2),
               pre + " forward gate open, any split bound passes");
     }
     {
@@ -626,28 +626,28 @@ int main() {
     const fs::path pdir = dir / "model";
     {
         const fs::path pack = write_pack(pdir, LayerOpts{});
-        std::vector<std::unique_ptr<strata::GgufFile>> gfs;
+        std::vector<std::unique_ptr<maya::GgufFile>> gfs;
         for (int i = 1; i <= 3; ++i)
-            gfs.emplace_back(new strata::GgufFile((pdir / ("GLM-5.3-TEST-0000" + std::to_string(i) + "-of-00003.gguf")).string()));
+            gfs.emplace_back(new maya::GgufFile((pdir / ("GLM-5.3-TEST-0000" + std::to_string(i) + "-of-00003.gguf")).string()));
         check(gfs[0]->tensors().empty() && gfs[0]->get("glm-dsa.block_count"), "shard 1 holds metadata only");
-        const auto find = [&](const std::string& n) -> const strata::TensorInfo* {
+        const auto find = [&](const std::string& n) -> const maya::TensorInfo* {
             for (const auto& gf : gfs)
-                if (const strata::TensorInfo* t = gf->find(n)) return t;
+                if (const maya::TensorInfo* t = gf->find(n)) return t;
             return nullptr;
         };
         Glm5Geometry g;
         std::string err;
         bool ok = Glm5Geometry::from_gguf(*gfs[0], g, err);
         g.n_vocab = 0;   // as without vocab_size: the check takes token_embd's rows
-        ok = ok && strata::core::glm_geometry_check(g, find, 0, 0, err);
+        ok = ok && maya::core::glm_geometry_check(g, find, 0, 0, err);
         check(ok && g.n_vocab == 154880, "full 744B directory passes the shape check; n_vocab from token_embd" +
                                              (err.empty() ? "" : " [" + err + "]"));
         std::vector<double> cost(78, 0.2e9);
-        strata::core::glm_dense_layer_cost(g, pack.string(), cost);
+        maya::core::glm_dense_layer_cost(g, pack.string(), cost);
         check(cost[0] == 6144.0 * 2048 / 256 * 144 && cost[1] == 0 && cost[5] == 0,
               "dense split cost from index.txt + the shards (experts excluded)");
 
-        strata::core::Glm5Model m;
+        maya::core::Glm5Model m;
         err.clear();
         ok = m.load_pack(pack.string(), 4096, err);
         check(!ok && has(err, "check-only load"),
@@ -657,7 +657,7 @@ int main() {
     }
     const auto pack_err = [&](const LayerOpts& o) {
         const fs::path pack = write_pack(pdir, o);
-        strata::core::Glm5Model m;
+        maya::core::Glm5Model m;
         std::string err;
         const bool ok = m.load_pack(pack.string(), 4096, err);
         return ok ? std::string("LOADED") : err;
@@ -701,7 +701,7 @@ int main() {
         std::string err;
         {
             setenv("MAYA_GLM_SPLIT", "26,54", 1);
-            strata::core::Glm5Model m;
+            maya::core::Glm5Model m;
             m.load_pack_env(pack.string(), 4096, err);
             // (without GPUs Maya's glm_split_devices refuses the 3 parts after the bounds passed)
             check(!has(err, "1..44") && (has(err, "1..77") || has(err, "check-only load") || has(err, "devices")),
@@ -709,14 +709,14 @@ int main() {
         }
         {
             setenv("MAYA_GLM_SPLIT", "25,54", 1);
-            strata::core::Glm5Model m;
+            maya::core::Glm5Model m;
             err.clear();
             m.load_pack_env(pack.string(), 4096, err);
             check(has(err, "layer 25") && has(err, "full-indexer"), "25 is a shared-indexer layer: refused as a boundary");
         }
         {
             setenv("MAYA_GLM_SPLIT", "0", 1);
-            strata::core::Glm5Model m;
+            maya::core::Glm5Model m;
             err.clear();
             m.load_pack_env(pack.string(), 4096, err);
             check(has(err, "check-only load"), "MAYA_GLM_SPLIT=0: one part, refused at the forward gate");
@@ -733,7 +733,7 @@ int main() {
         Glm5Geometry g;
         std::string err;
         {
-            strata::GgufFile f((pdir / "GLM-5.3-TEST-00001-of-00003.gguf").string());
+            maya::GgufFile f((pdir / "GLM-5.3-TEST-00001-of-00003.gguf").string());
             Glm5Geometry::from_gguf(f, g, err);
         }
         const auto txt = [](const std::vector<int>& b) {
@@ -743,7 +743,7 @@ int main() {
         };
         const auto search = [&](const char* cards, std::vector<int> devs) {
             setenv("MAYA_GLM_SPLIT_CARDS", cards, 1);
-            const std::vector<int> b = strata::core::glm_split_search(pack.string(), 32768, devs);
+            const std::vector<int> b = maya::core::glm_split_search(pack.string(), 32768, devs);
             unsetenv("MAYA_GLM_SPLIT_CARDS");
             return b;
         };
@@ -752,13 +752,13 @@ int main() {
         // (BUILD-PLAN's {26, 54} and {30, 54} price within 0.2% of each other here - 27.79 / 27.74 ms with the default
         // coverage curve: 30 gives the three parts 27 / 24 / 24 MoE layers, 26 gives 23 / 28 / 24; the measured host
         // read speed picks between them)
-        check(v3.size() == 2 && strata::core::glm_split_bounds_full(g, v3) && (v3[0] == 26 || v3[0] == 30) && v3[1] == 54,
+        check(v3.size() == 2 && maya::core::glm_split_bounds_full(g, v3) && (v3[0] == 26 || v3[0] == 30) && v3[1] == 54,
               "3x V100 32 GB: full-indexer parts {26 or 30, 54}  [" + txt(v3) + "]");
         const std::vector<int> v2 = search("31.5:898,31.5:898", {0, 1});
-        check(v2.size() == 1 && strata::core::glm_split_bounds_full(g, v2),
+        check(v2.size() == 1 && maya::core::glm_split_bounds_full(g, v2),
               "2 cards: one full-indexer boundary  [" + txt(v2) + "]");
         const std::vector<int> v4 = search("23:1008:4090,23:1008:4090,31.5:898,15:448", {0, 1, 2, 3});
-        check(v4.size() == 3 && strata::core::glm_split_bounds_full(g, v4),
+        check(v4.size() == 3 && maya::core::glm_split_bounds_full(g, v4),
               "4 mixed cards: three full-indexer boundaries  [" + txt(v4) + "]");
         check(search("31.5:898", {0, 1}).empty(), "fewer simulated cards than devices: no plan (free-VRAM split)");
     }
@@ -767,29 +767,29 @@ int main() {
     std::printf("[B1.8 / B2.6 lists and gates]\n");
     {
         std::vector<std::string> raw = {"flash"}, b16 = {"flash"}, f32 = {"flash"};
-        strata::core::glm_mtp_lists(GlmArch::Glm5Next, raw, b16, f32);
+        maya::core::glm_mtp_lists(GlmArch::Glm5Next, raw, b16, f32);
         check(raw.size() == 1 && raw[0] == "flash" && b16[0] == "flash" && f32[0] == "flash",
               "Flash keeps Maya's NextN lists");
-        strata::core::glm_mtp_lists(GlmArch::GlmDsa, raw, b16, f32);
+        maya::core::glm_mtp_lists(GlmArch::GlmDsa, raw, b16, f32);
         bool comp = false, gi_b16 = false, gi_f32 = false;
         for (const auto* v : {&raw, &b16, &f32})
             for (const auto& n : *v) comp = comp || has(n, "compressor");
         for (const auto& n : b16) gi_b16 = gi_b16 || n == "ffn_gate_inp.weight";
         for (const auto& n : f32) gi_f32 = gi_f32 || n == "ffn_gate_inp.weight";
         check(!comp && !gi_b16 && gi_f32, "glm-dsa NextN lists: no indexer_compressor_*, router kept F32");
-        check(std::string(strata::core::glm_mtp_fallback(GlmArch::GlmDsa, "nextn.shared_head_norm.weight")) ==
+        check(std::string(maya::core::glm_mtp_fallback(GlmArch::GlmDsa, "nextn.shared_head_norm.weight")) ==
                       "output_norm.weight" &&
-                  strata::core::glm_mtp_fallback(GlmArch::Glm5Next, "nextn.shared_head_norm.weight") == nullptr,
+                  maya::core::glm_mtp_fallback(GlmArch::Glm5Next, "nextn.shared_head_norm.weight") == nullptr,
               "glm-dsa shared_head_norm falls back to output_norm (Flash: none)");
         // the batched prompt's weight types (prefill_setup deq_ok): Flash keeps Maya v1.1.3's set (BF16 and the
         // dequant_bf16 table, no i-quant); glm-dsa adds the i-quants dequant_f16 routes (IQ2_XXS .. IQ1_M)
         bool flash_same = true;
         for (int t = 0; t < 64; ++t)
-            flash_same = flash_same && strata::core::glmpf::f16_covers(t, false) ==
-                                           (t == 30 || strata::kernels::dequant_bf16_supported(t));
+            flash_same = flash_same && maya::core::glmpf::f16_covers(t, false) ==
+                                           (t == 30 || maya::kernels::dequant_bf16_supported(t));
         bool dsa_iq = true;
         for (int t : {16, 17, 18, 21, 22, 29})
-            dsa_iq = dsa_iq && strata::core::glmpf::f16_covers(t, true) && !strata::core::glmpf::f16_covers(t, false);
+            dsa_iq = dsa_iq && maya::core::glmpf::f16_covers(t, true) && !maya::core::glmpf::f16_covers(t, false);
         check(flash_same && dsa_iq, "prompt FP16 types: Flash = Maya's deq_ok set, glm-dsa adds the i-quants");
     }
 

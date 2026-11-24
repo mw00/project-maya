@@ -1,9 +1,9 @@
-#include "strata/core/expert_cache.hpp"
+#include "maya/core/expert_cache.hpp"
 #include <cstdio>
 #include <vector>
 
 int main() {
-    strata::core::ExpertCache cache;
+    maya::core::ExpertCache cache;
     std::string err;
     auto check = [&](bool ok) {
         if (!ok) std::fprintf(stderr, "%s\n", err.c_str());

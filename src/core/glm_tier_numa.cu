@@ -1,11 +1,11 @@
 // src/core/glm_tier_numa.cu - the glm-dsa port B8.2 / B8.3 / B8.4 / B8.7: the memory tiers at run time (see
 // glm_tier_numa.hpp).  Host code plus two small copy kernels; nothing here runs unless its feature is on.
-#include "strata/core/glm_env.hpp"
-#include "strata/core/glm_req_knobs.hpp"   // speed plan: per-request prefetch_blocks / cpu_split
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_req_knobs.hpp"   // speed plan: per-request prefetch_blocks / cpu_split
 #include "glm_tier_numa.hpp"
 
-#include "strata/core/glm_arch.hpp"
-#include "strata/core/glm_dsa_split.hpp"
+#include "maya/core/glm_arch.hpp"
+#include "maya/core/glm_dsa_split.hpp"
 
 #include "ggml.h"
 
@@ -28,7 +28,7 @@
 #include <unistd.h>
 #endif
 
-namespace strata::core::glmtier {
+namespace maya::core::glmtier {
 
 using glmfast::cpu_relax;
 
@@ -841,12 +841,12 @@ bool cpu_experts(Glm5Model::FastState& F, const Glm5Geometry& g, int il, int ne,
     return true;
 }
 
-}  // namespace strata::core::glmtier
+}  // namespace maya::core::glmtier
 
 // ---------------------------------------------------------------- the split planner's view of the lane pools
-// (include/strata/core/glm_dsa_split.hpp: glm_split_pool_ids; glm_model.cu glm_search_bounds prices misses and the
+// (include/maya/core/glm_dsa_split.hpp: glm_split_pool_ids; glm_model.cu glm_search_bounds prices misses and the
 // B11.2 head with them)
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 // the NUMA node a GPU hangs off (sysfs, by its PCI address), -1 when unknown
@@ -875,4 +875,4 @@ std::vector<int> glm_split_pool_ids(const Glm5Geometry& g, const std::vector<int
                             gpu_node);
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

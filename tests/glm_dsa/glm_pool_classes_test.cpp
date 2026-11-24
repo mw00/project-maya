@@ -6,16 +6,16 @@
 //     largest folded stride, the demand counters are summed, every slot still holds its layer's blob;
 //   * a cap at or above the class count, or 0, changes nothing; inconsistent vectors are left alone;
 //   * glm_pool_classes_last() reports the latest count.
-#include "strata/core/glm_pool_classes.hpp"
+#include "maya/core/glm_pool_classes.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using strata::core::glm_pool_class_cap;
-using strata::core::glm_pool_classes_last;
-using strata::core::glm_pool_merge_classes;
+using maya::core::glm_pool_class_cap;
+using maya::core::glm_pool_classes_last;
+using maya::core::glm_pool_merge_classes;
 
 namespace {
 

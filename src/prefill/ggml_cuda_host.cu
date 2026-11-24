@@ -1,8 +1,8 @@
 // src/prefill/ggml_cuda_host.cu - prompt-speed plan step 2b: the host-side symbols of llama.cpp's ggml-cuda that its MMQ
-// and quantize code reference, for the MMQ kernels compiled into strata_mmq without the rest of ggml-cuda.cu.
+// and quantize code reference, for the MMQ kernels compiled into maya_mmq without the rest of ggml-cuda.cu.
 #include "common.cuh"
-#include "strata/prefill/failure.hpp"
-#include "strata/prefill/moe_mmq.hpp"
+#include "maya/prefill/failure.hpp"
+#include "maya/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -114,7 +114,7 @@ const ggml_cuda_device_info & ggml_cuda_info() { return cuda_info_mut(); }
 // 100 %, and on NVIDIA it then launches one block a tile (gridDim = ntiles: every block's k range is one whole tile,
 // no fixup) - upstream's own mode for launches that tile well.  (HIP's rule launches nsm blocks whatever the
 // efficiency, so nsm stays there: AMD's RDNA configs tile without stream-k anyway.)  Set before the products run.
-namespace strata::prefill::mmq {
+namespace maya::prefill::mmq {
 bool set_whole_tiles(bool on) {
     std::lock_guard<std::mutex> lk(g_whole_mu);
     const bool old = g_whole;
@@ -135,7 +135,7 @@ bool whole_tiles() {
     std::lock_guard<std::mutex> lk(g_whole_mu);
     return g_whole;
 }
-}  // namespace strata::prefill::mmq
+}  // namespace maya::prefill::mmq
 
 namespace {
 // The prompt path's MMQ scratch, where the pool has no business taking VRAM: the part of the borrowed region
@@ -188,7 +188,7 @@ struct CachingPool : ggml_cuda_pool {
         if (fail_left.load() > 0 && fail_left.fetch_sub(1) > 0) {
             std::fprintf(stderr, "ggml-cuda (strata mmq): CUDA%d wanted %.1f MB of scratch and cannot have it "
                                  "(MAYA_MMQ_POOL_FAIL)\n", dev, (double) cls / 1048576.0);
-            strata::prefill::fail("prefill mmq: the scratch pool wanted " +
+            maya::prefill::fail("prefill mmq: the scratch pool wanted " +
                                   std::to_string((unsigned long long) (cls >> 20)) + " MB and could not have it: "
                                   "out of memory");
         }
@@ -225,7 +225,7 @@ struct CachingPool : ggml_cuda_pool {
                          dev, (double) cls / 1048576.0, (double) held() / 1048576.0, bufs.size(),
                          (double) free_b / 1048576.0, (double) total_b / 1048576.0, cudaGetErrorString(e));
             (void) cudaGetLastError();   // the error is reported here, not left for something else to find
-            strata::prefill::fail(std::string("prefill mmq: the scratch pool wanted ") +
+            maya::prefill::fail(std::string("prefill mmq: the scratch pool wanted ") +
                                   std::to_string((unsigned long long) (cls >> 20)) + " MB and the card had " +
                                   std::to_string((unsigned long long) (free_b >> 20)) + " MB free: " +
                                   cudaGetErrorString(e));
@@ -254,7 +254,7 @@ struct CachingPool : ggml_cuda_pool {
 // Called by the prompt path once per chunk, before that chunk's MMQ launches: `base`/`bytes` are the tail of the
 // borrowed expert pool region this chunk's layout left over (glm_prefill.cu's prefill_carve).  The bump restarts
 // there; a chunk whose layout puts the tail somewhere else invalidates the buffers cached from the old one.
-extern "C" void strata_mmq_pool_slab(int dev, void * base, size_t bytes) {
+extern "C" void maya_mmq_pool_slab(int dev, void * base, size_t bytes) {
     std::lock_guard<std::mutex> lk(g_slab_mu);
     if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return;
     g_slab[dev] = {(uint8_t *) base, base != nullptr ? bytes : 0, 0};

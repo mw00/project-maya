@@ -1,5 +1,5 @@
-// src/platform/memory.cpp - see include/strata/platform/memory.hpp.
-#include "strata/platform/memory.hpp"
+// src/platform/memory.cpp - see include/maya/platform/memory.hpp.
+#include "maya/platform/memory.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -9,7 +9,7 @@
 #include <sys/mman.h>
 #endif
 
-namespace strata::platform {
+namespace maya::platform {
 
 #if defined(_WIN32)
 LockResult lock_resident(void* p, uint64_t bytes) {
@@ -73,4 +73,4 @@ void unlock_resident(void* p, uint64_t bytes) {
 }
 #endif
 
-}  // namespace strata::platform
+}  // namespace maya::platform

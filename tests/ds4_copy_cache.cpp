@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
     return 0;
 #else
-    using namespace strata::ds4::os;
+    using namespace maya::ds4::os;
     std::string pattern=std::string(argc>1 ? argv[1] : "/tmp")+"/maya-copy-cache-XXXXXX";
     std::vector<char> name(pattern.begin(),pattern.end());name.push_back(0);
     int fd=mkstemp(name.data());check(fd>=0,"create fixture");unlink(name.data());

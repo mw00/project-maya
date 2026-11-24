@@ -12,7 +12,7 @@
 
 #include <cuda_runtime.h>
 
-namespace strata::kernels::dsa {
+namespace maya::kernels::dsa {
 
 // a float's order-preserving key: larger float, larger key (-0 is +0; the scores are never NaN)
 __device__ __forceinline__ unsigned score_key(float f) {
@@ -124,4 +124,4 @@ static __device__ void select_top_pools(const float* __restrict__ sc, int n_vis,
     }
 }
 
-}  // namespace strata::kernels::dsa
+}  // namespace maya::kernels::dsa

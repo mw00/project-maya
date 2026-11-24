@@ -7,7 +7,7 @@
 //   indexer key LayerNorm + rope, query rope per head, head-weight scale, ReLU-weighted score with the causal mask;
 //   top-k   descending score, ties by the lower cell, -inf excluded, -1 padding, n <= k returns every key;
 //   MLA     absorbed attention equals standard attention on K/V decompressed with W_kb / W_vb.
-#include "strata/kernels/glmd_ref.hpp"
+#include "maya/kernels/glmd_ref.hpp"
 
 #include "../../src/kernels/cuda/glmd_rope.cuh"
 

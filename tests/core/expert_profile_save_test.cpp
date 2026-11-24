@@ -1,7 +1,7 @@
 // #477: --expert-profile-save's profile - rank_learned_profile's order (resident first, then the counted routing, then
 // the profile the engine started from) and write_expert_profile's file, byte for byte tools/make_profile.py's format,
 // read back by read_expert_profile.  CPU only: no device is touched.
-#include "strata/core/expert_cache.hpp"
+#include "maya/core/expert_cache.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -32,21 +32,21 @@ int main() {
     heat[11] = 9.0;               // (2, 3): the hottest, but not resident
     heat[0] = 3.0;
     const std::vector<Pair> prior = {{2, 0}, {1, 3}, {0, 1}};   // a profile that ranks three pairs
-    const std::vector<Pair> r = strata::core::rank_learned_profile(L, E, resident, heat, prior);
+    const std::vector<Pair> r = maya::core::rank_learned_profile(L, E, resident, heat, prior);
     check(r.size() == 12, "every pair is ranked");
     const std::vector<Pair> head = {{1, 1}, {0, 2}, {2, 3}, {0, 0}, {2, 0}, {1, 3}, {0, 1}, {0, 3}};
     for (size_t i = 0; i < head.size() && i < r.size(); ++i)
         check(r[i] == head[i], "resident by heat, then the rest by heat, then the prior, then the index");
     // no counts at all: the resident ones, then the prior's order
-    const std::vector<Pair> r0 = strata::core::rank_learned_profile(L, E, resident, {}, prior);
+    const std::vector<Pair> r0 = maya::core::rank_learned_profile(L, E, resident, {}, prior);
     check(r0.size() == 12 && r0[0] == Pair(0, 2) && r0[1] == Pair(1, 1) && r0[2] == Pair(2, 0) &&
           r0[3] == Pair(1, 3) && r0[4] == Pair(0, 1) && r0[5] == Pair(0, 0), "without heat: resident, then prior");
 
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "strata_profile_save_test";
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "maya_profile_save_test";
     std::filesystem::create_directories(dir);
     const std::string path = (dir / "learned.bin").string();
     std::string err;
-    check(strata::core::write_expert_profile(path, L, E, r, err), "written");
+    check(maya::core::write_expert_profile(path, L, E, r, err), "written");
     check(!std::filesystem::exists(path + ".tmp"), "no temporary file left");
     // the bytes make_profile.write_profile would write for the same ranking
     std::vector<uint8_t> want(4);
@@ -66,13 +66,13 @@ int main() {
     check(got == want, "the file is make_profile.py's format, byte for byte");
     std::vector<Pair> back;
     int64_t slots = 0;
-    check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == r && slots == 12,
+    check(maya::core::read_expert_profile(path, L, E, back, slots, err) && back == r && slots == 12,
           "read back by the loader");
     // a second save replaces the first (the rename over an existing file)
-    check(strata::core::write_expert_profile(path, L, E, r0, err), "written again");
-    check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == r0, "replaced");
-    check(!strata::core::write_expert_profile(path, L, E, {{3, 0}}, err), "a pair out of range is refused");
-    check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == r0,
+    check(maya::core::write_expert_profile(path, L, E, r0, err), "written again");
+    check(maya::core::read_expert_profile(path, L, E, back, slots, err) && back == r0, "replaced");
+    check(!maya::core::write_expert_profile(path, L, E, {{3, 0}}, err), "a pair out of range is refused");
+    check(maya::core::read_expert_profile(path, L, E, back, slots, err) && back == r0,
           "a refused save keeps the file");
     std::filesystem::remove_all(dir);
     if (fails == 0) std::puts("expert_profile_save_test: OK");

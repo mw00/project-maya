@@ -1,4 +1,4 @@
-// B0.12: an glm-dsa test registered through cmake/strata.cmake links against strata_engine.
+// B0.12: an glm-dsa test registered through cmake/strata.cmake links against maya_engine.
 #include <cstdio>
 #include <cstring>
 namespace glmd { const char* build_tag(); }

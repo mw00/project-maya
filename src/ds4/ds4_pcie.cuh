@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace strata::ds4::pcie {
+namespace maya::ds4::pcie {
 
 /// A request's pull (host-mapped, a ring of them by seq): `seq` once src is set; src[i] the device address of pick i's
 /// expert in pinned memory (0: not streamed), laid out as its blob (gate, up, down at the layer's offsets);
@@ -41,7 +41,7 @@ struct Mats {
 // the device's clock in ns (NVIDIA's globaltimer; HIP's wall clock, 100 MHz on gfx11/gfx12); 0 on other AMD GPUs,
 // whose wall clock may tick at another rate - the host then times the pull itself
 __device__ __forceinline__ unsigned long long pull_clock() {
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
@@ -157,4 +157,4 @@ inline void stream_fetch_win(Pull* p, unsigned seq, unsigned* dflag, uint8_t* vr
                                                 wplan, T * 8);
 }
 
-}  // namespace strata::ds4::pcie
+}  // namespace maya::ds4::pcie

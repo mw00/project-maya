@@ -19,7 +19,7 @@ set "ROCM_F=%ROCM:\=/%"
 set "BITCODE=%ROCM_F%/lib/llvm/amdgcn/bitcode"
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VS="
-if exist "%VSWHERE%" for /f "delims=" %%V in ('"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set "VS=%%V"
+if exist "%VSWHERE%" for /f "delims=" %%V in ('"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set "VS=%%V"
 if not defined VS (echo Visual Studio Build Tools not found & exit /b 1)
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 set "HIP_PLATFORM=amd"
@@ -28,8 +28,8 @@ set "ROCM_PATH=%ROCM%"
 set "PATH=%ROCM%\bin;%ROCM%\lib\llvm\bin;%PATH%"
 if not exist "%BUILD_DIR%\build.ninja" (
   cmake -G Ninja -S "%SRC%" -B "%BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release ^
-    -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=%TESTS% -DSTRATA_PREFILL_MMQ=ON ^
-    -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON "-DCMAKE_HIP_ARCHITECTURES=%MAYA_HIP_ARCHS%" ^
+    -DMAYA_ENABLE_HIP=ON -DMAYA_ENABLE_CUDA=OFF -DMAYA_BUILD_TESTS=%TESTS% -DMAYA_PREFILL_MMQ=ON ^
+    -DMAYA_NATIVE_EXPERTS=ON -DMAYA_PORTABLE=ON "-DCMAKE_HIP_ARCHITECTURES=%MAYA_HIP_ARCHS%" ^
     "-DCMAKE_C_COMPILER=%ROCM_F%/lib/llvm/bin/clang.exe" "-DCMAKE_CXX_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" ^
     "-DCMAKE_HIP_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" "-DCMAKE_HIP_COMPILER_ROCM_ROOT=%ROCM_F%" ^
     "-DCMAKE_PREFIX_PATH=%ROCM_F%" "-DCMAKE_HIP_FLAGS=--rocm-path=%ROCM_F% --rocm-device-lib-path=%BITCODE%" || exit /b 1

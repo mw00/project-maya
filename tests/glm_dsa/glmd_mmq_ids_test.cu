@@ -19,7 +19,7 @@
 // on every hardware thread: on one it went past ctest's 900 s on the test PC's 2.0 GHz Xeons. The weights, activations and
 // reference are the same at any thread count.
 // Needs a GPU; exits 77 (ctest SKIP_RETURN_CODE) when there is none.
-#include "strata/prefill/moe_mmq.hpp"
+#include "maya/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
 
@@ -36,7 +36,7 @@
 #include <utility>
 #include <vector>
 
-namespace mmq = strata::prefill::mmq;
+namespace mmq = maya::prefill::mmq;
 
 namespace {
 
@@ -414,7 +414,7 @@ void run_type(int type, int N, int K) {
     cudaMemcpy(y3.data(), d_y1, y3.size() * 4, cudaMemcpyDeviceToHost);
     cudaMemcpy(y4.data(), d_y2, y4.size() * 4, cudaMemcpyDeviceToHost);
     for (size_t i = 0; i < y3.size(); ++i) whole_diff += std::memcmp(&y3[i], &y4[i], 4) != 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     const bool whole_ok = true;   // (HIP: no switch - reported only)
 #else
     const bool whole_ok = whole_diff == 0;
@@ -450,7 +450,7 @@ int main() {
         std::printf("no CUDA device: skipped\n");
         return 77;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     {   // which of MMQ's two forms this AMD device's instances take (g_mma); CUDA builds keep the V100 (dp4a) model
         int dev = 0;
         cudaGetDevice(&dev);

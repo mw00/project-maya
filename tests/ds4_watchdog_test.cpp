@@ -8,7 +8,7 @@
 #include <cassert>
 #include <cstdio>
 
-using strata::ds4::StallRule;
+using maya::ds4::StallRule;
 
 int main() {
     // a slow PC's 1M-token prompt: a chunk every 500 s for ~14 hours - moving all the time, never a stall

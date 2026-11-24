@@ -18,7 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::core {
+namespace maya::core {
 
 void Glm5Model::seq_bind(int s) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
@@ -203,7 +203,7 @@ bool Glm5Model::seq_pipe_ready(std::string& err) {
     return true;
 }
 
-bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::SamplerParams& sp, std::string& err) {
+bool Glm5Model::multi_issue(int s, int32_t token, const maya::kernels::SamplerParams& sp, std::string& err) {
     if (s < 0 || s >= seq_count() || seq_.empty()) {
         err = "glm multi: no sequence " + std::to_string(s);
         return false;
@@ -303,4 +303,4 @@ bool Glm5Model::multi_boundary(std::string& err) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

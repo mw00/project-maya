@@ -15,7 +15,7 @@
 // glmd::twin::topk (src/core/glm_dsa_cpu_fast_twin.cpp) is the same algorithm on the host.
 #pragma once
 
-#include "strata/kernels/glmd_fast.hpp"
+#include "maya/kernels/glmd_fast.hpp"
 
 #include <cuda_runtime.h>
 

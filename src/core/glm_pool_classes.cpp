@@ -1,12 +1,12 @@
 // src/core/glm_pool_classes.cpp - glm-dsa B3.7: the slow-path expert pool's size classes (glm_pool_classes.hpp).
-#include "strata/core/glm_pool_classes.hpp"
+#include "maya/core/glm_pool_classes.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 std::atomic<int> g_last{-1};
@@ -56,4 +56,4 @@ int glm_pool_merge_classes(std::vector<int>& layer_class, std::vector<size_t>& s
 
 int glm_pool_classes_last() { return g_last.load(); }
 
-}  // namespace strata::core
+}  // namespace maya::core

@@ -1,8 +1,8 @@
 // src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
-#include "strata/kernels/elementwise.hpp"
+#include "maya/kernels/elementwise.hpp"
 
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/bf16_bits.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -327,4 +327,4 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     sync_if_needed(stream, "rms_norm_weighted");
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

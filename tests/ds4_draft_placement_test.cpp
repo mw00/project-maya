@@ -8,7 +8,7 @@ static void require(bool ok) {
 }
 
 int main() {
-    using strata::ds4::draft_gpu_indices;
+    using maya::ds4::draft_gpu_indices;
     std::vector<int> out;
     std::string err;
     // IDs intentionally differ from both vector indices and TP member numbers.

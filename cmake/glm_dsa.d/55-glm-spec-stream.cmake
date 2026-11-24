@@ -7,21 +7,21 @@
 #   src/core/glm_dsa_prefill_stream.cpp  CUDA runtime: the next parts' early prestage (a Glm5Model member), the
 #                                        NUMA-bound landing ring, the node-split host share on the node lanes
 # Maya-owned glm_fast_path.cu, glm_model.cu and glm_prefill.cu call them through one-line hooks (STRATA-EDITS.txt),
-# so they join strata_engine on any GPU backend.
-if(TARGET strata_engine)
-  target_sources(strata_engine PRIVATE src/core/glm_dsa_spec.cpp src/core/glm_dsa_prefill_stream_plan.cpp
+# so they join maya_engine on any GPU backend.
+if(TARGET maya_engine)
+  target_sources(maya_engine PRIVATE src/core/glm_dsa_spec.cpp src/core/glm_dsa_prefill_stream_plan.cpp
                                        src/core/glm_dsa_prefill_share.cpp src/core/glm_dsa_prefill_stream.cpp)
 endif()
 
-if(STRATA_BUILD_TESTS)
+if(MAYA_BUILD_TESTS)
   enable_testing()
   # CPU: head pricing and choice, the head rule (Flash = Maya's), acceptance accounting, GLM-5.3 rollback rows.
   add_executable(glm_dsa_spec_test tests/glm_dsa/glm_dsa_spec_test.cpp src/core/glm_dsa_spec.cpp
                                    src/core/glm_state_layout.cpp)
   target_include_directories(glm_dsa_spec_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
-                             ${_strata_gpu_include_directories})
-  if(STRATA_ENABLE_HIP)   # hip_compat's cuda_runtime.h (via glm_model.hpp) needs the HIP headers
-    target_link_libraries(glm_dsa_spec_test PRIVATE ${_strata_gpu_runtime_target})
+                             ${_maya_gpu_include_directories})
+  if(MAYA_ENABLE_HIP)   # hip_compat's cuda_runtime.h (via glm_model.hpp) needs the HIP headers
+    target_link_libraries(glm_dsa_spec_test PRIVATE ${_maya_gpu_runtime_target})
   endif()
   add_test(NAME glm_dsa_spec_test COMMAND glm_dsa_spec_test)
   # ... and with the head tuner's no-drafting candidate on (S3)
@@ -45,24 +45,24 @@ if(STRATA_BUILD_TESTS)
                                                src/core/glm_dsa_cpu_volta_twin.cpp)
     target_include_directories(glm_dsa_prefill_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
-    target_link_libraries(glm_dsa_prefill_stream_test PRIVATE strata_kernels_cpu)
+    target_link_libraries(glm_dsa_prefill_stream_test PRIVATE maya_kernels_cpu)
     add_test(NAME glm_dsa_prefill_stream_test COMMAND glm_dsa_prefill_stream_test)
   endif()
 
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP) AND TARGET maya_engine)
     # GPU: the rollback checks on the device decode kernels (MID geometry, FP16 / INT8 latents).
     add_executable(glm_dsa_spec_gpu_test tests/glm_dsa/glm_dsa_spec_gpu_test.cu)
     target_include_directories(glm_dsa_spec_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core
-                               ${_strata_gpu_include_directories})
-    target_link_libraries(glm_dsa_spec_gpu_test PRIVATE strata_engine)
+                               ${_maya_gpu_include_directories})
+    target_link_libraries(glm_dsa_spec_gpu_test PRIVATE maya_engine)
     glm_dsa_hip_links(glm_dsa_spec_gpu_test)
     add_test(NAME glm_dsa_spec_gpu_test COMMAND glm_dsa_spec_gpu_test)
     set_tests_properties(glm_dsa_spec_gpu_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
     # GPU: the B9.9 landing ring (NUMA-bound on glm-dsa, cudaHostAlloc on Flash) is DMA-able and frees cleanly.
     add_executable(glm_dsa_prefill_stream_gpu_test tests/glm_dsa/glm_dsa_prefill_stream_gpu_test.cu)
     target_include_directories(glm_dsa_prefill_stream_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core
-                               ${_strata_gpu_include_directories})
-    target_link_libraries(glm_dsa_prefill_stream_gpu_test PRIVATE strata_engine)
+                               ${_maya_gpu_include_directories})
+    target_link_libraries(glm_dsa_prefill_stream_gpu_test PRIVATE maya_engine)
     glm_dsa_hip_links(glm_dsa_prefill_stream_gpu_test)
     add_test(NAME glm_dsa_prefill_stream_gpu_test COMMAND glm_dsa_prefill_stream_gpu_test)
     set_tests_properties(glm_dsa_prefill_stream_gpu_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)

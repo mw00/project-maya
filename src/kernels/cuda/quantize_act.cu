@@ -21,8 +21,8 @@
 //      `rintf` differs from the reference wherever the f32 quotient rounds across a .5 boundary.
 //   3. The DEQUANTIZED value is `q * d16`, the fp16 scale, not `q * d32`.  The block stores fp16 and that is
 //      what a reader multiplies by.
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/quantize_act.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -30,12 +30,12 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int QK8_0 = 32;
 
-// THE fp16 CONVERSION LIVES IN `strata/kernels/f16_bits.hpp`, and this file used to carry its own copy.
+// THE fp16 CONVERSION LIVES IN `maya/kernels/f16_bits.hpp`, and this file used to carry its own copy.
 //
 // Round 198 found the private copy wrong in a way no fixture here could see: it tested `if (exp >= 31)` to
 // detect an out-of-range exponent, which conflates an f32 INF/NAN (raw exponent 255) with a FINITE value too
@@ -310,4 +310,4 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels
