@@ -2,6 +2,7 @@
 #include "ling_kernels.cuh"
 
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cmath>
 #include <cstdio>
 
@@ -159,42 +160,178 @@ __global__ void __launch_bounds__(256)
     }
 }
 
-// ---- Grouped sigmoid router (grid: T, block: 512) ----
+// ---- Fast warp-parallel grouped sigmoid router (grid: T, block: 256) ----
+// Preserves exact deterministic tie-breaking (higher score, then lower index).
 __device__ __forceinline__ bool r_better(float av, int ai, float bv, int bi) {
     return av > bv || (av == bv && ai < bi);
 }
 
-__global__ void __launch_bounds__(512)
+__device__ __forceinline__ void warp_best(float& v, int& id) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, id, o);
+        if (r_better(ov, oi, v, id)) {
+            v = ov;
+            id = oi;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256)
     router_grouped_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_exp, int n_used,
                           int n_group, int n_group_used, int w_norm, float w_scale, int* __restrict__ ids_out,
                           float* __restrict__ w_out) {
-    __shared__ float sp[512], sv[512];
-    __shared__ int si[512];
+    __shared__ float sp[512];
+    __shared__ float sv[512];
     __shared__ float gscore[16];
-    __shared__ int gkeep[16];
+    __shared__ int gslot[16];
+    __shared__ float cand_v[64];
+    __shared__ int cand_id[64];
 
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
+    const int w = tid >> 5;
+    const int lane = tid & 31;
     const float* lr = logits + (size_t) t * n_exp;
 
-    if (tid < n_exp) {
-        const float p = sigmoid_exact(lr[tid]);
-        sp[tid] = p;
-        sv[tid] = p + (bias != nullptr ? bias[tid] : 0.0f);
-        si[tid] = tid;
-    } else {
-        sp[tid] = 0.0f;
-        sv[tid] = -INFINITY;
-        si[tid] = 0x7fffffff;
+    // Fast 3-barrier path for Ling (n_group <= 8, per == 64, n_group_used * n_used <= 32)
+    if (n_group > 1 && n_group <= 8 && n_exp == n_group * 64 && n_group_used * n_used <= 32) {
+        if (w < n_group) {
+            const int a_id = w * 64 + lane;
+            const int b_id = a_id + 32;
+            const float pa = sigmoid_exact(lr[a_id]);
+            const float pb = sigmoid_exact(lr[b_id]);
+            sp[a_id] = pa;
+            sp[b_id] = pb;
+            float va = pa + (bias != nullptr ? bias[a_id] : 0.0f);
+            float vb = pb + (bias != nullptr ? bias[b_id] : 0.0f);
+
+            // Top-1 in group w
+            float bv1 = va;
+            int bi1 = a_id;
+            if (r_better(vb, b_id, bv1, bi1)) {
+                bv1 = vb;
+                bi1 = b_id;
+            }
+            warp_best(bv1, bi1);
+            // Top-2 in group w
+            float ra = (a_id == bi1) ? -INFINITY : va;
+            float rb = (b_id == bi1) ? -INFINITY : vb;
+            float bv2 = ra;
+            int bi2 = a_id;
+            if (r_better(rb, b_id, bv2, bi2)) {
+                bv2 = rb;
+                bi2 = b_id;
+            }
+            warp_best(bv2, bi2);
+            if (lane == 0) {
+                gscore[w] = bv1 + bv2;
+                gslot[w] = -1;
+            }
+            __syncthreads();
+
+            if (tid == 0) {
+                for (int k = 0; k < n_group_used; ++k) {
+                    int best = -1;
+                    float best_v = -INFINITY;
+                    for (int g = 0; g < n_group; ++g) {
+                        if (gslot[g] >= 0) continue;
+                        if (best < 0 || r_better(gscore[g], g, best_v, best)) {
+                            best = g;
+                            best_v = gscore[g];
+                        }
+                    }
+                    if (best >= 0) gslot[best] = k;
+                }
+            }
+            __syncthreads();
+
+            const int gs = gslot[w];
+            if (gs >= 0) {
+                // Kept group warp finds its top-n_used purely in registers (zero __syncthreads!)
+                for (int k = 0; k < n_used; ++k) {
+                    float cv = va;
+                    int ci = a_id;
+                    if (r_better(vb, b_id, cv, ci)) {
+                        cv = vb;
+                        ci = b_id;
+                    }
+                    warp_best(cv, ci);
+                    if (lane == 0) {
+                        cand_v[gs * n_used + k] = cv;
+                        cand_id[gs * n_used + k] = ci;
+                    }
+                    if (a_id == ci) va = -INFINITY;
+                    if (b_id == ci) vb = -INFINITY;
+                }
+            }
+            __syncthreads();
+
+            if (w == 0) {
+                const int n_cand = n_group_used * n_used;
+                float mv = (lane < n_cand) ? cand_v[lane] : -INFINITY;
+                int mi = (lane < n_cand) ? cand_id[lane] : 0x7fffffff;
+                int* idr = ids_out + (size_t) t * n_used;
+                float* wr = w_out + (size_t) t * n_used;
+                int pk_id[16];
+                float pk_p[16];
+                float sum = 0.0f;
+                for (int k = 0; k < n_used; ++k) {
+                    float cv = mv;
+                    int ci = mi;
+                    warp_best(cv, ci);
+                    if (lane == 0) {
+                        pk_id[k] = ci;
+                        const float p = sp[ci];
+                        pk_p[k] = p;
+                        sum += p;
+                    }
+                    if (mi == ci) mv = -INFINITY;
+                }
+                if (lane == 0) {
+                    const float inv = (w_norm != 0 && sum > 0.0f) ? (w_scale / sum) : w_scale;
+                    for (int k = 0; k < n_used; ++k) {
+                        idr[k] = pk_id[k];
+                        wr[k] = pk_p[k] * inv;
+                    }
+                }
+            }
+            return;
+        }
+        __syncthreads();
+        __syncthreads();
+        __syncthreads();
+        return;
     }
+
+    // Generic fallback for any other (n_exp <= 512, n_group, n_used)
+    __shared__ float wv[8];
+    __shared__ int wi[8];
+    const int e0 = tid;
+    const int e1 = tid + 256;
+    float p0 = 0.0f, v0 = -INFINITY;
+    float p1 = 0.0f, v1 = -INFINITY;
+    if (e0 < n_exp) {
+        p0 = sigmoid_exact(lr[e0]);
+        v0 = p0 + (bias != nullptr ? bias[e0] : 0.0f);
+    }
+    if (e1 < n_exp) {
+        p1 = sigmoid_exact(lr[e1]);
+        v1 = p1 + (bias != nullptr ? bias[e1] : 0.0f);
+    }
+    sp[e0] = p0;
+    sv[e0] = v0;
+    sp[e1] = p1;
+    sv[e1] = v1;
     __syncthreads();
 
     if (n_group > 1) {
         const int per = n_exp / n_group;
         if (tid < n_group) {
             float b1 = -INFINITY, b2 = -INFINITY;
-            const int e0 = tid * per, e1 = e0 + per;
-            for (int e = e0; e < e1; ++e) {
+            const int g0 = tid * per, g1 = g0 + per;
+            for (int e = g0; e < g1; ++e) {
                 const float v = sv[e];
                 if (v > b1) {
                     b2 = b1;
@@ -204,7 +341,7 @@ __global__ void __launch_bounds__(512)
                 }
             }
             gscore[tid] = b1 + b2;
-            gkeep[tid] = 0;
+            gslot[tid] = 0;
         }
         __syncthreads();
         if (tid == 0) {
@@ -212,55 +349,62 @@ __global__ void __launch_bounds__(512)
                 int best = -1;
                 float best_v = -INFINITY;
                 for (int g = 0; g < n_group; ++g) {
-                    if (gkeep[g]) continue;
+                    if (gslot[g]) continue;
                     if (best < 0 || r_better(gscore[g], g, best_v, best)) {
                         best = g;
                         best_v = gscore[g];
                     }
                 }
-                if (best >= 0) gkeep[best] = 1;
+                if (best >= 0) gslot[best] = 1;
             }
         }
         __syncthreads();
-        if (tid < n_exp && !gkeep[tid / per]) sv[tid] = -INFINITY;
-        __syncthreads();
+        if (e0 < n_exp && !gslot[e0 / per]) v0 = -INFINITY;
+        if (e1 < n_exp && !gslot[e1 / per]) v1 = -INFINITY;
     }
 
-    // 512-element bitonic sort descending by (sv, -si)
-    for (int k = 2; k <= 512; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            const int ixj = tid ^ j;
-            if (ixj > tid) {
-                const float a = sv[tid], b = sv[ixj];
-                const int ia = si[tid], ib = si[ixj];
-                const bool asc = (tid & k) != 0;   // false: descending (better first)
-                const bool b_better = r_better(b, ib, a, ia);
-                if (asc ? !b_better : b_better) {
-                    sv[tid] = b;
-                    sv[ixj] = a;
-                    si[tid] = ib;
-                    si[ixj] = ia;
+    int* idr = ids_out + (size_t) t * n_used;
+    float* wr = w_out + (size_t) t * n_used;
+    __shared__ int picked_id[16];
+    __shared__ float picked_p[16];
+    for (int k = 0; k < n_used; ++k) {
+        float bv = v0;
+        int bi = e0;
+        if (r_better(v1, e1, bv, bi)) {
+            bv = v1;
+            bi = e1;
+        }
+        warp_best(bv, bi);
+        if (lane == 0) {
+            wv[w] = bv;
+            wi[w] = bi;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float best_v = wv[0];
+            int best_i = wi[0];
+            for (int j = 1; j < 8; ++j) {
+                if (r_better(wv[j], wi[j], best_v, best_i)) {
+                    best_v = wv[j];
+                    best_i = wi[j];
                 }
             }
-            __syncthreads();
+            picked_id[k] = best_i;
+            picked_p[k] = sp[best_i];
+            wi[0] = best_i;
         }
+        __syncthreads();
+        const int chosen = wi[0];
+        if (e0 == chosen) v0 = -INFINITY;
+        if (e1 == chosen) v1 = -INFINITY;
     }
-
     if (tid == 0) {
         float sum = 0.0f;
-        int* idr = ids_out + (size_t) t * n_used;
-        float* wr = w_out + (size_t) t * n_used;
-        for (int j = 0; j < n_used; ++j) {
-            const int e = si[j];
-            idr[j] = e;
-            const float pj = sp[e];
-            wr[j] = pj;
-            sum += pj;
-        }
-        const float denom = w_norm ? fmaxf(sum, 6.103515625e-5f) : 1.0f;
-        const float mult = (w_scale != 0.0f && w_scale != 1.0f) ? (w_scale / denom) : (1.0f / denom);
-        if (w_norm || (w_scale != 0.0f && w_scale != 1.0f)) {
-            for (int j = 0; j < n_used; ++j) wr[j] *= mult;
+        for (int k = 0; k < n_used; ++k) sum += picked_p[k];
+        const float inv = (w_norm != 0 && sum > 0.0f) ? (w_scale / sum) : w_scale;
+        for (int k = 0; k < n_used; ++k) {
+            idr[k] = picked_id[k];
+            wr[k] = picked_p[k] * inv;
         }
     }
 }
@@ -598,6 +742,701 @@ __global__ void __launch_bounds__(128)
     ((__half*) out16)[((size_t) t * H + h) * v_head + d] = __float2half_rn(v);
 }
 
+// ---- Fast O(N) adaptive expert cache resolver (grid: 1, block: 512) ----
+__device__ __forceinline__ bool f_worse(float av, int ai, float bv, int bi) {
+    return av < bv || (av == bv && ai < bi);
+}
+
+__global__ void __launch_bounds__(512)
+    fetch_resolve_fast_kernel(const int* __restrict__ ids, int T, int n_used, hy4::k::FetchLayer fl,
+                              hy4::k::FetchScratch fs, int k_gpu, int cache, float decay) {
+    __shared__ int ent[hy4::k::kMaxWin * 16];
+    __shared__ int cnt[1024];
+    __shared__ unsigned char gpu_e[1024];
+    __shared__ float sc[1024];
+    __shared__ int miss_e[hy4::k::kMaxWin * 16];
+    __shared__ float miss_sc[hy4::k::kMaxWin * 16];
+    __shared__ float wv[16];
+    __shared__ int wi[16];
+    __shared__ int n_miss, n_hit, n_lane, n_fetch, n_zc, n_adm, n_stage, s_admit_open;
+
+    const int tid = threadIdx.x;
+    const int n_ent = T * n_used;
+    const int n_exp = fl.n_exp;
+    if (tid == 0) n_miss = n_hit = n_lane = n_fetch = n_zc = n_adm = n_stage = 0;
+    for (int i = tid; i < n_ent; i += blockDim.x) ent[i] = ids[i];
+    for (int e = tid; e < n_exp; e += blockDim.x) {
+        cnt[e] = 0;
+        gpu_e[e] = 0;
+    }
+    __syncthreads();
+
+    if (tid < T) {
+        int g = 0, hit = 0, lane = 0;
+        for (int j = 0; j < n_used; ++j) {
+            const int i = tid * n_used + j;
+            const int e = ent[i];
+            const bool res = fl.slot[e] >= 0;
+            const bool mine = res || k_gpu < 0 || g < k_gpu;
+            if (!res && mine) ++g;
+            fs.who[i] = mine ? 0 : 1;
+            if (mine) gpu_e[e] = 1;
+            hit += res;
+            lane += !mine;
+            atomicAdd(&cnt[e], 1);
+        }
+        atomicAdd(&n_hit, hit);
+        atomicAdd(&n_lane, lane);
+    }
+    __syncthreads();
+
+    const float dec_pow = cache ? (T == 1 ? decay : powf(decay, (float) T)) : 0.0f;
+    for (int e = tid; e < n_exp; e += blockDim.x) {
+        const int s = fl.slot[e];
+        float v = 0.0f;
+        if (cache) {
+            v = fl.score[e] * dec_pow + (float) cnt[e];
+            fl.score[e] = v;
+        }
+        sc[e] = v;
+        if (gpu_e[e]) {
+            if (s >= 0) {
+                fs.eptr[e] = (unsigned long long) (fl.vram + (size_t) s * fl.blob);
+            } else {
+                const int m_idx = atomicAdd(&n_miss, 1);
+                miss_e[m_idx] = e;
+                miss_sc[m_idx] = v;
+            }
+        } else {
+            fs.eptr[e] = 0ull;
+        }
+    }
+    __syncthreads();
+
+    const int nm = n_miss;
+    if (nm == 0) {
+        if (tid == 0) {
+            *fs.nf = 0u;
+            if (fs.stats) {
+                atomicAdd(&fs.stats[0], (unsigned long long) n_ent);
+                atomicAdd(&fs.stats[1], (unsigned long long) n_hit);
+                atomicAdd(&fs.stats[4], (unsigned long long) n_lane);
+            }
+        }
+        return;
+    }
+
+    // Sort the tiny miss list (typically 1-4 elements) descending by score on thread 0
+    if (tid == 0 && nm > 1) {
+        for (int i = 1; i < nm; ++i) {
+            const int ke = miss_e[i];
+            const float ks = miss_sc[i];
+            int j = i - 1;
+            while (j >= 0 && (miss_sc[j] < ks || (miss_sc[j] == ks && miss_e[j] > ke))) {
+                miss_e[j + 1] = miss_e[j];
+                miss_sc[j + 1] = miss_sc[j];
+                --j;
+            }
+            miss_e[j + 1] = ke;
+            miss_sc[j + 1] = ks;
+        }
+    }
+    __syncthreads();
+
+    // O(nm * N) parallel warp-min victim selection (nm is typically 1-2!)
+    const int w = tid >> 5;
+    const int lane = tid & 31;
+    const int n_warps = blockDim.x >> 5;
+    if (tid == 0) s_admit_open = (cache != 0 && fl.n_res > 0) ? 1 : 0;
+    __syncthreads();
+    for (int mi = 0; mi < nm; ++mi) {
+        int vict = -1;
+        float vict_sc = INFINITY;
+        const bool ao = (s_admit_open != 0);
+        if (ao) {
+            float bv = INFINITY;
+            int bi = 0x7fffffff;
+            for (int e = tid; e < n_exp; e += blockDim.x) {
+                if (fl.slot[e] >= 0 && cnt[e] == 0) {
+                    const float v = sc[e];
+                    if (f_worse(v, e, bv, bi)) {
+                        bv = v;
+                        bi = e;
+                    }
+                }
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (f_worse(ov, oi, bv, bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            if (lane == 0) {
+                wv[w] = bv;
+                wi[w] = bi;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                float best_v = INFINITY;
+                int best_i = 0x7fffffff;
+                for (int k = 0; k < n_warps; ++k) {
+                    if (f_worse(wv[k], wi[k], best_v, best_i)) {
+                        best_v = wv[k];
+                        best_i = wi[k];
+                    }
+                }
+                wv[0] = best_v;
+                wi[0] = best_i;
+            }
+            __syncthreads();
+            if (wi[0] < n_exp) {
+                vict = wi[0];
+                vict_sc = wv[0];
+            }
+        }
+
+        if (tid == 0) {
+            const int m = miss_e[mi];
+            unsigned long long dst = 0ull;
+            if (ao && vict >= 0 && miss_sc[mi] > vict_sc) {
+                const int sl = fl.slot[vict];
+                fl.slot[vict] = -1;
+                fl.slot[m] = sl;
+                fl.owner[sl] = m;
+                dst = (unsigned long long) (fl.vram + (size_t) sl * fl.blob);
+                ++n_adm;
+            } else {
+                s_admit_open = 0;
+                if (n_stage < fs.n_stage) {
+                    dst = (unsigned long long) (fs.stage + (size_t) n_stage * fl.blob);
+                    ++n_stage;
+                }
+            }
+            if (dst != 0ull) {
+                const int f = n_fetch++;
+                fs.src[f] = fl.hptr[m];
+                fs.dst[f] = dst;
+                fs.eptr[m] = dst;
+            } else {
+                fs.eptr[m] = fl.hptr[m];
+                ++n_zc;
+            }
+        }
+        if (tid == 0 && ao && wi[0] >= n_exp) s_admit_open = 0;
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *fs.nf = (unsigned) n_fetch;
+        if (fs.stats) {
+            atomicAdd(&fs.stats[0], (unsigned long long) n_ent);
+            atomicAdd(&fs.stats[1], (unsigned long long) n_hit);
+            atomicAdd(&fs.stats[2], (unsigned long long) n_fetch);
+            atomicAdd(&fs.stats[3], (unsigned long long) n_zc);
+            atomicAdd(&fs.stats[4], (unsigned long long) n_lane);
+            atomicAdd(&fs.stats[5], (unsigned long long) n_adm);
+        }
+    }
+}
+
+// ---- Fast 2-stage parallel argmax (stage 1: 128 blocks x 256, stage 2: 1 block x 128) ----
+__global__ void __launch_bounds__(256)
+    argmax_stage1_kernel(const float* __restrict__ x, int n, float* __restrict__ pval, int* __restrict__ pidx) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    const int tid = threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    float bv = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += stride) {
+        const float v = x[i];
+        if (v > bv || (v == bv && i < bi)) {
+            bv = v;
+            bi = i;
+        }
+    }
+    warp_best(bv, bi);
+    if ((tid & 31) == 0) {
+        sv[tid >> 5] = bv;
+        si[tid >> 5] = bi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float best_v = sv[0];
+        int best_i = si[0];
+        for (int w = 1; w < 8; ++w) {
+            if (r_better(sv[w], si[w], best_v, best_i)) {
+                best_v = sv[w];
+                best_i = si[w];
+            }
+        }
+        pval[blockIdx.x] = best_v;
+        pidx[blockIdx.x] = best_i;
+    }
+}
+
+__global__ void __launch_bounds__(128)
+    argmax_stage2_kernel(const float* __restrict__ pval, const int* __restrict__ pidx, int m, int* __restrict__ out) {
+    __shared__ float sv[4];
+    __shared__ int si[4];
+    const int tid = threadIdx.x;
+    float bv = tid < m ? pval[tid] : -INFINITY;
+    int bi = tid < m ? pidx[tid] : 0x7fffffff;
+    warp_best(bv, bi);
+    if ((tid & 31) == 0) {
+        sv[tid >> 5] = bv;
+        si[tid >> 5] = bi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float best_v = sv[0];
+        int best_i = si[0];
+        for (int w = 1; w < 4; ++w) {
+            if (r_better(sv[w], si[w], best_v, best_i)) {
+                best_v = sv[w];
+                best_i = si[w];
+            }
+        }
+        *out = best_i;
+    }
+}
+
+// ---- Fused add / add2 + RMSNorm + Q8_0 quantization (T >= 1, E <= 4096) ----
+template <int NADD>
+__global__ void __launch_bounds__(512)
+    add_rmsnorm_q8_kernel(float* __restrict__ x, const float* __restrict__ a, const float* __restrict__ b,
+                          const float* __restrict__ w, int E, float eps, float* __restrict__ cur_out,
+                          int8_t* __restrict__ xq, float* __restrict__ xd) {
+    __shared__ float s_sum[16];
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    float* xr = x + (size_t) t * E;
+    const float* ar = a + (size_t) t * E;
+    const float* br = (NADD == 2) ? (b + (size_t) t * E) : nullptr;
+    float* cr = cur_out != nullptr ? (cur_out + (size_t) t * E) : nullptr;
+    int8_t* qr = xq + (size_t) t * E;
+    float* dr = xd + (size_t) t * (E / 32);
+
+    float xv[8], wv[8];
+    float ss = 0.0f;
+    const int n_iter = (E + 511) >> 9;
+    for (int j = 0; j < n_iter; ++j) {
+        const int i = tid + j * 512;
+        if (i < E) {
+            float v = xr[i] + ar[i];
+            if constexpr (NADD == 2) v += br[i];
+            xr[i] = v;
+            xv[j] = v;
+            wv[j] = w[i];
+            ss += v * v;
+        }
+    }
+    ss = warp_sum_f(ss);
+    if (lane == 0) s_sum[warp] = ss;
+    __syncthreads();
+    if (tid < 16) {
+        float v = s_sum[tid];
+        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0x0000ffffu, v, o);
+        if (tid == 0) s_sum[0] = rsqrtf(v / (float) E + eps);
+    }
+    __syncthreads();
+    const float inv = s_sum[0];
+
+    for (int j = 0; j < n_iter; ++j) {
+        const int i = tid + j * 512;
+        if (i < E) {
+            const float o = xv[j] * inv * wv[j];
+            if (cr != nullptr) cr[i] = o;
+            const float am = warp_max_f(fabsf(o));
+            const float sc = am / 127.0f;
+            qr[i] = (int8_t) (am > 0.0f ? __float2int_rn(o / sc) : 0);
+            if (lane == 0) dr[i >> 5] = sc;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(32)
+    pack_route_cpu_kernel(const int* __restrict__ ids, const float* __restrict__ w, const int* __restrict__ who,
+                          int n_used, RoutePack* __restrict__ dst) {
+    const int i = threadIdx.x;
+    if (i < n_used) {
+        dst->ids[i] = ids[i];
+        dst->w[i] = w[i];
+        dst->who[i] = who[i];
+    }
+}
+
+// ---- Portable Vectorized Register-Accumulated WMMA Split-K MLA Decode (H=32, KL=512, R=64) ----
+constexpr int kMlaMaxSplits1 = 128;
+constexpr int kMlaMaxSplitsM = 64;
+constexpr int kMlaK = 576;
+constexpr int kMlaLora = 512;
+constexpr int kMlaPart = kMlaLora + 4;
+
+template <int TILE>
+constexpr size_t mla_wmma_smem_bytes() {
+    return (size_t) 32 * kMlaK * 2 + (size_t) TILE * kMlaK * 2 + (size_t) 8 * 256 * 4 + (size_t) 32 * TILE * 2 + 512;
+}
+
+__device__ __forceinline__ int mla_num_splits(int n, int tile, int s_max) {
+    const int n_tiles = (n + tile - 1) / tile;
+    return min(s_max, max(1, (n_tiles + 1) >> 1));
+}
+
+template <int LQ8, int TILE>
+__global__ void __launch_bounds__(256, 1)
+    mla_dec_wmma_kernel(const float* __restrict__ q_abs, const float* __restrict__ q, int q_stride, int q_pe_off,
+                        const void* __restrict__ lat, const uint16_t* __restrict__ k_pe, int n_sel_cap,
+                        const int* __restrict__ n_sel_dev, int T, float scale, int s_max, float* __restrict__ part) {
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* sQ = (__half*) smem;                                                   // [32][576]
+    __half* sL = sQ + 32 * kMlaK;                                                  // [TILE][576]
+    float* sTmp = (float*) (sL + TILE * kMlaK);                                    // [8][256]
+    __half* sP = (__half*) (sTmp + 8 * 256);                                       // [32][TILE]
+    float* sM = (float*) (sP + 32 * TILE);                                         // [32]
+    float* sSum = sM + 32;                                                         // [32]
+    float* sAlpha = sSum + 32;                                                     // [32]
+
+    const int b = blockIdx.x;
+    const int tok = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int w = tid >> 5;
+    const int lane = tid & 31;
+    const int hg = w >> 2;   // 0: heads 0..15, 1: heads 16..31
+    const int ks = w & 3;    // 0..3
+
+    const int n_base = n_sel_dev != nullptr ? min(n_sel_cap, *n_sel_dev) : n_sel_cap;
+    const int n = n_base - (T - 1 - tok);
+    if (n <= 0) return;
+    const int S = mla_num_splits(n, TILE, s_max);
+    if (b >= S) return;
+
+    const int n_tiles = (n + TILE - 1) / TILE;
+    const int t0 = (int) (((int64_t) b * n_tiles) / S);
+    const int t1 = (int) (((int64_t) (b + 1) * n_tiles) / S);
+
+    // Load all 32 heads of query token `tok` into sQ[32][576] (FP16) using warp-coalesced rows
+    const float* qa_tok = q_abs + (size_t) tok * 32 * kMlaLora;
+    const float* qp_tok = q + (size_t) tok * 32 * q_stride + q_pe_off;
+    for (int h = w; h < 32; h += 8) {
+        __half* dst = sQ + (size_t) h * kMlaK;
+        const float* qa_h = qa_tok + (size_t) h * kMlaLora;
+        const float* qp_h = qp_tok + (size_t) h * q_stride;
+        for (int d = lane * 2; d < kMlaLora; d += 64) {
+            *((__half2*) (dst + d)) = __floats2half2_rn(qa_h[d], qa_h[d + 1]);
+        }
+        *((__half2*) (dst + kMlaLora + lane * 2)) = __floats2half2_rn(qp_h[lane * 2], qp_h[lane * 2 + 1]);
+    }
+    // Portable WMMA row-index discovery (exact on sm_70..sm_120 without arch-specific lane assumptions!)
+    sTmp[tid] = (float) (tid >> 4);
+    if (tid < 32) {
+        sM[tid] = -INFINITY;
+        sSum[tid] = 0.0f;
+        sAlpha[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> rfrag;
+    wmma::load_matrix_sync(rfrag, sTmp, 16, wmma::mem_row_major);
+    int my_row[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) my_row[e] = (int) (rfrag.x[e] + 0.5f);
+    __syncthreads();
+
+    // Register-resident WMMA accumulators for O[hg*16..+15, ks*128..+127] — zero smem roundtrips in tile loop!
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) wmma::fill_fragment(o_acc[j], 0.0f);
+
+    const size_t rec_bytes = (size_t) kMlaLora + (size_t) (kMlaLora / 32) * 2;  // 544 B (16B aligned)
+
+    for (int tile = t0; tile < t1; ++tile) {
+        const int k_base = tile * TILE;
+
+        // Vectorized 16-byte coalesced load of TILE KV rows into sL[TILE][576] (FP16)
+        for (int c = w; c < TILE; c += 8) {
+            __half* dst = sL + (size_t) c * kMlaK;
+            const int pos = k_base + c;
+            if (pos < n) {
+                if constexpr (LQ8 == 0) {
+                    const uint4* src_lat = (const uint4*) ((const __half*) lat + (size_t) pos * kMlaLora);
+                    uint4* dst_lat = (uint4*) dst;
+                    dst_lat[lane] = src_lat[lane];
+                    dst_lat[lane + 32] = src_lat[lane + 32];
+                } else {
+                    const uint8_t* rec = (const uint8_t*) lat + (size_t) pos * rec_bytes;
+                    const uint4 qv = ((const uint4*) rec)[lane];
+                    const float sc = __half2float(((const __half*) (rec + kMlaLora))[lane >> 1]);
+                    uint4 out0, out1;
+                    __half2* p0 = (__half2*) &out0;
+                    __half2* p1 = (__half2*) &out1;
+                    auto up = [&](uint32_t wd, __half2& h01, __half2& h23) {
+                        h01 = __floats2half2_rn((float) (int8_t) (wd & 0xffu) * sc,
+                                                (float) (int8_t) ((wd >> 8) & 0xffu) * sc);
+                        h23 = __floats2half2_rn((float) (int8_t) ((wd >> 16) & 0xffu) * sc,
+                                                (float) (int8_t) ((wd >> 24) & 0xffu) * sc);
+                    };
+                    up(qv.x, p0[0], p0[1]);
+                    up(qv.y, p0[2], p0[3]);
+                    up(qv.z, p1[0], p1[1]);
+                    up(qv.w, p1[2], p1[3]);
+                    uint4* dst_lat = (uint4*) dst;
+                    dst_lat[lane * 2] = out0;
+                    dst_lat[lane * 2 + 1] = out1;
+                }
+                if (lane < 8) {
+                    ((uint4*) (dst + kMlaLora))[lane] = ((const uint4*) (k_pe + (size_t) pos * 64))[lane];
+                }
+            } else {
+                uint4 z = make_uint4(0, 0, 0, 0);
+                uint4* dst_lat = (uint4*) dst;
+                dst_lat[lane] = z;
+                dst_lat[lane + 32] = z;
+                if (lane < 8) ((uint4*) (dst + kMlaLora))[lane] = z;
+            }
+        }
+        __syncthreads();
+
+        // Phase A: Score GEMM S[32, TILE] = sQ[32, 576] @ sL[TILE, 576]^T
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_acc;
+        wmma::fill_fragment(s_acc, 0.0f);
+        if constexpr (TILE == 32) {
+            const int cg = (w >> 1) & 1;
+            const int kh = w & 1;
+            const int k_start = kh * 18;
+            const __half* sQ_row = sQ + (size_t) (hg * 16) * kMlaK;
+            const __half* sL_row = sL + (size_t) (cg * 16) * kMlaK;
+#pragma unroll
+            for (int ki = 0; ki < 18; ++ki) {
+                const int k_off = (k_start + ki) * 16;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+                wmma::load_matrix_sync(qa, sQ_row + k_off, kMlaK);
+                wmma::load_matrix_sync(kb, sL_row + k_off, kMlaK);
+                wmma::mma_sync(s_acc, qa, kb, s_acc);
+            }
+        } else {
+            const int k_start = ks * 9;
+            const __half* sQ_row = sQ + (size_t) (hg * 16) * kMlaK;
+#pragma unroll
+            for (int ki = 0; ki < 9; ++ki) {
+                const int k_off = (k_start + ki) * 16;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+                wmma::load_matrix_sync(qa, sQ_row + k_off, kMlaK);
+                wmma::load_matrix_sync(kb, sL + k_off, kMlaK);
+                wmma::mma_sync(s_acc, qa, kb, s_acc);
+            }
+        }
+        wmma::store_matrix_sync(sTmp + w * 256, s_acc, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        // Phase B: 8-warp parallel online softmax (8 consecutive lanes per head -> 32 heads across 256 threads)
+        {
+            const int h = tid >> 3;
+            const int lh = tid & 7;
+            const int h_g = h >> 4;
+            const int h_l = h & 15;
+            constexpr int C_PER = TILE / 8;  // 4 for TILE=32, 2 for TILE=16
+            float sc_loc[C_PER];
+            float m_loc = -INFINITY;
+#pragma unroll
+            for (int u = 0; u < C_PER; ++u) {
+                const int c = lh * C_PER + u;
+                if (k_base + c < n) {
+                    float sum_v;
+                    if constexpr (TILE == 32) {
+                        const int cg = c >> 4;
+                        const int idx = h_l * 16 + (c & 15);
+                        sum_v = sTmp[(h_g * 4 + cg * 2 + 0) * 256 + idx] +
+                                sTmp[(h_g * 4 + cg * 2 + 1) * 256 + idx];
+                    } else {
+                        const int idx = h_l * 16 + c;
+                        sum_v = sTmp[(h_g * 4 + 0) * 256 + idx] + sTmp[(h_g * 4 + 1) * 256 + idx] +
+                                sTmp[(h_g * 4 + 2) * 256 + idx] + sTmp[(h_g * 4 + 3) * 256 + idx];
+                    }
+                    const float sv = sum_v * scale;
+                    sc_loc[u] = sv;
+                    m_loc = fmaxf(m_loc, sv);
+                } else {
+                    sc_loc[u] = -INFINITY;
+                }
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) m_loc = fmaxf(m_loc, __shfl_xor_sync(0xffffffffu, m_loc, o));
+            const float m_old = sM[h];
+            const float m_new = fmaxf(m_old, m_loc);
+            const float al = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+            float l_loc = 0.0f;
+#pragma unroll
+            for (int u = 0; u < C_PER; ++u) {
+                const int c = lh * C_PER + u;
+                const float p = (k_base + c < n) ? expf(sc_loc[u] - m_new) : 0.0f;
+                sP[h * TILE + c] = __float2half_rn(p);
+                l_loc += p;
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) l_loc += __shfl_xor_sync(0xffffffffu, l_loc, o);
+            if (lh == 0) {
+                sM[h] = m_new;
+                sSum[h] = sSum[h] * al + l_loc;
+                sAlpha[h] = al;
+            }
+        }
+        __syncthreads();
+
+        // Phase C: Value GEMM O[32, 512] = alpha * O + sP[32, TILE] @ sL[TILE, 512] (pure register accumulation!)
+        float al_e[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) al_e[e] = sAlpha[hg * 16 + my_row[e]];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o_acc[j].x[e] *= al_e[e];
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa0;
+        wmma::load_matrix_sync(pa0, sP + (hg * 16) * TILE, TILE);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa1;
+        if constexpr (TILE == 32) {
+            wmma::load_matrix_sync(pa1, sP + (hg * 16) * TILE + 16, TILE);
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int col_base = (ks * 8 + j) * 16;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb0;
+            wmma::load_matrix_sync(vb0, sL + col_base, kMlaK);
+            wmma::mma_sync(o_acc[j], pa0, vb0, o_acc[j]);
+            if constexpr (TILE == 32) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb1;
+                wmma::load_matrix_sync(vb1, sL + 16 * kMlaK + col_base, kMlaK);
+                wmma::mma_sync(o_acc[j], pa1, vb1, o_acc[j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store final accumulated O once per split to part[tok][b][h][0..513]
+    float* p_tok = part + (size_t) tok * (size_t) s_max * 32 * kMlaPart;
+    const int o_row = lane >> 1;
+    const int o_col = (lane & 1) << 3;
+    const int h_out = hg * 16 + o_row;
+    float* dst_row = p_tok + ((size_t) b * 32 + h_out) * kMlaPart;
+    float* wt = sTmp + w * 256;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        wmma::store_matrix_sync(wt, o_acc[j], 16, wmma::mem_row_major);
+        __syncwarp();
+        const float4* src4 = (const float4*) (wt + o_row * 16 + o_col);
+        float4* dst4 = (float4*) (dst_row + (ks * 8 + j) * 16 + o_col);
+        dst4[0] = src4[0];
+        dst4[1] = src4[1];
+    }
+    if (ks == 0 && (lane & 1) == 0) {
+        dst_row[kMlaLora] = sM[h_out];
+        dst_row[kMlaLora + 1] = sSum[h_out];
+    }
+#else
+    (void) q_abs; (void) q; (void) q_stride; (void) q_pe_off; (void) lat; (void) k_pe;
+    (void) n_sel_cap; (void) n_sel_dev; (void) T; (void) scale; (void) s_max; (void) part;
+#endif
+}
+
+__global__ void __launch_bounds__(256)
+    mla_dec_wmma_combine_kernel(const float* __restrict__ part, int n_sel_cap, const int* __restrict__ n_sel_dev, int T,
+                                int n_head, int tile_sz, int s_max, float* __restrict__ ctx) {
+    __shared__ float s_w[kMlaMaxSplits1];
+    __shared__ float s_inv;
+    const int h = blockIdx.x;
+    const int tok = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int n_base = n_sel_dev != nullptr ? min(n_sel_cap, *n_sel_dev) : n_sel_cap;
+    const int n = n_base - (T - 1 - tok);
+    const int S = n > 0 ? mla_num_splits(n, tile_sz, s_max) : 0;
+    const float* p_tok = part + (size_t) tok * (size_t) s_max * n_head * kMlaPart;
+    float* out_row = ctx + ((size_t) tok * n_head + h) * kMlaLora;
+    if (S <= 0) {
+        for (int c = tid; c < kMlaLora; c += 256) out_row[c] = 0.0f;
+        return;
+    }
+    if (tid < 32) {
+        float mb[4], lb[4], M = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int b = tid + 32 * k;
+            const float* pb = p_tok + ((size_t) b * n_head + h) * kMlaPart;
+            mb[k] = b < S ? pb[kMlaLora] : -INFINITY;
+            lb[k] = b < S ? pb[kMlaLora + 1] : 0.0f;
+            M = fmaxf(M, mb[k]);
+        }
+        M = warp_max_f(M);
+        float L = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float w = mb[k] == -INFINITY ? 0.0f : expf(mb[k] - M);
+            s_w[tid + 32 * k] = w;
+            L += w * lb[k];
+        }
+        L = warp_sum_f(L);
+        if (tid == 0) s_inv = L > 0.0f ? 1.0f / L : 0.0f;
+    }
+    __syncthreads();
+    for (int c = tid; c < kMlaLora; c += 256) {
+        float acc = 0.0f;
+        for (int b = 0; b < S; ++b) acc += s_w[b] * p_tok[((size_t) b * n_head + h) * kMlaPart + c];
+        out_row[c] = acc * s_inv;
+    }
+}
+
+static int mla_dec_dev_sms() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static int sms[64] = {};
+    int& v = sms[dev & 63];
+    if (v != 0) return v;
+    int mp = 0;
+    cudaDeviceGetAttribute(&mp, cudaDevAttrMultiProcessorCount, dev);
+    v = mp > 0 ? mp : 64;
+    return v;
+}
+
+// Returns 32 (TILE=32 supported), 16 (TILE=16 supported), or 0 (unsupported)
+template <int LQ8>
+static int mla_dec_wmma_tile_ok() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static int checked[64] = {};
+    int& st = checked[dev & 63];
+    if (st != 0) return st < 0 ? 0 : st;
+    int cc_maj = 0, optin = 0;
+    cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (cc_maj >= 8 && (size_t) optin >= mla_wmma_smem_bytes<32>()) {
+        if (cudaFuncSetAttribute(mla_dec_wmma_kernel<LQ8, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int) mla_wmma_smem_bytes<32>()) == cudaSuccess) {
+            st = 32;
+            return 32;
+        }
+        cudaGetLastError();
+    }
+    if (cc_maj >= 7 && (size_t) optin >= mla_wmma_smem_bytes<16>()) {
+        if (cudaFuncSetAttribute(mla_dec_wmma_kernel<LQ8, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int) mla_wmma_smem_bytes<16>()) == cudaSuccess) {
+            st = 16;
+            return 16;
+        }
+        cudaGetLastError();
+    }
+    st = -1;
+    return 0;
+}
+
 }  // namespace
 
 void kda_prep_full(const float* q_in, const float* k_in, const float* v_in, const float* f_in, const float* conv_q,
@@ -620,7 +1459,7 @@ void kda_rec_q8(const float* q, const float* k, const float* v, const float* g1,
 void router_grouped(const float* logits, const float* bias, int T, int n_exp, int n_used, int n_group, int n_group_used,
                     bool w_norm, float w_scale, int* ids_out, float* w_out, cudaStream_t s) {
     if (T <= 0) return;
-    router_grouped_kernel<<<(unsigned) T, 512, 0, s>>>(logits, bias, n_exp, n_used, n_group, n_group_used,
+    router_grouped_kernel<<<(unsigned) T, 256, 0, s>>>(logits, bias, n_exp, n_used, n_group, n_group_used,
                                                        w_norm ? 1 : 0, w_scale, ids_out, w_out);
 }
 
@@ -716,5 +1555,73 @@ void max_rows_from_bounds(const int* bounds, int n_slots, int* out_dev, cudaStre
     max_rows_from_bounds_kernel<<<1, 256, 0, s>>>(bounds, n_slots, out_dev);
 }
 
+void fetch_resolve_fast(const int* ids, int T, int n_used, const hy4::k::FetchLayer& fl, const hy4::k::FetchScratch& fs,
+                        int k_gpu, bool cache, float decay, cudaStream_t s) {
+    fetch_resolve_fast_kernel<<<1, 512, 0, s>>>(ids, T, n_used, fl, fs, k_gpu, cache ? 1 : 0, decay);
+}
+
+void argmax_f32(const float* logits, int n, float* scratch_val, int* scratch_idx, int* out_id, cudaStream_t s) {
+    constexpr int kBlocks = 128;
+    argmax_stage1_kernel<<<kBlocks, 256, 0, s>>>(logits, n, scratch_val, scratch_idx);
+    argmax_stage2_kernel<<<1, 128, 0, s>>>(scratch_val, scratch_idx, kBlocks, out_id);
+}
+
+void add_rmsnorm_q8(float* x, const float* a, const float* w, int T, int E, float eps, float* cur_out, int8_t* xq,
+                    float* xd, cudaStream_t s) {
+    if (T <= 0) return;
+    add_rmsnorm_q8_kernel<1><<<(unsigned) T, 512, 0, s>>>(x, a, nullptr, w, E, eps, cur_out, xq, xd);
+}
+
+void add2_rmsnorm_q8(float* x, const float* a, const float* b, const float* w, int T, int E, float eps, float* cur_out,
+                     int8_t* xq, float* xd, cudaStream_t s) {
+    if (T <= 0) return;
+    add_rmsnorm_q8_kernel<2><<<(unsigned) T, 512, 0, s>>>(x, a, b, w, E, eps, cur_out, xq, xd);
+}
+
+void pack_route_cpu(const int* ids, const float* w, const int* who, int n_used, RoutePack* dst, cudaStream_t s) {
+    pack_route_cpu_kernel<<<1, 32, 0, s>>>(ids, w, who, n_used, dst);
+}
+
+size_t mla_dec_wmma_part_bytes(int n_head, int max_T) {
+    const size_t slots = std::max<size_t>((size_t) kMlaMaxSplits1, (size_t) std::max(1, max_T) * (size_t) kMlaMaxSplitsM);
+    return slots * (size_t) n_head * (size_t) kMlaPart * sizeof(float);
+}
+
+void mla_dec_wmma_init() {
+    (void) mla_dec_dev_sms();
+    (void) mla_dec_wmma_tile_ok<0>();
+    (void) mla_dec_wmma_tile_ok<1>();
+}
+
+bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off, const void* lat, int lat_q8,
+                  const uint16_t* k_pe, int n_sel_cap, const int* n_sel_dev, int T, int n_head, int kv_lora,
+                  int qk_rope, float scale, float* part, float* ctx, cudaStream_t s) {
+    if (T <= 0 || n_head != 32 || kv_lora != kMlaLora || qk_rope != 64) return false;
+    const int tile = lat_q8 != 0 ? mla_dec_wmma_tile_ok<1>() : mla_dec_wmma_tile_ok<0>();
+    if (tile == 0) return false;
+    const int sms = mla_dec_dev_sms();
+    const int s_max = (T > 1) ? std::min(kMlaMaxSplitsM, std::max(1, sms / T)) : std::min(kMlaMaxSplits1, sms);
+    const dim3 grid((unsigned) s_max, (unsigned) T);
+    if (tile == 32) {
+        if (lat_q8 != 0)
+            mla_dec_wmma_kernel<1, 32><<<grid, 256, mla_wmma_smem_bytes<32>(), s>>>(
+                q_abs, q, q_stride, q_pe_off, lat, k_pe, n_sel_cap, n_sel_dev, T, scale, s_max, part);
+        else
+            mla_dec_wmma_kernel<0, 32><<<grid, 256, mla_wmma_smem_bytes<32>(), s>>>(
+                q_abs, q, q_stride, q_pe_off, lat, k_pe, n_sel_cap, n_sel_dev, T, scale, s_max, part);
+    } else {
+        if (lat_q8 != 0)
+            mla_dec_wmma_kernel<1, 16><<<grid, 256, mla_wmma_smem_bytes<16>(), s>>>(
+                q_abs, q, q_stride, q_pe_off, lat, k_pe, n_sel_cap, n_sel_dev, T, scale, s_max, part);
+        else
+            mla_dec_wmma_kernel<0, 16><<<grid, 256, mla_wmma_smem_bytes<16>(), s>>>(
+                q_abs, q, q_stride, q_pe_off, lat, k_pe, n_sel_cap, n_sel_dev, T, scale, s_max, part);
+    }
+    mla_dec_wmma_combine_kernel<<<dim3((unsigned) n_head, (unsigned) T), 256, 0, s>>>(part, n_sel_cap, n_sel_dev, T,
+                                                                                      n_head, tile, s_max, ctx);
+    return true;
+}
+
 }  // namespace ling::k
+
 

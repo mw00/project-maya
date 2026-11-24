@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include "hy4_kernels.cuh"
 
 namespace ling::k {
 
@@ -85,6 +86,38 @@ void mla_o_finalize_gate(const float* o_acc, const float* l, const float* gate, 
 
 /// Compute max_e (bounds[e+1] - bounds[e]) into *out_dev (1 int).
 void max_rows_from_bounds(const int* bounds, int n_slots, int* out_dev, cudaStream_t s);
+
+/// Fast O(N) adaptive expert cache resolver (drop-in replacement for hy4::k::fetch_resolve):
+/// Immediate O(1) fast-exit when n_miss == 0; single-pass warp-parallel victim selection when n_miss > 0.
+void fetch_resolve_fast(const int* ids, int T, int n_used, const hy4::k::FetchLayer& fl, const hy4::k::FetchScratch& fs,
+                        int k_gpu, bool cache, float decay, cudaStream_t s);
+
+/// Fast 2-stage parallel argmax over n floats (vocab = 157184) -> *out_id (1 int on device).
+/// scratch_val / scratch_idx must hold at least 128 floats / 128 ints.
+void argmax_f32(const float* logits, int n, float* scratch_val, int* scratch_idx, int* out_id, cudaStream_t s);
+
+/// Fused residual add + RMSNorm + Q8_0 row quantization (T >= 1, E <= 4096, E % 32 == 0).
+/// Updates x[t] += a[t] (+ b[t]) in-place, writes normalized F32 to cur_out (optional), and Q8_0 to (xq, xd).
+void add_rmsnorm_q8(float* x, const float* a, const float* w, int T, int E, float eps, float* cur_out, int8_t* xq,
+                    float* xd, cudaStream_t s);
+void add2_rmsnorm_q8(float* x, const float* a, const float* b, const float* w, int T, int E, float eps, float* cur_out,
+                     int8_t* xq, float* xd, cudaStream_t s);
+
+/// Pack routing outputs (ids, w, who) into one contiguous 96-byte device struct for single D2H transfer in kCpu mode.
+struct RoutePack {
+    int ids[8];
+    float w[8];
+    int who[8];
+};
+void pack_route_cpu(const int* ids, const float* w, const int* who, int n_used, RoutePack* dst, cudaStream_t s);
+
+/// Portable WMMA split-K MLA decode (H = 32, kv_lora = 512, qk_rope = 64; supports T >= 1 and FP16 / INT8 KV).
+/// Vectorized coalesced KV loads + register-accumulated WMMA (TILE=32 on sm_80+, TILE=16 on sm_70/75).
+size_t mla_dec_wmma_part_bytes(int n_head, int max_T = 1);
+void mla_dec_wmma_init();
+bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off, const void* lat, int lat_q8,
+                  const uint16_t* k_pe, int n_sel_cap, const int* n_sel_dev, int T, int n_head, int kv_lora,
+                  int qk_rope, float scale, float* part, float* ctx, cudaStream_t s);
 
 }  // namespace ling::k
 

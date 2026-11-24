@@ -402,10 +402,14 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         cudaGetLastError();
         CK(cudaStreamCreateWithFlags(&gp.s, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&gp.s_copy, cudaStreamNonBlocking));
+        CK(cudaStreamCreateWithFlags(&gp.s_d2h, cudaStreamNonBlocking));
         CKBLAS(cublasCreate(&gp.blas));
         CKBLAS(cublasSetStream(gp.blas, gp.s));
         CK(cudaEventCreateWithFlags(&gp.ev_xfer, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&gp.ev_route, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&gp.ev_d2h, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&gp.ev_norm, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&gp.ev_sh, cudaEventDisableTiming));
         for (int b = 0; b < 2; ++b) {
             CK(cudaEventCreateWithFlags(&gp.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&gp.ev_comp[b], cudaEventDisableTiming));
@@ -554,7 +558,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
 
     // Allocate decode + double-buffered prefill scratch
     const int P = std::max(1, std::min(o_.prefill_chunk, o_.ctx));
-    const size_t mla_part_b = glmd::mla_dec_part_bytes(H);
+    const size_t mla_part_b = std::max(glmd::mla_dec_part_bytes(H), k::mla_dec_wmma_part_bytes(H, 4));
     const size_t max_w16_elems = std::max<size_t>(
         {(size_t) H * c.qk_head * (size_t) E, (size_t) c.n_ff * (size_t) E, (size_t) H * (size_t) KL * c.qk_nope,
          (size_t) H * (size_t) c.v_head * (size_t) KL, (size_t) DI * (size_t) E});
@@ -609,10 +613,15 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         if (gi == ngpu - 1) {
             gp.logits = (float*) dev_alloc(gp, (size_t) c_.vocab * 4);
             gp.d_top = (float*) dev_alloc(gp, 2 * sizeof(float));
+            gp.d_arg_val = (float*) dev_alloc(gp, 128 * sizeof(float));
+            gp.d_arg_idx = (int*) dev_alloc(gp, 128 * sizeof(int));
+            gp.d_arg_out = (int*) dev_alloc(gp, sizeof(int));
+            gp.h_arg_out = (int*) host_alloc(gp, sizeof(int));
         }
         gp.d_step = (int*) dev_alloc(gp, 3 * sizeof(int));
         gp.d_iota = (int*) dev_alloc(gp, (size_t) o_.ctx * sizeof(int));
         k::fill_iota(gp.d_iota, o_.ctx, gp.s);
+        k::mla_dec_wmma_init();
 
         gp.fxs.eptr = (unsigned long long*) dev_alloc(gp, (size_t) c.n_expert * sizeof(unsigned long long));
         gp.fxs.who = (int*) dev_alloc(gp, 16 * sizeof(int));
@@ -624,6 +633,10 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         gp.fxs.stats = (unsigned long long*) dev_alloc(gp, 8 * sizeof(unsigned long long));
         CK(cudaMemset(gp.fxs.stats, 0, 8 * sizeof(unsigned long long)));
 
+        gp.d_route_pack = (k::RoutePack*) dev_alloc(gp, sizeof(k::RoutePack));
+        gp.h_route_pack = (k::RoutePack*) host_alloc(gp, sizeof(k::RoutePack));
+        gp.h_neg1 = (int*) host_alloc(gp, sizeof(int));
+        *gp.h_neg1 = -1;
         gp.h_step = (int*) host_alloc(gp, 3 * sizeof(int));
         gp.h_ids = (int*) host_alloc(gp, 16 * sizeof(int));
         gp.h_w = (float*) host_alloc(gp, 16 * sizeof(float));
@@ -734,7 +747,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
                          mtp_want.at(mtp_prefix + "ffn_down_exps.weight"), c.n_layers});
     }
 
-    const bool want_pin = (o_.offload != OffloadMode::kCpu) && (o_.pin_ram_gib > 0.0);
+    const bool want_pin = (o_.pin_ram_gib > 0.0);
     double pin_budget = want_pin ? o_.pin_ram_gib * (double) (1ULL << 30) : 0.0;
     size_t pin_bytes = 0, page_bytes = 0;
 
@@ -817,6 +830,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         l.fl.owner = (int*) dev_alloc(gp, (size_t) std::max(1, l.n_res) * sizeof(int));
         l.fl.score = (float*) dev_alloc(gp, (size_t) c.n_expert * sizeof(float));
         CK(cudaMemset(l.fl.score, 0, (size_t) c.n_expert * sizeof(float)));
+        CK(cudaEventCreateWithFlags(&l.ev_promo, cudaEventDisableTiming));
+        l.h_owner.assign((size_t) std::max(1, l.n_res), -1);
+        l.h_score.assign((size_t) c.n_expert, 0.0f);
 
         if (l.n_res > 0) {
             l.fl.vram = gp.vram_pool + l.vram_pool_off;
@@ -875,8 +891,12 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         CK(cudaStreamSynchronize(gp.s));
     }
 
+    const double vram_res_frac =
+        total_experts > 0 ? (double) total_vram_experts / (double) total_experts : 1.0;
     if (o_.offload == OffloadMode::kAuto) {
-        active_offload_ = any_host_unpinned_ ? OffloadMode::kCpu : OffloadMode::kGpu;
+        // When >= 65% of experts fit in VRAM, hit rate is ~97-99% so CUDA-graphed GPU fetch wins;
+        // below 65%, async-adapting CPU lane serves misses ~3x faster than PCIe 3.0 while overlapping GPU hits.
+        active_offload_ = (any_host_unpinned_ || vram_res_frac < 0.65) ? OffloadMode::kCpu : OffloadMode::kGpu;
     } else if (o_.offload == OffloadMode::kGpu && any_host_unpinned_) {
         std::fprintf(stderr, "maya-ling: host experts exceed --pin-ram-gib, falling back to CPU lane offload\n");
         active_offload_ = OffloadMode::kCpu;
@@ -886,7 +906,14 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
 
     if (active_offload_ == OffloadMode::kCpu || active_offload_ == OffloadMode::kMix || any_host_unpinned_) {
         maya::ds4::gguf::iq_cpu_row_hint(E);
-        lane_ = std::make_unique<hy4::Lane>(o_.cpu_threads);
+        // Cap auto threads at 24 on large-core CPUs to avoid NUMA/barrier overhead on DDR4/DDR5 decode
+        int req_th = o_.cpu_threads;
+        if (req_th <= 0) {
+            const int hc = (int) std::thread::hardware_concurrency();
+            const int est_phys = hc >= 4 ? hc / 2 : std::max(1, hc - 1);
+            req_th = std::min(est_phys, 24);
+        }
+        lane_ = std::make_unique<hy4::Lane>(req_th);
     }
 
     const int n_kda = (int) std::count(c.kda, c.kda + c.n_layers, true);
@@ -931,7 +958,13 @@ Model::~Model() {
             hy4::ram_free(l.host_blobs, l.host_bytes);
         }
     };
-    for (auto& l : layers_) free_layer_host(l);
+    for (auto& l : layers_) {
+        if (l.ev_promo != nullptr) {
+            set_dev(gpus_[(size_t) l.dev_idx].dev);
+            cudaEventDestroy(l.ev_promo);
+        }
+        free_layer_host(l);
+    }
     if (mtp_loaded_) free_layer_host(mtp_.layer);
 
     for (auto& gp : gpus_) {
@@ -944,7 +977,11 @@ Model::~Model() {
         }
         if (gp.ev_xfer != nullptr) cudaEventDestroy(gp.ev_xfer);
         if (gp.ev_route != nullptr) cudaEventDestroy(gp.ev_route);
+        if (gp.ev_d2h != nullptr) cudaEventDestroy(gp.ev_d2h);
+        if (gp.ev_norm != nullptr) cudaEventDestroy(gp.ev_norm);
+        if (gp.ev_sh != nullptr) cudaEventDestroy(gp.ev_sh);
         if (gp.blas != nullptr) cublasDestroy(gp.blas);
+        if (gp.s_d2h != nullptr) cudaStreamDestroy(gp.s_d2h);
         if (gp.s_copy != nullptr) cudaStreamDestroy(gp.s_copy);
         if (gp.s != nullptr) cudaStreamDestroy(gp.s);
     }
@@ -1044,7 +1081,7 @@ void Model::transfer_x(int g_from, int g_to, int T, bool prefill_buf) {
 
 // ------------------------------ single-token decode ------------------------------
 
-void Model::kda_decode(Gpu& gp, Layer& l, int il, bool seam) {
+void Model::kda_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x) {
     const Config& c = c_;
     const int DI = c.d_inner(), H = c.n_head;
     cudaStream_t s = gp.s;
@@ -1071,10 +1108,10 @@ void Model::kda_decode(Gpu& gp, Layer& l, int il, bool seam) {
     iq::MvJob o{l.wo.p, l.wo.ld, l.wo.type, l.wo.k, l.wo.n, 1, gp.xq2, gp.xd2, gp.out, (size_t) l.wo.n, nullptr, 1.0f};
     if (!iq::mv(&o, 1, s)) throw std::runtime_error("kda: output type not supported");
     if (seam) dump_seam_f32(gp, "kda_out-" + std::to_string(il), gp.out, (size_t) c.n_embd);
-    hy::add(gp.x, gp.out, (size_t) c.n_embd, s);
+    if (add_to_x) hy::add(gp.x, gp.out, (size_t) c.n_embd, s);
 }
 
-void Model::mla_decode(Gpu& gp, Layer& l, int il, bool seam) {
+void Model::mla_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x) {
     const Config& c = c_;
     const int H = c.n_head, KL = c.kv_lora, R = c.n_rot;
     cudaStream_t s = gp.s;
@@ -1094,9 +1131,12 @@ void Model::mla_decode(Gpu& gp, Layer& l, int il, bool seam) {
 
     k::kv_store_split(gp.kvall, 1, KL, R, l.kv_a_norm, c.eps, gp.d_step + 1, 0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s);
 
-    if (!glmd::mla_dec(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, gp.d_iota, o_.ctx,
-                       gp.d_step + 2, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s))
-        throw std::runtime_error("mla: glmd::mla_dec refused shape");
+    if (!k::mla_dec_wmma(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, o_.ctx,
+                         gp.d_step + 2, 1, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s)) {
+        if (!glmd::mla_dec(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, gp.d_iota, o_.ctx,
+                           gp.d_step + 2, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s))
+            throw std::runtime_error("mla: mla_dec refused shape");
+    }
 
     hy::q8_heads(gp.ctxo, (size_t) H * KL, (size_t) KL, 1, H, KL, gp.q8c, gp.d8c, s);
     iq::MvJob vb{l.wvb.p, l.wvb.ld, l.wvb.type, KL, c.v_head, 1, gp.q8c, gp.d8c, gp.o128, (size_t) c.v_head, nullptr,
@@ -1110,10 +1150,10 @@ void Model::mla_decode(Gpu& gp, Layer& l, int il, bool seam) {
                 1.0f};
     if (!iq::mv(&o, 1, s)) throw std::runtime_error("mla: output type not supported");
     if (seam) dump_seam_f32(gp, "mla_out-" + std::to_string(il), gp.out, (size_t) c.n_embd);
-    hy::add(gp.x, gp.out, (size_t) c.n_embd, s);
+    if (add_to_x) hy::add(gp.x, gp.out, (size_t) c.n_embd, s);
 }
 
-void Model::ffn_dense_decode(Gpu& gp, Layer& l, int il, bool seam) {
+void Model::ffn_dense_decode(Gpu& gp, Layer& l, int il, bool seam, const float* next_norm) {
     const Config& c = c_;
     cudaStream_t s = gp.s;
     iq::MvJob j[2] = {
@@ -1125,13 +1165,59 @@ void Model::ffn_dense_decode(Gpu& gp, Layer& l, int il, bool seam) {
                         nullptr, s);
     iq::MvJob d{l.fd.p, l.fd.ld, l.fd.type, l.fd.k, l.fd.n, 1, gp.ehq, gp.ehd, gp.out, (size_t) l.fd.n, nullptr, 1.0f};
     if (!iq::mv(&d, 1, s)) throw std::runtime_error("ffn: down type not supported");
-    hy::add(gp.x, gp.out, (size_t) c.n_embd, s);
+    if (next_norm != nullptr && !seam) {
+        k::add_rmsnorm_q8(gp.x, gp.out, next_norm, 1, c.n_embd, c.eps, gp.cur, gp.xq, gp.xd, s);
+    } else {
+        hy::add(gp.x, gp.out, (size_t) c.n_embd, s);
+    }
 }
 
-void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam) {
+void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* next_norm) {
     const Config& c = c_;
     const int E = c.n_embd, FE = c.n_ff_exp, FS = c.n_ff_shexp, NU = c.n_used;
     cudaStream_t s = gp.s;
+
+    const bool use_lane = (l.n_res < c.n_expert) &&
+                          (active_offload_ == OffloadMode::kCpu || active_offload_ == OffloadMode::kMix || !l.host_pinned);
+
+    auto run_shared = [&](cudaStream_t st) {
+        iq::MvJob sj[2] = {
+            {l.fg.p, l.fg.ld, l.fg.type, E, FS, 1, gp.xq, gp.xd, gp.gu, (size_t) FS, nullptr, 1.0f},
+            {l.fu.p, l.fu.ld, l.fu.type, E, FS, 1, gp.xq, gp.xd, gp.gu + FS, (size_t) FS, nullptr, 1.0f},
+        };
+        if (!iq::mv(sj, 2, st)) throw std::runtime_error("moe: shared gate/up type not supported");
+        k::swiglu_clamp_out(gp.gu, gp.gu + FS, 1, FS, c.clamp_shexp[il], seam ? gp.shact : nullptr, gp.shq, gp.shd,
+                            nullptr, st);
+        if (seam && c.clamp_shexp[il] > 1e-6f)
+            dump_seam_f32(gp, "ffn_swiglu_limited-" + std::to_string(il), gp.shact, (size_t) FS);
+        iq::MvJob sd{l.fd.p, l.fd.ld, l.fd.type, FS, E, 1, gp.shq, gp.shd, gp.shout, (size_t) E, nullptr, 1.0f};
+        if (!iq::mv(&sd, 1, st)) throw std::runtime_error("moe: shared down type not supported");
+    };
+
+    auto finish_add = [&] {
+        if (seam) {
+            dump_seam_f32(gp, "ffn_moe_out-" + std::to_string(il), gp.moe, (size_t) E);
+            dump_seam_f32(gp, "ffn_shexp-" + std::to_string(il), gp.shout, (size_t) E);
+        }
+        if (next_norm != nullptr && !seam) {
+            k::add2_rmsnorm_q8(gp.x, gp.moe, gp.shout, next_norm, 1, E, c.eps, gp.cur, gp.xq, gp.xd, s);
+        } else {
+            k::add2(gp.x, gp.moe, gp.shout, E, s);
+        }
+    };
+
+    // In kCpu mode, start copying gp.cur (10 KB) to host on dedicated s_d2h IMMEDIATELY (overlaps router + fetch_resolve!)
+    if (use_lane) {
+        CK(cudaEventRecord(gp.ev_norm, s));
+        CK(cudaStreamWaitEvent(gp.s_d2h, gp.ev_norm, 0));
+        CK(cudaMemcpyAsync(gp.h_cur, gp.cur, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost, gp.s_d2h));
+    } else if (!seam) {
+        // In kGpu / full-VRAM mode, overlap shared expert on s_copy with router + fetch_resolve + fetch_copy!
+        CK(cudaEventRecord(gp.ev_norm, s));
+        CK(cudaStreamWaitEvent(gp.s_copy, gp.ev_norm, 0));
+        run_shared(gp.s_copy);
+        CK(cudaEventRecord(gp.ev_sh, gp.s_copy));
+    }
 
     if (l.router_type == 0)
         hy::gemv_f32w((const float*) l.router_w, (size_t) E, E, c.n_expert, gp.cur, (size_t) E, 1, gp.rlog,
@@ -1143,20 +1229,6 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam) {
     k::router_grouped(gp.rlog, l.rb_dev, 1, c.n_expert, NU, c.n_group, c.n_group_used, c.w_norm, c.w_scale, gp.d_ids,
                       gp.d_w, s);
     if (seam) dump_seam_i32(gp, "ffn_moe_topk-" + std::to_string(il), gp.d_ids, (size_t) NU);
-
-    auto run_shared = [&] {
-        iq::MvJob sj[2] = {
-            {l.fg.p, l.fg.ld, l.fg.type, E, FS, 1, gp.xq, gp.xd, gp.gu, (size_t) FS, nullptr, 1.0f},
-            {l.fu.p, l.fu.ld, l.fu.type, E, FS, 1, gp.xq, gp.xd, gp.gu + FS, (size_t) FS, nullptr, 1.0f},
-        };
-        if (!iq::mv(sj, 2, s)) throw std::runtime_error("moe: shared gate/up type not supported");
-        k::swiglu_clamp_out(gp.gu, gp.gu + FS, 1, FS, c.clamp_shexp[il], seam ? gp.shact : nullptr, gp.shq, gp.shd,
-                            nullptr, s);
-        if (seam && c.clamp_shexp[il] > 1e-6f)
-            dump_seam_f32(gp, "ffn_swiglu_limited-" + std::to_string(il), gp.shact, (size_t) FS);
-        iq::MvJob sd{l.fd.p, l.fd.ld, l.fd.type, FS, E, 1, gp.shq, gp.shd, gp.shout, (size_t) E, nullptr, 1.0f};
-        if (!iq::mv(&sd, 1, s)) throw std::runtime_error("moe: shared down type not supported");
-    };
 
     iq::Args a;
     a.plan_ptr = gp.d_plan;
@@ -1184,18 +1256,14 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam) {
         hy::q8_rows(gp.eh, (size_t) FE, NU, FE, gp.ehq, gp.ehd, s);
         if (!iq::down(a, NU, 1, s)) throw std::runtime_error("moe: down failed");
         hy::moe_sum(gp.part, 1, NU, E, gp.d_w, gp.moe, s);
-        run_shared();
-        if (seam) {
-            dump_seam_f32(gp, "ffn_moe_out-" + std::to_string(il), gp.moe, (size_t) E);
-            dump_seam_f32(gp, "ffn_shexp-" + std::to_string(il), gp.shout, (size_t) E);
-        }
-        k::add2(gp.x, gp.moe, gp.shout, E, s);
+        if (seam) run_shared(s);
+        else CK(cudaStreamWaitEvent(s, gp.ev_sh, 0));
+        finish_add();
         return;
     }
 
-    const bool use_lane = (active_offload_ == OffloadMode::kCpu || active_offload_ == OffloadMode::kMix || !l.host_pinned);
     if (!use_lane) {
-        hy::fetch_resolve(gp.d_ids, 1, NU, l.fl, gp.fxs, -1, l.n_res > 0, 0.98f, s);
+        k::fetch_resolve_fast(gp.d_ids, 1, NU, l.fl, gp.fxs, -1, l.n_res > 0, 0.98f, s);
         hy::fetch_copy(gp.fxs, l.blob, 32, s);
         hy::plan_experts(gp.d_ids, NU, nullptr, 0, gp.d_plan, s, nullptr, gp.d_w, gp.fxs.eptr, gp.fxs.who);
         if (!iq::gate_up(a, NU, 1, s)) throw std::runtime_error("moe: gate_up failed");
@@ -1204,49 +1272,121 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam) {
         hy::q8_rows(gp.eh, (size_t) FE, NU, FE, gp.ehq, gp.ehd, s);
         if (!iq::down(a, NU, 1, s)) throw std::runtime_error("moe: down failed");
         hy::moe_sum(gp.part, 1, NU, E, gp.d_w, gp.moe, s);
-        run_shared();
-        if (seam) {
-            dump_seam_f32(gp, "ffn_moe_out-" + std::to_string(il), gp.moe, (size_t) E);
-            dump_seam_f32(gp, "ffn_shexp-" + std::to_string(il), gp.shout, (size_t) E);
-        }
-        k::add2(gp.x, gp.moe, gp.shout, E, s);
+        if (seam) run_shared(s);
+        else CK(cudaStreamWaitEvent(s, gp.ev_sh, 0));
+        finish_add();
         return;
+    }
+
+    // Complete any finished race-free async background VRAM promotion from an earlier token (zero stall!)
+    if (l.promo_pending_e >= 0 && cudaEventQuery(l.ev_promo) == cudaSuccess) {
+        const int pe = l.promo_pending_e, psl = l.promo_pending_sl;
+        l.h_slot[(size_t) pe] = psl;
+        l.h_owner[(size_t) psl] = pe;
+        CK(cudaMemcpyAsync(l.fl.slot + pe, &l.h_slot[(size_t) pe], sizeof(int), cudaMemcpyHostToDevice, s));
+        l.promo_pending_e = -1;
+        l.promo_pending_v = -1;
+        l.promo_pending_sl = -1;
+        ++cpu_admitted_;
     }
 
     const int k_gpu = (active_offload_ == OffloadMode::kMix && l.host_pinned) ? o_.mix_k_gpu : 0;
     const bool adapt = (k_gpu > 0 && l.n_res > 0);
-    hy::fetch_resolve(gp.d_ids, 1, NU, l.fl, gp.fxs, k_gpu, adapt, 0.98f, s);
-    CK(cudaMemcpyAsync(gp.h_ids, gp.d_ids, (size_t) NU * sizeof(int), cudaMemcpyDeviceToHost, s));
-    CK(cudaMemcpyAsync(gp.h_w, gp.d_w, (size_t) NU * sizeof(float), cudaMemcpyDeviceToHost, s));
-    CK(cudaMemcpyAsync(gp.h_who, gp.fxs.who, (size_t) NU * sizeof(int), cudaMemcpyDeviceToHost, s));
-    CK(cudaMemcpyAsync(gp.h_cur, gp.cur, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost, s));
+    k::fetch_resolve_fast(gp.d_ids, 1, NU, l.fl, gp.fxs, k_gpu, adapt, 0.98f, s);
+    k::pack_route_cpu(gp.d_ids, gp.d_w, gp.fxs.who, NU, gp.d_route_pack, s);
     CK(cudaEventRecord(gp.ev_route, s));
+
+    // Single 96-byte D2H transfer on dedicated s_d2h (NEVER blocked by s_copy background H2D promos!)
+    CK(cudaStreamWaitEvent(gp.s_d2h, gp.ev_route, 0));
+    CK(cudaMemcpyAsync(gp.h_route_pack, gp.d_route_pack, sizeof(k::RoutePack), cudaMemcpyDeviceToHost, gp.s_d2h));
+    CK(cudaEventRecord(gp.ev_d2h, gp.s_d2h));
 
     if (k_gpu > 0) hy::fetch_copy(gp.fxs, l.blob, 32, s);
     hy::plan_experts(gp.d_ids, NU, nullptr, 0, gp.d_plan, s, nullptr, gp.d_w, gp.fxs.eptr, gp.fxs.who);
     if (!iq::gate_up(a, NU, 1, s)) throw std::runtime_error("moe: gate_up failed");
+    if (seam && c.clamp_exp[il] > 1e-6f)
+        dump_seam_f32(gp, "ffn_moe_swiglu_limited-" + std::to_string(il), gp.eh, (size_t) NU * FE);
     hy::q8_rows(gp.eh, (size_t) FE, NU, FE, gp.ehq, gp.ehd, s);
     if (!iq::down(a, NU, 1, s)) throw std::runtime_error("moe: down failed");
     hy::moe_sum(gp.part, 1, NU, E, gp.d_w, gp.moe, s);
-    run_shared();
+    run_shared(s);
 
-    CK(cudaEventSynchronize(gp.ev_route));
+    CK(cudaEventSynchronize(gp.ev_d2h));
+    const k::RoutePack& rp = *gp.h_route_pack;
     std::vector<hy4::CpuEntry> entries;
     entries.reserve((size_t) NU);
     for (int j2 = 0; j2 < NU; ++j2) {
-        if (gp.h_who[j2] != 0) entries.push_back({0, gp.h_ids[j2], gp.h_w[j2]});
+        if (rp.who[j2] == 1) entries.push_back({0, rp.ids[j2], rp.w[j2]});
     }
     if (!entries.empty()) {
-        hy4::cpu_experts(*lane_, l.cex, entries, gp.h_cur, 1, gp.h_cpu_out);
         cpu_lane_picks_ += (unsigned long long) entries.size();
+        hy4::cpu_experts(*lane_, l.cex, entries, gp.h_cur, 1, gp.h_cpu_out);
         CK(cudaMemcpyAsync(gp.d_cpu_out, gp.h_cpu_out, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s));
         hy::add(gp.moe, gp.d_cpu_out, (size_t) E, s);
     }
-    if (seam) {
-        dump_seam_f32(gp, "ffn_moe_out-" + std::to_string(il), gp.moe, (size_t) E);
-        dump_seam_f32(gp, "ffn_shexp-" + std::to_string(il), gp.shout, (size_t) E);
+
+    // Race-free async background VRAM cache admission across all layers (round-robin, dedicated s_copy!)
+    if (k_gpu == 0 && l.n_res > 0 && l.n_res < c.n_expert && l.host_blobs != nullptr && l.host_pinned) {
+        if (!l.cpu_cache_ready) {
+            if ((int) l.h_owner.size() != l.n_res) l.h_owner.assign((size_t) l.n_res, -1);
+            if ((int) l.h_score.size() != c.n_expert) l.h_score.assign((size_t) c.n_expert, 0.0f);
+            for (int e = 0; e < c.n_expert; ++e) {
+                const int sl = l.h_slot[(size_t) e];
+                if (sl >= 0 && sl < l.n_res) l.h_owner[(size_t) sl] = e;
+            }
+            l.cpu_cache_ready = true;
+        }
+        const int NE = c.n_expert;
+        for (int e = 0; e < NE; ++e) l.h_score[(size_t) e] *= 0.98f;
+        uint8_t active_mask[512] = {};
+        for (int j2 = 0; j2 < NU; ++j2) {
+            const int e = rp.ids[j2];
+            l.h_score[(size_t) e] += 1.0f;
+            if (e >= 0 && e < 512) active_mask[e] = 1;
+        }
+        const int layer_dist = (il - promo_rr_ + c.n_layers) % c.n_layers;
+        const bool rr_eligible = (tok_promo_budget_ > 0) && (layer_dist < 40);
+        if (!entries.empty() && l.promo_pending_e < 0 && rr_eligible) {
+            int best_m = -1;
+            float best_ms = -1.0f;
+            for (const auto& ce : entries) {
+                const float sc_e = l.h_score[(size_t) ce.e];
+                if (sc_e > best_ms) {
+                    best_ms = sc_e;
+                    best_m = ce.e;
+                }
+            }
+            int worst_v = -1, worst_sl = -1;
+            float worst_vs = 1e30f;
+            for (int sl = 0; sl < l.n_res; ++sl) {
+                const int ve = l.h_owner[(size_t) sl];
+                if (ve < 0 || (ve < 512 && active_mask[ve])) continue;
+                const float sv = l.h_score[(size_t) ve];
+                if (sv < worst_vs) {
+                    worst_vs = sv;
+                    worst_v = ve;
+                    worst_sl = sl;
+                }
+            }
+            if (best_m >= 0 && worst_v >= 0 && best_ms > worst_vs) {
+                // Race-free eviction: mark victim slot=-1 on s BEFORE s_copy overwrites worst_sl!
+                l.h_slot[(size_t) worst_v] = -1;
+                l.h_owner[(size_t) worst_sl] = -1;
+                CK(cudaMemcpyAsync(l.fl.slot + worst_v, gp.h_neg1, sizeof(int), cudaMemcpyHostToDevice, s));
+                CK(cudaEventRecord(gp.ev_comp[0], s));
+                CK(cudaStreamWaitEvent(gp.s_copy, gp.ev_comp[0], 0));
+                CK(cudaMemcpyAsync(l.fl.vram + (size_t) worst_sl * l.blob, l.host_blobs + (size_t) best_m * l.blob,
+                                   l.blob, cudaMemcpyHostToDevice, gp.s_copy));
+                CK(cudaEventRecord(l.ev_promo, gp.s_copy));
+                l.promo_pending_e = best_m;
+                l.promo_pending_v = worst_v;
+                l.promo_pending_sl = worst_sl;
+                --tok_promo_budget_;
+            }
+        }
     }
-    k::add2(gp.x, gp.moe, gp.shout, E, s);
+
+    finish_add();
 }
 
 void Model::decode_segment(int gi, bool capture_safe) {
@@ -1262,29 +1402,48 @@ void Model::decode_segment(int gi, bool capture_safe) {
         if (seam) dump_seam_f32(gp, "model.input_embed", gp.x, (size_t) E);
     }
 
+    bool normed = false;
     for (int il = gp.l0; il < gp.l1; ++il) {
         Layer& l = layers_[(size_t) il];
-        hy::rmsnorm(gp.x, (size_t) E, 1, E, l.attn_norm, c.eps, gp.cur, (size_t) E, s, {gp.xq, gp.xd});
+        if (!normed) {
+            hy::rmsnorm(gp.x, (size_t) E, 1, E, l.attn_norm, c.eps, gp.cur, (size_t) E, s, {gp.xq, gp.xd});
+        }
         if (seam) dump_seam_f32(gp, "attn_norm-" + std::to_string(il), gp.cur, (size_t) E);
-        if (l.kda) kda_decode(gp, l, il, seam);
-        else mla_decode(gp, l, il, seam);
-        if (seam) dump_seam_f32(gp, "ffn_inp-" + std::to_string(il), gp.x, (size_t) E);
-        hy::rmsnorm(gp.x, (size_t) E, 1, E, l.ffn_norm, c.eps, gp.cur, (size_t) E, s, {gp.xq, gp.xd});
-        if (il < c.n_dense_lead) ffn_dense_decode(gp, l, il, seam);
-        else ffn_moe_decode(gp, l, il, seam);
+        const bool fuse_attn = !seam;
+        if (l.kda) kda_decode(gp, l, il, seam, !fuse_attn);
+        else mla_decode(gp, l, il, seam, !fuse_attn);
+        if (fuse_attn) {
+            k::add_rmsnorm_q8(gp.x, gp.out, l.ffn_norm, 1, E, c.eps, gp.cur, gp.xq, gp.xd, s);
+        } else {
+            if (seam) dump_seam_f32(gp, "ffn_inp-" + std::to_string(il), gp.x, (size_t) E);
+            hy::rmsnorm(gp.x, (size_t) E, 1, E, l.ffn_norm, c.eps, gp.cur, (size_t) E, s, {gp.xq, gp.xd});
+        }
+        const float* next_norm = nullptr;
+        if (!seam) {
+            if (il + 1 < gp.l1) next_norm = layers_[(size_t) (il + 1)].attn_norm;
+            else if (gi == (int) gpus_.size() - 1) next_norm = out_norm_;
+        }
+        if (il < c.n_dense_lead) ffn_dense_decode(gp, l, il, seam, next_norm);
+        else ffn_moe_decode(gp, l, il, seam, next_norm);
+        normed = (next_norm != nullptr);
         if (seam) dump_seam_f32(gp, "l_out-" + std::to_string(il), gp.x, (size_t) E);
     }
 
     if (gi == (int) gpus_.size() - 1) {
-        hy::rmsnorm(gp.x, (size_t) E, 1, E, out_norm_, c.eps, gp.hn, (size_t) E, s, {gp.xq, gp.xd});
-        if (seam) dump_seam_f32(gp, "result_norm", gp.hn, (size_t) E);
-        iq::MvJob j{out_w_.p, out_w_.ld, out_w_.type, E, c.vocab, 1, gp.xq, gp.xd, gp.logits, (size_t) c.vocab, nullptr,
-                    1.0f};
+        if (!normed) {
+            hy::rmsnorm(gp.x, (size_t) E, 1, E, out_norm_, c.eps, gp.cur, (size_t) E, s, {gp.xq, gp.xd});
+        }
+        if (mtp_loaded_) CK(cudaMemcpyAsync(gp.hn, gp.cur, (size_t) E * 4, cudaMemcpyDeviceToDevice, s));
+        if (seam) dump_seam_f32(gp, "result_norm", gp.cur, (size_t) E);
+        iq::MvJob j{out_w_.p, out_w_.ld, out_w_.type, out_w_.k, out_w_.n, 1, gp.xq, gp.xd, gp.logits, (size_t) out_w_.n,
+                    nullptr, 1.0f};
         if (!iq::mv(&j, 1, s)) throw std::runtime_error("output: type not supported");
     }
 }
 
 const float* Model::step(int token, int pos) {
+    tok_promo_budget_ = 32;
+    promo_rr_ = c_.n_dense_lead + ((pos * 7) % std::max(1, c_.n_layers - c_.n_dense_lead));
     const int ngpu = (int) gpus_.size();
     const bool graph_ok = o_.use_graph && active_offload_ == OffloadMode::kGpu && !any_host_unpinned_ &&
                           o_.seam_dir.empty();
@@ -1633,6 +1792,8 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
             CK(cudaMemcpyAsync(gp.h_pf_w, mb.w, (size_t) B * NU * sizeof(float), cudaMemcpyDeviceToHost, s));
         }
         CK(cudaStreamSynchronize(s));
+        // Recency-weight prompt expert counts across macro-blocks so tail document warms decode cache
+        for (int e = 0; e < NE; ++e) l.pf_counts[(size_t) e] >>= 1;
         for (int i = 0; i < B * NU; ++i) {
             const int e = gp.h_pf_ids[i];
             l.pf_counts[(size_t) e]++;
@@ -1696,8 +1857,9 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
                 promote_slot[(size_t) e] = sl;
             }
             l.h_score.resize((size_t) NE);
-            const float norm = 4.0f / (float) max_c;
-            for (int e = 0; e < NE; ++e) l.h_score[(size_t) e] = (float) l.pf_counts[(size_t) e] * norm;
+            const float ref_c = std::max(1.0f, (float) l.pf_counts[(size_t) order[(size_t) (n_res_eff - 1)]]);
+            for (int e = 0; e < NE; ++e)
+                l.h_score[(size_t) e] = std::min(8.0f, 1.5f * (float) l.pf_counts[(size_t) e] / ref_c);
         }
     }
 
@@ -2111,6 +2273,22 @@ void Model::warm_vram_cache() {
 
 const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host) {
     if (n <= 0) throw std::runtime_error("prefill: empty prompt");
+    for (auto& l : layers_) {
+        if (l.promo_pending_e >= 0) {
+            Gpu& gp = gpus_[(size_t) l.dev_idx];
+            set_dev(gp.dev);
+            CK(cudaEventSynchronize(l.ev_promo));
+            const int pe = l.promo_pending_e, psl = l.promo_pending_sl;
+            l.h_slot[(size_t) pe] = psl;
+            l.h_owner[(size_t) psl] = pe;
+            CK(cudaMemcpyAsync(l.fl.slot + pe, &l.h_slot[(size_t) pe], sizeof(int), cudaMemcpyHostToDevice, gp.s));
+            l.promo_pending_e = -1;
+            l.promo_pending_v = -1;
+            l.promo_pending_sl = -1;
+            ++cpu_admitted_;
+        }
+        l.cpu_cache_ready = false;
+    }
     last_warm_s_ = 0.0;
     if (n == 1 || o_.prefill_chunk <= 1 || !o_.seam_dir.empty()) {
         const float* lg = nullptr;
@@ -2509,12 +2687,10 @@ const float* Model::mtp_step(const float* h_nextn_dev, int next_token, int pos) 
 int Model::argmax_logits(const float* logits_dev) {
     Gpu& gl = gpus_.back();
     set_dev(gl.dev);
-    hy::row_top(logits_dev, 1, c_.vocab, (size_t) c_.vocab, 0, gl.d_top, gl.s);
-    CK(cudaMemcpyAsync(gl.h_top, gl.d_top, 2 * sizeof(float), cudaMemcpyDeviceToHost, gl.s));
+    k::argmax_f32(logits_dev, c_.vocab, gl.d_arg_val, gl.d_arg_idx, gl.d_arg_out, gl.s);
+    CK(cudaMemcpyAsync(gl.h_arg_out, gl.d_arg_out, sizeof(int), cudaMemcpyDeviceToHost, gl.s));
     CK(cudaStreamSynchronize(gl.s));
-    int id = 0;
-    std::memcpy(&id, gl.h_top, 4);
-    return id;
+    return *gl.h_arg_out;
 }
 
 TierStats Model::stats() const {
@@ -2531,6 +2707,7 @@ TierStats Model::stats() const {
         st.admitted += s[5];
     }
     if (st.cpu_lane == 0) st.cpu_lane = cpu_lane_picks_;
+    st.admitted += cpu_admitted_;
     return st;
 }
 

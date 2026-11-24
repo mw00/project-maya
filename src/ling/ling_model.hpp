@@ -13,6 +13,7 @@
 #include <cublas_v2.h>
 
 #include "hy4_kernels.cuh"
+#include "ling_kernels.cuh"
 #include "hy4_lane.hpp"
 
 namespace maya {
@@ -169,16 +170,26 @@ private:
         std::vector<int> h_owner;           // host mirror of fl.owner for async warm
         std::vector<float> h_score;         // host mirror of fl.score for async warm
         std::vector<uint32_t> pf_counts;    // prompt pick counts for cache warm
+        // Async background cache promotion in kCpu decode mode
+        bool cpu_cache_ready = false;
+        int promo_pending_e = -1;
+        int promo_pending_v = -1;
+        int promo_pending_sl = -1;
+        cudaEvent_t ev_promo = nullptr;
     };
 
     struct Gpu {
         int dev = 0;
         int l0 = 0, l1 = 0;                 // assigned trunk layers [l0, l1)
         cudaStream_t s = nullptr;
-        cudaStream_t s_copy = nullptr;      // dedicated DMA stream for overlapped prefill staging
+        cudaStream_t s_copy = nullptr;      // dedicated DMA / shared-expert overlap stream
+        cudaStream_t s_d2h = nullptr;       // dedicated tiny D2H stream for kCpu routing readback
         cublasHandle_t blas = nullptr;
         cudaEvent_t ev_xfer = nullptr;
         cudaEvent_t ev_route = nullptr;
+        cudaEvent_t ev_d2h = nullptr;
+        cudaEvent_t ev_norm = nullptr;
+        cudaEvent_t ev_sh = nullptr;
         cudaEvent_t ev_copy[2] = {nullptr, nullptr};
         cudaEvent_t ev_comp[2] = {nullptr, nullptr};
         uint8_t* vram_pool = nullptr;
@@ -202,6 +213,13 @@ private:
         int8_t *ehq = nullptr, *shq = nullptr;
         float *ehd = nullptr, *shd = nullptr;
         float* d_top = nullptr;
+        float* d_arg_val = nullptr;
+        int* d_arg_idx = nullptr;
+        int* d_arg_out = nullptr;
+        int* h_arg_out = nullptr;
+        k::RoutePack* d_route_pack = nullptr;
+        k::RoutePack* h_route_pack = nullptr;
+        int* h_neg1 = nullptr;
         hy4::k::FetchScratch fxs;
         // pinned host buffers
         int* h_step = nullptr;
@@ -263,6 +281,9 @@ private:
     bool any_host_unpinned_ = false;
     std::vector<std::string> vocab_tokens_;
     unsigned long long cpu_lane_picks_ = 0;
+    unsigned long long cpu_admitted_ = 0;
+    int tok_promo_budget_ = 0;
+    int promo_rr_ = 0;
     double last_warm_s_ = 0.0;
 
     void* dev_alloc(Gpu& g, size_t bytes);
@@ -275,10 +296,10 @@ private:
     void transfer_bytes(int g_from, int g_to, const void* p_src, void* p_dst, size_t bytes);
 
     void decode_segment(int gi, bool capture_safe);
-    void kda_decode(Gpu& gp, Layer& l, int il, bool seam);
-    void mla_decode(Gpu& gp, Layer& l, int il, bool seam);
-    void ffn_dense_decode(Gpu& gp, Layer& l, int il, bool seam);
-    void ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam);
+    void kda_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x = true);
+    void mla_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x = true);
+    void ffn_dense_decode(Gpu& gp, Layer& l, int il, bool seam, const float* next_norm = nullptr);
+    void ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* next_norm = nullptr);
 
     void gemm_mat(Gpu& gp, const Mat& m, const uint16_t* a16, int T, float* out_f32);
     struct MacroBufs {
