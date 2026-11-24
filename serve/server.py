@@ -2012,6 +2012,55 @@ class StrataEngine:
             self.proc.kill()
 
 
+PICTURE_DIR_PREFIXES = ("maya-vision-", "maya-ds4-pictures-", "maya-hy4-pictures-", "maya-mm3-pictures-")
+PICTURE_DIR_PID = ".maya-pid"       # the server that owns the folder (a second server running at once keeps its own)
+
+
+def picture_dir(prefix: str) -> Path:
+    """A folder in the temp directory for the pictures a server reads (cached by hash while it runs).  It goes when the
+    server ends (any way out of main(); #1180) - on tmpfs these folders were RAM that was never given back."""
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    with contextlib.suppress(OSError):
+        (d / PICTURE_DIR_PID).write_text(str(os.getpid()), encoding="ascii")
+    atexit.register(shutil.rmtree, str(d), True)
+    return d
+
+
+def clean_stale_picture_dirs(older_than: float = 86400.0, temp: str | None = None, now: float | None = None) -> int:
+    """At start: the picture folders of earlier runs that ended without removing theirs (kill -9, a power cut): only
+    ours (the prefixes above), only in the temp directory, only when older than a day and their server is gone.  The
+    number removed."""
+    root = Path(temp or tempfile.gettempdir())
+    now = time.time() if now is None else now
+    n = 0
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for d in entries:
+        try:
+            if not d.name.startswith(PICTURE_DIR_PREFIXES) or d.is_symlink() or not d.is_dir():
+                continue
+            if now - d.stat().st_mtime < older_than:
+                continue
+            try:
+                pid = int((d / PICTURE_DIR_PID).read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                pid = 0
+            if pid and pid != os.getpid():
+                try:
+                    import psutil
+                    if psutil.pid_exists(pid):
+                        continue                         # (its server still runs)
+                except ImportError:
+                    pass
+            shutil.rmtree(d, ignore_errors=True)
+            n += not d.exists()
+        except OSError:
+            continue
+    return n
+
+
 class Vision:
     """The resident image encoder: `maya-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     and `VID <video> <out>` lines and writes each picture's embeddings (a video: one record per frame); results
@@ -2036,7 +2085,7 @@ class Vision:
         if cfg.get("no_flash_attn"):   # GLM-5.3's encoder on a GPU: full-precision attention (cosine 0.9997 vs 0.999)
             args.append("--no-flash-attn")
         self.args, self.log, self.env = args, log, env
-        self.dir = Path(tempfile.mkdtemp(prefix="maya-vision-"))
+        self.dir = picture_dir("maya-vision-")
         self.proc = None
         self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
         # on demand without lending (Inkling 2: maya-ik2 lends no memory): a callable, True when the GPU's free memory
@@ -2259,14 +2308,14 @@ class Vision:
             return self.cache[key]
 
     def close(self):
-        if self.proc is None:
-            return
-        try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+        if self.proc is not None:
+            try:
+                self.proc.stdin.write("QUIT\n")
+                self.proc.stdin.flush()
+                self.proc.wait(timeout=10)
+            except Exception:
+                self.proc.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)    # (#1180: the pictures it kept go with the server)
 
 
 def gpu_free_bytes(gpu: int) -> int | None:
@@ -7899,6 +7948,7 @@ def main() -> int:
                          "when it closes - that program ended, however it ended - the server stops as on Ctrl+C "
                          "(on Linux also when its parent process ends)")
     a = ap.parse_args()
+    clean_stale_picture_dirs()
     stop = threading.Event()
     stop_signals(stop)                                  # before any engine starts (#1181); ends it if one comes then
     if a.engine == "strata":
@@ -8007,7 +8057,7 @@ def main() -> int:
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
             # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
             vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
+                                       picture_dir("maya-ds4-pictures-"), Vision.load)
             room = engine.info.get("vision_room")
             where = (f"{engine.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
                      f"none between pictures, ~{engine.info.get('vision_room_mib')} MiB while one is read, lent by "
@@ -8017,7 +8067,7 @@ def main() -> int:
         elif vision is None and not vcfg and engine.info.get("vision") == "hy4":
             # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
             vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-hy4-pictures-")), Vision.load)
+                                       picture_dir("maya-hy4-pictures-"), Vision.load)
             # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
             where = (f"; no VRAM kept for pictures (~{engine.info.get('vision_room_mib')} MiB while one is read, lent "
                      "by the prompt buffers)" if engine.info.get("vision_room") == "chunk" else "")
@@ -8026,7 +8076,7 @@ def main() -> int:
         elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
             # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
             vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-mm3-pictures-")), Vision.load)
+                                       picture_dir("maya-mm3-pictures-"), Vision.load)
             print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
                   f"({vision.g.max_tokens} tokens) a picture", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "off":

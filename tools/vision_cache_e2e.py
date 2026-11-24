@@ -263,7 +263,7 @@ def main():
         httpd.server_close()
         svc.response_jobs.close()
         vision.close()
-        shutil.rmtree(vision.dir)
+        shutil.rmtree(vision.dir, ignore_errors=True)   # (vision.close() removed it already)
     result = {'passed': all(row['passed'] for row in outcomes), 'cases': outcomes,
               'provider_source': str(args.maya_root / 'serve/server.py'),
               'provider_sha256': hashlib.sha256((args.maya_root / 'serve/server.py').read_bytes()).hexdigest(),
