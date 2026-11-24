@@ -971,6 +971,17 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
                             : active_offload_ == OffloadMode::kMix ? "gpu-cache+cpu-lane"
                                                                    : "vram+cpu-lane";
     size_t vram_sum = std::accumulate(gpu_vram_used.begin(), gpu_vram_used.end(), size_t(0));
+    total_experts_ = total_experts;
+    total_vram_experts_ = total_vram_experts;
+    {
+        size_t used_sum = 0;
+        for (const auto& gp : gpus_) {
+            set_dev(gp.dev);
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) used_sum += (tb - fb);
+        }
+        total_vram_gb_ = (double) used_sum / (double) (1ULL << 30);
+    }
     if (!o_.mmproj_path.empty()) {
         vision_ = std::make_unique<VisionTower>();
         std::string verr;
@@ -2343,7 +2354,8 @@ void Model::warm_vram_cache() {
     last_warm_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host) {
+const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host,
+                            const std::function<bool(int, int)>& on_progress) {
     if (n <= 0) throw std::runtime_error("prefill: empty prompt");
     for (auto& l : layers_) {
         if (l.promo_pending_e >= 0) {
@@ -2368,6 +2380,11 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
         if (all_logits_host != nullptr) row.resize((size_t) c_.vocab);
         for (int i = 0; i < n; ++i) {
             lg = step(tokens[i], pos0 + i);
+            if (on_progress && ((i + 1) == n || ((i + 1) % 64) == 0)) {
+                set_dev(output_dev());
+                CK(cudaStreamSynchronize(output_stream()));
+                if (!on_progress(i + 1, n)) return nullptr;
+            }
             if (all_logits_host != nullptr) {
                 set_dev(output_dev());
                 CK(cudaMemcpyAsync(row.data(), lg, (size_t) c_.vocab * 4, cudaMemcpyDeviceToHost, output_stream()));
@@ -2633,6 +2650,11 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
                     }
 
                     run_gpu_stage(gi, off, B, is_last, x_slots[slot]);
+                    if (gi == ngpu - 1 && on_progress) {
+                        set_dev(gpus_.back().dev);
+                        CK(cudaStreamSynchronize(gpus_.back().s));
+                        (void) on_progress(off + B, n);
+                    }
 
                     if (gi + 1 < ngpu) {
                         // Wait until next stage finished using x_slots_next[slot] from blk - 2
@@ -2706,6 +2728,11 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
                     transfer_buf(gi - 1, gi, mbufs[(size_t) (gi - 1)].x, mbufs[(size_t) gi].x, (size_t) B * E);
                 }
                 run_gpu_stage(gi, off, B, is_last, mbufs[(size_t) gi].x);
+                if (gi == ngpu - 1 && on_progress) {
+                    set_dev(gpus_.back().dev);
+                    CK(cudaStreamSynchronize(gpus_.back().s));
+                    if (!on_progress(off + B, n)) return nullptr;
+                }
                 if (gi == ngpu - 1 && all_logits_host != nullptr) {
                     Gpu& gp = gpus_[(size_t) gi];
                     set_dev(gp.dev);
@@ -3399,6 +3426,60 @@ bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<
         CK(cudaStreamSynchronize(g0.s));
     }
     return ok;
+}
+
+
+// ------------------------------ KDA Prefix Session Snapshots ------------------------------
+
+void Model::save_kda_snapshot(KdaSnapshot& snap, const std::vector<int>& tokens,
+                              const std::vector<std::pair<int64_t, uint64_t>>& pics) const {
+    const Config& c = c_;
+    const size_t st_elems = (size_t) c.n_head * (size_t) c.kda_head * (size_t) c.kda_head;
+    const size_t cs_elems = (size_t) 3 * (size_t) c.d_inner() * (size_t) (c.d_conv - 1);
+    snap.tokens = tokens;
+    snap.pics = pics;
+    snap.rope_delta = rope_delta_;
+    snap.states.clear();
+    snap.convs.clear();
+    for (int il = 0; il < c.n_layers; ++il) {
+        const Layer& l = layers_[(size_t) il];
+        if (!l.kda) continue;
+        const Gpu& gp = gpus_[(size_t) l.dev_idx];
+        cudaSetDevice(gp.dev);
+        std::vector<float> sv(st_elems), cv(cs_elems);
+        CK(cudaMemcpyAsync(sv.data(), l.state, st_elems * sizeof(float), cudaMemcpyDeviceToHost, gp.s));
+        CK(cudaMemcpyAsync(cv.data(), l.conv_state, cs_elems * sizeof(float), cudaMemcpyDeviceToHost, gp.s));
+        snap.states.push_back(std::move(sv));
+        snap.convs.push_back(std::move(cv));
+    }
+    for (const auto& gp : gpus_) {
+        cudaSetDevice(gp.dev);
+        CK(cudaStreamSynchronize(gp.s));
+    }
+}
+
+void Model::restore_kda_snapshot(const KdaSnapshot& snap) {
+    const Config& c = c_;
+    const size_t st_elems = (size_t) c.n_head * (size_t) c.kda_head * (size_t) c.kda_head;
+    const size_t cs_elems = (size_t) 3 * (size_t) c.d_inner() * (size_t) (c.d_conv - 1);
+    size_t ki = 0;
+    for (int il = 0; il < c.n_layers; ++il) {
+        Layer& l = layers_[(size_t) il];
+        if (!l.kda) continue;
+        Gpu& gp = gpus_[(size_t) l.dev_idx];
+        set_dev(gp.dev);
+        CK(cudaMemcpyAsync(l.state, snap.states[ki].data(), st_elems * sizeof(float), cudaMemcpyHostToDevice, gp.s));
+        CK(cudaMemcpyAsync(l.conv_state, snap.convs[ki].data(), cs_elems * sizeof(float), cudaMemcpyHostToDevice, gp.s));
+        ++ki;
+    }
+    for (auto& gp : gpus_) {
+        set_dev(gp.dev);
+        CK(cudaStreamSynchronize(gp.s));
+    }
+    rope_delta_ = snap.rope_delta;
+    images_.clear();
+    mtp_done_ = 0;
+    mtp_tokens_ = snap.tokens;
 }
 
 }  // namespace ling

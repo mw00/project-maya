@@ -92,6 +92,7 @@ class ChatTemplate:
         # "args"}<|end_message|> - which InklingRewriter turns into what OutputParser reads; reasoning_effort by name
         # (none .. max, its effort_map) or a number; tool call arguments must be objects
         self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
+        self.ling = "<|role_end|>" in self.source and "detailed thinking on" in self.source
 
     def effort_shown(self, value) -> str | None:
         """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in
@@ -180,6 +181,14 @@ class ChatTemplate:
                 kwargs["reasoning_effort"] = level
             return self.template.render(messages=inkling_messages(messages), tools=tools,
                                         add_generation_prompt=add_generation_prompt, **kwargs)
+        if self.ling:
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking_mode", None)
+            kwargs["enable_thinking"] = not (off or level in ("none", "no_think"))
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
         if self.hy4:
             # Hy4-flash thinks at one level, high, or not at all (no_think): thinking off is no_think, every other level
             # (low, max ... - the template would take them, the model is not made for them) and none named are high.

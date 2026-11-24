@@ -16,15 +16,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2", "ling")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 # ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini, an experimental preview; the 594B
 #  Inkling-2-Small runs by hand, docs/INKLING2.md)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
-         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
+         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini", "ling": "Ling-3.2-air"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
          "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
-         "ik2": "Inkling 2 Mini"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "ik2": "Inkling 2 Mini", "ling": "Ling 3.2 Air"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -60,6 +60,8 @@ MODEL_DEFAULTS = {
     # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
     # (QUANT_SAMPLING / QUANT_THINK_BUDGET are keyed by this key, not by the family both share)
     "glm53": ({"temperature": 1.0, "top_p": 0.95}, "max"),
+    # Ling-3.2-air (maya-ling): generation_config.json - temperature 1.0, top_p 0.95, top_k 20; thinking on by default
+    "ling": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "high"),
 }
 GLM53 = "glm53"
 
@@ -322,6 +324,8 @@ def family_of(cfg: dict) -> str:
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
+    if inst.get("family") == "ling" or exe.startswith("maya-ling"):
+        return "ling"
     if inst.get("family") == "ik2" or exe.startswith("maya-ik2"):   # (Inkling-2-Mini: the setup's; Inkling-2-Small: by hand)
         return "ik2"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):

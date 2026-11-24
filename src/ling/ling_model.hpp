@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <map>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -107,6 +108,22 @@ public:
     void set_images(std::vector<Image> imgs);
     int rope_delta() const { return rope_delta_; }
     void set_rope_delta(int d) { rope_delta_ = d; }
+    int max_ctx() const { return o_.ctx; }
+    int prefill_chunk_size() const { return gpus_.empty() ? o_.prefill_chunk : gpus_[0].pf_cap; }
+    double vram_gb() const { return total_vram_gb_; }
+    size_t experts_all() const { return total_experts_; }
+    size_t experts_vram() const { return total_vram_experts_; }
+
+    struct KdaSnapshot {
+        std::vector<int> tokens;
+        std::vector<std::pair<int64_t, uint64_t>> pics;
+        int rope_delta = 0;
+        std::vector<std::vector<float>> states;
+        std::vector<std::vector<float>> convs;
+    };
+    void save_kda_snapshot(KdaSnapshot& snap, const std::vector<int>& tokens,
+                           const std::vector<std::pair<int64_t, uint64_t>>& pics) const;
+    void restore_kda_snapshot(const KdaSnapshot& snap);
 
     // Reset KDA states and prompt frequency counters for a fresh sequence.
     void reset();
@@ -117,7 +134,8 @@ public:
     // Batched prefill for tokens[0..n-1] starting at pos0.
     // Returns logits of the final token (vocab F32 on output_dev()).
     // If all_logits_host != nullptr, appends all n positions' F32 logits (n * vocab floats).
-    const float* prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host = nullptr);
+    const float* prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host = nullptr,
+                         const std::function<bool(int, int)>& on_progress = nullptr);
 
     // Run MTP block (blk.<n_layers>) on trunk h_nextn (E F32 on output_dev()) paired with next_token at pos.
     // Returns MTP logits (vocab F32 on output_dev()).
@@ -347,6 +365,9 @@ private:
     std::unique_ptr<VisionTower> vision_;
     std::vector<Image> images_;
     int rope_delta_ = 0;
+    double total_vram_gb_ = 0.0;
+    size_t total_experts_ = 0;
+    size_t total_vram_experts_ = 0;
 
     void* dev_alloc(Gpu& g, size_t bytes);
     void* host_alloc(Gpu& g, size_t bytes);

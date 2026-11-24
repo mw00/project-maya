@@ -3128,7 +3128,7 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     return meta
 
 
-ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2")
+ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-ling")
 
 
 def target_of_exe(exe) -> str | None:
@@ -5170,7 +5170,7 @@ def busy_gpus(cfg: dict) -> list:
 DISPLAY_MIB = 1536
 
 # Maya's engines as the GPU's process list names them (and the names they had before the rename)
-ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-glm-helper", "strata", "strata-ds4")
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-ling", "maya-glm-helper", "strata", "strata-ds4")
 
 
 def maya_engines_on(cfg: dict) -> list:

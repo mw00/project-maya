@@ -58,7 +58,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, hy4_vision, ling_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
@@ -2371,7 +2371,7 @@ def engine_args(cfg: dict) -> list[str]:
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
     # (maya-ik2 on two GPUs splits by experts, not layers - its --gpus 2 is in the config's args)
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) != "ik2":
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) not in ("ik2", "ling"):
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
     # needs its own room there.  On a card the model already fills (Maya-XS leaves ~130 MB) the third
@@ -2944,6 +2944,8 @@ class Service:
                             _special_ids("[e~[") + _special_ids("]~b]") +
                             # Inkling 2 with <|content_model_end_sampling|>
                             _special_ids("<|content_model_end_sampling|>") +
+                            # Ling-3.2-air ends a turn with <|role_end|>
+                            _special_ids("<|role_end|>") +
                             # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
                             (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
                              _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
@@ -4107,7 +4109,8 @@ class Service:
         if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
             # the engines' own vision towers (DeepSeek, MiniMax, Hy4) read pictures only: say so instead of dropping
             # the video (with a picture next to it) or failing on a missing video encoder (without one)
-            raise ValueError(("Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
+            raise ValueError(("Ling-3.2-air" if isinstance(self.vision, ling_vision.Vision) else
+                              "Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
                               "MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
                              + " reads pictures, not videos")
         if images and isinstance(self.vision, ENGINE_VISION):
@@ -7927,6 +7930,13 @@ def main() -> int:
                      + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
             print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}: "
                   f"{where}), up to {vision.g.max_tokens} tokens a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("vision") == "ling":
+            vision = ling_vision.Vision(ling_vision.Geometry.from_info(engine.info),
+                                        Path(tempfile.mkdtemp(prefix="maya-ling-pictures-")), Vision.load)
+            where = (f"; no permanent VRAM (~{engine.info.get('vision_room_mib')} MiB lent while encoding)"
+                     if engine.info.get("vision_room") == "tail" else "")
+            print(f"[maya] images: Ling-3.2-air vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
+                  f"({vision.g.max_tokens} tokens) a picture{where}", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "hy4":
             # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
             vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),

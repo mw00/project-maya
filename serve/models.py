@@ -52,7 +52,7 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 # end yet)
 # (maya-hy4: Tencent's own Q4_K_M run end to end up to 256K; Maya's sizes up to 32K so far - the model is trained for 1M)
 # (maya-ik2: Inkling-2-Mini run to 262,144 by its contributor - every expert in VRAM with an FP8 cache)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "ik2": 262144}
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "ik2": 262144, "ling": 262144}
 CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
@@ -91,6 +91,7 @@ HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a 
 # plain words when a client asks for it (each one's "off": IK2_OFF)
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on its card: the setup's own figures
 IK2_KEYS = ("context", "images", "gpus", "env", "kv", "draft", "parallel")
+LING_KEYS = ("context", "images", "gpus", "env", "kv", "draft", "prefill_chunk", "cpu_threads")
 IK2_OFF: dict = {}
 IK2_NOT_YET: dict = {}   # (v1.1.74: --parallel, Answers at once, is in - the engine's resident path on one GPU)
 
@@ -164,7 +165,7 @@ def gpus_of(cfg: dict) -> list:
 def pack_of(cfg: dict) -> Path | None:
     args = cfg.get("args") or []
     p = flag(args, "--glm-pack") or flag(args, "--pack")
-    if not p and family(cfg) == "ik2" and flag(args, "--model") and cfg.get("tokenizer"):
+    if not p and family(cfg) in ("ik2", "ling") and (flag(args, "--model") or flag(args, "--gguf") or flag(args, "-m")) and cfg.get("tokenizer"):
         # (maya-ik2 reads its GGUF in place: the setup's folder beside it - the tokenizer and its sources.json - stands
         #  for the pack, in the model's folder)
         return Path(str(cfg["tokenizer"])).parent
@@ -428,6 +429,12 @@ def choices(cfg: dict) -> dict:
 
 
 def _choices(cfg: dict) -> dict:
+    if family(cfg) == "ling":
+        dr = flag(args, "--drafting") or ("auto" if flag(args, "--spec-k") == "auto" else "mtp" if "--mtp" in args else "none")
+        out.update(images=bool(flag(args, "--mmproj")) and flag(args, "--vision") != "off",
+                   kv=flag(args, "--kv", "q8"), draft=dr,
+                   prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
+        return out
     if family(cfg) == "minimax":
         return {"draft": ["dspark", "none"] if mm3_pack_has(cfg, "dspark.num_hidden_layers") else ["none"],
                 "images": mm3_pack_has(cfg, "vision.hidden_size")}
@@ -438,6 +445,9 @@ def _choices(cfg: dict) -> dict:
         # (auto: the engine measures once on this PC which decodes fastest - no drafting or a drafter the pack holds)
         drafters = (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else [])
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
+    if family(cfg) == "ling":
+        args = cfg.get("args") or []
+        return {"draft": ["auto", "mtp", "none"], "images": bool(flag(args, "--mmproj")), "kv": ["q8", "fp16"]}
     if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off)
         # (drafting: auto - measured once on this PC; the drafter by hand where the setup downloaded it; none)
         ctx = int(flag(cfg.get("args") or [], "--max-context") or 0)
@@ -585,7 +595,7 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS, "hy4": HY4_KEYS, "ik2": IK2_KEYS}.get(fam, GLM_KEYS)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS, "hy4": HY4_KEYS, "ik2": IK2_KEYS, "ling": LING_KEYS}.get(fam, GLM_KEYS)
     known += ("ablate",)
     if fam == "hy4":
         not_yet = sorted(k for k in set(settings) & set(HY4_NOT_YET)
@@ -738,6 +748,19 @@ def apply(cfg: dict, settings: dict) -> dict:
                 out["installer"][HY4_CHUNK_BY_HAND] = True
         if hy4_context_check(cfg, {**out, "args": args}) and flag(args, "--kv-streaming") is None:
             args = set_flag(args, "--kv-streaming", "auto")   # (streams only where nothing else fits, as the setup's)
+    elif fam == "ling":
+        kv = str(s.get("kv") or "q8").lower()
+        if kv not in ("q8", "fp16", "f16", "int8"):
+            raise ValueError("KV cache: q8 or fp16")
+        args = set_flag(args, "--kv", "fp16" if kv in ("fp16", "f16") else "q8")
+        if s.get("draft") in ("auto", "mtp", "none"):
+            args = set_flag(args, "--drafting", s["draft"])
+        if "images" in settings:
+            args = set_flag(args, "--vision", "on" if s.get("images") else "off")
+        pc = _num(s, "prefill_chunk", 64, 8192, "Prefill chunk")
+        args = set_flag(args, "--prefill-chunk", pc) if pc else args
+        ct = _num(s, "cpu_threads", 1, 256, "CPU threads")
+        args = set_flag(args, "--cpu-threads", ct) if ct else args
     elif fam == "ik2":
         # (maya-ik2: --max-context above; one GPU or two - --gpus 2, the split; the cache's format, IK2_KV)
         if len(set(gpus)) not in (1, 2):
@@ -996,7 +1019,7 @@ def describe(path: Path, running: str | None) -> dict:
         used = None
     cur = shown_settings(cfg)
     rng = context_range(trained_context_of(cfg), cur.get("context"),
-                        {"deepseek": "ds4", "minimax": "mm3", "ik2": "ik2",
+                        {"deepseek": "ds4", "minimax": "mm3", "ik2": "ik2", "ling": "ling",
                          "hy4": "hy4-q4" if hy4_plain(cfg) else "hy4"}.get(family(cfg), ""))
     hy4_fits = hy4_contexts(cfg) if family(cfg) == "hy4" else []
     ik2 = family(cfg) == "ik2"

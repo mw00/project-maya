@@ -1,3 +1,11 @@
+#include <sstream>
+#include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <csignal>
+#include <condition_variable>
+#include <atomic>
 #include <fstream>
 #include <cstring>
 // src/ling/ling_main.cu - maya-ling CLI for Ling-3.2-air (bailingmoe3).
@@ -128,10 +136,19 @@ void print_mem(const std::vector<int>& gpus) {
 }  // namespace
 
 
+#ifdef _WIN32
+#include <io.h>
+static long ling_read_stdin(char* buf, size_t n) { return (long) _read(0, buf, (unsigned) n); }
+#else
+#include <unistd.h>
+static long ling_read_stdin(char* buf, size_t n) { return (long) ::read(0, buf, n); }
+#endif
+
 struct CliPic {
     int64_t start = 0;
     int width = 0, height = 0;
     std::vector<uint8_t> rgb;
+    uint64_t hash = 0;
 };
 
 static bool read_mmi1_file(const std::string& path, std::vector<CliPic>& out, std::string& err) {
@@ -160,6 +177,11 @@ static bool read_mmi1_file(const std::string& path, std::vector<CliPic>& out, st
             err = path + ": truncated pixel data for picture " + std::to_string(i);
             return false;
         }
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](const uint8_t* b, size_t k) { for (size_t j = 0; j < k; ++j) h = (h ^ b[j]) * 1099511628211ull; };
+        mix((const uint8_t*) wh, 8);
+        mix(q.rgb.data(), q.rgb.size());
+        q.hash = h;
         out.push_back(std::move(q));
     }
     return true;
@@ -236,6 +258,635 @@ static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g,
     return true;
 }
 
+
+namespace {
+
+struct ServeLines {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> q;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> wrap{false};
+    bool eof = false;
+
+    void start() {
+        std::thread([this] {
+            std::string buf;
+            char chunk[4096];
+            for (;;) {
+                const long n = ling_read_stdin(chunk, sizeof chunk);
+                if (n <= 0) break;
+                buf.append(chunk, (size_t) n);
+                for (size_t nl; (nl = buf.find('\n')) != std::string::npos;) {
+                    std::string l = buf.substr(0, nl);
+                    buf.erase(0, nl + 1);
+                    if (!l.empty() && l.back() == '\r') l.pop_back();
+                    if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
+                        stop.store(true);
+                        continue;
+                    }
+                    if (l == "WRAP") {
+                        wrap.store(true);
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> lk(mu);
+                    q.push_back(std::move(l));
+                    cv.notify_one();
+                }
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            eof = true;
+            cv.notify_one();
+        }).detach();
+    }
+
+    bool next(std::string& out) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return !q.empty() || eof; });
+        if (q.empty()) return false;
+        out = std::move(q.front());
+        q.pop_front();
+        return true;
+    }
+};
+
+struct ServeReq {
+    int max_new = 256;
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    int top_k = 0;
+    float min_p = 0.0f;
+    uint64_t seed = 0;
+    int pen_n = 64;
+    float pen_repeat = 1.0f;
+    float pen_freq = 0.0f;
+    float pen_present = 0.0f;
+    int64_t think_budget = 0;
+    int think_end = -1;
+    int spec = -2;  // -2 = inherit default, 0 = off, >0 = fixed, -1 = auto
+    std::string file;
+    std::vector<int> ids;
+};
+
+static bool parse_serve_gen(const std::string& line, ServeReq& r) {
+    const bool geni = line.rfind("GENI ", 0) == 0;
+    std::istringstream is(line.substr(geni ? 5 : 4));
+    if (!(is >> r.max_new)) return false;
+    for (std::string tok; is >> tok;) {
+        const size_t eq = tok.find('=');
+        if (eq == std::string::npos) {
+            if (geni && r.file.empty()) {
+                r.file = tok;
+                continue;
+            }
+            std::string cur;
+            for (char ch : tok) {
+                if (ch == ',') {
+                    if (!cur.empty()) r.ids.push_back(std::atoi(cur.c_str()));
+                    cur.clear();
+                } else {
+                    cur.push_back(ch);
+                }
+            }
+            if (!cur.empty()) r.ids.push_back(std::atoi(cur.c_str()));
+            break;
+        }
+        const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+        if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
+        else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
+        else if (k == "top_k") r.top_k = std::atoi(v.c_str());
+        else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
+        else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
+        else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
+        else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
+        else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
+        else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "spec") {
+            const int sv = std::atoi(v.c_str());
+            r.spec = sv <= 1 ? 0 : std::min(sv - 1, ling::Model::kMaxWin - 1);
+        }
+    }
+    return !r.ids.empty();
+}
+
+static bool has_penalties(const ServeReq& r) {
+    return (r.pen_n != 0) &&
+           (std::fabs(r.pen_repeat - 1.0f) > 1e-6f || std::fabs(r.pen_freq) > 1e-6f || std::fabs(r.pen_present) > 1e-6f);
+}
+
+// Compute filtered probability distribution over top candidates (returns sorted (id, prob) pairs summing to 1.0).
+static std::vector<std::pair<int, double>> build_target_dist(const float* logits, int V, const ServeReq& r,
+                                                             const std::vector<int>& hist) {
+    std::vector<float> pen_buf;
+    const float* lg = logits;
+    if (has_penalties(r) && !hist.empty()) {
+        pen_buf.assign(logits, logits + V);
+        std::unordered_map<int, int> cnt;
+        const size_t n_h = hist.size();
+        const size_t start = (r.pen_n > 0 && (size_t) r.pen_n < n_h) ? (n_h - (size_t) r.pen_n) : 0;
+        for (size_t i = start; i < n_h; ++i) {
+            const int id = hist[i];
+            if (id >= 0 && id < V) cnt[id]++;
+        }
+        for (const auto& kv : cnt) {
+            float& v = pen_buf[(size_t) kv.first];
+            if (std::fabs(r.pen_repeat - 1.0f) > 1e-6f) v = v > 0.0f ? (v / r.pen_repeat) : (v * r.pen_repeat);
+            v -= (float) kv.second * r.pen_freq + r.pen_present;
+        }
+        lg = pen_buf.data();
+    }
+
+    int best_id = 0;
+    float best_v = lg[0];
+    for (int i = 1; i < V; ++i) {
+        if (lg[i] > best_v) {
+            best_v = lg[i];
+            best_id = i;
+        }
+    }
+    if (r.temperature <= 0.0f) return {{best_id, 1.0}};
+
+    const float inv_t = 1.0f / r.temperature;
+    const float cut = best_v - 40.0f * r.temperature;
+    std::vector<std::pair<int, float>> cands;
+    cands.reserve(256);
+    for (int i = 0; i < V; ++i) {
+        if (lg[i] >= cut) cands.push_back({i, lg[i]});
+    }
+    if (cands.empty()) return {{best_id, 1.0}};
+
+    auto cmp_desc = [](const std::pair<int, float>& a, const std::pair<int, float>& b) {
+        return a.second > b.second || (a.second == b.second && a.first < b.first);
+    };
+    if (r.top_k > 0 && (int) cands.size() > r.top_k) {
+        std::nth_element(cands.begin(), cands.begin() + r.top_k, cands.end(), cmp_desc);
+        cands.resize((size_t) r.top_k);
+    }
+    std::sort(cands.begin(), cands.end(), cmp_desc);
+
+    std::vector<std::pair<int, double>> dist;
+    dist.reserve(cands.size());
+    double sum = 0.0;
+    const float m = cands[0].second;
+    for (const auto& kv : cands) {
+        const double p = std::exp((double) (kv.second - m) * (double) inv_t);
+        dist.push_back({kv.first, p});
+        sum += p;
+    }
+    if (sum <= 0.0) return {{best_id, 1.0}};
+    for (auto& kv : dist) kv.second /= sum;
+
+    if (r.min_p > 0.0f && dist.size() > 1) {
+        const double thr = (double) r.min_p * dist[0].second;
+        size_t keep = 1;
+        while (keep < dist.size() && dist[keep].second >= thr) ++keep;
+        dist.resize(keep);
+    }
+    if (r.top_p > 0.0f && r.top_p < 1.0f && dist.size() > 1) {
+        double cum = 0.0;
+        size_t keep = 0;
+        for (size_t i = 0; i < dist.size(); ++i) {
+            cum += dist[i].second;
+            keep = i + 1;
+            if (cum >= (double) r.top_p) break;
+        }
+        dist.resize(std::max<size_t>(1, keep));
+    }
+    double norm = 0.0;
+    for (const auto& kv : dist) norm += kv.second;
+    if (norm > 0.0) {
+        for (auto& kv : dist) kv.second /= norm;
+    }
+    return dist;
+}
+
+static int draw_from_dist(const std::vector<std::pair<int, double>>& dist, std::mt19937_64& rng, int exclude_id = -1) {
+    if (dist.empty()) return 0;
+    double total = 0.0;
+    for (const auto& kv : dist)
+        if (kv.first != exclude_id) total += kv.second;
+    if (total <= 0.0) return dist[0].first;
+    std::uniform_real_distribution<double> u(0.0, total);
+    double r = u(rng);
+    for (const auto& kv : dist) {
+        if (kv.first == exclude_id) continue;
+        r -= kv.second;
+        if (r <= 0.0) return kv.first;
+    }
+    for (auto it = dist.rbegin(); it != dist.rend(); ++it)
+        if (it->first != exclude_id) return it->first;
+    return dist[0].first;
+}
+
+static int serve_loop(ling::Model& model, int default_spec_k, float default_floor) {
+    const ling::Config& c = model.cfg();
+    const bool has_mtp = model.has_mtp();
+    std::printf("INFO engine=ling engine_kind=ling model=Ling-3.2-air ctx=%d vram_gb=%.2f dspark=0 mtp=%d "
+                "experts=%zu vram_slots=%zu expert_slots=%zu\n",
+                model.max_ctx(), model.vram_gb(), (has_mtp && default_spec_k != 0) ? 1 : 0, model.experts_all(),
+                model.experts_vram(), model.experts_vram());
+    if (const ling::VisionGeo* vg = model.vision()) {
+        std::printf("INFO vision=ling image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
+                    "vision_max_pixels=%d vision_min_pixels=%d vision_room=%s vision_room_mib=%zu\n",
+                    vg->image_token, vg->image_start, vg->image_end, vg->patch, vg->merge, vg->max_pixels,
+                    vg->min_pixels, model.vision_room(), model.vision_room_bytes() >> 20);
+    }
+    std::printf("READY %d stop\n", model.max_ctx());
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya-ling serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT\n");
+
+#if defined(SIGPIPE)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+
+    ServeLines& in = *new ServeLines;
+    in.start();
+
+    auto now_ms = []() -> double {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    auto is_eos = [&](int tok) -> bool {
+        return tok == c.eos_id || tok == 156892 || tok == 156895;
+    };
+
+    // Rolling host-RAM KDA snapshots (~75 MiB each, up to 4 checkpoints) for instant multi-turn prefix reuse
+    constexpr size_t kMaxSnaps = 4;
+    std::deque<ling::Model::KdaSnapshot> snaps;
+    std::vector<int> live_tokens;
+    std::vector<std::pair<int64_t, uint64_t>> live_pics;
+
+    auto pics_match_prefix = [](const std::vector<std::pair<int64_t, uint64_t>>& a,
+                                const std::vector<std::pair<int64_t, uint64_t>>& b, size_t prefix_len) -> bool {
+        std::vector<std::pair<int64_t, uint64_t>> fa, fb;
+        for (const auto& p : a)
+            if ((size_t) p.first < prefix_len) fa.push_back(p);
+        for (const auto& p : b)
+            if ((size_t) p.first < prefix_len) fb.push_back(p);
+        return fa == fb;
+    };
+
+    auto push_snap = [&](const std::vector<int>& toks, const std::vector<std::pair<int64_t, uint64_t>>& pics) {
+        if (toks.size() < 16) return;
+        // Avoid duplicating an identical checkpoint length
+        for (const auto& s : snaps)
+            if (s.tokens.size() == toks.size() && s.tokens == toks && s.pics == pics) return;
+        ling::Model::KdaSnapshot sp;
+        model.save_kda_snapshot(sp, toks, pics);
+        if (snaps.size() >= kMaxSnaps) snaps.pop_front();
+        snaps.push_back(std::move(sp));
+    };
+
+    std::vector<float> h_logits((size_t) c.vocab);
+    std::vector<float> h_wlogits((size_t) ling::Model::kMaxWin * (size_t) c.vocab);
+    uint64_t req_counter = 0;
+    std::string line;
+
+    while (in.next(line)) {
+        if (line == "QUIT") break;
+        if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
+            std::printf("ERR unsupported command '%s'\n", line.substr(0, line.find(' ')).c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        in.stop.store(false);
+        in.wrap.store(false);
+        ServeReq r;
+        if (!parse_serve_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
+            std::printf("ERR malformed GEN/GENI request\n");
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+            std::fflush(stdout);
+            continue;
+        }
+        if ((int) r.ids.size() >= model.max_ctx()) {
+            std::printf("ERR prompt (%zu) exceeds context (%d)\n", r.ids.size(), model.max_ctx());
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+            std::fflush(stdout);
+            continue;
+        }
+
+        const double t0 = now_ms();
+        std::vector<CliPic> pics;
+        std::vector<std::pair<int64_t, uint64_t>> req_pic_sig;
+        std::string err;
+        if (!r.file.empty()) {
+            if (!read_mmi1_file(r.file, pics, err)) {
+                std::printf("ERR %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", err.c_str(), r.ids.size());
+                std::fflush(stdout);
+                continue;
+            }
+            for (const auto& q : pics) req_pic_sig.push_back({q.start, q.hash});
+        }
+
+        // Find longest reusable prefix across live GPU state and host-RAM KDA snapshots (strictly < r.ids.size())
+        size_t reused = 0;
+        int best_snap = -1;  // -1 = reset, -2 = live GPU state matches exactly
+        if (!live_tokens.empty() && live_tokens.size() < r.ids.size() &&
+            std::equal(live_tokens.begin(), live_tokens.end(), r.ids.begin()) &&
+            pics_match_prefix(live_pics, req_pic_sig, live_tokens.size())) {
+            reused = live_tokens.size();
+            best_snap = -2;
+        }
+        for (size_t si = 0; si < snaps.size(); ++si) {
+            const auto& sp = snaps[si];
+            if (sp.tokens.size() > reused && sp.tokens.size() < r.ids.size() &&
+                std::equal(sp.tokens.begin(), sp.tokens.end(), r.ids.begin()) &&
+                pics_match_prefix(sp.pics, req_pic_sig, sp.tokens.size())) {
+                reused = sp.tokens.size();
+                best_snap = (int) si;
+            }
+        }
+        if (best_snap == -1) {
+            model.reset();
+            reused = 0;
+        } else if (best_snap >= 0) {
+            model.restore_kda_snapshot(snaps[(size_t) best_snap]);
+        }
+        // Encode any images overlapping [reused .. r.ids.size())
+        std::vector<ling::Model::Image> mimgs;
+        if (!pics.empty()) {
+            const ling::VisionGeo* vg = model.vision();
+            if (!vg) {
+                std::printf("ERR no vision tower loaded (pass --mmproj)\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n",
+                            r.ids.size());
+                std::fflush(stdout);
+                live_tokens.clear();
+                live_pics.clear();
+                continue;
+            }
+            bool vis_ok = true;
+            for (const auto& q : pics) {
+                const int ntok = vg->tokens(q.width, q.height);
+                if (ntok <= 0 || q.start + ntok > (int64_t) r.ids.size()) {
+                    err = "invalid picture span";
+                    vis_ok = false;
+                    break;
+                }
+                if (q.start + ntok > (int64_t) reused) {
+                    if (q.start < (int64_t) reused) {
+                        // Partial overlap with cached image span -> safely reset to before image
+                        model.reset();
+                        reused = 0;
+                    }
+                    ling::Model::Image im;
+                    im.start = q.start;
+                    im.width = q.width;
+                    im.height = q.height;
+                    if (!model.encode_image(q.rgb.data(), q.width, q.height, im.rows, err)) {
+                        vis_ok = false;
+                        break;
+                    }
+                    mimgs.push_back(std::move(im));
+                }
+            }
+            if (!vis_ok) {
+                std::printf("ERR %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", err.c_str(), r.ids.size());
+                std::fflush(stdout);
+                live_tokens.clear();
+                live_pics.clear();
+                continue;
+            }
+        }
+        model.set_images(std::move(mimgs));
+
+        const int to_read = (int) (r.ids.size() - reused);
+        bool cancelled = false;
+        const float* logits = nullptr;
+        try {
+            logits = model.prefill(
+                r.ids.data() + reused, to_read, (int) reused, nullptr, [&](int done_rel, int /*tot_rel*/) -> bool {
+                    const double ms = now_ms() - t0;
+                    const size_t done_abs = reused + (size_t) done_rel;
+                    std::printf("PP %zu %zu %.1f %.1f %zu\n", done_abs, r.ids.size(), ms,
+                                ms > 0.0 ? 1000.0 * (double) done_rel / ms : 0.0, reused);
+                    std::fflush(stdout);
+                    if (in.stop.load() && done_rel < to_read) {
+                        cancelled = true;
+                        return false;
+                    }
+                    return true;
+                });
+        } catch (const std::exception& e) {
+            std::printf("ERR prefill failed: %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", e.what(), r.ids.size());
+            std::fflush(stdout);
+            live_tokens.clear();
+            live_pics.clear();
+            continue;
+        }
+        const double t1 = now_ms();
+        const double prompt_ms = t1 - t0;
+        if (cancelled || logits == nullptr) {
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.ids.size(), prompt_ms, reused);
+            std::fflush(stdout);
+            live_tokens.clear();
+            live_pics.clear();
+            continue;
+        }
+
+        // Prompt fully evaluated: live state matches r.ids exactly; checkpoint it for instant retries / branching!
+        live_tokens = r.ids;
+        live_pics = req_pic_sig;
+        push_snap(live_tokens, live_pics);
+
+        const ling::TierStats st0 = model.stats();
+        ++req_counter;
+        std::mt19937_64 rng(r.seed != 0 ? r.seed : (0x9E3779B97F4A7C15ull * req_counter));
+
+        const int max_new = std::min(r.max_new > 0 ? r.max_new : model.max_ctx(),
+                                     std::max(0, model.max_ctx() - (int) r.ids.size() - 1));
+        const int eff_spec = (r.spec == -2) ? default_spec_k : r.spec;
+        const bool use_spec = has_mtp && (eff_spec != 0) && !has_penalties(r);
+        const bool auto_spec = (eff_spec < 0);
+        const bool high_vram = model.vram_res_frac() >= 0.65;
+        const int base_k = auto_spec ? (high_vram ? 1 : 2) : std::max(0, eff_spec);
+        const int max_k_lim = auto_spec ? 2 : std::max(0, eff_spec);
+        const float f0 = auto_spec ? 0.25f : 0.0f;
+
+        auto fetch_row = [&](const float* dev_lg) {
+            cudaSetDevice(model.output_dev());
+            cudaMemcpyAsync(h_logits.data(), dev_lg, (size_t) c.vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                            model.output_stream());
+            cudaStreamSynchronize(model.output_stream());
+        };
+        auto sample_one = [&](const float* dev_lg, const std::vector<int>& hist) -> int {
+            if (r.temperature <= 0.0f && !has_penalties(r)) return model.argmax_logits(dev_lg);
+            fetch_row(dev_lg);
+            const auto dist = build_target_dist(h_logits.data(), c.vocab, r, hist);
+            return draw_from_dist(dist, rng);
+        };
+
+        int produced = 0;
+        int pos = (int) r.ids.size();
+        const char* finish = "length";
+        unsigned long long d_off = 0, d_acc = 0;
+        bool in_think = (r.think_budget > 0 && r.think_end >= 0);
+
+        auto emit_token = [&](int tok) -> bool {
+            std::printf("T %d\n", tok);
+            std::fflush(stdout);
+            ++produced;
+            if (is_eos(tok)) {
+                finish = "stop";
+                return false;
+            }
+            if (in_think && tok == r.think_end) in_think = false;
+            if ((produced & 15) == 0) {
+                const double dms = now_ms() - t1;
+                const ling::TierStats st = model.stats();
+                const unsigned long long dp = st.picks - st0.picks;
+                const unsigned long long dh = st.vram_hits - st0.vram_hits;
+                std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f\n",
+                            dms > 0.0 ? 1000.0 * (double) produced / dms : 0.0,
+                            produced > 0 ? dms / (double) produced : 0.0,
+                            dp > 0 ? (double) dh / (double) dp : 1.0);
+                std::fflush(stdout);
+            }
+            if (in.stop.load()) {
+                finish = "cancel";
+                return false;
+            }
+            return produced < max_new;
+        };
+
+        if (max_new > 0) {
+            int cur_tok = sample_one(logits, live_tokens);
+            bool alive = emit_token(cur_tok);
+
+            if (!use_spec) {
+                while (alive && pos < model.max_ctx() - 1) {
+                    if (in_think && produced >= r.think_budget) {
+                        cur_tok = r.think_end;
+                        in_think = false;
+                        alive = emit_token(cur_tok);
+                        if (!alive) break;
+                    }
+                    logits = model.step(cur_tok, pos++);
+                    live_tokens.push_back(cur_tok);
+                    cur_tok = sample_one(logits, live_tokens);
+                    alive = emit_token(cur_tok);
+                }
+            } else {
+                int streak = 0, pause = 0, wait_p = 16;
+                double acc_ema = 0.65;
+                std::vector<int> drafts;
+                std::vector<float> confs;
+                while (alive && pos < model.max_ctx() - 1) {
+                    const int rem = std::min(max_new - produced, model.max_ctx() - 1 - pos);
+                    int want_k = base_k;
+                    if (auto_spec) {
+                        if (pause > 0) {
+                            --pause;
+                            want_k = 0;
+                        } else {
+                            want_k = std::min(max_k_lim, base_k + (streak >= 2 ? 1 : 0));
+                        }
+                    }
+                    want_k = std::min(want_k, std::min(ling::Model::kMaxWin - 1, rem - 1));
+                    drafts.clear();
+                    if (want_k > 0) {
+                        model.mtp_draft(cur_tok, pos, want_k, default_floor, drafts, confs, f0);
+                    }
+                    const int K = (int) drafts.size();
+                    if (K == 0) {
+                        logits = model.step(cur_tok, pos++);
+                        live_tokens.push_back(cur_tok);
+                        cur_tok = sample_one(logits, live_tokens);
+                        alive = emit_token(cur_tok);
+                        continue;
+                    }
+                    int win_toks[ling::Model::kMaxWin];
+                    win_toks[0] = cur_tok;
+                    for (int i = 0; i < K; ++i) win_toks[1 + i] = drafts[(size_t) i];
+                    const int W = 1 + K;
+                    const float* wlogits = model.step_window(win_toks, W, pos);
+
+                    int kept = 0;
+                    int bonus_tok = 0;
+                    if (r.temperature <= 0.0f) {
+                        int pred[ling::Model::kMaxWin];
+                        model.argmax_rows(wlogits, W, pred);
+                        while (kept < K && pred[kept] == drafts[(size_t) kept]) ++kept;
+                        bonus_tok = pred[kept];
+                    } else {
+                        // Exact lossless rejection sampling for deterministic drafter q(x)=delta(x, d):
+                        // accept d with prob p(d); else draw from p(x | x != d).
+                        cudaSetDevice(model.output_dev());
+                        cudaMemcpyAsync(h_wlogits.data(), wlogits, (size_t) W * (size_t) c.vocab * sizeof(float),
+                                        cudaMemcpyDeviceToHost, model.output_stream());
+                        cudaStreamSynchronize(model.output_stream());
+                        std::uniform_real_distribution<double> u01(0.0, 1.0);
+                        bool rejected = false;
+                        for (int i = 0; i < K; ++i) {
+                            const auto dist =
+                                build_target_dist(h_wlogits.data() + (size_t) i * c.vocab, c.vocab, r, live_tokens);
+                            double pd = 0.0;
+                            for (const auto& kv : dist) {
+                                if (kv.first == drafts[(size_t) i]) {
+                                    pd = kv.second;
+                                    break;
+                                }
+                            }
+                            if (u01(rng) < pd) {
+                                ++kept;
+                            } else {
+                                bonus_tok = draw_from_dist(dist, rng, drafts[(size_t) i]);
+                                rejected = true;
+                                break;
+                            }
+                        }
+                        if (!rejected) {
+                            const auto dist =
+                                build_target_dist(h_wlogits.data() + (size_t) K * c.vocab, c.vocab, r, live_tokens);
+                            bonus_tok = draw_from_dist(dist, rng);
+                        }
+                    }
+
+                    const int n_accept = 1 + kept;
+                    model.commit_window(n_accept, W, pos, win_toks);
+                    for (int t = 0; t < n_accept; ++t) live_tokens.push_back(win_toks[t]);
+                    pos += n_accept;
+                    d_off += (unsigned long long) K;
+                    d_acc += (unsigned long long) kept;
+
+                    if (auto_spec) {
+                        streak = (kept == K) ? (streak + 1) : 0;
+                        const double step_rate = (double) kept / (double) K;
+                        acc_ema = 0.85 * acc_ema + 0.15 * step_rate;
+                        if (acc_ema < 0.25) {
+                            pause = wait_p;
+                            wait_p = std::min(wait_p * 2, 128);
+                            acc_ema = 0.55;
+                        } else if (kept > 0) {
+                            wait_p = 16;
+                        }
+                    }
+
+                    for (int i = 0; i < kept && alive; ++i) alive = emit_token(drafts[(size_t) i]);
+                    if (!alive) break;
+                    cur_tok = bonus_tok;
+                    alive = emit_token(cur_tok);
+                }
+            }
+            // Step the final non-EOS token? No — live_tokens matches the exact GPU state currently in KDA/MLA caches!
+        }
+
+        // Checkpoint the post-generation conversation state so the next turn reuses 100% of prompt + assistant reply!
+        push_snap(live_tokens, live_pics);
+
+        const double decode_ms = now_ms() - t1;
+        const ling::TierStats st1 = model.stats();
+        const unsigned long long dh = st1.vram_hits - st0.vram_hits;
+        const unsigned long long dp = st1.picks - st0.picks;
+        std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %zu %llu %llu\n", produced, r.ids.size(), prompt_ms, decode_ms,
+                    finish, d_acc, d_off, reused, dh, dp);
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     std::string gguf, ids_file, prompt, tok_bin = "llama-tokenize";
     ling::Options opt;
@@ -243,7 +894,7 @@ int main(int argc, char** argv) {
     float temp = 0.0f, top_p = 0.95f;
     int top_k = 40;
     unsigned seed = 42;
-    bool print_text = false, no_stop = false, mtp_check = false;
+    bool print_text = false, no_stop = false, mtp_check = false, serve_mode = false;
     int spec_k = 0;           // 0=off, 1..3=fixed max drafts, -1=auto
     float draft_floor = 0.50f;
     std::string mmi1_file, image_file, vision_dump_emb;
@@ -261,7 +912,7 @@ int main(int argc, char** argv) {
             print_text = true;
         } else if (a == "--tokenize-bin") tok_bin = val("--tokenize-bin");
         else if (a == "--n-predict") n_predict = std::atoi(val("--n-predict").c_str());
-        else if (a == "--ctx") opt.ctx = std::atoi(val("--ctx").c_str());
+        else if (a == "--ctx" || a == "--max-context") opt.ctx = std::atoi(val(a.c_str()).c_str());
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::atoi(val("--prefill-chunk").c_str());
         else if (a == "--prefill-block") opt.prefill_block = std::atoi(val("--prefill-block").c_str());
         else if (a == "--no-ep") opt.ep_prefill = false;
@@ -308,6 +959,18 @@ int main(int argc, char** argv) {
             image_file = val("--image");
         } else if (a == "--vision-dump-emb") {
             vision_dump_emb = val("--vision-dump-emb");
+        } else if (a == "--serve") {
+            serve_mode = true;
+        } else if (a == "--drafting") {
+            const std::string v = val("--drafting");
+            if (v == "none" || v == "off" || v == "0") spec_k = 0;
+            else if (v == "auto" || v == "mtp" || v == "on" || v == "1") {
+                spec_k = -1;
+                opt.load_mtp = true;
+            }
+        } else if (a == "--vision") {
+            const std::string v = val("--vision");
+            if (v == "off" || v == "0") opt.mmproj_path.clear();
         } else if (a == "--temp") temp = (float) std::atof(val("--temp").c_str());
         else if (a == "--top-k") top_k = std::atoi(val("--top-k").c_str());
         else if (a == "--top-p") top_p = (float) std::atof(val("--top-p").c_str());
@@ -317,7 +980,7 @@ int main(int argc, char** argv) {
         else throw std::runtime_error("unknown argument " + a);
     }
 
-    if (gguf.empty() || (ids_file.empty() && prompt.empty() && vision_dump_emb.empty())) {
+    if (gguf.empty() || (!serve_mode && ids_file.empty() && prompt.empty() && vision_dump_emb.empty())) {
         std::fprintf(stderr,
                      "maya-ling --gguf MODEL.gguf [--prompt-ids ids.txt | --prompt text [--tokenize-bin PATH]]\n"
                      "          [--n-predict N] [--ctx N] [--prefill-chunk N] [--prefill-block N] [--no-ep] [--gpus 0[,1]]\n"
@@ -338,6 +1001,7 @@ int main(int argc, char** argv) {
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
         std::fprintf(stderr, "%s\nload: %.2f s\n", model.info().c_str(), load_s);
         print_mem(opt.gpus);
+        if (serve_mode) return serve_loop(model, spec_k, draft_floor);
 
         if (!vision_dump_emb.empty()) {
             const ling::VisionGeo* vg = model.vision();
