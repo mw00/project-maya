@@ -612,7 +612,8 @@ void mv_heads_bench() {
         }
     } else {
         for (int ty : {iq::kQ8_0, iq::kQ6_K})
-            for (auto kn : {std::pair<int, int>{192, 512}, {512, 128}, {512, 192}, {512, 256}})
+            for (const std::pair<int, int> kn : {std::pair<int, int>{192, 512}, std::pair<int, int>{512, 128},
+                                                 std::pair<int, int>{512, 192}, std::pair<int, int>{512, 256}})
                 shapes.push_back({ty, kn.first, kn.second, 32});
     }
     std::mt19937 rng(11);
