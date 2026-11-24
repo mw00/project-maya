@@ -2,8 +2,8 @@
 //
 // The body is the validated kernel, moved rather than rewritten: it carries the P0.T2 parity result
 // (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
-// include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
-#include "strata/kernels/cpu/expert.hpp"
+// include/maya/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
+#include "maya/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
 #if defined(_MSC_VER)
@@ -18,13 +18,13 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
-/// u8 x s8 dot products of four into int32 lanes: AVX512-VNNI's vpdpbusd, or (STRATA_CPU_DPBUSD_BW: a toolchain
+/// u8 x s8 dot products of four into int32 lanes: AVX512-VNNI's vpdpbusd, or (MAYA_CPU_DPBUSD_BW: a toolchain
 /// whose assembler has no VNNI, #535) AVX512-BW's maddubs + madd - the same sums here, since every unsigned operand
 /// is a 2-bit code (0..3): maddubs' 16-bit pair sums stay within 2 * 3 * 128, never saturating
-#if defined(STRATA_CPU_DPBUSD_BW)
+#if defined(MAYA_CPU_DPBUSD_BW)
 inline __m256i dpbusd256(__m256i acc, __m256i u, __m256i s) {
     return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
 }
@@ -167,7 +167,7 @@ inline float hsum_ps(__m256 v) {
 // products built for eight blocks at a time; the weight-independent correction is one FMA per eight blocks.
 // The sum order differs from the 256-bit kernel (last-bit differences); the verify window and plain decode both
 // use this kernel, so speculative decode still reproduces plain decode exactly.
-static const bool kZmm = std::getenv("STRATA_CPU_YMM") == nullptr;
+static const bool kZmm = std::getenv("MAYA_CPU_YMM") == nullptr;
 
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
@@ -697,4 +697,4 @@ void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool q
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

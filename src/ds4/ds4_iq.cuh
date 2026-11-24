@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace strata::ds4::gguf::iq {
+namespace maya::ds4::gguf::iq {
 
 // ggml type ids
 constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19,
@@ -35,6 +35,10 @@ constexpr float kOaiAlpha = 1.702f;
 
 /// Whether the routed experts' kernels take this ggml type.
 bool supported(int type);
+/// Whether the experts' kernels take it with the clamped SwiGLU (kActSwiglu: gate_up, down, the light and the set
+/// forms): the experts' types, Q6_K and Q8_0 (maya-hy4's); down_supported: the same
+bool expert_supported(int type);
+bool down_supported(int type);
 /// Whether the GEMVs and FP16 rows take it (the experts' types and the dense ones: Q8_0, Q6_K).
 bool mv_supported(int type);
 /// Values a block of the type (32: Q8_0, IQ4_NL; 256: the others).
@@ -79,7 +83,7 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
 /// [bounds[i], bounds[i + 1]) (local row = sorted row - row0); gate / up: h16[local] = F16 swiglu over x[idx[local]]
 /// (F32 rows, ldx); down: y[local] = down(h16[local]) (F16 rows in, ldx; F32 out, ldo).  A set's experts of at most 16
 /// rows take the token kernels' form (each weight read once, the rows' inputs rounded to int8 per 32 as the token path
-/// rounds them; STRATA_DS4_NO_LIGHT=1: never), the others GEMM tiles (tensor cores on CUDA, F16 operands).
+/// rounds them; MAYA_DS4_NO_LIGHT=1: never), the others GEMM tiles (tensor cores on CUDA, F16 operands).
 struct SetArgs {
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
@@ -103,7 +107,7 @@ struct SetArgs {
     int tu = 0;                // (kActOai) the up's type when it is not the gate's (0: tg) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
 };
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 // Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.
 // Keeping it here leaves the shared EXL3/GGUF SetArgs ABI unchanged.
 class MmqRowsScope {
@@ -116,7 +120,7 @@ private:
     int previous_rows_;
     const int* previous_bounds_;
 };
-// The prompt set's scratch for its int8 activations (the fused experts, STRATA_DS4_PREFILL_FUSED): the caller's down
+// The prompt set's scratch for its int8 activations (the fused experts, MAYA_DS4_PREFILL_FUSED): the caller's down
 // output rows, which the set's gate / up leaves unused until its down writes them; nested scopes restore their caller's.
 class FusedScratchScope {
 public:
@@ -159,6 +163,15 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// H jobs alike but for their offsets, in one launch (a 3D matrix's heads): job h = b with w + h w_stride (bytes),
+/// xq + h xq_stride, xd + h xd_stride, y + h y_stride; each row's sums as mv's.  false: a type or size mv refuses.
+bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
+              cudaStream_t s);
+/// (tests) mv_heads's short-row form (MAYA_IQ_MV_RW: rows of at most 16 sub-blocks packed 2 or 4 a warp, the same
+/// bits): 1 / 0 on / off whatever the environment, -1 back to MAYA_IQ_MV_RW (default: on with gfx1100)
+void set_mv_rows(int on);
+/// (tests) whether mv_heads packs short rows on the current GPU now (set_mv_rows, else MAYA_IQ_MV_RW, else gfx1100)
+bool mv_rows_on();
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'
@@ -176,4 +189,4 @@ bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* 
 bool persist_on();
 void set_persist(int on);
 
-}  // namespace strata::ds4::gguf::iq
+}  // namespace maya::ds4::gguf::iq

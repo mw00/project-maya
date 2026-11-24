@@ -1,39 +1,39 @@
-// src/core/verify.cpp - see include/strata/core/verify.hpp.
-#include "strata/core/verify.hpp"
+// src/core/verify.cpp - see include/maya/core/verify.hpp.
+#include "maya/core/verify.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
 
-#include "strata/core/native_head.hpp"
-#include "strata/core/on_device.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/native_router.hpp"
-#include "strata/kernels/native_moe.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/cvec.hpp"
-#include "strata/kernels/gr.hpp"
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/native_qsa.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
-#include "strata/kernels/native_rope.hpp"
-#include "strata/kernels/ngram.hpp"
-#include "strata/kernels/ple.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/qsa_select.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/rope.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/sampler.hpp"
-#include "strata/core/progress.hpp"
-#include "strata/kernels/shared_expert.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+#include "maya/core/native_head.hpp"
+#include "maya/core/on_device.hpp"
+#include "maya/kernels/iq_kernels.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/bf16_gemv.hpp"
+#include "maya/kernels/native_router.hpp"
+#include "maya/kernels/native_moe.hpp"
+#include "maya/kernels/cpu/expert.hpp"
+#include "maya/kernels/elementwise.hpp"
+#include "maya/kernels/fused_gr.hpp"
+#include "maya/kernels/cvec.hpp"
+#include "maya/kernels/gr.hpp"
+#include "maya/kernels/kv_q4.hpp"
+#include "maya/kernels/kv_q8.hpp"
+#include "maya/kernels/native_mmvq.hpp"
+#include "maya/kernels/native_qsa.hpp"
+#include "maya/kernels/native_qsa_indexer.hpp"
+#include "maya/kernels/native_rope.hpp"
+#include "maya/kernels/ngram.hpp"
+#include "maya/kernels/ple.hpp"
+#include "maya/kernels/qsa.hpp"
+#include "maya/kernels/qsa_decode_attn.hpp"
+#include "maya/kernels/qsa_select.hpp"
+#include "maya/kernels/quantize_act.hpp"
+#include "maya/kernels/rope.hpp"
+#include "maya/kernels/s2_expert_grouped.hpp"
+#include "maya/kernels/sampler.hpp"
+#include "maya/core/progress.hpp"
+#include "maya/kernels/shared_expert.hpp"
+#include "maya/kernels/verify_kernels.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -46,15 +46,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include "strata/platform/cpu_relax.hpp"
+#include "maya/platform/cpu_relax.hpp"
 
-namespace strata::core {
+namespace maya::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
-const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+const bool g_dbg = std::getenv("MAYA_VERIFY_DEBUG") != nullptr;
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
 struct Bump {
@@ -73,8 +73,8 @@ bool mapped(size_t bytes, void** h, void** d) {
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
 
-strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+maya::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
+    maya::kernels::QsaShapes s = maya::kernels::qsa_real_shapes();
     s.n_head = g.n_head;
     s.n_head_kv = g.n_head_kv;
     s.head_dim = g.head_dim;
@@ -143,8 +143,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
-    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
-        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
+    if (max_t < 2 || max_t > maya::kernels::kVerifyMaxT || max_t > maya::kernels::cpu::MAXT) {
+        err = "verify: the window must hold 2.." + std::to_string(maya::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
@@ -156,7 +156,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: " + why + " (the verify window reproduces the default native decode path)";
         return false;
     }
-    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
+    if (!maya::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
         g.ssm_d_conv != 4) {
         err = "verify: geometry differs from the artifact's";
         return false;
@@ -171,23 +171,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
 
-    const strata::kernels::QsaShapes s = shapes_of(g);
-    cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    const maya::kernels::QsaShapes s = shapes_of(g);
+    cap_ = maya::kernels::qsa_selection_width(maya::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[0].max_cells / s.idx_block + 2;
-    attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    attn_scratch_floats_ = (int64_t) maya::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
-    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t HS = (uint64_t) maya::kernels::NG_HIST * maya::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
-              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
+              mapped(T * maya::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
@@ -226,13 +226,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     // ---- the device arena: the same sequence counted, then carved
     auto carve = [&](Bump& b) {
-        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * maya::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
+        xq_ = b.take<uint8_t>(maya::kernels::native_q8_1_bytes(max_in, (int) T));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -247,12 +247,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * maya::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            maya::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+            maya::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -266,7 +266,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     cudaMemset(arena_, 0, count.used);
-    prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    prof_on_ = std::getenv("MAYA_VERIFY_PROFILE") != nullptr;
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
@@ -286,10 +286,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
-    // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
+    // E-6: a layer whose routed experts are all resident is planned on the device (MAYA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
-        const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+        const char* v = std::getenv("MAYA_VERIFY_DEVICE_PLAN");
         device_plan_ = v != nullptr && std::atoi(v) != 0;
     }
     if (device_plan_) {
@@ -335,7 +335,7 @@ bool Verifier::read_head_logits(int rows, float* host, std::string& err) {
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
 bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
     SessionState& ss = *ss_;
@@ -351,7 +351,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2) ? 2 : 1;
-    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool dec_batch = [] { const char* v = std::getenv("MAYA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
@@ -512,7 +512,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
-                // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
+                // window's rows each - row-wise identical arithmetic (MAYA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
@@ -618,7 +618,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
-        // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
+        // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (MAYA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
@@ -662,7 +662,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
         }
-        if (strata::kernels::cpu::expert_layout().native)
+        if (maya::kernels::cpu::expert_layout().native)
             quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
         else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
@@ -693,21 +693,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const unsigned long long* p_ptr2 = p_ptr + capx;
         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
         float* hit_out = hit_out_ + (size_t) tb * K * N;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = maya::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) -> bool {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.u_type, f.d_type, f.n_embd, f.n_ff);
+                return native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,   // glm-dsa B3.5: false, no std::exit
+                                             nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
             }
+            return true;   // glm-dsa B3.5: launched
         };
-        grouped(p_ptr, p_start, p_counts);
+        if (!grouped(p_ptr, p_start, p_counts)) {   // (the PCIe call below has the same types: it cannot fail then)
+            err = "verify layer " + std::to_string(l) + ": no device kernel for its expert types";
+            return false;
+        }
         stamp(l, 20, grp);
         if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
         else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
@@ -852,8 +856,8 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-#if !defined(STRATA_USE_HIP)   // a CUDA debug listing (node types, kernel names)
-    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
+#if !defined(MAYA_USE_HIP)   // a CUDA debug listing (node types, kernel names)
+    if (std::getenv("MAYA_VERIFY_NODES") != nullptr) {   // what the window graph holds
         size_t nn = 0;
         cudaGraphGetNodes(graph, nullptr, &nn);
         std::vector<cudaGraphNode_t> nodes(nn);
@@ -901,7 +905,7 @@ bool Verifier::capture(int T, std::string& err) {
 
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
@@ -967,7 +971,7 @@ bool Verifier::capture_commit(std::string& err) {
 
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
-    using namespace strata::kernels;
+    using namespace maya::kernels;
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     const ModelGeometry& g = *g_;
@@ -979,7 +983,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // 1 that (the default on Windows + HIP), 2 before every window (a diagnosis arm)
     static const int sync_mode = [] {
         if (const char* v = std::getenv("MAYA_QWEN_SYNC")) return std::atoi(v);
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
         return 1;
 #else
         return 0;
@@ -1039,7 +1043,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
         while (*seq < want) {
-            strata_cpu_pause();
+            maya_cpu_pause();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -1065,7 +1069,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         VDBG("layer %lld served\n", (long long) l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        strata_store_fence();
+        maya_store_fence();
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -1126,7 +1130,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
-    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
+    if (static const bool dbg = std::getenv("MAYA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
             std::vector<float> h((size_t) T * (size_t) n_vocab_);
@@ -1163,7 +1167,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.start2 = base + ptr_off + 4 * cap;
     const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
+    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * maya::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }
 
@@ -1200,7 +1204,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
 
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
-    strata_store_fence();
+    maya_store_fence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
@@ -1226,4 +1230,4 @@ bool Verifier::commit(int n_keep, std::string& err) {
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

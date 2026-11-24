@@ -1,7 +1,7 @@
 // The expert cache's lendable arena (the on-demand vision encoder): its tail is given back to the driver - the free
 // VRAM grows by what was lent - the slots before it keep their bytes, and once mapped again at the same addresses and
 // refilled every slot holds its expert.  A HIP build (one allocation) must refuse to lend.  Needs a GPU (77: none).
-#include "strata/core/expert_cache.hpp"
+#include "maya/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
 
@@ -33,17 +33,17 @@ int main() {
     }
     std::vector<int64_t> sizes;
     for (int i = 0; i < 256; ++i) sizes.push_back(((int64_t) 1 << 20) + (int64_t) i * 4096 + 100);   // ~1.4 MB each
-    strata::core::ExpertCache c;
+    maya::core::ExpertCache c;
     std::string err;
     c.set_lendable(true);
     expect(c.open_sized(sizes, 8, 32, err), "open_sized", err);
     if (fails) return 1;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     uint64_t from = 0, given = 0;
     expect(!c.lendable() && c.lendable_bytes(0) == 0, "a HIP build keeps one allocation");
     expect(!c.lend_tail(1 << 20, 0, from, given, err) && given == 0, "a HIP build cannot lend");
     expect(c.reclaim_tail(err) && !c.lent(), "nothing to reclaim");
-    strata::core::LendableArena a;
+    maya::core::LendableArena a;
     expect(!a.open(1 << 20, err) && !a.ok() && a.lendable_bytes(0) == 0, "a HIP build has no lendable arena");
     std::printf(fails ? "FAILED\n" : "ok (HIP: no lending)\n");
     return fails ? 1 : 0;
@@ -122,7 +122,7 @@ int main() {
     }
     // a plain arena (the draft layer's experts): its tail goes back, the head keeps its bytes, the same address after
     {
-        strata::core::LendableArena a;
+        maya::core::LendableArena a;
         const uint64_t ab = ((uint64_t) 130 << 20) + 12345;
         expect(a.open(ab, err) && a.ok() && a.lendable_bytes(0) >= ab, "an arena", err);
         std::vector<uint8_t> h((size_t) ab), back((size_t) ab);

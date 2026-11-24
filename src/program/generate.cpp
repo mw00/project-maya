@@ -14,58 +14,61 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
-#include "strata/core/expert_cache.hpp"
-#include "strata/platform/env_alias.hpp"
-#include "strata/platform/idle_gate.hpp"
-#include "strata/platform/env_report.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/core/expert_source.hpp"
-#include "strata/core/remote_experts.hpp"
-#include "strata/core/on_device.hpp"
-#include "strata/core/layer.hpp"
-#include "strata/core/layout.hpp"
-#include "strata/core/session.hpp"
-#include "strata/core/weights.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/pool.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/ngram.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/sampler.hpp"
-#include "strata/kernels/verify_kernels.hpp"
-#include "strata/kernels/shared_expert.hpp"
-#include "strata/kernels/native_moe.hpp"
-#include "strata/kernels/native_gdn.hpp"
-#include "strata/kernels/native_router.hpp"
-#include "strata/kernels/native_qsa.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
-#include "strata/kernels/native_rope.hpp"
-#include "strata/kernels/mrope.hpp"
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/core/native_head.hpp"
-#include "strata/core/verify.hpp"
-#include "strata/core/mtp.hpp"
-#include "strata/prefill/prefill.hpp"
-#include "strata/prefill/failure.hpp"
-#include "strata/core/native_dense.hpp"
-#include "strata/core/glm_model.hpp"
-#include "strata/core/mtp_rows.hpp"
-#include "strata/core/split_groups.hpp"
-#include "strata/core/prefix_cut.hpp"
-#include "strata/core/prefill_pieces.hpp"
-#include "strata/core/prefill_gaps.hpp"
-#include "strata/core/vram_mark.hpp"
-#include "strata/program/logits_selection.hpp"
-#include "strata/program/conv_cache.hpp"
-#include "strata/spec/draft_policy.hpp"
-#include "strata/spec/suffix_drafter.hpp"
-#include "strata/kernels/cvec.hpp"
-#include "strata/core/progress.hpp"
+#include "maya/core/expert_cache.hpp"
+#include "maya/platform/env_alias.hpp"
+#include "maya/platform/idle_gate.hpp"
+#include "maya/platform/env_report.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/core/expert_source.hpp"
+#include "maya/core/remote_experts.hpp"
+#include "maya/core/on_device.hpp"
+#include "maya/core/layer.hpp"
+#include "maya/core/layout.hpp"
+#include "maya/core/session.hpp"
+#include "maya/core/weights.hpp"
+#include "maya/kernels/cpu/expert.hpp"
+#include "maya/kernels/cpu/pool.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/ngram.hpp"
+#include "maya/kernels/s2_expert_grouped.hpp"
+#include "maya/kernels/sampler.hpp"
+#include "maya/kernels/verify_kernels.hpp"
+#include "maya/kernels/shared_expert.hpp"
+#include "maya/kernels/native_moe.hpp"
+#include "maya/kernels/native_gdn.hpp"
+#include "maya/kernels/native_router.hpp"
+#include "maya/kernels/native_qsa.hpp"
+#include "maya/kernels/native_qsa_indexer.hpp"
+#include "maya/kernels/native_rope.hpp"
+#include "maya/kernels/mrope.hpp"
+#include "maya/kernels/kv_q4.hpp"
+#include "maya/kernels/qsa.hpp"
+#include "maya/core/native_head.hpp"
+#include "maya/core/verify.hpp"
+#include "maya/core/mtp.hpp"
+#include "maya/prefill/prefill.hpp"
+#include "maya/prefill/failure.hpp"
+#include "maya/core/native_dense.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/mtp_rows.hpp"
+#include "maya/core/split_groups.hpp"
+#include "maya/core/prefix_cut.hpp"
+#include "maya/core/prefill_pieces.hpp"
+#include "maya/core/prefill_gaps.hpp"
+#include "maya/core/vram_mark.hpp"
+#include "maya/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
+#include "maya/core/glm_prompt_cache.hpp"   // glm-dsa B14.14
+#include "maya/core/glm_req_knobs.hpp"   // glm-dsa request knobs
+#include "maya/program/logits_selection.hpp"
+#include "maya/program/conv_cache.hpp"
+#include "maya/spec/draft_policy.hpp"
+#include "maya/spec/suffix_drafter.hpp"
+#include "maya/kernels/cvec.hpp"
+#include "maya/core/progress.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
 #endif
-#include "strata/artifact/gguf_reader.hpp"
+#include "maya/artifact/gguf_reader.hpp"
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -105,16 +108,16 @@
 #include <vector>
 
 namespace {
-// perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+// perf-review D-4: the lent slots are refilled with queued copies and one wait; MAYA_REFILL_BLOCKING=1 waits on each
 bool refill_blocking() {
-    static const bool v = std::getenv("STRATA_REFILL_BLOCKING") != nullptr;
+    static const bool v = std::getenv("MAYA_REFILL_BLOCKING") != nullptr;
     return v;
 }
 
-// The bytes the on-demand vision encoder needs on the first GPU (what the server measured, STRATA_GLM_VISION_LEND_MB
+// The bytes the on-demand vision encoder needs on the first GPU (what the server measured, MAYA_GLM_VISION_LEND_MB
 // - the variable is named for the engine that had it first); 0 = no on-demand encoder.
 uint64_t vision_lend_need() {
-    const char* v = std::getenv("STRATA_GLM_VISION_LEND_MB");
+    const char* v = std::getenv("MAYA_GLM_VISION_LEND_MB");
     return v != nullptr && std::atoll(v) > 0 ? (uint64_t) std::atoll(v) << 20 : 0;
 }
 
@@ -271,8 +274,16 @@ struct Options {
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
-    std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as STRATA_GLM_PREFILL)
-    std::string dflash;                ///< `--dflash`: a DFlash2 draft GGUF for the GLM engine (STRATA_GLM_DFLASH)
+    std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as MAYA_GLM_PREFILL)
+    std::string dflash;                ///< `--dflash`: a DFlash2 draft GGUF for the GLM engine (MAYA_GLM_DFLASH)
+    // --ablate (the GLM engine): a control vector's direction projected out of every residual write
+    // (src/core/glm_ablate.hpp); --ablate-layer N its direction.N, --ablate-scale F its strength (0: the file's
+    // maya.ablate.scale, else 1); --ablate-default on|off: whether a conversation projects it until a request's
+    // GEN ablate=0|1 says otherwise (on: as a startup flag; the server starts engines with off)
+    std::string ablate;
+    int ablate_layer = 0;
+    float ablate_scale = 0.0f;
+    bool ablate_default = true;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -289,7 +300,7 @@ struct Options {
     /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
     std::string spec_oracle;
-    std::string spec_follow, spec_follow_save;   // --glm-pack: STRATA_GLM_SPEC_FOLLOW / _SAVE (glm_pack_generate)
+    std::string spec_follow, spec_follow_save;   // --glm-pack: MAYA_GLM_SPEC_FOLLOW / _SAVE (glm_pack_generate)
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
@@ -346,11 +357,11 @@ struct Options {
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
-    /// pay (strata/spec/draft_policy.hpp).  On by default; 0 = MTP only.
+    /// pay (maya/spec/draft_policy.hpp).  On by default; 0 = MTP only.
     int suffix_draft = 3;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
-    /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
+    /// A control vector on the residual stream (maya/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
     std::vector<std::pair<std::string, float>> cvec_files;
@@ -394,6 +405,10 @@ void usage() {
                  "  --parallel N         --serve: up to N requests decode at once (1-8, default 1). One GPU decodes\n"
                  "                       them together (each weight read once for all); a split pipelines them\n"
                  "                       across its cards. Each extra conversation keeps its own context state\n"
+                 "  --ablate GGUF        (--glm-pack) refusal ablation: a control vector's direction (direction.N,\n"
+                 "                       F32 [n_embd]) projected out of every layer's mixer and FFN writes\n"
+                 "                       [--ablate-layer N] [--ablate-scale F] [--ablate-default on|off]\n"
+                 "                       (--serve: GEN ablate=0|1 per request; default on)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard)\n"
@@ -556,7 +571,7 @@ std::vector<std::string> model_shards(const std::string& first) {
 std::string shard_with(const std::string& first, const char* tensor) {
     for (const auto& p : model_shards(first)) {
         try {
-            strata::GgufFile f(p);
+            maya::GgufFile f(p);
             for (const auto& t : f.tensors())
                 if (t.name == tensor) return p;
         } catch (const std::exception&) {
@@ -587,7 +602,7 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
 struct Drive {
-    strata::core::ExpertDispatch d;
+    maya::core::ExpertDispatch d;
     double cpu_ms = 0;
     int64_t calls = 0;
     /// THE ROUTING TRACE, which is P0.S8 and a stated prerequisite of Phase 3.  `drive_pool` is called once
@@ -601,7 +616,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
                 float* out) {
     Drive* t = (Drive*) user;
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
+    maya::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
     // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
@@ -632,7 +647,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
+    maya::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
@@ -657,7 +672,7 @@ struct SplitDrive {
     Drive* base = nullptr;
     int n = 0;                                    ///< stages
     int64_t end[kMax] = {};                       ///< stage i runs the layers from end[i - 1] (0) below end[i]
-    strata::core::GpuPlanSink* plan[kMax] = {};
+    maya::core::GpuPlanSink* plan[kMax] = {};
     const uint8_t* cache_base[kMax] = {};
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
@@ -682,16 +697,16 @@ struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
-    strata::core::WeightTable wt;
-    strata::core::NativeDense dense;
-    strata::core::NativeHead head;
-    strata::core::SessionState ss;
+    maya::core::WeightTable wt;
+    maya::core::NativeDense dense;
+    maya::core::NativeHead head;
+    maya::core::SessionState ss;
     cudaStream_t stream = nullptr;
-    strata::core::ExpertCache cache;
+    maya::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
-    strata::core::Verifier ver;
-    strata::prefill::Prefill sp;
+    maya::core::Verifier ver;
+    maya::prefill::Prefill sp;
     cudaStream_t adapt_stream = nullptr;
     cudaEvent_t adapt_ev = nullptr;
     bool adapt_live = false;                             ///< swaps of this request are in flight on it
@@ -743,18 +758,18 @@ MemSample mem_sample() {
 }
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
-    strata::core::Progress& p = strata::core::progress();
+    maya::core::Progress& p = maya::core::progress();
     std::fprintf(f, "maya serve: stall report (engine %s): stage \"%s %lld\" for %lld s; %llu layers served since the "
-                    "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, p.where.load(),
-                 (long long) p.detail.load(), (long long) ((strata::core::progress_now_ms() - p.since_ms.load()) / 1000),
+                    "last finished step (0 = stopped, more = slow)\n", MAYA_VERSION, p.where.load(),
+                 (long long) p.detail.load(), (long long) ((maya::core::progress_now_ms() - p.since_ms.load()) / 1000),
                  (unsigned long long) layers_during);
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             std::fprintf(f, "  2 s later:\n");
         }
-        if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
-        if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
+        if (auto fn = maya::core::diag_pool_fn().load()) fn(f);
+        if (auto fn = maya::core::diag_verify_fn().load()) fn(f);
         const MemSample m = mem_sample();
         std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
                      m.commit_mib,
@@ -788,16 +803,16 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 #endif
 }
 
-// issue #29: a request whose heartbeat (tokens, prompt chunks or layers, verify windows) stops for STRATA_WATCHDOG_S
+// issue #29: a request whose heartbeat (tokens, prompt chunks or layers, verify windows) stops for MAYA_WATCHDOG_S
 // seconds (default_s when unset; 0 = off) is stuck on a flag nobody will raise - end the engine with where it was, so
 // the server starts it again instead of the GPU spinning forever.  Issue #31: before it does, it reports what every
 // part was doing (stall_report), so one occurrence says where the wait is.  Issue #40: the GLM serve has it too.
 void start_serve_watchdog(int default_s) {
-    const char* ws = std::getenv("STRATA_WATCHDOG_S");
+    const char* ws = std::getenv("MAYA_WATCHDOG_S");
     const int limit = ws ? std::atoi(ws) : default_s;
     if (limit <= 0) return;
     std::thread([limit] {
-        strata::core::Progress& p = strata::core::progress();
+        maya::core::Progress& p = maya::core::progress();
         uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
         auto since = std::chrono::steady_clock::now();
         for (;;) {
@@ -818,9 +833,9 @@ void start_serve_watchdog(int default_s) {
     }).detach();
 }
 
-/// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
+/// MAYA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
-    static const bool on = std::getenv("STRATA_TRACE") != nullptr;
+    static const bool on = std::getenv("MAYA_TRACE") != nullptr;
     if (!on) return;
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -871,18 +886,18 @@ struct ConvStateSizes {
     size_t gdn = 0, ple = 0, tail = 0;
 };
 
-ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
+ConvStateSizes conv_state_sizes(const maya::core::ModelGeometry& g) {
     ConvStateSizes z;
     z.gdn = (size_t) g.n_gdn_layers() *
             ((size_t) g.ssm_state_size * (size_t) g.ssm_v_heads * (size_t) g.ssm_state_size +
              (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1)) * sizeof(float);
-    z.ple = (size_t) strata::kernels::NG_HIST * (size_t) strata::kernels::NG_HC_DIM * sizeof(float);
-    z.tail = (size_t) (strata::kernels::qsa_real_shapes().idx_block - 1) * (size_t) g.idx_key_dim * sizeof(float);
+    z.ple = (size_t) maya::kernels::NG_HIST * (size_t) maya::kernels::NG_HC_DIM * sizeof(float);
+    z.tail = (size_t) (maya::kernels::qsa_real_shapes().idx_block - 1) * (size_t) g.idx_key_dim * sizeof(float);
     return z;
 }
 
 /// Copies the running state out.  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_save(ConvCheckpoint& c, const maya::core::SessionState& ss, const maya::core::ModelGeometry& g) {
     const ConvStateSizes z = conv_state_sizes(g);
     c.gdn.resize(z.gdn);
     c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
@@ -898,7 +913,7 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
-bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_restore(const ConvCheckpoint& c, maya::core::SessionState& ss, const maya::core::ModelGeometry& g) {
     const ConvStateSizes z = conv_state_sizes(g);
     if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
     if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
@@ -918,23 +933,23 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
-bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary, std::string& err) {
+bool load_control_vectors(const Options& o, const maya::core::ModelGeometry& g, std::string& summary, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
     for (const auto& [path, scale] : o.cvec_files) {
         try {
-            strata::GgufFile f(path);
-            const strata::MetaValue* arch = f.get("general.architecture");
+            maya::GgufFile f(path);
+            const maya::MetaValue* arch = f.get("general.architecture");
             if (arch == nullptr || arch->s != "controlvector") {
                 err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
                 return false;
             }
-            const strata::MetaValue* hint = f.get("controlvector.model_hint");
+            const maya::MetaValue* hint = f.get("controlvector.model_hint");
             if (hint != nullptr && hint->s != "qwen4exp")
                 std::fprintf(stderr, "maya generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
             int found = 0;
-            for (const strata::TensorInfo& t : f.tensors()) {
+            for (const maya::TensorInfo& t : f.tensors()) {
                 if (t.name.rfind("direction.", 0) != 0) continue;
                 const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
                 if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
@@ -980,7 +995,7 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         ++steered;
     }
     if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
+    if (!maya::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
     summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
@@ -1031,7 +1046,7 @@ double probe_pcie_h2d_gbps() {
 // NOT wired here yet, and refused rather than approximated: prompt-prefix reuse and per-request
 // state continuity across GEN lines (each GEN starts a fresh sequence), drafts,
 // the batched prompt path (the prompt runs one token at a time), images, control vectors and
-// layer splits.  Sampling is the engine's own sampler (strata::kernels::sample_tokens, greedy by
+// layer splits.  Sampling is the engine's own sampler (maya::kernels::sample_tokens, greedy by
 // default), so the top-k/top-p/temperature chain behaves exactly as in the qwen4exp path - the
 // penalties too (#273): the request's history (its prompt, then what it wrote) rides in
 // SamplerParams::host_history, and every pick counts its last penalty_last_n tokens
@@ -1050,7 +1065,7 @@ static void set_env(const char* k, const char* v) {
 #endif
 }
 
-// A failure in the request's own work - an allocation, a launch - is thrown (strata/prefill/failure.hpp) and
+// A failure in the request's own work - an allocation, a launch - is thrown (maya/prefill/failure.hpp) and
 // caught here: it ends this request with an error, not the process.  The engine lives and the next request runs.
 template <typename F>
 static bool guarded(F&& f, std::string& err) {
@@ -1078,7 +1093,7 @@ static bool cuda_context_broken(const std::string& why) {
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
-    // aside (STRATA_GLM_SLOT_KEEP).  A SIGTERM to the whole process group (systemd stopping a service, a supervisor
+    // aside (MAYA_GLM_SLOT_KEEP).  A SIGTERM to the whole process group (systemd stopping a service, a supervisor
     // killing the server's group) must not end it mid-write; a server that is already gone must not end it with
     // SIGPIPE when it writes its last lines.
     if (o.serve) {
@@ -1094,27 +1109,36 @@ static int glm_pack_generate(const Options& o) {
         std::signal(SIGBREAK, SIG_IGN);
     }
 #endif
-    strata::core::Glm5Model model;
+    maya::core::Glm5Model model;
     std::string err;
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
-    // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
-    if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
-    // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
-    if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
-    // --spec-follow / --spec-follow-save (else STRATA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
-    if (!o.spec_follow.empty()) set_env("STRATA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
-    if (!o.spec_follow_save.empty()) set_env("STRATA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
+    // (the engine reads it as MAYA_GLM_PREFILL; without either, auto)
+    if (!o.prefill_arg.empty()) set_env("MAYA_GLM_PREFILL", o.prefill_arg.c_str());
+    // the DFlash2 drafter (--dflash, else MAYA_GLM_DFLASH): loaded with the model, on the device of its head
+    if (!o.dflash.empty()) set_env("MAYA_GLM_DFLASH", o.dflash.c_str());
+    // --spec-follow / --spec-follow-save (else MAYA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
+    if (!o.spec_follow.empty()) set_env("MAYA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
+    if (!o.spec_follow_save.empty()) set_env("MAYA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
     // the expert profile (Strata's profile.bin: setup passes data/expert-profile-glm.bin) and the routing trace
     // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other
     if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
-    if (!o.dump_routing.empty() && !strata::core::Glm5Model::set_routing_dump(o.dump_routing, err)) {
+    if (!o.dump_routing.empty() && !maya::core::Glm5Model::set_routing_dump(o.dump_routing, err)) {
         std::fprintf(stderr, "maya generate: --dump-routing: %s\n", err.c_str());
         return 1;
     }
-    // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
+    // the layer split across the visible GPUs: MAYA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
         return 1;
+    }
+    // --ablate: the direction on every part (src/core/glm_ablate.hpp), each conversation by --ablate-default until a
+    // request says otherwise
+    if (!o.ablate.empty()) {
+        if (!model.ablate_load(o.ablate, o.ablate_layer, o.ablate_scale, o.ablate_default, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "%s (default %s)\n", model.ablate_what().c_str(), o.ablate_default ? "on" : "off");
     }
     const int64_t n_vocab = model.geometry().n_vocab;
     // the driver samples on the device (sample_token), so the fast path never downloads the logits
@@ -1133,6 +1157,8 @@ static int glm_pack_generate(const Options& o) {
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
                     model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(),
                     model.cpu_lane_threads_max(), model.pcie_share());
+        if (model.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
+            std::printf("INFO ablate=1 ablate_default=%d\n", o.ablate_default ? 1 : 0);
         // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
         // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
         for (const auto& r : model.vram_report())
@@ -1155,7 +1181,7 @@ static int glm_pack_generate(const Options& o) {
         }
     }
 
-    strata::kernels::SamplerParams sp;
+    maya::kernels::SamplerParams sp;
     sp.greedy = o.greedy;
     sp.top_k = o.top_k;
     sp.top_p = o.top_p;
@@ -1164,17 +1190,17 @@ static int glm_pack_generate(const Options& o) {
 
     const std::vector<int64_t> glm_eos = {154820, 154827, 154829};
     const std::vector<int64_t>& eos = o.eos_given ? o.eos_ids : glm_eos;
-    // STRATA_GLM_KL_DUMP=<file>,<n> (a test of the K/V cache formats): --tokens-file's tokens teacher-forced - all but
+    // MAYA_GLM_KL_DUMP=<file>,<n> (a test of the K/V cache formats): --tokens-file's tokens teacher-forced - all but
     // the last n through the prompt path, those n one at a time through the decode - and the logits after each of the
     // n into file (n x n_vocab F32: row i predicts token size - n + i + 1)
-    if (const char* kd = std::getenv("STRATA_GLM_KL_DUMP")) {
+    if (const char* kd = std::getenv("MAYA_GLM_KL_DUMP")) {
         const std::string spec(kd);
         const size_t c = spec.rfind(',');
         const std::string path = spec.substr(0, c);
         const int64_t n = c == std::string::npos ? 64 : std::atoll(spec.c_str() + c + 1);
         const auto& t = o.tokens;
         if (n <= 0 || (int64_t) t.size() <= n) {
-            std::fprintf(stderr, "maya generate: STRATA_GLM_KL_DUMP needs more than %lld tokens\n", (long long) n);
+            std::fprintf(stderr, "maya generate: MAYA_GLM_KL_DUMP needs more than %lld tokens\n", (long long) n);
             return 2;
         }
         model.set_host_logits(true);
@@ -1215,21 +1241,21 @@ static int glm_pack_generate(const Options& o) {
     // PAUSE (the server's fair slices): STOP, and the conversation's state is kept with what the request wrote (the
     // snapshot moves to the last token fed), so the request that continues it reads only its last token
     std::atomic<bool> pause_req{false}, pause_keep{false};
-    // several conversations at once (STRATA_GLM_SEQS): STOP <rid> / PAUSE <rid> [keep] for one request; the request
+    // several conversations at once (MAYA_GLM_SEQS): STOP <rid> / PAUSE <rid> [keep] for one request; the request
     // whose prompt is being read stops at the next chunk
     std::mutex ctl_mu;
     std::map<int, int> ctl;   // rid -> 1 STOP, 2 PAUSE, 3 PAUSE keep
     std::atomic<int> admitting_rid{-1};
-    // STRATA_GLM_PREFILL_INTERLEAVE (strata/core/prefill_pieces.hpp): the other requests decode between the pieces of
+    // MAYA_GLM_PREFILL_INTERLEAVE (maya/core/prefill_pieces.hpp): the other requests decode between the pieces of
     // a prompt being read, so a STOP / PAUSE for the request being admitted stops its read alone (admit_stop) - not
     // stop_req, which every decoding request reads as its own.  Off: stop_req as before (nothing decodes meanwhile)
-    static const strata::core::PrefillInterleave interleave =
-        strata::core::prefill_interleave_parse(std::getenv("STRATA_GLM_PREFILL_INTERLEAVE"));
-    // STRATA_GLM_PREFILL_GAPS (strata/core/prefill_gaps.hpp): the other requests decode at the chunk boundaries of a
+    static const maya::core::PrefillInterleave interleave =
+        maya::core::prefill_interleave_parse(std::getenv("MAYA_GLM_PREFILL_INTERLEAVE"));
+    // MAYA_GLM_PREFILL_GAPS (maya/core/prefill_gaps.hpp): the other requests decode at the chunk boundaries of a
     // prompt being read (one call, its chunks pipelined as without) - like interleave, a STOP for the request being
     // read stops its read alone.  Over interleave when both are set.
-    static const strata::core::PrefillGaps read_gaps =
-        strata::core::prefill_gaps_parse(std::getenv("STRATA_GLM_PREFILL_GAPS"));
+    static const maya::core::PrefillGaps read_gaps =
+        maya::core::prefill_gaps_parse(std::getenv("MAYA_GLM_PREFILL_GAPS"));
     std::atomic<bool> admit_stop{false};
     const auto read_stopped = [&] { return stop_req.load() || admit_stop.load(); };
     std::mutex in_mu;
@@ -1264,7 +1290,7 @@ static int glm_pack_generate(const Options& o) {
                 }
             };
             while (getline_fd(l)) {
-                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
+                maya::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 if (l.rfind("STOP ", 0) == 0 || (l.rfind("PAUSE ", 0) == 0 && l != "PAUSE keep")) {
@@ -1328,6 +1354,9 @@ static int glm_pack_generate(const Options& o) {
     int32_t req_think_end = -1;
     // the request's logit_bias (GEN key logit_bias=<id>:<bias>,...): added to its logits before every sample
     std::vector<std::pair<int32_t, float>> req_bias;
+    // the request's ablate=0|1 (GEN key; -1: --ablate-default) and whether it projects the --ablate direction
+    int req_abl = -1;
+    const auto abl_req = [&]() { return model.ablate_loaded() && (req_abl >= 0 ? req_abl != 0 : o.ablate_default); };
     uint64_t snap_img_hash = 1469598103934665603ull;
     const auto img_hash = [&](size_t len) {
         uint64_t h = 1469598103934665603ull;   // FNV-1a over the positions and rows inside [0, len)
@@ -1342,11 +1371,11 @@ static int glm_pack_generate(const Options& o) {
     // CONVERSATION SLOTS (the fast path): a request that does not continue the conversation in the model first sets
     // that conversation aside in a file (Glm5Model::slot_save: its snapshot and DSA caches), then takes back the slot
     // it does continue (slot_load) - chats, and an agent's side requests, that interleave no longer re-read each
-    // other's prompts.  STRATA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of STRATA_GLM_SLOT_MIN tokens
-    // or more (1024), in STRATA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most STRATA_GLM_SLOT_GB on
+    // other's prompts.  MAYA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of MAYA_GLM_SLOT_MIN tokens
+    // or more (1024), in MAYA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most MAYA_GLM_SLOT_GB on
     // disk (16) and never below 8 GB free.  A conversation with pictures is set aside too: its slot keeps img_hash() of
     // them and is taken back only by a prompt with the same pictures at the same places.  Or the slots
-    // live in RAM and nothing reaches the disk: STRATA_GLM_SLOT_RAM_GB (0, off) caps their bytes there - the states
+    // live in RAM and nothing reaches the disk: MAYA_GLM_SLOT_RAM_GB (0, off) caps their bytes there - the states
     // are host buffers that die with the run, so SLOT_DIR, SLOT_GB (1) and the disk-space guard do not apply.
     // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
     // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
@@ -1368,29 +1397,30 @@ static int glm_pack_generate(const Options& o) {
     uint64_t slot_clock = 0, slot_seq = 0;
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
     const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
-    int slot_max = model.fast() && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
-    const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
-    const uint64_t slot_budget = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
+    int slot_max = model.fast() && getenv("MAYA_GLM_NO_REUSE") == nullptr ? (int) env_num("MAYA_GLM_SLOTS", 4) : 0;
+    if (slot_max > 0 && maya::core::glmpc::engine_on(model)) slot_max = 0;   // glm-dsa B14.14: the prompt cache replaces the slots
+    const size_t slot_min = (size_t) std::max(1.0, env_num("MAYA_GLM_SLOT_MIN", 1024));
+    const uint64_t slot_budget = (uint64_t) (env_num("MAYA_GLM_SLOT_GB", 16) * 1073741824.0);
     // slots in RAM: the conversation's state is parked in a host buffer instead of a file.  The cap moves to RAM too
     // (slot_cap below); the states die with the run, so SLOT_KEEP, SLOT_DAYS, SLOT_DIR and the 8 GB-free disk guard
     // are theirs no longer.  Nothing on the disk is touched: in RAM mode the slots folder is neither used nor wiped.
-    const bool slot_ram = env_num("STRATA_GLM_SLOT_RAM_GB", 0) > 0;
+    const bool slot_ram = env_num("MAYA_GLM_SLOT_RAM_GB", 0) > 0;
     const uint64_t slot_cap =
-        slot_ram ? (uint64_t) (env_num("STRATA_GLM_SLOT_RAM_GB", 16) * 1073741824.0) : slot_budget;
-    // STRATA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
+        slot_ram ? (uint64_t) (env_num("MAYA_GLM_SLOT_RAM_GB", 16) * 1073741824.0) : slot_budget;
+    // MAYA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
     // and kept when they belong to this model), the conversation in the model is set aside when the engine ends
-    // (QUIT or end of input), and a file not used for STRATA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
+    // (QUIT or end of input), and a file not used for MAYA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
     // .meta beside it: this model's identity, the conversation's tokens and the slot's size; a slot whose .meta is
     // missing, foreign or does not match its file is deleted.  Both files are written under a temporary name first.
-    const bool slot_keep = getenv("STRATA_GLM_SLOT_KEEP") != nullptr && std::atoi(getenv("STRATA_GLM_SLOT_KEEP")) != 0;
-    const double slot_days = env_num("STRATA_GLM_SLOT_DAYS", 7);
+    const bool slot_keep = getenv("MAYA_GLM_SLOT_KEEP") != nullptr && std::atoi(getenv("MAYA_GLM_SLOT_KEEP")) != 0;
+    const double slot_days = env_num("MAYA_GLM_SLOT_DAYS", 7);
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
     const std::string slot_identity = [&] {
         std::ostringstream id;
-        id << "maya-session-2 engine=" << STRATA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
+        id << "maya-session-2 engine=" << MAYA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
         std::error_code ec;
         for (const char* f : {"index.txt", "dense.bin", "native_experts.txt"})
             id << " " << f << ":" << (unsigned long long) fs::file_size(fs::path(o.glm_pack) / f, ec);
@@ -1459,7 +1489,7 @@ static int glm_pack_generate(const Options& o) {
     if (slot_max > 0 && slot_ram)
         note("slots parked in RAM (" + gb(slot_cap) + " max) - nothing is written to disk, the states die with the run");
     if (slot_max > 0 && !slot_ram) {
-        slot_dir = getenv("STRATA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("STRATA_GLM_SLOT_DIR"))
+        slot_dir = getenv("MAYA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("MAYA_GLM_SLOT_DIR"))
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
@@ -1501,7 +1531,7 @@ static int glm_pack_generate(const Options& o) {
             slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock});
             // a system prompt's state (slot_prefix) goes only as the least recently used, after a restart too: the
             // .meta has no flag for it, its tokens tell (no user turn)
-            slots.back().prefix = strata::core::is_system_prefix(slots.back().tokens, 154827);
+            slots.back().prefix = maya::core::is_system_prefix(slots.back().tokens, 154827);
             slots.back().img = fd.img;
         }
         if (slot_keep) {
@@ -1536,6 +1566,7 @@ static int glm_pack_generate(const Options& o) {
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
+        if (model.ablating()) return;   // (--ablate: a projected conversation is not kept - it is read again)
         // an earlier state of this conversation is superseded (the same pictures: the same tokens with other
         // pictures are another conversation)
         for (size_t i = slots.size(); i-- > 0;)
@@ -1619,7 +1650,7 @@ static int glm_pack_generate(const Options& o) {
     };
     // the longest slot this prompt continues, back in the model: the tokens it covers (0: none)
     const auto slot_take = [&](const std::vector<int32_t>& prompt) -> size_t {
-        if (slot_max <= 0) return 0;
+        if (slot_max <= 0 || abl_req()) return 0;   // (slots hold unprojected states only)
       for (;;) {   // the longest slot this prompt continues; one that will not load (saved by another model layout, a
                    // damaged file) is dropped and the next-longest tried - before, the first failure read the whole
                    // prompt from token 0 although a shorter slot or a checkpoint held most of it
@@ -1673,19 +1704,19 @@ static int glm_pack_generate(const Options& o) {
     // `tag` prefixes the PP / ERR lines ("<rid> " with several conversations at once).
     std::string tag;
     // CONVERSATION CHECKPOINTS (Glm5Model::ckpt_save): besides the snapshot (the last prompt but its last token), up to
-    // STRATA_GLM_CKPTS (4; 0 = none) states of the conversation in the model at earlier positions, in host RAM (~150 MB
+    // MAYA_GLM_CKPTS (4; 0 = none) states of the conversation in the model at earlier positions, in host RAM (~150 MB
     // each with GLM-5.3-Flash): at the end of the system prompt (the first user turn's marker), at the start of the
-    // prompt's last turn (its last user or tool-result marker) and every STRATA_GLM_CKPT_EVERY (16384) fresh prompt
+    // prompt's last turn (its last user or tool-result marker) and every MAYA_GLM_CKPT_EVERY (16384) fresh prompt
     // tokens - only where at least 512 fresh tokens lie before.  A prompt that leaves the conversation before the
     // snapshot's position - an edited or replaced last message, another chat with the same system prompt and tools, a
     // client that rewrote an older turn - restores the longest checkpoint it starts with and reads only the rest,
-    // where it read everything from token 0.  Text prompts only; STRATA_GLM_NO_REUSE turns it off with the rest of the
-    // reuse.  SEVERAL CONVERSATIONS AT ONCE (STRATA_GLM_SEQS > 1) keep them only with STRATA_GLM_MULTI_CKPTS=1 (#711):
+    // where it read everything from token 0.  Text prompts only; MAYA_GLM_NO_REUSE turns it off with the rest of the
+    // reuse.  SEVERAL CONVERSATIONS AT ONCE (MAYA_GLM_SEQS > 1) keep them only with MAYA_GLM_MULTI_CKPTS=1 (#711):
     // each context then has checkpoints of its own conversation.  The model's checkpoint slots are host buffers that
     // take whichever sequence is bound when one is written, and a checkpoint is good only for the sequence whose DSA
     // rows it stood on, so context c owns the slots [c * ckpt_max, (c + 1) * ckpt_max): its list goes in and out with
     // its snapshot (bind_ctx) and ckpt_base is its first slot.  Every context's checkpoints together are at most
-    // kMultiCkptSlots (~150 MB of host RAM each), and the periodic ones stay off there unless STRATA_GLM_CKPT_EVERY is
+    // kMultiCkptSlots (~150 MB of host RAM each), and the periodic ones stay off there unless MAYA_GLM_CKPT_EVERY is
     // set: each one ends a prompt-path call, a pipeline fill on a split, while other conversations wait to decode.
     struct Ckpt {
         std::vector<int32_t> tokens;   // the conversation's first tokens the checkpoint holds the state after (empty: free)
@@ -1694,19 +1725,19 @@ static int glm_pack_generate(const Options& o) {
     std::vector<Ckpt> ckpts;   // the bound context's (several conversations: each context's in turn, see bind_ctx)
     uint64_t ckpt_clock = 0;
     int ckpt_base = 0;         // the bound context's first checkpoint slot in the model (0 with one conversation)
-    const bool multi_ckpts = model.seq_count() > 1 && env_num("STRATA_GLM_MULTI_CKPTS", 0) != 0;
+    const bool multi_ckpts = model.seq_count() > 1 && env_num("MAYA_GLM_MULTI_CKPTS", 0) != 0;
     const int ckpt_max = [&] {
-        if (!model.fast() || getenv("STRATA_GLM_NO_REUSE") != nullptr) return 0;
-        const int want = std::max(0, std::min(16, (int) env_num("STRATA_GLM_CKPTS", 4)));
+        if (!model.fast() || getenv("MAYA_GLM_NO_REUSE") != nullptr) return 0;
+        const int want = std::max(0, std::min(16, (int) env_num("MAYA_GLM_CKPTS", 4)));
         if (model.seq_count() <= 1) return want;
         if (!multi_ckpts) return 0;
         constexpr int kMultiCkptSlots = 32;   // every context's together (~4.8 GB with GLM-5.3-Flash at most)
         return std::min(want, kMultiCkptSlots / model.seq_count());
     }();
     const int64_t ckpt_every =
-        model.seq_count() > 1 && getenv("STRATA_GLM_CKPT_EVERY") == nullptr
+        model.seq_count() > 1 && getenv("MAYA_GLM_CKPT_EVERY") == nullptr
             ? 0
-            : std::max<int64_t>(0, (int64_t) env_num("STRATA_GLM_CKPT_EVERY", 16384));
+            : std::max<int64_t>(0, (int64_t) env_num("MAYA_GLM_CKPT_EVERY", 16384));
     if (multi_ckpts && ckpt_max > 0) {
         const std::string every = ckpt_every > 0 ? " and every " + std::to_string(ckpt_every) + " fresh tokens" : "";
         std::fprintf(stderr, "glm checkpoints: up to %d for each of the %d conversations at once "
@@ -1746,7 +1777,7 @@ static int glm_pack_generate(const Options& o) {
         at.erase(std::unique(at.begin(), at.end()), at.end());
         // at most ckpt_max a prompt, the latest kept (the turn's start, then the ones before it)
         if ((int) at.size() > ckpt_max) at.erase(at.begin(), at.end() - ckpt_max);
-        // every prompt-path call between them must reach its minimum (STRATA_GLM_PREFILL_MIN, 32: fewer go through the
+        // every prompt-path call between them must reach its minimum (MAYA_GLM_PREFILL_MIN, 32: fewer go through the
         // token path, one token at a time): only the piece after the last one may be shorter
         std::vector<size_t> kept;
         for (const size_t p : at)
@@ -1770,8 +1801,11 @@ static int glm_pack_generate(const Options& o) {
         slot_put(" (its system prompt, for other chats that start with it)");
         if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
     };
-    // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
-    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false) {
+    // the state now (after prompt[0, p)) into a free or the least recently used checkpoint (at_pos: the state after
+    // prompt[0, p) for a p the read went past - glm-dsa's positional state, Glm5Model::ckpt_save_at; glm-dsa has no
+    // snapshot buffers to copy either, so a from_snapshot checkpoint there is the position p too)
+    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false,
+                               bool at_pos = false) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
         size_t c = 0;
         for (size_t i = 0; i < ckpts.size(); ++i) {
@@ -1781,7 +1815,10 @@ static int glm_pack_generate(const Options& o) {
         std::string e;
         ckpts[c].tokens.clear();
         const int slot = ckpt_base + (int) c;   // (several conversations: this context's own slots)
-        if (!(from_snapshot ? model.ckpt_save_snapshot(slot, e) : model.ckpt_save(slot, e))) {
+        const bool positional = at_pos || (from_snapshot && model.ckpt_positional());
+        if (!(positional      ? model.ckpt_save_at(slot, (int64_t) p, e)
+              : from_snapshot ? model.ckpt_save_snapshot(slot, e)
+                              : model.ckpt_save(slot, e))) {
             std::fprintf(stderr, "glm checkpoints: not kept at %zu (%s)\n", p, e.c_str());
             return;
         }
@@ -1805,13 +1842,13 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "glm nan guard: %s - this conversation's state is dropped; it is read again from token 0\n",
                      why.c_str());
     };
-    // set by the several-conversation scheduler while it admits a request (STRATA_GLM_PREFILL_INTERLEAVE): the piece the
+    // set by the several-conversation scheduler while it admits a request (MAYA_GLM_PREFILL_INTERLEAVE): the piece the
     // prompt path reads next (0: the rest of the segment, as before) and what runs between two pieces - 0 go on,
     // 1 stopped (the request's STOP), 2 failed (prompt_between_err says why; every request ended, the state reset)
     std::function<size_t()> prompt_piece;
     std::function<int()> prompt_between;
     std::string prompt_between_err;
-    // STRATA_GLM_PREFILL_GAPS: true inside a gap (the decode steps at a chunk boundary of a prompt's read, or between
+    // MAYA_GLM_PREFILL_GAPS: true inside a gap (the decode steps at a chunk boundary of a prompt's read, or between
     // two of its calls) - no tier boundary runs there, nothing binds another context (a PAUSE's snapshot waits for the
     // read's end: deferred_pauses), and an engine error leaves the contexts' reset to gap_reset, after the read has
     // ended (the pool's tail is lent in it); gap_failed: a gap inside a prompt-path call failed (prompt_between_err
@@ -1838,13 +1875,18 @@ static int glm_pack_generate(const Options& o) {
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
         // restored when this prompt extends it - a chat's next turn reads only what is new
-        strata::core::progress_at("the request: restoring a conversation");
-        const bool snap_ok = model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
+        maya::core::progress_at("the request: restoring a conversation");
+        // --ablate: the state, its snapshot and its checkpoints were read with this conversation's setting - a request
+        // with the other one reuses none of them (the prompt is read from the start); projected states are never kept
+        // as slots or in the prompt cache (slot_put / below), and none is taken back for a projecting request
+        const bool abl_want = abl_req();
+        const bool abl_flip = model.ablate_loaded() && abl_want != model.ablating();
+        const bool snap_ok = !abl_flip && model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
                              std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
-                             img_hash(snap_tokens.size()) == snap_img_hash && getenv("STRATA_GLM_NO_REUSE") == nullptr;
+                             img_hash(snap_tokens.size()) == snap_img_hash && getenv("MAYA_GLM_NO_REUSE") == nullptr;
         // the longest checkpoint this prompt starts with (it holds less than the snapshot when both match)
         int ck = -1;
-        if (ckpt_max > 0 && cur_img_pos.empty())
+        if (ckpt_max > 0 && cur_img_pos.empty() && !abl_flip)
             for (int c = 0; c < (int) ckpts.size(); ++c) {
                 const auto& t = ckpts[(size_t) c].tokens;
                 if (!t.empty() && t.size() < prompt.size() && (ck < 0 || t.size() > ckpts[(size_t) ck].tokens.size()) &&
@@ -1880,11 +1922,14 @@ static int glm_pack_generate(const Options& o) {
                 ckpts[(size_t) ck].tokens.clear();
             }
         }
+        // glm-dsa B14.14: the conversation in the model goes to the NVMe prompt cache before this prompt overwrites it
+        // (no-op unless MAYA_GLM_PROMPT_CACHE_DIR on a glm-dsa model; the slots are off then)
+        if (reuse == 0 && !model.ablating()) maya::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
             if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
-        } else if (reuse > 0 && !from_ckpt && slot_max > 0 && getenv("STRATA_GLM_SLOT_ROUNDTRIP") != nullptr) {
+        } else if (reuse > 0 && !from_ckpt && slot_max > 0 && !abl_want && getenv("MAYA_GLM_SLOT_ROUNDTRIP") != nullptr) {
             // a test: the restored state goes through a slot file and back - the same tokens must follow
             snap_in_slot = false;
             slot_put("");
@@ -1894,18 +1939,23 @@ static int glm_pack_generate(const Options& o) {
                 reuse = back;
             }
         }
+        if (reuse == 0 && !abl_want) reuse = maya::core::glmpc::engine_take(model, prompt, cur_img_pos.empty(), snap_tokens, snap_img_hash, snap_in_slot, kNoImages);   // glm-dsa B14.14
         if (reuse == 0) model.reset();
+        if (model.ablate_loaded()) {   // (the conversation's setting from here on: the state it holds now is read so)
+            model.set_ablate(abl_want);
+            if (abl_flip && reuse == 0) snap_tokens.clear();   // (the other setting's snapshot: never restored again)
+        }
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
         // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
         // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
         // token, a few tokens before the turn) is kept as a checkpoint instead: copied to host RAM on a side thread
-        // while this prompt runs, so it costs the prompt nothing.  STRATA_GLM_CKPT_TURN=0: off.  After the slot
+        // while this prompt runs, so it costs the prompt nothing.  MAYA_GLM_CKPT_TURN=0: off.  After the slot
         // restore and ckpt_drop_past: a conversation just taken back from a slot gets it too (before, the restore
         // dropped the checkpoint kept here, and an edited turn after A -> B -> A read all of A again: #400)
         if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0 &&
             cur_img_pos.empty()) {
-            static const bool turn_on = [] { const char* v = getenv("STRATA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
+            static const bool turn_on = [] { const char* v = getenv("MAYA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
             constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
             size_t last = 0;
             for (size_t i = prompt.size() - 1; i-- > reuse;)
@@ -1916,9 +1966,9 @@ static int glm_pack_generate(const Options& o) {
             if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
         }
         std::vector<float> lg;
-        const strata::core::VramMark vram0 = strata::core::vram_mark(vram_devs());   // (the line at the read's end)
+        const maya::core::VramMark vram0 = maya::core::vram_mark(vram_devs());   // (the line at the read's end)
         t0 = std::chrono::steady_clock::now();
-        gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
+        gap_mark = t0;   // (MAYA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
         // the state is saved before the generation prompt (snap_at), so an identical or extending prompt can reuse it
         bool snapped = false;
@@ -1926,12 +1976,12 @@ static int glm_pack_generate(const Options& o) {
         // <think></think>), where it used to stand before the last token.  The next prompt of this conversation goes on
         // from the same place whatever came of this answer - the answer itself, nothing (a cancelled answer that the
         // client sends again with a new message after it), or the same prompt again - so it continues the snapshot
-        // instead of leaving it at the <|assistant|> it no longer has.  Opt-in (STRATA_GLM_SNAP_GEN=1): the prompt's
+        // instead of leaving it at the <|assistant|> it no longer has.  Opt-in (MAYA_GLM_SNAP_GEN=1): the prompt's
         // last 2-4 tokens then go through the token path instead of the batched one, so a greedy answer can differ
         // from a read with the snapshot before the last token (the default).
         size_t snap_at = prompt.size() - 1;
         {
-            static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 0) != 0;
+            static const bool snap_gen = env_num("MAYA_GLM_SNAP_GEN", 0) != 0;
             constexpr int32_t kAsstTok = 154828;   // <|assistant|>
             // (at `reuse` itself too: the same prompt again restores the snapshot there and keeps it there)
             for (size_t k = 2; snap_gen && k <= 4 && k <= prompt.size(); ++k) {
@@ -1959,24 +2009,40 @@ static int glm_pack_generate(const Options& o) {
             };
             std::vector<size_t> marks = ckpt_marks(prompt, reuse, snap_at);
             // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
-            const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
-            // without checkpoints (STRATA_GLM_CKPTS=0, several conversations without STRATA_GLM_MULTI_CKPTS) the read
+            const size_t sys_end = maya::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
+            // without checkpoints (MAYA_GLM_CKPTS=0, several conversations without MAYA_GLM_MULTI_CKPTS) the read
             // still ends a call there with the slots on, for slot_prefix: another conversation with this system prompt
             // (a new conversation of the same client, another request of the same kind) restores it instead of reading
             // it again.  (With checkpoints the mark is ckpt_marks' `first` where that one is kept, and slot_prefix
             // runs there the same way: with several conversations the slot serves the other contexts too, which a
             // context's own checkpoints cannot.)
-            // STRATA_GLM_PREFIX_CUT=0: off
-            static const bool prefix_cut_on = env_num("STRATA_GLM_PREFIX_CUT", 1) != 0;
+            // MAYA_GLM_PREFIX_CUT=0: off
+            static const bool prefix_cut_on = env_num("MAYA_GLM_PREFIX_CUT", 1) != 0;
             if (ckpt_max <= 0 && slot_max > 0 && prefix_cut_on && cur_img_pos.empty())
-                strata::core::add_mark(marks, strata::core::prefix_cut(prompt.data(), prompt.size(), reuse, slot_min,
+                maya::core::add_mark(marks, maya::core::prefix_cut(prompt.data(), prompt.size(), reuse, slot_min,
                                                                         154827), reuse);
+            // glm-dsa L1-2: a checkpoint there is a position (Glm5Model::ckpt_positional: the caches' rows before it,
+            // no state to copy), so its marks do not end a prompt-path call - the call reads through them and each
+            // is kept once the read is past it (ckpt_save_at), so a split's parts pipeline the whole read (a 32K
+            // prompt: one call of four chunks, not two calls of two, each filling and draining the pipeline).  The
+            // system prompt's end still ends its call with the slots on (slot_prefix saves the state there).
+            std::vector<size_t> later;   // those marks, ascending
+            if (ckpt_max > 0 && model.ckpt_positional()) {
+                std::vector<size_t> cut;
+                for (const size_t p : marks) (slot_max > 0 && p == sys_end ? cut : later).push_back(p);
+                marks.swap(cut);
+            }
+            size_t li = 0;   // the next of them to keep
+            std::atomic<size_t> read_to{reuse};   // every part has read the prompt up to here (progress callback)
+            const auto keep_later = [&](size_t upto) {
+                for (; li < later.size() && later[li] <= upto; ++li) ckpt_keep(prompt, later[li], false, true);
+            };
             size_t at = reuse;   // the next token the prompt path reads
             bool pok = true, between_failed = false;
-            // one call to the next checkpoint mark (or the prompt's last token) - with STRATA_GLM_PREFILL_INTERLEAVE and
+            // one call to the next checkpoint mark (or the prompt's last token) - with MAYA_GLM_PREFILL_INTERLEAVE and
             // requests decoding, a piece of it, and their decode steps between two pieces (prompt_between)
             size_t mi = 0, seg_start = at;
-            // STRATA_GLM_PREFILL_GAPS: a gap before the read too (a round for the running requests) - back-to-back reads
+            // MAYA_GLM_PREFILL_GAPS: a gap before the read too (a round for the running requests) - back-to-back reads
             // would otherwise stall them for the last stage of one and the first of the next
             if (read_gap_first && prompt_between && at < snap_at) {
                 const int r = prompt_between();
@@ -1995,9 +2061,9 @@ static int glm_pack_generate(const Options& o) {
                 if (piece > 0 && interleave.exact) {
                     // whole chunks of the uncut read, each call cut in them: the same arithmetic, the same answer
                     if (at == seg_start || seg_chunk == 0) seg_chunk = model.prefill_chunk_for((int64_t) (seg_end - seg_start));
-                    piece = strata::core::prefill_aligned_piece(piece, (size_t) seg_chunk);
+                    piece = maya::core::prefill_aligned_piece(piece, (size_t) seg_chunk);
                 }
-                const size_t end = strata::core::prefill_piece_end(at, seg_end, piece);
+                const size_t end = maya::core::prefill_piece_end(at, seg_end, piece);
                 // (an interleaved piece cut freely (,cut): both GPUs of a split at work - two chunks, or ~4096-token ones
                 // for a larger piece: a call fills and drains the split's pipeline, a GPU idle for a chunk each way)
                 model.prefill_min_chunks = piece > 0 && !interleave.exact ? std::max<int>(2, (int) (piece / 4096)) : 1;
@@ -2006,6 +2072,7 @@ static int glm_pack_generate(const Options& o) {
                 const size_t base = at - reuse;
                 model.prefill_progress = [&](int64_t done, int64_t total) {
                     (void) total;
+                    read_to.store(reuse + base + (size_t) done, std::memory_order_relaxed);
                     pp_line(base + (size_t) done);
                     return !read_stopped();
                 };
@@ -2016,6 +2083,8 @@ static int glm_pack_generate(const Options& o) {
                 if (!pok && gap_failed) between_failed = true;   // (a decode gap inside the call failed)
                 if (pok) {
                     at = end;
+                    read_to.store(at, std::memory_order_relaxed);
+                    keep_later(at);
                     if (end == seg_end && mi < marks.size()) {
                         if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
                         if (end == sys_end) slot_prefix(prompt, end);
@@ -2052,7 +2121,7 @@ static int glm_pack_generate(const Options& o) {
                 if (gap_reset) gap_reset();   // (a gap's failure: the reset multi_fail left for after the read)
                 return 1;
             }
-            // a call the prompt path did not take (fewer tokens than STRATA_GLM_PREFILL_MIN: false, no error) leaves the
+            // a call the prompt path did not take (fewer tokens than MAYA_GLM_PREFILL_MIN: false, no error) leaves the
             // rest to the token path below - from where the prompt path stopped, not from `reuse`
             i_first = at;
             if (pok) {
@@ -2064,14 +2133,25 @@ static int glm_pack_generate(const Options& o) {
                 // agent that gave up waiting and sends the same prompt again - goes on from there instead of reading
                 // it all again, and a conversation that runs in between sets it aside in a slot.  The DSA rows before
                 // the checkpoint were written by calls that ended; the cancelled call wrote only past it.
-                // STRATA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
-                static const bool keep_cancelled = env_num("STRATA_GLM_KEEP_CANCELLED", 1) != 0;
+                // glm-dsa (positional checkpoints, `later`): its marks do not end a call, so the cancelled call itself
+                // went past them - `at` is still its start.  Every part has written the cache rows before read_to (the
+                // progress callback: a pipeline's last part after its stream sync, the sequential path once the chunk
+                // is queued on every part's stream, which ckpt_save_at / ckpt_restore synchronize), so the marks up
+                // to there are kept now and the longest checkpoint up to there is restored - as when each mark ended a
+                // call (a 32K prompt cancelled at 24,000 tokens: its retry goes on from 16,384, not from token 0).
+                // MAYA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
+                static const bool keep_cancelled = env_num("MAYA_GLM_KEEP_CANCELLED", 1) != 0;
+                const size_t reached = later.empty() ? at : std::max(at, read_to.load(std::memory_order_relaxed));
                 size_t kept = 0;
                 if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                    // (the marks in (at, reached]: each is longer than any checkpoint the read started from, so the
+                    // restore below takes the last of them and ckpt_drop_past keeps them all)
+                    keep_later(reached);
                     int best = -1;
                     for (int c = 0; c < (int) ckpts.size(); ++c) {
                         const auto& t = ckpts[(size_t) c].tokens;
-                        if (!t.empty() && t.size() <= at && (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
+                        if (!t.empty() && t.size() <= reached &&
+                            (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
                             std::equal(t.begin(), t.end(), prompt.begin()))
                             best = c;
                     }
@@ -2105,8 +2185,8 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         for (size_t i = i_first; i < prompt.size();) {
-            strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
-            strata::core::progress_beat();
+            maya::core::progress_at("the prompt: the token path, at token", (int64_t) i);
+            maya::core::progress_beat();
             if (model.fast() && !snapped && i == snap_at) {
                 if (model.snapshot_save()) {
                     snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
@@ -2136,7 +2216,7 @@ static int glm_pack_generate(const Options& o) {
             if (read_stopped()) { finish = "cancel"; break; }
         }
         {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
-            const std::string vt = strata::core::vram_mark_text(vram0, strata::core::vram_mark(vram_devs()));
+            const std::string vt = maya::core::vram_mark_text(vram0, maya::core::vram_mark(vram_devs()));
             if (!vt.empty())
                 std::fprintf(stderr, "glm vram: prompt %zu tokens read in %.1f s; %s\n",
                              prompt.size() > reuse ? prompt.size() - reuse : (size_t) 0,
@@ -2149,7 +2229,7 @@ static int glm_pack_generate(const Options& o) {
     // Text only, and only when the state stands exactly there (the decode paths leave pos = fed tokens).
     const auto pause_snapshot = [&](const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted,
                                     bool keep) {
-        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && getenv("STRATA_GLM_NO_REUSE") == nullptr) {
+        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && getenv("MAYA_GLM_NO_REUSE") == nullptr) {
             const int64_t p = model.position();
             const int64_t full = (int64_t) (prompt.size() + emitted.size());
             if (keep && slot_max > 0 && p > (int64_t) prompt.size() && p < full) {
@@ -2177,15 +2257,15 @@ static int glm_pack_generate(const Options& o) {
             }
         }
     };
-    // STRATA_GLM_SPEC_FOLLOW=<file> (--spec-follow): every request decodes this continuation instead of its own picks
-    // and ends with it (Glm5Model::set_follow) - a speed A/B on one text.  STRATA_GLM_SPEC_FOLLOW_SAVE=<file>
+    // MAYA_GLM_SPEC_FOLLOW=<file> (--spec-follow): every request decodes this continuation instead of its own picks
+    // and ends with it (Glm5Model::set_follow) - a speed A/B on one text.  MAYA_GLM_SPEC_FOLLOW_SAVE=<file>
     // (--spec-follow-save): each request's decoded ids are written there, the next run's continuation.  A text made by
     // another model, or by the same model with other settings, favours the drafts that made it: compare a change on
     // the same model and its own text.
     std::vector<int32_t> follow_ids;
-    const char* follow_save = getenv("STRATA_GLM_SPEC_FOLLOW_SAVE");
+    const char* follow_save = getenv("MAYA_GLM_SPEC_FOLLOW_SAVE");
     if (follow_save != nullptr && follow_save[0] == '\0') follow_save = nullptr;
-    if (const char* fp = getenv("STRATA_GLM_SPEC_FOLLOW"); fp != nullptr && fp[0] != '\0') {
+    if (const char* fp = getenv("MAYA_GLM_SPEC_FOLLOW"); fp != nullptr && fp[0] != '\0') {
         std::ifstream input(fp);
         std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         std::vector<int64_t> v;
@@ -2203,13 +2283,13 @@ static int glm_pack_generate(const Options& o) {
                      follow_ids.size(), fp);
     }
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
-                                 const strata::kernels::SamplerParams& rq_in) -> int {
-        strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
+                                 const maya::kernels::SamplerParams& rq_in) -> int {
+        maya::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
         stop_req.store(false);
         pause_req.store(false);
         pause_keep.store(false);
         model.force_next(-1);
-        model.set_follow(follow_ids);   // STRATA_GLM_SPEC_FOLLOW: this request's tokens (empty: its own picks)
+        model.set_follow(follow_ids);   // MAYA_GLM_SPEC_FOLLOW: this request's tokens (empty: its own picks)
         if (!follow_ids.empty()) max_new = std::min<int64_t>(max_new, (int64_t) follow_ids.size());
         bool in_think = req_think_budget > 0 && req_think_end >= 0;
         std::vector<int32_t> prompt;
@@ -2246,10 +2326,10 @@ static int glm_pack_generate(const Options& o) {
         // thinking budget or max_tokens ends it - minutes of nothing.  When the last W tokens are one pattern of at most
         // 32 tokens repeated exactly, thinking is closed at once (as the budget does); in the answer, what the model is in the
         // middle of is closed (a tool call's argument, else the turn), and a second loop ends it.
-        // W: STRATA_GLM_LOOP_THINK (256) while thinking, STRATA_GLM_LOOP_ANSWER (1024) in the answer - long enough
+        // W: MAYA_GLM_LOOP_THINK (256) while thinking, MAYA_GLM_LOOP_ANSWER (1024) in the answer - long enough
         // for legitimately repetitive output (a zero-filled array); 0 turns that check off.
-        static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
-        static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
+        static const int loop_w_think = (int) env_num("MAYA_GLM_LOOP_THINK", 256);
+        static const int loop_w_answer = (int) env_num("MAYA_GLM_LOOP_ANSWER", 1024);
         std::vector<int> gen_hist;
         std::vector<int32_t> emitted;   // every token this request wrote (a PAUSE keeps the state they lead to)
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
@@ -2269,8 +2349,8 @@ static int glm_pack_generate(const Options& o) {
             ++produced;
             emitted.push_back((int32_t) tok);
             if (sp.host_history != nullptr) pen_hist.push_back((int32_t) tok);   // (fed next: the picks after count it)
-            strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
-            strata::core::progress_beat();
+            maya::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
+            maya::core::progress_beat();
             gen_hist.push_back(tok);
             if (in_think && tok != req_think_end) {
                 if (const int per = looping(loop_w_think)) {
@@ -2385,14 +2465,17 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.mtp_rounds_ - rounds0),
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
             }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready() && req_spec != 1 &&
+                   !model.spec_plain_turn()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
-            // running the NextN block's draft (same tokens as the loop below)
-            // STRATA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
+            // running the NextN block's draft (same tokens as the loop below).  "spec": 1 (the request's) decodes
+            // token by token, as on the DFlash and one-GPU branches above; so does the head tuner's measured
+            // no-drafting turn (spec_plain_turn, GLM-5.3 on 3+ GPUs)
+            // MAYA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
             int64_t n_spec = 0;
-            int spec_win = 0;
-            if (const char* e = getenv("STRATA_GLM_SPEC_WIN")) spec_win = std::atoi(e) != 0;
-            const bool piped = spec_win != 0;
+            // (unset: on for a split of three or more Volta GPUs - Glm5Model::spec_win_mode)
+            const bool piped = model.spec_win_mode() != 0;
+            maya::core::glmng::set_history(&model, prompt);   // glm-dsa B14.13 (no-op unless MAYA_GLM_NGRAM_DRAFT)
             const bool done_ok = piped ? model.decode_spec_pipe(sp, max_new, on_token, n_spec, err)
                                        : model.decode_spec(sp, max_new, on_token, n_spec, err);
             if (!done_ok) {
@@ -2421,6 +2504,7 @@ static int glm_pack_generate(const Options& o) {
                     return 1;
                 }
             }
+            model.spec_plain_end(produced);   // (the head tuner's no-drafting turn: its time)
         }
         const auto t2 = std::chrono::steady_clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2473,7 +2557,7 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         model.set_follow({});
-        // STRATA_GLM_SPEC_FOLLOW_SAVE: this request's decoded ids, the continuation another run can follow
+        // MAYA_GLM_SPEC_FOLLOW_SAVE: this request's decoded ids, the continuation another run can follow
         if (follow_save != nullptr && !emitted.empty()) {
             const std::string tmp = std::string(follow_save) + ".tmp";
             {
@@ -2492,7 +2576,7 @@ static int glm_pack_generate(const Options& o) {
         return 0;
     };
 
-    // ---- SEVERAL CONVERSATIONS AT ONCE (serve, STRATA_GLM_SEQS=<n> > 1).  GEN lines carry rid=<id>, and every line
+    // ---- SEVERAL CONVERSATIONS AT ONCE (serve, MAYA_GLM_SEQS=<n> > 1).  GEN lines carry rid=<id>, and every line
     // a request causes carries it after its keyword (T <rid> <id>, PP <rid> ..., DONE <rid> ..., ERR <rid> ...);
     // STOP <rid> and PAUSE <rid> [keep] end one request, STOP alone all of them.  Each request runs in one of the n
     // sequence states, a CONTEXT: an idle context whose snapshot the prompt extends is taken as it stands (nothing
@@ -2505,16 +2589,16 @@ static int glm_pack_generate(const Options& o) {
                      model.seq_count());
         follow_ids.clear();
     }
-    // STRATA_GLM_MULTI_MTP=<drafts>: the running requests' batched steps carry verify windows - each one's last token
-    // and the NextN block's drafts after it (Glm5Model::mtpw_*, strata/core/mtp_rows.hpp)
+    // MAYA_GLM_MULTI_MTP=<drafts>: the running requests' batched steps carry verify windows - each one's last token
+    // and the NextN block's drafts after it (Glm5Model::mtpw_*, maya/core/mtp_rows.hpp)
     const bool mtp_rows = multi && model.mtpw_ok();
-    if (multi && strata::core::Glm5Model::multi_mtp_setting() > 0 && !mtp_rows)
+    if (multi && maya::core::Glm5Model::multi_mtp_setting() > 0 && !mtp_rows)
         std::fprintf(stderr, "glm multi mtp: MAYA_GLM_MULTI_MTP is set but not used here - it needs MAYA_GLM_SPLIT_ROWS "
                              "on a split (or one GPU), the NextN block loaded (no MAYA_GLM_NO_MTP) and no --dflash\n");
     if (mtp_rows)
         std::fprintf(stderr, "glm multi mtp: the running requests verify up to %d drafts each in their batched steps "
-                             "(%d rows a group)\n", strata::core::Glm5Model::multi_mtp_setting(),
-                     strata::core::Glm5Model::rows_max());
+                             "(%d rows a group)\n", maya::core::Glm5Model::multi_mtp_setting(),
+                     maya::core::Glm5Model::rows_max());
     if (multi && model.dflash_ready())
         std::fprintf(stderr, "glm dflash: not used with MAYA_GLM_SEQS=%d - the several-conversation scheduler decodes "
                              "without it (and without the MTP block, which --dflash leaves unloaded)\n",
@@ -2523,7 +2607,7 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int32_t> snap_tokens;
         uint64_t snap_img_hash = kNoImages;
         bool snap_in_slot = false;
-        std::vector<Ckpt> ckpts;   // its checkpoints (STRATA_GLM_MULTI_CKPTS): the model's slots from c * ckpt_max on
+        std::vector<Ckpt> ckpts;   // its checkpoints (MAYA_GLM_MULTI_CKPTS): the model's slots from c * ckpt_max on
         uint64_t used = 0;
         bool busy = false;
     };
@@ -2551,7 +2635,7 @@ static int glm_pack_generate(const Options& o) {
     };
     struct Gen {
         int rid = -1, ctx = 0;
-        strata::kernels::SamplerParams sp;
+        maya::kernels::SamplerParams sp;
         int64_t max_new = 0, produced = 0;
         std::vector<int32_t> prompt, emitted;
         std::vector<int32_t> pen;   // the penalties' history (sp.host_history): the prompt, then every token written
@@ -2569,8 +2653,8 @@ static int glm_pack_generate(const Options& o) {
         size_t reuse = 0;
         std::chrono::steady_clock::time_point t0, t1;
         uint64_t spec_steps0 = 0, spec_hits0 = 0;
-        strata::core::Glm5Model::FastStats st1;
-        // STRATA_GLM_MULTI_MTP: the NextN block's drafts for the positions after `pending` (made at position
+        maya::core::Glm5Model::FastStats st1;
+        // MAYA_GLM_MULTI_MTP: the NextN block's drafts for the positions after `pending` (made at position
         // draft_at after draft_tok: stale once either moved), and this request's verify statistics
         std::vector<int32_t> drafts;
         int64_t draft_at = -1;
@@ -2586,28 +2670,29 @@ static int glm_pack_generate(const Options& o) {
         int rid;
         std::vector<int64_t> ids;
         int64_t max_new;
-        strata::kernels::SamplerParams rq;
+        maya::kernels::SamplerParams rq;
         int64_t think_budget;
         int32_t think_end;
         std::vector<int64_t> img_pos;
         std::vector<float> img_rows;
         std::vector<std::pair<int32_t, float>> bias;
+        int abl = -1;   // its GEN ablate= (-1: --ablate-default)
     };
     std::deque<Pending> pending;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
     // context with this much left after it, and its max tokens are cut to that context
-    static const int64_t multi_room = (int64_t) env_num("STRATA_GLM_MULTI_ROOM", 16384);
-    static const int multi_boundary_every = (int) env_num("STRATA_GLM_MULTI_BOUNDARY", 32);
-    static const bool multi_spec = env_num("STRATA_GLM_MULTI_SPEC", 1) != 0;
-    static const int split_rows = strata::core::Glm5Model::split_rows_setting();
-    // STRATA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
-    // k at a time (strata/core/split_groups.hpp): k 4 no longer makes one group - and idle GPUs - at 4 requests or fewer
-    static const bool even_groups = env_num("STRATA_GLM_EVEN_GROUPS", 0) != 0;
+    static const int64_t multi_room = (int64_t) env_num("MAYA_GLM_MULTI_ROOM", 16384);
+    static const int multi_boundary_every = (int) env_num("MAYA_GLM_MULTI_BOUNDARY", 32);
+    static const bool multi_spec = env_num("MAYA_GLM_MULTI_SPEC", 1) != 0;
+    static const int split_rows = maya::core::Glm5Model::split_rows_setting();
+    // MAYA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
+    // k at a time (maya/core/split_groups.hpp): k 4 no longer makes one group - and idle GPUs - at 4 requests or fewer
+    static const bool even_groups = env_num("MAYA_GLM_EVEN_GROUPS", 0) != 0;
     // Reuse split-row scheduler buffers; allocating vectors for each decode group defeats part of the batching gain.
     std::vector<Gen*> split_group;
     std::vector<int> split_seqs;
     std::vector<int32_t> split_toks;
-    std::vector<strata::kernels::SamplerParams> split_sps;
+    std::vector<maya::kernels::SamplerParams> split_sps;
     if (split_rows > 0) {
         const size_t cap = (size_t) split_rows;
         split_group.reserve(cap);
@@ -2618,7 +2703,7 @@ static int glm_pack_generate(const Options& o) {
     int since_boundary = 0;
     uint64_t multi_n = 0;        // tokens since the engine last had nothing to do (the STAT lines' rate)
     std::chrono::steady_clock::time_point multi_t1;
-    strata::core::Glm5Model::FastStats multi_st1;
+    maya::core::Glm5Model::FastStats multi_st1;
     uint64_t multi_spec0 = 0, multi_hits0 = 0, multi_mtp_acc = 0, multi_mtp_off = 0;   // (the drafts since then, for the STAT lines)
     const auto input_pending = [&]() -> bool {
         std::lock_guard<std::mutex> lk(in_mu);
@@ -2639,8 +2724,8 @@ static int glm_pack_generate(const Options& o) {
         ++multi_n;
         g.emitted.push_back((int32_t) tok);
         if (g.sp.host_history != nullptr) g.pen.push_back((int32_t) tok);
-        strata::core::progress_at("decode: after token", g.produced);
-        strata::core::progress_beat();
+        maya::core::progress_at("decode: after token", g.produced);
+        maya::core::progress_beat();
         g.hist.push_back(tok);
         const auto looping = [&](int w) -> int {
             const int n = (int) g.hist.size();
@@ -2652,8 +2737,8 @@ static int glm_pack_generate(const Options& o) {
             }
             return 0;
         };
-        static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
-        static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
+        static const int loop_w_think = (int) env_num("MAYA_GLM_LOOP_THINK", 256);
+        static const int loop_w_answer = (int) env_num("MAYA_GLM_LOOP_ANSWER", 1024);
         if (g.in_think && tok != g.think_end) {
             if (const int per = looping(loop_w_think)) {
                 g.force = g.think_end;
@@ -2733,7 +2818,7 @@ static int glm_pack_generate(const Options& o) {
         }
         return g.produced < g.max_new;
     };
-    // the PAUSE snapshots a read's gaps kept back (STRATA_GLM_PREFILL_GAPS): taken once no prompt is being read and no
+    // the PAUSE snapshots a read's gaps kept back (MAYA_GLM_PREFILL_GAPS): taken once no prompt is being read and no
     // request waits for its first token (the tail's logits are its own until then), their contexts idle again
     const auto flush_pauses = [&] {
         for (const auto& d : deferred_pauses) {
@@ -2806,13 +2891,13 @@ static int glm_pack_generate(const Options& o) {
         if (!gen_token(g, tok)) gen_finish(g);
         else g.pending = tok;
     };
-    // STRATA_GLM_MULTI_MTP: the groups of verify windows in flight, oldest first - each past its front (every part but
+    // MAYA_GLM_MULTI_MTP: the groups of verify windows in flight, oldest first - each past its front (every part but
     // the last), `back` once its last part and head are queued too
     struct WinGroup {
         std::vector<Gen*> g;
         std::vector<int> seqs, counts;
         std::vector<int32_t> toks;
-        std::vector<strata::kernels::SamplerParams> sps;
+        std::vector<maya::kernels::SamplerParams> sps;
         bool back = false;
     };
     std::deque<WinGroup> wflight;
@@ -2826,10 +2911,10 @@ static int glm_pack_generate(const Options& o) {
     // windows' drafts - the next group's last part is queued between the drafts and their wait, so the last GPU goes
     // on with it; the requests that ended, ended
     const auto win_take = [&]() -> bool {
-        // phase timing of a rows path's round (STRATA_GLM_MTPW_TRACE=1): the wait for the picks, the accept + the
+        // phase timing of a rows path's round (MAYA_GLM_MTPW_TRACE=1): the wait for the picks, the accept + the
         // commit, the next round's drafts, the whole wall
-        static const bool trace = getenv("STRATA_GLM_MTPW_TRACE") != nullptr &&
-                                  std::atoi(getenv("STRATA_GLM_MTPW_TRACE")) != 0;
+        static const bool trace = getenv("MAYA_GLM_MTPW_TRACE") != nullptr &&
+                                  std::atoi(getenv("MAYA_GLM_MTPW_TRACE")) != 0;
         const auto t_round0 = std::chrono::steady_clock::now();
         WinGroup w = std::move(wflight.front());
         wflight.pop_front();
@@ -2843,12 +2928,12 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int> keep((size_t) n, 1), nd((size_t) n, 0);
         std::vector<int32_t> written, last((size_t) n, -1);
         std::vector<char> ended((size_t) n, 0);
-        const int D = strata::core::Glm5Model::multi_mtp_setting();
+        const int D = maya::core::Glm5Model::multi_mtp_setting();
         for (int i = 0, row = 0; i < n; row += w.counts[(size_t) i], ++i) {
             Gen& g = *w.g[(size_t) i];
             g.inflight = false;
             std::vector<int32_t> wr;
-            keep[(size_t) i] = strata::core::mtp_accept(
+            keep[(size_t) i] = maya::core::mtp_accept(
                 w.toks.data() + row, picks.data() + row, w.counts[(size_t) i],
                 [&](int, int32_t pick, int32_t& out) {
                     int32_t tok = pick;
@@ -2861,9 +2946,9 @@ static int glm_pack_generate(const Options& o) {
                     g.sp.counter += 1;
                     if (!gen_token(g, tok)) {
                         ended[(size_t) i] = 1;
-                        return strata::core::MtpTake::stop;
+                        return maya::core::MtpTake::stop;
                     }
-                    return g.force >= 0 ? strata::core::MtpTake::forced : strata::core::MtpTake::more;
+                    return g.force >= 0 ? maya::core::MtpTake::forced : maya::core::MtpTake::more;
                 });
             const int k = keep[(size_t) i];
             g.mtp_steps += 1;
@@ -2948,7 +3033,7 @@ static int glm_pack_generate(const Options& o) {
         return true;
     };
     // an engine error in the middle: every running request gets it, the sequences are reset
-    uint64_t multi_fails = 0;      // (a prompt read between decode steps sees one happen: STRATA_GLM_PREFILL_INTERLEAVE)
+    uint64_t multi_fails = 0;      // (a prompt read between decode steps sees one happen: MAYA_GLM_PREFILL_INTERLEAVE)
     std::string multi_fail_why;
     const auto multi_fail = [&](const std::string& why) {
         ++multi_fails;
@@ -2984,7 +3069,7 @@ static int glm_pack_generate(const Options& o) {
         }
         gen_sweep();
     };
-    // the contexts' reset a failed gap left (STRATA_GLM_PREFILL_GAPS; multi_fail), once the read has ended
+    // the contexts' reset a failed gap left (MAYA_GLM_PREFILL_GAPS; multi_fail), once the read has ended
     gap_reset = [&] {
         if (!gap_failed) return;
         gap_failed = false;
@@ -2997,20 +3082,20 @@ static int glm_pack_generate(const Options& o) {
             model.reset();
         }
     };
-    // the decode steps between two pieces of a prompt being read in context read_ctx (STRATA_GLM_PREFILL_INTERLEAVE;
+    // the decode steps between two pieces of a prompt being read in context read_ctx (MAYA_GLM_PREFILL_INTERLEAVE;
     // set below, after multi_step): prompt_between's 0 / 1 / 2
     std::function<int(int)> interleave_round;
-    // one decode gap of a prompt being read (STRATA_GLM_PREFILL_GAPS; set below, after multi_step): 0 / 1 / 2 as
+    // one decode gap of a prompt being read (MAYA_GLM_PREFILL_GAPS; set below, after multi_step): 0 / 1 / 2 as
     // prompt_between's; gap_mark: the read's start, then each gap's end
     std::function<int()> read_gap;
     uint64_t gap_count = 0, gap_tok = 0;
     double gap_ms = 0.0;
     // the last gap's decode round (ms; 0: none yet) - a boundary's gap is due once its budget is half of one
-    // (prefill_gap_due; STRATA_GLM_PREFILL_GAP_CREDIT=0: every boundary, as before)
+    // (prefill_gap_due; MAYA_GLM_PREFILL_GAP_CREDIT=0: every boundary, as before)
     double gap_round_ms = 0.0;
-    static const bool gap_credit = env_num("STRATA_GLM_PREFILL_GAP_CREDIT", 1) != 0;
+    static const bool gap_credit = env_num("MAYA_GLM_PREFILL_GAP_CREDIT", 1) != 0;
     const auto gen_admit = [&](int rid, const std::vector<int64_t>& ids, int64_t max_new,
-                               const strata::kernels::SamplerParams& rq) {
+                               const maya::kernels::SamplerParams& rq) {
         if (!multi_drain() || !resolve_ready()) {
             const std::string why = err;
             multi_fail(why);
@@ -3041,7 +3126,7 @@ static int glm_pack_generate(const Options& o) {
             g->sp.host_history = &g->pen;
         }
         // the context: an idle one that holds the prompt and the room after it, and whose snapshot - or one of its
-        // conversation checkpoints (STRATA_GLM_MULTI_CKPTS: an edited last message, a cancelled answer sent again
+        // conversation checkpoints (MAYA_GLM_MULTI_CKPTS: an edited last message, a cancelled answer sent again
         // without it, an older turn rewritten) - this prompt extends (the longest), else the least recently used of
         // those.  prep_prompt then restores the one it found, as with one conversation.
         const int64_t want = (int64_t) g->prompt.size() + std::min<int64_t>(max_new, multi_room) + 8;
@@ -3053,10 +3138,12 @@ static int glm_pack_generate(const Options& o) {
             const auto& st = c == cur_ctx ? snap_tokens : ctxs[(size_t) c].snap_tokens;
             const uint64_t hh = c == cur_ctx ? snap_img_hash : ctxs[(size_t) c].snap_img_hash;
             size_t len = 0;
-            if (!st.empty() && st.size() < g->prompt.size() && std::equal(st.begin(), st.end(), g->prompt.begin()) &&
-                img_hash(st.size()) == hh)
+            // (--ablate: a context read with the other setting holds nothing this request can continue)
+            const bool abl_same = !model.ablate_loaded() || model.abl_seq_on(c) == abl_req();
+            if (abl_same && !st.empty() && st.size() < g->prompt.size() &&
+                std::equal(st.begin(), st.end(), g->prompt.begin()) && img_hash(st.size()) == hh)
                 len = st.size();
-            if (ckpt_max > 0 && cur_img_pos.empty()) {   // (checkpoints are kept of text prompts only)
+            if (abl_same && ckpt_max > 0 && cur_img_pos.empty()) {   // (checkpoints are kept of text prompts only)
                 const std::vector<Ckpt>& cl = c == cur_ctx ? ckpts : ctxs[(size_t) c].ckpts;
                 for (const Ckpt& k : cl)
                     if (k.tokens.size() > len && k.tokens.size() < g->prompt.size() &&
@@ -3082,7 +3169,7 @@ static int glm_pack_generate(const Options& o) {
                 return;
             }
             pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows,
-                               req_bias});
+                               req_bias, req_abl});
             std::fprintf(stderr, "glm multi: request %d waits for a context that holds %lld tokens\n", rid,
                          (long long) want);
             return;
@@ -3108,7 +3195,7 @@ static int glm_pack_generate(const Options& o) {
         ctxs[(size_t) best].busy = true;
         g->ctx = best;
         tag = std::to_string(rid) + " ";
-        // STRATA_GLM_PREFILL_GAPS: the running requests decode at the read's chunk boundaries and between its calls
+        // MAYA_GLM_PREFILL_GAPS: the running requests decode at the read's chunk boundaries and between its calls
         // (the split's batched rows: they never bind a context; text prompts only, as interleave)
         const bool use_gaps = read_gaps.percent > 0 && cur_img_pos.empty() && split_rows > 0 && model.split_rows_ok();
         if (read_gaps.percent > 0 && !use_gaps && !gens.empty()) {
@@ -3131,7 +3218,7 @@ static int glm_pack_generate(const Options& o) {
                 if (!gap_credit) return true;
                 const double stage_ms =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gap_mark).count();
-                return strata::core::prefill_gap_due(read_gaps, stage_ms, gap_round_ms);
+                return maya::core::prefill_gap_due(read_gaps, stage_ms, gap_round_ms);
             };
             model.prefill_gap = [&] { return read_gap(); };
             prompt_between = [&] { return read_gap(); };
@@ -3139,15 +3226,15 @@ static int glm_pack_generate(const Options& o) {
             gap_count = gap_tok = 0;
             gap_ms = 0.0;
         }
-        // STRATA_GLM_PREFILL_INTERLEAVE: while other requests decode, the prompt in pieces with their steps between
+        // MAYA_GLM_PREFILL_INTERLEAVE: while other requests decode, the prompt in pieces with their steps between
         // (text prompts only: a prompt's image rows are the driver's globals while it is read)
         if (interleave.tokens > 0 && read_gaps.percent == 0 && !cur_img_pos.empty() && !gens.empty())
             std::fprintf(stderr, "glm multi: request %d's prompt has images: read whole, not in pieces "
                                  "(MAYA_GLM_PREFILL_INTERLEAVE is for text prompts)\n", rid);
         if (!use_gaps && interleave.tokens > 0 && cur_img_pos.empty()) {
-            // (STRATA_GLM_PREFILL_INTERLEAVE_ALWAYS=1, a test: the pieces with nothing decoding too - to compare with
+            // (MAYA_GLM_PREFILL_INTERLEAVE_ALWAYS=1, a test: the pieces with nothing decoding too - to compare with
             // the prompt read whole, the decode alone)
-            static const bool always = env_num("STRATA_GLM_PREFILL_INTERLEAVE_ALWAYS", 0) != 0;
+            static const bool always = env_num("MAYA_GLM_PREFILL_INTERLEAVE_ALWAYS", 0) != 0;
             prompt_piece = [&]() -> size_t {
                 for (const auto& gp : gens)
                     if (!gp->done) return interleave.tokens;
@@ -3235,6 +3322,7 @@ static int glm_pack_generate(const Options& o) {
             req_think_budget = w2.think_budget;
             req_think_end = w2.think_end;
             req_bias = std::move(w2.bias);
+            req_abl = w2.abl;
             cur_img_pos = std::move(w2.img_pos);
             cur_img_rows = std::move(w2.img_rows);
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
@@ -3250,10 +3338,7 @@ static int glm_pack_generate(const Options& o) {
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
-        static const bool spec_win_env = [] {
-            const char* e = getenv("STRATA_GLM_SPEC_WIN");
-            return e != nullptr && std::atoi(e) != 0;
-        }();
+        static const bool spec_win_env = model.spec_win_mode() != 0;
         if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready() && spec_win_env) {
             Gen& g = *only;
             bind_ctx(g.ctx);
@@ -3315,6 +3400,7 @@ static int glm_pack_generate(const Options& o) {
             int32_t last = -1, forced_unused = -1;
             bool interrupted = false;
             int64_t n_spec = 0;
+            maya::core::glmng::set_history(&model, g.prompt, g.emitted);   // glm-dsa B14.13
             const bool ok = model.decode_spec(g.sp, g.max_new - g.produced, [&](int tok) {
                 forced_unused = -1;   // a force handed over is consumed by the token that comes next
                 last = tok;
@@ -3349,13 +3435,13 @@ static int glm_pack_generate(const Options& o) {
             multi_fail(err);
             return;
         }
-        // STRATA_GLM_MULTI_MTP: the ready requests' windows (their last token and the drafts made for the positions
+        // MAYA_GLM_MULTI_MTP: the ready requests' windows (their last token and the drafts made for the positions
         // after it) in groups as the split's batched rows take them, each group through every part but the last;
         // then the oldest group back (win_take) - its last part queued now if it was not
-        // (STRATA_GLM_MULTI_MTP_MAX, 4: the windows only while that many requests or fewer run - with more, every
+        // (MAYA_GLM_MULTI_MTP_MAX, 4: the windows only while that many requests or fewer run - with more, every
         // GPU is already busy and a window's rows cost about what the tokens they save cost; 0: always. Switching
         // drains what the other way has in flight)
-        static const int mtp_max = (int) env_num("STRATA_GLM_MULTI_MTP_MAX", 4);
+        static const int mtp_max = (int) env_num("MAYA_GLM_MULTI_MTP_MAX", 4);
         int n_run = 0;
         for (auto& gp : gens) n_run += !gp->done;
         const bool use_win = mtp_rows && (mtp_max <= 0 || n_run <= mtp_max);
@@ -3375,7 +3461,7 @@ static int glm_pack_generate(const Options& o) {
                 active += gp->inflight || gp->pending >= 0;
             }
             const int k = std::max(1, split_rows > 0 ? split_rows : model.seq_count());
-            const std::vector<int> sizes = strata::core::split_groups(ready, active, k, even_groups);
+            const std::vector<int> sizes = maya::core::split_groups(ready, active, k, even_groups);
             std::vector<Gen*> rdy;
             for (auto& gp : gens)
                 if (!gp->done && !gp->inflight && gp->pending >= 0) rdy.push_back(gp.get());
@@ -3387,11 +3473,11 @@ static int glm_pack_generate(const Options& o) {
                     const int64_t pos = model.seq_pos(gp->ctx);
                     const int d = gp->draft_at == pos && gp->draft_tok == gp->pending ? (int) gp->drafts.size() : 0;
                     w.seqs.push_back(gp->ctx);
-                    w.counts.push_back(strata::core::mtp_rows_count(d, gp->max_new - gp->produced,
+                    w.counts.push_back(maya::core::mtp_rows_count(d, gp->max_new - gp->produced,
                                                                     model.seq_max_ctx(gp->ctx) - 1 - pos));
                     w.sps.push_back(gp->sp);
                 }
-                strata::core::mtp_rows_fit(w.counts, strata::core::Glm5Model::rows_max());
+                maya::core::mtp_rows_fit(w.counts, maya::core::Glm5Model::rows_max());
                 for (size_t j = 0; j < w.g.size(); ++j) {
                     w.toks.push_back(w.g[j]->pending);
                     for (int t = 1; t < w.counts[j]; ++t) w.toks.push_back(w.g[j]->drafts[(size_t) t - 1]);
@@ -3428,9 +3514,9 @@ static int glm_pack_generate(const Options& o) {
             std::vector<Gen*> rg;
             std::vector<int> seqs, out;
             std::vector<int32_t> toks;
-            std::vector<strata::kernels::SamplerParams> sps;
+            std::vector<maya::kernels::SamplerParams> sps;
             for (auto& gp : gens)
-                if (!gp->done && gp->pending >= 0 && (int) rg.size() < strata::core::Glm5Model::rows_max()) {
+                if (!gp->done && gp->pending >= 0 && (int) rg.size() < maya::core::Glm5Model::rows_max()) {
                     rg.push_back(gp.get());
                     seqs.push_back(gp->ctx);
                     toks.push_back(gp->pending);
@@ -3483,7 +3569,7 @@ static int glm_pack_generate(const Options& o) {
                 ready += !gp->inflight && gp->pending >= 0;
                 active += gp->inflight || gp->pending >= 0;
             }
-            const std::vector<int> sizes = strata::core::split_groups(ready, active, split_rows, even_groups);
+            const std::vector<int> sizes = maya::core::split_groups(ready, active, split_rows, even_groups);
             size_t gi = 0;
             for (auto& gp : gens) {
                 if (gp->done || gp->inflight || gp->pending < 0) continue;
@@ -3549,7 +3635,7 @@ static int glm_pack_generate(const Options& o) {
         gen_sweep();
     };
 
-    // Between two pieces of a prompt being read (STRATA_GLM_PREFILL_INTERLEAVE): `rounds` rounds of the scheduler's own
+    // Between two pieces of a prompt being read (MAYA_GLM_PREFILL_INTERLEAVE): `rounds` rounds of the scheduler's own
     // steps - each until every request running at its start has a token more (or ended) - then every issued token back
     // (the prompt path needs the GPUs to itself) and the reading context bound again.  The steps are multi_step's, so
     // a request that ends meanwhile ends as it would (DONE, its pause snapshot), and a STOP for one ends it; an engine
@@ -3594,7 +3680,7 @@ static int glm_pack_generate(const Options& o) {
         return read_stopped() ? 1 : 0;
     };
 
-    // One decode gap of a prompt's read (STRATA_GLM_PREFILL_GAPS): at a chunk boundary inside a prompt-path call (every
+    // One decode gap of a prompt's read (MAYA_GLM_PREFILL_GAPS): at a chunk boundary inside a prompt-path call (every
     // part idle, the pool's tail lent; Glm5Model::prefill_gap) or between two of its calls.  The running requests' own
     // steps (multi_step's: the split's batched rows, which never bind a context) in rounds - each until every request
     // running at its start has a token more or ended - for percent / (100 - percent) of the time the read ran since
@@ -3611,7 +3697,7 @@ static int glm_pack_generate(const Options& o) {
             gap_mark = t_in;
             return 0;
         }
-        const double budget = strata::core::prefill_gap_budget_ms(read_gaps, stage_ms);
+        const double budget = maya::core::prefill_gap_budget_ms(read_gaps, stage_ms);
         const uint64_t fails0 = multi_fails, n0 = multi_n;
         in_read_gap = true;
         step_no_spec = true;
@@ -3656,11 +3742,11 @@ static int glm_pack_generate(const Options& o) {
         return read_stopped() ? 1 : 0;
     };
 
-    // STRATA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs STRATA_GLM_SEQS >= n): n synthetic
+    // MAYA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs MAYA_GLM_SEQS >= n): n synthetic
     // prompts of <prompt> tokens, then <gen> greedy tokens each - sequence 0 alone through the token path first (the
     // reference), then all n through the selected together, split-rows or pipelined path; prints both rates and whether
     // same tokens both ways.
-    if (const char* mb = getenv("STRATA_GLM_MULTI_BENCH")) {
+    if (const char* mb = getenv("MAYA_GLM_MULTI_BENCH")) {
         int n = 2, L = 512, G = 256, K = 32, same_prompt = 0;
         std::sscanf(mb, "%d,%d,%d,%d,%d", &n, &L, &G, &K, &same_prompt);
         if (n > model.seq_count() || n < 1 || L < 2 || G < 2) {
@@ -3668,7 +3754,7 @@ static int glm_pack_generate(const Options& o) {
             return 2;
         }
         model.set_host_logits(false);
-        strata::kernels::SamplerParams g0 = sp;
+        maya::kernels::SamplerParams g0 = sp;
         g0.greedy = true;
         std::vector<std::vector<int32_t>> prompts((size_t) n);
         uint64_t rs = 0x9e3779b97f4a7c15ull;
@@ -3704,9 +3790,9 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int> solo, solo2;
         model.seq_bind_all(0);
         double solo_s = 0;
-        strata::core::Glm5Model::FastStats st_a, st_b;   // the expert tiers over each timed phase
-        const auto tiers = [](const char* what, const strata::core::Glm5Model::FastStats& a,
-                              const strata::core::Glm5Model::FastStats& b, int tokens) {
+        maya::core::Glm5Model::FastStats st_a, st_b;   // the expert tiers over each timed phase
+        const auto tiers = [](const char* what, const maya::core::Glm5Model::FastStats& a,
+                              const maya::core::Glm5Model::FastStats& b, int tokens) {
             const double h = (double) (b.hits - a.hits), m = (double) (b.misses - a.misses), t = std::max(1, tokens);
             std::printf("  %s: VRAM hit %.1f%%, a token: %.1f RAM fetches, %.2f disk reads, %.1f promotions, %.1f CPU "
                         "experts\n", what, 100.0 * h / std::max(1.0, h + m), (double) (b.ram_hits - a.ram_hits) / t,
@@ -3726,7 +3812,7 @@ static int glm_pack_generate(const Options& o) {
             solo_s = secs(t0, now());
             st_b = model.fast_stats();
         }
-        const strata::core::Glm5Model::FastStats solo_a = st_a, solo_b = st_b;
+        const maya::core::Glm5Model::FastStats solo_a = st_a, solo_b = st_b;
         // all n through the pipelined decode
         std::vector<std::vector<int>> out((size_t) n);
         for (int s = 0; s < n; ++s) {
@@ -3739,14 +3825,14 @@ static int glm_pack_generate(const Options& o) {
         st_a = model.fast_stats();
         const auto t0 = now();
         int since = 0, boundaries = 0;
-        // STRATA_GLM_MULTI_MTP: every sequence's verify windows through the batched rows (the server's order of calls)
+        // MAYA_GLM_MULTI_MTP: every sequence's verify windows through the batched rows (the server's order of calls)
         const bool wrows = model.mtpw_ok() && (model.rows_ok() || (split_rows > 0 && model.split_rows_ok()));
         const bool rows = model.rows_ok() && !wrows;   // one GPU: all n together, one step per token of each
         const bool srows = !rows && !wrows && split_rows > 0 && model.split_rows_ok();
         const char* path = wrows ? "mtp-windows" : rows ? "together" : srows ? "split-rows" : "pipelined";
         uint64_t w_steps = 0, w_drafts = 0, w_acc = 0;
         if (wrows) {
-            const int D = strata::core::Glm5Model::multi_mtp_setting();
+            const int D = maya::core::Glm5Model::multi_mtp_setting();
             std::vector<std::vector<int32_t>> drafts((size_t) n);
             struct BG {
                 std::vector<int> seqs, counts;
@@ -3756,7 +3842,7 @@ static int glm_pack_generate(const Options& o) {
             const auto back = [&](BG& b) -> bool {
                 if (b.back) return true;
                 b.back = true;
-                const std::vector<strata::kernels::SamplerParams> sps(b.seqs.size(), g0);
+                const std::vector<maya::kernels::SamplerParams> sps(b.seqs.size(), g0);
                 return model.mtpw_back(b.seqs.data(), b.counts.data(), (int) b.seqs.size(), b.toks.data(), sps.data(),
                                        err);
             };
@@ -3767,18 +3853,18 @@ static int glm_pack_generate(const Options& o) {
                 if (act.empty()) break;
                 std::vector<BG> gs;
                 size_t first = 0;
-                for (const int k : strata::core::split_groups((int) act.size(), (int) act.size(),
+                for (const int k : maya::core::split_groups((int) act.size(), (int) act.size(),
                                                               std::max(1, split_rows > 0 ? split_rows : n), even_groups)) {
                     BG b;
                     for (int j = 0; j < k; ++j) {
                         const int s = act[first + (size_t) j];
                         b.seqs.push_back(s);
-                        b.counts.push_back(strata::core::mtp_rows_count(
+                        b.counts.push_back(maya::core::mtp_rows_count(
                             (int) drafts[(size_t) s].size(), G - (int64_t) out[(size_t) s].size(),
                             model.seq_max_ctx(s) - 1 - model.seq_pos(s)));
                     }
                     first += (size_t) k;
-                    strata::core::mtp_rows_fit(b.counts, strata::core::Glm5Model::rows_max());
+                    maya::core::mtp_rows_fit(b.counts, maya::core::Glm5Model::rows_max());
                     for (size_t j = 0; j < b.seqs.size(); ++j) {
                         const int s = b.seqs[j];
                         b.toks.push_back((int32_t) out[(size_t) s].back());
@@ -3804,13 +3890,13 @@ static int glm_pack_generate(const Options& o) {
                     for (int i = 0, row = 0; i < m; row += b.counts[(size_t) i], ++i) {
                         const int s = b.seqs[(size_t) i];
                         std::vector<int32_t> wr;
-                        keep[(size_t) i] = strata::core::mtp_accept(
+                        keep[(size_t) i] = maya::core::mtp_accept(
                             b.toks.data() + row, picks.data() + row, b.counts[(size_t) i],
                             [&](int, int32_t pick, int32_t&) {
                                 wr.push_back(pick);
                                 out[(size_t) s].push_back(pick);
-                                return (int) out[(size_t) s].size() < G ? strata::core::MtpTake::more
-                                                                        : strata::core::MtpTake::stop;
+                                return (int) out[(size_t) s].size() < G ? maya::core::MtpTake::more
+                                                                        : maya::core::MtpTake::stop;
                             });
                         const int k = keep[(size_t) i];
                         ++w_steps;
@@ -3857,7 +3943,7 @@ static int glm_pack_generate(const Options& o) {
         if (rows) {
             std::vector<int> seqs((size_t) n), next((size_t) n);
             std::vector<int32_t> toks((size_t) n);
-            const std::vector<strata::kernels::SamplerParams> sps((size_t) n, g0);
+            const std::vector<maya::kernels::SamplerParams> sps((size_t) n, g0);
             for (int s = 0; s < n; ++s) seqs[(size_t) s] = s;
             while ((int) out[0].size() < G) {
                 for (int s = 0; s < n; ++s) toks[(size_t) s] = out[(size_t) s].back();
@@ -3873,14 +3959,14 @@ static int glm_pack_generate(const Options& o) {
         if (srows) {
             std::deque<int> qg;
             const auto issue_rows = [&](const std::vector<int>& seqs) -> bool {
-                // (STRATA_GLM_EVEN_GROUPS: the groups the server makes, from the sequences still decoding)
+                // (MAYA_GLM_EVEN_GROUPS: the groups the server makes, from the sequences still decoding)
                 int active = 0;
                 for (int s = 0; s < n; ++s) active += (int) out[(size_t) s].size() < G;
                 size_t first = 0;
-                for (const int k : strata::core::split_groups((int) seqs.size(), active, split_rows, even_groups)) {
+                for (const int k : maya::core::split_groups((int) seqs.size(), active, split_rows, even_groups)) {
                     std::vector<int> group_seqs;
                     std::vector<int32_t> toks;
-                    std::vector<strata::kernels::SamplerParams> sps((size_t) k, g0);
+                    std::vector<maya::kernels::SamplerParams> sps((size_t) k, g0);
                     for (int j = 0; j < k; ++j) {
                         const int s = seqs[first + (size_t) j];
                         group_seqs.push_back(s);
@@ -3987,9 +4073,9 @@ static int glm_pack_generate(const Options& o) {
         std::printf("  solo :");
         for (int i = 0; i < 12 && i < (int) solo.size(); ++i) std::printf(" %d", solo[(size_t) i]);
         std::printf("\n");
-        // STRATA_GLM_MULTI_DUMP=<file>: every sequence's tokens, a line each (then the solo run's) - two builds' or
+        // MAYA_GLM_MULTI_DUMP=<file>: every sequence's tokens, a line each (then the solo run's) - two builds' or
         // settings' runs compared whole, not by their first 12
-        if (const char* dump = getenv("STRATA_GLM_MULTI_DUMP")) {
+        if (const char* dump = getenv("MAYA_GLM_MULTI_DUMP")) {
             if (std::FILE* f = std::fopen(dump, "w")) {
                 for (int s = 0; s <= n; ++s) {
                     const std::vector<int>& v = s < n ? out[(size_t) s] : solo;
@@ -4011,19 +4097,19 @@ static int glm_pack_generate(const Options& o) {
                                  "header of src/program/generate.cpp)\n");
             return 2;
         }
-        // STRATA_GLM_SCORE=<c>: score --tokens instead of generating.  Every token goes through the one-token decode
+        // MAYA_GLM_SCORE=<c>: score --tokens instead of generating.  Every token goes through the one-token decode
         // path (the tiers and the CPU lane as in a decode); the tokens after the first c are scored given the ones
-        // before: mean NLL, perplexity, top-1 hits.  STRATA_GLM_SCORE_DUMP=<file> writes each scored position's
-        // log-softmax (n_vocab floats); STRATA_GLM_SCORE_REF=<file> reads such a dump and reports KL(ref || this) and
+        // before: mean NLL, perplexity, top-1 hits.  MAYA_GLM_SCORE_DUMP=<file> writes each scored position's
+        // log-softmax (n_vocab floats); MAYA_GLM_SCORE_REF=<file> reads such a dump and reports KL(ref || this) and
         // how often both pick the same top token - the quality yardstick for engine changes and for quants.
-        // STRATA_GLM_SCORE_TOPK=<file> is the compact reference (the FP8 model's, tools/maya_quant): an int32 k, then
+        // MAYA_GLM_SCORE_TOPK=<file> is the compact reference (the FP8 model's, tools/maya_quant): an int32 k, then
         // per scored position k int32 token ids (best first) and their k float log-probs.  KL over those k tokens plus
         // one bucket for the rest of the vocabulary.
-        if (const char* sc = getenv("STRATA_GLM_SCORE")) {
+        if (const char* sc = getenv("MAYA_GLM_SCORE")) {
             const size_t c = (size_t) std::max(0L, std::atol(sc));
-            const char* dump = getenv("STRATA_GLM_SCORE_DUMP");
-            const char* ref = getenv("STRATA_GLM_SCORE_REF");
-            const char* tkf = getenv("STRATA_GLM_SCORE_TOPK");
+            const char* dump = getenv("MAYA_GLM_SCORE_DUMP");
+            const char* ref = getenv("MAYA_GLM_SCORE_REF");
+            const char* tkf = getenv("MAYA_GLM_SCORE_TOPK");
             std::FILE* df = dump && dump[0] ? std::fopen(dump, "wb") : nullptr;
             std::FILE* rf = ref && ref[0] ? std::fopen(ref, "rb") : nullptr;
             std::FILE* tf = tkf && tkf[0] ? std::fopen(tkf, "rb") : nullptr;
@@ -4041,10 +4127,10 @@ static int glm_pack_generate(const Options& o) {
             double nll = 0.0, kl = 0.0, kl_max = 0.0;
             size_t n = 0, top1 = 0, same = 0, nref = 0;
             const auto ts = std::chrono::steady_clock::now();
-            // STRATA_GLM_SCORE_PREFILL=1: the unscored context (all but its last token) through the prompt path, so a
+            // MAYA_GLM_SCORE_PREFILL=1: the unscored context (all but its last token) through the prompt path, so a
             // long context is scored in minutes (the KV-cache formats at 128K); the scored tokens stay token by token
             size_t i0 = 0;
-            if (getenv("STRATA_GLM_SCORE_PREFILL") != nullptr && model.fast() && model.prefill_chunk() > 0 && c > 2 &&
+            if (getenv("MAYA_GLM_SCORE_PREFILL") != nullptr && model.fast() && model.prefill_chunk() > 0 && c > 2 &&
                 c < o.tokens.size()) {
                 const std::vector<int32_t> part(o.tokens.begin(), o.tokens.begin() + (long) (c - 1));
                 if (!model.prefill(part, err, (int32_t) o.tokens[c - 1])) {
@@ -4125,21 +4211,21 @@ static int glm_pack_generate(const Options& o) {
         return rc;
     }
 
-    // STRATA_GLM_WARM_PROMPT=<n> (default 0 = off; 32 or more): one synthetic prompt through the whole part chain
+    // MAYA_GLM_WARM_PROMPT=<n> (default 0 = off; 32 or more): one synthetic prompt through the whole part chain
     // before the server is told READY, so the session's first request does not pay what only a session's first
     // prompt pays (issue #8: it read 95-133 ms/token against 23-44 warm - the first chunk carries the one-time work:
     // every kernel's first launch, the prompt path's own allocations, the tiers' first reads).  It costs about one
     // chunk of the smallest part's size (~15 s on a four-way split, beside the tiers' own 90-151 s warm-up), its ids
     // are spread over the vocabulary so the routes are not one expert's, and the state is zeroed right after it: no
     // conversation can see it (a request with no slot in use resets anyway, before its own prompt).
-    if (const char* wv = getenv("STRATA_GLM_WARM_PROMPT")) {
+    if (const char* wv = getenv("MAYA_GLM_WARM_PROMPT")) {
         const int wn = std::atoi(wv);
         if (wn > 0 && model.prefill_chunk() > 0) {
             const int wtn = std::max(32, wn);
             std::vector<int32_t> wids((size_t) wtn);
             for (int i = 0; i < wtn; ++i) wids[(size_t) i] = (int32_t) (100 + (i * 131) % 20000);
             std::fprintf(stderr, "glm fast: warming the prompt path with a %d-token prompt before READY "
-                                 "(STRATA_GLM_WARM_PROMPT)\n", wtn);
+                                 "(MAYA_GLM_WARM_PROMPT)\n", wtn);
             const auto wt0 = std::chrono::steady_clock::now();
             std::string werr;
             const bool wok = model.prefill(wids, werr);
@@ -4162,7 +4248,7 @@ static int glm_pack_generate(const Options& o) {
     // windows' graphs are captured on first use) a later allocation fails, and under Windows' WDDM the driver pages GPU
     // memory to system RAM instead: decode falls to a few tok/s and a request can stall for good.  Said, never changed:
     // the line names the setting that leaves room (--vram-reserve-mib is deducted before the expert pool is sized).
-    const auto pools = model.fast() ? model.pool_vram() : std::vector<strata::core::Glm5Model::PoolVram>();
+    const auto pools = model.fast() ? model.pool_vram() : std::vector<maya::core::Glm5Model::PoolVram>();
     const auto free_mib_on = [](int dev) -> int64_t {
         int cur = 0;
         cudaGetDevice(&cur);
@@ -4173,6 +4259,17 @@ static int glm_pack_generate(const Options& o) {
         cudaSetDevice(cur);
         return ok ? (int64_t) (fb >> 20) : -1;
     };
+    // an integrated GPU (an APU): what is allocated after the expert pool fit (the one-GPU drafting buffers, ~3.4 GB
+    // for GLM-5.3) can use up the reserve and go on into its shared GPU memory - the same RAM, and it runs as before -
+    // so "0 MiB free" there is no reason to shrink the pool
+    const auto integrated_gpu = [](int dev) {
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return v != 0;
+    };
     for (size_t i = 0; i < pools.size(); ++i) {
         const auto& pv = pools[i];
         const int64_t fm = free_mib_on(pv.dev);
@@ -4180,6 +4277,10 @@ static int glm_pack_generate(const Options& o) {
         const int64_t ok_mib = i == 0 ? 256 : 512;
         if (fm >= ok_mib) {
             std::fprintf(stderr, "maya serve: CUDA%d: %lld MiB of VRAM free with everything loaded\n", pv.dev, (long long) fm);
+        } else if (!pv.adapted && integrated_gpu(pv.dev)) {
+            std::fprintf(stderr, "maya serve: CUDA%d: %lld MiB of VRAM free with everything loaded (an integrated GPU: "
+                                 "what is allocated after the expert pool, such as the drafting buffers, is in its "
+                                 "shared GPU memory - nothing to change)\n", pv.dev, (long long) fm);
         } else if (pv.adapted) {
             std::fprintf(stderr, "maya serve: WARNING: CUDA%d: %lld MiB of VRAM free with everything loaded - this card "
                                  "only just fits the model (the VRAM reserve was lowered to %d MiB so the expert pool "
@@ -4197,6 +4298,10 @@ static int glm_pack_generate(const Options& o) {
                                      "room\n", (long long) pv.fixed);
         }
     }
+    // (#1026) a start that came out short of its VRAM reserve: the server starts the engine once more, which keeps
+    // what this one measured free beside it
+    if (model.fast())
+        if (const int short_mib = model.late_check(true); short_mib > 0) std::printf("INFO reserve_short=%d\n", short_mib);
     // the serve wire contract (serve/server.py): READY <max_context> [stop] once, then GEN <max_new>
     // [<key>=<value> ...] <id,id,...> lines - the sampling keys are per request and the ids are the LAST
     // token.  "stop" is NOT advertised: a request runs to its end (no mid-request cancel in M3.1).
@@ -4228,8 +4333,8 @@ static int glm_pack_generate(const Options& o) {
         if (multi && !gens.empty()) {   // requests running: a line when one is there, else one scheduler step
             if (!try_line(line)) {
                 struct StepScope {
-                    StepScope() { strata::core::progress().busy.store(true); }
-                    ~StepScope() { strata::core::progress().busy.store(false); }
+                    StepScope() { maya::core::progress().busy.store(true); }
+                    ~StepScope() { maya::core::progress().busy.store(false); }
                 } step_scope;
                 multi_step();
                 continue;
@@ -4252,13 +4357,13 @@ static int glm_pack_generate(const Options& o) {
         // the watchdog watches a command from here until this iteration ends, whichever way it ends.  A command that
         // ended is progress: back-to-back short commands (the zero-shot suite's LOGP lines, ~0.4 s each on the token
         // path, which has no beat of its own) leave the watchdog's 1 s look almost never on an idle moment, so
-        // without this beat it stopped a healthy engine after STRATA_WATCHDOG_S of answers
+        // without this beat it stopped a healthy engine after MAYA_WATCHDOG_S of answers
         struct BusyScope {
-            BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("the request"); }
+            BusyScope() { maya::core::progress().busy.store(true); maya::core::progress_at("the request"); }
             ~BusyScope() {
-                strata::core::progress_beat();
-                strata::core::progress().busy.store(false);
-                strata::core::progress_at("idle");
+                maya::core::progress_beat();
+                maya::core::progress().busy.store(false);
+                maya::core::progress_at("idle");
             }
         } busy_scope;
         // LOGP <n_ctx> <id,id,...>: the summed log-probability of the tokens from n_ctx on given those before
@@ -4295,6 +4400,10 @@ static int glm_pack_generate(const Options& o) {
             std::vector<int32_t> t(t64.begin(), t64.end());
             snap_tokens.clear();                  // the saved state is LOGP's now, not a conversation's
             ckpt_drop_past(0);                    // ... and so are the caches the checkpoints stood on
+            if (model.ablate_loaded() && model.ablating() != o.ablate_default) {   // (--ablate: LOGP scores as the
+                model.set_ablate(o.ablate_default);                                 //  engine started - read anew)
+                lp_ctx.clear();
+            }
             model.set_host_logits(true);
             const std::vector<int32_t> ctx(t.begin(), t.begin() + n_ctx);
             bool ok = true;
@@ -4308,9 +4417,9 @@ static int glm_pack_generate(const Options& o) {
                     for (size_t i = 0; ok && i < head.size(); i += 8) {
                         const std::vector<int32_t> part(head.begin() + (long) i,
                                                         head.begin() + (long) std::min(head.size(), i + 8));
-                        strata::core::progress_at("LOGP: the context on the token path, at token", (int64_t) i);
+                        maya::core::progress_at("LOGP: the context on the token path, at token", (int64_t) i);
                         ok = model.forward(part, lg0, err);
-                        strata::core::progress_beat();
+                        maya::core::progress_beat();
                     }
                 }
                 lp_ctx.clear();
@@ -4320,10 +4429,10 @@ static int glm_pack_generate(const Options& o) {
             double lp = 0.0;
             bool greedy = true;
             for (int64_t j = n_ctx; ok && j < (int64_t) t.size(); ++j) {
-                strata::core::progress_at("LOGP: the continuation, at token", j);
+                maya::core::progress_at("LOGP: the continuation, at token", j);
                 ok = model.forward({t[(size_t) j - 1]}, lgv, err);
                 if (!ok) break;
-                strata::core::progress_beat();
+                maya::core::progress_beat();
                 float mx = lgv[0];
                 size_t am = 0;
                 for (size_t v = 1; v < lgv.size(); ++v)
@@ -4344,16 +4453,17 @@ static int glm_pack_generate(const Options& o) {
             continue;
         }
         if (cmd == "GEN" || cmd == "GENI") {
+            if (model.fast()) (void) model.late_check(false);   // (#1026: what the requests before allocated)
             int64_t max_new = 0;
             ss >> max_new;
-            strata::kernels::SamplerParams rq = sp;
+            maya::kernels::SamplerParams rq = sp;
             bool any_key = false, greedy_req = false, seed_req = false;
             req_think_budget = 0;
             req_think_end = -1;
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
             int req_chunks = 0;   // ... and its disk reads' pieces (0: as the engine started)
-            double req_msw = -1.0;   // ... and its light-miss bar / first layer (STRATA_GLM_MISS_SKIP_W / _FROM; < 0: the engine's)
+            double req_msw = -1.0;   // ... and its light-miss bar / first layer (MAYA_GLM_MISS_SKIP_W / _FROM; < 0: the engine's)
             int req_msf = -1;
             int req_rid = -1;
             req_spec = 0;
@@ -4361,9 +4471,11 @@ static int glm_pack_generate(const Options& o) {
             req_spec_n_min = -1;
             req_spec_cum = -1.0;
             req_bias.clear();
+            req_abl = -1;
             std::string bias_err;
             int pen_n = 0;
             float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+            maya::core::glmknob::Request req_knobs;   // glm-dsa request knobs: this request's engine knobs
             std::string tok2, ids, emb_path;
             while (ss >> tok2) {
                 const size_t eq = tok2.find('=');
@@ -4394,6 +4506,8 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "spec_min_p") { req_spec_min_p = std::atof(v.c_str()); }
                 else if (k == "spec_n_min") { req_spec_n_min = std::atoi(v.c_str()); }
                 else if (k == "spec_cum") { req_spec_cum = std::atof(v.c_str()); }
+                else if (req_knobs.take(k, v)) {}   // glm-dsa request knobs: promote_min= .. pcie_frac_head= (glm_req_knobs.hpp)
+                else if (k == "ablate") { req_abl = std::atoi(v.c_str()) != 0 ? 1 : 0; }   // (--ablate: this request's)
                 else if (k == "logit_bias") {   // <id>:<bias>,... - -100 or below bans the token
                     for (size_t at = 0; at < v.size() && bias_err.empty();) {
                         size_t end = v.find(',', at);
@@ -4462,6 +4576,7 @@ static int glm_pack_generate(const Options& o) {
             model.set_cpu_lane_threads(req_threads > 0 ? req_threads : 0);
             model.set_read_chunks(req_chunks > 0 ? req_chunks : 0);
             model.set_miss_skip(req_msw, req_msf);
+            maya::core::glmknob::apply(model, req_knobs);   // glm-dsa request knobs: after set_pcie_share (pcie_frac_head)
             std::vector<int64_t> toks;
             std::string e;
             if (max_new <= 0 || ids.empty() || !parse_i64_list(ids.c_str(), toks, e)) {
@@ -4541,6 +4656,11 @@ static int glm_pack_generate(const Options& o) {
                 gen_finish(*gp);
             }
         gen_sweep();
+        if (maya::core::glmpc::engine_on(model))   // glm-dsa B14.14: every conversation to the prompt cache
+            for (int c = 0; c < (int) ctxs.size(); ++c) {
+                bind_ctx(c);
+                if (!model.ablating()) maya::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
+            }
         if (slot_keep && !slot_ram)
             for (int c = 0; c < (int) ctxs.size(); ++c) {
                 bind_ctx(c);
@@ -4548,21 +4668,22 @@ static int glm_pack_generate(const Options& o) {
             }
         return 0;
     }
+    if (!model.ablating()) maya::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);   // glm-dsa B14.14
     if (slot_keep && !slot_ram) slot_put(" on shutdown");
     save_profile("quit");   // #477
-    strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
+    maya::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
     return 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+    maya::platform::env_aliases();   // (MAYA_* settings under their older names too)
     {
         // the GLM tuning settings taken from the environment, said once at start (#6), with the value used where the
         // engine clamps one (the same ranges as where each is read)
-        namespace gf = strata::kernels::glmf;
-        static const strata::platform::EnvRange kRanges[] = {
+        namespace gf = maya::kernels::glmf;
+        static const maya::platform::EnvRange kRanges[] = {
             {"GLM_PREFETCH_N", 0, gf::kSpares - 1, "at most kSpares-1"},          // glm_fast_path.cu
             {"GLM_AHEAD", 0, gf::kAhead, "at most kAhead"},                       // glm_fast_path.cu
             {"GLM_DISK_SKIP_FROM", 0, 8, "0-8"},                                  // glm_fast_path.cu
@@ -4572,7 +4693,7 @@ int main(int argc, char** argv) {
 #else
         char** env = environ;
 #endif
-        const std::string line = strata::platform::env_report(env, "GLM_", "glm settings from the environment",
+        const std::string line = maya::platform::env_report(env, "GLM_", "glm settings from the environment",
                                                               kRanges, sizeof(kRanges) / sizeof(kRanges[0]));
         if (!line.empty()) std::fprintf(stderr, "%s\n", line.c_str());
     }
@@ -4620,22 +4741,41 @@ int main(int argc, char** argv) {
         else if (a == "--glm-pack") o.glm_pack = next("--glm-pack");
         else if (a == "--glm-ram-resident") {
 #if defined(_WIN32)
-            _putenv_s("STRATA_GLM_RAM_RESIDENT", "1");
+            _putenv_s("MAYA_GLM_RAM_RESIDENT", "1");
 #else
-            setenv("STRATA_GLM_RAM_RESIDENT", "1", 1);
+            setenv("MAYA_GLM_RAM_RESIDENT", "1", 1);
 #endif
         }
-        else if (a == "--parallel") {   // the sequence states (STRATA_GLM_SEQS): n conversations at once
+        else if (a == "--ablate") o.ablate = next("--ablate");
+        else if (a == "--ablate-layer") {
+            const int n = std::atoi(next("--ablate-layer"));
+            if (n < 1 || n > 4096) { std::fprintf(stderr, "--ablate-layer takes 1..4096\n"); return 2; }
+            o.ablate_layer = n;
+        }
+        else if (a == "--ablate-scale") {
+            const double v = std::atof(next("--ablate-scale"));
+            if (!(v >= 1e-6 && v <= 1e6)) { std::fprintf(stderr, "--ablate-scale takes 1e-6..1e6\n"); return 2; }
+            o.ablate_scale = (float) v;
+        }
+        else if (a == "--ablate-default") {   // on (every pass, as a startup flag) | off (GEN ablate=1 turns it on)
+            const std::string v = next("--ablate-default");
+            if (v != "on" && v != "off" && v != "1" && v != "0") {
+                std::fprintf(stderr, "--ablate-default: on or off\n");
+                return 2;
+            }
+            o.ablate_default = v == "on" || v == "1";
+        }
+        else if (a == "--parallel") {   // the sequence states (MAYA_GLM_SEQS): n conversations at once
             const int n = std::atoi(next("--parallel"));
             if (n < 1 || n > 8) { std::fprintf(stderr, "--parallel takes 1..8\n"); return 2; }
-            set_env("STRATA_GLM_SEQS", std::to_string(n).c_str());
+            set_env("MAYA_GLM_SEQS", std::to_string(n).c_str());
         }
         else if (a == "--glm-ram-slack") {
             const char* v = next("--glm-ram-slack");
 #if defined(_WIN32)
-            _putenv_s("STRATA_GLM_RAM_SLACK", v);
+            _putenv_s("MAYA_GLM_RAM_SLACK", v);
 #else
-            setenv("STRATA_GLM_RAM_SLACK", v, 1);
+            setenv("MAYA_GLM_RAM_SLACK", v, 1);
 #endif
         }
         else if (a == "--tokens") {
@@ -4666,7 +4806,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
-            if (!strata::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
+            if (!maya::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
                 std::fprintf(stderr, "--logits-stride requires a positive decimal int64\n"); return 2;
             }
             have_logits_stride = true;
@@ -4850,9 +4990,13 @@ int main(int argc, char** argv) {
     // mistake worth saying out loud.
     // --kv-streaming on|off: on streams with --kv-resident's window (32768 when it gives none), off keeps every cell in
     // VRAM whatever --kv-resident says
+    bool kv_auto = false;   // `on` with no window of the user's: glm-dsa streams only when its cache does not fit (36)
     if (!o.kv_streaming.empty()) {
         if (o.kv_streaming == "on") {
-            if (o.kv_resident <= 0) o.kv_resident = 32768;
+            if (o.kv_resident <= 0) {
+                o.kv_resident = 32768;
+                kv_auto = true;
+            }
         } else if (o.kv_streaming == "off") {
             o.kv_resident = 0;
         } else {
@@ -4860,22 +5004,30 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (!o.ablate.empty() && o.glm_pack.empty()) {   // (the Qwen engine has no projection: refused, not ignored)
+        std::fprintf(stderr, "--ablate: the GLM engine only (--glm-pack); this model's engine has no refusal ablation\n");
+        return 2;
+    }
     if (!o.glm_pack.empty()) {
         // GLM without --kv: INT8, as the setup writes it (v1.1.55: KL against the full model within FP16's own
         // run-to-run spread, no new loops; half the latent cache's VRAM); --kv fp16 or MAYA_GLM_KV_INT8=0 keeps FP16
-        if (!o.kv_given && std::getenv("STRATA_GLM_KV_INT8") == nullptr) o.kv = "int8";
+        if (!o.kv_given && std::getenv("MAYA_GLM_KV_INT8") == nullptr) o.kv = "int8";
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
-        if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        if (o.kv == "int8" && std::getenv("MAYA_GLM_KV_INT8") == nullptr) set_env("MAYA_GLM_KV_INT8", "1");
         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
         if (o.kv_resident < 0) {
             std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");
             return 2;
         }
-        if (o.kv_resident > 0 && std::getenv("STRATA_GLM_KV_RESIDENT") == nullptr)
-            set_env("STRATA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
-        if (o.kv_streaming == "off") set_env("STRATA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
-        // the expert pool's size, set in the config's args (the engine reads them as STRATA_GLM_EXPERT_CACHE,
-        // STRATA_GLM_RESERVE_MB and STRATA_GLM_RESERVE_LATER_MB; given here, they win over the environment):
+        const bool kv_env = std::getenv("MAYA_GLM_KV_RESIDENT") != nullptr;
+        if (o.kv_resident > 0 && !kv_env)
+            set_env("MAYA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
+        // OWNER-DECISIONS 36: the setup's `on` lets a glm-dsa model keep its whole cache in VRAM when it fits there
+        // (decided at load from the measured VRAM; Flash streams as before)
+        if (kv_auto && !kv_env && std::getenv("MAYA_GLM_KV_AUTO") == nullptr) set_env("MAYA_GLM_KV_AUTO", "1");
+        if (o.kv_streaming == "off") set_env("MAYA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
+        // the expert pool's size, set in the config's args (the engine reads them as MAYA_GLM_EXPERT_CACHE,
+        // MAYA_GLM_RESERVE_MB and MAYA_GLM_RESERVE_LATER_MB; given here, they win over the environment):
         // --expert-cache auto | N (0 = auto), --vram-reserve-mib N, --vram-reserve-later-mib N
         if (o.expert_cache < -1) {
             std::fprintf(stderr, "maya generate: --expert-cache takes auto or a number of experts\n");
@@ -4886,10 +5038,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (o.expert_cache != 0)
-            set_env("STRATA_GLM_EXPERT_CACHE", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache).c_str());
-        if (o.vram_reserve_given) set_env("STRATA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
+            set_env("MAYA_GLM_EXPERT_CACHE", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache).c_str());
+        if (o.vram_reserve_given) set_env("MAYA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
         if (o.vram_reserve_later_mib >= 0)
-            set_env("STRATA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
+            set_env("MAYA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }
@@ -5012,9 +5164,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya generate: --kv must be fp16, int8, q4_0 or k8v4\n");
         return 2;
     }
-    strata::core::qsa_set_kv_int8(o.kv == "int8");
-    strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
-    strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
+    maya::core::qsa_set_kv_int8(o.kv == "int8");
+    maya::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    maya::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "maya generate: --kv-resident must be >= 0\n");
         return 2;
@@ -5023,15 +5175,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya generate: --kv k8v4 does not support --kv-resident streaming (yet)\n");
         return 2;
     }
-    strata::core::qsa_set_kv_resident(o.kv_resident);
+    maya::core::qsa_set_kv_resident(o.kv_resident);
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
-    // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
+    // up to 2 tokens longer; the draft policy (maya/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
-    strata::core::layer_set_shared_early(!o.shared_late);
+    maya::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         if (o.no_ple || o.ple_gguf.empty()) {
             std::fprintf(stderr, "maya generate: --native requires --ple-gguf (the PLE key is native too)\n");
@@ -5113,7 +5265,7 @@ int main(int argc, char** argv) {
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI) and its translation unit is
     // compiled `/arch:AVX512`, so on a CPU without those features it does not fail - it executes an illegal
     // instruction at some unpredictable token.  Refusing at second zero is the whole point of P2.S3's check.
-    strata::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
+    maya::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
 
     std::string err;
     if (!o.native_head_gguf.empty() && !o.stream_token) {
@@ -5124,18 +5276,18 @@ int main(int argc, char** argv) {
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
-        const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        const maya::core::ModelGeometry g0;
+        if (!maya::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
     }
-    const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    const bool native_pack = maya::kernels::cpu::expert_layout().native;
     if (o.expert_cache_remote[0] > 0) {
         // Keep CUDA1's proven startup order: initialise its context before
         // allocating GPU0 weights or mapping the large host expert arena.
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(remote_dev[0], free_gib, err)) {
+        if (!maya::core::RemoteExperts::preflight(remote_dev[0], free_gib, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -5164,12 +5316,12 @@ int main(int argc, char** argv) {
         }
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (!strata::kernels::cpu::cpu_avx512_ok())
+    if (!native_pack) maya::kernels::cpu::cpu_require_expert_support();
+    else if (!maya::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "maya generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
-                     std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
-    strata::core::NativeEmbed native_embed;
+                     std::getenv("MAYA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (MAYA_NO_IQ256 set)");
+    maya::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
@@ -5177,15 +5329,15 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
+        const maya::core::ModelGeometry g0;
         if (!native_embed.load(shard_with(o.native_preset, "token_embd.weight"), g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
-        strata::core::set_native_embed(&native_embed);
+        maya::core::set_native_embed(&native_embed);
         std::fprintf(stderr, "maya generate: native pack: %s experts (largest blob %.2f MB), token embedding "
                              "type %d in mapped host memory (%.0f MiB)\n",
-                     o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
+                     o.pack.c_str(), (double) maya::kernels::cpu::expert_layout().max_blob / 1e6,
                      native_embed.type(), (double) native_embed.bytes() / 1048576.0);
     }
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
@@ -5193,7 +5345,7 @@ int main(int argc, char** argv) {
     std::set<std::string> skip;
     if (!o.keep_canonical) {
         if (!o.native_dense_gguf.empty() &&
-            !strata::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, skip, err)) {
+            !maya::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, skip, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -5203,7 +5355,7 @@ int main(int argc, char** argv) {
         if (native_pack) skip.insert("token_embd.weight");
     }
     uint64_t pool_bytes = 0;
-    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!maya::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
         return 1;
     }
@@ -5213,7 +5365,7 @@ int main(int argc, char** argv) {
                      (unsigned long long) pool_bytes);
         return 1;
     }
-    strata::core::WeightTable wt;
+    maya::core::WeightTable wt;
     if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
         return 1;
@@ -5222,7 +5374,7 @@ int main(int argc, char** argv) {
                          "served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
 
-    strata::core::NativeDense native_dense;
+    maya::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "maya generate: native dense projections: %s\n", err.c_str());
@@ -5232,27 +5384,27 @@ int main(int argc, char** argv) {
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0));
     }
 
-    strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
-    strata::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
+    maya::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
+    maya::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
     // Plan v0.3 P3: the fused hyper-connection read rides the native (FP32-activation) contract; the per-stage
     // and dump measurements need the unfused layout of R, so they keep the old kernels.
-    strata::core::layer_set_fast_attn(!o.no_fast_attn);
-    strata::core::layer_set_publish_kernel(!o.no_publish_kernel);
-    strata::core::layer_set_fused_gdn(!o.no_fused_gdn);
-    strata::core::layer_set_fast_select(!o.no_fast_select);
-    strata::core::layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && o.dump_layers.empty() &&
+    maya::core::layer_set_fast_attn(!o.no_fast_attn);
+    maya::core::layer_set_publish_kernel(!o.no_publish_kernel);
+    maya::core::layer_set_fused_gdn(!o.no_fused_gdn);
+    maya::core::layer_set_fast_select(!o.no_fast_select);
+    maya::core::layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && o.dump_layers.empty() &&
                                      o.dump_halves.empty() && !o.stage_timing);
-    strata::core::layer_set_native_bf16(o.native_bf16);
-    strata::core::layer_set_native_flash_attn_short(o.native_flash_attn_short);
-    strata::kernels::ple_set_native_bf16(o.native_bf16_extra);
-    strata::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
-    strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
-    strata::kernels::native_gdn_set_enabled(o.native_gdn);
-    strata::kernels::native_router_set_enabled(o.native_router);
-    strata::kernels::native_qsa_set_enabled(o.native_qsa);
-    strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
-    strata::kernels::native_rope_set_enabled(o.native_rope);
-    // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
+    maya::core::layer_set_native_bf16(o.native_bf16);
+    maya::core::layer_set_native_flash_attn_short(o.native_flash_attn_short);
+    maya::kernels::ple_set_native_bf16(o.native_bf16_extra);
+    maya::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
+    maya::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
+    maya::kernels::native_gdn_set_enabled(o.native_gdn);
+    maya::kernels::native_router_set_enabled(o.native_router);
+    maya::kernels::native_qsa_set_enabled(o.native_qsa);
+    maya::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
+    maya::kernels::native_rope_set_enabled(o.native_rope);
+    // The vision path: every rope kernel reads a cell's (t, h, w) from this table (maya/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
@@ -5267,20 +5419,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "maya generate: cannot allocate the image position table\n");
             return 1;
         }
-        strata::kernels::mrope_table_set(d_mrope);
+        maya::kernels::mrope_table_set(d_mrope);
     }
-    strata::kernels::ple_set_native_postops(o.native_ple_postops);
-    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
+    maya::kernels::ple_set_native_postops(o.native_ple_postops);
+    maya::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     if (!o.native_preset.empty()) {
         // a pruned variant (the Qwen Coder) ships fewer experts than the canonical 512x10; the model file
         // is the authority on its own MoE shape - everything else in the geometry is unchanged
         try {
-            strata::GgufFile model_gguf(o.native_preset);
+            maya::GgufFile model_gguf(o.native_preset);
             // BOTH spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next"
             // (docs/GLM5-FLASH.md; Glm5Geometry::from_gguf detects them the same way).
-            if (const strata::MetaValue* v = model_gguf.get("general.architecture");
-                v != nullptr && v->type == strata::MetaType::STRING &&
+            if (const maya::MetaValue* v = model_gguf.get("general.architecture");
+                v != nullptr && v->type == maya::MetaType::STRING &&
                 (v->s == "glm5-next" || v->s == "glm5next")) {
                 // this GGUF belongs to the GLM runner, not the qwen4exp session/graph machinery:
                 // point at the pack path instead of dying inside check_all with shape mismatches.
@@ -5292,8 +5444,8 @@ int main(int argc, char** argv) {
                              o.native_preset.c_str(), v->s.c_str());
                 return 2;
             }
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+            if (const maya::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
+            if (const maya::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "maya generate: reading the model's expert shape from %s: %s\n",
                          o.native_preset.c_str(), e.what());
@@ -5316,11 +5468,11 @@ int main(int argc, char** argv) {
     }
 
     void* sbuf = nullptr;
-    if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess) {
+    if (cudaMalloc(&sbuf, maya::core::session_bytes(g, o.max_context, K)) != cudaSuccess) {
         std::fprintf(stderr, "maya generate: session state allocation failed\n");
         return 1;
     }
-    strata::core::SessionState ss;
+    maya::core::SessionState ss;
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
     // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
     // i.e. stream 0.  `bench/micro/kernel_costs.cu` measures what that costs: EVERY kernel it launches through
@@ -5334,14 +5486,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* const main_cs = (void*) main_stream;
-    if (strata::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
+    if (maya::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
         std::fprintf(stderr, "maya generate: session_init failed\n");
         return 1;
     }
     if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1)
         std::fprintf(stderr, "maya generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                              "%.2f GiB of pinned RAM\n", (long long) (ss.qsa_states[0].n_slots * 4),
-                     (long long) o.max_context, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+                     (long long) o.max_context, (double) maya::core::qsa_kv_host_bytes() / 1073741824.0);
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
     // half copies are issued from inside `block_layer_pre`/`block_layer_post`, so they are only ever enqueued
@@ -5367,8 +5519,8 @@ int main(int argc, char** argv) {
         ss.block.dump = half_stage;
     }
 
-    strata::core::Doorbell db;
-    if (strata::core::doorbell_init(g, K, db) == 0) {
+    maya::core::Doorbell db;
+    if (maya::core::doorbell_init(g, K, db) == 0) {
         std::fprintf(stderr, "maya generate: doorbell_init failed\n");
         return 1;
     }
@@ -5380,13 +5532,13 @@ int main(int argc, char** argv) {
     // module was built and parity-tested, and nothing called it.  Everything below is construction - the table
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
-    strata::kernels::PleTable ple_table;
-    std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
+    maya::kernels::PleTable ple_table;
+    std::vector<float> ple_emb_host((size_t) maya::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
     if (!o.ple_gguf.empty()) {
-        strata::kernels::PleIoOptions pio;
-        pio.mode = o.ple_io == "mmap" ? strata::kernels::PleIo::Mmap : strata::kernels::PleIo::Direct;
+        maya::kernels::PleIoOptions pio;
+        pio.mode = o.ple_io == "mmap" ? maya::kernels::PleIo::Mmap : maya::kernels::PleIo::Direct;
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
         pio.io_thread = !o.ple_sync_submit;
@@ -5394,12 +5546,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
-        const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
-        const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
-        const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
-        const strata::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
-        const strata::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
-        const strata::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
+        const maya::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
+        const maya::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
+        const maya::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
+        const maya::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
+        const maya::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
+        const maya::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
         if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
             std::fprintf(stderr, "maya generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
                                  "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
@@ -5428,15 +5580,15 @@ int main(int argc, char** argv) {
         ss.ple.w.norm_query = (const float*) wnq->data;
         ss.ple.w.norm_conv = (const float*) wnc->data;
         ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
-        ss.ple.consts = strata::kernels::ple_artifact_consts();
+        ss.ple.consts = maya::kernels::ple_artifact_consts();
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
         ss.ple.table = &ple_table;
         ss.ple.token = &ss.ple_token;
         ss.ple.prev = ss.ple_prev;
         ss.ple.hist = ss.ple_hist;
         ss.ple.emb_host = ple_emb_host.data();
-        if (cudaMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
-            cudaMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+        if (cudaMalloc((void**) &ple_emb_dev, (size_t) maya::kernels::NG_N_EMBD * 4) != cudaSuccess ||
+            cudaMalloc((void**) &ple_scratch, maya::core::ple_run_scratch_bytes()) != cudaSuccess) {
             std::fprintf(stderr, "maya generate: the PLE buffers failed\n");
             return 1;
         }
@@ -5470,11 +5622,11 @@ int main(int argc, char** argv) {
         st.dev = split_devs[i];
         const bool last = i + 1 == split_devs.size();
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
+        if (!maya::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
-        const strata::core::OnDevice on(st.dev);
+        const maya::core::OnDevice on(st.dev);
         void* arena_s = nullptr;
         if (cudaMalloc(&arena_s, pool_bytes) != cudaSuccess ||
             !st.wt.load(o.pack, arena_s, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
@@ -5488,15 +5640,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         void* sbuf_s = nullptr;
-        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss) == 0 ||
+        if (cudaMalloc(&sbuf_s, maya::core::session_bytes(g, o.max_context, K)) != cudaSuccess ||
+            maya::core::session_init(g, o.max_context, K, sbuf_s, st.ss) == 0 ||
             cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&st.adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&st.adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
             std::fprintf(stderr, "maya generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
-        const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
+        const maya::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_gguf, g.n_embd, wo_s->ne1, err))) {
             std::fprintf(stderr, "maya generate: layer split, CUDA%d head: %s\n", st.dev,
@@ -5504,7 +5656,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         // a control vector (the speed projection): its tables on this device too - the stage's layers apply it here
-        if (!strata::kernels::cvec_replicate(err)) {
+        if (!maya::kernels::cvec_replicate(err)) {
             std::fprintf(stderr, "maya generate: layer split, CUDA%d: %s\n", st.dev, err.c_str());
             return 1;
         }
@@ -5517,7 +5669,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "maya generate: layer split, CUDA%d: the image position table failed\n", st.dev);
                 return 1;
             }
-            strata::kernels::mrope_table_set(st.mrope);
+            maya::kernels::mrope_table_set(st.mrope);
         }
         // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed)
         st.pcie_frac = o.pcie_frac;
@@ -5536,7 +5688,7 @@ int main(int argc, char** argv) {
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
-    strata::core::MtpDrafter mtp;
+    maya::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "maya generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -5545,8 +5697,8 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
-        static const strata::core::ModelGeometry draft_geometry{};
-#if !defined(STRATA_USE_HIP)
+        static const maya::core::ModelGeometry draft_geometry{};
+#if !defined(MAYA_USE_HIP)
         // an on-demand vision encoder (it runs on the first GPU): a drafter there can lend its experts' VRAM too,
         // when the expert cache alone cannot hold the encoder (nothing drafts while a picture is read)
         {
@@ -5557,14 +5709,14 @@ int main(int argc, char** argv) {
         }
 #endif
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
-        const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
+        const maya::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "maya generate: %s\n", err.c_str()); return 1; }
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
     for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
+        if (!maya::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -5592,21 +5744,21 @@ int main(int argc, char** argv) {
     // The earlier "the arena does not fit" conclusion was WRONG and is worth recording: the failure was a stale
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
-    strata::core::FileExpertSource src;
-    strata::core::ArenaExpertSource arena_src;
-    strata::core::GgufExpertSource gguf_src;
-    strata::core::ExpertSource* srcp = nullptr;
+    maya::core::FileExpertSource src;
+    maya::core::ArenaExpertSource arena_src;
+    maya::core::GgufExpertSource gguf_src;
+    maya::core::ExpertSource* srcp = nullptr;
     // v1.1.32: a native pack without experts.bin whose experts this PC's RAM cannot hold (CYBER-FROST-3.8's 78 GB
     // on a 64 GB PC) reads them straight from the model's GGUF - VRAM, then RAM, then the SSD
     const bool gguf_capable = native_pack && !o.mmap_experts && !o.native_preset.empty() &&
                               !std::filesystem::exists(std::filesystem::path(o.pack) / "experts.bin") &&
-                              !strata::kernels::cpu::expert_layout().gguf_off.empty();
+                              !maya::kernels::cpu::expert_layout().gguf_off.empty();
     const bool from_gguf = gguf_capable &&
         (o.experts_from_gguf == "on" ||
          (o.experts_from_gguf == "auto" &&
-          strata::core::expert_ram_room() < strata::kernels::cpu::expert_layout().total + (2ull << 30)));
+          maya::core::expert_ram_room() < maya::kernels::cpu::expert_layout().total + (2ull << 30)));
     if (from_gguf) {
-        if (!gguf_src.open(o.native_preset, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::MAXT * K, err)) {
+        if (!gguf_src.open(o.native_preset, g.n_layers, g.n_expert, (int64_t) maya::kernels::cpu::MAXT * K, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -5643,7 +5795,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "maya generate: expert arena: %s\n", arena_src.note().c_str());
         std::fprintf(stderr, "maya generate: loaded %.2f GiB at %.2f GiB/s\n",
-                     (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
+                     (double) maya::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
         // A rate under ~0.2 GiB/s is not the hardware.  Task Scheduler / service contexts throttle this
         // read+fill about 24x (measured 0.05 vs 1.42 GiB/s for the same binary, args and cache state; the
@@ -5660,17 +5812,17 @@ int main(int argc, char** argv) {
 #endif
         srcp = &arena_src;
     }
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
-    if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
+    maya::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    if (o.no_ple_prefetch) maya::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     mem_mark("the weights, the session and the drafter");
-    strata::core::ExpertCache xcache;
+    maya::core::ExpertCache xcache;
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
-        if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
+        if (!maya::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -5693,10 +5845,10 @@ int main(int argc, char** argv) {
     //     the routed mass of rank r is taken as (r+1)^-1.2 (fits the sweep's hit rates: K=24/26/28 predicted
     //     99.53/99.34/99.15%, measured 99.5/99.4/99.0%).
     // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
-    // STRATA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
+    // MAYA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
     const int64_t split_pf_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
     auto stage_room = [&](int dev, bool later) -> int64_t {
-        const strata::core::OnDevice on(dev);
+        const maya::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "maya generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
@@ -5705,7 +5857,7 @@ int main(int argc, char** argv) {
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = maya::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
         std::vector<double> layer_ms((size_t) ns);
@@ -5722,7 +5874,7 @@ int main(int argc, char** argv) {
                                  "%.2f GiB for experts\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
                          (double) cap[(size_t) i] / 1073741824.0);
         }
-        const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
+        const double miss_ms = std::getenv("MAYA_SPLIT_MISS_MS") ? std::atof(std::getenv("MAYA_SPLIT_MISS_MS")) : 190.0;
         std::vector<double> mass(profile.size());
         double total_mass = 0;
         for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
@@ -5814,10 +5966,10 @@ int main(int argc, char** argv) {
     // after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after it and ate most of
     // the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for good at its first
     // verify window.  Loaded first, the cache is sized around it.
-    const strata::core::WeightRef* wo = wt.find("output.weight");
+    const maya::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "maya generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
-    strata::core::NativeHead native_head;
+    maya::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -5842,19 +5994,19 @@ int main(int argc, char** argv) {
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
-        int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        int64_t slots = ((int64_t) free_b - reserve) / (int64_t) maya::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         // A serve on a small card (8 GB): with borrowing the cache is meant to lend the prompt path its buffers, but
         // a cache of few slots cannot (lend_slots + 128 slots), and the prompt path then allocates them on top - after
         // the cache took everything above the reserve.  Together with the verify window, that left ~100 MiB free, and
         // what a first request creates later (cuBLAS state, window graphs: ~100 MiB measured) ran the card out of
         // memory - "verify arena does not fit", cuBLAS status 14, "round capture".  So when the buffers will be the
-        // prompt path's own, they come out of the cache's share, down to the floor the load line asks (STRATA_
+        // prompt path's own, they come out of the cache's share, down to the floor the load line asks (MAYA_
         // SERVE_FREE_FLOOR_MIB, default 256 MiB free once everything is loaded).  A card that can lend (or has the
         // room) is untouched: the floor only binds when the cache would eat into it.
         if (borrow && o.serve && !multi_gpu && o.prefill_chunk > 0 && slots > 0) {
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            auto k_for = [&](int64_t c) { return ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, c) + blob - 1) / blob; };
+            const int64_t blob = (int64_t) maya::kernels::cpu::expert_layout().max_blob;
+            auto k_for = [&](int64_t c) { return ((int64_t) maya::prefill::Prefill::bytes_needed(g, ss, c) + blob - 1) / blob; };
             auto can_lend = [&](int64_t sl) {
                 if (o.prefill_auto) {
                     for (const int64_t c : {8192, 6144, 4096, 3072, 2048, 1024, 512, 256})
@@ -5866,12 +6018,12 @@ int main(int argc, char** argv) {
                 return false;
             };
             if (!can_lend(slots)) {
-                const int64_t own_mib = (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_auto ? 1024 : o.prefill_chunk) >> 20);
+                const int64_t own_mib = (int64_t) (maya::prefill::Prefill::bytes_needed(g, ss, o.prefill_auto ? 1024 : o.prefill_chunk) >> 20);
                 // (measured on an 8 GB card at --prefill 512 --spec 4: the prompt path took its bytes_needed + ~180 MiB of
                 // cuBLAS and staging state, the verify window ~90 MiB, the host-registered expert tiers' tables ~110 MiB)
                 const int64_t verify_mib = 16 * ((int64_t) o.spec + 2);
                 const int64_t other_mib = 192 + 112;
-                const char* fv = std::getenv("STRATA_SERVE_FREE_FLOOR_MIB");
+                const char* fv = std::getenv("MAYA_SERVE_FREE_FLOOR_MIB");
                 const int64_t floor_mib = fv ? std::atoll(fv) : 256;
                 const int64_t post_mib = own_mib + verify_mib + other_mib;
                 const int64_t by_floor = ((int64_t) (free_b >> 20) - post_mib - floor_mib) * (1ll << 20) / blob;
@@ -5895,7 +6047,7 @@ int main(int argc, char** argv) {
         cudaMemGetInfo(&free_b, &total_b);
         const int64_t prefill_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
-        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
+        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) maya::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
             std::fprintf(stderr, "maya generate: layer split: --expert-cache %d leaves no room for the prompt path's "
                                  "buffers (%lld MiB) on CUDA0: %lld slots\n", o.expert_cache, (long long) prefill_mib,
@@ -5909,7 +6061,7 @@ int main(int argc, char** argv) {
     if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = maya::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
@@ -5934,13 +6086,13 @@ int main(int argc, char** argv) {
                 sized_slots.resize(keep);
                 o.expert_cache = (int) keep;
             } else {
-                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
+                o.expert_cache = (int) (keep_bytes / (int64_t) maya::kernels::cpu::expert_layout().max_blob);
             }
             if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
             return true;
         };
         auto cache_bytes = [&]() -> int64_t {
-            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) maya::kernels::cpu::expert_layout().max_blob;
             int64_t b = 0;
             for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
             return b;
@@ -5950,11 +6102,11 @@ int main(int argc, char** argv) {
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
         // page back while the verify graph spun on a host flag never finished.  So the slots are zeroed and the
         // free figure read again; while it is short of the reserve the cache is reopened smaller.
-        // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
-        int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
+        // MAYA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
+        int fake_fails = std::getenv("MAYA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("MAYA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
-#if !defined(STRATA_USE_HIP)
-        // an on-demand vision encoder (serve --vision; the server sets STRATA_GLM_VISION_LEND_MB): the cache is mapped
+#if !defined(MAYA_USE_HIP)
+        // an on-demand vision encoder (serve --vision; the server sets MAYA_GLM_VISION_LEND_MB): the cache is mapped
         // in pieces, so its tail can be given back while a picture is read (HIP: only VRAM that is free is lent)
         if (o.serve && o.vision && vision_lend_need() > 0) xcache.set_lendable(true);
 #endif
@@ -5965,7 +6117,7 @@ int main(int argc, char** argv) {
                 err = "ExpertCache: cudaMalloc failed: out of memory (MAYA_TEST_CACHE_FAIL)";
             } else {
                 ok = sized_slots.empty()
-                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
+                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) maya::kernels::cpu::expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
             }
             if (!ok) {
@@ -6049,10 +6201,10 @@ int main(int argc, char** argv) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (slot == strata::core::kNotResident) break;
+            if (slot == maya::core::kNotResident) break;
             const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) maya::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
                 std::fprintf(stderr, "maya generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -6064,7 +6216,7 @@ int main(int argc, char** argv) {
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+                                (int64_t) maya::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -6083,9 +6235,9 @@ int main(int argc, char** argv) {
 
     for (auto& stp : stages) {
         GpuStage& st = *stp;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = maya::kernels::cpu::expert_layout();
         const int64_t room = stage_room(st.dev, true);
-        const strata::core::OnDevice on(st.dev);
+        const maya::core::OnDevice on(st.dev);
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {
@@ -6105,7 +6257,7 @@ int main(int argc, char** argv) {
         for (const auto& pr : st.profile) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
-            if (slot == strata::core::kNotResident) break;
+            if (slot == maya::core::kNotResident) break;
             const uint8_t* b = srcp->blob(pr.first, pr.second);
             if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
                 std::fprintf(stderr, "maya generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
@@ -6129,7 +6281,7 @@ int main(int argc, char** argv) {
     if (multi_gpu)
         std::fprintf(stderr, "maya generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
 
-    std::array<strata::core::RemoteExperts, 3> remote_experts;
+    std::array<maya::core::RemoteExperts, 3> remote_experts;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
@@ -6218,8 +6370,8 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> order, drop;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
-                bool held = xcache.valid() && xcache.slot_of(l, e) != strata::core::kNotResident;
-                for (auto& st : stages) held = held || st->cache.slot_of(l, e) != strata::core::kNotResident;
+                bool held = xcache.valid() && xcache.slot_of(l, e) != maya::core::kNotResident;
+                for (auto& st : stages) held = held || st->cache.slot_of(l, e) != maya::core::kNotResident;
                 const int64_t i = l * g.n_expert + e;
                 for (int r = 0; r < 3; ++r)
                     held = held || (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].owns(i));
@@ -6264,7 +6416,7 @@ int main(int argc, char** argv) {
     float* d_hit_q8_scale = nullptr;   ///< R4.2h: the fp32 activation scales the CPU path also uses
     float* d_hit_out = nullptr;
     if (o.expert_cache > 0 && !o.no_pool) {
-        const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
+        const uint64_t sb = maya::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, maya::kernels::cpu::FF);
         if (cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
@@ -6280,7 +6432,7 @@ int main(int argc, char** argv) {
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
-        drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        drive.d.cache_blob = (int64_t) maya::kernels::cpu::expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
@@ -6316,28 +6468,28 @@ int main(int argc, char** argv) {
                                  "--no-capture as well.\n");
             return 2;
         }
-        if (!strata::core::stage_timing_enable()) {
+        if (!maya::core::stage_timing_enable()) {
             std::fprintf(stderr, "maya generate: stage_timing_enable failed\n");
             return 1;
         }
-        strata::core::stage_timing_name(0, "gr_read (attn)");
-        strata::core::stage_timing_name(1, "attention block");
-        strata::core::stage_timing_name(2, "gr_write (attn)");
-        strata::core::stage_timing_name(3, "gr_read (ffn)");
-        strata::core::stage_timing_name(4, "moe_route");
-        strata::core::stage_timing_name(5, "moe_finish");
-        strata::core::stage_timing_name(6, "gr_write (ffn)");
+        maya::core::stage_timing_name(0, "gr_read (attn)");
+        maya::core::stage_timing_name(1, "attention block");
+        maya::core::stage_timing_name(2, "gr_write (attn)");
+        maya::core::stage_timing_name(3, "gr_read (ffn)");
+        maya::core::stage_timing_name(4, "moe_route");
+        maya::core::stage_timing_name(5, "moe_finish");
+        maya::core::stage_timing_name(6, "gr_write (ffn)");
         // The GDN block's internals.  It is 36 of the 48 layers, 0.96 ms each, and its entire weight traffic
         // is ~26 MB - so ~0.11 ms at the measured read rate.  ~13 tiny latency-bound launches live in it and
         // a single "attention block" number cannot say which one costs anything.
-        strata::core::stage_timing_name(8, "  gdn: quantize x");
-        strata::core::stage_timing_name(9, "  gdn: qkv gemv");
-        strata::core::stage_timing_name(10, "  gdn: conv+silu");
-        strata::core::stage_timing_name(11, "  gdn: l2 norms");
-        strata::core::stage_timing_name(12, "  gdn: alpha/beta/gate");
-        strata::core::stage_timing_name(13, "  gdn: gdn_step");
-        strata::core::stage_timing_name(14, "  gdn: z + out_norm");
-        strata::core::stage_timing_name(15, "  gdn: out gemv");
+        maya::core::stage_timing_name(8, "  gdn: quantize x");
+        maya::core::stage_timing_name(9, "  gdn: qkv gemv");
+        maya::core::stage_timing_name(10, "  gdn: conv+silu");
+        maya::core::stage_timing_name(11, "  gdn: l2 norms");
+        maya::core::stage_timing_name(12, "  gdn: alpha/beta/gate");
+        maya::core::stage_timing_name(13, "  gdn: gdn_step");
+        maya::core::stage_timing_name(14, "  gdn: z + out_norm");
+        maya::core::stage_timing_name(15, "  gdn: out gemv");
     }
     std::FILE* routing = nullptr;
     if (!o.dump_routing.empty()) {
@@ -6353,11 +6505,11 @@ int main(int argc, char** argv) {
         }
         drive.routing = routing;
     }
-    strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
+    maya::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
     // The hit hook rides the same switch as the pool: with no pool there is no `parts` staging to
     // write into, and a hit path with nowhere to write is a wrong token rather than an error.
-    strata::core::HitFn hit_fn =
-        (o.no_pool || o.expert_cache <= 0) ? nullptr : &strata::core::expert_hit_run;
+    maya::core::HitFn hit_fn =
+        (o.no_pool || o.expert_cache <= 0) ? nullptr : &maya::core::expert_hit_run;
     void* pool_user = o.no_pool ? nullptr : (void*) &drive;
     std::fprintf(stderr, "maya generate: %d expert-pool workers%s%s\n", pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
@@ -6378,9 +6530,9 @@ int main(int argc, char** argv) {
     // residual chain; the CPU term is answered by Phase 3's VRAM expert cache, not by this pipeline.
 
     // ---- the graphs
-    strata::core::SessionGraphs gr;
+    maya::core::SessionGraphs gr;
     if (!o.no_capture && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages)) {
+        if (!maya::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages)) {
             std::fprintf(stderr, "maya generate: session_capture: %s\n", err.c_str());
             return 1;
         }
@@ -6419,11 +6571,11 @@ int main(int argc, char** argv) {
     }
 
     mem_mark("the expert cache and the graphs");
-    std::fprintf(stderr, "maya generate: session is up (engine %s)\n", STRATA_VERSION);
+    std::fprintf(stderr, "maya generate: session is up (engine %s)\n", MAYA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
-            return strata::core::lm_head(wt, g, ss.block, d_logits, stream, err);
-        return strata::core::lm_head_mix(wt, g, ss.block, stream, err) &&
+            return maya::core::lm_head(wt, g, ss.block, d_logits, stream, err);
+        return maya::core::lm_head_mix(wt, g, ss.block, stream, err) &&
                native_head.run(ss.block.mixed, d_logits, stream, err);
     };
     float* d_emb = nullptr;
@@ -6447,12 +6599,12 @@ int main(int argc, char** argv) {
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
     void* token_stream = o.stream_token ? main_cs : nullptr;
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
-        if (!strata::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
+        if (!maya::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return false;
         }
         if (pos == 0) {
-            strata::core::session_zero(ss, g, d_emb, token_stream);
+            maya::core::session_zero(ss, g, d_emb, token_stream);
         } else {
             for (int64_t c = 0; c < g.hc; ++c)
                 if (cudaMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
@@ -6464,7 +6616,7 @@ int main(int argc, char** argv) {
         return o.stream_token || cudaDeviceSynchronize() == cudaSuccess;
     };
 
-    strata::kernels::SamplerParams sp;
+    maya::kernels::SamplerParams sp;
     sp.greedy = o.greedy;
     sp.seed = o.seed;
     sp.top_k = o.top_k;
@@ -6500,7 +6652,7 @@ int main(int argc, char** argv) {
         // class of defect as a self-check that verifies the wrong invariant: anything reading the count instead
         // of the size gets a wrong answer that looks authoritative.  `tools/logits_identical.py` caught it by
         // parsing the header and refusing the file.
-        const int32_t n_rows = (int32_t) strata::program::logits_selection::row_count(dump_positions, o.logits_stride);
+        const int32_t n_rows = (int32_t) maya::program::logits_selection::row_count(dump_positions, o.logits_stride);
         const int32_t hdr[2] = {(int32_t) n_vocab, n_rows};
         if (std::fwrite(hdr, sizeof hdr, 1, dump) != 1) {
             std::fprintf(stderr, "maya generate: cannot write logits header\n");
@@ -6560,16 +6712,16 @@ int main(int argc, char** argv) {
     // kernels, looks like 55% of the token there.
     // ---- R0.9: THE PER-STAGE TABLE ON THE CAPTURED GRAPH.
     if (o.gpu_stages) {
-        strata::core::doorbell_reset(db);
+        maya::core::doorbell_reset(db);
         double mix = 0, ffn = 0, post = 0;
-        if (!strata::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
+        if (!maya::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
         const int reps = 20;
         double t_mix = 0, t_ffn = 0, t_post = 0;
         for (int r = 0; r < reps; ++r) {
-            if (!strata::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
+            if (!maya::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
                 std::fprintf(stderr, "maya generate: %s\n", err.c_str());
                 return 1;
             }
@@ -6600,7 +6752,7 @@ int main(int argc, char** argv) {
             std::vector<double> acc((size_t) g.n_layers, 0.0), per;
             double f2 = 0, p2 = 0;
             for (int r = 0; r < reps; ++r) {
-                if (!strata::core::session_replay_stages_per_layer(g, 0, 0, ss, gr, main_cs, per, f2, p2, err)) {
+                if (!maya::core::session_replay_stages_per_layer(g, 0, 0, ss, gr, main_cs, per, f2, p2, err)) {
                     std::fprintf(stderr, "maya generate: %s\n", err.c_str());
                     return 1;
                 }
@@ -6610,7 +6762,7 @@ int main(int argc, char** argv) {
             int64_t ng = 0, nq = 0, worst_l = 0;
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 const double v = acc[(size_t) l] / reps;
-                if (strata::core::is_qsa_layer(g, l)) { qsa += v; ++nq; }
+                if (maya::core::is_qsa_layer(g, l)) { qsa += v; ++nq; }
                 else { gdn += v; ++ng; }
                 if (v > worst) { worst = v; worst_l = l; }
             }
@@ -6632,7 +6784,7 @@ int main(int argc, char** argv) {
         {
             std::vector<double> acc5(5, 0.0), per, s5;
             for (int r = 0; r < reps; ++r) {
-                if (!strata::core::session_replay_stage_prefixes(g, 0, 0, ss, gr, main_cs, s5, per, err)) {
+                if (!maya::core::session_replay_stage_prefixes(g, 0, 0, ss, gr, main_cs, s5, per, err)) {
                     std::fprintf(stderr, "maya generate: %s\n", err.c_str());
                     return 1;
                 }
@@ -6673,7 +6825,7 @@ int main(int argc, char** argv) {
                 for (int k = 1; k <= 5; ++k) {
                     double acc = 0, one = 0;
                     for (int r = 0; r < reps; ++r) {
-                        if (!strata::core::session_replay_stage_sweep(g, 0, 0, ss, gr, main_cs, k, one, err)) {
+                        if (!maya::core::session_replay_stage_sweep(g, 0, 0, ss, gr, main_cs, k, one, err)) {
                             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
                             return 1;
                         }
@@ -6696,16 +6848,16 @@ int main(int argc, char** argv) {
         }
         std::printf("\n  compare `--gpu-only-full`, which replays the same work as TWO graphs per layer.  The\n");
         std::printf("  three sum slightly above it because each launch carries the driver's gap.\n");
-        strata::core::session_graphs_free(gr);
-        strata::core::doorbell_free(db);
+        maya::core::session_graphs_free(gr);
+        maya::core::doorbell_free(db);
         cudaFree(d_next);
         return 0;
     }
 
     if (o.graph_only) {
-        strata::core::doorbell_reset(db);
+        maya::core::doorbell_reset(db);
         // one warm pass so the first launch does not pay for page mapping
-        if (!strata::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
+        if (!maya::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
             std::fprintf(stderr, "maya generate: session_replay warm: %s\n", err.c_str());
             return 1;
         }
@@ -6716,7 +6868,7 @@ int main(int argc, char** argv) {
         const int reps = 20;
         const Clock::time_point t0 = Clock::now();
         for (int r = 0; r < reps; ++r) {
-            if (!strata::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
+            if (!maya::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
                 std::fprintf(stderr, "maya generate: session_replay: %s\n", err.c_str());
                 return 1;
             }
@@ -6743,12 +6895,12 @@ int main(int argc, char** argv) {
     // This flag is what "pure GPU" has to mean, and it replaces that number everywhere.  No pool runs, so
     // `parts` keeps whatever the buffer holds and the timing is GPU work alone.
     if (o.gpu_only_full) {
-        strata::core::doorbell_reset(db);
+        maya::core::doorbell_reset(db);
         const int reps = 20;
         double ms_layers = 0, ms_head = 0;
         for (int r = -1; r < reps; ++r) {          // r == -1 is the warm pass, not counted
             const Clock::time_point t0 = Clock::now();
-            if (!strata::core::session_replay_full(g, 0, 0, ss, gr, main_cs, err)) {
+            if (!maya::core::session_replay_full(g, 0, 0, ss, gr, main_cs, err)) {
                 std::fprintf(stderr, "maya generate: session_replay_full: %s\n", err.c_str());
                 return 1;
             }
@@ -6790,9 +6942,9 @@ int main(int argc, char** argv) {
     // TOKEN, and `cudaFreeHost` at the end of each call implicitly synchronises the device - so every token
     // finished with a device-wide sync nobody asked for.  The scratch is created once here and reused; it also
     // owns the host pin for the whole session rather than taking and releasing it per token.
-    strata::core::SessionLoopScratch loop_scratch;
+    maya::core::SessionLoopScratch loop_scratch;
     struct ScratchFree {
-        strata::core::SessionLoopScratch* p;
+        maya::core::SessionLoopScratch* p;
         ~ScratchFree() { if (p != nullptr) p->free(); }
     } scratch_free{&loop_scratch};
     // Initialised unconditionally, including under --no-pool: the loop validates the scratch it is handed, so
@@ -6804,27 +6956,27 @@ int main(int argc, char** argv) {
     }
     // Plan v0.3 P3: the whole token as ONE graph whenever nothing needs a host step between the ring and post[l]
     // (the VRAM expert tier and the per-layer dumps do).  `--no-token-graph` keeps two graphs per layer.
-    strata::core::TokenGraph tgraph;
+    maya::core::TokenGraph tgraph;
     struct TokenGraphFree {
-        strata::core::TokenGraph* p;
-        ~TokenGraphFree() { strata::core::token_graph_free(*p); }
+        maya::core::TokenGraph* p;
+        ~TokenGraphFree() { maya::core::token_graph_free(*p); }
     } tgraph_free{&tgraph};
     // Plan v0.3 P4: with a PROFILE-filled cache the residency is static, so the hit decision moves onto the
     // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
     std::vector<int32_t> host_res;
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
-    strata::core::TokenHits thits;
+    maya::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
-        host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+        host_res.assign((size_t) (g.n_layers * g.n_expert), maya::core::kNotResident);
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int st = multi_gpu ? stage_of(l) : 0;
                 const int32_t slot = st > 0 ? stages[(size_t) st - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e);
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
-                if (slot != strata::core::kNotResident) ++resident;
+                if (slot != maya::core::kNotResident) ++resident;
             }
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
@@ -6835,7 +6987,7 @@ int main(int argc, char** argv) {
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
         for (auto& st : stages) {   // layer split across GPUs: the same table on every device
-            const strata::core::OnDevice on(st->dev);
+            const maya::core::OnDevice on(st->dev);
             if (cudaMalloc((void**) &st->d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
@@ -6859,7 +7011,7 @@ int main(int argc, char** argv) {
     }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
         (hit_fn == nullptr || thits.on()) && !native_pack) {
-        if (!strata::core::session_capture_token(wt, g, ss, d_parts, loop_scratch.y_miss, loop_scratch.parts_bytes,
+        if (!maya::core::session_capture_token(wt, g, ss, d_parts, loop_scratch.y_miss, loop_scratch.parts_bytes,
                                                  tgraph, err, thits.on() ? &thits : nullptr)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
@@ -6905,18 +7057,18 @@ int main(int argc, char** argv) {
     // the share of expert bytes the arena could pin (sizes the prompt path's streamed ring and its lend cap)
     if (srcp != nullptr && o.prefill_chunk > 0) {
         uint64_t pinned = 0, total = 0;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = maya::kernels::cpu::expert_layout();
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const uint64_t b = lay.blob_bytes(l);
                 total += b;
                 if (srcp->pinned(l, e)) pinned += b;
             }
-        strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
+        maya::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
     auto lend_slots = [&](int64_t c) -> int64_t {
-        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        const uint64_t need = maya::prefill::Prefill::bytes_needed(g, ss, c);
+        const int64_t blob = (int64_t) maya::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
             k = 0;
@@ -6928,7 +7080,7 @@ int main(int argc, char** argv) {
     auto lend_bytes = [&](int32_t first) -> uint64_t {
         return xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
                                      : (uint64_t) (xcache.slots() - first) *
-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+                                           (uint64_t) maya::kernels::cpu::expert_layout().max_blob;
     };
     auto request_chunk = [](int64_t tokens, int64_t max_chunk) -> int64_t {
         if (tokens <= 0 || max_chunk <= 0) return 0;
@@ -6946,11 +7098,11 @@ int main(int argc, char** argv) {
         static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
         // at 8192-token chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the
         // copies are DMA from pinned RAM (Q2_0 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the
-        // limit (lending more only streams more through them).  STRATA_PREFILL_LEND_PCT overrides (tuning).
+        // limit (lending more only streams more through them).  MAYA_PREFILL_LEND_PCT overrides (tuning).
         const int64_t kAutoLendPct = [] {
-            const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+            const char* v = std::getenv("MAYA_PREFILL_LEND_PCT");
             return v ? (int64_t) std::atoi(v)
-                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+                     : (int64_t) (maya::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
         }();
         auto slots_for = lend_slots;
         if (o.prefill_auto) {
@@ -6973,7 +7125,7 @@ int main(int argc, char** argv) {
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
         }
-        strata::prefill::Prefill sp;
+        maya::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -6995,7 +7147,7 @@ int main(int argc, char** argv) {
                 borrow = xcache.device_slot(lend_first);
                 borrow_bytes = xcache.slot_offsets()
                                    ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[lend_first])
-                                   : (uint64_t) k * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+                                   : (uint64_t) k * (uint64_t) maya::kernels::cpu::expert_layout().max_blob;
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             }
@@ -7011,7 +7163,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < stages.size(); ++i) {
             GpuStage& st = *stages[i];
             st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
-            const strata::core::OnDevice on(st.dev);
+            const maya::core::OnDevice on(st.dev);
             if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream, err)) {
                 std::fprintf(stderr, "maya serve: layer split, CUDA%d prompt path: %s\n", st.dev, err.c_str());
                 return 1;
@@ -7032,16 +7184,16 @@ int main(int argc, char** argv) {
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) maya::kernels::kVerifyMaxT;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
-        if (const strata::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
+        if (const maya::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
             std::fprintf(stderr, "maya serve: the penalty-history allocation failed\n");
             return 1;
         }
-        strata::core::Verifier ver;
-        strata::core::VerifyHits vh;
+        maya::core::Verifier ver;
+        maya::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -7050,16 +7202,16 @@ int main(int argc, char** argv) {
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
-        strata::core::Verifier ver_same;
+        maya::core::Verifier ver_same;
         SplitDrive split_drive;
-        auto stage_ver = [&](int st) -> strata::core::Verifier& {
+        auto stage_ver = [&](int st) -> maya::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
         if (n_stages > 1) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
-                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            const size_t hb = (size_t) maya::kernels::kVerifyMaxT *
+                              (size_t) maya::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
                 float* hh = nullptr;
@@ -7086,8 +7238,8 @@ int main(int argc, char** argv) {
                     ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
-                    const strata::core::OnDevice on(gs.dev);
-                    strata::core::VerifyHits vs;
+                    const maya::core::OnDevice on(gs.dev);
+                    maya::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
                     vs.cache_base = gs.cache.device_slot(0);
                     vs.blob = thits.blob;
@@ -7123,7 +7275,7 @@ int main(int argc, char** argv) {
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
-        const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
+        const maya::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
@@ -7185,7 +7337,7 @@ int main(int argc, char** argv) {
             } else {
                 if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
-                    const strata::core::OnDevice on(st->dev);
+                    const maya::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
                     if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(part, st->ss, g)) return false;
                     c.stage_parts.push_back(std::move(part));
@@ -7197,7 +7349,7 @@ int main(int argc, char** argv) {
                 std::vector<uint64_t> stamps;
                 stamps.reserve(checks.size());
                 for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-                const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
+                const size_t victim = maya::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
                                                                                    o.prompt_cache);
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
@@ -7214,8 +7366,8 @@ int main(int argc, char** argv) {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0, (long long) pp_from);
-            strata::core::progress_at("reading the prompt (batched), done up to token", done);
-            strata::core::progress_beat();
+            maya::core::progress_at("reading the prompt (batched), done up to token", done);
+            maya::core::progress_beat();
             std::fflush(stdout);
             if (o.prompt_cache_every > 0 && done >= pp_next_check) {
                 bool saved = false;
@@ -7242,8 +7394,8 @@ int main(int argc, char** argv) {
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
             for (size_t i = 0; i <= stages.size(); ++i) {
-                strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
-                strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
+                maya::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
+                maya::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
                     part_next[i] = done + o.prompt_cache_every;
@@ -7269,12 +7421,13 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        uint64_t completed_promotions = 0; // advanced only after pending swaps complete
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             for (auto& st : stages) {
-                const strata::core::OnDevice on(st->dev);
+                const maya::core::OnDevice on(st->dev);
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
         };
@@ -7289,6 +7442,7 @@ int main(int argc, char** argv) {
                 }
             for (auto& st : stages) st->adapt_live = false;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            completed_promotions += pending.size();
             pending.clear();
             res_upload();
         };
@@ -7326,9 +7480,9 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
-                const strata::core::OnDevice on(gs ? gs->dev : -1);
+                const maya::core::OnDevice on(gs ? gs->dev : -1);
                 if (slot < 0 || b == nullptr) return false;
-                const int64_t nbytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                const int64_t nbytes = (int64_t) maya::kernels::cpu::expert_layout().blob_bytes(s.layer);
                 if (!srcp->stable(s.layer, s.in)) {
                     // an expert staged from the model file: its ring slot is reused, and a queued copy may read it
                     // later than it was written (Windows HIP submits queued copies at the next host wait) - copied
@@ -7343,14 +7497,14 @@ int main(int argc, char** argv) {
                 }
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
-                host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                host_res[out] = maya::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
-                    const strata::core::OnDevice on(st->dev);
+                    const maya::core::OnDevice on(st->dev);
                     cudaEventRecord(st->adapt_ev, st->adapt_stream);
                 }
             for (float& v : drive.d.usage) v *= 0.7f;
@@ -7393,7 +7547,7 @@ int main(int argc, char** argv) {
                 }
             };
             while (getline_fd(l)) {
-                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
+                maya::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
@@ -7413,8 +7567,8 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
-        // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
-        const bool trace = std::getenv("STRATA_TRACE") != nullptr;
+        // MAYA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
+        const bool trace = std::getenv("MAYA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
             std::fprintf(stderr, "maya trace: %s %lld %lld\n", what, a, b);
@@ -7486,14 +7640,14 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f engine=" STRATA_VERSION "\n",
+                        "spec_min_p=%.2f engine=" MAYA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         // (the RAM the experts take: with them read from the GGUF, the RAM tier's - sized to fit)
-                        (long long) ((from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total)
+                        (long long) ((from_gguf ? gguf_src.resident_bytes() : maya::kernels::cpu::expert_layout().total)
                                      >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p);
             // (v1.1.32) the expert tiers, as the GLM engine's INFO names them: the Monitor's "where the experts live"
@@ -7503,7 +7657,7 @@ int main(int argc, char** argv) {
                         " vision_lend=%llu\n",
                         (long long) all_experts, (long long) xcache.slots(), (double) xcache.bytes() / 1073741824.0,
                         (long long) ram_experts,
-                        (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
+                        (double) (from_gguf ? gguf_src.resident_bytes() : maya::kernels::cpu::expert_layout().total) /
                             1073741824.0,
                         o.mtp.empty() ? 0 : 1, (unsigned long long) vis_cap);
         }
@@ -7515,8 +7669,8 @@ int main(int argc, char** argv) {
         const int S = o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
-        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        maya::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        maya::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more maya-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -7535,7 +7689,7 @@ int main(int argc, char** argv) {
             for (const auto& [i, slot] : vis_lent) {   // as after a prompt: queued copies, one wait
                 const int64_t l = i / g.n_expert, ex = i % g.n_expert;
                 const uint8_t* b = srcp->blob(l, ex);
-                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                const int64_t nb = (int64_t) maya::kernels::cpu::expert_layout().blob_bytes(l);
                 const bool blocking = refill_blocking() || !srcp->stable(l, ex);
                 if (b == nullptr || !(blocking ? xcache.fill_slot_blocking(slot, b, e, nb)
                                                : xcache.fill_slot_queued(slot, b, e, nb))) {
@@ -7590,11 +7744,11 @@ int main(int argc, char** argv) {
             // the watchdog watches a request from here until this iteration ends, whichever way it ends; a request
             // that ended is progress (back-to-back short requests leave the watchdog's 1 s look no idle moment)
             struct BusyScope {
-                BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
+                BusyScope() { maya::core::progress().busy.store(true); maya::core::progress_at("request"); }
                 ~BusyScope() {
-                    strata::core::progress_beat();
-                    strata::core::progress().busy.store(false);
-                    strata::core::progress_at("idle");
+                    maya::core::progress_beat();
+                    maya::core::progress().busy.store(false);
+                    maya::core::progress_at("idle");
                 }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
@@ -7644,7 +7798,7 @@ int main(int argc, char** argv) {
                         for (size_t i = 0; i < host_res.size(); ++i)
                             if (host_res[i] >= first && (!multi_gpu || stage_of((int64_t) i / g.n_expert) == 0)) {
                                 vis_lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
+                                host_res[i] = maya::core::kNotResident;
                             }
                         res_upload();
                     }
@@ -7678,7 +7832,7 @@ int main(int argc, char** argv) {
                 bool back = false;
                 for (int i = 0; i < 120 && !(back = vis_reclaim(ve)); ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                    strata::core::progress_beat();
+                    maya::core::progress_beat();
                 }
                 if (!back) {
                     std::printf("ERR the GPU memory lent to the vision encoder is not free yet (%s)\n", ve.c_str());
@@ -7822,7 +7976,7 @@ int main(int argc, char** argv) {
                     bool ok = cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                          cudaMemcpyHostToDevice) == cudaSuccess;
                     for (auto& st : stages) {
-                        const strata::core::OnDevice on(st->dev);
+                        const maya::core::OnDevice on(st->dev);
                         cudaDeviceSynchronize();
                         ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                               cudaMemcpyHostToDevice) == cudaSuccess;
@@ -7873,14 +8027,14 @@ int main(int argc, char** argv) {
             };
             // the control vector for this request.  The live session and the checkpoints were read one way, so a
             // switch reads the prompt again from the start
-            if (strata::kernels::cvec().loaded()) {
+            if (maya::kernels::cvec().loaded()) {
                 const bool want = req_cvec != 0;
                 if (want != cvec_cached) {
                     live_ok = false;
                     checks.clear();
                     cvec_cached = want;
                 }
-                strata::kernels::cvec_set_enabled(want);
+                maya::kernels::cvec_set_enabled(want);
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -7911,13 +8065,13 @@ int main(int argc, char** argv) {
                                     (c.decode && (int64_t) c.ids.size() < resume);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
-            int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+            int64_t reread_to = -1;   // MAYA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
-                strata::core::session_zero(ss, g, nullptr, main_cs);
+                maya::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
-                    const strata::core::OnDevice on(st->dev);
-                    strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                    const maya::core::OnDevice on(st->dev);
+                    maya::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                     cudaStreamSynchronize(st->stream);
                 }
                 checks.clear();
@@ -7925,18 +8079,18 @@ int main(int argc, char** argv) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
-                static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+                static const bool reread = std::getenv("MAYA_CKPT_REREAD") != nullptr;
                 if (reread && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
-                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    maya::core::session_zero(ss, g, nullptr, main_cs);
                     cudaStreamSynchronize(main_stream);
                     for (auto& st : stages) {
-                        const strata::core::OnDevice on(st->dev);
-                        strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                        const maya::core::OnDevice on(st->dev);
+                        maya::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                         cudaStreamSynchronize(st->stream);
                     }
                     reread_to = resume;
@@ -7945,7 +8099,7 @@ int main(int argc, char** argv) {
                 } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
-                                   const strata::core::OnDevice on(stages[i]->dev);
+                                   const maya::core::OnDevice on(stages[i]->dev);
                                    if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
                                }
                                return false;
@@ -7970,7 +8124,7 @@ int main(int argc, char** argv) {
                 std::fill(part_next.begin(), part_next.end(), pp_next_check);
             }
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
-            strata::core::progress_at("reading the prompt, from token", read_from);
+            maya::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
             // A SHORT PART OF THE PROMPT - the new message of a chat that continues from a checkpoint, the assistant
             // header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path
@@ -7978,8 +8132,8 @@ int main(int argc, char** argv) {
             // not in VRAM over PCIe), and it borrows slots it must refill after (~180 ms); a window costs ~16 ms a
             // token, with the misses on the CPU.  Each part below is decided on its own, so a long first message is
             // read batched and its header still goes through the windows.  Picture rows need the batched path.
-            // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
-            static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+            // MAYA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
+            static const bool no_short = std::getenv("MAYA_CKPT_REREAD") != nullptr;
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || b - a > o.short_read) return false;
                 if (sp.embd_rows != nullptr)
@@ -7991,8 +8145,8 @@ int main(int argc, char** argv) {
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
-                    strata::core::Verifier& v;
-                    explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+                    maya::core::Verifier& v;
+                    explicit NoHeadSampling(maya::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
@@ -8016,7 +8170,7 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0, (long long) pp_from);
-                strata::core::progress_beat();
+                maya::core::progress_beat();
                 std::fflush(stdout);
                 return true;
             };
@@ -8027,9 +8181,9 @@ int main(int argc, char** argv) {
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
-                for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (MAYA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    const int64_t nb = (int64_t) maya::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     // (an expert staged from the model file: its ring slot is reused - copied and waited for)
                     const bool blocking = refill_blocking() || !srcp->stable(i / g.n_expert, i % g.n_expert);
                     if (b == nullptr || !(blocking ? xcache.fill_slot_blocking(slot, b, e, nb)
@@ -8071,7 +8225,7 @@ int main(int argc, char** argv) {
                         lend_first_now = first;
                         break;
                     }
-                    if (!strata::prefill::is_allocation_failure(rerr) || want <= kMinPromptChunk) {
+                    if (!maya::prefill::is_allocation_failure(rerr) || want <= kMinPromptChunk) {
                         e = rerr;
                         return false;
                     }
@@ -8089,7 +8243,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent_now.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
+                        host_res[i] = maya::core::kNotResident;
                     }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 lent_chunk = want;
@@ -8097,7 +8251,7 @@ int main(int argc, char** argv) {
             };
             apply_pending(true);
             // per-request sampling for the verify window's head (greedy when temperature is absent)
-            strata::kernels::SamplerParams req_sp;
+            maya::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
             req_sp.temperature = req_temperature;
             req_sp.top_p = req_top_p;
@@ -8159,7 +8313,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     std::fflush(stdout);
                     if (cuda_context_broken(err)) return 1;
-                    if (strata::prefill::is_allocation_failure(err)) {
+                    if (maya::prefill::is_allocation_failure(err)) {
                         chunk_cap = std::max<int64_t>(kMinPromptChunk, chunk_cap / 2);
                         std::fprintf(stderr, "maya serve: the prompt path's buffers did not fit: the chunk is %lld "
                                              "tokens for the requests that follow\n", (long long) chunk_cap);
@@ -8202,7 +8356,7 @@ int main(int argc, char** argv) {
                 // its prompt with a smaller chunk: the memory this request wanted is not there.
                 std::string rerr;
                 if (!refill(rerr)) std::fprintf(stderr, "maya serve: the lent slots could not be refilled: %s\n", rerr.c_str());
-                if (strata::prefill::is_allocation_failure(err)) {
+                if (maya::prefill::is_allocation_failure(err)) {
                     chunk_cap = std::max<int64_t>(kMinPromptChunk, chunk_cap / 2);
                     std::fprintf(stderr, "maya serve: the prompt path ran out of memory: the chunk is %lld tokens for "
                                          "the requests that follow\n", (long long) chunk_cap);
@@ -8233,7 +8387,7 @@ int main(int argc, char** argv) {
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
             // (the Monitor's "where the experts live": every routed expert in GB, and the RAM tier's share)
-            const double qwen_ram_gb = (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) / 1073741824.0;
+            const double qwen_ram_gb = (double) (from_gguf ? gguf_src.resident_bytes() : maya::kernels::cpu::expert_layout().total) / 1073741824.0;
             const double qwen_all_gb = from_gguf ? (double) gguf_src.all_bytes() / 1073741824.0 : qwen_ram_gb;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
@@ -8241,8 +8395,8 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
-            // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
-            static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+            // MAYA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
+            static const bool dec_timing = std::getenv("MAYA_DECODE_TIMING") != nullptr;
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run;
                 int64_t misses, entries, hits, pcie;
@@ -8255,6 +8409,7 @@ int main(int argc, char** argv) {
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
+            const uint64_t promotions0 = completed_promotions;
             const int64_t decode_hits0 = drive.d.cache_hits;
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t staged0 = from_gguf ? gguf_src.staged() : 0;
@@ -8286,7 +8441,7 @@ int main(int argc, char** argv) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                        const maya::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
@@ -8304,9 +8459,9 @@ int main(int argc, char** argv) {
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
                     // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
                     // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
+                    maya::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
                                                   hist_n, hist_stage.data());
-                    const strata::core::OnDevice on_h(hist_dev);
+                    const maya::core::OnDevice on_h(hist_dev);
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                                cudaMemcpyHostToDevice);
                 }
@@ -8370,7 +8525,7 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
-                    strata::core::progress_beat();
+                    maya::core::progress_beat();
                     ++produced_n;
                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
@@ -8385,15 +8540,16 @@ int main(int argc, char** argv) {
                     const int64_t h = drive.d.cache_hits - decode_hits0;
                     const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
                     const int64_t staged = from_gguf ? gguf_src.staged() - staged0 : 0;
-                    std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=0 "
+                    std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
                                 "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f "
                                 "disk_gb=%.1f draft_acc=%lld draft_off=%lld\n",
                                 nt / std::max(1e-9, el), 1000.0 * el / nt, (double) h / (double) std::max<int64_t>(1, look),
                                 (double) std::max<int64_t>(0, look - h - staged) / nt, (double) staged / nt,
+                                (double) (completed_promotions - promotions0) / nt,
                                 (long long) xcache.resident(), (long long) xcache.slots(),
                                 (long long) (from_gguf ? gguf_src.resident_blobs()
                                                        : (int64_t) g.n_layers * g.n_expert - xcache.resident()),
-                                (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
+                                (double) (from_gguf ? gguf_src.resident_bytes() : maya::kernels::cpu::expert_layout().total) /
                                     1073741824.0,
                                 (double) xcache.bytes() / 1073741824.0,
                                 std::max(0.0, qwen_all_gb - (double) xcache.bytes() / 1073741824.0 - qwen_ram_gb),
@@ -8445,7 +8601,7 @@ int main(int argc, char** argv) {
                                 if ((int64_t) k.ids.size() == L) {
                                     bool ok = checkpoint_restore(k, ss, g) && k.stage_parts.size() == stages.size();
                                     for (size_t i = 0; ok && i < stages.size(); ++i) {
-                                        const strata::core::OnDevice on(stages[i]->dev);
+                                        const maya::core::OnDevice on(stages[i]->dev);
                                         ok = checkpoint_restore(k.stage_parts[i], stages[i]->ss, g);
                                     }
                                     std::fprintf(stderr, "maya serve: MAYA_DECODE_CKPT_ROUNDTRIP at %lld: %s\n",
@@ -8491,14 +8647,14 @@ int main(int argc, char** argv) {
                 live_ok = o.prompt_cache > 0;
             }
             if (window_failed) continue;   // the ERR was reported: the engine lives, the next request runs
-            static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
+            static const bool state_hash = std::getenv("MAYA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
                 cudaDeviceSynchronize();
                 const int64_t L = (int64_t) live.size();
-                const strata::kernels::QsaShapes qs = [&] {
-                    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+                const maya::kernels::QsaShapes qs = [&] {
+                    maya::kernels::QsaShapes s = maya::kernels::qsa_real_shapes();
                     s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_dim = g.idx_key_dim;
                     return s;
                 }();
@@ -8520,7 +8676,7 @@ int main(int argc, char** argv) {
                 };
                 const ConvStateSizes z = conv_state_sizes(g);
                 uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
-                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // per GDN layer: which one differs first
+                if (std::getenv("MAYA_STATE_HASH_GDN") != nullptr) {   // per GDN layer: which one differs first
                     const size_t per = z.gdn / (size_t) g.n_gdn_layers();
                     std::string s;
                     char b[8];
@@ -8534,14 +8690,14 @@ int main(int argc, char** argv) {
                 uint64_t h_tail = 1469598103934665603ull, h_pool = h_tail, h_kv = h_tail, h_stale = h_tail;
                 const int64_t kvb = qs.head_dim, scb = (qs.head_dim / 64) * 2;
                 // a state's K/V arrays and their bytes per (cell, head) row: the host copy when it has one
-                auto kv_arrays = [&](const strata::core::QsaState& st) {
+                auto kv_arrays = [&](const maya::core::QsaState& st) {
                     const bool h = st.kv_mode != 0;
                     std::vector<std::pair<const void*, int64_t>> a;
                     if (st.kv_q4) {
-                        const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                        const int64_t q4b = (int64_t) maya::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
                     } else if (st.kv_hybrid) {
-                        const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                        const int64_t q4b = (int64_t) maya::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q4 : st.v_q4, q4b},
                              {h ? st.host.k_scale : st.k_scale, scb}};
                     } else {
@@ -8553,7 +8709,7 @@ int main(int argc, char** argv) {
                 const int64_t end_cell = std::min<int64_t>(((L + qs.page_size - 1) / qs.page_size) * qs.page_size,
                                                            ss.qsa_states[0].max_cells);
                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
-                    const strata::core::QsaState& st = ss.qsa_states[i];
+                    const maya::core::QsaState& st = ss.qsa_states[i];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
                     // KV streaming: the host copy is the identity layout and holds every cell
@@ -8562,7 +8718,7 @@ int main(int argc, char** argv) {
                         h_stale = hash_cells(pool, w, L, end_cell, h_stale);
                     }
                 }
-                const strata::core::QsaState& ms = mtp.kv_state();
+                const maya::core::QsaState& ms = mtp.kv_state();
                 uint64_t h_mtp = 1469598103934665603ull;
                 const int64_t mL = std::min<int64_t>(L, ms.max_cells);
                 for (const auto& [pool, w] : kv_arrays(ms))
@@ -8595,11 +8751,11 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look);
             }
-            // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
+            // MAYA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
-            if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)
+            if (static const bool st_timing = std::getenv("MAYA_SPLIT_TIMING") != nullptr; st_timing)
                 for (int st = 0; st < n_stages; ++st) {
-                    const strata::core::Verifier& v = stage_ver(st);
+                    const maya::core::Verifier& v = stage_ver(st);
                     const double w = v.windows > 0 ? (double) v.windows : 1.0;
                     std::fprintf(stderr, "maya serve: stage %d: %lld windows; per window: wait for the GPU %.3f ms, "
                                          "pool + plan %.3f ms, host staging %.3f ms, commit %.3f ms\n", st,
@@ -8610,7 +8766,7 @@ int main(int argc, char** argv) {
                 uint64_t miss = 0, look = 0;
                 bool over = false;
                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
-                    const strata::kernels::KvStreamCounters c = strata::kernels::kv_stream_counters(ss.qsa_states[i].map);
+                    const maya::kernels::KvStreamCounters c = maya::kernels::kv_stream_counters(ss.qsa_states[i].map);
                     miss += c.misses; look += c.lookups; over = over || c.overflow;
                 }
                 std::fprintf(stderr, "maya serve: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
@@ -8638,7 +8794,7 @@ int main(int argc, char** argv) {
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
-    strata::prefill::Prefill prefill;
+    maya::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
@@ -8664,13 +8820,13 @@ int main(int argc, char** argv) {
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t blob = (int64_t) maya::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
+                        host_res[i] = maya::core::kNotResident;
                     }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 borrow = xcache.device_slot(first);
@@ -8707,14 +8863,14 @@ int main(int argc, char** argv) {
         if (dump != nullptr) {
             auto mtp_chunk = prefill.on_chunk;   // (empty without --mtp)
             prefill.on_chunk = [&, mtp_chunk](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
-                strata::core::BlockBuffers bb = ss.block;
+                maya::core::BlockBuffers bb = ss.block;
                 for (int64_t t = 0; t < T; ++t) {
-                    if (!strata::program::logits_selection::selected(p0 + t, dump_positions, o.logits_stride)) continue;
+                    if (!maya::program::logits_selection::selected(p0 + t, dump_positions, o.logits_stride)) continue;
                     bb.R = const_cast<float*>(R_rows) + (size_t) t * (size_t) (g.hc * g.n_embd);
                     const bool ok = native_head.loaded()
-                                        ? strata::core::lm_head_mix(wt, g, bb, main_cs, e) &&
+                                        ? maya::core::lm_head_mix(wt, g, bb, main_cs, e) &&
                                               native_head.run(bb.mixed, d_logits, main_cs, e)
-                                        : strata::core::lm_head(wt, g, bb, d_logits, main_cs, e);
+                                        : maya::core::lm_head(wt, g, bb, d_logits, main_cs, e);
                     if (!ok) return false;
                     if (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost,
                                         (cudaStream_t) main_cs) != cudaSuccess ||
@@ -8738,9 +8894,9 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
-            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (MAYA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                const int64_t nb = (int64_t) maya::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 const bool blocking = refill_blocking() || !srcp->stable(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !(blocking ? xcache.fill_slot_blocking(slot, b, err, nb)
                                                : xcache.fill_slot_queued(slot, b, err, nb))) {
@@ -8764,7 +8920,7 @@ int main(int argc, char** argv) {
         // the PLE window of the token path: the two tokens before `pos_start`
         ss.ple_prev[0] = pos_start >= 2 ? (int32_t) o.tokens[(size_t) (pos_start - 2)] : -1;
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
-        const strata::prefill::PrefillStats& ps = prefill.stats();
+        const maya::prefill::PrefillStats& ps = prefill.stats();
         std::fprintf(stderr, "maya generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
                              "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
@@ -8794,7 +8950,7 @@ int main(int argc, char** argv) {
         Clock::time_point tp = Clock::now();
         // Plan v0.3 P2: the 16 SSD reads start here and complete while the embedding is staged; `ms_ple` is
         // the issue plus the time still spent WAITING afterwards, i.e. the part the embedding did not hide.
-        if (ss.ple.ready() && !strata::core::ple_issue_token(ss.ple, err)) {
+        if (ss.ple.ready() && !maya::core::ple_issue_token(ss.ple, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -8809,7 +8965,7 @@ int main(int argc, char** argv) {
             ms_embed += std::chrono::duration<double, std::milli>(n - tp).count();
             tp = n;
         }
-        if (ss.ple.ready() && !strata::core::ple_finish_token(ss.ple, token_stream, err)) {
+        if (ss.ple.ready() && !maya::core::ple_finish_token(ss.ple, token_stream, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -8832,20 +8988,20 @@ int main(int argc, char** argv) {
         drive.d.failed = false;
         err.clear();
         if (o.no_capture) {
-            if (!strata::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
+            if (!maya::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
                                              o.sync_every_layer, err)) {
                 std::fprintf(stderr, "maya generate: session_token: %s\n", err.c_str());
                 return 1;
             }
         } else {
-            strata::core::doorbell_reset(db);
+            maya::core::doorbell_reset(db);
             if (tgraph.captured) {
-                if (!strata::core::session_run_token(g, pos, /*pos_base=*/0, ss, tgraph, pool_fn, pool_user,
+                if (!maya::core::session_run_token(g, pos, /*pos_base=*/0, ss, tgraph, pool_fn, pool_user,
                                                      loop_scratch.y_miss, main_cs, err)) {
                     std::fprintf(stderr, "maya generate: %s\n", err.c_str());
                     return 1;
                 }
-            } else if (!strata::core::session_loop(g, pos, /*pos_base=*/0, ss, gr, pool_fn, hit_fn, pool_user, /*overlap=*/true, main_cs,
+            } else if (!maya::core::session_loop(g, pos, /*pos_base=*/0, ss, gr, pool_fn, hit_fn, pool_user, /*overlap=*/true, main_cs,
                                         err, layer_stage, &loop_scratch)) {
                 std::fprintf(stderr, "maya generate: session_loop: %s\n", err.c_str());
                 return 1;
@@ -8894,7 +9050,7 @@ int main(int argc, char** argv) {
             tp = n;
         }
         const bool emit_logits = dump != nullptr &&
-            strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
+            maya::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
         const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
         if (read_logits && (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
                                            cudaMemcpyDeviceToHost, (cudaStream_t) token_stream) != cudaSuccess ||
@@ -8930,7 +9086,7 @@ int main(int argc, char** argv) {
         // The draw is Philox(seed, position), as in a verify window (row t at pos0 draws pos0 + t): a seed gives
         // the same text whether a token comes from this path or from the speculative loop below.
         sp.counter = (uint64_t) pos;
-        strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
+        maya::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
         if (cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost,
                             (cudaStream_t) token_stream) != cudaSuccess ||
             cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess) {
@@ -8942,7 +9098,7 @@ int main(int argc, char** argv) {
         // status readback. Retain one status per layer so a later layer cannot
         // hide an earlier failure; no extra synchronization or token allocation.
         if (o.native_flash_attn_short) for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
-            const int32_t status = ss.qsa_states[i].host_step[strata::kernels::kStepCount];
+            const int32_t status = ss.qsa_states[i].host_step[maya::kernels::kStepCount];
             if (status != 0) {
                 std::fprintf(stderr, "maya generate: native attention status %d at QSA layer %lld, position %lld\n",
                              status, (long long) i, (long long) pos);
@@ -9010,8 +9166,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         mem_mark("the head and the prompt path");
-        strata::core::Verifier ver;
-        strata::core::VerifyHits vh;
+        maya::core::Verifier ver;
+        maya::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -9096,12 +9252,12 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) maya::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "maya generate: an adaptive refill failed\n");
                     return false;
                 }
-                host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                host_res[out] = maya::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
@@ -9121,7 +9277,7 @@ int main(int argc, char** argv) {
             if (dump == nullptr || rows <= 0) return true;
             if (!ver.read_head_logits(rows, dump_rows.data(), err)) return false;
             for (int r = 0; r < rows; ++r) {
-                if (!strata::program::logits_selection::selected(pos0 + r, dump_positions, o.logits_stride)) continue;
+                if (!maya::program::logits_selection::selected(pos0 + r, dump_positions, o.logits_stride)) continue;
                 if (std::fwrite(dump_rows.data() + (size_t) r * (size_t) n_vocab, sizeof(float), (size_t) n_vocab, dump) !=
                     (size_t) n_vocab) {
                     err = "cannot write logits at position " + std::to_string(pos0 + r);
@@ -9170,8 +9326,8 @@ int main(int argc, char** argv) {
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
-        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        maya::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        maya::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         if (o.suffix_draft > 0) {
@@ -9194,7 +9350,7 @@ int main(int argc, char** argv) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                    const maya::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
@@ -9350,7 +9506,7 @@ int main(int argc, char** argv) {
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
                     o.dump_routing.c_str(), (long long) drive.calls);
     }
-    if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
+    if (o.stage_timing) maya::core::stage_timing_report(g.n_layers);
 
     const int64_t decoded = (int64_t) produced.size();
     std::printf("prompt  :");
@@ -9500,8 +9656,8 @@ int main(int argc, char** argv) {
 
     if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
 
-    strata::core::session_graphs_free(gr);
-    strata::core::doorbell_free(db);
+    maya::core::session_graphs_free(gr);
+    maya::core::doorbell_free(db);
     cudaFree(d_next);
     cudaFree(d_logits);
     cudaFree(d_emb);

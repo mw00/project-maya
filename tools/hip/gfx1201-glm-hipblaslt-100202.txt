@@ -1,5 +1,5 @@
 # solution IDs are scoped to this hipBLASLt version and device architecture
-STRATA_HIPBLASLT_TUNING_V1 gfx1201 100202
+MAYA_HIPBLASLT_TUNING_V1 gfx1201 100202
 # rows kept only where hipBLASLt beat hipblasGemmEx by >= 2% (RDNA4's hipBLAS is already fast)
 f16 8192 4096 8192 1024 88029
 f16 2730 12288 4096 1024 88759

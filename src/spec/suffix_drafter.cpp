@@ -1,9 +1,9 @@
-// src/spec/suffix_drafter.cpp - see include/strata/spec/suffix_drafter.hpp.
-#include "strata/spec/suffix_drafter.hpp"
+// src/spec/suffix_drafter.cpp - see include/maya/spec/suffix_drafter.hpp.
+#include "maya/spec/suffix_drafter.hpp"
 
 #include <algorithm>
 
-namespace strata::spec {
+namespace maya::spec {
 
 namespace {
 uint64_t mix(uint64_t x) {
@@ -85,4 +85,4 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     return k;
 }
 
-}  // namespace strata::spec
+}  // namespace maya::spec

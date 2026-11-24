@@ -1,8 +1,8 @@
-// prefix_cut (STRATA_GLM_PREFIX_CUT): where a prompt's read ends a call to keep its system prompt's state - the first
+// prefix_cut (MAYA_GLM_PREFIX_CUT): where a prompt's read ends a call to keep its system prompt's state - the first
 // user turn, only where both calls reach the prompt path's minimum and the read does not start at or near it - the
 // marks it goes into (sorted, spaced, the existing ones win), and kept slots told apart by their tokens.  With the
 // marks, a read covers every token once, in order, and one call ends at the system prompt's end.  CPU only.
-#include "strata/core/prefix_cut.hpp"
+#include "maya/core/prefix_cut.hpp"
 
 #include <cstdio>
 #include <vector>
@@ -37,7 +37,7 @@ std::vector<size_t> walk(size_t from, size_t end, const std::vector<size_t>& mar
 }  // namespace
 
 int main() {
-    using namespace strata::core;
+    using namespace maya::core;
     // system_prompt_end: the first user turn at index 1 or later
     {
         const std::vector<int32_t> none = prompt(0, 100);

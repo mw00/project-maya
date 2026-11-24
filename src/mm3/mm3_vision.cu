@@ -12,7 +12,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
 #include <cuda_bf16.h>
 #endif
 #include "../ds4/ds4_numerics.cuh"   // (BF16 on HIP: the same bits in plain arithmetic)
@@ -42,9 +42,9 @@ namespace {
 
 // the GEMMs' BF16 inputs: CUDA's type, or on AMD (HIP) its 16 bits as they are (hip_bf16.h's own type clashes with
 // the hip_compat warp functions; hipBLAS reads HIP_R_16BF from the same bits), rounded to nearest even either way
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 using bf16_t = uint16_t;
-__device__ __forceinline__ bf16_t f2bf(float f) { return strata::ds4::bf16_rn(f); }
+__device__ __forceinline__ bf16_t f2bf(float f) { return maya::ds4::bf16_rn(f); }
 #else
 using bf16_t = __nv_bfloat16;
 __device__ __forceinline__ bf16_t f2bf(float f) { return __float2bfloat16(f); }

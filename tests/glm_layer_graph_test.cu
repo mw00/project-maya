@@ -1,6 +1,6 @@
 // Capture/direct repeated-step parity, dynamic tables, plans and request counts.
 #include "../src/core/glm_layer_graphs.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_fast.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
-using strata::core::glmfast::LayerGraphs;
+namespace gf = maya::kernels::glmf;
+using maya::core::glmfast::LayerGraphs;
 
 static void check(cudaError_t e) {
     if (e != cudaSuccess) {
@@ -93,7 +93,8 @@ int main() {
         require(x == y, "dynamic table or captured plan differs");
         require(count == expected && expected == (uint64_t) step + 1, "replayed request count differs");
     }
-    require(graphs.replays > 0 && graphs.invalidations > 0 && graphs.captures < STEPS, "capture cache not exercised");
+    // (a graph per layer and key is kept: a changed plan captures another graph and invalidates none)
+    require(graphs.replays > 0 && graphs.invalidations == 0 && graphs.captures < STEPS, "capture cache not exercised");
     const uint64_t before = expected;
     bool replayed = false;
     err.clear();

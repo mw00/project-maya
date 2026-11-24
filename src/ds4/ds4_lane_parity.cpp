@@ -33,7 +33,7 @@
 #define PAR_AVX2
 #endif
 
-namespace strata::ds4::par {
+namespace maya::ds4::par {
 namespace {
 
 constexpr int kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ3_S = 21, kIQ2_S = 22;
@@ -495,7 +495,7 @@ std::vector<uint8_t> rand_rows(int type, int n, int k, std::mt19937& rng) {
 void pick_form() {
 #if defined(PAR_X86)
     init_ksx();
-    const char* f = std::getenv("STRATA_DS4_LANE_PARITY_SCALAR");
+    const char* f = std::getenv("MAYA_DS4_LANE_PARITY_SCALAR");
     if (f == nullptr) f = std::getenv("DS4_LANE_PARITY_SCALAR");
     if ((f != nullptr && std::atoi(f) != 0) || !cpu_avx2()) return;
     std::mt19937 rng(0x644u);
@@ -667,4 +667,4 @@ float row_ref(int type, const uint8_t* row, int k, const void* act, int lpr) {
     return s[0][0];
 }
 
-}  // namespace strata::ds4::par
+}  // namespace maya::ds4::par

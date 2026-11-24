@@ -1,26 +1,27 @@
-// src/prefill/moe_mmq.cu - see include/strata/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) is compiled
+// src/prefill/moe_mmq.cu - see include/maya/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) is compiled
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
-#include "strata/prefill/moe_mmq.hpp"
-#include "strata/prefill/failure.hpp"
+#include "maya/prefill/moe_mmq.hpp"
+#include "maya/prefill/failure.hpp"
 
 #include "common.cuh"
 #include "convert.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <atomic>   // glm-dsa B15.2: the refused products' count
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::prefill::mmq {
+namespace maya::prefill::mmq {
 namespace {
 
 // A failed launch (an allocation, most of the time) ends this request, not the process: the reason is thrown and
-// the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
+// the caller turns it into an error for the request (include/maya/prefill/failure.hpp).
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
-        strata::prefill::fail(std::string("prefill mmq: ") + what + ": " + cudaGetErrorString(e));
+        maya::prefill::fail(std::string("prefill mmq: ") + what + ": " + cudaGetErrorString(e));
     }
 }
 
@@ -44,7 +45,7 @@ __global__ void copy1_kernel(const uint8_t* __restrict__ a, int64_t na, const ui
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales
 // [2560][10] f16 (the layout of prefill/kernels.cu's blob_dequant_kernel).  A GGUF Q2_0 block is {f16 d; 16 code
 // bytes} with the same 2-bit codes in the same order, so a block is a scale and a 16-byte run of codes.
-__global__ void strata_q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu, uint16_t* __restrict__ dn) {
+__global__ void maya_q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu, uint16_t* __restrict__ dn) {
     constexpr size_t O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,
                      O_D_SC = O_GU_SC + (size_t) 1280 * 40 * 2;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one GGUF block
@@ -159,8 +160,24 @@ void dispatch(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s)
 
 }  // namespace
 
+// glm-dsa B15.2: MMQ finds expert e at w + e * (expert_bytes / type size) WHOLE blocks (stride_channel_x), so a
+// stride that is not a whole number of blocks would be truncated and every expert after the first parsed off its
+// block boundaries.  stride_refused() refuses such a product without a launch and counts it (launch_errors(): the
+// GLM prompt path fails on it).  Every Maya caller's stride is whole blocks, so this never fires on Flash.
+static std::atomic<int> g_refused{0};
+int launch_errors() { return g_refused.load(std::memory_order_relaxed); }
+static bool stride_refused(const Product& p) {
+    const ggml_type t = (ggml_type) p.type;
+    if (!supported(p.type) || p.expert_bytes % ggml_type_size(t) == 0) return false;
+    if (g_refused.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr, "prefill mmq: type %d: expert stride %zu B is not whole %zu-B blocks (refused)\n", (int) t,
+                     p.expert_bytes, ggml_type_size(t));
+    return true;
+}
+
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
+    if (stride_refused(p)) return;   // glm-dsa B15.2
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
@@ -171,9 +188,9 @@ void Context::run(const Product& p, void* stream) {
     dispatch(*(ggml_backend_cuda_context*) ctx_, a, (cudaStream_t) stream);
 }
 
-// STRATA_MMQ_GLU: the build compiles MMQ from a copy of ggml-cuda with third_party/ggml/mmq-fused-swiglu.patch
+// MAYA_MMQ_GLU: the build compiles MMQ from a copy of ggml-cuda with third_party/ggml/mmq-fused-swiglu.patch
 bool glu_supported(int t, int64_t n_ff) {
-#if defined(STRATA_MMQ_GLU)
+#if defined(MAYA_MMQ_GLU)
     if (!ggml_cuda_mmq_fusion_supported((ggml_type) t) || n_ff <= 0 || n_ff % 128 != 0) return false;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
@@ -186,8 +203,9 @@ bool glu_supported(int t, int64_t n_ff) {
 }
 
 void Context::run_glu(const Product& p, float limit, void* stream) {
-#if defined(STRATA_MMQ_GLU)
+#if defined(MAYA_MMQ_GLU)
     if (p.n <= 0 || p.max_rows <= 0) return;
+    if (stride_refused(p)) return;   // glm-dsa B15.2
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk, n_ff = p.w_rows / 2;
     // x the up rows, x_gate the gate rows of each expert's matrix; the output has n_ff rows
@@ -227,7 +245,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 }
 
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
-    strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
+    maya_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
     ck(cudaGetLastError(), "gather_strata_q2");
 }
@@ -254,8 +272,8 @@ bool to_f16(int t, const void* w, uint16_t* dst, int64_t n, void* stream) {
     return true;
 }
 
-extern "C" void strata_mmq_pool_slab(int dev, void* base, size_t bytes);   // src/prefill/ggml_cuda_host.cu's pool
+extern "C" void maya_mmq_pool_slab(int dev, void* base, size_t bytes);   // src/prefill/ggml_cuda_host.cu's pool
 
-void pool_slab(int dev, void* base, size_t bytes) { strata_mmq_pool_slab(dev, base, bytes); }
+void pool_slab(int dev, void* base, size_t bytes) { maya_mmq_pool_slab(dev, base, bytes); }
 
-}  // namespace strata::prefill::mmq
+}  // namespace maya::prefill::mmq

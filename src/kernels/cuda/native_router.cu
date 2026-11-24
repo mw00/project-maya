@@ -20,7 +20,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "strata/kernels/native_router.hpp"
+#include "maya/kernels/native_router.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cfloat>
@@ -28,7 +28,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {

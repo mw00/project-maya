@@ -213,7 +213,6 @@ class Responses(ResponseCase):
             {"input": [{"role": "user", "content": [{"type": "input_file", "file_id": "f"}]}]},
             {"input": [{"type": "function_call_output", "call_id": "missing", "output": "value"}]},
             {"input": [{"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{}"}]},
-            {"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "url", "detail": "high"}]}]},
             {"text": {"format": {"type": "json_schema"}}}, {"reasoning": {"summary": "verbose"}},
             {"reasoning": {"effort": "low", "generate_summary": "auto"}},
             {"include": ["file_search_call.results"]},
@@ -275,8 +274,9 @@ class Responses(ResponseCase):
                    {"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{}"},
                    {"type": "function_call_output", "call_id": "c", "output": [
                        {"type": "input_text", "text": "Result:"},
-                       {"type": "input_image", "image_url": "data:image/png;base64,Ymx1ZQ=="}]},
-                   {"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,cmVk"},
+                       {"type": "input_image", "image_url": "data:image/png;base64,Ymx1ZQ==", "detail": "original"}]},
+                   {"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,cmVk",
+                                                 "detail": "high"},
                                                 {"type": "input_text", "text": "compare"}]}]
         status, out = self.post(input=history)
         self.assertEqual(status, 400)

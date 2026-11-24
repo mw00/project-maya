@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 struct VisionGeo {
     int layers = 0, dim = 1024, heads = 16, inter = 2816, patch = 14, merge = 3, out = 5120;
@@ -93,4 +93,4 @@ private:
     void *copied_[2] = {nullptr, nullptr}, *used_[2] = {nullptr, nullptr};   // cudaEvent_t per slot
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

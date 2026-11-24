@@ -13,9 +13,9 @@
 //                                         DS4_IQ512=1, DS4_IQ512=0 and DS4_IQ_OWN=0 to compare the rows; --bench --glm
 //                                         also times the GLM lane's AVX-512 multi-token rows against its AVX2 ones
 #include "../src/ds4/ds4_gguf_cpu.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/iq_avx2.hpp"
-#include "strata/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/iq_avx2.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -28,10 +28,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_MSC_VER) && defined(__clang__)
+#include <immintrin.h>
+#include <intrin.h>
+#endif
 #include <string>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
+namespace gg = maya::ds4::gguf;
 
 namespace {
 
@@ -193,7 +197,21 @@ void bench(int type, int nt, RowsFn fn = nullptr, const char* name = nullptr) {
 
 // AVX-512 F / BW / VL / DQ and BMI2 with the OS saving the state (the rows' own check: ds4_iq_cpu.cpp's iq_isa)
 bool cpu_x512() {
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_MSC_VER) && defined(__clang__)
+    // clang for Windows (the HIP build): CPUID and XGETBV with iq_isa's x512 bits, because clang's __builtin_cpu_* need
+    // compiler-rt's __cpu_model, which an MSVC-style link does not bring.  MSVC keeps the #else below, as before.
+    int r[4];
+    __cpuidex(r, 0, 0);
+    if (r[0] < 7) return false;
+    __cpuidex(r, 1, 0);
+    const unsigned c = (unsigned) r[2];
+    if (!((c >> 12) & 1u) || !((c >> 27) & 1u) || !((c >> 28) & 1u)) return false;   // FMA, OSXSAVE, AVX
+    if ((_xgetbv(0) & 0xE6) != 0xE6) return false;   // the OS saves the YMM and ZMM state
+    __cpuidex(r, 7, 0);
+    const unsigned b = (unsigned) r[1];
+    return ((b >> 5) & 1u) && ((b >> 16) & 1u) && ((b >> 17) & 1u) && ((b >> 30) & 1u) && ((b >> 31) & 1u) &&
+           ((b >> 8) & 1u);   // AVX2; AVX-512 F, DQ, BW, VL; BMI2
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl") &&
            __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("bmi2");
@@ -214,11 +232,11 @@ int main(int argc, char** argv) {
             for (int nt : {1, 2, 4}) bench(type, nt);
         // (the GLM lane's multi-token rows, AVX-512 against AVX2, on the same rows: what one thread says about 512-bit
         // integer code on this CPU)
-        if (argc > 2 && std::string(argv[2]) == "--glm" && strata::kernels::cpu::cpu_avx512bw_ok())
+        if (argc > 2 && std::string(argv[2]) == "--glm" && maya::kernels::cpu::cpu_avx512bw_ok())
             for (int type : {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS})
                 for (int nt : {2, 4}) {
-                    bench(type, nt, strata::kernels::cpu::iq512_rows, "glm-avx512");
-                    bench(type, nt, strata::kernels::cpu::iq256_rows, "glm-avx2");
+                    bench(type, nt, maya::kernels::cpu::iq512_rows, "glm-avx512");
+                    bench(type, nt, maya::kernels::cpu::iq256_rows, "glm-avx2");
                 }
         return 0;
     }

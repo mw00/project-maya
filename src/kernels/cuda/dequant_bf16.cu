@@ -1,9 +1,9 @@
-// src/kernels/cuda/dequant_bf16.cu - see include/strata/kernels/dequant_bf16.hpp.
+// src/kernels/cuda/dequant_bf16.cu - see include/maya/kernels/dequant_bf16.hpp.
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "maya/kernels/dequant_bf16.hpp"
+#include "maya/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 __device__ __forceinline__ float h2f(const uint8_t* p) {
@@ -276,20 +276,20 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
-#define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
+#define MAYA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
     switch (type) {
-    case 2: STRATA_DQ(2);
-    case 6: STRATA_DQ(6);
-    case 8: STRATA_DQ(8);
-    case 11: STRATA_DQ(11);
-    case 12: STRATA_DQ(12);
-    case 13: STRATA_DQ(13);
-    case 14: STRATA_DQ(14);
-    case 20: STRATA_DQ(20);
-    case 23: STRATA_DQ(23);
-    case 42: STRATA_DQ(42);
+    case 2: MAYA_DQ(2);
+    case 6: MAYA_DQ(6);
+    case 8: MAYA_DQ(8);
+    case 11: MAYA_DQ(11);
+    case 12: MAYA_DQ(12);
+    case 13: MAYA_DQ(13);
+    case 14: MAYA_DQ(14);
+    case 20: MAYA_DQ(20);
+    case 23: MAYA_DQ(23);
+    case 42: MAYA_DQ(42);
     }
-#undef STRATA_DQ
+#undef MAYA_DQ
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
@@ -356,4 +356,4 @@ void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
     launch<float>(ggml_type, blocks, row0, rows, cols, out, stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

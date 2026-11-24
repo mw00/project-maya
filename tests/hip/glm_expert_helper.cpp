@@ -1,5 +1,5 @@
 // Helper ownership/replacement and weighted sums against the primary GPU.
-#include "strata/core/remote_experts.hpp"
+#include "maya/core/remote_experts.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #define GGML_COMMON_DECL_CPP
@@ -23,7 +23,7 @@ static int unsetenv(const char* k) { return _putenv_s(k, ""); }
     std::fprintf(stderr, "%s: %s\n", #call, hipGetErrorString(e)); return 2; } } while (0)
 
 static int helper_routing() {
-    namespace gf = strata::kernels::glmf;
+    namespace gf = maya::kernels::glmf;
     constexpr int NE = 64, N = 4096, K = 8, keys = 2 * NE;
     void* arena = nullptr;
     CHECK(hipMalloc(&arena, 256 << 10));
@@ -80,7 +80,7 @@ static int helper_routing() {
 // numbers, different bytes.  Each must answer from its own region (interleaved calls, against the primary GPU's sum
 // of that region's experts), and its answer must not be the other region's.
 static int two_helpers(int helper_device) {
-    namespace gf = strata::kernels::glmf;
+    namespace gf = maya::kernels::glmf;
     constexpr int E = 4096, FF = 2048, K = 4, gu_type = 16, d_type = 22;
     const size_t gu_block = sizeof(block_iq2_xxs), d_block = sizeof(block_iq2_s);
     const size_t gu_bytes = size_t(2) * FF * E / 256 * gu_block, down_bytes = size_t(E) * FF / 256 * d_block;
@@ -106,7 +106,7 @@ static int two_helpers(int helper_device) {
     const float weights[K] = {0.1f, 0.2f, 0.3f, 0.4f};
     const int keys[K] = {3, 1, 0, 2};
     std::string err;
-    strata::core::GlmExpertHelper part[2];
+    maya::core::GlmExpertHelper part[2];
     for (int p = 0; p < 2; ++p) {
         if (!part[p].open(helper_device, E, FF, {{host[p], K * blob_bytes}}, err) || !part[p].reserve(2 * K, K * blob_bytes, err)) {
             std::fprintf(stderr, "%s\n", err.c_str()); return 30;
@@ -114,9 +114,9 @@ static int two_helpers(int helper_device) {
         for (int i = 0; i < K; ++i)
             if (!part[p].insert(i, host[p] + size_t(i) * blob_bytes, blob_bytes, blob_bytes, err)) return 31;
         // the path it SELECTED: zero-copy exactly when the helper is integrated and the setting is not 0
-        const char* zc = std::getenv("STRATA_GLM_HELPER_ZEROCOPY");
+        const char* zc = std::getenv("MAYA_GLM_HELPER_ZEROCOPY");
         const bool want = part[p].integrated() && !(zc != nullptr && zc[0] == '0');
-        if (part[p].zero_copy() != want || part[p].profiling() != (std::getenv("STRATA_GLM_PROF") != nullptr)) return 36;
+        if (part[p].zero_copy() != want || part[p].profiling() != (std::getenv("MAYA_GLM_PROF") != nullptr)) return 36;
     }
     void *dev_blobs[2] = {nullptr, nullptr}, *dxq = nullptr, *dhq = nullptr;
     float *dx = nullptr, *dout = nullptr;
@@ -234,7 +234,7 @@ static int memory_probe(int device) {
 }
 
 int main() {
-    namespace gf = strata::kernels::glmf;
+    namespace gf = maya::kernels::glmf;
     constexpr int E = 4096, FF = 2048, K = 8;
     int devices = 0, helper_device = -1;
     CHECK(hipGetDeviceCount(&devices));
@@ -245,16 +245,16 @@ int main() {
     }
     CHECK(hipSetDevice(0));
     if (int status = helper_routing()) return status;
-    // both call paths (zero-copy - an integrated helper's default - and the copies, STRATA_GLM_HELPER_ZEROCOPY=0), each
-    // with the per-call profile off and on (STRATA_GLM_PROF: its line at each helper's close)
+    // both call paths (zero-copy - an integrated helper's default - and the copies, MAYA_GLM_HELPER_ZEROCOPY=0), each
+    // with the per-call profile off and on (MAYA_GLM_PROF: its line at each helper's close)
     for (const char* zc : {"1", "0"})
         for (const bool prof : {false, true}) {
-            setenv("STRATA_GLM_HELPER_ZEROCOPY", zc, 1);
-            if (prof) setenv("STRATA_GLM_PROF", "0", 1);
-            else unsetenv("STRATA_GLM_PROF");
+            setenv("MAYA_GLM_HELPER_ZEROCOPY", zc, 1);
+            if (prof) setenv("MAYA_GLM_PROF", "0", 1);
+            else unsetenv("MAYA_GLM_PROF");
             if (int status = two_helpers(helper_device)) return status;
         }
-    unsetenv("STRATA_GLM_PROF");
+    unsetenv("MAYA_GLM_PROF");
     std::mt19937 rng(47);
     std::vector<float> x(E), reference(E), actual(E);
     float weights[K];
@@ -271,7 +271,7 @@ int main() {
         }
     };
     for (const char* zc : {"1", "0"}) {   // the quant types on both call paths (a discrete helper copies on both)
-    setenv("STRATA_GLM_HELPER_ZEROCOPY", zc, 1);
+    setenv("MAYA_GLM_HELPER_ZEROCOPY", zc, 1);
     for (const auto [gu_type, d_type] : {std::pair{16, 22}, std::pair{18, 22}, std::pair{16, 18}, std::pair{10, 11}}) {
         const size_t gu_block = block_bytes(gu_type), d_block = block_bytes(d_type);
         const size_t gu_bytes = size_t(2) * FF * E / 256 * gu_block;
@@ -295,7 +295,7 @@ int main() {
                 }
             }
         }
-        strata::core::GlmExpertHelper helper;
+        maya::core::GlmExpertHelper helper;
         if (!helper.open(helper_device, E, FF, {{host, K * blob_bytes}}, err)) {
             std::fprintf(stderr, "%s\n", err.c_str()); return 1;
         }
@@ -395,7 +395,7 @@ int main() {
         CHECK(hipHostFree(host));
     }
     }
-    unsetenv("STRATA_GLM_HELPER_ZEROCOPY");
+    unsetenv("MAYA_GLM_HELPER_ZEROCOPY");
     if (int status = memory_probe(helper_device)) return status;   // (print only)
     std::puts("GLM expert helper ownership, adaptation and parity passed (both call paths)");
 }

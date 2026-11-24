@@ -1,7 +1,7 @@
 // Small, startup-only exact-F32 transport comparison. Never uses model activations or weights.
 #include "ds4_kernels.cuh"
 #include "ds4_peer_cuda_compat.cuh"  // (the HIP names the peer all-reduce uses, on CUDA)
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
 #include <hip/hip_runtime.h>
 #endif
 #include <algorithm>
@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 namespace {
 using Clock = std::chrono::steady_clock;
 __global__ void check_probe(const float* x, int n, unsigned expected, unsigned* error) {
@@ -84,7 +84,7 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
         auto& r = rank[m];
         if (hipSetDevice(ids[m]) == hipSuccess) {   // (CUDA lazy loading: no first launch beside a spinning rank)
             peer_ar_preload();
-#if !defined(STRATA_USE_HIP)
+#if !defined(MAYA_USE_HIP)
             cudaFuncAttributes fa{};
             (void) cudaFuncGetAttributes(&fa, check_probe);
             (void) cudaGetLastError();
@@ -189,4 +189,4 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
     hipSetDevice(previous);
     return result;
 }
-}  // namespace strata::ds4
+}  // namespace maya::ds4

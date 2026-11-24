@@ -17,7 +17,7 @@
 #include <random>
 #include <vector>
 
-namespace dk = strata::ds4;
+namespace dk = maya::ds4;
 
 namespace {
 
@@ -49,8 +49,8 @@ Src make(int fmt, const std::vector<float>& want) {
             s.f[i] = want[i];
             std::memcpy(&s.bits[i * 4], &want[i], 4);
         } else {
-            const uint16_t h = fmt == dk::kMarkovBF16 ? bf16_bits(want[i]) : strata::kernels::f16_from_f32(want[i]);
-            s.f[i] = fmt == dk::kMarkovBF16 ? bf16_value(h) : strata::kernels::f32_from_f16(h);
+            const uint16_t h = fmt == dk::kMarkovBF16 ? bf16_bits(want[i]) : maya::kernels::f16_from_f32(want[i]);
+            s.f[i] = fmt == dk::kMarkovBF16 ? bf16_value(h) : maya::kernels::f32_from_f16(h);
             std::memcpy(&s.bits[i * 2], &h, 2);
         }
     }

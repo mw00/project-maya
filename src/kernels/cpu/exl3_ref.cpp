@@ -1,16 +1,16 @@
-// src/kernels/cpu/exl3_ref.cpp - the EXL3 format on the CPU, scalar (see include/strata/kernels/cpu/exl3_ref.hpp).
-#include "strata/kernels/cpu/exl3_ref.hpp"
+// src/kernels/cpu/exl3_ref.cpp - the EXL3 format on the CPU, scalar (see include/maya/kernels/cpu/exl3_ref.hpp).
+#include "maya/kernels/cpu/exl3_ref.hpp"
 
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/f16_bits.hpp"
 
 #include <cmath>
 #include <vector>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 
 float exl3_decode(uint32_t state, int cb) {
-    using strata::kernels::f16_from_f32;
-    using strata::kernels::f32_from_f16;
+    using maya::kernels::f16_from_f32;
+    using maya::kernels::f32_from_f16;
     if (cb == 2) {
         // fp16(1024 + byte sum) * fp16(0x1eee) + fp16(0xc931) in one FP16 FMA: the F32 FMA is exact here (a 22-bit
         // product plus a bias of the same magnitude), so the single rounding to FP16 matches the device's
@@ -70,8 +70,8 @@ void exl3_had128(float* v, size_t n) {
 }
 
 void exl3_mv(const float* w, const uint16_t* suh, const uint16_t* svh, int k, int n, const float* x, float* y) {
-    using strata::kernels::f16_from_f32;
-    using strata::kernels::f32_from_f16;
+    using maya::kernels::f16_from_f32;
+    using maya::kernels::f32_from_f16;
     std::vector<float> xh((size_t) k);
     for (int i = 0; i < k; ++i) xh[(size_t) i] = x[i] * f32_from_f16(suh[i]);
     exl3_had128(xh.data(), (size_t) k);
@@ -87,4 +87,4 @@ void exl3_mv(const float* w, const uint16_t* suh, const uint16_t* svh, int k, in
     for (int c = 0; c < n; ++c) y[c] *= f32_from_f16(svh[c]);
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

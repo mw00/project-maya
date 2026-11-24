@@ -12,7 +12,7 @@
 // A single end-to-end comparison would have had to carry one loose tolerance for both, and the interesting
 // failure - the NEOX pairing being wrong - is a PERMUTATION that a loose tolerance over all 256 dims would
 // happily accept.
-#include "strata/kernels/rope.hpp"
+#include "maya/kernels/rope.hpp"
 
 #include <cuda_runtime.h>
 
@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
 
     // ---- 1. the table against the float64 reference
     std::vector<float> hcos((size_t) max_pos * half), hsin((size_t) max_pos * half);
-    strata::kernels::build_rope_table(n_rot, theta, max_pos, hcos.data(), hsin.data());
+    maya::kernels::build_rope_table(n_rot, theta, max_pos, hcos.data(), hsin.data());
     long long table_bad = 0;
     double table_worst = 0.0;
     for (int p = 0; p < max_pos; ++p) {
@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(d_cos, hcos.data(), hcos.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cos");
     check(cudaMemcpy(d_sin, hsin.data(), hsin.size() * sizeof(float), cudaMemcpyHostToDevice), "copy sin");
     check(cudaMemcpy(d_pos, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice), "copy pos");
-    strata::kernels::rope_neox_apply(d_x, d_out, rows, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
+    maya::kernels::rope_neox_apply(d_x, d_out, rows, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
     std::vector<float> got(ref.size());
     check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "back");
 
@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
         // the check would report the correct kernel as wrong.  The first version made exactly that mistake.
         int p7 = 7;
         check(cudaMemcpy(d_pos, &p7, sizeof(int), cudaMemcpyHostToDevice), "copy p7");
-        strata::kernels::rope_neox_apply(d_x, d_out, 1, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
+        maya::kernels::rope_neox_apply(d_x, d_out, 1, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
         check(cudaMemcpy(o.data(), d_out, o.size() * sizeof(float), cudaMemcpyDeviceToHost), "back e");
         int moved[4] = {0, 0, 0, 0};       // dims 0, 1, half, half+1
         const float* chk[4] = {&e[0], &e[1], &e[half], &e[half + 1]};

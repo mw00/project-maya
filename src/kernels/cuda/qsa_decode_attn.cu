@@ -1,7 +1,7 @@
-// src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
-#include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/kv_q4.hpp"
+// src/kernels/cuda/qsa_decode_attn.cu - see include/maya/kernels/qsa_decode_attn.hpp.
+#include "maya/kernels/qsa_decode_attn.hpp"
+#include "maya/kernels/kv_q8.hpp"
+#include "maya/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int HD = 256;          // head_dim
@@ -292,4 +292,4 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

@@ -4,7 +4,7 @@ A prompt often routes several tokens to the same expert. Larger scalar tiles unp
 
 `MAYA_EXL3_HIP_SCALAR_ROWS=0` (default, or `8`) retains the original implementation. `12`, `16` and `24` select a fixed tile. `auto` selects gate/up's original 8 rows below `MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS` (48), otherwise 12; down uses 12 below `MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS` (128), otherwise 24. Each choice applies to one dispatched expert batch, using its existing `SetArgs.max_rows`; it is not an extra per-expert readback or learned predictor.
 
-The cutoffs are configurable because occupancy and routed-row distributions differ between cards, model shapes and workloads. Capability is checked per visible GPU. Only gfx12, uniform integer 3/4-bit layouts with codebook 2 (mul1), on the scalar set path are selected. Other layouts, mixed expert sets and architectures retain the existing implementation. Existing matrix-kernel selection still wins. Decode and MTP-verification kernels are not changed. Native launches accept `STRATA_EXL3_HIP_SCALAR_*` and `EXL3_HIP_SCALAR_*` aliases too.
+The cutoffs are configurable because occupancy and routed-row distributions differ between cards, model shapes and workloads. Capability is checked per visible GPU. Only gfx12, uniform integer 3/4-bit layouts with codebook 2 (mul1), on the scalar set path are selected. Other layouts, mixed expert sets and architectures retain the existing implementation. Existing matrix-kernel selection still wins. Decode and MTP-verification kernels are not changed. Native launches accept `MAYA_EXL3_HIP_SCALAR_*` and `EXL3_HIP_SCALAR_*` aliases too.
 
 Example serving-config environment (explicit opt-in):
 

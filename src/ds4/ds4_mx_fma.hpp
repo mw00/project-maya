@@ -10,7 +10,7 @@
 #include <immintrin.h>
 #endif
 
-namespace strata::ds4::gguf::detail {
+namespace maya::ds4::gguf::detail {
 inline bool fast_fma_environment_ok() {
 #if (defined(__x86_64__) || defined(_M_X64)) && FLT_EVAL_METHOD == 0
     // Only RN with gradual underflow. Other environments retain the original library operation.
@@ -42,4 +42,4 @@ template <bool Fast> inline float mx_fma(float a, float b, float c) {
     if constexpr (Fast) return fma_guarded_rn(a, b, c);
     return std::fma(a, b, c);
 }
-}  // namespace strata::ds4::gguf::detail
+}  // namespace maya::ds4::gguf::detail

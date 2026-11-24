@@ -1,9 +1,9 @@
 # GLM-5.3-Flash UD-IQ1_S on one GPU at several VRAM budgets (2026-10-05)
 
-Build: glm5-flash after commit 54f6fc5 + `STRATA_GLM_VRAM_GB` (caps the engine's total use of the card, so the
+Build: glm5-flash after commit 54f6fc5 + `MAYA_GLM_VRAM_GB` (caps the engine's total use of the card, so the
 expert pool gets what a card of that size would leave it). Host: the 2x V100 PC, using one Tesla V100-PCIE-32GB (PCIe 3.0 x16,
 900 GB/s HBM2), Xeon E5-2690 v4, **30 GB RAM** (the pinned RAM tier gets ~23 GB), NVMe at ~2.2-2.4 GB/s.
-Protocol: `CUDA_VISIBLE_DEVICES=0 STRATA_GLM_SPLIT=0`, fresh process (tiers warmed at load from expert_prior.txt),
+Protocol: `CUDA_VISIBLE_DEVICES=0 MAYA_GLM_SPLIT=0`, fresh process (tiers warmed at load from expert_prior.txt),
 three requests of 128 tokens on different prompts (chat 40 tokens, code 61, math 61), context 4096.
 
 | VRAM | in use before experts | expert slots (of 12,096) | decode tok/s, req 1 / 2 / 3 | VRAM hit | RAM fetches /tok | disk reads /tok (ms/tok) | prompt ms/tok |

@@ -4,9 +4,9 @@
 #include <cmath>
 #include <cstdio>
 
-using strata::ds4::PathFlowCalibration;
-using strata::ds4::path_size_class;
-using strata::ds4::should_use_flow_path;
+using maya::ds4::PathFlowCalibration;
+using maya::ds4::path_size_class;
+using maya::ds4::should_use_flow_path;
 
 #define CHECK(expr) \
     do { \

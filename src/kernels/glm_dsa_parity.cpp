@@ -9,7 +9,7 @@
 //   4. NO TAIL.  Dropping the incomplete tail (select_tail) hides the newest tokens from every query.
 //   5. WRONG ATTENTION SCALE.  1/sqrt(kv_lora) instead of 1/sqrt(qk_nope) - the two are both "head
 //      dims" of this layer and only one is the ggml kq_scale.
-#include "strata/kernels/glm_dsa.hpp"
+#include "maya/kernels/glm_dsa.hpp"
 
 #include <cuda_runtime.h>
 
@@ -246,7 +246,7 @@ void test_case(int T, int kpool, int idx_heads, int key_dim, int kv_lora, int n_
     float* d_out = a.d + off; off += (size_t) v_head * n_head * T;
 
     // ---- pool
-    strata::kernels::glm_dsa_pool(d_ik, d_ig, d_ape, key_dim, kpool, n_pools, d_pooled, nullptr);
+    maya::kernels::glm_dsa_pool(d_ik, d_ig, d_ape, key_dim, kpool, n_pools, d_pooled, nullptr);
     check(cudaGetLastError(), "pool launch");
     std::vector<float> k_pooled((size_t) key_dim * n_pools);
     check(cudaMemcpy(k_pooled.data(), d_pooled, k_pooled.size() * sizeof(float), cudaMemcpyDeviceToHost),
@@ -261,7 +261,7 @@ void test_case(int T, int kpool, int idx_heads, int key_dim, int kv_lora, int n_
     require(max_abs(r_pooled, w_pooled) > 1e-3, "the pool weights are invisible");
 
     // ---- score
-    strata::kernels::glm_dsa_score(d_iq, d_pooled, d_weights, key_dim, idx_heads, T, n_pools, d_score, nullptr);
+    maya::kernels::glm_dsa_score(d_iq, d_pooled, d_weights, key_dim, idx_heads, T, n_pools, d_score, nullptr);
     check(cudaGetLastError(), "score launch");
     std::vector<float> k_score((size_t) n_pools * T);
     check(cudaMemcpy(k_score.data(), d_score, k_score.size() * sizeof(float), cudaMemcpyDeviceToHost),
@@ -279,7 +279,7 @@ void test_case(int T, int kpool, int idx_heads, int key_dim, int kv_lora, int n_
     int* d_ident = nullptr;   // its own allocation: the cells region ends the useful arena
     check(cudaMalloc(&d_ident, T * sizeof(int)), "ident");
     check(cudaMemcpy(d_ident, ident.data(), T * sizeof(int), cudaMemcpyHostToDevice), "ident H2D");
-    strata::kernels::glm_dsa_select(d_score, n_pools, kpool, top_pools, SELECT_TAIL, T, n_sel, d_ident,
+    maya::kernels::glm_dsa_select(d_score, n_pools, kpool, top_pools, SELECT_TAIL, T, n_sel, d_ident,
                                     d_cells, nullptr);
     check(cudaGetLastError(), "select launch");
     std::vector<int> k_cells((size_t) n_sel * T);
@@ -297,7 +297,7 @@ void test_case(int T, int kpool, int idx_heads, int key_dim, int kv_lora, int n_
 
     // ---- attention
     cudaFree(d_ident);
-    strata::kernels::glm_mla_attention(d_qabs, d_lat, d_cells, d_wvb, kv_lora, n_head, v_head, qk_nope, T, n_sel,
+    maya::kernels::glm_mla_attention(d_qabs, d_lat, d_cells, d_wvb, kv_lora, n_head, v_head, qk_nope, T, n_sel,
                                        d_out, nullptr);
     check(cudaGetLastError(), "attention launch");
     std::vector<float> k_out((size_t) v_head * n_head * T);

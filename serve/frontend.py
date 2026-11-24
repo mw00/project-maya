@@ -30,13 +30,14 @@ import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from serve.response_schema import json_instruction, with_system_note
+from serve.glm_dsa_template import effort_dialect
 
 
 # ------------------------------------------------------------------------------------------------ template
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, glm_dsa: bool = False):
         def raise_exception(message):
             raise jinja2.exceptions.TemplateError(message)
 
@@ -71,6 +72,50 @@ class ChatTemplate:
         # ... and it keeps a past turn's thinking (reasoning_content) unless told preserve_thinking=false: a client that
         # sends the reasoning back gets the conversation as the model wrote it (the engine then goes on from it)
         self.keeps_thinking = self.qwen and "preserve_thinking is undefined or preserve_thinking is true" in self.source
+        # GLM-5.3 (744B, glm-dsa: the server sets it from the pack): text only; its template gets the tool call ids
+        # (it orders parallel results by them) and clear_thinking, and a parameter whose schema allows a string stays
+        # one (openai_to_messages / anthropic_to_messages / OutputParser with glm_dsa).  Its effort words are read from
+        # the template (serve/glm_dsa_template.py): a GLM template without the phrase above (GLM-5.2's high / max)
+        # gets the nearest level it knows.  Every other model renders exactly as before.
+        self.glm_dsa = bool(glm_dsa)
+        self.dialect = effort_dialect(self.source)
+        # Hy4-flash (Tencent's own template, the GGUF's): every tag carries the template's suffix (HYTK, ':6124c78e' -
+        # <think:6124c78e>, <tool_call:6124c78e>, <｜hy_end:6124c78e｜>), reasoning_effort no_think / low / high / max
+        # beside a reasoning_mode token, tool calls in GLM's form (NAME<arg_key>K</arg_key><arg_value>V...) inside a
+        # <tool_calls> wrapper.  The pack's tokenizer names each suffixed tag token by GLM's spelling (its aliases), so
+        # the parser reads Hy4's answers as GLM's.
+        hytk = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
+        self.hy4 = bool(hytk) and "reasoning_mode" in self.source and "hy_start" in self.source
+        self.hy4_tag = hytk.group(1) if hytk else ""
+        # Inkling 2 (thinkingmachines' own template, tools/ik2/chat_template.jinja): typed segments in place of tags -
+        # <|content_thinking|>, <|content_text|>, a tool call <|message_model|>NAME<|content_invoke_tool_json|>{"name",
+        # "args"}<|end_message|> - which InklingRewriter turns into what OutputParser reads; reasoning_effort by name
+        # (none .. max, its effort_map) or a number; tool call arguments must be objects
+        self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
+
+    def effort_shown(self, value) -> str | None:
+        """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in
+        the server's words: "none", or "high" for every other level (render's rule) - what /health and the start's
+        line report.  None for another model's template, or a value that is no level."""
+        level = effort_level(value) if self.hy4 else None
+        if level is None:
+            return None
+        return "none" if level == "none" else "high"
+
+    def thinking_levels(self) -> list | None:
+        """Hy4-flash: the two levels it is made for, in the server's words (none / high) - /health's
+        "thinking_levels".  None for every other model."""
+        return ["none", "high"] if self.hy4 else None
+
+    def opens_thinking(self, prompt: str) -> bool:
+        """Whether a rendered prompt ends in an open thinking block (Hy4-flash: its suffixed <think:..>)."""
+        end = prompt.rstrip()
+        return end.endswith("<think>") or (self.hy4 and end.endswith("<think%s>" % self.hy4_tag))
+
+    def hy4_call_open(self, name: str = "") -> str:
+        """Hy4-flash: a tool call's opening as its template writes one (the wrapper, the call, the tool's name) - what
+        a required call's prompt ends with.  (The parser reads the same opening in GLM's spelling, CALL_START + name.)"""
+        return "<tool_calls%s><tool_call%s>%s" % (self.hy4_tag, self.hy4_tag, name or "")
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -122,11 +167,38 @@ class ChatTemplate:
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
+        if self.inkling:
+            # thinking off is effort "none" (the template's 0); a level it knows by name goes as it is; none named:
+            # the template's default (0.9, its "high")
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            level = name or level
+            kwargs.pop("thinking_mode", None)
+            if off:
+                kwargs["reasoning_effort"] = "none"
+            elif level in INKLING_EFFORT:
+                kwargs["reasoning_effort"] = level
+            return self.template.render(messages=inkling_messages(messages), tools=tools,
+                                        add_generation_prompt=add_generation_prompt, **kwargs)
+        if self.hy4:
+            # Hy4-flash thinks at one level, high, or not at all (no_think): thinking off is no_think, every other level
+            # (low, max ... - the template would take them, the model is not made for them) and none named are high.
+            # Its template reads tool['function'] where a tool has one.
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking_mode", None)
+            kwargs["reasoning_effort"] = "no_think" if off or level in ("none", "no_think") else "high"
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
         off = False
         if self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
             kwargs["reasoning_effort"] = "low" if off else level if level in ("low", "high") else "max"
+        elif self.glm_dsa and self.dialect.kind == "glm":
+            off = kwargs.pop("enable_thinking", True) is False
+            kwargs.update(self.dialect.template_kwargs(kwargs.pop("reasoning_effort", None), off))
         elif kwargs.get("reasoning_effort") in QWEN_EFFORT and not self.deepseek:
             kwargs["reasoning_effort"] = QWEN_EFFORT[kwargs["reasoning_effort"]]
         if add_generation_prompt and not self.glm_effort:
@@ -144,6 +216,21 @@ class ChatTemplate:
                 out.endswith("<think>\n"):
             out += "\n</think>\n\n"
         return out
+
+    def think_level(self, kwargs: dict) -> str | None:
+        """GLM-5.3 (glm-dsa): the thinking level its prompt is rendered at for these template kwargs, picked as render()
+        picks it - low, high or max (auto, or no level named: the template's default, Max) - or None with the thinking
+        off, for a template that takes no levels, and for every other model.  (Service.prepare: a request that asks for
+        Max itself and is rendered at Max may get GLM-5.3's long thinking budget, Service.think_budget_max.)"""
+        if not self.glm_dsa or self.deepseek or self.minimax or kwargs.get("enable_thinking") is False:
+            return None
+        level = kwargs.get("reasoning_effort")
+        level = None if level == AUTO else level
+        if self.glm_effort:
+            return level if level in ("low", "high") else "max"
+        if self.dialect.kind == "glm":
+            return self.dialect.template_kwargs(level, False)["reasoning_effort"]
+        return None
 
 
 # ------------------------------------------------------------------------------------------------ requests
@@ -164,7 +251,8 @@ VIDEO_PARTS = ("video_url", "input_video", "video")
 # "auto" (or "default") is the model's own default: the template is told no level at all (MiniMax-M3.1's adaptive
 # thinking with no effort named, GLM's Max, DeepSeek's encoder default).
 AUTO = "auto"
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+# ("no_think" is Hy4-flash's own word for off, the one its card sets in chat_template_kwargs.)
+EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max",
           "auto": AUTO, "default": AUTO}
 QWEN_EFFORT = {"low": "low", "high": "medium", "max": "xhigh"}   # the same levels in a Qwen3.x template's words
@@ -258,7 +346,7 @@ def deepseek_keep_thinking() -> bool:
     """MAYA_DS4_KEEP_THINKING=1: an earlier turn's reasoning stays in the prompt for the turns after it, where
     DeepSeek's own serving drops it at the next user turn - so a tool-less chat's next turn starts with the prompt the
     model already holds (with MAYA_DS4_SLOT_KEEP, with its state), instead of one that differs at every assistant turn."""
-    return os.environ.get("STRATA_DS4_KEEP_THINKING", "0") not in ("", "0")
+    return os.environ.get("MAYA_DS4_KEEP_THINKING", "0") not in ("", "0")
 
 
 def budget_effort(tokens) -> dict:
@@ -583,8 +671,39 @@ def _json_format_note(req: dict, messages: list[dict]) -> list[dict]:
     return with_system_note(messages, json_instruction(schema if isinstance(schema, dict) else None))
 
 
-def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
-    """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+def _clear_thinking(req: dict) -> dict:
+    """GLM-5.3 (glm_dsa): chat_template_kwargs.clear_thinking passed through to its template - it keeps every past
+    turn's reasoning unless that is true (then only the turns after the last user message keep theirs)."""
+    ctk = req.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and isinstance(ctk.get("clear_thinking"), bool):
+        return {"clear_thinking": ctk["clear_thinking"]}
+    return {}
+
+
+_JSON_KINDS = {str: "a string", bool: "a boolean", int: "a number", float: "a number", list: "a list",
+               type(None): "null"}
+
+
+def check_messages(req: dict, key: str = "messages") -> None:
+    """A request's list of messages (`messages`; the Responses API's `input`, which may also be one string) has the
+    right shape: a list of objects.  Else a ValueError with plain words - the server answers 400 with them, where
+    reading the list would stop at the first item with an AttributeError."""
+    msgs = req.get(key)
+    if msgs is None or (key == "input" and isinstance(msgs, str)):
+        return
+    if not isinstance(msgs, list):
+        raise ValueError(f"`{key}` must be a list of messages, not {_JSON_KINDS.get(type(msgs), 'an object')}")
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            raise ValueError(f"`{key}[{i}]` must be an object (a message with its role and content), not "
+                             f"{_JSON_KINDS.get(type(m), 'that')}")
+
+
+def openai_to_messages(req: dict, deepseek: bool = False,
+                       glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
+    """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  glm_dsa (GLM-5.3's template,
+    ChatTemplate.glm_dsa): the tool call ids and clear_thinking go to the template too."""
+    check_messages(req)
     if deepseek:
         from serve.ds41_encoding import _tool_name_for_encoding, tools_from_openai_format
         messages = copy.deepcopy(req.get("messages", []))
@@ -646,6 +765,8 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
+        if glm_dsa and role == "tool" and m.get("tool_call_id"):   # GLM-5.3 orders parallel results by id
+            out["tool_call_id"] = m["tool_call_id"]
         if m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -654,6 +775,8 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
                     args = json.loads(args) if args.strip() else {}
                 calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
+                if glm_dsa and c.get("id"):
+                    calls[-1]["id"] = c["id"]
             out["tool_calls"] = calls
         if role == "assistant" and not out["content"] and not out.get("tool_calls") and not out.get("reasoning_content"):
             continue   # an empty turn is not rendered: a history of them teaches the model to answer with nothing
@@ -673,6 +796,8 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    if glm_dsa:
+        kwargs.update(_clear_thinking(req))
     # "required" / a named function: the answer starts with the call (Service.prepare; from Strata #790)
     if tools and tc == "required":
         kwargs["_force_tool"] = ""
@@ -681,8 +806,10 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
     return _late_system_to_user(_json_format_note(req, messages)), tools, kwargs
 
 
-def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
-    """Anthropic Messages -> (template messages, template tools, template kwargs)."""
+def anthropic_to_messages(req: dict, deepseek: bool = False,
+                          glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
+    """Anthropic Messages -> (template messages, template tools, template kwargs).  glm_dsa: as openai_to_messages."""
+    check_messages(req)
     messages = []
     system = req.get("system")
     if system:
@@ -713,9 +840,13 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
                 call = {"function": {"name": block.get("name"), "arguments": block.get("input") or {}}}
                 if deepseek:
                     call.update(id=block.get("id", ""), type="function")
+                elif glm_dsa and block.get("id"):
+                    call["id"] = block["id"]
                 calls.append(call)
             elif kind == "tool_result":
                 messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+                if glm_dsa and block.get("tool_use_id"):
+                    messages[-1]["tool_call_id"] = block["tool_use_id"]
         if text or calls or reasoning:
             out = {"role": m["role"], "content": ("\n\n" if deepseek else "").join(text)}
             if reasoning:
@@ -739,6 +870,8 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
         kwargs.update(deepseek_effort_kwargs(effort) if deepseek else effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
+    if glm_dsa:
+        kwargs.update(_clear_thinking(req))
     tc = req.get("tool_choice") if isinstance(req.get("tool_choice"), dict) else {}
     if tools and tc.get("type") == "any":            # a call is required: the answer starts with it
         kwargs["_force_tool"] = ""
@@ -783,6 +916,23 @@ ARG_KEY, ARG_KEY_END = "<arg_key>", "</arg_key>"   # GLM's form: NAME<arg_key>K<
 ARG_VAL, ARG_VAL_END = "<arg_value>", "</arg_value>"
 
 
+def _declared_type(schema, unions: bool = False):
+    """A parameter schema's type for decoding: its plain "type" - and with `unions` (GLM-5.3, glm_dsa) "string" when a
+    string is one of its types (["string", "null"], an anyOf / oneOf member), as MCP and OpenAI strict schemas write
+    optional strings: "123" stays a string there."""
+    if not unions:
+        return (schema or {}).get("type")
+    if not isinstance(schema, dict):
+        return None
+    t = schema.get("type")
+    if t == "string" or (isinstance(t, list) and "string" in t):
+        return "string"
+    for alt in (schema.get("anyOf") or []) + (schema.get("oneOf") or []):
+        if _declared_type(alt, True) == "string":
+            return "string"
+    return t if isinstance(t, str) else None
+
+
 def _arg_value(value: str, declared) -> object:
     """A parameter's text as the client gets it: as written when the schema says string, else JSON-decoded when it
     parses (numbers, booleans, objects, arrays), else as written."""
@@ -811,7 +961,7 @@ class MalformedToolCall(ValueError):
         self.body = body
 
 
-def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+def parse_tool_call(body: str, schema: dict | None = None, unions: bool = False) -> ToolCall:
     """A call body -> ToolCall, in GLM's form (`NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`, what GLM-5.x
     writes: issue #5) or Qwen's (`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>`).  Values are
     JSON-decoded when the tool's schema says the parameter is not a string (or, without a schema, when they parse as
@@ -837,7 +987,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             end = rest.find(ARG_VAL_END)
             value = rest[:end] if end >= 0 else rest
             rest = rest[end + len(ARG_VAL_END):] if end >= 0 else ""
-            args[key] = _arg_value(value, (props.get(key) or {}).get("type"))
+            args[key] = _arg_value(value, _declared_type(props.get(key), unions))
         return ToolCall(name=name, arguments=args)
     if ">" not in body:
         raise MalformedToolCall(body)
@@ -858,7 +1008,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        declared = (props.get(pname) or {}).get("type")
+        declared = _declared_type(props.get(pname), unions)
         if declared == "string":
             args[pname] = value
         else:
@@ -1194,13 +1344,149 @@ class MinimaxRewriter:
         return {n: v for n, v in items}
 
 
+INKLING_EFFORT = ("none", "minimal", "low", "medium", "high", "xhigh", "max")   # (its template's effort_map)
+
+
+def inkling_messages(messages: list[dict]) -> list[dict]:
+    """The messages as Inkling 2's template takes them: a tool call's arguments an object (it refuses a JSON string),
+    no None content, a developer message a system one, reasoning as reasoning_content."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        if m.get("content") is None:
+            m["content"] = ""
+        if m.get("role") == "developer":
+            m["role"] = "system"
+        if m.get("reasoning") and not m.get("reasoning_content"):
+            m["reasoning_content"] = m["reasoning"]
+        if m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                tc = copy.deepcopy(tc)
+                fn = tc.setdefault("function", {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args) if args.strip() else {}
+                    except ValueError:
+                        fn["arguments"] = {"_raw": args}
+                elif args is None:
+                    fn["arguments"] = {}
+                calls.append(tc)
+            m["tool_calls"] = calls
+        out.append(m)
+    return out
+
+
+INK_THINK, INK_TEXT, INK_CALL = "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>"
+INK_MODEL, INK_END, INK_EOS = "<|message_model|>", "<|end_message|>", "<|content_model_end_sampling|>"
+INK_OTHER_TEXT = ("<|content_tool_error|>", "<|content_invoke_tool_text|>")
+
+
+class InklingRewriter:
+    """Inkling 2's output rewritten, as it streams, into what OutputParser reads (DeepSeek's and MiniMax's path: GLM's
+    tool-call form with JSON values).  The model writes typed segments: <|content_thinking|> opens reasoning
+    (THINK_AGAIN), <|content_text|> (and the tool-error / text-invoke kinds) opens answer text (</think> while
+    reasoning is open), and a tool call is <|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}
+    <|end_message|>, which goes out whole at its end as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..
+    </tool_call> with V JSON.  What stands between segments (the tool's name after <|message_model|>, <|end_message|>)
+    is dropped.  A mark split across deltas is held until it is whole."""
+
+    MARKS = (INK_THINK, INK_TEXT, INK_CALL, INK_MODEL, INK_END, INK_EOS) + INK_OTHER_TEXT
+
+    def __init__(self, thinking: bool = True):
+        self.buf = ""
+        self.mode = "lead"           # lead (before any segment) | think | text | name | call | between
+        self.open = thinking         # the parser is in its reasoning state (it starts there when thinking)
+        self.name = ""
+        self.body = ""
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            hits = [(i, m) for m in self.MARKS for i in (self.buf.find(m),) if i >= 0]
+            if not hits:
+                keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                out.append(self._text(self.buf[:len(self.buf) - keep]))
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i, m = min(hits)
+            if i:
+                out.append(self._text(self.buf[:i]))
+            self.buf = self.buf[i + len(m):]
+            out.append(self._mark(m))
+        return "".join(out)
+
+    def _text(self, s: str) -> str:
+        if self.mode == "name":
+            self.name += s
+            return ""
+        if self.mode == "call":
+            self.body += s
+            return ""
+        if self.mode == "lead":      # (no segment opened: a model that answers plainly)
+            self.mode = "text" if s.strip() else "lead"
+            return (self._close() + s) if self.mode == "text" else ""
+        return s if self.mode in ("think", "text") else ""
+
+    def _close(self) -> str:
+        if self.open:
+            self.open = False
+            return "</think>"
+        return ""
+
+    def _mark(self, m: str) -> str:
+        if m == INK_THINK:
+            self.mode = "think"
+            if self.open:
+                return ""
+            self.open = True
+            return THINK_AGAIN
+        if m == INK_TEXT or m in INK_OTHER_TEXT:
+            self.mode = "text"
+            return self._close()
+        if m == INK_MODEL:
+            self.mode, self.name = "name", ""
+            return ""
+        if m == INK_CALL:
+            self.mode, self.body = "call", ""
+            return ""
+        out = self._call() if self.mode == "call" else ""
+        self.mode = "between"          # <|end_message|> / the end of sampling: the segment is over
+        return out
+
+    def finish(self) -> str:
+        """The end of the answer: a mark's partial text held back is text; a call still open goes out as far as it is
+        whole (an unfinished one as its text)."""
+        rest, self.buf = self.buf, ""
+        out = self._text(rest)
+        if self.mode == "call":
+            out += self._call()
+            self.mode = "between"
+        return out
+
+    def _call(self) -> str:
+        try:
+            j = json.loads(self.body)
+            name = (j.get("name") if isinstance(j, dict) else None) or self.name.strip()
+            args = (j.get("args") if isinstance(j, dict) else None) or {}
+            if not name or not isinstance(args, dict):
+                raise ValueError(self.body)
+        except ValueError:
+            return self._close() + self.body   # (not a call the parser can read: its text, as the answer's)
+        val = lambda v: json.dumps(v, ensure_ascii=False).replace("<", "\\u003c")   # ("<" occurs in strings only)
+        return (self._close() + CALL_START + name +
+                "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + val(v) + ARG_VAL_END for k, v in args.items()) + CALL_END)
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False):
+                 token_only_end: bool = False, unions: bool = False, inkling: bool = False):
         self.state = "reasoning" if thinking else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
@@ -1208,13 +1494,15 @@ class OutputParser:
         # through close_reasoning(), at the token.  A template that spells the end as text (GLM's, Qwen's) keeps the
         # text search.
         self.token_only_end = token_only_end
+        self.unions = unions   # GLM-5.3 (glm_dsa): a parameter whose schema allows a string stays one (_declared_type)
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
-        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
+        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else \
+            InklingRewriter(thinking) if inkling else None   # (Inkling 2: its typed segments, InklingRewriter)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
-        self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax or inkling else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1282,7 +1570,7 @@ class OutputParser:
         if self.dsml is not None and "::" in name:
             self.scall.namespace = name.split("::", 1)[0]
         props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-        self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+        self.sdeclared = {k: _declared_type(v, self.unions) for k, v in props.items()}
         out.append(Event("tool_start", call=self.scall))
         args("{")
 
@@ -1566,7 +1854,7 @@ class OutputParser:
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
                 try:
-                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                    call = parse_tool_call(body, self.schemas.get(call_name(body)), self.unions)
                 except MalformedToolCall as e:
                     # a call that does not parse never fails the whole answer (#613: 24K tokens lost to one): one
                     # already announced goes out as written so far, marked incomplete (as one the output ended

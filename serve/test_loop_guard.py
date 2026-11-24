@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import loop_guard as LG  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (IM_END, LOOP_STOP_NOTE, THINK_NOTE, THINK_RESTARTS, ByteTokenizer, Service, check_request_sampling,  # noqa: E402
+from serve.server import (IM_END, LOOP_STOP_NOTE, THINK_NOTE, THINK_RESTARTS, THINK_STOP_NOTE, ByteTokenizer, Service, check_request_sampling,  # noqa: E402
                           loop_guard_setting, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -365,7 +365,7 @@ class Settings(unittest.TestCase):
     def test_on_by_default_and_the_ways_to_turn_it_off(self):
         self.assertTrue(loop_guard_setting({}, {}))
         self.assertFalse(loop_guard_setting({}, {"MAYA_LOOP_GUARD": "0"}))
-        self.assertFalse(loop_guard_setting({}, {"STRATA_LOOP_GUARD": "off"}))
+        self.assertFalse(loop_guard_setting({}, {"MAYA_LOOP_GUARD": "off"}))
         self.assertFalse(loop_guard_setting({"loop_guard": False}, {}))
         self.assertFalse(loop_guard_setting({"loop_guard": "false"}, {}))
         self.assertTrue(loop_guard_setting({"loop_guard": True}, {}))
@@ -898,6 +898,50 @@ class ToolBlock(unittest.TestCase):
         svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
         self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
 
+    def test_an_anthropic_tool_result_is_not_an_answer_to_the_user(self):
+        # #925's rule over Anthropic requests: a user turn of tool_result blocks (text beside them or not) is a tool
+        # result - as tool messages then a user message, or (DeepSeek) one user message with content_blocks
+        from serve.frontend import anthropic_to_messages
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}]}
+        result = {"type": "tool_result", "tool_use_id": "t1", "content": "found it"}
+        for turn in ([result], [result, {"type": "text", "text": "<reminder>keep going</reminder>"}]):
+            req = {"messages": [{"role": "user", "content": "find it"}, call, {"role": "user", "content": turn}]}
+            for deepseek in (False, True):
+                with self.subTest(turn=len(turn), deepseek=deepseek):
+                    self.assertFalse(LG.answers_user(anthropic_to_messages(req, deepseek=deepseek)[0]))
+        req = {"messages": [{"role": "user", "content": "find it"}, call, {"role": "user", "content": [result]},
+                            {"role": "assistant", "content": "Found it."}, {"role": "user", "content": "thanks"}]}
+        for deepseek in (False, True):
+            self.assertTrue(LG.answers_user(anthropic_to_messages(req, deepseek=deepseek)[0]))
+        self.assertFalse(LG.answers_user([]))
+
+    def test_an_answer_to_the_user_ends_the_turn(self):
+        # #921: a chat of short acknowledgements, tools offered and none called - "Affirmative. Loud and clear." to
+        # "can you hear me" was kept going (every sentence of it said before), 3 times at most, and the continuation
+        # was joined to it without a space ("clear.I am still here")
+        from serve.frontend import openai_to_messages
+        other = "grep -n on_bytes host/bellhost/bridge.py"
+        ack = "Acknowledged. Standing by for the next command."
+        req = agent(user="all tests pass")
+        for _ in range(3):
+            req["messages"] += [{"role": "assistant", "content": ack}, {"role": "user", "content": "do you mean standing by"}]
+        msgs, tools, kw = openai_to_messages(req)
+        self.assertTrue(LG.echoes(msgs))                                # the conversation repeats itself ...
+        self.assertTrue(LG.answers_user(msgs))                          # ... and the model answers the user
+        self.assertFalse(LG.answers_user(openai_to_messages(agent(NMCLI))[0]))   # (a tool result: it works on)
+        eng = ScriptEngine(Tok(), ack, call_text(other))
+        svc = Server().service(eng)
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events = [x for k, x in svc.run(ids, thinking, tools, max_new, {"_blocked": kw.get("_blocked")},
+                                        threading.Event()) if k == "event"]
+        self.assertEqual("".join(e.text for e in events if e.kind == "content"), ack)   # the model's own stop ends it
+        self.assertEqual((len(eng.prompts), svc.metrics()["loop_guard"]["kept_going"]), (1, 0))
+        # after a tool result the rule stands, and the continuation starts a new paragraph in the client's text
+        talk = "OK \u2014 the loop guard is right. Stop repeating identical greps. Break out: use what I have."
+        svc, eng, kw, calls, text, done = self.answer(talk, "Next I read bridge.py itself.", rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts), done["finish"]), ([], 2, "stop"))
+        self.assertEqual(text, talk + "\n\nNext I read bridge.py itself.")
+
     def test_what_is_not_blocked(self):
         # four runs: notes only, the call goes out
         self.assertEqual(self.answer(call_text(NMCLI[0]), rounds=(NMCLI,) * 4)[3], [NMCLI[0]])
@@ -1012,6 +1056,75 @@ class GuardedUsage(unittest.TestCase):
         self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 5000}, 1000)["reused"], 1000)
 
 
+class LastEngine(ScriptEngine):
+    """ScriptEngine with a DONE line's figures (`last`, a new dict a call, set as the engine's drain sets it - also when
+    the call is closed early): the first call found `CACHED` of its prompt in the cache, a later one all but the last 3
+    tokens of its prompt (the request's prompt plus what was written)."""
+    CACHED = 5
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        k, call = 0, len(self.prompts) + 1
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                k += 1
+                yield t
+        finally:
+            self.last = {"generated": k, "prompt_tokens": len(ids),
+                         "reused": self.CACHED if call == 1 else len(ids) - 3, "prompt_ms": 100.0 * call,
+                         "decode_ms": 10.0 * k, "finish": "stop", "drafts_accepted": k // 2, "drafts_offered": k,
+                         "hits": call, "lookups": 2 * call}
+
+
+class RequestFigures(unittest.TestCase):
+    """#1058: a request that runs the engine more than once (after a blocked tool call, a keep, a thinking resume)
+    reports its figures over all its calls - its row in /metrics and the totals took the last call's DONE alone:
+    reused > the prompt (53,069 of 20,288), 689 of 33,471 tokens written, ~2850 tok/s for ~80."""
+
+    def test_merge_calls(self):
+        from serve.server import merge_calls
+        calls = [{"generated": 32782, "prompt_tokens": 20288, "reused": 120, "prompt_ms": 9000.0,
+                  "decode_ms": 405000.0, "drafts_accepted": 9000, "drafts_offered": 12000, "finish": "stop"},
+                 {"generated": 689, "prompt_tokens": 53100, "reused": 53069, "prompt_ms": 40.0, "decode_ms": 10368.0,
+                  "drafts_accepted": 200, "drafts_offered": 300, "finish": "stop"}]
+        got = merge_calls(calls)
+        self.assertEqual((got["prompt_tokens"], got["reused"], got["prompt_ms"]), (20288, 120, 9000.0))  # the first's
+        self.assertEqual((got["generated"], got["decode_ms"]), (33471, 415368.0))                          # summed
+        self.assertEqual((got["drafts_accepted"], got["drafts_offered"]), (9200, 12300))
+        self.assertNotIn("hits", got)                                   # (no call reported it: not made up)
+        self.assertEqual(merge_calls(calls[:1]), calls[0])              # one call: its own figures
+        self.assertEqual(merge_calls([]), {})
+
+    def test_a_blocked_call_continuation_counts_every_call(self):
+        other = "nmcli -f 802-11-wireless-security.key-mgmt connection show Smulnet"
+        eng = LastEngine(Tok(), call_text(NMCLI[0]), "Checking the key management.\n" + call_text(other))
+        eng.last = {}
+        svc, eng, kw, calls, text, done = ToolBlock().answer(engine=eng)
+        self.assertEqual((calls, len(eng.prompts)), ([other], 2))       # two engine calls
+        row = svc.metrics()["requests"][0]
+        self.assertEqual(row["prompt_tokens"], len(eng.prompts[0]))
+        self.assertEqual(row["reused"], LastEngine.CACHED)              # the request's prompt, not the 2nd call's
+        self.assertEqual(row["prompt_ms"], 100.0)                       # its own prompt read (one scope with reused)
+        self.assertEqual(row["engine_generated"], eng.made)             # every call's tokens ...
+        self.assertEqual(row["decode_ms"], 10.0 * eng.made)             # ... and decode time
+        self.assertEqual(row["decode_tok_s"], 100.0)
+        self.assertEqual(row["drafts_offered"], eng.made)
+        self.assertEqual(row["hit_rate"], 0.5)                          # (1 + 2) of (2 + 4)
+        t = svc.metrics()["totals"]
+        self.assertEqual((t["reused"], t["decode_ms"]), (LastEngine.CACHED, 10.0 * eng.made))
+        self.assertGreaterEqual(t["prompt_tokens"] - t["reused"], 0)     # (llamacpp:prompt_tokens_total never < 0)
+        self.assertEqual(done["timings"]["cache_n"], LastEngine.CACHED)
+        self.assertEqual(done["timings"]["predicted_per_second"], 100.0)
+
+    def test_one_call_is_as_before(self):
+        eng = LastEngine(Tok(), "Done.")
+        eng.last = {}
+        svc, eng, kw, calls, text, done = ToolBlock().answer(engine=eng)
+        self.assertEqual(len(eng.prompts), 1)
+        row = svc.metrics()["requests"][0]
+        self.assertEqual((row["reused"], row["engine_generated"], row["prompt_ms"]), (LastEngine.CACHED, eng.made,
+                                                                                      100.0))
+
+
 # DeepSeek-V4.1's turn markers, as its vocabulary has them (one CONTROL token each): built from code points, so this
 # file never spells them out (an agent's own stream through the server must not read as the marker)
 DS_USER = chr(0x3c) + chr(0xff5c) + "User" + chr(0xff5c) + chr(0x3e)
@@ -1114,7 +1227,62 @@ class ThinkingMarkers(unittest.TestCase):
         eos = tok.encode(DS_EOS, parse_special=True)[0]
         seq = tok.encode("thinking ", parse_special=True) + [eos]
         svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
-        self.assertEqual((len(eng.prompts), done["finish"], text), (1 + THINK_RESTARTS, "stop", ""))
+        # the last restart is the answer's: the reasoning is closed, </think> is in the prompt, and the continuation
+        # (a third engine call) is the model writing its answer - the fixture replays its one script, so that replay
+        # is the answer here, not the note
+        self.assertEqual((len(eng.prompts), done["finish"]), (1 + THINK_RESTARTS, "stop"))
+        self.assertTrue(text.strip())                       # (never an empty answer: the client would retry it)
+
+    def test_a_whole_thinking_turn_is_never_empty(self):
+        # the shape an agent gets from DeepSeek-V4.1 when the history carries its reasoning as plain text: the answer
+        # (and the tool calls) written inside the thinking, then the engine's EOS - every time the server resumes.
+        # The last restart closes the thinking and the continuation is the answer: the fixture's replay of its
+        # script, so the turn ends with something to read, never with a reasoning block and no content at all.
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("Let me check these.\n\nLet me do it.", parse_special=True) + [eos]
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((done["finish"], len(eng.prompts)), ("stop", 1 + THINK_RESTARTS))
+        self.assertIn("Let me do it.", reason)              # (what it wrote stayed the reasoning: not the answer)
+        self.assertTrue(text.strip())                       # (the answer is the continuation's: never empty)
+
+    def test_no_resume_a_call_at_the_thinking_s_end_is_read_out_of_it(self):
+        # no resume the template can render: the restarts never run, the turn ends at the first EOS - and a call
+        # the reasoning ENDS with is read out of it by the salvage (the note only when there is no such call)
+        from serve.frontend import openai_to_messages
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("Let me look.\n\n", parse_special=True) + \
+            tok.encode(call_text("ls -la"), parse_special=True) + [eos]
+        eng = SeqEngine(tok, seq)
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(agent())
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events, done = [], None
+        for kind, x in svc.run(ids, thinking, tools, max_new, {"_blocked": None, "_think_resume": None},
+                               threading.Event()):
+            if kind == "event":
+                events.append(x)
+            elif kind == "done":
+                done = x
+        text = "".join(e.text for e in events if e.kind == "content")
+        calls = [e.call.name for e in events if e.kind == "tool_call"]
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertEqual(calls, ["bash"])                   # (the call its reasoning ended with)
+        self.assertNotIn(THINK_STOP_NOTE, text)
+
+    def test_a_call_written_in_the_thinking_is_read_out_of_it(self):
+        # the turn a DeepSeek agent really dies in: the model writes the call it means to make INSIDE its thinking and
+        # ends the turn there.  The answer channel never sees it, so nothing went out at all - the call is read out of
+        # what the model wrote (see the salvage in the restarts' last branch), not the note
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("Let me look.\n\n", parse_special=True) + \
+            tok.encode(call_text("ls -la"), parse_special=True) + [eos]
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual(calls, ["bash"])                   # (the call it wrote in the thinking, as the answer's)
+        self.assertNotIn(THINK_STOP_NOTE, text)
+        self.assertIn("<tool_call>", reason)                # (still the reasoning's text too: nothing was moved)
 
     def test_a_marker_in_code_or_a_call_in_the_answer_is_text(self):
         tok = DeepTok()
@@ -1155,6 +1323,22 @@ class ThinkingMarkers(unittest.TestCase):
         self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
         self.assertIn("ANSWER OK", text)
 
+    def test_a_second_think_end_in_the_answer_is_dropped(self):
+        # the answer's continuation runs after the reasoning was closed (the last restart's shape): a model that
+        # closes once more - or closes first and reasons on in the content, as its context's examples show it -
+        # would otherwise put the tag verbatim into the answer's text (46 turns of 11-23).  The tag is no one's text
+        tok = DeepTok()
+        tag = chr(0x3c) + "/think" + chr(0x3e)             # the end-of-thinking tag, spelled out codepoint-wise
+        end = tok.encode(tag, parse_special=True)[0]
+        seq = tok.encode("thinking about it", parse_special=True) + [end] + \
+            tok.encode("ANSWER OK", parse_special=True) + [end] + \
+            tok.encode(" the model wrote this on in the content", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok, token_only_end=True)
+        self.assertNotIn(tag, text)                         # (the second one: dropped, not the answer's text)
+        self.assertIn("ANSWER OK", text)
+        self.assertIn("the model wrote this on in the content", text)   # (what follows it: still the answer)
+        self.assertNotIn(tag, reason)                       # (the first one closed the reasoning: not its text either)
+
     def test_a_gguf_named_tokenizer_resumes_at_every_turn_end_the_engine_stops_at(self):
         # GLM's pack tokenizer names its ids by their GGUF keys (no "eos"), and the GLM engine ends at every turn-end
         # token (<|endoftext|>, <|user|>, <|observation|>): a turn end in the thinking ended the engine there, and the
@@ -1177,6 +1361,43 @@ class ThinkingMarkers(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
         self.assertIn("x = 1", text)
         self.assertNotIn("y = 2", text)
+
+
+
+class Hy4(unittest.TestCase):
+    """Hy4-Flash (its public template, its tags one token each as its pack's tokenizer has them): the guard is on for it
+    as for every model, and its thinking is closed with the template's own suffixed </think:..> token."""
+
+    def service(self, engine):
+        from serve.test_hy4_frontend import PUBLIC
+        return Service(engine, engine.tok, ChatTemplate(PUBLIC))
+
+    def test_a_loop_in_the_answer_is_dropped_and_penalised(self):
+        from serve.test_hy4_frontend import Hy4Tok
+        eng = LoopingEngine(Hy4Tok(), HEAD, BLOCK, escape=ESCAPE)
+        svc = self.service(eng)
+        self.assertTrue(svc.loop_guard)
+        _, content, done, _ = run(svc, sampling={"temperature": 0})
+        kept_block(self, content, after=ESCAPE)
+        self.assertEqual((done["finish"], len(eng.calls)), ("stop", 2))
+        self.assertEqual(eng.calls[1][2]["repetition_penalty"], LG.LOOP_PENALTY)
+        self.assertEqual({k: svc.loop_guard_counts[k] for k in ("detected", "penalised", "stopped")},
+                         {"detected": 1, "penalised": 1, "stopped": 0})
+
+    def test_a_third_loop_in_the_thinking_closes_it(self):
+        from serve.test_hy4_frontend import CLOSE, Hy4Tok
+        tok = Hy4Tok()
+        think_end = tok.special_tokens[CLOSE]
+        eng = LoopingEngine(tok, "I need to list them:\n", BLOCK, answer="\n\nThe numbers: 1017, 245, 26.",
+                            think_end=think_end)
+        svc = self.service(eng)
+        self.assertEqual(svc.think_end_id, think_end)
+        reasoning, content, done, _ = run(svc, thinking=True)
+        kept_block(self, reasoning, head="I need to list them:\n")
+        self.assertEqual(content.strip(), "The numbers: 1017, 245, 26.")
+        self.assertEqual(done["finish"], "stop")
+        self.assertEqual(eng.calls[-1][0][-1], think_end)          # the thinking closed by the model's own token
+        self.assertEqual(svc.loop_guard_counts["thinking_closed"], 1)
 
 
 if __name__ == "__main__":

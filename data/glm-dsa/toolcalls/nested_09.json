@@ -1,0 +1,78 @@
+{
+ "id": "nested_09",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Plan a cycling route from (38.7223, -9.1393) via (38.6979, -9.2065) named 'Belem' avoiding highways."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "plan_route",
+     "description": "Plan a route through waypoints.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "waypoints": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "lat": {
+           "type": "number"
+          },
+          "lon": {
+           "type": "number"
+          },
+          "name": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "lat",
+          "lon"
+         ]
+        }
+       },
+       "mode": {
+        "type": "string",
+        "enum": [
+         "driving",
+         "walking",
+         "cycling"
+        ]
+       },
+       "avoid": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "waypoints"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "plan_route",
+    "args": {
+     "mode": "cycling"
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

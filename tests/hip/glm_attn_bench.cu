@@ -16,8 +16,8 @@
 // shuffled permutation of a 512 MiB latent pool's rows, cut into sets: no row in two sets), each round all of them, the
 // rotation never restarting (warm-up and rounds continue it); the query, the head weights and the partials stay hot
 // as in the engine.  The copies and sets are bounded (<= 128, <= 512 MiB); the bench prints the bytes each round reads.
-#include "strata/kernels/glm_expert_bench.hpp"
-#include "strata/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_expert_bench.hpp"
+#include "maya/kernels/glm_fast.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
@@ -32,8 +32,8 @@
 #include <string>
 #include <vector>
 
-namespace gf = strata::kernels::glmf;
-namespace hb = strata::kernels::glmf::hip_expert_bench;
+namespace gf = maya::kernels::glmf;
+namespace hb = maya::kernels::glmf::hip_expert_bench;
 namespace {
 constexpr int kH = 32, kK = 128, kPool = 4, kTop = 512, kTail = kPool - 1;
 constexpr int kHeads = 64, kLora = 512, kNope = 256, kSel = kTop * kPool + kTail;

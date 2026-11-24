@@ -18,14 +18,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_qsa_score.hpp"
+#include "maya/kernels/native_qsa_score.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
@@ -62,7 +62,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
     if(row0>full)return;
     const int lane=threadIdx.x,warp=threadIdx.y;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-    // Turing (STRATA_EXPERIMENTAL_SM75, a layer-split stage): no tf32 mma.  The same scores with FP32 FMAs, one row
+    // Turing (MAYA_EXPERIMENTAL_SM75, a layer-split stage): no tf32 mma.  The same scores with FP32 FMAs, one row
     // per thread of the first warp - rounded differently from the tensor-core path (FP32 instead of TF32 inputs).
     if(warp!=0)return;
     const int row=row0+lane;
@@ -210,4 +210,4 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
     const auto error=cudaGetLastError();
     if(error!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(error));
 }
-} // namespace strata::kernels
+} // namespace maya::kernels

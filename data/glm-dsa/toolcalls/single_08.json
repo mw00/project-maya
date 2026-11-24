@@ -1,0 +1,69 @@
+{
+ "id": "single_08",
+ "group": "single",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What time is it in Tokyo?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_time",
+     "description": "Current local time in an IANA time zone.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "timezone": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "timezone"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "get_time",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

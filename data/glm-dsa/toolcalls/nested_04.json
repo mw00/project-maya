@@ -1,0 +1,92 @@
+{
+ "id": "nested_04",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Find kitchen products under 30 dollars, cheapest first."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "query_products",
+     "description": "Search the product catalogue with structured filters.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "filters": {
+        "type": "object",
+        "properties": {
+         "category": {
+          "type": "string"
+         },
+         "price": {
+          "type": "object",
+          "properties": {
+           "min": {
+            "type": "number"
+           },
+           "max": {
+            "type": "number"
+           }
+          }
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "in_stock": {
+          "type": "boolean"
+         }
+        }
+       },
+       "sort": {
+        "type": "object",
+        "properties": {
+         "field": {
+          "type": "string",
+          "enum": [
+           "price",
+           "rating",
+           "name"
+          ]
+         },
+         "order": {
+          "type": "string",
+          "enum": [
+           "asc",
+           "desc"
+          ]
+         }
+        }
+       },
+       "limit": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "filters"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "query_products",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

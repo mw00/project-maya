@@ -12,7 +12,7 @@ import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emi
 import {usd} from "./sidebar.js";
 import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
-import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
+import {ablateOf, chatInstructions, clearBrowser, estimateTokens, setAblate, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
 import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
@@ -45,7 +45,8 @@ const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`se
   <span class="set-row__ctl">${children}</span></div>`;
 
 // the engines by their INFO engine_kind
-const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)"};
+const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)",
+                 hy4: "Hy4-Flash (maya-hy4)", ik2: "Inkling 2 (maya-ik2, an experimental preview)"};
 
 // ------------------------------------------------------------------ General
 function General() {
@@ -131,7 +132,7 @@ function ThinkBudget() {
   const bad = budgetError(text), changed = text.trim() !== String(tb.budget);
   return html`<div class="set-block">
     <label class="field"><span class="field__label">Thinking budget</span>
-      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${tb.saved ? "" : " Not saved: this server runs without a config."}</span>
+      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${(tb.max_level ? ` A Max you pick yourself (in a chat, or as Thinking above) may think longer, up to ${fmt(tb.max_level)}, while this is the default; a number saved here applies at every level.` : "") + (tb.saved ? "" : " Not saved: this server runs without a config.")}</span>
       <span class="set-row__ctl"><input id="set-think-budget" class="input input--num" inputmode="numeric" value=${text}
         aria-invalid=${changed && bad ? "true" : "false"} aria-label="Thinking budget in tokens"
         onInput=${(e) => setText(e.target.value.replace(/\D/g, ""))}
@@ -141,10 +142,23 @@ function ThinkBudget() {
 }
 
 // ------------------------------------------------------------------ Chat defaults (sampling)
+// a change saves at once: a small "Saved" after the title says so, then fades (it keeps its room on the title's line, so
+// nothing moves; the status region stays, so a screen reader hears each save)
+export const SAVED_MS = 1600;
+function useSaved() {
+  const [on, setOn] = useState(false), timer = useRef(null);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const flash = () => { setOn(true); clearTimeout(timer.current); timer.current = setTimeout(() => setOn(false), SAVED_MS); };
+  return [on, flash];
+}
+const Saved = ({on}) => html`<span class=${`set-saved${on ? " is-on" : ""}`}>
+  <span class="set-saved__mark" aria-hidden="true"><${Icon} name="check" sm/>Saved</span>
+  <span class="set-saved__say" role="status" aria-live="polite">${on ? "Saved" : ""}</span></span>`;
 function ChatDefaults() {
   const t = +P.temperature, greedy = t === 0, preset = presetOf(P);
   const titles = thinkTitles();
-  const set = (patch) => { savePrefs(patch); syncShared(); };
+  const [saved, flashSaved] = useSaved();
+  const set = (patch) => { savePrefs(patch); syncShared(); flashSaved(); };
   // the running model's recommended values (its run config: the model card's) say so
   const isDefault = (k) => !greedy && Math.abs(+P[k] - (+DEFAULTS[k] || 0)) < 1e-9;
   const sliders = [
@@ -167,7 +181,8 @@ function ChatDefaults() {
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
     : "API clients get them for anything they don't set themselves.";
-  return html`<${Head} title="Chat defaults" intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
+  return html`<${Head} title=${html`Chat defaults<${Saved} on=${saved}/>`}
+      intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
       <${TurboButton}/><//>
     <${ModelCtx}/>
     <${Group} cap="Sampling">
@@ -196,6 +211,9 @@ function ChatDefaults() {
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
     <${ThinkBudget}/>
+    ${(S.health.ablate || {}).available && html`<${Row} label="Refusal ablation (this chat)"
+        sub="Projects the model's refusal direction out of its answers. Off by default; the model's own default is on the Models page.">
+      <${Switch} label="Refusal ablation (this chat)" on=${ablateOf() === true} onChange=${setAblate}/><//>`}
     <div class="set-block set-block--pens"><span class="set-row__sub">Penalties: none by default (no model has any as a standard). Set one to discourage repeats.</span>
     <div class="set-pair set-pair--3">
       ${[["repetition_penalty", "Repetition", "1.0 off, e.g. 1.1"], ["frequency_penalty", "Frequency", "0 off, e.g. 0.3"],
@@ -420,6 +438,8 @@ function facts() {
     kv = eng.kv_resident   // KV streaming (--kv-resident): the cache's VRAM is its window, not a cost per token
       ? `${k} attention cache, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM`
       : `${k} attention cache, in VRAM${kvPerTok ? ` (about ${fmt(kvPerTok / 1024)} KB a token, ${fmt(eng.kv_gb, 1)} GB at this size)` : ""}`;
+  } else if (eng.engine_kind === "ik2") {   // (maya-ik2's INFO: kv=fp8|f16 - the full layers' cache, all in VRAM)
+    kv = `${eng.kv === "fp8" ? "8-bit (FP8)" : "16-bit"}, all in VRAM (the layers without a window; the others keep 1,024 positions)`;
   } else {
     const k = (eng.engine_kind === "mm3"   // (MiniMax's: maya-mm3's KV formats)
       ? {bf16: "16-bit (BF16)", int8: "8-bit (INT8)", fp8: "8-bit (FP8)", fp4: "4-bit (FP4)", nvfp4: "4-bit (NVFP4)",
@@ -442,10 +462,15 @@ function facts() {
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["Trained for", eng.trained_context ? `up to ${fmt(eng.trained_context)} tokens` : null],
     ["KV cache", kv],
-    ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
+    // (maya-hy4: the experts in VRAM, the others computed on the CPU from RAM - none read from the SSD)
+    ["Experts", eng.experts && eng.engine_kind === "hy4"
+                ? `${fmt(eng.experts)} routed; ${+eng.vram_slots >= +eng.experts ? "all of them in VRAM"
+                    : `${fmt(+eng.vram_slots || 0)} in VRAM, the others computed on the CPU from RAM`}`
+                : eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
                  `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}` +
                  `${+eng.expert_slots + (+eng.ram_slots || 0) >= +eng.experts ? "" : ", the rest read from the SSD"}` : null],
-    ["Speculation", eng.dspark != null
+    ["Speculation", eng.engine_kind === "hy4" && !+eng.dspark && !+eng.mtp ? "off: drafting is not available for Hy4-Flash's files yet"
+                  : eng.dspark != null && !(eng.engine_kind === "hy4" && +eng.mtp)
                   ? (+eng.dspark ? "DSpark: its drafter proposes a few tokens at a time, the full model checks them" +
                                   (m.tiers && m.tiers.now && m.tiers.now.drafts != null ? ` (${fmt(100 * m.tiers.now.drafts)}% of them kept in the last answer)` : "")
                                 : "off (the config's --dspark, or no DSpark drafter in this pack)")

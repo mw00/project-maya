@@ -8,14 +8,14 @@
 //
 // Naive on purpose: one thread per block, no vectors, no shared memory, no unrolling.  Phase 3 changes this
 // file and the parity test in src/kernels/dequant_s2_parity.cpp is what says whether a change is still right.
-#include "strata/kernels/dequant_s2.hpp"
+#include "maya/kernels/dequant_s2.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int QK = 64;             // S2 group = Q2_0 block = 64 elements
@@ -48,4 +48,4 @@ void dequant_s2(const uint8_t* codes, const float* scales, float* out, int64_t n
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

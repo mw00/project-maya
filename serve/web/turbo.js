@@ -5,7 +5,7 @@
 // the engine's is in the run config (serve/models.py).
 import {html} from "./preact.js";
 import {api, esc, store} from "./lib.js";
-import {S, THINKING, P, confirmDialog, emit, loadPrefs, prefsKey, toast} from "./state.js";
+import {S, THINKING, P, confirmDialog, emit, familyOf, loadPrefs, prefsKey, toast} from "./state.js";
 import {loadTime} from "./server.js";
 import {turboEnter, turboLeave} from "./turbo-core.js";
 
@@ -14,7 +14,7 @@ S.turbo = {on: false, engine: false, plan: {}, env: {}, restarts: false, busy: f
 export async function loadTurbo() {
   try {
     const t = await api("api/turbo");
-    S.turbo = {...S.turbo, ...t, busy: S.turbo.busy};
+    S.turbo = {...S.turbo, hidden: false, ...t, busy: S.turbo.busy};   // (hidden: only while the server says so)
   } catch (e) { S.turbo = {...S.turbo, unavailable: true}; }   // (an older server: no Turbo)
   emit();
   return S.turbo;
@@ -106,8 +106,9 @@ export async function setTurbo(on) {
 // the button: a small flame that burns while Turbo is on (turbo.css)
 export function TurboButton() {
   const t = S.turbo;
-  if (t.unavailable) return null;
-  const tip = t.on ? "Turbo ON: trades quality for maximum speed (greedy decoding, no thinking, expert skipping, aggressive drafting). Click to put your settings back."
+  if (t.unavailable || t.hidden) return null;   // (hidden: GLM-5.3 (744B), until Turbo's values are measured on it)
+  // (Hy4-Flash, Inkling 2: their engines have no expert skipping or Turbo drafting - Turbo is the request's half alone)
+  const tip = t.on ? `Turbo ON: trades quality for maximum speed (greedy decoding, no thinking${["hy4", "ik2"].includes(familyOf()) ? "" : ", expert skipping, aggressive drafting"}). Click to put your settings back.`
                    : "Turbo: trades quality for maximum speed, for benchmarks and playing with the engine. Your own settings come back when you switch it off.";
   return html`<button type="button" class=${`turbo${t.on ? " turbo--on" : ""}${t.busy ? " turbo--busy" : ""}`} aria-pressed=${t.on ? "true" : "false"}
       title=${tip} disabled=${t.busy} onClick=${() => setTurbo(!t.on)}>

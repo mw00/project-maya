@@ -1,5 +1,5 @@
 // Real-pack prefill/decode comparison. Requires the pack, GPU and a CSV of prompt IDs.
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_model.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -26,8 +26,8 @@ int main(int argc, char** argv) {
     const fs::path out = fs::absolute(argv[3]);
     fs::create_directories(out / "active");
     env("GLM_CB_DIR", (out / "active").string());
-    env("STRATA_GLM_PREFILL", "auto");
-    env("STRATA_GLM_CPU_LANE", "0");
+    env("MAYA_GLM_PREFILL", "auto");
+    env("MAYA_GLM_CPU_LANE", "0");
     std::ifstream input(argv[2]);
     std::string csv((std::istreambuf_iterator<char>(input)), {});
     std::replace(csv.begin(), csv.end(), ',', ' ');
@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> ids;
     for (int32_t t; stream >> t;) ids.push_back(t);
     need(ids.size() >= 9, "need at least nine prompt tokens");
-    strata::core::Glm5Model model;
+    maya::core::Glm5Model model;
     std::string error;
     need(model.load_pack_env(argv[1], 32768, error), error);
     need(model.fast() && model.n_parts_ == 1, "single GPU fast model required");

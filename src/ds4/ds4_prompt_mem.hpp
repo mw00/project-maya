@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 // a 0 / 1 switch: -1 when it is not set (or empty), else whether it is non-zero
 inline int tri_of(const char* v) { return v == nullptr || *v == 0 ? -1 : std::atoi(v) != 0; }
@@ -59,6 +59,11 @@ inline int staging_ring_mb(double room_bytes) {
 // parts)
 constexpr double kRingBatchS = 0.010;
 constexpr double kRingSlowS = 0.001;
+// (1.1 ms where the link rule applies (a link under slow_bps): the link is measured at each start and reads 0.1-0.2 GB/s
+// apart from one start to the next, so a card whose expert took ~1.0 ms flipped between the link-sized batch and one
+// a batch (#1143: 6.4 MB over 6.5-6.7 GB/s, 40 slots read a 29.7K prompt in 22.6 s, 4 slots in 27.2 s).  Every
+// measured case for one a batch is at 1.15 ms or more.  slow_bps off (MAYA_DS4_RING_FAST_LINK=0) keeps kRingSlowS.)
+constexpr double kRingSlowBandS = 0.0011;
 constexpr double kRingSlowBps = 8e9;
 constexpr int kRingMaxMB = 400;
 inline int ring_slots(double link, size_t stride, double room, int parts, double slow_bps = kRingSlowBps) {
@@ -66,7 +71,7 @@ inline int ring_slots(double link, size_t stride, double room, int parts, double
     const double cap_b = std::min((double) ((size_t) kRingMaxMB << 20), room > 0 ? room / 16.0 : 1e300);
     const int cap = std::max(1, (int) (cap_b / (double) stride) / parts);   // (batches of the cap)
     const int want = link <= 0 ? cap
-                   : (double) stride / link >= kRingSlowS && link < slow_bps ? 1
+                   : (double) stride / link >= (slow_bps < 1e200 ? kRingSlowBandS : kRingSlowS) && link < slow_bps ? 1
                    : (int) (link * kRingBatchS / (double) stride);
     return std::max(1, std::min(cap, want)) * parts;
 }
@@ -96,4 +101,17 @@ inline uint64_t uma_free(uint64_t driver_free, uint64_t total, uint64_t mem_avai
     return std::min(std::max(driver_free, mem_available - headroom), std::max(total, driver_free));
 }
 
-}  // namespace strata::ds4
+// ---- #794 (Windows, NVIDIA, several GPUs): with the CPU lane's RAM copies pinned (cp_pin) every GPU read "0 MiB
+// free" after the load and the first request failed with out of memory on CUDA0; without the pin (DS4_COPY_PIN=0) the
+// same load had ~1.4 GB free on each GPU and ran.  pre / post: a GPU's free VRAM in MiB just before and just after the
+// pin (-1: the driver's read failed).  It took the GPU's room when its read failed after a good one, or when it had at
+// least floor_mib free before and under floor_mib after - page-locked host memory takes no VRAM by itself, so a GPU
+// the pin leaves near empty is that failure.  A GPU already under floor_mib before is not the pin's doing; floor_mib
+// <= 0: the check is off
+inline bool pin_took_vram(long long pre, long long post, long long floor_mib) {
+    if (floor_mib <= 0 || pre < 0) return false;
+    if (post < 0) return true;
+    return pre >= floor_mib && post < floor_mib;
+}
+
+}  // namespace maya::ds4

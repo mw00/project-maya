@@ -50,7 +50,7 @@ def main():
         r = subprocess.run([a.exe, "--glm-pack", a.pack, "--max-context", str(a.max_context), "--greedy",
                             "--eos-ids", ",".join(map(str, sorted(EOS))),
                             "--max-new", str(a.max_new), "--tokens-file", f.name],
-                           capture_output=True, text=True, cwd=root, env=dict(os.environ, STRATA_GLM_USAGE="0"))
+                           capture_output=True, text=True, cwd=root, env=dict(os.environ, MAYA_GLM_USAGE="0"))
         os.unlink(f.name)
         out = [int(l.split()[1]) for l in r.stdout.splitlines() if l.startswith("T ")]
         text = tok.decode(out, skip_special_tokens=False)

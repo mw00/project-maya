@@ -3,9 +3,9 @@
 #include <hip/hip_runtime.h>
 
 #include "ggml.h"
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/native_mmvq.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -48,7 +48,7 @@ Q8Reference quantize_q8_1_reference(const std::vector<float>& x) {
             continue;
         }
         const float scale_f32 = amax / 127.0f;
-        const float scale_f16 = strata::kernels::f32_from_f16(strata::kernels::f16_from_f32(scale_f32));
+        const float scale_f16 = maya::kernels::f32_from_f16(maya::kernels::f16_from_f32(scale_f32));
         for (int i = 0; i < 32; ++i) {
             const int q = static_cast<int>(std::round(x[offset + i] / scale_f32));
             result.dequantized[offset + i] = static_cast<float>(static_cast<int8_t>(q)) * scale_f16;
@@ -115,8 +115,8 @@ int main(int argc, char** argv) {
     }
 
     try {
-        strata::GgufFile gguf(argv[1]);
-        const strata::TensorInfo* tensor = gguf.find("blk.1.ple_key.weight");
+        maya::GgufFile gguf(argv[1]);
+        const maya::TensorInfo* tensor = gguf.find("blk.1.ple_key.weight");
         if (!tensor || (tensor->type != kTypeIq3Xxs && tensor->type != kTypeIq4Xs) || tensor->shape.size() != 2 ||
             tensor->shape[0] != kNIn || tensor->shape[1] != kNOut) {
             std::fprintf(stderr, "expected blk.1.ple_key.weight IQ3_XXS or IQ4_XS [2560,10240] in %s\n", argv[1]);
@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const uint8_t* host_weights = gguf.tensor_data(*tensor);
-        const size_t weight_bytes = strata::kernels::native_mmvq_weight_bytes(static_cast<int>(tensor->type), kNIn, kNOut);
+        const size_t weight_bytes = maya::kernels::native_mmvq_weight_bytes(static_cast<int>(tensor->type), kNIn, kNOut);
         const size_t row_bytes = weight_bytes / kNOut;
         const size_t expected_bytes_per_block = tensor->type == kTypeIq3Xxs ? 98 : 136;
         if (weight_bytes != static_cast<size_t>(tensor->elements()) / 256 * expected_bytes_per_block ||
@@ -150,14 +150,14 @@ int main(int argc, char** argv) {
         CHECK(hipMalloc(reinterpret_cast<void**>(&device_weights), weight_bytes));
         CHECK(hipMalloc(reinterpret_cast<void**>(&device_x), kNIn * sizeof(float)));
         CHECK(hipMalloc(reinterpret_cast<void**>(&device_y), kNOut * sizeof(float)));
-        CHECK(hipMalloc(&device_q8_1, strata::kernels::native_q8_1_bytes(kNIn)));
+        CHECK(hipMalloc(&device_q8_1, maya::kernels::native_q8_1_bytes(kNIn)));
         CHECK(hipMemcpy(device_weights, host_weights, weight_bytes, hipMemcpyHostToDevice));
 
         hipStream_t stream = nullptr;
         CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
         CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
-        strata::kernels::native_quantize_q8_1(device_x, device_q8_1, kNIn, 1, static_cast<void*>(stream));
-        strata::kernels::native_mmvq(static_cast<int>(tensor->type), device_weights, device_q8_1, device_y,
+        maya::kernels::native_quantize_q8_1(device_x, device_q8_1, kNIn, 1, static_cast<void*>(stream));
+        maya::kernels::native_mmvq(static_cast<int>(tensor->type), device_weights, device_q8_1, device_y,
                                      kNIn, kNOut, 1, static_cast<void*>(stream));
         hipGraph_t graph = nullptr;
         CHECK(hipStreamEndCapture(stream, &graph));

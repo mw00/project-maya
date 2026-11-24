@@ -7,10 +7,12 @@ from pathlib import Path
 OUT = Path(sys.argv[1] if len(sys.argv) > 1 else "badges")
 # (file name, label, Hugging Face repo)
 BADGES = [
+    ("glm53", "GLM-5.3 Maya downloads", "peasantsmith/GLM-5.3-Maya-GGUF"),
     ("glm", "GLM-5.3-Flash Maya downloads", "peasantsmith/GLM-5.3-Flash-Maya-GGUF"),
     ("glm-m-derisked", "GLM-5.3-Flash Maya-M-Derisked downloads", "peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"),
     ("deepseek", "DeepSeek-V4.1-Flash Maya downloads", "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"),
     ("minimax", "MiniMax-M3.1-Flash Maya downloads", "peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"),
+    ("hy4", "Hy4-Flash Maya downloads", "peasantsmith/Hy4-Flash-Maya-GGUF"),
 ]
 
 

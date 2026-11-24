@@ -1,9 +1,9 @@
 // src/artifact/gguf_reader.cpp - the `strata-gguf` CLI.  The reader itself is header-only in
-// include/strata/artifact/gguf_reader.hpp; this file is just the entry point, so it cannot drift
+// include/maya/artifact/gguf_reader.hpp; this file is just the entry point, so it cannot drift
 // from the library it exercises.
-#include "strata/artifact/gguf_reader.hpp"
+#include "maya/artifact/gguf_reader.hpp"
 
-#ifndef STRATA_GGUF_MAIN_DISABLED
+#ifndef MAYA_GGUF_MAIN_DISABLED
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("usage: gguf_reader <file.gguf> [--check]\n");
@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     }
     const bool check = (argc > 2 && std::string(argv[2]) == "--check");
     try {
-        strata::GgufFile g(argv[1]);
+        maya::GgufFile g(argv[1]);
         std::printf("%s\n", argv[1]);
         std::printf("  version %u   tensors %zu   metadata %zu   data_start %llu   size %llu\n", g.version(),
                     g.tensors().size(), g.metadata().size(), (unsigned long long)g.data_start(),
@@ -29,14 +29,14 @@ int main(int argc, char** argv) {
             // Every tensor's byte size must land inside the gap to the next tensor's offset, since
             // GGUF aligns every tensor. That is the same bracket test tools/verify_q2_0_geometry.py
             // uses, and it validates block_geometry() against the file rather than asserting it.
-            std::vector<const strata::TensorInfo*> ordered;
+            std::vector<const maya::TensorInfo*> ordered;
             for (const auto& t : g.tensors()) ordered.push_back(&t);
             std::sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->offset < b->offset; });
             size_t bad = 0, unknown = 0;
             for (size_t i = 0; i < ordered.size(); ++i) {
                 const auto* t = ordered[i];
                 int el = 0, by = 0;
-                if (!strata::block_geometry(t->type, el, by)) {
+                if (!maya::block_geometry(t->type, el, by)) {
                     ++unknown;
                     continue;
                 }
@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
                 if (!(nb <= end && end < nb + 32)) ++bad;
             }
             std::printf("  geometry bracket: %zu out of range, %zu types unknown\n", bad, unknown);
-            const std::string err = strata::check_architecture(g);
+            const std::string err = maya::check_architecture(g);
             std::printf("  architecture guard: %s\n", err.empty() ? "PASS" : ("FAIL - " + err).c_str());
             if (bad) return 1;
         }
@@ -64,4 +64,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-#endif // STRATA_GGUF_MAIN_DISABLED
+#endif // MAYA_GGUF_MAIN_DISABLED

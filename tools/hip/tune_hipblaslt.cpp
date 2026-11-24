@@ -423,7 +423,7 @@ void tuning_file(const std::string &path,const std::string &arch,int version,con
     std::ofstream f(path);
     if(!f){std::fprintf(stderr,"cannot write tuning output: %s\n",path.c_str());std::exit(2);}
     f<<"# solution IDs are scoped to this hipBLASLt version and device architecture\n";
-    f<<"STRATA_HIPBLASLT_TUNING_V1 "<<arch<<" "<<version<<"\n";
+    f<<"MAYA_HIPBLASLT_TUNING_V1 "<<arch<<" "<<version<<"\n";
     for(const auto &b:rows)f<<dtype(b.s.bf16)<<" "<<b.s.n<<" "<<b.s.k<<" "<<b.s.ldy<<" "<<b.s.t<<" "<<b.solution_id<<"\n";
 }
 } // namespace

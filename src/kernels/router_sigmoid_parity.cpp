@@ -13,7 +13,7 @@
 //   5. TIE ORDER.  Equal selection scores must pick the LOWER index first (stable descending
 //      argsort); the rank formula in the kernel reproduces it, and a quantised-logits fixture
 //      makes the ties happen on purpose.
-#include "strata/kernels/router_sigmoid.hpp"
+#include "maya/kernels/router_sigmoid.hpp"
 
 #include <cuda_runtime.h>
 
@@ -121,7 +121,7 @@ void test_case(int n_tokens, int n_expert, int k, float w_scale, bool norm_w, bo
     }    check(cudaMalloc(&d_ids, (size_t) n_tokens * k * sizeof(int)), "ids");
     check(cudaMalloc(&d_weights, (size_t) n_tokens * k * sizeof(float)), "weights");
 
-    strata::kernels::router_sigmoid(d_logits, with_bias ? d_bias : nullptr, n_tokens, n_expert, k, w_scale,
+    maya::kernels::router_sigmoid(d_logits, with_bias ? d_bias : nullptr, n_tokens, n_expert, k, w_scale,
                                     norm_w, d_ids, d_weights, nullptr);
     check(cudaGetLastError(), "router_sigmoid launch");
     std::vector<int> ids;

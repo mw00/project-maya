@@ -1,6 +1,6 @@
 // Numerical parity for the CUDA intrinsics supplied by the HIP compatibility layer.
 #include <hip/hip_runtime.h>
-#include "strata/hip_compat/intrinsics.hpp"
+#include "maya/hip_compat/intrinsics.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -46,7 +46,7 @@ __global__ void logical_warp_probe(uint32_t* results) {
     const unsigned base = lane & ~31u;
     const unsigned local = lane & 31u;
     values[lane] = lane * 7u;
-#if HIP_VERSION_MAJOR >= 7 && !defined(STRATA_HIP_WAVE64)
+#if HIP_VERSION_MAJOR >= 7 && !defined(MAYA_HIP_WAVE64)
     __syncwarp(static_cast<uint64_t>(0xffffffffu));  // HIP 7's native wave32 form requires a 64-bit mask.
 #else
     __syncwarp(0xffffffffu);

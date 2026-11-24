@@ -1,9 +1,9 @@
 // src/kernels/cuda/glm_ffn.cu - the glm5-next clamped SwiGLU.  See glm_ffn.hpp for the math.
-#include "strata/kernels/glm_ffn.hpp"
+#include "maya/kernels/glm_ffn.hpp"
 
 #include <cuda_runtime.h>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int GF_THREADS = 256;
@@ -30,4 +30,4 @@ void glm_swiglu_clamp(const float* gate, const float* up, float limit, int64_t n
     glm_swiglu_clamp_kernel<<<(unsigned) blocks, GF_THREADS, 0, (cudaStream_t) stream>>>(gate, up, limit, n, out);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

@@ -35,7 +35,7 @@ body:
     id: model
     attributes:
       label: Model and quant
-      placeholder: GLM-5.3-Flash, Maya-S
+      placeholder: GLM-5.3-Flash, Maya-S (or GLM-5.3, UD-IQ2_M)
     validations:
       required: true
   - type: input

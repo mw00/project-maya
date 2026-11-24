@@ -14,8 +14,8 @@
 // bit-identical to ggml-cpu's dot (native_expert.cpp checks this against ggml before it uses the rows). On a Ryzen 7
 // 9700X (Zen 5), Maya-S24's IQ2_XXS gate/up rows: ~1.4x ggml's dot at 8 threads (a whole expert with its IQ2_S down
 // rows: ~1.26x).
-#include "strata/kernels/cpu/iq_avx512_one.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/iq_avx512_one.hpp"
+#include "maya/kernels/cpu/expert_layout.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -31,20 +31,20 @@
 #include <cstring>
 
 #if defined(_MSC_VER)
-#define STRATA_ALWAYS_INLINE __forceinline
+#define MAYA_ALWAYS_INLINE __forceinline
 #else
-#define STRATA_ALWAYS_INLINE inline __attribute__((always_inline))
+#define MAYA_ALWAYS_INLINE inline __attribute__((always_inline))
 #endif
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
-STRATA_ALWAYS_INLINE float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
-STRATA_ALWAYS_INLINE uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
-STRATA_ALWAYS_INLINE uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
+MAYA_ALWAYS_INLINE float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
+MAYA_ALWAYS_INLINE uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
+MAYA_ALWAYS_INLINE uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
 
 // ggml's hsum_float_8: the same additions in the same order
-STRATA_ALWAYS_INLINE float hsum_ggml(__m256 x) {
+MAYA_ALWAYS_INLINE float hsum_ggml(__m256 x) {
     __m128 r = _mm256_extractf128_ps(x, 1);
     r = _mm_add_ps(r, _mm256_castps256_ps128(x));
     r = _mm_add_ps(r, _mm_movehl_ps(r, r));
@@ -53,12 +53,12 @@ STRATA_ALWAYS_INLINE float hsum_ggml(__m256 x) {
 }
 
 // a block's 16 int32 lanes -> ggml's 8 (lane k + lane k + 8), exact
-STRATA_ALWAYS_INLINE __m256i fold(__m512i a) {
+MAYA_ALWAYS_INLINE __m256i fold(__m512i a) {
     return _mm256_add_epi32(_mm512_castsi512_si256(a), _mm512_extracti64x4_epi64(a, 1));
 }
 
 // int16 lanes 0-7 -> s0, 8-15 -> s1, 16-23 -> s2, 24-31 -> s3
-STRATA_ALWAYS_INLINE __m512i scales4(int s0, int s1, int s2, int s3) {
+MAYA_ALWAYS_INLINE __m512i scales4(int s0, int s1, int s2, int s3) {
     const __m512i idx = _mm512_set_epi16(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1,
                                          0, 0, 0, 0, 0, 0, 0, 0);
     const uint64_t packed = (uint64_t) (uint16_t) s0 | ((uint64_t) (uint16_t) s1 << 16) |
@@ -67,7 +67,7 @@ STRATA_ALWAYS_INLINE __m512i scales4(int s0, int s1, int s2, int s3) {
 }
 
 // ksigns_iq2xs for the four 7-bit fields of a word: i | parity(i) << 7 in four bytes
-STRATA_ALWAYS_INLINE uint32_t signs4(uint32_t w) {
+MAYA_ALWAYS_INLINE uint32_t signs4(uint32_t w) {
     const uint64_t s = _pdep_u64(w & 0x0FFFFFFFu, 0x7F7F7F7Full);
     uint64_t p = s ^ ((s >> 4) & 0x0F0F0F0Full);
     p ^= (p >> 2) & 0x03030303ull;
@@ -109,7 +109,7 @@ bool cpu_bmi2_ok() {
     return (r[1] >> 8) & 1u;
 }
 
-STRATA_ALWAYS_INLINE float row_iq2xxs(const uint8_t* row, int nblocks, const block_q8_K* y, const __m512i* T,
+MAYA_ALWAYS_INLINE float row_iq2xxs(const uint8_t* row, int nblocks, const block_q8_K* y, const __m512i* T,
                                       const __m512i* pidx) {
     const __m512i lut = _mm512_set4_epi32(0, 0, 0, 0x002b1908);   // code -> grid byte, in every 128-bit lane
     const __m512i ctl = _mm512_set1_epi64(0x0E0C0A0806040200LL);  // byte k of a qword <- bits 2k.. of its low word
@@ -171,4 +171,4 @@ void iq512_one_rows(int type, const uint8_t* w, size_t row_bytes, int n, const v
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

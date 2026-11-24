@@ -19,14 +19,14 @@
 //              RMS, then the normed-and-gated write.
 //
 // All arithmetic f32; the parity harness holds the kernels to ref/glm.py's f64 loop at f32 tolerance.
-#include "strata/kernels/glm_kda.hpp"
+#include "maya/kernels/glm_kda.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int KD_THREADS = 256;
@@ -206,4 +206,4 @@ void glm_kda_out_gate(const float* o, const float* norm_w, const float* g2, int 
         o, norm_w, g2, head_dim, n_head, T, eps, gated);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

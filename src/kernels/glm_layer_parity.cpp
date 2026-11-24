@@ -12,12 +12,12 @@
 // accumulated in double so the comparison measures the KERNELS, not the host math.  A divergence
 // here means the KERNEL FAMILY does not compose into the layer, which no single-kernel parity can
 // catch: the layouts agree per kernel while the seams disagree between them.
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/glm_dsa.hpp"
-#include "strata/kernels/glm_ffn.hpp"
-#include "strata/kernels/glm_hc.hpp"
-#include "strata/kernels/glm_kda.hpp"
-#include "strata/kernels/router_sigmoid.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/glm_dsa.hpp"
+#include "maya/kernels/glm_ffn.hpp"
+#include "maya/kernels/glm_hc.hpp"
+#include "maya/kernels/glm_kda.hpp"
+#include "maya/kernels/router_sigmoid.hpp"
 
 #include <cuda_runtime.h>
 
@@ -230,7 +230,7 @@ int main(int argc, char** argv) {
     const std::string dumps_path = argc > 3 ? argv[3] : "data/glm5-synth-dumps";
     load_dumps(dumps_path);
 
-    strata::GgufFile gguf(gguf_path);
+    maya::GgufFile gguf(gguf_path);
     const auto tensor = [&](const std::string& name) -> std::vector<float> {
         const auto* t = gguf.find(name);
         if (!t) {
@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
     const size_t T = dump("hc_init").size() / ((size_t) hc * n_embd);
     const size_t hc_dim = (size_t) hc * n_embd;
 
-    strata::kernels::GlmHcShapes hcs;
+    maya::kernels::GlmHcShapes hcs;
     hcs.n_embd = n_embd;
     hcs.hc = hc;
     hcs.sinkhorn_iters = sinkhorn;
@@ -291,10 +291,10 @@ int main(int argc, char** argv) {
         dev.stage_zero((size_t) hc * hc * T);                                // 7 comb
         dev.stage_zero(1);                                                   // 8 inv_rms workspace
         dev.upload();
-        strata::kernels::GlmHcWorkspace ws;
-        strata::kernels::glm_hc_workspace_init(hcs, dev.dev(8), ws);
+        maya::kernels::GlmHcWorkspace ws;
+        maya::kernels::glm_hc_workspace_init(hcs, dev.dev(8), ws);
         for (size_t t = 0; t < T; ++t)
-            strata::kernels::glm_hc_pre(dev.dev(0) + t * hc_dim, dev.dev(1), dev.dev(2), dev.dev(3),
+            maya::kernels::glm_hc_pre(dev.dev(0) + t * hc_dim, dev.dev(1), dev.dev(2), dev.dev(3),
                                         (float) norm_eps, (float) hc_eps, hcs, ws, dev.dev(4) + t * n_embd,
                                         dev.dev(5) + t * hc, dev.dev(6) + t * hc, dev.dev(7) + t * hc * hc,
                                         nullptr);
@@ -323,7 +323,7 @@ int main(int argc, char** argv) {
         dev.stage_zero(hc_dim * T);
         dev.upload();
         for (size_t t = 0; t < T; ++t)
-            strata::kernels::glm_hc_post(dev.dev(0) + t * n_embd, dev.dev(1) + t * hc_dim, dev.dev(2) + t * hc,
+            maya::kernels::glm_hc_post(dev.dev(0) + t * n_embd, dev.dev(1) + t * hc_dim, dev.dev(2) + t * hc,
                                          dev.dev(3) + t * hc * hc, hcs, dev.dev(4) + t * hc_dim, nullptr);
         check(cudaGetLastError(), "hc_post launch");
         check(cudaDeviceSynchronize(), "hc_post sync");
@@ -350,7 +350,7 @@ int main(int argc, char** argv) {
             d.stage_zero((size_t) d_inner * (d_conv - 1));
             d.stage_zero((size_t) d_inner * T);
             d.upload();
-            strata::kernels::glm_kda_conv(d.dev(0), d.dev(1), d.dev(2), d_inner, d_conv, (int) T, d.dev(3), nullptr);
+            maya::kernels::glm_kda_conv(d.dev(0), d.dev(1), d.dev(2), d_inner, d_conv, (int) T, d.dev(3), nullptr);
             check(cudaGetLastError(), "kda conv launch");
             check(cudaDeviceSynchronize(), "kda conv sync");
             return d.read(3, (size_t) d_inner * T);
@@ -379,9 +379,9 @@ int main(int argc, char** argv) {
         d3.stage_zero((size_t) kda_head_dim * kda_head_dim * n_head);            // 7 state
         d3.stage_zero((size_t) d_inner * T);                                     // 8 out
         d3.upload();
-        strata::kernels::glm_kda_gate(d3.dev(0), d3.dev(1), (float) kda_lb, kda_head_dim, n_head, (int) T,
+        maya::kernels::glm_kda_gate(d3.dev(0), d3.dev(1), (float) kda_lb, kda_head_dim, n_head, (int) T,
                                       d3.dev(2), nullptr);
-        strata::kernels::glm_kda_recurrence(d3.dev(3), d3.dev(4), d3.dev(5), d3.dev(2), d3.dev(6), d3.dev(7),
+        maya::kernels::glm_kda_recurrence(d3.dev(3), d3.dev(4), d3.dev(5), d3.dev(2), d3.dev(6), d3.dev(7),
                                             n_head, kda_head_dim, (int) T, d3.dev(8), nullptr);
         check(cudaGetLastError(), "kda kernels launch");
         check(cudaDeviceSynchronize(), "kda sync");
@@ -397,7 +397,7 @@ int main(int argc, char** argv) {
         d4.stage(g2);
         d4.stage_zero((size_t) d_inner * T);
         d4.upload();
-        strata::kernels::glm_kda_out_gate(d4.dev(0), d4.dev(1), d4.dev(2), kda_head_dim, n_head, (int) T,
+        maya::kernels::glm_kda_out_gate(d4.dev(0), d4.dev(1), d4.dev(2), kda_head_dim, n_head, (int) T,
                                           (float) norm_eps, d4.dev(3), nullptr);
         check(cudaGetLastError(), "out_gate launch");
         check(cudaDeviceSynchronize(), "out_gate sync");
@@ -492,18 +492,18 @@ int main(int argc, char** argv) {
         d5.stage_zero((size_t) n_sel * T);                            // 10 cells (int)
         d5.stage_zero((size_t) v_head * n_head * T);                  // 11 out
         d5.upload();
-        strata::kernels::glm_dsa_pool(d5.dev(0), d5.dev(1), d5.dev(2), idx_key, kpool, n_pools, d5.dev(3), nullptr);
-        strata::kernels::glm_dsa_score(d5.dev(4), d5.dev(3), d5.dev(5), idx_key, idx_heads, (int) T, n_pools,
+        maya::kernels::glm_dsa_pool(d5.dev(0), d5.dev(1), d5.dev(2), idx_key, kpool, n_pools, d5.dev(3), nullptr);
+        maya::kernels::glm_dsa_score(d5.dev(4), d5.dev(3), d5.dev(5), idx_key, idx_heads, (int) T, n_pools,
                                        d5.dev(6), nullptr);
         std::vector<int> ident((size_t) T);
         for (int t = 0; t < (int) T; ++t) ident[(size_t) t] = t;
         int* d_ident = nullptr;
         check(cudaMalloc(&d_ident, ident.size() * sizeof(int)), "ident");
         check(cudaMemcpy(d_ident, ident.data(), ident.size() * sizeof(int), cudaMemcpyHostToDevice), "ident H2D");
-        strata::kernels::glm_dsa_select(d5.dev(6), n_pools, kpool, top_pools, 1, (int) T, n_sel, d_ident,
+        maya::kernels::glm_dsa_select(d5.dev(6), n_pools, kpool, top_pools, 1, (int) T, n_sel, d_ident,
                                         (int*) d5.dev(10), nullptr);
         cudaFree(d_ident);
-        strata::kernels::glm_mla_attention(d5.dev(7), d5.dev(8), (int*) d5.dev(10), d5.dev(9), kv_lora, n_head,
+        maya::kernels::glm_mla_attention(d5.dev(7), d5.dev(8), (int*) d5.dev(10), d5.dev(9), kv_lora, n_head,
                                            v_head, qk_nope, (int) T, n_sel, d5.dev(11), nullptr);
         check(cudaGetLastError(), "dsa kernels launch");
         check(cudaDeviceSynchronize(), "dsa sync");
@@ -532,7 +532,7 @@ int main(int argc, char** argv) {
         d7.stage_zero((size_t) n_exp_used * T);           // 2 ids (int32)
         d7.stage_zero((size_t) n_exp_used * T);           // 3 weights
         d7.upload();
-        strata::kernels::router_sigmoid(d7.dev(0), d7.dev(1), (int) T, n_expert, n_exp_used, 2.5f, true,
+        maya::kernels::router_sigmoid(d7.dev(0), d7.dev(1), (int) T, n_expert, n_exp_used, 2.5f, true,
                                         (int*) d7.dev(2), d7.dev(3), nullptr);
         check(cudaGetLastError(), "router launch");
         check(cudaDeviceSynchronize(), "router sync");

@@ -16,12 +16,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FAMILIES = ("glm", "deepseek", "minimax", "qwen")
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
+# ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini, an experimental preview; the 594B
+#  Inkling-2-Small runs by hand, docs/INKLING2.md)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
-         "qwen": "CYBER-FROST-3.8-PS"}
-SHOWN = {"glm": "GLM-5.3", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
-         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
+SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
+         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
+         "ik2": "Inkling 2 Mini"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -41,11 +44,29 @@ MODEL_DEFAULTS = {
     # CYBER-FROST-3.8-PS: Blackfrost-AI/CYBER-FROST-3.8-BF16 generation_config.json and card - temperature 1.0, top_p
     # 0.95, top_k 20; thinking on, its template's default effort xhigh
     "qwen": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "xhigh"),
+    # Hy4-flash: tencent/Hy4-flash generation_config.json and card ("Recommended sampling parameters") - temperature
+    # 0.9, top_p 1.0, no top-k (its -1); reasoning_effort high its template's default (no_think: direct answers)
+    "hy4": ({"temperature": 0.9, "top_p": 1.0}, "high"),
+    # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (no
+    # generation_config.json), so plain sampling - temperature 1.0, top_p 1.0; "auto" its template's own effort (0.9)
+    "ik2": ({"temperature": 1.0, "top_p": 1.0}, "auto"),
+    # Inkling-2-Mini (the setup's Inkling 2, an experimental preview; model_key "ik2-mini"), its author's values (PR
+    # #1095): thinkingmachines/Inkling-2-Mini's generation_config.json - temperature 1.0, top_p 1.0, no top-k, no
+    # penalties; the level its template's own default, 0.9 - "high" by name (the page offers none / low / medium /
+    # high / max: its xhigh is max's 0.99, and the server reads a client's "minimal" as off, as for every model)
+    "ik2-mini": ({"temperature": 1.0, "top_p": 1.0}, "high"),
+    # GLM-5.3 (744B, glm-dsa: model_key "glm53", serve/glm_dsa_product.py): zai-org/GLM-5.3's
+    # generation_config.json and card - temperature 1.0, top_p 0.95 (no top-k, min-p or penalties); reasoning_effort
+    # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
+    # (QUANT_SAMPLING / QUANT_THINK_BUDGET are keyed by this key, not by the family both share)
+    "glm53": ({"temperature": 1.0, "top_p": 0.95}, "max"),
 }
+GLM53 = "glm53"
 
 
 # A quant with its own sampling (the owner validated it on that quant, 2026-11-02): GLM-5.3-Flash Maya-XS - temperature
-# 0.7, top_p 0.95, min_p 0.05, no penalties.  Every other quant keeps its model's (MODEL_DEFAULTS).
+# 0.7, top_p 0.95, min_p 0.05, no penalties.  Every other quant keeps its model's (MODEL_DEFAULTS).  Keyed by
+# (model_key, tier): a GLM-5.3 (744B) quant of the same tier is ("glm53", ...), never GLM-5.3-Flash's.
 QUANT_SAMPLING = {("glm", "Maya-XS"): {"temperature": 0.7, "top_p": 0.95, "min_p": 0.05},
                   # Qwen3.8-Flash-Next itself (unsloth's UD-IQ2_XS, by its installer "quant"): Qwen/Qwen3.8-Flash-Next's
                   # card, thinking mode - temperature 1.0, top_p 0.95, top_k 20, min_p 0
@@ -53,17 +74,64 @@ QUANT_SAMPLING = {("glm", "Maya-XS"): {"temperature": 0.7, "top_p": 0.95, "min_p
 
 
 def model_defaults(cfg: dict) -> tuple:
-    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its family, the quant's own
-    sampling where it has one: QUANT_SAMPLING), copies."""
+    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its model: model_key, the
+    quant's own sampling where it has one: QUANT_SAMPLING), copies."""
+    key = model_key(cfg)
+    sampling, effort = MODEL_DEFAULTS.get(key, MODEL_DEFAULTS["glm"])
+    return dict(QUANT_SAMPLING.get((key, tier_of(cfg)), sampling)), effort
+
+
+_g53 = None
+
+
+def is_glm53(cfg: dict) -> bool:
+    """Whether `cfg` runs GLM-5.3 (744B, glm-dsa) rather than GLM-5.3-Flash: its pack's header says so
+    (serve/glm_dsa_product.py's config_is_glm_dsa).  Read where it is asked: a config without a glm-dsa pack - every
+    config but GLM-5.3's - is answered as before."""
+    global _g53
+    if not isinstance(cfg, dict) or "--glm-pack" not in [str(a) for a in (cfg.get("args") or [])[:-1]]:
+        return False
+    if _g53 is None:
+        try:
+            from serve import glm_dsa_product as g53
+        except ImportError:                            # (tools/ alone on the path: the module by its file)
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "maya_glm_dsa_product", Path(__file__).resolve().parents[1] / "serve" / "glm_dsa_product.py")
+            g53 = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(g53)
+        _g53 = g53
+    return _g53.config_is_glm_dsa(cfg)
+
+
+def model_key(cfg: dict) -> str:
+    """The model a config runs, as MODEL_DEFAULTS, QUANT_SAMPLING and QUANT_THINK_BUDGET are keyed: its family
+    (family_of), and "glm53" for GLM-5.3 (744B), which shares the "glm" family (engine, server, setup) with
+    GLM-5.3-Flash but not its defaults."""
     fam = family_of(cfg)
-    sampling, effort = MODEL_DEFAULTS.get(fam, MODEL_DEFAULTS["glm"])
-    return dict(QUANT_SAMPLING.get((fam, tier_of(cfg)), sampling)), effort
+    if fam == "ik2" and is_ik2_mini(cfg):
+        return IK2_MINI
+    return GLM53 if fam == "glm" and is_glm53(cfg) else fam
+
+
+IK2_MINI = "ik2-mini"
+
+
+def is_ik2_mini(cfg: dict) -> bool:
+    """An Inkling 2 config that runs Inkling-2-Mini (the setup's: its installer record; one written by hand: its
+    model_name or its GGUF's name) rather than Inkling-2-Small."""
+    inst = cfg.get("installer") or {}
+    if inst.get("ik2_quant"):
+        return True
+    args = [str(a) for a in cfg.get("args") or []]
+    gguf = args[args.index("--model") + 1] if "--model" in args[:-1] else ""
+    return "mini" in str(cfg.get("model_name") or "").lower() or "mini" in Path(gguf).name.lower()
 
 
 # The thinking budget (the config's "thinking_budget": tokens, 0 = no limit; the reasoning ends there and the answer
 # starts).  GLM-5.3-Flash Maya-XS thinks past 32K on a plain three.js prompt and never answers; 8192 gave complete,
 # valid answers fastest.  Only the quants listed here get another default (the owner, 2026-11-02: Maya-XS only); every
-# other quant and model keeps 32768.  Keyed by (family, tier): a quant's catalog entry in QUANTS (and maya.MODELS)
+# other quant and model keeps 32768.  Keyed by (model_key, tier): a quant's catalog entry in QUANTS (and maya.MODELS)
 # carries the tier, so adding the GLM Maya-XS entry there is all it needs to pick this up.
 OLD_THINK_BUDGET = 32768
 GLM_THINK_BUDGET = 8192
@@ -81,8 +149,9 @@ THINK_BUDGET_MIN, THINK_BUDGET_MAX = 256, 262144
 
 
 def default_thinking_budget(cfg: dict) -> int:
-    """The thinking budget a config without one runs with: its quant's (QUANT_THINK_BUDGET), else 32768."""
-    return QUANT_THINK_BUDGET.get((family_of(cfg), tier_of(cfg)), OLD_THINK_BUDGET)
+    """The thinking budget a config without one runs with: its quant's (QUANT_THINK_BUDGET, by model_key), else
+    32768."""
+    return QUANT_THINK_BUDGET.get((model_key(cfg), tier_of(cfg)), OLD_THINK_BUDGET)
 
 
 def thinking_budget_for(cfg: dict) -> int | None:
@@ -94,6 +163,26 @@ def thinking_budget_for(cfg: dict) -> int | None:
         return None
     value = cfg.get("thinking_budget")
     return new if value is None or value == OLD_THINK_BUDGET else None
+
+
+# GLM-5.3 (744B), a request that asks for Max itself (the owner, 2026-11-07: "normal use stays quick, people who ask
+# for max effort get the long budget"): its budget stays the default 32768 (what the config and the dashboard's field
+# say, and what a request left at its default level, Max, gets), and a request that names Max may think up to 65536
+# tokens - as far as its room allows (serve/server.py THINK_LONG_RESERVE) - while the budget is that default (its
+# card's evaluations ran with 64K and more new tokens).  A budget the user set - the dashboard's field
+# (installer.thinking_budget_set) or any other value in the config - applies at every level, Max included.  GLM-5.3
+# only: the server gives it to a glm-dsa pack (main, Service.think_budget_max); every other model has one budget.
+GLM53_MAX_THINK_BUDGET = 65536
+
+
+def thinking_budget_is_default(cfg: dict) -> bool:
+    """Whether `cfg` runs its model's default thinking budget: none set, or exactly the default
+    (default_thinking_budget), and not marked as the user's own (installer.thinking_budget_set: the dashboard's
+    field)."""
+    if (cfg.get("installer") or {}).get("thinking_budget_set"):
+        return False
+    value = cfg.get("thinking_budget")
+    return value is None or value == default_thinking_budget(cfg)
 
 
 def check_thinking_budget(value) -> int:
@@ -119,6 +208,10 @@ QUANTS = (
     ("deepseek", "maya-m", "Maya-M", "deepseek-maya-m"),
     ("minimax", "gguf-xs", "Maya-XS", "minimax-maya-xs"),
     ("minimax", "gguf-s", "Maya-S", "minimax-maya-s"),
+    ("hy4", "maya-xs", "Maya-XS", "hy4-flash-maya-xs"),
+    ("hy4", "maya-s", "Maya-S", "hy4-flash-maya-s"),
+    ("hy4", "maya-m", "Maya-M", "hy4-flash-maya-m"),
+    ("hy4", "maya-l", "Maya-L", "hy4-flash-maya-l"),
 )
 # the other files the setup offers, as shown after the model's name (a GLM download not listed: its own name); also
 # the ones an install can still have though the list no longer offers them (DeepSeek's UD-Q4_K_XL: maya.DS4_BY_HAND)
@@ -128,17 +221,27 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("deepseek", "gguf-iq2_xxs"): "UD-IQ2_XXS", ("deepseek", "gguf-q2_k_xl"): "UD-Q2_K_XL",
           ("deepseek", "gguf-iq3_xxs"): "UD-IQ3_XXS", ("deepseek", "gguf-iq3_s"): "UD-IQ3_S",
           ("deepseek", "gguf-q3_k_xl"): "UD-Q3_K_XL",
-          ("deepseek", "exl3"): "EXL3 2.9 bpw", ("deepseek", "exl3-3.5"): "EXL3 3.5 bpw",
+          ("deepseek", "exl3-2.25"): "EXL3 2.25 bpw", ("deepseek", "exl3"): "EXL3 2.9 bpw",
+          ("deepseek", "exl3-3.5"): "EXL3 3.5 bpw",
           ("deepseek", "abliterated-128g"): "orcarouter Abliterated Mix-128G",
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
-          ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS"}   # (the base model in unsloth's GGUF: maya.QWEN_UD)
+          ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
+          ("hy4", "q4_k_m"): "Q4_K_M",                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
+          ("ik2", "ud-q4_k_xl"): "unsloth UD-Q4_K_XL"}  # (unsloth's GGUF of Inkling-2-Mini: maya.IK2)
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
 SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next"}
 # CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
 QWEN_IDS = ("cyber-frost", "cyber-frost-3.8", "cyber-frost-3.8-ps", "cyber-frost-3.8-ps-q5_k_m", "cyber-frost-q5_k_m")
 # unsloth's UD-IQ2_XS of Qwen3.8-Flash-Next: the setup ids it is asked for by (the first: the Models page's)
 QWEN_UD_IDS = ("qwen-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2_xs", "qwen3.8-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2-xs")
+# Hy4-flash: AngelSlim's Q4_K_M GGUF (two shards) - the setup ids it is asked for by (the first: the Models page's).
+# "hy4-flash" and "hy4" alone are the model: its files are then asked (Maya's quants and this one), or --hy4-quant
+HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
+# Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL, its one file set - the setup ids it is asked
+# for by (the first: the Models page's)
+IK2_IDS = ("inkling-2-mini", "inkling-2-mini-ud-q4_k_xl", "inkling2-mini", "ik2-mini")
+IK2_QUANT = "ud-q4_k_xl"
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -170,10 +273,14 @@ def shown(family: str, key: str | None = None, gb: float | None = None) -> str:
 def config_stem(family: str, key: str | None) -> str | None:
     """A Maya quant's config name under the scheme (maya-minimax-maya-xs), or None where the config keeps the name it
     always had (GLM's maya-<download>.json, DeepSeek's maya-ds4.json, MiniMax's EXL3 maya-mm3.json - installs and
-    their run scripts point at them).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
+    their run scripts point at them; a second DeepSeek quant beside the first: maya.ds4_config_path's own name).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
     if family == "qwen":
         return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
-    return f"maya-{setup_id(family, key)}" if family == "minimax" and setup_id(family, key) else None
+    if family == "hy4" and key == "q4_k_m":            # (AngelSlim's Q4_K_M: the config's name since its first setup)
+        return "maya-hy4-flash"
+    if family == "ik2":                                # (Inkling-2-Mini: its one file set)
+        return "maya-inkling-2-mini"
+    return f"maya-{setup_id(family, key)}" if family in ("minimax", "hy4") and setup_id(family, key) else None
 
 
 def resolve(name: str, glm_downloads=()) -> tuple | None:
@@ -193,7 +300,13 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "qwen", "q5_k_m"
     if low in QWEN_UD_IDS:
         return "qwen", "ud-iq2_xs"
-    for f in ("deepseek", "minimax", "qwen"):
+    if low in HY4_IDS:
+        return "hy4", "q4_k_m"
+    if low == "hy4":                                   # (the model by its short name: its files then asked)
+        return "hy4", None
+    if low in IK2_IDS:                                 # (Inkling-2-Mini: one file set, unsloth's UD-Q4_K_XL)
+        return "ik2", IK2_QUANT
+    for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None
     return None
@@ -201,10 +314,16 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
 
 def family_of(cfg: dict) -> str:
     """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
-    n-gram table, --ple-gguf), "deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's --pack: also the configs from
-    before the programs' names of v1.1.16), else "glm"."""
+    n-gram table, --ple-gguf), "hy4" for Hy4-flash (maya-hy4, whose --pack is its own), "ik2" for Inkling-2-Small
+    (maya-ik2), "deepseek" for a
+    DeepSeek-V4.1-Flash config (maya-ds4's --pack: also the configs from before the programs' names of v1.1.16), else
+    "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
+    if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
+        return "hy4"
+    if inst.get("family") == "ik2" or exe.startswith("maya-ik2"):   # (Inkling-2-Mini: the setup's; Inkling-2-Small: by hand)
+        return "ik2"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
         return "minimax"
     args = cfg.get("args") or []
@@ -225,8 +344,14 @@ def config_key(cfg: dict) -> str | None:
         return inst.get("ds4_quant") or "exl3"
     if fam == "minimax":
         return inst.get("mm3_quant") or "exl3"
+    if fam == "hy4":
+        return inst.get("hy4_quant") or "maya-xs"
     if fam == "qwen":   # (its keys are lower case: a hand-edited "UD-IQ2_XS" is the same files and the same name)
         return str(inst.get("qwen_quant") or "q5_k_m").lower()
+    if fam == "hy4":
+        return str(inst.get("hy4_quant") or "q4_k_m").lower()
+    if fam == "ik2":
+        return str(inst.get("ik2_quant") or IK2_QUANT).lower()
     return inst.get("quant")
 
 
@@ -250,8 +375,21 @@ def exl3_bits(cfg: dict) -> str | None:
 
 
 def config_label(cfg: dict) -> str | None:
-    """What a config runs, as users see it ("GLM-5.3 · Maya-S24"), or None for a config the setup did not write."""
+    """What a config runs, as users see it ("GLM-5.3-Flash · Maya-S24"; GLM-5.3 itself: "GLM-5.3 (744B) · UD-IQ2_M"), or
+    None for a config the setup did not write."""
     if not isinstance(cfg.get("installer"), dict):
         return None
+    if is_glm53(cfg):
+        what = glm53_quant(config_key(cfg))
+        return _g53.LABEL + (SEP + what if what else "")
     fam, bits = family_of(cfg), exl3_bits(cfg)
     return SHOWN.get(fam, fam) + SEP + bits if bits else shown(fam, config_key(cfg))
+
+
+def glm53_quant(key) -> str | None:
+    """A GLM-5.3 (744B) config's files as shown after its name: the setup's quant name less the model's own
+    ("GLM-5.3-UD-IQ2_M" -> "UD-IQ2_M"); None when the config names none."""
+    if not key:
+        return None
+    key = str(key)
+    return key[len("GLM-5.3-"):] if key.lower().startswith("glm-5.3-") and len(key) > len("GLM-5.3-") else key

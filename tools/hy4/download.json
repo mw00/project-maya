@@ -1,0 +1,101 @@
+{
+ "_": "Hy4-flash's files, one table. \"quants\": Project Maya's quants of tencent/Hy4-flash (GGUF sets; tools/hy4/pack_gguf.py packs them for maya-hy4), named as every Maya quant (tools/maya_quants.py): one repo for the model, a folder per size. A set is two shards: 00001 the model (its trunk), 00002 the n-gram table alone - \"ngram\": ONE file, the same for every size, layout and set, downloaded once and hard-linked into the other folders. This table is the one switch: a size is offered by the setup and the dashboard once \"revision\" names the repo's commit and the size has \"files\" with their sizes and sha256 (until then: --model hy4-flash-maya-xs --model-dir <folder with the files>, checked against the sizes and sha256 here). \"memory_gb\": the VRAM + RAM that hold the whole set (the setup recommends a size by it); \"for_gb\": the RAM + VRAM of the PCs a size is meant for, as the model card says it (the setup's list shows it). \"plan\": what maya-hy4 needs in VRAM for everything that is not a routed expert, GiB by context with its \"reserve_gb\" (\"need_gib\"; the engine has no RAM fallback for these parts - a context not listed is worked out from the nearest one below it, maya.py's hy4_need_gib; \"need_gib_q8\": the same with the latent cache in 8-bit rows - what the engine's --kv auto takes where F16 rows do not fit -, for the contexts measured so), and the \"chunk\" a prompt is read in. \"layouts\": the same size with another trunk for cards the standard one does not fit (\"8gb\": attention Q4_K, run with --chunk 256 --reserve-gb 0.5 --vram-experts 0), in a folder of its own beside the size's. \"published\": false switches a size or a layout off whatever else it lists (none now); \"hub\" on a layout (none now: the 8 GB-card trunk is at \"revision\"): its file may be uploaded after a release, at a later commit than \"revision\" - the setup asks Hugging Face whether it is there (same size and sha256 as here) when no folder on the PC has it, uses it if so, and says plainly that it is not published yet if not. A size with empty \"files\" is not offered: to switch one on, fill its \"files\", \"memory_gb\", \"about\" and \"plan\" and move \"revision\" to the commit that has them. A file's name carries its quant type (IQ2_XXS, IQ2_S, IQ3_XXS, IQ4_XS; the 8 GB-card trunk none: it is a .gguf_file on the Hub, saved here as .gguf): Hugging Face reads a repo's sizes from the names. \"was\": the names a file had before (folders filled earlier, by hand or by a release candidate): a file there under one of them, the same size and sha256, is hard-linked to its name of today, not downloaded again. \"drafter\" (a size's own): the DFly2 drafter of that size - Tencent's 5 draft layers (model.dfly_layers.*, a GGUF of general.type drafter, named .dfly2 on the Hub and kept under that name), at \"revision\"; the pack takes it from the model's folder and maya-hy4 drafts with it (--dfly2) where the MTP block does not fit (about 0.7-0.9 GB of VRAM against the block's 4). \"others\": sets that are not Maya's - \"q4_k_m\": Tencent's own Q4_K_M in AngelSlim's GGUF (architecture hy_v4_flash: 42 layers and an MTP block, 512 experts, 16 a token, Engram; routed experts Q4_K gate/up and Q6_K or Q4_K down, Q8_0 elsewhere), the one set with the model's MTP block (\"mtp\": it drafts, --mtp). Its \"repo\" and \"revision\" are the commit its trunk is pinned at, with its sha256: the setup checks the file against it; its n-gram table is \"ngram\" above like every set's; \"theirs\": the n-gram shard of AngelSlim's own set (the Engram table F8), taken as it is where a folder already has it; \"dir\": its folder in the models folder.",
+ "name": "Hy4-Flash",
+ "repo": "peasantsmith/Hy4-Flash-Maya-GGUF",
+ "revision": "9d73294d20e1119d03d00ea81d1d352bfbe61ff4",
+ "license": "Tencent Hy License (LICENSE.hy4-flash)",
+ "_vision": "the vision tower's mmproj file (clip.projector_type hy_v4_flash; maya-hy4 runs it on the main GPU a picture at a time): one file for every Maya size (Q8_0), downloaded with the model unless --no-vision; Tencent's own Q4_K_M takes AngelSlim's (BF16), its \"vision\"",
+ "vision": {
+  "Maya-XS/mmproj-Hy4-Flash-Maya-XS.gguf": [784524096, "6884c0317a4e3e781eef4a535706e47ae1423742ffe8341adf6e50497a7338be"]
+ },
+ "_mtp": "the draft block of Maya's sizes: Tencent's MTP block (the model's block 42, BF16) as in AngelSlim/Hy4-flash-GGUF, its tensors unchanged in a file of their own (tools/hy4/mtp_gguf.py) - one file for every size, on the Hub as .gguf_file (not in the Hub's size list), saved as .gguf; the pack takes it from the model's folder and maya-hy4 drafts with it (--mtp). \"mtp_revision\": the commit of Maya's repo the file is at - empty until it is uploaded: the setup then takes only a copy already on the PC.",
+ "mtp": {
+  "mtp/Hy4-Flash-mtp-BF16.gguf_file": [7486183072, "a49e5ae439de9a51c680b9110563106743e8d579d91e4d4cb514a527fa908908"]
+ },
+ "mtp_revision": "8027c703f9b49924e610d900edf8bdba2d82d12a",
+ "ngram": {
+  "Maya-XS/Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf": [63360616160, "5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244"]
+ },
+ "was": {
+  "Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf": ["Hy4-Flash-Maya-XS-00001-of-00002.gguf"],
+  "Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf": ["Hy4-Flash-Maya-XS-00002-of-00002.gguf", "Hy4-Flash-Maya-M-00002-of-00002.gguf", "Hy4-Flash-Maya-L-00002-of-00002.gguf", "Hy4-Flash-Maya-S-00002-of-00002.gguf", "Hy4-Flash-Maya-S-IQ2_S-00002-of-00002.gguf", "Hy4-Flash-Maya-M-IQ3_XXS-00002-of-00002.gguf", "Hy4-Flash-Maya-L-IQ4_XS-00002-of-00002.gguf"],
+  "Hy4-Flash-Maya-S-IQ2_S-00001-of-00002.gguf": ["Hy4-Flash-Maya-S-00001-of-00002.gguf"],
+  "Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf": ["Hy4-Flash-Maya-M-00001-of-00002.gguf"],
+  "Hy4-Flash-Maya-L-IQ4_XS-00001-of-00002.gguf": ["Hy4-Flash-Maya-L-00001-of-00002.gguf"],
+  "Hy4-Flash-Maya-XS-8GB-00001-of-00002.gguf": ["Hy4-Flash-Maya-XS-8GB-IQ2_XXS_S-00001-of-00002.gguf", "Hy4-Flash-Maya-XS-00001-of-00002.gguf"]
+ },
+ "quants": {
+  "Hy4-Flash-Maya-XS": {
+   "about": "routed experts IQ2_XXS (2 bits) in every layer; attention and head Q6_K, shared expert Q8_0",
+   "memory_gb": 52,
+   "for_gb": [56, 64],
+   "files": {
+    "Maya-XS/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf": [44786173984, "18fcc5224d5f882ed3f6e6619b508b9eeec87e88cb714557091bf6baf64e7d4d"]
+   },
+   "drafter": {"Maya-XS/Hy4-Flash-Maya-XS-drafter.dfly2": [693975936, "d171d5c75b9da5aa90ff0e46824480310745e83f1813649c1fc719f039117c75"]},
+   "plan": {"chunk": 1024, "reserve_gb": 0.75, "need_gib": {"4096": 8.68, "8192": 8.97, "32768": 9.83}},
+   "layouts": {
+    "8gb": {
+     "about": "attention Q4_K: for cards under about 10 GB",
+     "_": "on the Hub as .gguf_file (a GGUF the Hub's size list leaves out); the setup saves it as .gguf",
+     "files": {
+      "Maya-XS-8GB/Hy4-Flash-Maya-XS-8GB-00001-of-00002.gguf_file": [43565100064, "307bf551cf92a9567b72e1ba1795ff3a526141b791ae7ea9a04af910754e4c8a"]
+     },
+     "plan": {"chunk": 256, "reserve_gb": 0.5, "vram_experts": 0, "need_gib": {"4096": 6.5, "8192": 6.8}, "need_gib_q8": {"16384": 7.0, "32768": 7.1}}
+    }
+   }
+  },
+  "Hy4-Flash-Maya-S": {
+   "_": "the Hub's label for it is IQ2_S (2.5 bits a weight on average); its file carries Tencent's chat template of 19 Nov 2026 (thinking: high or no_think)",
+   "about": "routed experts IQ2_XXS (2 bits) on layers 1-23, IQ3_XXS (3 bits) on layers 24-41; attention and head Q6_K, shared expert Q8_0",
+   "memory_gb": 64,
+   "for_gb": [68, 80],
+   "files": {
+    "Maya-S/Hy4-Flash-Maya-S-IQ2_S-00001-of-00002.gguf": [52970756096, "80843b8df8e6ce4c1f4d768b42b717a6862ef1d91c06ae9083411b537d6b816e"]
+   },
+   "drafter": {"Maya-S/Hy4-Flash-Maya-S-drafter.dfly2": [898772352, "8c5050792c0a954d47878e01742929d40e513758f8ab756dc65a471f02ba8a16"]},
+   "plan": {"chunk": 1024, "reserve_gb": 0.75, "need_gib": {"4096": 8.82, "8192": 9.11, "32768": 9.97}}
+  },
+  "Hy4-Flash-Maya-M": {
+   "about": "routed experts IQ3_XXS (3 bits), IQ4_XS (4 bits) on 7 layers; attention, head and shared expert Q8_0",
+   "memory_gb": 76,
+   "for_gb": [80, 96],
+   "files": {
+    "Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf": [68391812128, "9ef12ab340a06b631069f99b9faccc9e99b686cf9d98b74bb872c4923e4732af"]
+   },
+   "drafter": {"Maya-M/Hy4-Flash-Maya-M-drafter.dfly2": [898772352, "3d19c87847632dba235c011a07399ce2866694067d5b923891609d1a574ce77d"]},
+   "plan": {"chunk": 1024, "reserve_gb": 0.75, "need_gib": {"4096": 9.84, "8192": 10.13, "32768": 10.99}}
+  },
+  "Hy4-Flash-Maya-L": {
+   "about": "routed experts IQ4_XS (4 bits), Q5_K (5 bits) on 5 layers; attention, head and shared expert Q8_0",
+   "memory_gb": 100,
+   "for_gb": [104, 128],
+   "files": {
+    "Maya-L/Hy4-Flash-Maya-L-IQ4_XS-00001-of-00002.gguf": [89512229920, "5f47ce10c0cb6186ec34036cd5eae47b662b780933abca9f1db0db2770799c17"]
+   },
+   "drafter": {"Maya-L/Hy4-Flash-Maya-L-drafter.dfly2": [898772352, "c856ae476a42ea69ec1f958ca70b96238fd6356f123914ecde497fac3116ab45"]},
+   "plan": {"chunk": 1024, "reserve_gb": 0.75, "need_gib": {"4096": 9.97, "8192": 10.26, "32768": 11.12}}
+  }
+ },
+ "others": {
+  "q4_k_m": {
+   "name": "Hy4-flash",
+   "dir": "Hy4-flash",
+   "repo": "AngelSlim/Hy4-flash-GGUF",
+   "revision": "ecd803c859a36bdf9f3614dbd7c548165df74c30",
+   "license": "the repo's LICENSE (AngelSlim's model and dataset license) and Tencent's terms for Hy4-flash",
+   "about": "Q4_K_M: Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere, 512 experts, 16 a token",
+   "memory_gb": 170,
+   "mtp": true,
+   "vision": {
+    "mmproj-Hy4-flash-bf16.gguf": [1044397440, "8c33a48ef57480abf4854126964058a2015b5da3b773b14c847c995cf8899bda"]
+   },
+   "files": {
+    "Hy4-flash-Q4_K_M-00001-of-00002.gguf": [104986517504, "d6f76e5620f949bb50b23d0104786a4d091c487b6bee331facbeb996445ebe14"]
+   },
+   "theirs": {
+    "Hy4-flash-Q4_K_M-00002-of-00002.gguf": [63360616128, "ecd6a0ecd7f258b1ee9211bf566261ae33efc1743ad40f58cb5004cf7b051839"]
+   }
+  }
+ }
+}

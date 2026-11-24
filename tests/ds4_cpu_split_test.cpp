@@ -16,7 +16,7 @@
 // somewhere (else the test proves nothing).
 //
 // The EXL3 kernels run on the one tier this CPU picks (exl3_cpu_tier(), printed at start-up): 0 scalar, 1 AVX2 + FMA +
-// F16C, 2 AVX-512 F/BW, 3 AVX-512 VNNI - the widest the CPU has.  STRATA_FORCE_AVX2=1 keeps an AVX-512 CPU on tier 1
+// F16C, 2 AVX-512 F/BW, 3 AVX-512 VNNI - the widest the CPU has.  MAYA_FORCE_AVX2=1 keeps an AVX-512 CPU on tier 1
 // (ctest ds4_cpu_split_test_avx2; on a CPU without AVX-512 that is the default run again).  Tier 2 cannot be forced on a
 // VNNI CPU (it always takes 3), so only a CPU with AVX-512 F/BW and no VNNI tests it.
 #include "../src/ds4/ds4_cpu_exl3.hpp"
@@ -33,10 +33,10 @@
 #include <string>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
-using strata::ds4::Exl3Lane;
-using strata::ds4::LaneEnt;
-using strata::ds4::Pool;
+namespace kc = maya::kernels::cpu;
+using maya::ds4::Exl3Lane;
+using maya::ds4::LaneEnt;
+using maya::ds4::Pool;
 
 static int g_fail = 0;
 
@@ -71,7 +71,7 @@ static void test_runs() {
         {20, 30, 9, 3},      // two parts' gate / up (9 bands): 1 round of 20 -> 2 of a third (ideal 0.67)
     };
     for (const C& c : cs) {
-        const int got = strata::ds4::exl3_split_runs(c.jobs, c.threads, c.bands);
+        const int got = maya::ds4::exl3_split_runs(c.jobs, c.threads, c.bands);
         expect(got == c.want, "exl3_split_runs(" + std::to_string(c.jobs) + ", " + std::to_string(c.threads) + ", " +
                                   std::to_string(c.bands) + ") = " + std::to_string(got) + ", want " +
                                   std::to_string(c.want));
@@ -80,8 +80,8 @@ static void test_runs() {
     for (int w = 1; w <= 64; ++w)
         for (int j = 1; j <= 300; ++j)
             for (int b : {1, 2, 7, 9, 18, 20, 40}) {
-                const int s = strata::ds4::exl3_split_runs(j, w, b);
-                if (s < 1 || b % s != 0 || (s > 1 && (long) j * s > (long) strata::ds4::kSplitJobs * w)) {
+                const int s = maya::ds4::exl3_split_runs(j, w, b);
+                if (s < 1 || b % s != 0 || (s > 1 && (long) j * s > (long) maya::ds4::kSplitJobs * w)) {
                     expect(false, "exl3_split_runs(" + std::to_string(j) + ", " + std::to_string(w) + ", " +
                                       std::to_string(b) + ") = " + std::to_string(s) + ": not a divisor or too many");
                     return;
@@ -109,12 +109,12 @@ int main(int argc, char** argv) {
     // the kernels' tier this run tests (src/kernels/cpu/exl3_cpu.cpp detect_tier)
     const int tier = kc::exl3_cpu_tier();
     const char* tier_names[] = {"scalar", "AVX2 + FMA + F16C", "AVX-512 F/BW", "AVX-512 VNNI"};
-    const char* force = std::getenv("STRATA_FORCE_AVX2");
+    const char* force = std::getenv("MAYA_FORCE_AVX2");
     const bool forced = force != nullptr && force[0] == '1';
     std::printf("EXL3 CPU tier %d (%s)%s\n", tier, tier >= 0 && tier <= 3 ? tier_names[tier] : "unknown",
-                forced ? ", STRATA_FORCE_AVX2=1" : "");
+                forced ? ", MAYA_FORCE_AVX2=1" : "");
     expect(tier >= 0 && tier <= 3, "exl3_cpu_tier() = " + std::to_string(tier) + ", not 0-3");
-    expect(!forced || tier <= 1, "STRATA_FORCE_AVX2=1 but tier " + std::to_string(tier));
+    expect(!forced || tier <= 1, "MAYA_FORCE_AVX2=1 but tier " + std::to_string(tier));
     test_runs();
 
     const int E = small ? 1280 : 5120, FF = small ? 768 : 2304;
@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
                             poison();
                             batches.clear();
                             c.split_w = split_w;
-                            strata::ds4::exl3_experts(c, x.data(), (size_t) E, ents.data(), ne, part, nodes, nophase, flow);
+                            maya::ds4::exl3_experts(c, x.data(), (size_t) E, ents.data(), ne, part, nodes, nophase, flow);
                             c.split_w = 0;
                             return std::vector<float>(yd.begin(), yd.begin() + (size_t) rows * E);
                         };
@@ -219,8 +219,8 @@ int main(int argc, char** argv) {
                         bool finite = true;
                         for (float v : ref) finite = finite && std::isfinite(v);
                         expect(finite, what + ": the reference has non-finite outputs (the synthetic weights' scale)");
-                        const int R0 = strata::ds4::exl3_split_runs(ne * 2 * GQ, W, GB);
-                        const int R2 = strata::ds4::exl3_split_runs(ne * DQ, W, DB);
+                        const int R0 = maya::ds4::exl3_split_runs(ne * 2 * GQ, W, GB);
+                        const int R2 = maya::ds4::exl3_split_runs(ne * DQ, W, DB);
                         cut_gu += R0 > 1;
                         cut_dn += R2 > 1;
                         const int J0 = ne * 2 * GQ * R0, J1 = ne * GB, J2 = ne * DQ * R2, J3 = ne * DB;

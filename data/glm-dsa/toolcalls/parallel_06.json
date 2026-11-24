@@ -1,0 +1,56 @@
+{
+ "id": "parallel_06",
+ "group": "parallel",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Translate 'good morning' into French and into Spanish."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "translate",
+     "description": "Translate text into a target language.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "target_language": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "text",
+       "target_language"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "translate",
+    "args": {
+     "text": "good morning"
+    }
+   },
+   {
+    "name": "translate",
+    "args": {
+     "text": "good morning"
+    }
+   }
+  ],
+  "min_calls": 2,
+  "max_calls": 4,
+  "no_call": false
+ }
+}

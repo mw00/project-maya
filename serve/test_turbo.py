@@ -38,9 +38,12 @@ class ResidentSkip(unittest.TestCase):
         from tools import maya_names as N
         env = dict(M.TURBO_ENV["glm"], **M.TURBO_ENV["deepseek"])
         N.alias_env(env)
-        self.assertEqual(env["STRATA_GLM_RESIDENT_TOPK"], env["MAYA_GLM_RESIDENT_TOPK"])
-        self.assertEqual(env["STRATA_DS4_RESIDENT_TOPK"], env["MAYA_DS4_RESIDENT_TOPK"])
-        self.assertEqual(N.read_as("MAYA_DS4_RESIDENT_SKIP_W"), "STRATA_DS4_RESIDENT_SKIP_W")
+        self.assertIn("MAYA_GLM_RESIDENT_TOPK", env)
+        self.assertIn("MAYA_DS4_RESIDENT_TOPK", env)
+        old = {"STRATA_DS4_RESIDENT_TOPK": "3"}                    # (an older name alone counts as the MAYA_ one)
+        N.alias_env(old)
+        self.assertEqual(old["MAYA_DS4_RESIDENT_TOPK"], "3")
+        self.assertEqual(N.read_as("STRATA_DS4_RESIDENT_SKIP_W"), "MAYA_DS4_RESIDENT_SKIP_W")
         exported = {}
         N.export_env(exported, {"MAYA_GLM_RESIDENT_TOPK": "4"})
         self.assertEqual((exported["MAYA_GLM_RESIDENT_TOPK"], exported["STRATA_GLM_RESIDENT_TOPK"]), ("4", "4"))
@@ -51,7 +54,7 @@ class ResidentSkip(unittest.TestCase):
         docs = (self.ROOT / "docs/SETTINGS.md").read_text(encoding="utf-8")
         for prefix, text in src.items():
             for opt in ("RESIDENT_TOPK", "RESIDENT_SKIP_W"):
-                self.assertIn(f'getenv("STRATA_{prefix}_{opt}")', text, (prefix, opt))
+                self.assertIn(f'getenv("MAYA_{prefix}_{opt}")', text, (prefix, opt))
                 self.assertIn(f"MAYA_{prefix}_{opt}", docs)
         self.assertEqual(docs.count("changes the answers - Turbo"), 2)
 
@@ -64,7 +67,7 @@ class ResidentSkip(unittest.TestCase):
         glm = (self.ROOT / "src/kernels/cuda/glm_fast.cu").read_text(encoding="utf-8")
         self.assertIn("const bool out = rank != 0 &&", glm)
         self.assertIn("if (a.norm_w && drop != 0u) inv =", glm)                   # (renormalised only where the model does)
-        self.assertIn("resident_ok", (self.ROOT / "include/strata/kernels/glm_fast.hpp").read_text(encoding="utf-8"))
+        self.assertIn("resident_ok", (self.ROOT / "include/maya/kernels/glm_fast.hpp").read_text(encoding="utf-8"))
 
     def test_off_in_a_config_without_turbo(self):
         d = Path(tempfile.mkdtemp())

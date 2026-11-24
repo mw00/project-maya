@@ -48,6 +48,7 @@ class CmakeStepsEnv(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t, \
                 patch.object(maya, "WIN", True), patch.object(maya, "ROOT", Path(t)), \
                 patch.object(maya.S, "find_vcvars", return_value=Path(r"C:\VS\vcvars64.bat")), \
+                patch.object(maya.S, "full_build_output", return_value=True), \
                 patch.object(maya, "run", side_effect=fake_run), patch.object(maya, "say"):
             env = {"PATH": rf'"{PHYSX}";C:\cuda\bin', "CUDA_VISIBLE_DEVICES": "1,0"}
             self.assertIsNone(maya.cmake_steps(["cmake", "-S", "x"], ["cmake", "--build", "b"], env, "build-maya.bat"))

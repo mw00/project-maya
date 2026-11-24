@@ -1,12 +1,12 @@
-// The NO_* on/off switches (include/strata/platform/env_switch.hpp, #860): unset, empty, 0, false, off and no are
+// The NO_* on/off switches (include/maya/platform/env_switch.hpp, #860): unset, empty, 0, false, off and no are
 // OFF; 1 and any other value ON, as before.  Host code only, no GPU.
-#include "strata/platform/env_switch.hpp"
+#include "maya/platform/env_switch.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
-using strata::platform::env_switch;
-using strata::platform::env_switch_value;
+using maya::platform::env_switch;
+using maya::platform::env_switch_value;
 
 static int failures = 0;
 
@@ -47,17 +47,17 @@ int main() {
     expect("no", false);
     expect("No", false);
     // from the environment itself
-    set("STRATA_TEST_ENV_SWITCH", "0");
-    if (env_switch("STRATA_TEST_ENV_SWITCH")) {
+    set("MAYA_TEST_ENV_SWITCH", "0");
+    if (env_switch("MAYA_TEST_ENV_SWITCH")) {
         ++failures;
-        std::fprintf(stderr, "FAIL: STRATA_TEST_ENV_SWITCH=0 read as on\n");
+        std::fprintf(stderr, "FAIL: MAYA_TEST_ENV_SWITCH=0 read as on\n");
     }
-    set("STRATA_TEST_ENV_SWITCH", "1");
-    if (!env_switch("STRATA_TEST_ENV_SWITCH")) {
+    set("MAYA_TEST_ENV_SWITCH", "1");
+    if (!env_switch("MAYA_TEST_ENV_SWITCH")) {
         ++failures;
-        std::fprintf(stderr, "FAIL: STRATA_TEST_ENV_SWITCH=1 read as off\n");
+        std::fprintf(stderr, "FAIL: MAYA_TEST_ENV_SWITCH=1 read as off\n");
     }
-    if (env_switch("STRATA_TEST_ENV_SWITCH_NEVER_SET")) {
+    if (env_switch("MAYA_TEST_ENV_SWITCH_NEVER_SET")) {
         ++failures;
         std::fprintf(stderr, "FAIL: an unset switch read as on\n");
     }

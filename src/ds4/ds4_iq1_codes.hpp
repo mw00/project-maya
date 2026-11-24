@@ -17,7 +17,7 @@
 #define DS4_IQ1_HD inline
 #endif
 
-namespace strata::ds4::gguf::iq {
+namespace maya::ds4::gguf::iq {
 
 // 4 nibbles times 8 (bits 3..6 of each byte: 0, 8 or 16) -> 4 codes, a byte each: bias 0x79 (delta +1/8: 8 n - 7) or
 // 0x77 (-1/8: 8 n - 9) a byte, its top bit flipped back after - each byte's sum stays below 0x100, so nothing carries
@@ -49,4 +49,4 @@ DS4_IQ1_HD void iq1m_scales(uint32_t s01, uint32_t s23, int ib, int& s0, int& s1
     s1 = 2 * (int) ((w >> 3) & 7u) + 1;
 }
 
-}  // namespace strata::ds4::gguf::iq
+}  // namespace maya::ds4::gguf::iq

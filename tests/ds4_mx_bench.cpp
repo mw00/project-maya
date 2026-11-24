@@ -13,7 +13,7 @@
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_pool.hpp"
 
-#if defined(STRATA_NATIVE_EXPERTS)
+#if defined(MAYA_NATIVE_EXPERTS)
 #include "ggml-cpu.h"
 #include "ggml.h"
 #endif
@@ -28,9 +28,9 @@
 #include <string>
 #include <vector>
 
-namespace gg = strata::ds4::gguf;
-namespace os = strata::ds4::os;
-using strata::ds4::Pool;
+namespace gg = maya::ds4::gguf;
+namespace os = maya::ds4::os;
+using maya::ds4::Pool;
 
 namespace {
 
@@ -145,7 +145,7 @@ struct Acts {   // T tokens' activations of E and FF values in every form a kern
         for (int i = 0; i < T; ++i) {
             gg::mx_quant(&xf[(size_t) i * E], E, &xq[(size_t) i * gg::mx_act_bytes(E)]);
             gg::mx_quant(&hf[(size_t) i * FF], FF, &hq[(size_t) i * gg::mx_act_bytes(FF)]);
-#if defined(STRATA_NATIVE_EXPERTS)
+#if defined(MAYA_NATIVE_EXPERTS)
             const auto* q8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
             q8->from_float(&xf[(size_t) i * E], &x8[(size_t) i * E / 32 * 34], E);
             q8->from_float(&hf[(size_t) i * FF], &h8[(size_t) i * FF / 32 * 34], FF);
@@ -169,7 +169,7 @@ void rows(int kern, const uint8_t* w, size_t rb, int k, int r0, int r1, const Ac
         return;
     }
     if (kern == kGgml) {
-#if defined(STRATA_NATIVE_EXPERTS)
+#if defined(MAYA_NATIVE_EXPERTS)
         static const ggml_vec_dot_t dot = ggml_get_type_traits_cpu(GGML_TYPE_MXFP4)->vec_dot;
         const uint8_t* x8 = down ? a.h8.data() : a.x8.data();
         for (int r = r0; r < r1; ++r)
@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
         else if (a == "--file") file = v;
         else if (a == "--make-file") make_file = v;
     }
-#if defined(STRATA_NATIVE_EXPERTS)
+#if defined(MAYA_NATIVE_EXPERTS)
     ggml_cpu_init();
 #endif
     const size_t total = (size_t) B.n_exp * kExpert;
@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
         for (const std::string& ks : kerns) {
             const int kern = kern_id(ks);
             if (kern < 0 || (kern < gg::kMxTiers && !gg::mx_tier_ok(kern))) continue;
-#if !defined(STRATA_NATIVE_EXPERTS)
+#if !defined(MAYA_NATIVE_EXPERTS)
             if (kern == kGgml) continue;
 #endif
             for (int T : Ts) {

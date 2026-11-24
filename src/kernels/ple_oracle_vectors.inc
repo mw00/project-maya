@@ -9,7 +9,7 @@
 #pragma once
 #include <cstdint>
 
-namespace strata::kernels::ple_oracle {
+namespace maya::kernels::ple_oracle {
 
 struct HashCase { const char* name; int n_tokens; const int32_t* tokens;
                   const int32_t* prev; const uint32_t* rows; };
@@ -102,4 +102,4 @@ inline constexpr uint64_t kKeyScalesBytes  = 819200ull;
 inline constexpr uint64_t kValueOffset = 1025219456ull;
 inline constexpr uint64_t kValueBytes  = 26214400ull;
 
-}  // namespace strata::kernels::ple_oracle
+}  // namespace maya::kernels::ple_oracle

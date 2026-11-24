@@ -9,7 +9,7 @@ Open an issue with:
 - **`./maya.sh --bench`** (Maya stopped) **then `./maya.sh --report`**, and attach `maya-report.txt`. Windows:
   `START-MAYA.bat --bench` / `--report`. The report includes the bench results.
 - **A build from source without the installer** is fine too. Send the same things by hand:
-  - the exact engine command and environment (`STRATA_GLM_*` settings);
+  - the exact engine command and environment (`MAYA_GLM_*` settings);
   - GPUs (model, VRAM, PCIe generation and width as `nvidia-smi` shows them), CPU, RAM, disk;
   - model and context length;
   - the engine log's `glm fast:`, `glm split`, `glm stat:` and `glm spec:` lines.
@@ -32,12 +32,12 @@ of its log (the `.log` next to your `maya-*.json`).
 - **Base it on `main`** and keep it to one topic.
 - **Measure before and after** on your hardware, same harness, and put the numbers in the description (a change for
   several conversations at once: `tools/agent_bench.py`, each setting twice or more). If the output changes (it can: which expert runs on the CPU or the GPU changes the last bits), say so.
-- **New settings** are `STRATA_GLM_*` environment variables, off or at today's behaviour by default unless measured
+- **New settings** are `MAYA_GLM_*` environment variables, off or at today's behaviour by default unless measured
   better, with a row in [docs/SETTINGS.md](docs/SETTINGS.md).
-- **AMD (HIP) and other backends:** keep NVIDIA's code path unchanged (`#if defined(STRATA_USE_HIP)`). We can't test
+- **AMD (HIP) and other backends:** keep NVIDIA's code path unchanged (`#if defined(MAYA_USE_HIP)`). We can't test
   AMD ourselves, so we merge AMD changes on your measurements once NVIDIA builds and behaves the same.
 - **A new CUDA call needs its AMD mapping.** The AMD build compiles the same sources with
-  `include/strata/hip_compat/` forced in. A CUDA runtime or cuBLAS name without a `#define` there breaks every AMD build,
+  `include/maya/hip_compat/` forced in. A CUDA runtime or cuBLAS name without a `#define` there breaks every AMD build,
   as v1.0.21 did. `python tools/check_hip_compat.py` names any missing one.
 - **Every push and pull request runs the checks** (GitHub Actions, `.github/workflows/tests.yml`), with no GPU needed:
   - the AMD-mapping check;

@@ -17,7 +17,7 @@
 
 namespace mm3 {
 
-namespace dg = strata::ds4::gguf;
+namespace dg = maya::ds4::gguf;
 
 namespace {
 constexpr int kRows = 64;   // rows a job

@@ -8,49 +8,49 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core::glmfast {
+namespace maya::core::glmfast {
 
-// The all-resident launch skip (STRATA_GLM_RESIDENT_SKIP; the complete pool was here too until v1.1.35): on by
+// The all-resident launch skip (MAYA_GLM_RESIDENT_SKIP; the complete pool was here too until v1.1.35): on by
 // default on AMD, where the Strix / Gorgon Halo APUs hold every expert (measured there); an NVIDIA build launches
 // every route's kernels unless the setting is 1.  The setting, when given, wins either way.
 inline bool on_by_default_on_amd(const char* env) {
     if (const char* v = std::getenv(env)) return std::atoi(v) != 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return true;
 #else
     return false;
 #endif
 }
-// The complete pool (STRATA_GLM_COMPLETE_POOL): on by default on every GPU since v1.1.35 - it is taken only where
+// The complete pool (MAYA_GLM_COMPLETE_POOL): on by default on every GPU since v1.1.35 - it is taken only where
 // the budget holds every expert, the spares and the prompt path's tail (complete_pool_slots), so the capped pool
 // stays wherever it is needed.  NVIDIA kept the capped pool before, even where the budget held a complete one: a long
 // prompt's borrow then evicted ~270 residents a layer for good and the CPU lane ran the decode's misses (#474: 4x A100,
 // 33 tok/s instead of 83).  The setting, when given, wins either way (0: the capped pool, for A/B).
 inline bool complete_pool_on() {
-    if (const char* v = std::getenv("STRATA_GLM_COMPLETE_POOL")) return std::atoi(v) != 0;
+    if (const char* v = std::getenv("MAYA_GLM_COMPLETE_POOL")) return std::atoi(v) != 0;
     return true;
 }
 // ... and the other way round: on by default on NVIDIA, off on AMD unless the setting is 1
 inline bool off_by_default_on_amd(const char* env) {
     if (const char* v = std::getenv(env)) return std::atoi(v) != 0;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
     return false;
 #else
     return true;
 #endif
 }
-// STRATA_GLM_GROUP_EXPERTS=1: the batched rows' routed experts each run once for all the rows of a group (glm_rows.cu)
+// MAYA_GLM_GROUP_EXPERTS=1: the batched rows' routed experts each run once for all the rows of a group (glm_rows.cu)
 inline bool group_experts_on() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_GLM_GROUP_EXPERTS");
+        const char* v = std::getenv("MAYA_GLM_GROUP_EXPERTS");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
-// STRATA_GLM_SKIP_EMPTY=1: the batched rows leave out the launches their routes have no work for (glm_rows.cu)
+// MAYA_GLM_SKIP_EMPTY=1: the batched rows leave out the launches their routes have no work for (glm_rows.cu)
 inline bool skip_empty_on() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_GLM_SKIP_EMPTY");
+        const char* v = std::getenv("MAYA_GLM_SKIP_EMPTY");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
@@ -75,6 +75,17 @@ inline std::pair<size_t, bool> pool_reserve(size_t device_free, size_t reserve, 
     return {device_free - floor, true};
 }
 
+// What the "no room for the expert pool" error says about a reserve set by hand (#899): a smaller one is named only
+// where it can make the room - the pool's budget measured more than 0 and what is short fits in the reserve.  A budget
+// of 0 means the free VRAM read was no more than the reserve: something else holds the VRAM, and a smaller reserve
+// only moves that figure.  A default reserve is not named (the start already lowers it where that helps).
+enum class ReserveHint { none, smaller, budget_zero, short_beyond };
+inline ReserveHint reserve_hint(bool given, size_t budget, size_t short_bytes, size_t reserve) {
+    if (!given) return ReserveHint::none;
+    if (budget == 0) return ReserveHint::budget_zero;
+    return short_bytes <= reserve ? ReserveHint::smaller : ReserveHint::short_beyond;
+}
+
 // The check of a written budget: the bytes it gives back once `have` of the `asked` bytes were allocated and touched
 // and `free_after` was read - what the driver refused, plus what the reserve is short by and 64 MiB.  A read of
 // nearly nothing free (under 16 MiB) only says "at least": the first two give back 1 GiB each, later ones a quarter.
@@ -87,6 +98,24 @@ inline size_t pool_give_back(size_t asked, size_t have, size_t free_after, size_
         give += g;
     }
     return std::min(give, asked);
+}
+
+// The written budget's frees, back as free VRAM (#899).  On Linux HIP (two RX 9070s) the free figure read right after
+// the check freed its pieces still counted them as in use - the card's free VRAM less the reserve, all of it - so the
+// pool sized next found 0 slots a layer while the split had planned 74.  `read` gives the free VRAM now, `pause` waits
+// a little between reads: the figure is read until it is back within `slack` of `free_before` (the free VRAM read
+// before the budget was written), at most `max_polls` pauses.  Returns the last read; `polls` the pauses it took.
+template <class Read, class Pause>
+inline size_t await_check_frees(size_t free_before, size_t slack, int max_polls, Read&& read, Pause&& pause,
+                                int& polls) {
+    polls = 0;
+    size_t fr = read();
+    while (fr + slack < free_before && polls < max_polls) {
+        pause();
+        ++polls;
+        fr = read();
+    }
+    return fr;
 }
 
 inline bool minimal_ram_tier(bool unified, bool all_experts_fit, bool explicit_budget) {
@@ -102,6 +131,17 @@ inline bool full_unified_pool(bool unified, int slots, int experts) {
 // prompt path borrows only the tail beyond them, and the decode never misses.
 inline bool complete_pool(int main_slots, int experts, int spares) {
     return main_slots >= experts + spares;
+}
+
+// A unified-memory host's complete pool: its budget is RAM's (MemAvailable less the headroom and the reserve), so where
+// that holds every expert, the spares and the prompt path's tail the pool is the complete one too - short of it, the
+// experts' bytes exactly, as before.  An AMD APU under Linux; CUDA's unified hosts keep the exact pool.
+inline bool unified_complete_pool() {
+#if defined(MAYA_USE_HIP) && !defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
 }
 
 // The slots a layer gets where the budget (avail bytes; stride_sum: one slot in every MoE layer) holds a complete pool
@@ -183,4 +223,76 @@ inline bool ram_class_plan(uint64_t budget, const std::vector<size_t>& stride,
     return true;
 }
 
-}  // namespace strata::core::glmfast
+// The room a RAM tier keeps pinnable above it under a pinning cap (Windows).  `cap`: the bytes pinned under the cap
+// plus what more pinned when it was measured (before that: what the tier holds so far).  512 MB by default - the
+// driver's own buffers for a pageable copy (#105); on NVIDIA more held experts back that the disk then served (#129).
+// A discrete AMD card under Windows (HIP) failed its start with the tier 512 MB under the cap ("the warmed expert
+// tables did not upload (unspecified launch failure)") and started with it a few GB under, lower for a model with
+// larger experts (#924): there the room is a tenth of the cap, so it follows the cap measured with this model's own
+// buffers in place.  `room_mb` >= 0 (MAYA_GLM_PIN_ROOM_MB) sets it.  Rounded up to whole 256 MB (pin_room's probes).
+inline int64_t pin_cap_room(bool discrete_amd_windows, int64_t cap, int64_t room_mb) {
+    static constexpr int64_t kStep = int64_t{256} << 20, kRoom = int64_t{512} << 20;
+    const auto up = [](int64_t b) { return (b + kStep - 1) & ~(kStep - 1); };
+    if (room_mb >= 0) return up(std::min<int64_t>(room_mb, int64_t{1} << 30) << 20);
+    if (!discrete_amd_windows) return kRoom;
+    return std::max(kRoom, up(std::max<int64_t>(0, cap) / 10));
+}
+
+// Whether the pinning cap is measured before the expert pool (#924, #1035).  On Windows with a discrete Radeon (HIP),
+// pinning host memory up to Windows' refusal while the card's VRAM is nearly full leaves the device unusable for the
+// rest of the process - the next upload fails ("unspecified launch failure") even once everything is freed - while
+// the same search with VRAM to spare is harmless (measured on an RX 7900 XT 20 GB with 64 GB of RAM).  So there the
+// cap is measured before the pool fills the card, the RAM tier is sized under it, and nothing pinned after the pool
+// goes up to a refusal.  Not on an APU (HIP does not refuse there: apu_shared_room sizes its tier), nor in a split
+// (its parts load at once: a later part's search would run with another card's pool in place).  `force`
+// (MAYA_GLM_PIN_MEASURE_FIRST): "0" off, "1" on for every one-GPU host (tests, with MAYA_GLM_PIN_CAP_MB).
+inline bool pin_cap_before_pool(bool windows_hip, bool integrated, int n_parts, const char* force) {
+    if (n_parts != 1) return false;
+    if (force != nullptr && force[0] != '\0') return std::atoi(force) != 0;
+    return windows_hip && !integrated;
+}
+
+// What more pins now under a cap measured earlier: what more pinned then, less what was pinned since (never below 0)
+inline int64_t pin_left_since(int64_t measured_more, int64_t pinned_since) {
+    return std::max<int64_t>(0, measured_more - std::max<int64_t>(0, pinned_since));
+}
+
+// A RAM tier class's slots under a pinning cap: `left` more pins, `keep` stays pinnable above the tier, `planned` the
+// bytes this class and the classes after it planned, `n` this class's planned slots.  Taken class by class (each one's
+// bytes off `left` before the next), the classes together never pass left - keep.
+inline int64_t pin_cap_share(int64_t left, int64_t keep, int64_t planned, int64_t n) {
+    const double f = (double) std::max<int64_t>(0, left - keep) / (double) std::max<int64_t>(1, planned);
+    return (int64_t) (f * (double) n);
+}
+
+// The shared GPU memory a Windows APU's RAM tier leaves free above it and what is pinned after it (glm_fast_path's
+// apu_shared_room): an eighth of Windows' shared GPU memory limit, 1 to 4 GB, in whole 256 MB.  With the prompt
+// path's buffers in place (a GLM-5.3 quant the batched prompt path now covers) a Radeon 8065S (15.84 GB limit) failed
+// its start with the tier 0.96 GB under the limit - the same "warmed expert tables did not upload (unspecified launch
+// failure)" as #924's discrete card - and started with it 1.71 GB under; 1 GB was enough while those buffers were not
+// there.  That limit keeps 2 GB; the buffers do not grow with the limit, hence the 4 GB ceiling.
+inline int64_t apu_shared_margin(int64_t limit) {
+    static constexpr int64_t kStep = int64_t{256} << 20, kMin = int64_t{1} << 30, kMax = int64_t{4} << 30;
+    return std::min(kMax, std::max(kMin, (std::max<int64_t>(0, limit) / 8 + kStep - 1) & ~(kStep - 1)));
+}
+
+// An expert demoted at the last boundary (fast_boundary step 3) has no table entry until its copy to the RAM tier
+// lands, so a route that uses it reaches the host as a disk miss (glm_fast_path's fast_service).  drain_of: the demotion
+// of RAM slot (rclass, rslot) for that expert's key - its index in the drains, -1 none.
+template <class Drain>
+inline int drain_of(const std::vector<Drain>& drains, int rclass, int rslot, int key) {
+    for (size_t i = 0; i < drains.size(); ++i)
+        if (drains[i].rclass == rclass && drains[i].rslot == rslot && drains[i].key == key) return (int) i;
+    return -1;
+}
+// drain_reads_vram: such a miss reads the bytes from the VRAM slot the copy reads them from while that slot is still
+// draining (nothing writes it before the boundary that lands the copy frees it) - the same bytes, with no wait on the
+// copy stream.  A route's service that waited for that copy instead stalled a two-GPU drafting decode on Windows (#860:
+// RTX PRO 5000 + RTX 4090): the copy did not run while the device spun on that very route's answer, the device gave
+// the wait up after ~30 s and went on with the previous answer's sources ("invalid expert ID or non-finite score").
+// False (the slot is no longer the expert's, or another layer's): the RAM slot once the copy landed, as before.
+inline bool drain_reads_vram(int drain_layer, int route_layer, char vslot_state, char draining_state) {
+    return drain_layer == route_layer && vslot_state == draining_state;
+}
+
+}  // namespace maya::core::glmfast

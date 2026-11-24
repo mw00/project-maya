@@ -120,9 +120,10 @@ def _as_pictures(pages: list[tuple[str, bytes]], total: int | None) -> dict:
 
 
 def _extract_into(pdf: Path, data: bytes, *, want_images: bool, text_limit: int, pdftotext: str | None,
-                  pdftoppm: str | None) -> dict:
+                  pdftoppm: str | None, text_only: str | None = None) -> dict:
     """The route out of the tempdir that holds the PDF: text, pages or the error that says why neither came out.
-    poppler first when it is there; serve/pdf_text.py where it is not, or where it read nothing."""
+    poppler first when it is there; serve/pdf_text.py where it is not, or where it read nothing.  text_only: the
+    model's name when it has no vision tower at all (GLM-5.3) - the error then says so, not "images are off"."""
     body, total, problem = (_text_of(pdftotext, pdf, text_limit) or "").strip() if pdftotext else "", None, None
     if len(body) < TEXT_FLOOR:
         try:
@@ -150,6 +151,10 @@ def _extract_into(pdf: Path, data: bytes, *, want_images: bool, text_limit: int,
         return _as_text(body, page_count(pdf) or total, text_limit)
     if problem:
         return {"error": {"message": problem}}
+    if not want_images and text_only:
+        return {"error": {"message": f"this PDF has no text layer (a scanned one), and {text_only} reads text only: "
+                                     "it has no vision tower to read its pages as pictures - attach the document's "
+                                     "text instead"}}
     if not want_images:
         return {"error": {"message": "this PDF has no text layer, and its pages cannot be sent as pictures: this "
                                      "model runs without images (Models › Engine settings turns them on when it can)"}}
@@ -157,10 +162,11 @@ def _extract_into(pdf: Path, data: bytes, *, want_images: bool, text_limit: int,
                                  (f" - {NEED_POPPLER}" if pdftotext is None or pdftoppm is None else "")}}
 
 
-def extract(data: bytes, *, want_images: bool, text_limit: int) -> dict:
+def extract(data: bytes, *, want_images: bool, text_limit: int, text_only: str | None = None) -> dict:
     """A PDF's bytes -> the chat page's attachment: text when it carries a text layer worth sending, the first
     pages as pictures when it is scanned and the model reads pictures (want_images), an error saying why when
-    neither applies.  Temporary files live in one tempdir, gone at the exit."""
+    neither applies (text_only: the name of a model with no vision tower, GLM-5.3, for its words).  Temporary files
+    live in one tempdir, gone at the exit."""
     if not data.lstrip()[:5] == b"%PDF-":
         return {"error": {"message": "this is not a PDF"}}
     pdftotext, pdftoppm = shutil.which("pdftotext"), shutil.which("pdftoppm")
@@ -172,6 +178,7 @@ def extract(data: bytes, *, want_images: bool, text_limit: int) -> dict:
             return {"error": {"message": f"the PDF could not be written to a temporary file ({e})"}}
         try:
             return _extract_into(pdf, data, want_images=want_images, text_limit=text_limit,
-                                 pdftoppm=pdftoppm, pdftotext=pdftotext)
+                                 pdftoppm=pdftoppm, pdftotext=pdftotext,
+                                 **({"text_only": text_only} if text_only else {}))
         except TimeoutError as e:
             return {"error": {"message": f"{e}: the PDF was dropped, try a smaller one"}}

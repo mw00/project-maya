@@ -4,7 +4,7 @@
 
 #include <cstdio>
 
-namespace d = strata::ds4;
+namespace d = maya::ds4;
 
 static int fails = 0;
 #define CHECK(c)                                                       \
@@ -70,6 +70,11 @@ int main() {
         CHECK(d::ring_slots(12.3 * GB, x3full, 28 * GB, 4) == 28);   // (1.03 ms on PCIe 3 x16: the link-sized batch, 7)
         CHECK(d::ring_slots(7.9 * GB, x3full, 28 * GB, 4) == 4);     // (under 8 GB/s: one a batch, as before)
         CHECK(d::ring_slots(12.3 * GB, x3full, 28 * GB, 4, 1e300) == 4);   // (MAYA_DS4_RING_FAST_LINK=0: one a batch)
+        {   // #1143: 6.4 MB experts on links that read 6.4-6.8 GB/s from one start to the next: one answer for all of them
+            const size_t x3 = 6400000;
+            for (double g = 6.45; g <= 6.81; g += 0.1) CHECK(d::ring_slots(g * GB, x3, 28 * GB, 4) == 40);
+            CHECK(d::ring_slots(5.6 * GB, x3, 28 * GB, 4) == 4);   // (1.14 ms an expert: still one a batch)
+        }
         CHECK(d::ring_slots(25 * GB, l40s, 30 * GB, 4) == 20);     // (PCIe 4 x16, big blobs: 400 MB, as before)
         CHECK(d::ring_slots(11.5 * GB, v100, 1 * GB, 4) == 8);     // (1 GB of room: 62 MB, 2 a batch)
         CHECK(d::ring_slots(11.5 * GB, v100, 0.01 * GB, 4) == 4);  // (at least one a batch)
@@ -105,6 +110,16 @@ int main() {
         CHECK(d::uma_free(55 * GiB, tot, unknown, head) == 55 * GiB);      // (MemAvailable not known)
         CHECK(d::uma_free(55 * GiB, tot, 5 * GiB, head) == 55 * GiB);      // (less than the headroom)
         CHECK(d::uma_free(55 * GiB, 100 * GiB, 200 * GiB, head) == 100 * GiB);
+    }
+    {   // #794: the pin took a GPU's room - near empty after it, or its free read failed after a good one
+        CHECK(d::pin_took_vram(1412, 0, 256));       // (the reports: ~1.4 GB free without the pin, 0 with it)
+        CHECK(d::pin_took_vram(1412, -1, 256));      // (the read failed after the pin)
+        CHECK(d::pin_took_vram(256, 255, 256));
+        CHECK(!d::pin_took_vram(1412, 1400, 256));   // (a few MiB less: not the failure)
+        CHECK(!d::pin_took_vram(1412, 300, 256));
+        CHECK(!d::pin_took_vram(200, 0, 256));       // (already near empty before: not the pin's doing)
+        CHECK(!d::pin_took_vram(-1, 0, 256));        // (nothing to compare with)
+        CHECK(!d::pin_took_vram(1412, 0, 0));        // (the check off)
     }
     if (fails == 0) std::printf("ds4 prompt / memory rules: ok\n");
     return fails == 0 ? 0 : 1;

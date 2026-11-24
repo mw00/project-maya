@@ -149,7 +149,7 @@ class VideoGuards(unittest.TestCase):
         from serve.server import Vision
         with tempfile.TemporaryDirectory() as d, patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
                 patch.object(Vision, "video_seconds", staticmethod(lambda path: 600.0)), \
-                patch.dict("os.environ", {"STRATA_VIDEO_MAX_FRAMES": "240"}):
+                patch.dict("os.environ", {"MAYA_VIDEO_MAX_FRAMES": "240"}):
             with self.assertRaisesRegex(ValueError, r"600 s long: 2400 frames"):
                 self.vision(d, b"\0\0\0\x18ftypisom").encode_video("clip.mp4")
             self.assertEqual(list(Path(d).iterdir()), [])   # (the temporary file removed)

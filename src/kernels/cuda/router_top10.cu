@@ -51,7 +51,7 @@
 //     produced - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
 //     comparisons and that is the right trade here: n = 512, every comparison is independent, and the old
 //     version was O(k*n) with a serial `exp` inside.
-#include "strata/kernels/router_top10.hpp"
+#include "maya/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
 
@@ -59,7 +59,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace maya::kernels {
 namespace {
 
 constexpr int RT_MAX_THREADS = 512;
@@ -223,4 +223,4 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

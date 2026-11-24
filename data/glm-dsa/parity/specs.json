@@ -1,0 +1,23 @@
+{
+ "about": "The GLM-5.3 (glm-dsa) parity corpus: 4 short prompts (chat, code, tool call, Chinese; <= 2,048 tokens) and 2 long-document QA prompts of about 8,192 tokens, each followed by 256 tokens of llama.cpp aa94f208 greedy continuation. tools/strata/parity_corpus.py turns this file into <case>.tokens, <case>.ctx and cases.txt; tools/strata/parity_run.sh runs the check.",
+ "continuation": 256,
+ "cases": [
+  {"name": "chat", "kind": "short", "messages": [
+   {"role": "system", "content": "You are a careful assistant. Answer in plain prose."},
+   {"role": "user", "content": "My sourdough starter smells like nail polish remover and has stopped rising. I feed it once a day with equal weights of flour and water and keep it in a cold kitchen. What is going on, and what exactly should I change over the next week?"}]},
+  {"name": "code", "kind": "short", "messages": [
+   {"role": "user", "content": "Write a Python function merge_intervals(intervals) that takes a list of [start, end] pairs (ints, possibly unsorted and overlapping) and returns the merged list sorted by start. Then write five unittest test cases for it, including empty input, touching intervals and fully nested intervals. Explain the time complexity in one sentence."}]},
+  {"name": "toolcall", "kind": "short",
+   "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}}, "required": ["city"]}}},
+    {"type": "function", "function": {"name": "convert_currency", "description": "Convert an amount between currencies.", "parameters": {"type": "object", "properties": {"amount": {"type": "number"}, "from": {"type": "string"}, "to": {"type": "string"}}, "required": ["amount", "from", "to"]}}}],
+   "messages": [
+    {"role": "user", "content": "I fly to Lisbon tomorrow. What is the weather there in celsius, and how much is 250 US dollars in euros?"}]},
+  {"name": "chinese", "kind": "short", "messages": [
+   {"role": "user", "content": "请用中文解释一下什么是哈希表，它为什么查找很快，以及在什么情况下性能会变差。最后给出一个用 Python 字典统计一段文字中每个字出现次数的简短例子。"}]},
+  {"name": "longdoc_a", "kind": "long", "document": "../bench-corpus/prompt_32k.txt", "doc_offset": 0, "doc_tokens": 7900,
+   "question": "Question: Which places in the text above are mentioned more than once, and what happened at the first of them? Answer in a short paragraph."},
+  {"name": "longdoc_b", "kind": "long", "document": "../bench-corpus/prompt_32k.txt", "doc_offset": 100000, "doc_tokens": 7900,
+   "question": "Question: List the years that appear in the text above in order, and for the earliest one say who did what."}
+ ]
+}

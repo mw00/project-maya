@@ -14,8 +14,8 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
-namespace gg = strata::ds4::gguf;
-using strata::ds4::Pool;
+namespace gg = maya::ds4::gguf;
+using maya::ds4::Pool;
 namespace {
 size_t checked_values = 0, checked_cases = 0;
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }

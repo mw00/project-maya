@@ -1,0 +1,64 @@
+{
+ "id": "error_04",
+ "group": "error_reply",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's APPL at?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_4",
+      "type": "function",
+      "function": {
+       "name": "get_stock_price",
+       "arguments": "{\"ticker\": \"APPL\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_4",
+    "content": "{\"error\": \"unknown ticker APPL; did you mean AAPL?\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_stock_price",
+     "description": "Latest price of a stock ticker.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "ticker": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "ticker"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [],
+  "min_calls": 0,
+  "max_calls": 2,
+  "no_call": false,
+  "must_not_repeat": {
+   "name": "get_stock_price",
+   "args": {
+    "ticker": "APPL"
+   }
+  }
+ }
+}

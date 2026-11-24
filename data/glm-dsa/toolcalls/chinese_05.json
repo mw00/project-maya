@@ -1,0 +1,59 @@
+{
+ "id": "chinese_05",
+ "group": "chinese",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "在 2026-12-01 上午九点创建一个叫“年度计划讨论”的会议，参加人有李雷和韩梅梅。"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "create_event",
+     "description": "Create a calendar event.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "title": {
+        "type": "string"
+       },
+       "start": {
+        "type": "string",
+        "description": "ISO 8601 date-time"
+       },
+       "duration_minutes": {
+        "type": "integer"
+       },
+       "attendees": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "title",
+       "start"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "create_event",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false,
+  "cjk_args": true
+ }
+}

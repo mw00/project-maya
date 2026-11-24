@@ -222,10 +222,10 @@ class ReadChunks(unittest.TestCase):
 
 class Helpers(unittest.TestCase):
     def test_apply_replaces_and_clears(self):
-        env = {"STRATA_GLM_RAM_HEADROOM_GB": "4", CAL.SHARE_ENV: "0.50", CAL.THREADS_ENV: "12"}
+        env = {"MAYA_GLM_RAM_HEADROOM_GB": "4", CAL.SHARE_ENV: "0.50", CAL.THREADS_ENV: "12"}
         self.assertEqual(CAL.apply(env, {CAL.THREADS_ENV: "20"}),
-                         {"STRATA_GLM_RAM_HEADROOM_GB": "4", CAL.THREADS_ENV: "20"})
-        self.assertEqual(CAL.apply(env, {}), {"STRATA_GLM_RAM_HEADROOM_GB": "4"})
+                         {"MAYA_GLM_RAM_HEADROOM_GB": "4", CAL.THREADS_ENV: "20"})
+        self.assertEqual(CAL.apply(env, {}), {"MAYA_GLM_RAM_HEADROOM_GB": "4"})
 
     def test_thread_candidates(self):
         self.assertEqual(CAL.thread_candidates(40, (43, 21)), [40, 30, 27, 20, 10, 21])
@@ -272,18 +272,18 @@ class Helpers(unittest.TestCase):
             pack.mkdir()
             tmp.mkdir()
             (pack / "expert_usage.txt").write_text("3 7:12\n")
-            # no STRATA_GLM_USAGE: the engine keeps no usage file (an old pack's expert_usage.txt is not read)
-            self.assertEqual(CAL.usage_copy({"args": ["--glm-pack", str(pack)]}, tmp), {"STRATA_GLM_USAGE": "0"})
+            # no MAYA_GLM_USAGE: the engine keeps no usage file (an old pack's expert_usage.txt is not read)
+            self.assertEqual(CAL.usage_copy({"args": ["--glm-pack", str(pack)]}, tmp), {"MAYA_GLM_USAGE": "0"})
             self.assertFalse((tmp / "expert_usage.txt").exists())
             own = Path(d) / "mine.txt"
             own.write_text("5 1:2\n")
-            env = CAL.usage_copy({"args": ["--glm-pack", str(pack)], "env": {"STRATA_GLM_USAGE": str(own)}}, tmp)
-            self.assertEqual(env, {"STRATA_GLM_USAGE": str(tmp / "expert_usage.txt")})
+            env = CAL.usage_copy({"args": ["--glm-pack", str(pack)], "env": {"MAYA_GLM_USAGE": str(own)}}, tmp)
+            self.assertEqual(env, {"MAYA_GLM_USAGE": str(tmp / "expert_usage.txt")})
             self.assertEqual((tmp / "expert_usage.txt").read_text(), "5 1:2\n")
-            self.assertEqual(CAL.usage_copy({"env": {"STRATA_GLM_USAGE": "0"}}, tmp), {"STRATA_GLM_USAGE": "0"})
+            self.assertEqual(CAL.usage_copy({"env": {"MAYA_GLM_USAGE": "0"}}, tmp), {"MAYA_GLM_USAGE": "0"})
             (tmp / "expert_usage.txt").unlink()
-            env = CAL.usage_copy({"env": {"STRATA_GLM_USAGE": str(Path(d) / "none.txt")}}, tmp)   # no file yet
-            self.assertEqual(env, {"STRATA_GLM_USAGE": str(tmp / "expert_usage.txt")})
+            env = CAL.usage_copy({"env": {"MAYA_GLM_USAGE": str(Path(d) / "none.txt")}}, tmp)   # no file yet
+            self.assertEqual(env, {"MAYA_GLM_USAGE": str(tmp / "expert_usage.txt")})
             self.assertFalse((tmp / "expert_usage.txt").exists())
 
     def test_run_uses_a_usage_copy(self):
@@ -298,7 +298,7 @@ class Helpers(unittest.TestCase):
                 return FakeEngine(lambda s, t: 18.0, threads=0)
             cfg = {"args": ["--glm-pack", "pack", "--expert-profile", "p.bin", "--expert-profile-save", str(learned),
                             "--expert-profile-save-every", "5", "--dump-routing", "t.bin", "--prefill", "auto"],
-                   "env": {CAL.THREADS_ENV: "12", "STRATA_GLM_USAGE": str(own)}}
+                   "env": {CAL.THREADS_ENV: "12", "MAYA_GLM_USAGE": str(own)}}
             orig = CAL.prompt_ids
             CAL.prompt_ids = lambda c: [[1, 2, 3]] * 3
             try:
@@ -308,7 +308,7 @@ class Helpers(unittest.TestCase):
             self.assertNotIn(CAL.THREADS_ENV, seen[0]["env"])                              # the engine's own choice
             self.assertEqual({k: v for k, v in seen[0]["env"].items() if k == CAL.MAX_ENV},   # room to try more:
                              CAL.lane_max_env(cfg))                                        # one GPU, no SMT
-            self.assertNotEqual(Path(seen[0]["env"]["STRATA_GLM_USAGE"]), own)            # not this PC's own file
+            self.assertNotEqual(Path(seen[0]["env"]["MAYA_GLM_USAGE"]), own)            # not this PC's own file
             self.assertEqual(own.read_text(), "3 7:12\n")
             # the learned profile and the trace are not written; the profile it starts from stays
             self.assertEqual(seen[0]["args"], ["--glm-pack", "pack", "--expert-profile", "p.bin", "--prefill", "auto"])

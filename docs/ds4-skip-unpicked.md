@@ -59,4 +59,4 @@ g++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -fsanitize=address,undefined tests/ds4
 /tmp/ds4_ram_slice_test
 ```
 
-Also registered as `ds4_ram_slice_test` with `STRATA_BUILD_TESTS=ON`. Byte-slicing checks do not replace full-model parity.
+Also registered as `ds4_ram_slice_test` with `MAYA_BUILD_TESTS=ON`. Byte-slicing checks do not replace full-model parity.

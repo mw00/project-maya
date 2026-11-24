@@ -8,7 +8,7 @@
 //   4. NO CLAMP AT ALL - the plain SwiGLU, which agrees wherever |values| < limit and drifts outside.
 //
 // The fixture's gate values therefore reach well beyond +/-limit on purpose.
-#include "strata/kernels/glm_ffn.hpp"
+#include "maya/kernels/glm_ffn.hpp"
 
 #include <cuda_runtime.h>
 
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
     check(cudaMalloc(&d_o, n * sizeof(float)), "out");
     check(cudaMemcpy(d_g, gate.data(), n * sizeof(float), cudaMemcpyHostToDevice), "gate H2D");
     check(cudaMemcpy(d_u, up.data(), n * sizeof(float), cudaMemcpyHostToDevice), "up H2D");
-    strata::kernels::glm_swiglu_clamp(d_g, d_u, LIMIT, n, d_o, nullptr);
+    maya::kernels::glm_swiglu_clamp(d_g, d_u, LIMIT, n, d_o, nullptr);
     check(cudaGetLastError(), "glm_swiglu_clamp launch");
     std::vector<float> kernel(n);
     check(cudaMemcpy(kernel.data(), d_o, n * sizeof(float), cudaMemcpyDeviceToHost), "out D2H");

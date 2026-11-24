@@ -15,7 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::ds4::par {
+namespace maya::ds4::par {
 
 /// ggml types with device-order rows here: IQ2_XXS, IQ2_S (gate / up), IQ3_XXS, IQ3_S (down) - and each in the other
 /// role too.  MXFP4 (a GGUF's expert format, 32 values a block) has them for both roles.  k must be a multiple of 256
@@ -54,4 +54,4 @@ const char* form();
 /// One row's sum with `lpr` lanes (the device's gate / up 32, down 16), scalar.
 float row_ref(int type, const uint8_t* row, int k, const void* act, int lpr);
 
-}  // namespace strata::ds4::par
+}  // namespace maya::ds4::par

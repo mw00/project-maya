@@ -1,6 +1,6 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
-#include "strata/core/pinned.hpp"
-#include "strata/platform/memory.hpp"
+#include "maya/core/pinned.hpp"
+#include "maya/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -15,9 +15,9 @@
 // Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
 // spelling is not the same on the two platforms the engine builds for.
 #ifdef _WIN32
-#define STRATA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
+#define MAYA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
 #else
-#define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
+#define MAYA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
 #endif
 
 #ifdef _WIN32
@@ -30,7 +30,7 @@
 #endif
 #endif
 
-namespace strata::core {
+namespace maya::core {
 
 namespace {
 
@@ -57,8 +57,8 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege; a normal account does not have it and VirtualAlloc then
     // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
     SIZE_T large = GetLargePageMinimum();
-    // A/B switch: STRATA_NO_LARGEPAGES=1 skips the large-page attempt, same run, same boot.
-    if (large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr) {
+    // A/B switch: MAYA_NO_LARGEPAGES=1 skips the large-page attempt, same run, same boot.
+    if (large > 0 && std::getenv("MAYA_NO_LARGEPAGES") == nullptr) {
         // MEM_LARGE_PAGES requires the allocation size to be an exact multiple of the large page size -
         // anything else is ERROR_INVALID_PARAMETER (87), which reads like a privilege problem but is not.
         // Round up: the slack is under 2 MB and the tail stays unused.
@@ -75,7 +75,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
         note = "large pages refused for " + std::to_string((unsigned long long) lbytes) + " B (GetLargePageMinimum=" +
                std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
                std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
-    } else if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
+    } else if (std::getenv("MAYA_NO_LARGEPAGES") != nullptr) {
         note = "large pages skipped (MAYA_NO_LARGEPAGES); using 4 KB pages";
     } else {
         note = "this system has no large-page minimum; using 4 KB pages";
@@ -172,10 +172,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
             if (registered_bytes < bytes) {
-                const char* env = std::getenv("STRATA_ARENA_LOCK");
+                const char* env = std::getenv("MAYA_ARENA_LOCK");
                 if (env == nullptr || std::string(env) != "0") {
-                    const strata::platform::LockResult lr =
-                        strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
+                    const maya::platform::LockResult lr =
+                        maya::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
                     locked_bytes = lr.locked_bytes;
                     note = lr.note + "; " + note;
                 }
@@ -197,10 +197,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             (void) cudaGetLastError();
             // Plan v0.3 P0.1: keep it RESIDENT instead. Unpinned, Windows trims the arena under memory pressure
             // and the CPU pool's rate then depends on the OS; locking it through the working set needs no
-            // special privilege. STRATA_ARENA_LOCK=0 is the A/B arm.
-            const char* env = std::getenv("STRATA_ARENA_LOCK");
+            // special privilege. MAYA_ARENA_LOCK=0 is the A/B arm.
+            const char* env = std::getenv("MAYA_ARENA_LOCK");
             if (env == nullptr || std::string(env) != "0") {
-                const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
+                const maya::platform::LockResult lr = maya::platform::lock_resident(base, bytes);
                 locked_bytes = lr.locked_bytes;
                 note = lr.note + "; " + note;
             } else {
@@ -212,7 +212,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
 
 PinnedArena::~PinnedArena() {
     if (base) {
-        if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
+        if (locked_bytes) maya::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
             for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
         } else {
@@ -277,7 +277,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
             uint64_t pos = 0;
             uint64_t h = 1469598103934665603ull;
             // 64-bit seek: the pack is 42.9 GB, so the 32-bit `fseek` would wrap past 4 GiB
-            if (STRATA_FSEEK64(f, off) != 0) {
+            if (MAYA_FSEEK64(f, off) != 0) {
                 std::lock_guard<std::mutex> g(err_mu);
                 err = "seek to " + std::to_string(off) + " B failed in layer " + std::to_string(L);
                 return;
@@ -363,4 +363,4 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
     return st;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

@@ -2,7 +2,7 @@
 """serve/fake_multi_engine.py - a stand-in for `strata --serve` with several conversations (READY ... multi=<n>), for
 serve/test_multi.py: GEN ... rid=<id> <ids> answers with the prompt's ids (each + 1000) one at a time, the requests
 interleaved token by token as the pipelined decode interleaves them; STOP <id> ends one; QUIT ends.
-FAKE_MULTI_INTERLEAVE=<n> (STRATA_GLM_PREFILL_INTERLEAVE's line pattern): a prompt is read n ids a piece, one PP line
+FAKE_MULTI_INTERLEAVE=<n> (MAYA_GLM_PREFILL_INTERLEAVE's line pattern): a prompt is read n ids a piece, one PP line
 each, while the requests already running decode a token each between two pieces; one prompt is read at a time (later
 ones queue), and a STOP for the one being read ends it with no token.  A GEN with logprobs=<n> gets an LP line after
 each T line: logprob -0.25 * (the token's place % 4), then the token and n - 1 others (id + 1, + 2, ...) each 1 lower.
@@ -83,6 +83,7 @@ def read_piece():
 threading.Thread(target=reader, daemon=True).start()
 out("INFO engine=fake-multi")
 out("INFO logprobs=20")
+time.sleep(float(os.environ.get("FAKE_ENGINE_LOAD_S", "0") or 0))   # (a slow load: a stop signal arrives in it)
 out(f"READY 4096 stop pause multi={n}")
 while not quit_.is_set():
     read_piece()

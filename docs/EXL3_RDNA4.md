@@ -113,7 +113,7 @@ If normal setup built the engine with tests disabled, enable the test targets
 in that existing HIP build directory first:
 
 ```sh
-cmake -S . -B build-hip -DSTRATA_BUILD_TESTS=ON
+cmake -S . -B build-hip -DMAYA_BUILD_TESTS=ON
 cmake --build build-hip --target exl3_test -j 2
 ```
 

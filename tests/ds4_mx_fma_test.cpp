@@ -6,8 +6,8 @@
 #include <vector>
 #include <stdexcept>
 
-namespace gg = strata::ds4::gguf;
-namespace d = strata::ds4::gguf::detail;
+namespace gg = maya::ds4::gguf;
+namespace d = maya::ds4::gguf::detail;
 static float value(uint32_t bits) { float f; std::memcpy(&f, &bits, 4); return f; }
 static uint32_t bits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 int main(int argc, char** argv) {

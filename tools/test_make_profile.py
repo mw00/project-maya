@@ -115,7 +115,7 @@ class Glm(unittest.TestCase):
             usage, counts, trace = Path(d) / "usage.txt", Path(d) / "counts.txt", Path(d) / "trace.txt"
             usage.write_text("# strata expert usage\n3 0:5 7:2\n4 287:9\n")
             counts.write_text("3 1 0 4\n")                    # one count per expert id
-            trace.write_text("5 6\n5 6\n44 1\n")            # STRATA_GLM_TRACE: one route a line
+            trace.write_text("5 6\n5 6\n44 1\n")            # MAYA_GLM_TRACE: one route a line
             self.assertEqual(dict(MP.read_text(usage, 288, 46)), {(3, 0): 5, (3, 7): 2, (4, 287): 9})
             self.assertEqual(dict(MP.read_text(counts, 288, 46)), {(3, 0): 1, (3, 2): 4})
             self.assertEqual(dict(MP.read_text(trace, 288, 46)), {(5, 6): 2, (44, 1): 1})

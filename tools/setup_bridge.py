@@ -21,6 +21,34 @@ TAIL = 40                                               # the output lines a sum
 # tiers 40% (5.4 of 13.4 GB, 11 s)", then "glm fast: CUDA2 tiers warm: 1152 experts (13.4 GB) in 29 s"
 WARMING = re.compile(r"glm fast: (\S+?)(\d+) warming the expert tiers \d+% \(([\d.]+) of ([\d.]+) GB")
 WARMED = re.compile(r"glm fast: (\S+?)(\d+) tiers warm: \d+ experts \(([\d.]+) GB\)")
+MEASURE_LEFT = re.compile(r"measuring this PC: \d+ of \d+ choices done in \d+ s - about (\d+) s more")
+
+
+def measure_said(line: str) -> str:
+    """maya-hy4's "measuring this PC once" line in plain words, with roughly how long it takes on this kind of PC
+    (serve/server.py's narrate_start says the same): the drafting trial - each choice loaded and timed on a few short
+    answers - or the CPU lane's 4-bit copies and the prompt route."""
+    if "before the first answer: drafting" in line:
+        m = re.search(r"drafting \(([^:()]*):", line)
+        n = len(m.group(1).split(", ")) if m else 3
+        return (f"which drafting answers fastest: {n} choices, each loaded and timed on a few short answers - "
+                f"roughly {HY4_TRIAL_TIME.get(n, HY4_TRIAL_TIME[3])}")
+    return "the CPU lane's 4-bit copies and the prompt route - roughly " + HY4_LANE_TIME
+
+
+# (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
+#  with the CPU lane; serve/server.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
+HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
+HY4_LANE_TIME = "one minute"
+
+
+def output_text(line: bytes) -> str:
+    """Decode command output bytes to text.  Tries UTF-8 first.  On Windows, falls back to the console's OEM code page
+    (e.g., CP932/Shift-JIS for MSVC cl.exe output) to prevent garbled text."""
+    try:
+        return line.decode("utf-8")
+    except UnicodeDecodeError:
+        return line.decode("oem" if os.name == "nt" else "utf-8", "replace")
 
 
 def curl_meter(line: str):
@@ -61,6 +89,8 @@ class LoadWatch:
     def reset(self) -> None:
         """A start (or a reload) begins: nothing warm yet."""
         self.parts, self.t0 = {}, time.monotonic()      # the part's number -> [GB warm, GB in all]
+        self.measuring = False                          # (maya-hy4's first start on a PC: its choices measured once -
+        self.measure_left = None                        #  what, in plain words; the seconds left, at this PC's pace)
 
     def read(self) -> None:
         """The log's new lines (on the screen's thread, once a second: a few KB)."""
@@ -77,6 +107,12 @@ class LoadWatch:
                 self.parts[int(m.group(2))] = [float(m.group(3)), float(m.group(4))]
             elif m := WARMED.search(line):
                 self.parts[int(m.group(2))] = [float(m.group(3))] * 2
+            elif "measuring this PC once, before the first answer" in line:
+                self.measuring, self.measure_left = measure_said(line), None
+            elif m := MEASURE_LEFT.search(line):
+                self.measure_left = int(m.group(1))
+            elif "measured this PC once in" in line:
+                self.measuring, self.measure_left = False, None
 
     def total(self) -> tuple:
         """(the GB the start warms in all, whether it is known): each part's as the engine said; one not started yet
@@ -189,11 +225,13 @@ class Bridge:
         self._note("answer", f"  {question} {pick + 1}) {options[pick][0]}")
         return pick
 
-    def run(self, cmd, cwd=None, env=None, keep=True, parent_pipe=False):
+    def run(self, cmd, cwd=None, env=None, keep=True, parent_pipe=False, sink=None):
         """The command with its output on the screen as it comes (stdin closed: nothing can wait for a key).  keep:
         its output also into the log and the summary (not the server's: it runs for days - "live" on the screen).
         parent_pipe: Maya's server - its stdin a pipe from here instead (--parent-pipe: it stops when this process
-        ends, however it ends), and on Windows in a job object that ends it with this process (setup.end_with_me)."""
+        ends, however it ends), and on Windows in a job object that ends it with this process (setup.end_with_me).
+        sink: a compile step - each line goes to it (setup.BuildLog: a log file and one progress line), not to the
+        screen."""
         if not self._here():
             return None
         self.events.put(("run", cmd))
@@ -214,9 +252,15 @@ class Bridge:
                 parts = re.split(rb"(\r\n|\n|\r)", rest[:cut])
                 rest = parts.pop() + rest[cut:]
                 for text, end in zip(parts[::2], parts[1::2]):
-                    self._output(text.decode("utf-8", "replace"), end == b"\r", keep)
+                    if sink is not None:
+                        sink(output_text(text))
+                    else:
+                        self._output(output_text(text), end == b"\r", keep)
             if rest.strip(b"\r\n"):
-                self._output(rest.decode("utf-8", "replace").rstrip("\r\n"), False, keep)
+                if sink is not None:
+                    sink(output_text(rest).rstrip("\r\n"))
+                else:
+                    self._output(output_text(rest).rstrip("\r\n"), False, keep)
         self.proc = None
         self.events.put(("ran", p.returncode))
         if self.stopped.is_set():

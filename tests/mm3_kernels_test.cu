@@ -523,6 +523,43 @@ int main() {
                 cudaFree(rd);
                 cudaFree(yd);
             }
+    // the per-request switch (GEN ablate=0|1): a multi step's rows projected a run of one setting at a time - each
+    // projected row the same bits as in one launch of all the rows (the startup flag's), each other row untouched
+    std::printf("project_out by runs of rows (the per-request switch)\n");
+    for (int D : {1000, 6144}) {
+        const int T = 7;
+        const bool on[T] = {true, false, false, true, true, false, true};
+        std::vector<float> r((size_t) D), y((size_t) T * D);
+        double nn = 0.0;
+        for (float& v : r) {
+            v = nd(rng);
+            nn += (double) v * v;
+        }
+        for (float& v : r) v = (float) (v / std::sqrt(nn));
+        for (float& v : y) v = nd(rng);
+        float* rd = dev(r);
+        float* all = dev(y);
+        float* runs = dev(y);
+        k::project_out(all, rd, 1.0f, T, D, 0);
+        for (int t = 0; t < T;) {   // (mm3_model.cu's ablate(): runs of rows of one setting)
+            int u = t + 1;
+            while (u < T && on[u] == on[t]) ++u;
+            if (on[t]) k::project_out(runs + (size_t) t * D, rd, 1.0f, u - t, D, 0);
+            t = u;
+        }
+        cudaDeviceSynchronize();
+        const auto a = host(all, y.size()), b = host(runs, y.size());
+        bool exact = true;
+        for (int t = 0; t < T; ++t)
+            exact = exact && std::memcmp(b.data() + (size_t) t * D, (on[t] ? a.data() : y.data()) + (size_t) t * D,
+                                         (size_t) D * sizeof(float)) == 0;
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "D %d: rows on = one launch's bits, rows off untouched", D);
+        check(cudaGetLastError() == cudaSuccess && exact, buf);
+        cudaFree(rd);
+        cudaFree(all);
+        cudaFree(runs);
+    }
     std::printf("%s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }
