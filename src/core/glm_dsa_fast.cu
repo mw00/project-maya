@@ -307,6 +307,15 @@ void Glm5Model::fast_bind_dsa(int il, std::string& missing) {
     }
 }
 
+bool Glm5Model::fast_ffn_width(int il, int& ff, int& ffd, int& f0) const {
+    if (fast_ == nullptr || il < l0_ || il >= lt_ || il >= (int) fast_->L.size()) return false;
+    const FastState::Layer& Ly = fast_->L[(size_t) il];
+    ff = Ly.ff;
+    ffd = Ly.ffd;
+    f0 = Ly.f0;
+    return true;
+}
+
 // ---------------------------------------------------------------- the glm-dsa arena (after the shared one)
 bool Glm5Model::fast_dsa_arena(std::string& err) {
     FastState* F = fast_;
