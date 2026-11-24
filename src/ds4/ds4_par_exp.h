@@ -78,8 +78,14 @@ DS4_PAR_HD float swiglu_portable(float gv, float uv, float limit) {
     if (limit > 0.0f) {
         gv = p_min(gv, limit);
         uv = p_min(p_max(uv, -limit), limit);
+        return p_mul(p_div(gv, p_add(1.0f, exp_portable(-gv))), uv);
     }
-    return p_mul(p_div(gv, p_add(1.0f, exp_portable(-gv))), uv);
+    const float act = p_div(gv, p_add(1.0f, exp_portable(-gv)));
+    if (limit < 0.0f) {
+        const float L = -limit;
+        return p_mul(p_min(act, L), p_min(p_max(uv, -L), L));
+    }
+    return p_mul(act, uv);
 }
 
 }  // namespace maya::ds4::par

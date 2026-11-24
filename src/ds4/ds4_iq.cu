@@ -748,12 +748,18 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 #endif
 }
-__device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
+__device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's; < 0: post-SiLU clamp)
     if (limit > 0.0f) {
         gv = fminf(gv, limit);
         uv = fminf(fmaxf(uv, -limit), limit);
+        return fmul_no_fma(__fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv))), uv);
     }
-    return fmul_no_fma(__fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv))), uv);
+    const float act = __fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv)));
+    if (limit < 0.0f) {
+        const float L = -limit;
+        return fmul_no_fma(fminf(act, L), fminf(fmaxf(uv, -L), L));
+    }
+    return fmul_no_fma(act, uv);
 }
 // MiniMax-M3.1's swigluoai (mm3_exl3.cu's: the same operations)
 __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
@@ -2590,9 +2596,19 @@ __global__ void mmq_epilogue(const float* __restrict__ g, uint16_t* __restrict__
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * nff) return;
     const int r = i / nff, c = i - r * nff;
-    const float gv = fminf(g[(size_t) r * 2 * nff + c], limit);
-    const float uv = fminf(fmaxf(g[(size_t) r * 2 * nff + nff + c], -limit), limit);
-    const float v = gv / (1.0f + __expf(-gv)) * uv;
+    const float g0 = g[(size_t) r * 2 * nff + c];
+    const float u0 = g[(size_t) r * 2 * nff + nff + c];
+    float v;
+    if (limit > 0.0f) {
+        const float gv = fminf(g0, limit);
+        const float uv = fminf(fmaxf(u0, -limit), limit);
+        v = gv / (1.0f + __expf(-gv)) * uv;
+    } else if (limit < 0.0f) {
+        const float L = -limit;
+        v = fminf(g0 / (1.0f + __expf(-g0)), L) * fminf(fmaxf(u0, -L), L);
+    } else {
+        v = g0 / (1.0f + __expf(-g0)) * u0;
+    }
     h[(size_t) r * ldo + c] = __half_as_ushort(__float2half_rn(v));
 }
 
