@@ -7028,7 +7028,8 @@ def bench_config_text(cfg: dict, ctx: int, drafting: str) -> str:
     return " ".join(x for x in (f"{ctx // 1024}K", f"KV {kv}" if kv else "", drafting) if x)
 
 
-def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0) -> int:
+def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0,
+          lock_ok: bool = False) -> int:
     """--bench: the speed-test standard (tools/maya_bench.py) on the installed model - a quiet-machine check, one engine
     session with a warm-up answer, 3 answers of 256 tokens and the 2K / 8K prompts 3 times each; medians with min-max,
     what drafting chose, the wall time of each phase and one result line (maya-bench-results.txt).  --compare: the same
@@ -7058,7 +7059,11 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
     t_all = time.time()
     step(1, f"benchmark: {cfg_path.name}" + (f" against {compare}" if compare else ""))
     note = f"maya --bench pid {os.getpid()} on {socket.gethostname()} {time.strftime('%Y-%m-%d %H:%M')}"
-    why = MB.wait_quiet(backend, gpus, wait_min, say)
+    lock_ok = MB.lock_ok_asked(lock_ok)          # (--bench-lock-ok / MAYA_BENCH_LOCK_OK=1: a lock taken by hand)
+    if lock_ok:
+        for p, who in MB.held_locks(MB.lock_names(backend, gpus)):
+            say(f"  using the GPU lock already held ({p}: {who or 'no note'}); it stays as it is")
+    why = MB.wait_quiet(backend, gpus, wait_min, say, lock_ok=lock_ok)
     if why:
         fail("this machine is not quiet enough for a speed number: " + "; ".join(why),
              f"wait for it (or give it longer: {ME} --bench --bench-wait <minutes>), then run --bench again")
@@ -11919,6 +11924,9 @@ def main() -> int:
                                                        "in .bench-builds) - on the same model files, config and "
                                                        "learned files, alternated; exactness first, then the speed")
     ap.add_argument("--bench-rounds", type=int, default=2, help="--bench --compare: rounds a build (default 2)")
+    ap.add_argument("--bench-lock-ok", action="store_true", help="--bench: accept a GPU lock that is already held "
+                    "(one you took by hand for this run; also MAYA_BENCH_LOCK_OK=1) - by default a held lock stops "
+                    "the benchmark")
     ap.add_argument("--bench-wait", type=float, default=10.0, help="--bench: minutes to wait for a quiet machine "
                                                                    "before refusing (default 10; 0 = refuse at once)")
     ap.add_argument("--calibrate", action="store_true",
@@ -11981,7 +11989,8 @@ def main() -> int:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if not have:
             fail("Maya is not set up here yet", f"run {ME} first")
-        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait))
+        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait),
+                     a.bench_lock_ok)
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
     if a.backend:

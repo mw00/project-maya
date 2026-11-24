@@ -384,7 +384,12 @@ PC as everywhere. On one NVIDIA card, where plain
 decoding on the offload path is lane parity wherever that is the faster mode, the measurement times plain decoding in
 that mode against drafting in mode A and keeps the faster; the choice is remembered with the drafting calibration, so
 every start decodes in the same mode (the start line says which, and the figures), and `--drafting on` / `off` still
-decide by hand (mode A with drafting / plain decoding).
+decide by hand (mode A with drafting / plain decoding). Because the drafter's room is the tier's, the two are two
+layouts, and the first start times each on its own: two short runs of the engine before the start itself (the
+drafting layout's sources, then plain decoding on the full tier - their start lines in
+`data/ik2-drafting.txt.measure.log`), the faster one remembered, and the start then loads like every later one - so
+the first session has the chosen layout, and "no drafting" is timed at its real speed (`IK2_DRAFT_SPLIT=0`: one load
+measures them all on the drafting layout, as before; on AMD that is still the default, `IK2_DRAFT_SPLIT=1` there).
 
 Deep in a long context a window can cost more than the plain tokens it gives. The controller times an answer's
 drafting rounds against its plain tokens at the depth the answer is at, and where the rounds give fewer tokens a

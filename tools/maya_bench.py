@@ -115,6 +115,9 @@ def decode_samples(answers) -> list:
 
 
 DRAFT_LINE = re.compile(r"^(?:INFO )?drafting: (.+?)(?: - |, \d|$)")
+# a first start's measurement: what it chose (said after the engine's plan line, which names every source it loaded)
+MEASURED_LINE = re.compile(r"measured this PC once in \d+ s: drafting - (.+?)(?: \(|;|$)")
+MEASURING_LINE = re.compile(r"measuring this PC once, before the first answer: drafting")
 
 
 def drafting_choice(args, env: dict, engine_lines, answers, family: str = "") -> str:
@@ -125,6 +128,11 @@ def drafting_choice(args, env: dict, engine_lines, answers, family: str = "") ->
         m = DRAFT_LINE.match(x.strip())
         if m:
             said = m.group(1).strip()
+        m = MEASURED_LINE.search(x)
+        if m:                                # (the choice, not the plan line before the measurement)
+            said = m.group(1).strip()
+        elif MEASURING_LINE.search(x):       # (no result line after it: still not the plan line's sources)
+            said = "measuring"
     a = [str(x) for x in args or []]
     flag = lambda k: a[a.index(k) + 1] if k in a[:-1] else None   # noqa: E731
     if not said:
@@ -327,7 +335,13 @@ def on_windows() -> bool:
     return os.name == "nt"
 
 
-def machine_quiet(backend: str, gpus, lock_note="") -> list:
+def lock_ok_asked(flag: bool = False) -> bool:
+    """--bench-lock-ok, or MAYA_BENCH_LOCK_OK=1: a GPU lock that is already held (taken by hand for this run) is
+    accepted - the run neither takes nor releases it.  Default: strict, a held lock stops the benchmark."""
+    return bool(flag) or os.environ.get("MAYA_BENCH_LOCK_OK", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def machine_quiet(backend: str, gpus, lock_note="", lock_ok: bool = False) -> list:
     if backend == "hip":
         busy = []
         txt = _out(["rocm-smi", "--showuse", "--json"])
@@ -359,15 +373,16 @@ def machine_quiet(backend: str, gpus, lock_note="") -> list:
     load = cpu_load_now()
     hot = [p for p in list(HOT_FLAGS) + ([os.environ["MAYA_HOT_FLAG"]] if os.environ.get("MAYA_HOT_FLAG") else [])
            if Path(p).expanduser().exists()]
-    return quiet_reasons(busy, held_locks(lock_names(backend, gpus), lock_note), load, hot)
+    locks = [] if lock_ok else held_locks(lock_names(backend, gpus), lock_note)
+    return quiet_reasons(busy, locks, load, hot)
 
 
-def wait_quiet(backend, gpus, wait_min: float, say, lock_note="") -> list:
+def wait_quiet(backend, gpus, wait_min: float, say, lock_note="", lock_ok: bool = False) -> list:
     """Wait (up to wait_min minutes) for a quiet machine; [] when quiet, else the reasons it still is not."""
     t_end = time.time() + wait_min * 60
     told = None
     while True:
-        why = machine_quiet(backend, gpus, lock_note)
+        why = machine_quiet(backend, gpus, lock_note, lock_ok)
         if not why or time.time() >= t_end:
             return why
         kind = [re.sub(r"[\d.]+", "#", x) for x in why]     # (said again when the reasons change, not their numbers)
@@ -442,6 +457,8 @@ class Session:
                 self.multi = any(w.startswith("multi=") for w in line.split())
                 break
             self.lines.append(line.rstrip())
+            self.log.write(line if line.endswith("\n") else line + "\n")   # (the start lines: stdout's, kept too)
+            self.log.flush()
         self.load_s = time.time() - self.t0
 
     def gen(self, ids, n_new):
