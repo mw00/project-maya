@@ -4,6 +4,7 @@
 // Glm5Model::slot_load_prefix (src/core/glm_prompt_cache_model.cu).
 #include "maya/core/glm_prompt_cache.hpp"
 
+#include "maya/core/glm_env.hpp"
 #include "maya/core/glm_model.hpp"
 
 #include <chrono>
@@ -25,7 +26,7 @@ Store* store_of(Glm5Model& model) {
     static std::map<const Glm5Model*, std::unique_ptr<Store>> stores;
     const char* dir = std::getenv("MAYA_GLM_PROMPT_CACHE_DIR");
     if (dir == nullptr || dir[0] == '\0' || !model.fast() || model.geometry().arch != GlmArch::GlmDsa) return nullptr;
-    if (std::getenv("MAYA_GLM_NO_REUSE") != nullptr) {
+    if (maya::glmenv::no_reuse_env()) {
         static bool said = false;
         if (!said) std::fprintf(stderr, "glm prompt cache: off (MAYA_GLM_NO_REUSE)\n");
         said = true;

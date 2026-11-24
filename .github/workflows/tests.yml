@@ -37,6 +37,10 @@ jobs:
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/glm_memory_test.cpp -o "$RUNNER_TEMP/glm_memory_test"
           "$RUNNER_TEMP/glm_memory_test"
+      - name: GLM MAYA_GLM_NO_REUSE boolean switch parsing (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -Iinclude -Itests/glm_dsa tests/glm_dsa/glm_no_reuse_test.cpp -o "$RUNNER_TEMP/glm_no_reuse_test"
+          "$RUNNER_TEMP/glm_no_reuse_test"
       - name: DeepSeek CPU row preparation (CPU only)
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/ds4_cpu_prepare_rows_test.cpp -o "$RUNNER_TEMP/ds4_cpu_prepare_rows_test"
