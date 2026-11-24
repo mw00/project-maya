@@ -884,6 +884,7 @@ import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on the card
 IK2 = Q.MODEL["ik2"]                               # "Inkling-2-Mini" (its id: the installer record, --model)
 IK2_SHOWN = Q.SHOWN["ik2"]
 IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
+LING_EXE = BUILD / ("maya-ling.exe" if WIN else "maya-ling")
 IK2_MANIFEST = ROOT / "tools" / "ik2" / "download.json"
 IK2_TEMPLATE = ROOT / "tools" / "ik2" / "chat_template.jinja"
 IK2_TOKENIZER_TOOLS = ("tools/strata_tokenizer.py", "tools/ik2/chat_template.jinja")
@@ -900,6 +901,8 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     if target == "maya-glm-helper":                    # (GLM's AMD helper program for the two-GPU mode: mixed_builds)
         return BUILD / ("maya-glm-helper.exe" if WIN else "maya-glm-helper")
+    if target == "maya-ling":
+        return BUILD / ("maya-ling.exe" if WIN else "maya-ling")
     return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-ik2": IK2_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 
@@ -1103,13 +1106,14 @@ def fix_config_names(cfg: dict) -> bool:
 
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE
+    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE, LING_EXE
     BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal"}.get(backend, "build")
     EXE = BUILD / ("maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
     IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
+    LING_EXE = BUILD / ("maya-ling.exe" if WIN else "maya-ling")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -2067,7 +2071,7 @@ def config_family(cfg: dict) -> str:
 
 
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+FAMILY_TITLE = {**{k: v for k, v in Q.MODEL.items() if k in FAMILIES}, "qwen": "Qwen-3.8-Flash-Next"}
 
 
 def setup_title(cfg: dict) -> str:
@@ -2075,7 +2079,8 @@ def setup_title(cfg: dict) -> str:
     is GLM-5.3's own name, not GLM-5.3-Flash."""
     if G53.config_is_glm_dsa(cfg):
         return G53.SHOWN
-    return FAMILY_TITLE.get(config_family(cfg), "")
+    fam = config_family(cfg)
+    return FAMILY_TITLE.get(fam, Q.MODEL.get(fam, ""))
 
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's

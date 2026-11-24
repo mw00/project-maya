@@ -405,7 +405,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         Gpu& gp = gpus_[(size_t) gi];
         gp.dev = o_.gpus[(size_t) gi];
         set_dev(gp.dev);
+#ifndef MAYA_USE_HIP
         cudaSetDeviceFlags(cudaDeviceMapHost);
+#endif
         cudaGetLastError();
         CK(cudaStreamCreateWithFlags(&gp.s, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&gp.s_copy, cudaStreamNonBlocking));
@@ -577,7 +579,18 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
     }
 
     // Allocate decode + double-buffered prefill scratch
-    const int P = std::max(1, std::min(o_.prefill_chunk, o_.ctx));
+    int P = std::max(1, std::min(o_.prefill_chunk, o_.ctx));
+    {
+        size_t min_free_b = (size_t) -1;
+        for (const auto& gp : gpus_) {
+            set_dev(gp.dev);
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) min_free_b = std::min(min_free_b, fb);
+        }
+        if (min_free_b < (size_t) 6ULL << 30) P = std::min(P, 256);
+        else if (min_free_b < (size_t) 10ULL << 30) P = std::min(P, 512);
+        else if (min_free_b < (size_t) 14ULL << 30) P = std::min(P, 1024);
+    }
     const size_t mla_part_b = std::max(glmd::mla_dec_part_bytes(H), k::mla_dec_wmma_part_bytes(H, 4));
     const size_t max_w16_elems = std::max<size_t>(
         {(size_t) H * c.qk_head * (size_t) E, (size_t) c.n_ff * (size_t) E, (size_t) H * (size_t) KL * c.qk_nope,
@@ -796,8 +809,24 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
                          mtp_want.at(mtp_prefix + "ffn_down_exps.weight"), c.n_layers});
     }
 
+    size_t need_host_bytes = 0;
+    for (const auto& tk : tasks) {
+        if (tk.l->n_res < c.n_expert) need_host_bytes += tk.l->blob * (size_t) c.n_expert;
+    }
+    const uint64_t avail_ram = hy4::ram_available();
+    if (avail_ram > 0 && need_host_bytes > avail_ram) {
+        char ebuf[256];
+        std::snprintf(ebuf, sizeof ebuf,
+                      "maya-ling: not enough available host RAM for offloaded experts (need %.2f GiB, available %.2f GiB)",
+                      (double) need_host_bytes / (double) (1ULL << 30), (double) avail_ram / (double) (1ULL << 30));
+        throw std::runtime_error(ebuf);
+    }
     const bool want_pin = (o_.pin_ram_gib > 0.0);
     double pin_budget = want_pin ? o_.pin_ram_gib * (double) (1ULL << 30) : 0.0;
+    if (want_pin && avail_ram > 0) {
+        const double safe_pin = 0.75 * (double) avail_ram;
+        if (pin_budget > safe_pin) pin_budget = safe_pin;
+    }
     size_t pin_bytes = 0, page_bytes = 0;
 
     // Allocate THP host memory first (instant via mmap + MADV_HUGEPAGE)
@@ -1540,7 +1569,7 @@ const float* Model::step(int token, int pos) {
                 if (pos == 0) {
                     decode_segment(gi, true);
                 } else {
-                    CK(cudaStreamBeginCapture(gp.s, cudaStreamCaptureModeRelaxed));
+                    CK(cudaStreamBeginCapture(gp.s, cudaStreamCaptureModeThreadLocal));
                     decode_segment(gi, true);
                     CK(cudaStreamEndCapture(gp.s, &gp.graph));
                     CK(cudaGraphInstantiate(&gp.graph_exec, gp.graph, nullptr, nullptr, 0));
@@ -3157,7 +3186,7 @@ const float* Model::step_window(const int* tokens, int W, int pos0) {
 
         if (graph_ok) {
             if (!gp.wgraph_ready[wi]) {
-                CK(cudaStreamBeginCapture(gp.s, cudaStreamCaptureModeRelaxed));
+                CK(cudaStreamBeginCapture(gp.s, cudaStreamCaptureModeThreadLocal));
                 decode_segment_win(gi, W, true);
                 CK(cudaStreamEndCapture(gp.s, &gp.wgraph[wi]));
                 CK(cudaGraphInstantiate(&gp.wgraph_exec[wi], gp.wgraph[wi], nullptr, nullptr, 0));

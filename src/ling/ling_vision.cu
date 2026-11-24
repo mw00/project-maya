@@ -518,12 +518,19 @@ bool VisionTower::encode(const uint8_t* rgb, int width, int height, std::vector<
     int cc_maj = 8;
     VK(cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, p_->dev));
     const bool use_bf16 = (cc_maj >= 8);
+#ifndef MAYA_USE_HIP
     const cudaDataType_t gemm_dt = use_bf16 ? CUDA_R_16BF : CUDA_R_16F;
     const cublasComputeType_t attn_compute = use_bf16 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
     uint8_t* ws_ptr = take(kCublasWs);
     VB(cublasSetWorkspace(cl.blas, ws_ptr, kCublasWs));
     if (use_bf16) VB(cublasSetMathMode(cl.blas, CUBLAS_TF32_TENSOR_OP_MATH));
+#else
+    const auto gemm_dt = CUDA_R_16F;
+    const cublasComputeType_t attn_compute = CUBLAS_COMPUTE_32F;
+    uint8_t* ws_ptr = take(kCublasWs);
+    VB(cublasSetWorkspace(cl.blas, ws_ptr, kCublasWs));
+#endif
 
     uint8_t* d_rgb = take((size_t) height * width * 3);
     float* d_x = (float*) take((size_t) N * D * 4);

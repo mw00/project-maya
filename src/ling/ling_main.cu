@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <sstream>
 #include <unordered_map>
 #include <thread>
@@ -64,13 +65,22 @@ std::vector<int> read_ids(const std::string& path) {
 
 std::vector<int> tokenize(const std::string& bin, const std::string& gguf, const std::string& text) {
     if (text.find('\'') != std::string::npos) throw std::runtime_error("--prompt: a quote in the text");
+#ifdef _WIN32
+    const std::string cmd = "\"" + bin + "\" --ids -m \"" + gguf + "\" -p \"" + text + "\" 2>NUL";
+    FILE* p = _popen(cmd.c_str(), "r");
+#else
     const std::string cmd = bin + " --ids -m '" + gguf + "' -p '" + text + "' 2>/dev/null";
     FILE* p = popen(cmd.c_str(), "r");
+#endif
     if (p == nullptr) throw std::runtime_error("cannot run " + bin);
     std::string out;
     char tmp[1024];
     while (size_t n = std::fread(tmp, 1, sizeof tmp, p)) out.append(tmp, n);
+#ifdef _WIN32
+    if (_pclose(p) != 0) throw std::runtime_error(bin + " failed - use --prompt-ids");
+#else
     if (pclose(p) != 0) throw std::runtime_error(bin + " failed - use --prompt-ids");
+#endif
     std::vector<int> ids = parse_ints(out);
     if (ids.empty()) throw std::runtime_error(bin + " returned no ids - use --prompt-ids");
     return ids;
@@ -120,6 +130,7 @@ void print_mem(const std::vector<int>& gpus) {
                          (double) (tot - fr) / (double) (1ULL << 30), (double) tot / (double) (1ULL << 30));
         }
     }
+#ifdef __linux__
     if (FILE* f = std::fopen("/proc/self/status", "r")) {
         char line[256];
         double rss_gib = 0.0, hwm_gib = 0.0;
@@ -131,6 +142,7 @@ void print_mem(const std::vector<int>& gpus) {
         std::fclose(f);
         if (rss_gib > 0.0) std::fprintf(stderr, "Host RAM: %.2f GiB RSS (peak %.2f GiB)\n", rss_gib, hwm_gib);
     }
+#endif
 }
 
 }  // namespace
@@ -228,7 +240,7 @@ static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g,
         return true;
     }
     f.close();
-    const std::string tmp = "/tmp/ling_img_" + std::to_string((unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count()) + ".mmi1";
+    const std::string tmp = (std::filesystem::temp_directory_path() / ("ling_img_" + std::to_string((unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count()) + ".mmi1")).string();
     const char* py_code =
         "import math,struct,sys; from PIL import Image,ImageOps; "
         "im=ImageOps.exif_transpose(Image.open(sys.argv[1])); "
