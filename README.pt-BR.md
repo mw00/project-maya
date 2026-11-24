@@ -4,7 +4,7 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B), MiniMax-M3.1-Flash (428 B) e Hy4-Flash (220 B) na sua própria GPU</b><br>
+<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B), MiniMax-M3.1-Flash (428 B), Hy4-Flash (220 B) e Inkling 2 Mini (26 B) na sua própria GPU</b><br>
 privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, API compatível com OpenAI e Anthropic · várias requisições ao mesmo tempo</p>
 
 <p align="center">
@@ -23,7 +23,7 @@ privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, 
 <sub>O Project Maya é gratuito. Se ele roda bem no seu PC, patrocinar ajuda a pagar o hardware de testes e o trabalho no projeto.</sub></p>
 
 Modelos desse tamanho costumam precisar de um datacenter. O Maya roda cinco deles no hardware que você já tem:
-**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017**, **MiniMax-M3.1-Flash** e **Hy4-Flash**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
+**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017**, **MiniMax-M3.1-Flash** e **Hy4-Flash** - e o menor **Inkling 2 Mini**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
 
 - **Rápido:** até 149 tokens/s com duas RTX 5090 e uma RTX 4090, 124 com duas H100, 118 com quatro RTX 4090, 81 com uma RTX PRO 6000, mais de 30 com uma única RTX 5090. [Números reais de usuários reais](#how-fast-is-it).
 - **Perto do original:** as quantizações próprias do Maya do GLM-5.3-Flash mantêm 97,7-99,2% da precisão zero-shot do modelo FP8; o DeepSeek V4.1 · Maya-S escolhe o mesmo próximo token que o original em 92,6% das vezes, e o MiniMax M3.1 · Maya-S em 87,6% (a média das suas categorias).
@@ -61,6 +61,7 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · até 1M de contexto · lê imagens · NVIDIA, AMD no Linux</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44,8 GB<br>53,0 GB<br>68,4 GB<br>89,5 GB<br>cada um + uma tabela n-gram de 63,4 GB em comum | PCs com cerca de 56-64 GB (Maya-XS; placas a partir de 8 GB), 68-80 GB (Maya-S), 80-96 GB (Maya-M) ou 104-128 GB (Maya-L) de RAM + VRAM; Maya-S, Maya-M e Maya-L em placas a partir de 12 GB; a tabela n-gram fica no SSD |
+| **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · até 1M de contexto · lê imagens · NVIDIA, AMD no Linux</sub> | GGUF UD-Q4_K_XL da unsloth · `inkling-2-mini` | 17.6 GB | placas a partir de 8 GB: os especialistas que não cabem ficam na RAM; o modelo inteiro na VRAM a partir de 24 GB |
 
 **Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
@@ -240,7 +241,7 @@ Cada linha indica em qual versão do Maya foi medida.
 
 </details>
 
-<details><summary><b>Benchmarks de velocidade do Inkling 2 Mini (experimental preview)</b></summary>
+<details><summary><b>Benchmarks de velocidade do Inkling 2 Mini</b></summary>
 
 | Máquina | Modelo | Decodificação (escrevendo a resposta) | Prefill (lendo o seu prompt) | Versão | Por |
 | --- | --- | ---: | ---: | --- | --- |
