@@ -2424,6 +2424,26 @@ struct FastGraph {
     cudaGraphExec_t exec = nullptr;
 };
 FastGraph g_fgraph[4];      // by OutMode
+bool g_graph_full = false;  // the card has no device memory left for one more graph: no new ones, the launches go one by one
+// G's capture has ended: its graph instantiated.  False when the card has no device memory left for it (a graph's
+// executable holds device memory, and --parallel records one a set of conversations): then G stays empty, no graph is
+// recorded after it, and the caller launches its kernels itself - the same kernels, one by one
+bool graph_exec(FastGraph& G) {
+    size_t fr = 0, tot = 0;
+    const bool low = cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < ((size_t) 256 << 20);
+    if (!low) {
+        const cudaError_t e = cudaGraphInstantiate(&G.exec, G.graph, 0);
+        if (e == cudaSuccess) return true;
+        if (e != cudaErrorMemoryAllocation) CU(e);
+        (void) cudaGetLastError();
+    }
+    cudaGraphDestroy(G.graph);
+    G.graph = nullptr, G.exec = nullptr;
+    if (!g_graph_full)
+        std::fprintf(stderr, "maya-ik2: no device memory left for more CUDA graphs: the other steps run one by one\n");
+    g_graph_full = true;
+    return false;
+}
 int g_slot_cur = 0, g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits, the one g_fgraph holds)
 
 // ---- two GPUs (--gpus 2, the split): GPU 0 runs the offload path (the dense weights, the K / V cache, every prompt,
@@ -3381,13 +3401,14 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         fast_token_launches(M, W, out_mode);
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
-        if (!G.exec) {   // the first token of this kind: its launches recorded
+        if (!G.exec && !g_graph_full) {   // the first token of this kind: its launches recorded
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_token_launches(M, W, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else fast_token_launches(M, W, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
     if (out_mode == OutMode::kArgmax) {
@@ -3871,13 +3892,14 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         fast_block_launches(M, W, T, out_mode);
     } else {
         FastGraph& G = g_bgraph[T][(int) out_mode];
-        if (!G.exec) {
+        if (!G.exec && !g_graph_full) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_block_launches(M, W, T, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else fast_block_launches(M, W, T, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
     if (out_mode == OutMode::kArgmax) {
@@ -4252,13 +4274,14 @@ void par_step(Model& M, int T, const int* tok, const int* pos, const int* sl, bo
         par_launches(M, W, T, sl, cand);
     } else {
         FastGraph& G = g_pgraph[key];
-        if (!G.exec) {
+        if (!G.exec && !g_graph_full) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             par_launches(M, W, T, sl, cand);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else par_launches(M, W, T, sl, cand);
     }
     CU(cudaStreamSynchronize(g_s));
     for (int t = 0; t < T; ++t) am[t] = W.argmax_h[t];
