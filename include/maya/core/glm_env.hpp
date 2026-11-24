@@ -71,6 +71,10 @@ inline int env_switch(const char* name, int dflt, bool allow_auto = false) {
 /// An on/off switch from the environment.
 inline bool env_flag(const char* name, bool dflt) { return env_switch(name, dflt ? kOn : kOff) == kOn; }
 
+/// True when MAYA_GLM_NO_REUSE disables snapshot, conversation-slot, checkpoint, and prompt-cache reuse.
+/// Unset, empty, "0", "off", "false", and "no" keep reuse enabled.
+inline bool no_reuse_env() { return env_flag("MAYA_GLM_NO_REUSE", false); }
+
 /// An integer from a value: null or "" -> dflt; a whole decimal integer; anything else -> a warning and dflt.
 inline long long int_value(const char* name, const char* v, long long dflt) {
     if (v == nullptr || v[0] == '\0') return dflt;
