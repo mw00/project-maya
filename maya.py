@@ -7028,7 +7028,27 @@ def bench_config_text(cfg: dict, ctx: int, drafting: str) -> str:
     return " ".join(x for x in (f"{ctx // 1024}K", f"KV {kv}" if kv else "", drafting) if x)
 
 
-def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0) -> int:
+def bench_prompt_text(ref: str | None = None) -> str:
+    """The text --bench cuts its 2K / 8K prompts from: the README, docs/*.md and bench/results/*.md of this folder -
+    or, with a git ref (--bench-text-ref), of that commit: the same prompts whatever the docs say today (what saved
+    answers and night-to-night speeds need)."""
+    if not ref:
+        return "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
+                           for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
+                           sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
+
+    def git(*a):
+        r = subprocess.run(["git", "-C", str(ROOT), *a], capture_output=True)
+        if r.returncode:
+            raise RuntimeError(f"--bench-text-ref {ref}: git {a[0]} failed: "
+                               f"{r.stderr.decode(errors='replace').strip()[-200:]}")
+        return r.stdout.decode("utf-8", errors="replace")
+    names = git("ls-tree", "-r", "--name-only", ref, "--", "README.md", "docs", "bench/results").splitlines()
+    return "\n\n".join(git("show", f"{ref}:{n}") for n in MB.prompt_text_files(names))
+
+
+def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0,
+          tokens_file: Path | None = None, text_ref: str | None = None) -> int:
     """--bench: the speed-test standard (tools/maya_bench.py) on the installed model - a quiet-machine check, one engine
     session with a warm-up answer, 3 answers of 256 tokens and the 2K / 8K prompts 3 times each; medians with min-max,
     what drafting chose, the wall time of each phase and one result line (maya-bench-results.txt).  --compare: the same
@@ -7067,10 +7087,7 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
     try:
         tok = ST.Tokenizer.from_dir(tp)
         ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
-        text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
-                           for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
-                           sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
-        prompts, warm = MB.plan_prompts(tok.encode(text), ctx)
+        prompts, warm = MB.plan_prompts(tok.encode(bench_prompt_text(text_ref)), ctx)
         fmt = bench_chat(config_family(cfg), tp)   # (each family's own chat format, thinking off - #416, #549)
         chats = [tok.encode(fmt(q), parse_special=True) for q in BENCH_TOPICS]
         start = lambda c, cmd, env, tag: (cmd, env, c.get("cwd") or str(ROOT), ROOT / f"maya-bench{tag}.log")  # noqa
@@ -7082,9 +7099,11 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         gpu_text, driver = MB.gpu_summary(backend, found)
         base = {"machine": socket.gethostname().split(".")[0], "gpus": gpu_text, "driver": driver,
                 "model": bench_model_name(cfg), "date": time.strftime("%Y-%m-%d")}
+        choices = MB.choice_files(ROOT, cfg) if tokens_file else {}   # (the saved per-PC choices this run starts from)
         if not compare:
             before = MB.learned_listing(ROOT, cfg)
             run = MB.run_session(here, chats, prompts, warm, "", say)
+            runs = {"this": [run]}
             res = MB.summarize([run], prompts)
             drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"],
                                         config_family(cfg))
@@ -7099,8 +7118,16 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
             lines = bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, [run], t_quiet, t_all)
             records = [MB.record_line(rec)]
         else:
-            lines, records = bench_compare(cfg, cfg_path, compare, rounds, here, start, chats, prompts, warm, base,
-                                           version, ctx, args, gpu_text, t_quiet, t_all, SV)
+            lines, records, runs = bench_compare(cfg, cfg_path, compare, rounds, here, start, chats, prompts, warm,
+                                                 base, version, ctx, args, gpu_text, t_quiet, t_all, SV)
+        if tokens_file:                          # (--bench-tokens: every request's greedy tokens, for saved answers)
+            first = runs["this"][0]["tokens"]
+            Path(tokens_file).write_text(json.dumps(dict(
+                base, config=str(cfg_path), family=config_family(cfg), backend=backend, gpu_index=gpus or [],
+                context=ctx, commit=MB.commit_of(ROOT), version=version, text_ref=text_ref or "",
+                compare=compare or "", inputs=MB.input_hashes(chats, prompts, warm), choices=choices,
+                heads={k: tok.decode(v[:MB.HEAD_TOKENS]) for k, v in first.items()},
+                runs={k: [r["tokens"] for r in v] for k, v in runs.items()}, records=records)), encoding="utf-8")
     except RuntimeError as e:                    # (the engine stopped or refused, a build failed: said plainly)
         fail(str(e), "fix that, then run --bench again")
     finally:
@@ -7190,7 +7217,7 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
                      "start on this PC, so a difference between the builds is not proof of an answer change)")
     lines.append(f"wall time all: {time.time() - t_all:.0f} s (quiet check {t_quiet:.0f} s)")
     records.append(MB.compare_line(res["other"], res["this"], names["other"], names["this"], verdict))
-    return lines, records
+    return lines, records, runs
 
 
 # ------------------------------------------------------------------------------------------------ the setup
@@ -11919,6 +11946,10 @@ def main() -> int:
                                                        "in .bench-builds) - on the same model files, config and "
                                                        "learned files, alternated; exactness first, then the speed")
     ap.add_argument("--bench-rounds", type=int, default=2, help="--bench --compare: rounds a build (default 2)")
+    ap.add_argument("--bench-tokens", type=Path, metavar="FILE", help="--bench: also write every request's greedy "
+                    "tokens to this JSON file (tools/maya_golden.py: saved answers)")
+    ap.add_argument("--bench-text-ref", metavar="REF", help="--bench: cut the 2K / 8K prompts from the docs of this "
+                    "git ref instead of today's (the same prompts on every build)")
     ap.add_argument("--bench-wait", type=float, default=10.0, help="--bench: minutes to wait for a quiet machine "
                                                                    "before refusing (default 10; 0 = refuse at once)")
     ap.add_argument("--calibrate", action="store_true",
@@ -11981,7 +12012,8 @@ def main() -> int:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if not have:
             fail("Maya is not set up here yet", f"run {ME} first")
-        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait))
+        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait),
+                     a.bench_tokens, a.bench_text_ref)
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
     if a.backend:
