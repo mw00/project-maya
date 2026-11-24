@@ -4,6 +4,7 @@
 #include "ds4_iq1_codes.hpp"
 #include "ds4_par_exp.h"
 #include "ds4_pdl.cuh"
+#include "maya/kernels/lane_xor.hpp"   // warp sums in registers on RDNA
 #if defined(MAYA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
 #include "maya/prefill/moe_mmq.hpp"
 #if defined(MAYA_USE_HIP)
@@ -730,12 +731,19 @@ __device__ __forceinline__ float warp_sum(float v) {
     v += hip_xor1(v);
 #endif
     return v;
-#else
-#pragma unroll
+#else   // (the shuffle's xor order 16, 8, 4, 2, 1; maya_lane_xor: in registers on RDNA, the same bits)
 #if DS4_IQ_STRICT_FP
-    for (int o = 16; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+    v = fadd_no_fma(v, maya_lane_xor<16>(v));
+    v = fadd_no_fma(v, maya_lane_xor<8>(v));
+    v = fadd_no_fma(v, maya_lane_xor<4>(v));
+    v = fadd_no_fma(v, maya_lane_xor<2>(v));
+    v = fadd_no_fma(v, maya_lane_xor<1>(v));
 #else
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    v += maya_lane_xor<16>(v);
+    v += maya_lane_xor<8>(v);
+    v += maya_lane_xor<4>(v);
+    v += maya_lane_xor<2>(v);
+    v += maya_lane_xor<1>(v);
 #endif
     return v;
 #endif
@@ -803,12 +811,19 @@ __device__ __forceinline__ float lanes_sum(float v) {
     if constexpr (RW <= 16) v += hip_xor1(v);
 #endif
     return v;
-#else
-#pragma unroll
+#else   // (the shuffle's xor order 16 / RW .. 1, in registers on RDNA: maya_lane_xor)
 #if DS4_IQ_STRICT_FP
-    for (int o = 16 / RW; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if constexpr (RW <= 1) v = fadd_no_fma(v, maya_lane_xor<16>(v));
+    if constexpr (RW <= 2) v = fadd_no_fma(v, maya_lane_xor<8>(v));
+    if constexpr (RW <= 4) v = fadd_no_fma(v, maya_lane_xor<4>(v));
+    if constexpr (RW <= 8) v = fadd_no_fma(v, maya_lane_xor<2>(v));
+    if constexpr (RW <= 16) v = fadd_no_fma(v, maya_lane_xor<1>(v));
 #else
-    for (int o = 16 / RW; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if constexpr (RW <= 1) v += maya_lane_xor<16>(v);
+    if constexpr (RW <= 2) v += maya_lane_xor<8>(v);
+    if constexpr (RW <= 4) v += maya_lane_xor<4>(v);
+    if constexpr (RW <= 8) v += maya_lane_xor<2>(v);
+    if constexpr (RW <= 16) v += maya_lane_xor<1>(v);
 #endif
     return v;
 #endif
@@ -1500,6 +1515,54 @@ __global__ void __launch_bounds__(kThreads) mv_heads_reg_kernel(const MvJob b0, 
 }
 #endif
 
+// mv_heads_kernel with RW short rows a warp, 32 / RW lanes a row - for heads whose rows are at most 32 / RW sub-blocks
+// (Hy4's attention k_b: 6, v_b: 16), where mv_heads_kernel leaves the lanes past a row's end idle at 0.0f and a warp
+// does one row's few loads at a time.  Each live lane keeps its one sub-block (the same decode, sub_dot and fmaf onto
+// +0.0f as mv_heads_kernel's lane), and lanes_sum<RW> is warp_sum's tree without its first RW > 1 steps, which there
+// only add the idle lanes' +0.0f (the sums never hold -0.0f: an fmaf onto +0.0f and adds of such values can't make
+// one): every output the same bits.  Only Q6_K and Q8_0 (the types Hy4's heads take), n % RW == 0.
+template <int T>
+constexpr bool kMvRows = T == kQ6_K || T == kQ8_0;
+template <int T, int NC, int RW>
+__global__ void __launch_bounds__(kThreads) mv_heads_rows_kernel(const MvJob b0, size_t w_st, size_t xq_st,
+                                                                 size_t xd_st, size_t y_st) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    MvJob b = b0;
+    b.w += (size_t) blockIdx.y * w_st;
+    b.xq += (size_t) blockIdx.y * xq_st;
+    b.xd += (size_t) blockIdx.y * xd_st;
+    b.y += (size_t) blockIdx.y * y_st;
+    constexpr int LPR = 32 / RW;
+    const int lane32 = threadIdx.x & 31, lane = lane32 % LPR;
+    const int row = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
+    if (row >= b.n) return;   // (a whole warp: n % RW == 0)
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    if (lane < nsb) {   // (one sub-block a lane: nsb <= LPR)
+        Sub s;
+        decode<T>(w, lane, tab, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) lane * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + lane], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = lanes_sum<RW>(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
 // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
@@ -2172,8 +2235,51 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
     else if (max_c <= 8 && mv8()) pdl_launch(mv_kernel<T, 8>, grid, kThreads, 0, s, J);
     else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
+// MAYA_IQ_MV_RW: mv_heads_rows_kernel for short heads (the same bits); unset: on with AMD's gfx1100, where it was
+// measured (3 x RX 7900 XTX: Hy4's k_b / v_b GEMVs a third faster, a window 0.5%), off with other GPUs; 1 / 0: on /
+// off on any GPU.  set_mv_rows: the tests' override
+std::atomic<int> g_mv_rows{-1};
+bool mv_rows() {
+    const int o = g_mv_rows.load(std::memory_order_relaxed);
+    if (o >= 0) return o != 0;
+    static const int env = [] {
+        const char* e = std::getenv("MAYA_IQ_MV_RW");
+        return e && e[0] != '\0' ? (e[0] != '0' ? 1 : 0) : -1;
+    }();
+    if (env >= 0) return env != 0;
+#if defined(MAYA_USE_HIP)
+    static signed char known[64] = {};
+    int dev = -1;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p;
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx1100", 7) == 0
+                         ? 1
+                         : -1;
+    }
+    return known[dev] == 1;
+#else
+    return false;
+#endif
+}
+template <int T, int RW>
+void mv_heads_rows_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s) {
+    const dim3 grid((unsigned) ((b.n + kWarps * RW - 1) / (kWarps * RW)), (unsigned) H);
+    if (b.ncol <= 1) pdl_launch(mv_heads_rows_kernel<T, 1, RW>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 4) pdl_launch(mv_heads_rows_kernel<T, 4, RW>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 5 && mv56()) pdl_launch(mv_heads_rows_kernel<T, 5, RW>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 6 && mv56()) pdl_launch(mv_heads_rows_kernel<T, 6, RW>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 8 && mv56()) pdl_launch(mv_heads_rows_kernel<T, 8, RW>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else pdl_launch(mv_heads_rows_kernel<T, 16, RW>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+}
 template <int T>
 void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s, bool wide = false) {
+    if constexpr (kMvRows<T>) {
+        const int nsb = b.k / 32;
+        if (nsb <= 8 && b.n % 4 == 0 && mv_rows()) return mv_heads_rows_nc<T, 4>(b, H, ws, xs, ds, ys, s);
+        if (nsb <= 16 && b.n % 2 == 0 && mv_rows()) return mv_heads_rows_nc<T, 2>(b, H, ws, xs, ds, ys, s);
+    }
     const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
 #if !defined(MAYA_USE_HIP)
     if constexpr (T == kQ8_0)
@@ -2292,6 +2398,8 @@ bool light_down(const SetArgs& a, cudaStream_t s) {
     return light_set(a, false, s);
 }
 
+void set_mv_rows(int on) { g_mv_rows.store(on < 0 ? -1 : on ? 1 : 0, std::memory_order_relaxed); }
+bool mv_rows_on() { return mv_rows(); }
 bool persist_on() {
 #if !DS4_IQ_PERSIST_BUILD
     return false;

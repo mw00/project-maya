@@ -623,6 +623,49 @@ def learned_listing(root: Path, cfg: dict) -> list:
     return sorted(str(p) for p in learned_files(root, cfg))
 
 
+CAL_FILE = "glm-cpu-cal.txt"     # GLM's kept CPU-lane timing: one line a build (its key starts with the build's own stamp)
+
+
+def _cal_split(line: str):
+    """(key's part after the build stamp, key, values) of a cal line, or None."""
+    key, tab, vals = line.rstrip("\n").rpartition("\t")
+    if not tab:
+        return None
+    return key.partition(" | ")[2], key, vals
+
+
+def share_timing(this_file: Path, other_file: Path) -> int:
+    """Both builds run on one CPU and card: the other build's kept timing takes the values this build's priming start
+    measured (each build keys its line by its own compile stamp, so two builds time separately - and a timing a few
+    percent apart moves experts between the CPU lane and PCIe: other bits, other greedy answers).  Returns the lines set."""
+    if not (this_file.is_file() and other_file.is_file()):
+        return 0
+    mine = {}
+    for ln in this_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        sp = _cal_split(ln)
+        if sp:
+            mine[sp[0]] = sp[2]
+    out, n = [], 0
+    for ln in other_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        sp = _cal_split(ln)
+        if sp and sp[0] in mine and sp[2] != mine[sp[0]]:
+            ln, n = sp[1] + "\t" + mine[sp[0]], n + 1
+        out.append(ln)
+    other_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return n
+
+
+def prime_session(start, warm, say, label):
+    """One throw-away engine start: it writes what it keeps on its first start (GLM's CPU-lane timing ...), so every
+    round after it - this build's and the other's - starts from that kept state, not from a first start's."""
+    s = Session(*start)
+    say(f"  {label}priming start: loaded in {s.load_s:.0f} s")
+    try:
+        s.gen(warm, WARM_TOKENS)
+    finally:
+        s.close()
+
+
 class LearnedState:
     """A snapshot of the learned files at the start: restored before each round (both builds start from the same
     state, nothing learned again) and at the end; a second build's data folder gets the same copies (its own files
@@ -638,6 +681,7 @@ class LearnedState:
             shutil.copy2(p, dst)
             self.saved[p] = dst
         self.others = {}                     # {other root: ({its data files at the start}, {file: bytes or None})}
+        self.kept = {}                       # {build root: {file: its copy after the priming start}} (prime_keep)
 
     @staticmethod
     def _put(src: Path, dst: Path):
@@ -665,7 +709,10 @@ class LearnedState:
         copies into that build's data folder."""
         for p, s in self.saved.items():
             self._put(s, p)
-        self._drop_new(self.root / "data", set(self.saved))
+        mine_kept = self.kept.get(self.root, {})
+        for p, s in mine_kept.items():
+            self._put(s, p)
+        self._drop_new(self.root / "data", set(self.saved) | set(mine_kept))
         if other is None:
             return
         start, backup = self.others.setdefault(other, (self._files(other / "data"), {}))
@@ -677,7 +724,24 @@ class LearnedState:
                     backup[q] = q.read_bytes() if q.exists() else None
                 self._put(s, q)
                 mine.add(q)
+        for q, s in self.kept.get(other, {}).items():     # (what the other build's own priming start left)
+            if q not in backup:
+                backup[q] = q.read_bytes() if q.exists() else None
+            self._put(s, q)
+            mine.add(q)
         self._drop_new(other / "data", start | mine)
+
+    def prime_keep(self, root: Path):
+        """After a priming start of the build at `root`: the files its data folder holds now are that build's start state
+        for every round (restore puts them back), as a user's second start finds them."""
+        got = self.kept.setdefault(root, {})
+        for i, p in enumerate(sorted(self._files(root / "data"))):
+            if p.stat().st_size > LEARNED_MAX:
+                continue
+            dst = self.snap / f"kept-{len(self.kept)}-{i}-{p.name}"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+            got[p] = dst
 
     def adopt(self, cfg: dict):
         """Files the first round learned that the snapshot did not have (a first start's measurements) join it: no

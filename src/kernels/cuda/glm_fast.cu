@@ -3609,6 +3609,35 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
                 const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
                 *(uint4*) (sL + s * MLA_ROW + 8 * c8) = v[j];
             }
+        } else if ((reinterpret_cast<unsigned long long>(lat) & 15ull) == 0ull) {
+            // INT8 records (512 int8, then 16 FP16 steps: lat8_rec_bytes): 16 values a load, a thread's eight loads
+            // and their steps issued before any is used - as the FP16 rows above.  The loop below read a value and its
+            // step at a time, 128 dependent rounds a thread and chunk: ~44 us a chunk on an RTX 3090, 241 us a call
+            // at five chunks a block where the FP16 path takes 50 (2026-11-14).  The same values: (float) int8 x
+            // the step, rounded to FP16.
+            constexpr int NL = MLA_CHUNK * MLA_KV / 16 / 128;   // 16-byte loads a thread: 8
+            uint4 v[NL];
+            float st[NL];
+#pragma unroll
+            for (int j = 0; j < NL; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 16), c16 = i % (MLA_KV / 16);
+                const int cell = s_cell[s];
+                const uint8_t* rec = (const uint8_t*) lat + (size_t) lat8_rec_bytes(MLA_KV) * (cell < 0 ? 0 : cell);
+                v[j] = cell < 0 ? make_uint4(0, 0, 0, 0) : *(const uint4*) (rec + 16 * c16);
+                st[j] = cell < 0 ? 0.0f : __half2float(((const __half*) (rec + MLA_KV))[c16 >> 1]);
+            }
+#pragma unroll
+            for (int j = 0; j < NL; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 16), c16 = i % (MLA_KV / 16);
+                const int8_t* b = (const int8_t*) &v[j];
+                uint4 o[2];
+                uint16_t* oh = (uint16_t*) o;
+#pragma unroll
+                for (int x = 0; x < 16; ++x) oh[x] = lat_h((float) b[x] * st[j]);
+                uint4* d = (uint4*) (sL + s * MLA_ROW + 16 * c16);
+                d[0] = o[0];
+                d[1] = o[1];
+            }
         } else {
             for (int i = tid; i < MLA_CHUNK * MLA_KV; i += 128) {
                 const int s = i / MLA_KV, c = i - s * MLA_KV, cell = s_cell[s];
@@ -6629,8 +6658,7 @@ void dsa_score2_launch(int p, int blocks, const float* iq, const float* pooled, 
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
                float* score, cudaStream_t s, bool token) {
     if (n_pools <= 0) return;
-    // the take-two kernel on the decode's token path only (and under the bench's override); the record is the token
-    // path's - a prompt's windows, which keep the original, never write it
+    // the take-two kernel for the callers that ask (the token path, a window's tokens) and under the bench's override
     const bool path = token || g_dsa2_set.load(std::memory_order_acquire);
     const DsaScore2 t = path ? dsa2_shape() : DsaScore2{};
     const bool two = t.on && idx_heads == kDsaH && key_dim == kDsaK;

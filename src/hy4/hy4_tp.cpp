@@ -104,10 +104,9 @@ void Crew::wait() {
 // ---------------------------------------------------------------- Summer
 namespace {
 constexpr size_t kTile = 1024;   // (values a pass of the parts: an accumulator in L1)
-const size_t kPerThread = [] {   // (values a thread takes at least: below it fewer threads join)
-    const char* e = std::getenv("HY4_SUM_PER");
-    return e ? (size_t) std::atol(e) : (size_t) 2048;
-}();
+const char* const kPerEnv = std::getenv("HY4_SUM_PER");
+const size_t kPerThread = kPerEnv ? (size_t) std::atol(kPerEnv) : (size_t) 2048;   // (values a thread takes at least:
+                                                                                    //  below it fewer threads join)
 constexpr double kSpinS = 0.005;      // (a helper spins this long after its last sum, then sleeps)
 constexpr size_t kAddTeam = 65536;    // (add(): values from which the helpers join)
 }  // namespace
@@ -395,9 +394,12 @@ void Summer::sum(float* dst, const float* parts, int n_parts, size_t stride, siz
     n_ = n;
     go(n);
 }
+void Summer::windows_solo(bool on) {
+    solo_ = on && kPerEnv == nullptr;   // (HY4_SUM_PER, when set, decides alone)
+}
 void Summer::go(size_t n) {
     const int threads = (int) th_.size() + 1;
-    if (th_.empty() || (mode_ != 3 && n < 2 * kPerThread) || (mode_ == 3 && n < 4)) {   // (a token's few thousand values: the caller alone)
+    if (th_.empty() || (mode_ == 4 && solo_) || (mode_ != 3 && n < 2 * kPerThread) || (mode_ == 3 && n < 4)) {   // (a token's few thousand values: the caller alone)
         per_ = n;
         run(0, n);
         return;

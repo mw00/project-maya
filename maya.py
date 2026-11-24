@@ -7223,6 +7223,19 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
     learned = MB.LearnedState(ROOT, cfg, work / "learned-snapshot")
     runs = {"this": [], "other": []}
     try:
+        if "MAYA_GLM_CPU_CAL" in SV.child_env(cfg):
+            # GLM times its CPU lane on a build's first start and keeps it, each build under its own compile stamp: a
+            # first round that times it live (colder, noisier) differs from the rounds that read it back - and the two
+            # builds time apart.  One priming start a build, the other build then reading this one's values, and every
+            # round starts from that state (the timing is the same in all of them)
+            for side in ("this", "other"):
+                learned.restore(other if side == "other" else None)
+                MB.prime_session(here if side == "this" else there, warm, say, f"[{side}] ")
+                learned.prime_keep(other if side == "other" else ROOT)
+            n = MB.share_timing(ROOT / "data" / MB.CAL_FILE, other / "data" / MB.CAL_FILE)
+            if n:
+                say(f"  the other build's CPU-lane timing set to this build's ({n} line(s))")
+                learned.prime_keep(other)
         for r in range(rounds):
             for side in ("this", "other"):
                 learned.restore(other if side == "other" else None)
