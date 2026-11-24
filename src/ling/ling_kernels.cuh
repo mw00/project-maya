@@ -64,4 +64,27 @@ void add2(float* x, const float* a, const float* b, int64_t n, cudaStream_t s);
 /// dst[i] = i for i < n.
 void fill_iota(int* dst, int n, cudaStream_t s);
 
+/// Tiled dense MLA prefill helpers:
+/// Apply double-precision NORM RoPE on q_pe and write head-major FP16 q_nope16 [H][T][qk_nope], q_pe16 [H][T][n_rot].
+void mla_q_split_rope_f16(const float* qm, int T, int n_head, int qk_head, int qk_nope, int n_rot, int pos0, float base,
+                          uint16_t* q_nope16, uint16_t* q_pe16, cudaStream_t s);
+
+/// Dequantize BK rows of INT8 MLA latent cache starting at k0 -> FP16 [BK][kv_lora].
+void lat_q8_to_f16(const void* lat, int k0, int BK, int kv_lora, uint16_t* out16, cudaStream_t s);
+
+/// Initialize online softmax state m [H][T] = -inf, l [H][T] = 0, o_acc [H][T][v_head] = 0.
+void mla_init_state(float* m, float* l, float* o_acc, int H, int T, int v_head, cudaStream_t s);
+
+/// Online causal softmax over pre-scaled scores S [H][BQ][BK] -> P16 [H][BQ][BK], rescaling o_acc [H][T][v_head].
+void mla_online_softmax(const float* S, int H, int T, int q0, int BQ, int k0, int BK, int pos0, float* m, float* l,
+                        float* o_acc, int v_head, uint16_t* P16, cudaStream_t s);
+
+/// Finalize tiled MLA output: out16 [T][H][v_head] = FP16((o_acc[h][t][d] / l[h][t]) * sigmoid(gate[t][h])).
+void mla_o_finalize_gate(const float* o_acc, const float* l, const float* gate, int T, int H, int v_head,
+                         uint16_t* out16, cudaStream_t s);
+
+/// Compute max_e (bounds[e+1] - bounds[e]) into *out_dev (1 int).
+void max_rows_from_bounds(const int* bounds, int n_slots, int* out_dev, cudaStream_t s);
+
 }  // namespace ling::k
+

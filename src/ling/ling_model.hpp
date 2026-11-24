@@ -51,7 +51,9 @@ struct Config {
 
 struct Options {
     int ctx = 8192;
-    int prefill_chunk = 2048;        // 1: token-by-token prefill; >1: batched chunk size
+    int prefill_chunk = 2048;        // 1: token-by-token prefill; >1: attention/tile chunk size
+    int prefill_block = 16384;       // macro-block size for MoE expert reuse (borrows tail of VRAM pool when > prefill_chunk)
+    bool ep_prefill = false;         // opt-in multi-GPU EP prefill relay (default off; stage pipeline wins on multi-block)
     double expert_vram_gib = -1.0;   // < 0: free VRAM minus headroom per GPU
     double pin_ram_gib = 54.0;       // max pinned host RAM for offloaded experts
     std::vector<int> gpus = {0};     // CUDA device ordinals (layer split when size > 1)
@@ -115,7 +117,8 @@ public:
     std::string detokenize_one(int id) const;
 
 private:
-    static constexpr int kPfBatch = 32;   // experts per double-buffered prefill staging half (2 x 32 = 64 slots)
+    static constexpr int kPfBatch = 64;   // experts per double-buffered prefill staging half (2 x 64 = 128 slots)
+    static constexpr int kPfPmapRing = 32; // host pmap slots so pinned DMA never stalls host
 
     struct Mat {
         const uint8_t* p = nullptr;
@@ -155,6 +158,7 @@ private:
         size_t tr[3] = {0, 0, 0};           // offsets inside packed blob
         size_t blob = 0;                    // 256-aligned bytes per packed expert [gate|up|down]
         int n_res = 0;                      // experts resident in VRAM (0..n_expert)
+        size_t vram_pool_off = 0;           // byte offset inside Gpu::vram_pool
         bool host_pinned = false;           // GPU-accessible pinned RAM (cudaHostRegister or cudaMallocHost)
         bool host_registered = false;       // allocated via ram_alloc + cudaHostRegister
         uint8_t* host_blobs = nullptr;      // [n_expert][blob] packed experts in RAM (null if n_res == n_expert)
@@ -162,6 +166,8 @@ private:
         hy4::k::FetchLayer fl;              // GPU adaptive cache metadata
         hy4::CpuExperts cex;                // CPU lane view of host_blobs
         std::vector<int> h_slot;            // host mirror of fl.slot for prefill
+        std::vector<int> h_owner;           // host mirror of fl.owner for async warm
+        std::vector<float> h_score;         // host mirror of fl.score for async warm
         std::vector<uint32_t> pf_counts;    // prompt pick counts for cache warm
     };
 
@@ -175,6 +181,8 @@ private:
         cudaEvent_t ev_route = nullptr;
         cudaEvent_t ev_copy[2] = {nullptr, nullptr};
         cudaEvent_t ev_comp[2] = {nullptr, nullptr};
+        uint8_t* vram_pool = nullptr;
+        size_t vram_pool_bytes = 0;
         std::vector<void*> dev_allocs;
         std::vector<void*> host_allocs;
         // decode scratch
@@ -217,7 +225,10 @@ private:
         uint8_t* pf_stage[2] = {nullptr, nullptr};
         int* h_pf_ids = nullptr;
         float* h_pf_w = nullptr;
-        int* h_pf_pmap[2] = {nullptr, nullptr};
+        int h_pf_cap = 0;
+        int* h_pf_pmap[kPfPmapRing] = {};
+        int* d_max_rows = nullptr;
+        int* h_max_rows = nullptr;
         uint8_t* h_pf_stage[2] = {nullptr, nullptr};
         // CUDA graph for single-token decode
         cudaGraph_t graph = nullptr;
@@ -242,7 +253,7 @@ private:
     std::string info_;
     std::unique_ptr<hy4::Lane> lane_;
     std::vector<Gpu> gpus_;
-    std::vector<bool> p2p_ok_;
+    std::vector<std::vector<bool>> p2p_mat_;
     std::vector<Layer> layers_;
     Mat emb_, out_w_;
     const float* out_norm_ = nullptr;
@@ -260,6 +271,8 @@ private:
     void load_layer_weights(Layer& l, int il, Gpu& g, const maya::GgufFile& gf,
                             const std::map<std::string, const maya::TensorInfo*>& want);
     void transfer_x(int g_from, int g_to, int T, bool prefill_buf);
+    void transfer_buf(int g_from, int g_to, const float* p_src, float* p_dst, size_t floats);
+    void transfer_bytes(int g_from, int g_to, const void* p_src, void* p_dst, size_t bytes);
 
     void decode_segment(int gi, bool capture_safe);
     void kda_decode(Gpu& gp, Layer& l, int il, bool seam);
@@ -268,10 +281,16 @@ private:
     void ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam);
 
     void gemm_mat(Gpu& gp, const Mat& m, const uint16_t* a16, int T, float* out_f32);
-    void kda_prefill(Gpu& gp, Layer& l, int T);
-    void mla_prefill(Gpu& gp, Layer& l, int T, int pos0);
-    void ffn_dense_prefill(Gpu& gp, Layer& l, int il, int T);
-    void ffn_moe_prefill(Gpu& gp, Layer& l, int il, int T);
+    struct MacroBufs {
+        float *x = nullptr, *cur = nullptr, *moe = nullptr, *w = nullptr;
+        float *pipe_x = nullptr;     // second ping-pong x buffer for multi-GPU stage pipelining
+        int *ids = nullptr, *tok = nullptr, *row_of = nullptr;
+    };
+    void kda_prefill(Gpu& gp, Layer& l, int T, float* x_io);
+    void mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io);
+    void ffn_dense_prefill(Gpu& gp, Layer& l, int il, int T, float* x_io);
+    void ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_block, bool layer_borrowed,
+                               const std::vector<MacroBufs>& mbufs);
     void warm_vram_cache();
 
     void dump_seam_f32(Gpu& gp, const std::string& name, const float* dev, size_t n);

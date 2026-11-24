@@ -149,6 +149,9 @@ int main(int argc, char** argv) {
         else if (a == "--n-predict") n_predict = std::atoi(val("--n-predict").c_str());
         else if (a == "--ctx") opt.ctx = std::atoi(val("--ctx").c_str());
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::atoi(val("--prefill-chunk").c_str());
+        else if (a == "--prefill-block") opt.prefill_block = std::atoi(val("--prefill-block").c_str());
+        else if (a == "--no-ep") opt.ep_prefill = false;
+        else if (a == "--ep") opt.ep_prefill = true;
         else if (a == "--expert-vram-gib") opt.expert_vram_gib = std::atof(val("--expert-vram-gib").c_str());
         else if (a == "--pin-ram-gib") opt.pin_ram_gib = std::atof(val("--pin-ram-gib").c_str());
         else if (a == "--gpus" || a == "--device") opt.gpus = parse_ints(val(a.c_str()));
@@ -184,7 +187,7 @@ int main(int argc, char** argv) {
     if (gguf.empty() || (ids_file.empty() && prompt.empty())) {
         std::fprintf(stderr,
                      "maya-ling --gguf MODEL.gguf [--prompt-ids ids.txt | --prompt text [--tokenize-bin PATH]]\n"
-                     "          [--n-predict N] [--ctx N] [--prefill-chunk N] [--gpus 0[,1]]\n"
+                     "          [--n-predict N] [--ctx N] [--prefill-chunk N] [--prefill-block N] [--no-ep] [--gpus 0[,1]]\n"
                      "          [--offload auto|gpu|mix|cpu] [--mix-k-gpu N] [--kv fp16|q8]\n"
                      "          [--expert-vram-gib F] [--pin-ram-gib F] [--no-graph] [--no-cache-warm]\n"
                      "          [--temp F] [--top-k N] [--top-p F] [--seed N] [--print-text] [--no-stop]\n"

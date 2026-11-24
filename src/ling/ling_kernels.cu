@@ -449,6 +449,155 @@ __global__ void fill_iota_kernel(int* __restrict__ dst, int n) {
     if (i < n) dst[i] = i;
 }
 
+// ---- Tiled dense MLA prefill kernels ----
+__global__ void __launch_bounds__(256)
+    mla_q_split_rope_f16_kernel(const float* __restrict__ qm, int T, int n_head, int qk_head, int qk_nope, int n_rot,
+                                int pos0, float base, uint16_t* __restrict__ q_nope16, uint16_t* __restrict__ q_pe16) {
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const int c = threadIdx.x;
+    const float* qh = qm + ((size_t) t * n_head + h) * qk_head;
+    if (c < qk_nope) {
+        ((__half*) q_nope16)[((size_t) h * T + t) * qk_nope + c] = __float2half_rn(qh[c]);
+    } else if (c < qk_nope + (n_rot >> 1)) {
+        const int i = c - qk_nope;
+        float a = qh[qk_nope + 2 * i];
+        float b = qh[qk_nope + 2 * i + 1];
+        rope_pair_d(a, b, pos0 + t, i, n_rot, base);
+        __half* dst = (__half*) q_pe16 + ((size_t) h * T + t) * n_rot;
+        dst[2 * i] = __float2half_rn(a);
+        dst[2 * i + 1] = __float2half_rn(b);
+    }
+}
+
+__global__ void __launch_bounds__(256)
+    lat_q8_to_f16_kernel(const uint8_t* __restrict__ lat, int k0, int kv_lora, uint16_t* __restrict__ out16) {
+    const int r = blockIdx.x;
+    const int tid = threadIdx.x;
+    const size_t rec_bytes = (size_t) kv_lora + (size_t) (kv_lora / 32) * 2;
+    const uint8_t* rec = lat + (size_t) (k0 + r) * rec_bytes;
+    const int8_t* q = (const int8_t*) rec;
+    const __half* scales = (const __half*) (rec + kv_lora);
+    __half* dst = (__half*) out16 + (size_t) r * kv_lora;
+    for (int i = tid; i < kv_lora; i += blockDim.x) {
+        const float v = (float) q[i] * __half2float(scales[i >> 5]);
+        dst[i] = __float2half_rn(v);
+    }
+}
+
+__global__ void __launch_bounds__(256)
+    mla_init_state_kernel(float* __restrict__ m, float* __restrict__ l, float* __restrict__ o_acc, int64_t HT,
+                          int v_head) {
+    const int64_t idx0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    for (int64_t r = idx0; r < HT; r += stride) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+    }
+    const int64_t total_o = HT * (int64_t) v_head;
+    for (int64_t idx = idx0; idx < total_o; idx += stride) o_acc[idx] = 0.0f;
+}
+
+__global__ void __launch_bounds__(256)
+    max_rows_from_bounds_kernel(const int* __restrict__ bounds, int n_slots, int* __restrict__ out_dev) {
+    __shared__ int sm[8];
+    const int tid = threadIdx.x;
+    int mx = 0;
+    for (int e = tid; e < n_slots; e += blockDim.x) mx = max(mx, bounds[e + 1] - bounds[e]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((tid & 31) == 0) sm[tid >> 5] = mx;
+    __syncthreads();
+    if (tid == 0) {
+        int best = sm[0];
+        for (int w = 1; w < 8; ++w) best = max(best, sm[w]);
+        *out_dev = best;
+    }
+}
+
+__global__ void __launch_bounds__(256)
+    mla_online_softmax_kernel(const float* __restrict__ S, int H, int T, int q0, int BQ, int k0, int BK, int pos0,
+                              float* __restrict__ m, float* __restrict__ l, float* __restrict__ o_acc, int v_head,
+                              uint16_t* __restrict__ P16) {
+    __shared__ float smax[8];
+    __shared__ float ssum[8];
+    const int q = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int q_pos = pos0 + q0 + q;
+    const int valid_k = min(BK, max(0, q_pos - k0 + 1));
+
+    const size_t s_off = ((size_t) h * BQ + q) * BK;
+    const float* srow = S + s_off;
+    __half* prow = (__half*) P16 + s_off;
+
+    if (valid_k <= 0) {
+        for (int j = tid; j < BK; j += blockDim.x) prow[j] = __float2half_rn(0.0f);
+        return;
+    }
+
+    float rmax = -INFINITY;
+    for (int j = tid; j < valid_k; j += blockDim.x) rmax = fmaxf(rmax, srow[j]);
+    rmax = warp_max_f(rmax);
+    if ((tid & 31) == 0) smax[tid >> 5] = rmax;
+    __syncthreads();
+    if (tid < 32) {
+        float v = tid < 8 ? smax[tid] : -INFINITY;
+        v = warp_max_f(v);
+        if (tid == 0) smax[0] = v;
+    }
+    __syncthreads();
+
+    const size_t ht = (size_t) h * T + (size_t) (q0 + q);
+    const float m_old = m[ht];
+    const float m_tile = smax[0];
+    const float m_new = fmaxf(m_old, m_tile);
+
+    float rsum = 0.0f;
+    for (int j = tid; j < BK; j += blockDim.x) {
+        if (j < valid_k) {
+            const float p = expf(srow[j] - m_new);
+            prow[j] = __float2half_rn(p);
+            rsum += p;
+        } else {
+            prow[j] = __float2half_rn(0.0f);
+        }
+    }
+    rsum = warp_sum_f(rsum);
+    if ((tid & 31) == 0) ssum[tid >> 5] = rsum;
+    __syncthreads();
+    if (tid < 32) {
+        float v = tid < 8 ? ssum[tid] : 0.0f;
+        v = warp_sum_f(v);
+        if (tid == 0) ssum[0] = v;
+    }
+    __syncthreads();
+
+    const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+    if (alpha != 1.0f && m_old != -INFINITY) {
+        float* orow = o_acc + ht * (size_t) v_head;
+        for (int d = tid; d < v_head; d += blockDim.x) orow[d] *= alpha;
+    }
+    if (tid == 0) {
+        m[ht] = m_new;
+        l[ht] = l[ht] * alpha + ssum[0];
+    }
+}
+
+__global__ void __launch_bounds__(128)
+    mla_o_finalize_gate_kernel(const float* __restrict__ o_acc, const float* __restrict__ l,
+                               const float* __restrict__ gate, int T, int H, int v_head, uint16_t* __restrict__ out16) {
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const int d = threadIdx.x;
+    if (d >= v_head) return;
+    const size_t ht = (size_t) h * T + (size_t) t;
+    const float inv_l = 1.0f / l[ht];
+    const float g = sigmoid_exact(gate[(size_t) t * H + h]);
+    const float v = o_acc[ht * (size_t) v_head + d] * inv_l * g;
+    ((__half*) out16)[((size_t) t * H + h) * v_head + d] = __float2half_rn(v);
+}
+
 }  // namespace
 
 void kda_prep_full(const float* q_in, const float* k_in, const float* v_in, const float* f_in, const float* conv_q,
@@ -531,4 +680,41 @@ void fill_iota(int* dst, int n, cudaStream_t s) {
     fill_iota_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(dst, n);
 }
 
+void mla_q_split_rope_f16(const float* qm, int T, int n_head, int qk_head, int qk_nope, int n_rot, int pos0, float base,
+                          uint16_t* q_nope16, uint16_t* q_pe16, cudaStream_t s) {
+    if (T <= 0) return;
+    mla_q_split_rope_f16_kernel<<<dim3((unsigned) n_head, (unsigned) T), 256, 0, s>>>(
+        qm, T, n_head, qk_head, qk_nope, n_rot, pos0, base, q_nope16, q_pe16);
+}
+
+void lat_q8_to_f16(const void* lat, int k0, int BK, int kv_lora, uint16_t* out16, cudaStream_t s) {
+    if (BK <= 0) return;
+    lat_q8_to_f16_kernel<<<(unsigned) BK, 256, 0, s>>>((const uint8_t*) lat, k0, kv_lora, out16);
+}
+
+void mla_init_state(float* m, float* l, float* o_acc, int H, int T, int v_head, cudaStream_t s) {
+    const int64_t HT = (int64_t) H * T;
+    if (HT <= 0) return;
+    const int blocks = (int) std::min<int64_t>((HT * v_head + 255) / 256, 4096);
+    mla_init_state_kernel<<<(unsigned) blocks, 256, 0, s>>>(m, l, o_acc, HT, v_head);
+}
+
+void mla_online_softmax(const float* S, int H, int T, int q0, int BQ, int k0, int BK, int pos0, float* m, float* l,
+                        float* o_acc, int v_head, uint16_t* P16, cudaStream_t s) {
+    if (BQ <= 0 || BK <= 0) return;
+    mla_online_softmax_kernel<<<dim3((unsigned) BQ, (unsigned) H), 256, 0, s>>>(
+        S, H, T, q0, BQ, k0, BK, pos0, m, l, o_acc, v_head, P16);
+}
+
+void mla_o_finalize_gate(const float* o_acc, const float* l, const float* gate, int T, int H, int v_head,
+                         uint16_t* out16, cudaStream_t s) {
+    if (T <= 0) return;
+    mla_o_finalize_gate_kernel<<<dim3((unsigned) H, (unsigned) T), 128, 0, s>>>(o_acc, l, gate, T, H, v_head, out16);
+}
+
+void max_rows_from_bounds(const int* bounds, int n_slots, int* out_dev, cudaStream_t s) {
+    max_rows_from_bounds_kernel<<<1, 256, 0, s>>>(bounds, n_slots, out_dev);
+}
+
 }  // namespace ling::k
+

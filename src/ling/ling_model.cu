@@ -17,6 +17,8 @@
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -414,22 +416,27 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         gp.l1 = c.n_dense_lead + m1;
     }
 
-    p2p_ok_.assign((size_t) std::max(0, ngpu - 1), false);
-    for (int gi = 0; gi + 1 < ngpu; ++gi) {
-        const int d0 = gpus_[(size_t) gi].dev, d1 = gpus_[(size_t) (gi + 1)].dev;
-        int can01 = 0, can10 = 0;
-        cudaDeviceCanAccessPeer(&can01, d0, d1);
-        cudaDeviceCanAccessPeer(&can10, d1, d0);
-        if (can01 && can10) {
-            set_dev(d0);
-            cudaError_t e0 = cudaDeviceEnablePeerAccess(d1, 0);
-            if (e0 == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
-            set_dev(d1);
-            cudaError_t e1 = cudaDeviceEnablePeerAccess(d0, 0);
-            if (e1 == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
-            if ((e0 == cudaSuccess || e0 == cudaErrorPeerAccessAlreadyEnabled) &&
-                (e1 == cudaSuccess || e1 == cudaErrorPeerAccessAlreadyEnabled))
-                p2p_ok_[(size_t) gi] = true;
+    p2p_mat_.assign((size_t) ngpu, std::vector<bool>((size_t) ngpu, false));
+    for (int gi = 0; gi < ngpu; ++gi) {
+        p2p_mat_[(size_t) gi][(size_t) gi] = true;
+        for (int gj = gi + 1; gj < ngpu; ++gj) {
+            const int d0 = gpus_[(size_t) gi].dev, d1 = gpus_[(size_t) gj].dev;
+            int can01 = 0, can10 = 0;
+            cudaDeviceCanAccessPeer(&can01, d0, d1);
+            cudaDeviceCanAccessPeer(&can10, d1, d0);
+            if (can01 && can10) {
+                set_dev(d0);
+                cudaError_t e0 = cudaDeviceEnablePeerAccess(d1, 0);
+                if (e0 == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+                set_dev(d1);
+                cudaError_t e1 = cudaDeviceEnablePeerAccess(d0, 0);
+                if (e1 == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+                if ((e0 == cudaSuccess || e0 == cudaErrorPeerAccessAlreadyEnabled) &&
+                    (e1 == cudaSuccess || e1 == cudaErrorPeerAccessAlreadyEnabled)) {
+                    p2p_mat_[(size_t) gi][(size_t) gj] = true;
+                    p2p_mat_[(size_t) gj][(size_t) gi] = true;
+                }
+            }
         }
     }
 
@@ -636,9 +643,18 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
             gp.pf_x16 = (uint16_t*) dev_alloc(gp, (size_t) P * std::max({DI, c.n_ff, H * c.v_head}) * sizeof(uint16_t));
             gp.pf_w16 = (uint16_t*) dev_alloc(gp, max_w16_elems * sizeof(uint16_t));
             const size_t kda_b = (size_t) P * ((size_t) 8 * DI + (size_t) H) * 4 + 4096;
-            const size_t mla_b = (size_t) P * ((size_t) H * c.qk_head * 6 + (size_t) (KL + R) * 4 +
-                                               (size_t) H * KL * 10 + (size_t) H * c.v_head * 4 + (size_t) H * 4) +
-                                 4096;
+            const size_t mla_b_old = (size_t) P * ((size_t) H * c.qk_head * 6 + (size_t) (KL + R) * 4 +
+                                                   (size_t) H * KL * 10 + (size_t) H * c.v_head * 4 + (size_t) H * 4) +
+                                     4096;
+            const size_t bq_max = (size_t) std::min(P, 256);
+            const size_t bk_max = 1024;
+            const size_t mla_b_tiled =
+                (size_t) P * ((size_t) H * c.qk_head * 4 + (size_t) (KL + R) * 4 + (size_t) H * 4 +
+                              (size_t) H * (size_t) (c.qk_nope + R) * 2 + (size_t) H * c.v_head * 4 + (size_t) H * 8) +
+                (size_t) H * KL * (size_t) (c.qk_nope + c.v_head) * 2 +
+                bk_max * ((size_t) KL * 2 + (size_t) H * (size_t) (c.qk_nope + c.v_head) * 2) +
+                (size_t) H * bq_max * bk_max * 6 + 65536;
+            const size_t mla_b = std::max(mla_b_old, mla_b_tiled);
             const size_t ffn_b = (size_t) P * (size_t) 2 * std::max(c.n_ff, c.n_ff_shexp) * 4 + 4096;
             const size_t moe_b = (size_t) P * ((size_t) c.n_expert * 4 + (size_t) c.n_used * FE * 2 +
                                                (size_t) c.n_used * E * 4) +
@@ -650,13 +666,18 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
             gp.pf_bounds = (int*) dev_alloc(gp, (size_t) (c.n_expert + 1) * sizeof(int));
             gp.pf_tok = (int*) dev_alloc(gp, (size_t) P * c.n_used * sizeof(int));
             gp.pf_row_of = (int*) dev_alloc(gp, (size_t) P * c.n_used * sizeof(int));
-            gp.h_pf_ids = (int*) host_alloc(gp, (size_t) P * c.n_used * sizeof(int));
-            gp.h_pf_w = (float*) host_alloc(gp, (size_t) P * c.n_used * sizeof(float));
+            gp.h_pf_cap = std::max(P, std::min(o_.prefill_block > 0 ? o_.prefill_block : P, 32768));
+            gp.h_pf_ids = (int*) host_alloc(gp, (size_t) gp.h_pf_cap * c.n_used * sizeof(int));
+            gp.h_pf_w = (float*) host_alloc(gp, (size_t) gp.h_pf_cap * c.n_used * sizeof(float));
+            gp.d_max_rows = (int*) dev_alloc(gp, sizeof(int));
+            gp.h_max_rows = (int*) host_alloc(gp, sizeof(int));
             for (int b = 0; b < 2; ++b) {
                 gp.pf_pmap[b] = (int*) dev_alloc(gp, (size_t) c.n_expert * sizeof(int));
                 gp.pf_stage[b] = (uint8_t*) dev_alloc(gp, (size_t) kPfBatch * max_blob_);
-                gp.h_pf_pmap[b] = (int*) host_alloc(gp, (size_t) c.n_expert * sizeof(int));
                 gp.h_pf_stage[b] = (uint8_t*) host_alloc(gp, (size_t) kPfBatch * max_blob_);
+            }
+            for (int r = 0; r < kPfPmapRing; ++r) {
+                gp.h_pf_pmap[r] = (int*) host_alloc(gp, (size_t) c.n_expert * sizeof(int));
             }
         }
         CK(cudaStreamSynchronize(gp.s));
@@ -683,9 +704,14 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
             while (nr > 0 && (double) nr * (double) l.blob > budget) --nr;
             l.n_res = nr;
             budget -= (double) nr * (double) l.blob;
+            l.vram_pool_off = gpu_vram_used[(size_t) gi];
             gpu_vram_used[(size_t) gi] += (size_t) nr * l.blob;
             total_vram_experts += (size_t) nr;
             total_experts += (size_t) c.n_expert;
+        }
+        gp.vram_pool_bytes = gpu_vram_used[(size_t) gi];
+        if (gp.vram_pool_bytes > 0) {
+            gp.vram_pool = (uint8_t*) dev_alloc(gp, gp.vram_pool_bytes);
         }
     }
     if (mtp_loaded_) mtp_.layer.n_res = 0;
@@ -793,7 +819,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt) {
         CK(cudaMemset(l.fl.score, 0, (size_t) c.n_expert * sizeof(float)));
 
         if (l.n_res > 0) {
-            l.fl.vram = (uint8_t*) dev_alloc(gp, (size_t) l.n_res * l.blob);
+            l.fl.vram = gp.vram_pool + l.vram_pool_off;
             if (l.host_blobs != nullptr) {
                 CK(cudaMemcpyAsync(l.fl.vram, l.host_blobs, (size_t) l.n_res * l.blob, cudaMemcpyHostToDevice, gp.s));
             } else {
@@ -974,27 +1000,46 @@ void Model::dump_seam_i32(Gpu& gp, const std::string& name, const int* dev, size
 
 // ------------------------------ multi-GPU transfer ------------------------------
 
-void Model::transfer_x(int g_from, int g_to, int T, bool prefill_buf) {
+void Model::transfer_bytes(int g_from, int g_to, const void* p_src, void* p_dst, size_t bytes) {
+    if (bytes == 0) return;
     Gpu& src = gpus_[(size_t) g_from];
     Gpu& dst = gpus_[(size_t) g_to];
-    const size_t bytes = (size_t) T * (size_t) c_.n_embd * sizeof(float);
-    float* p_src = prefill_buf ? src.pf_x : src.x;
-    float* p_dst = prefill_buf ? dst.pf_x : dst.x;
-
-    set_dev(src.dev);
-    CK(cudaEventRecord(src.ev_xfer, src.s));
-    set_dev(dst.dev);
-    CK(cudaStreamWaitEvent(dst.s, src.ev_xfer, 0));
-    if (p2p_ok_[(size_t) g_from]) {
-        CK(cudaMemcpyPeerAsync(p_dst, dst.dev, p_src, src.dev, bytes, dst.s));
-    } else {
+    if (p2p_mat_[(size_t) g_from][(size_t) g_to]) {
         set_dev(src.dev);
-        CK(cudaMemcpyAsync(src.h_xfer, p_src, bytes, cudaMemcpyDeviceToHost, src.s));
         CK(cudaEventRecord(src.ev_xfer, src.s));
         set_dev(dst.dev);
         CK(cudaStreamWaitEvent(dst.s, src.ev_xfer, 0));
-        CK(cudaMemcpyAsync(p_dst, src.h_xfer, bytes, cudaMemcpyHostToDevice, dst.s));
+        CK(cudaMemcpyPeerAsync(p_dst, dst.dev, p_src, src.dev, bytes, dst.s));
+        return;
     }
+    const size_t chunk = (size_t) std::max(1, src.pf_cap) * (size_t) c_.n_embd * sizeof(float);
+    const uint8_t* sp = (const uint8_t*) p_src;
+    uint8_t* dp = (uint8_t*) p_dst;
+    for (size_t off = 0; off < bytes; off += chunk) {
+        const size_t n = std::min(chunk, bytes - off);
+        set_dev(src.dev);
+        CK(cudaMemcpyAsync(src.h_xfer, sp + off, n, cudaMemcpyDeviceToHost, src.s));
+        CK(cudaEventRecord(src.ev_xfer, src.s));
+        set_dev(dst.dev);
+        CK(cudaStreamWaitEvent(dst.s, src.ev_xfer, 0));
+        CK(cudaMemcpyAsync(dp + off, src.h_xfer, n, cudaMemcpyHostToDevice, dst.s));
+        if (off + n < bytes) {
+            CK(cudaEventRecord(dst.ev_xfer, dst.s));
+            set_dev(src.dev);
+            CK(cudaStreamWaitEvent(src.s, dst.ev_xfer, 0));
+        }
+    }
+}
+
+void Model::transfer_buf(int g_from, int g_to, const float* p_src, float* p_dst, size_t floats) {
+    transfer_bytes(g_from, g_to, p_src, p_dst, floats * sizeof(float));
+}
+
+void Model::transfer_x(int g_from, int g_to, int T, bool prefill_buf) {
+    Gpu& src = gpus_[(size_t) g_from];
+    Gpu& dst = gpus_[(size_t) g_to];
+    transfer_buf(g_from, g_to, prefill_buf ? src.pf_x : src.x, prefill_buf ? dst.pf_x : dst.x,
+                 (size_t) T * (size_t) c_.n_embd);
 }
 
 // ------------------------------ single-token decode ------------------------------
@@ -1285,7 +1330,7 @@ void Model::gemm_mat(Gpu& gp, const Mat& m, const uint16_t* a16, int T, float* o
                         CUDA_R_16F, m.k, &beta, out_f32, CUDA_R_32F, m.n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 
-void Model::kda_prefill(Gpu& gp, Layer& l, int T) {
+void Model::kda_prefill(Gpu& gp, Layer& l, int T, float* x_io) {
     const Config& c = c_;
     const int E = c.n_embd, DI = c.d_inner(), H = c.n_head;
     cudaStream_t s = gp.s;
@@ -1322,85 +1367,199 @@ void Model::kda_prefill(Gpu& gp, Layer& l, int T) {
                       c.eps, H, T, gp.pf_x16, s);
     }
     gemm_mat(gp, l.wo, gp.pf_x16, T, gp.pf_out);
-    hy::add(gp.pf_x, gp.pf_out, (size_t) T * E, s);
+    hy::add(x_io, gp.pf_out, (size_t) T * E, s);
 }
 
-void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0) {
+void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io) {
     const Config& c = c_;
     const int E = c.n_embd, H = c.n_head, KL = c.kv_lora, R = c.n_rot;
+    const int QN = c.qk_nope, VH = c.v_head;
     cudaStream_t s = gp.s;
 
     auto align_ptr = [](uint8_t* p) -> uint8_t* {
         return (uint8_t*) (((uintptr_t) p + 255u) & ~uintptr_t(255u));
     };
+
+    const int S_total = pos0 + T;
+    // Unabsorbed tiled cuBLAS dense MLA wins massively whenever T >= 64 or total context <= 2048;
+    // for tiny agent re-reads (T < 64) at deep context (> 2048), absorbed avoids expanding full KV.
+    const bool use_tiled = (T >= 64 || S_total <= 2048);
+
+    if (!use_tiled) {
+        uint8_t* curp = (uint8_t*) gp.pf_tmp;
+        float* pf_qm = (float*) curp;
+        curp = align_ptr(curp + (size_t) T * H * c.qk_head * 4);
+        uint16_t* pf_qm16 = (uint16_t*) curp;
+        curp = align_ptr(curp + (size_t) T * H * c.qk_head * 2);
+        float* pf_kvall = (float*) curp;
+        curp = align_ptr(curp + (size_t) T * (KL + R) * 4);
+        float* pf_qabs = (float*) curp;
+        curp = align_ptr(curp + (size_t) T * H * KL * 4);
+        float* pf_ctx = (float*) curp;
+        curp = align_ptr(curp + (size_t) T * H * KL * 4);
+        uint16_t* pf_ctx16 = (uint16_t*) curp;
+        curp = align_ptr(curp + (size_t) T * H * KL * 2);
+        float* pf_o128 = (float*) curp;
+        curp = align_ptr(curp + (size_t) T * H * VH * 4);
+        float* pf_gate = (float*) curp;
+
+        hy::to_f16(gp.pf_cur, (size_t) E, T, E, gp.pf_x16, (size_t) E, s);
+        gemm_mat(gp, l.wqm, gp.pf_x16, T, pf_qm);
+        gemm_mat(gp, l.wkva, gp.pf_x16, T, pf_kvall);
+        gemm_mat(gp, l.wgate, gp.pf_x16, T, pf_gate);
+
+        k::mla_q_prep(pf_qm, T, H, c.qk_head, QN, R, nullptr, pos0, c.rope_base, nullptr, nullptr, pf_qm16, s);
+
+        if (!iq::f16_rows(l.wkb.type, l.wkb.p, QN, KL * H, gp.pf_w16, QN, s))
+            throw std::runtime_error("mla prefill: k_b f16_rows failed");
+        const float alpha = 1.0f, beta = 0.0f;
+        CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, KL, T, QN, &alpha, gp.pf_w16, CUDA_R_16F,
+                                          QN, (long long) KL * QN, pf_qm16, CUDA_R_16F, H * c.qk_head,
+                                          (long long) c.qk_head, &beta, pf_qabs, CUDA_R_32F, H * KL, (long long) KL, H,
+                                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+        k::kv_store_split(pf_kvall, T, KL, R, l.kv_a_norm, c.eps, nullptr, pos0, c.rope_base, l.lat, o_.kv_q8, l.k_pe,
+                          s);
+
+        glmd::MlaPrompt mp;
+        mp.q_abs = pf_qabs;
+        mp.q = pf_qm;
+        mp.q_stride = c.qk_head;
+        mp.q_pe_off = QN;
+        mp.lat = l.lat;
+        mp.lat_q8 = o_.kv_q8 ? 1 : 0;
+        mp.k_pe = l.k_pe;
+        mp.walk = glmd::AttnWalk::Dense;
+        mp.p0 = pos0;
+        mp.T = T;
+        mp.n_head = H;
+        mp.kv_lora = KL;
+        mp.qk_rope = R;
+        mp.scale = 1.0f / sqrtf((float) c.qk_head);
+        mp.ctx = pf_ctx;
+        if (!glmd::mla_prompt_wmma(mp, s)) {
+            if (!glmd::mla_prompt_f32(mp, s)) throw std::runtime_error("mla prefill: attention failed");
+        }
+
+        hy::to_f16(pf_ctx, (size_t) H * KL, T, H * KL, pf_ctx16, (size_t) H * KL, s);
+        if (!iq::f16_rows(l.wvb.type, l.wvb.p, KL, VH * H, gp.pf_w16, KL, s))
+            throw std::runtime_error("mla prefill: v_b f16_rows failed");
+        CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, VH, T, KL, &alpha, gp.pf_w16, CUDA_R_16F,
+                                          KL, (long long) VH * KL, pf_ctx16, CUDA_R_16F, H * KL, (long long) KL, &beta,
+                                          pf_o128, CUDA_R_32F, H * VH, (long long) VH, H, CUBLAS_COMPUTE_32F,
+                                          CUBLAS_GEMM_DEFAULT));
+
+        k::head_gate_out(pf_o128, pf_gate, T, H, VH, nullptr, nullptr, gp.pf_x16, s);
+        gemm_mat(gp, l.wom, gp.pf_x16, T, gp.pf_out);
+        hy::add(x_io, gp.pf_out, (size_t) T * E, s);
+        return;
+    }
+
+    // ---- Unabsorbed Tiled cuBLAS Dense MLA ----
+    const int BQ_tile = std::min(T, 256);
+    const int BK_tile = std::min(S_total, 1024);
+
     uint8_t* curp = (uint8_t*) gp.pf_tmp;
     float* pf_qm = (float*) curp;
     curp = align_ptr(curp + (size_t) T * H * c.qk_head * 4);
-    uint16_t* pf_qm16 = (uint16_t*) curp;
-    curp = align_ptr(curp + (size_t) T * H * c.qk_head * 2);
     float* pf_kvall = (float*) curp;
     curp = align_ptr(curp + (size_t) T * (KL + R) * 4);
-    float* pf_qabs = (float*) curp;
-    curp = align_ptr(curp + (size_t) T * H * KL * 4);
-    float* pf_ctx = (float*) curp;
-    curp = align_ptr(curp + (size_t) T * H * KL * 4);
-    uint16_t* pf_ctx16 = (uint16_t*) curp;
-    curp = align_ptr(curp + (size_t) T * H * KL * 2);
-    float* pf_o128 = (float*) curp;
-    curp = align_ptr(curp + (size_t) T * H * c.v_head * 4);
     float* pf_gate = (float*) curp;
+    curp = align_ptr(curp + (size_t) T * H * 4);
+    uint16_t* q_nope16 = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) H * T * QN * 2);
+    uint16_t* q_pe16 = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) H * T * R * 2);
+    uint16_t* wkb16 = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) H * KL * QN * 2);
+    uint16_t* wvb16 = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) H * VH * KL * 2);
+    uint16_t* lat16_buf = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) BK_tile * KL * 2);
+    uint16_t* K_nope16 = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) H * BK_tile * QN * 2);
+    uint16_t* V16 = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) H * BK_tile * VH * 2);
+    float* S_buf = (float*) curp;
+    curp = align_ptr(curp + (size_t) H * BQ_tile * BK_tile * 4);
+    uint16_t* P16_buf = (uint16_t*) curp;
+    curp = align_ptr(curp + (size_t) H * BQ_tile * BK_tile * 2);
+    float* O_acc = (float*) curp;
+    curp = align_ptr(curp + (size_t) H * T * VH * 4);
+    float* m_buf = (float*) curp;
+    curp = align_ptr(curp + (size_t) H * T * 4);
+    float* l_buf = (float*) curp;
 
     hy::to_f16(gp.pf_cur, (size_t) E, T, E, gp.pf_x16, (size_t) E, s);
     gemm_mat(gp, l.wqm, gp.pf_x16, T, pf_qm);
     gemm_mat(gp, l.wkva, gp.pf_x16, T, pf_kvall);
     gemm_mat(gp, l.wgate, gp.pf_x16, T, pf_gate);
 
-    k::mla_q_prep(pf_qm, T, H, c.qk_head, c.qk_nope, R, nullptr, pos0, c.rope_base, nullptr, nullptr, pf_qm16, s);
-
-    if (!iq::f16_rows(l.wkb.type, l.wkb.p, c.qk_nope, KL * H, gp.pf_w16, c.qk_nope, s))
-        throw std::runtime_error("mla prefill: k_b f16_rows failed");
-    const float alpha = 1.0f, beta = 0.0f;
-    CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, KL, T, c.qk_nope, &alpha, gp.pf_w16,
-                                      CUDA_R_16F, c.qk_nope, (long long) KL * c.qk_nope, pf_qm16, CUDA_R_16F,
-                                      H * c.qk_head, (long long) c.qk_head, &beta, pf_qabs, CUDA_R_32F, H * KL,
-                                      (long long) KL, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-
+    k::mla_q_split_rope_f16(pf_qm, T, H, c.qk_head, QN, R, pos0, c.rope_base, q_nope16, q_pe16, s);
     k::kv_store_split(pf_kvall, T, KL, R, l.kv_a_norm, c.eps, nullptr, pos0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s);
 
-    glmd::MlaPrompt mp;
-    mp.q_abs = pf_qabs;
-    mp.q = pf_qm;
-    mp.q_stride = c.qk_head;
-    mp.q_pe_off = c.qk_nope;
-    mp.lat = l.lat;
-    mp.lat_q8 = o_.kv_q8 ? 1 : 0;
-    mp.k_pe = l.k_pe;
-    mp.walk = glmd::AttnWalk::Dense;
-    mp.p0 = pos0;
-    mp.T = T;
-    mp.n_head = H;
-    mp.kv_lora = KL;
-    mp.qk_rope = R;
-    mp.scale = 1.0f / sqrtf((float) c.qk_head);
-    mp.ctx = pf_ctx;
-    if (!glmd::mla_prompt_wmma(mp, s)) {
-        if (!glmd::mla_prompt_f32(mp, s)) throw std::runtime_error("mla prefill: attention failed");
+    if (!iq::f16_rows(l.wkb.type, l.wkb.p, QN, KL * H, wkb16, QN, s))
+        throw std::runtime_error("mla prefill: k_b f16_rows failed");
+    if (!iq::f16_rows(l.wvb.type, l.wvb.p, KL, VH * H, wvb16, KL, s))
+        throw std::runtime_error("mla prefill: v_b f16_rows failed");
+
+    k::mla_init_state(m_buf, l_buf, O_acc, H, T, VH, s);
+
+    const float one = 1.0f, zero = 0.0f;
+    const float scale = 1.0f / sqrtf((float) c.qk_head);
+
+    for (int k0 = 0; k0 < S_total; k0 += BK_tile) {
+        const int BK = std::min(BK_tile, S_total - k0);
+        const uint16_t* lat16_cur = nullptr;
+        if (o_.kv_q8) {
+            k::lat_q8_to_f16(l.lat, k0, BK, KL, lat16_buf, s);
+            lat16_cur = lat16_buf;
+        } else {
+            lat16_cur = (const uint16_t*) l.lat + (size_t) k0 * KL;
+        }
+
+        // Expand K_nope[H, BK, QN] = wkb[H, KL, QN]^T_col * lat[BK, KL]
+        CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, QN, BK, KL, &one, wkb16, CUDA_R_16F, QN,
+                                          (long long) KL * QN, lat16_cur, CUDA_R_16F, KL, 0LL, &zero, K_nope16,
+                                          CUDA_R_16F, QN, (long long) BK * QN, H, CUBLAS_COMPUTE_32F,
+                                          CUBLAS_GEMM_DEFAULT));
+        // Expand V[H, BK, VH] = wvb[H, VH, KL] * lat[BK, KL]
+        CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, VH, BK, KL, &one, wvb16, CUDA_R_16F, KL,
+                                          (long long) VH * KL, lat16_cur, CUDA_R_16F, KL, 0LL, &zero, V16, CUDA_R_16F,
+                                          VH, (long long) BK * VH, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+        const uint16_t* kpe_cur = l.k_pe + (size_t) k0 * R;
+
+        for (int q0 = 0; q0 < T; q0 += BQ_tile) {
+            const int BQ = std::min(BQ_tile, T - q0);
+            if (pos0 + q0 + BQ - 1 < k0) continue;   // strictly upper-triangular causal skip
+
+            // S[H, BQ, BK] = scale * (K_nope @ Q_nope^T + K_pe @ Q_pe^T)
+            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, BK, BQ, QN, &scale, K_nope16,
+                                              CUDA_R_16F, QN, (long long) BK * QN, q_nope16 + (size_t) q0 * QN,
+                                              CUDA_R_16F, QN, (long long) T * QN, &zero, S_buf, CUDA_R_32F, BK,
+                                              (long long) BQ * BK, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, BK, BQ, R, &scale, kpe_cur, CUDA_R_16F,
+                                              R, 0LL, q_pe16 + (size_t) q0 * R, CUDA_R_16F, R, (long long) T * R, &one,
+                                              S_buf, CUDA_R_32F, BK, (long long) BQ * BK, H, CUBLAS_COMPUTE_32F,
+                                              CUBLAS_GEMM_DEFAULT));
+
+            k::mla_online_softmax(S_buf, H, T, q0, BQ, k0, BK, pos0, m_buf, l_buf, O_acc, VH, P16_buf, s);
+
+            // O_acc[H, q0..q0+BQ, VH] += V[H, BK, VH] * P16[H, BQ, BK]
+            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, VH, BQ, BK, &one, V16, CUDA_R_16F, VH,
+                                              (long long) BK * VH, P16_buf, CUDA_R_16F, BK, (long long) BQ * BK, &one,
+                                              O_acc + (size_t) q0 * VH, CUDA_R_32F, VH, (long long) T * VH, H,
+                                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        }
     }
 
-    hy::to_f16(pf_ctx, (size_t) H * KL, T, H * KL, pf_ctx16, (size_t) H * KL, s);
-    if (!iq::f16_rows(l.wvb.type, l.wvb.p, KL, c.v_head * H, gp.pf_w16, KL, s))
-        throw std::runtime_error("mla prefill: v_b f16_rows failed");
-    CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, c.v_head, T, KL, &alpha, gp.pf_w16, CUDA_R_16F,
-                                      KL, (long long) c.v_head * KL, pf_ctx16, CUDA_R_16F, H * KL, (long long) KL,
-                                      &beta, pf_o128, CUDA_R_32F, H * c.v_head, (long long) c.v_head, H,
-                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-
-    k::head_gate_out(pf_o128, pf_gate, T, H, c.v_head, nullptr, nullptr, gp.pf_x16, s);
+    k::mla_o_finalize_gate(O_acc, l_buf, pf_gate, T, H, VH, gp.pf_x16, s);
     gemm_mat(gp, l.wom, gp.pf_x16, T, gp.pf_out);
-    hy::add(gp.pf_x, gp.pf_out, (size_t) T * E, s);
+    hy::add(x_io, gp.pf_out, (size_t) T * E, s);
 }
 
-void Model::ffn_dense_prefill(Gpu& gp, Layer& l, int il, int T) {
+void Model::ffn_dense_prefill(Gpu& gp, Layer& l, int il, int T, float* x_io) {
     const Config& c = c_;
     const int E = c.n_embd, FF = c.n_ff;
     cudaStream_t s = gp.s;
@@ -1411,184 +1570,457 @@ void Model::ffn_dense_prefill(Gpu& gp, Layer& l, int il, int T) {
     gemm_mat(gp, l.fu, gp.pf_x16, T, pf_u);
     k::swiglu_clamp_out(pf_g, pf_u, T, FF, c.clamp_shexp[il], nullptr, nullptr, nullptr, gp.pf_x16, s);
     gemm_mat(gp, l.fd, gp.pf_x16, T, gp.pf_out);
-    hy::add(gp.pf_x, gp.pf_out, (size_t) T * E, s);
+    hy::add(x_io, gp.pf_out, (size_t) T * E, s);
 }
 
-void Model::ffn_moe_prefill(Gpu& gp, Layer& l, int il, int T) {
+void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_block, bool layer_borrowed,
+                                  const std::vector<MacroBufs>& mbufs) {
+    Gpu& gp = gpus_[(size_t) gi];
+    const MacroBufs& mb = mbufs[(size_t) gi];
     const Config& c = c_;
     const int E = c.n_embd, FE = c.n_ff_exp, FS = c.n_ff_shexp, NU = c.n_used, NE = c.n_expert;
+    const int P = gp.pf_cap;
+    const int ngpu = (int) gpus_.size();
+    const int max_set_rows = P * NU;
+    const int n_res_eff = layer_borrowed ? 0 : l.n_res;
     cudaStream_t s = gp.s;
     cudaStream_t sc = gp.s_copy;
 
     auto align_ptr = [](uint8_t* p) -> uint8_t* {
         return (uint8_t*) (((uintptr_t) p + 255u) & ~uintptr_t(255u));
     };
-    uint8_t* curp = (uint8_t*) gp.pf_tmp;
-    float* pf_rlog = (float*) curp;
-    curp = align_ptr(curp + (size_t) T * NE * 4);
-    uint16_t* pf_h16 = (uint16_t*) curp;
-    curp = align_ptr(curp + (size_t) T * NU * FE * 2);
-    float* pf_y = (float*) curp;
+    auto scratch_ptrs = [&](Gpu& g, uint16_t*& h16, float*& y) {
+        uint8_t* curp = (uint8_t*) g.pf_tmp;
+        curp = align_ptr(curp + (size_t) P * NE * 4);
+        h16 = (uint16_t*) curp;
+        curp = align_ptr(curp + (size_t) max_set_rows * FE * 2);
+        y = (float*) curp;
+    };
 
-    if (l.router_type == 0) {
-        const float alpha = 1.0f, beta = 0.0f;
-        CKBLAS(cublasSgemm(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, NE, T, E, &alpha, (const float*) l.router_w, E, gp.pf_cur,
-                           E, &beta, pf_rlog, NE));
-    } else {
-        hy::gemv_bf16w((const uint16_t*) l.router_w, (size_t) E, E, NE, gp.pf_cur, (size_t) E, T, pf_rlog, (size_t) NE,
-                       1.0f, s);
+    set_dev(gp.dev);
+
+    // 1. RMSNorm + Router across all B tokens (tiled by P to reuse pf_tmp for router logits)
+    for (int t0 = 0; t0 < B; t0 += P) {
+        const int T = std::min(P, B - t0);
+        float* x_t = mb.x + (size_t) t0 * E;
+        float* cur_t = mb.cur + (size_t) t0 * E;
+        int* ids_t = mb.ids + (size_t) t0 * NU;
+        float* w_t = mb.w + (size_t) t0 * NU;
+        float* pf_rlog = gp.pf_tmp;
+        hy::rmsnorm(x_t, (size_t) E, T, E, l.ffn_norm, c.eps, cur_t, (size_t) E, s);
+        if (l.router_type == 0) {
+            const float alpha = 1.0f, beta = 0.0f;
+            CKBLAS(cublasSgemm(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, NE, T, E, &alpha, (const float*) l.router_w, E, cur_t,
+                               E, &beta, pf_rlog, NE));
+        } else {
+            hy::gemv_bf16w((const uint16_t*) l.router_w, (size_t) E, E, NE, cur_t, (size_t) E, T, pf_rlog, (size_t) NE,
+                           1.0f, s);
+        }
+        k::router_grouped(pf_rlog, l.rb_dev, T, NE, NU, c.n_group, c.n_group_used, c.w_norm, c.w_scale, ids_t, w_t, s);
     }
 
-    k::router_grouped(pf_rlog, l.rb_dev, T, NE, NU, c.n_group, c.n_group_used, c.w_norm, c.w_scale, gp.pf_ids, gp.pf_w,
-                      s);
-
+    // 2. Read back routing IDs and identify hits vs misses
     std::vector<int> miss_list;
+    std::vector<int> chunk_counts((size_t) NE, 0);
     int vram_hits = 0;
-    if (l.n_res < NE) {
-        CK(cudaMemcpyAsync(l.h_slot.data(), l.fl.slot, (size_t) NE * sizeof(int), cudaMemcpyDeviceToHost, s));
-        CK(cudaMemcpyAsync(gp.h_pf_ids, gp.pf_ids, (size_t) T * NU * sizeof(int), cudaMemcpyDeviceToHost, s));
-        if (lane_ && T <= 48) {
-            CK(cudaMemcpyAsync(gp.h_pf_w, gp.pf_w, (size_t) T * NU * sizeof(float), cudaMemcpyDeviceToHost, s));
+    int vram_max_rows = 0;
+    if (n_res_eff < NE) {
+        if (n_res_eff > 0) {
+            CK(cudaMemcpyAsync(l.h_slot.data(), l.fl.slot, (size_t) NE * sizeof(int), cudaMemcpyDeviceToHost, s));
+        }
+        CK(cudaMemcpyAsync(gp.h_pf_ids, mb.ids, (size_t) B * NU * sizeof(int), cudaMemcpyDeviceToHost, s));
+        if (lane_ && B <= 48) {
+            CK(cudaMemcpyAsync(gp.h_pf_w, mb.w, (size_t) B * NU * sizeof(float), cudaMemcpyDeviceToHost, s));
         }
         CK(cudaStreamSynchronize(s));
-        std::vector<uint8_t> seen((size_t) NE, 0);
-        for (int i = 0; i < T * NU; ++i) {
+        for (int i = 0; i < B * NU; ++i) {
             const int e = gp.h_pf_ids[i];
             l.pf_counts[(size_t) e]++;
-            if (l.h_slot[(size_t) e] >= 0) {
+            const int cnt = ++chunk_counts[(size_t) e];
+            if (n_res_eff > 0 && l.h_slot[(size_t) e] >= 0) {
                 ++vram_hits;
-            } else if (!seen[(size_t) e]) {
-                seen[(size_t) e] = 1;
+                if (cnt > vram_max_rows) vram_max_rows = cnt;
+            } else if (cnt == 1) {
                 miss_list.push_back(e);
             }
         }
     } else {
-        vram_hits = T * NU;
+        vram_hits = B * NU;
     }
 
-    auto run_set = [&](const uint8_t* wbase, const int* slot_map, int n_slots, bool accumulate) {
-        hy::moe_sort(gp.pf_ids, T, NU, NE, gp.pf_bounds, gp.pf_tok, gp.pf_row_of, s, slot_map, nullptr, n_slots);
+    // 3. Inline D2D cache warming plan on last macro-block (skipped for borrowed layers, restored post-prefill)
+    const bool warm_inline =
+        is_last_block && !layer_borrowed && o_.cache_warm && n_res_eff > 0 && n_res_eff < NE && l.host_blobs != nullptr;
+    std::vector<int> promote_slot;
+    std::vector<int> new_slot;
+    std::vector<uint8_t> promoted_done;
+    bool do_warm_commit = false;
+    if (warm_inline) {
+        uint32_t max_c = 0;
+        for (uint32_t v : l.pf_counts) max_c = std::max(max_c, v);
+        if (max_c > 0) {
+            do_warm_commit = true;
+            std::vector<int> order((size_t) NE);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                if (l.pf_counts[(size_t) a] != l.pf_counts[(size_t) b])
+                    return l.pf_counts[(size_t) a] > l.pf_counts[(size_t) b];
+                return (l.h_slot[(size_t) a] >= 0) > (l.h_slot[(size_t) b] >= 0);
+            });
+            std::vector<uint8_t> want_e((size_t) NE, 0);
+            for (int i = 0; i < n_res_eff; ++i) want_e[(size_t) order[(size_t) i]] = 1;
+
+            new_slot = l.h_slot;
+            promote_slot.assign((size_t) NE, -1);
+            promoted_done.assign((size_t) NE, 0);
+            std::vector<int> free_slots;
+            l.h_owner.assign((size_t) n_res_eff, -1);
+            for (int e = 0; e < NE; ++e) {
+                const int sl = new_slot[(size_t) e];
+                if (sl >= 0) {
+                    if (want_e[(size_t) e]) {
+                        l.h_owner[(size_t) sl] = e;
+                    } else {
+                        free_slots.push_back(sl);
+                        new_slot[(size_t) e] = -1;
+                    }
+                }
+            }
+            size_t fi = 0;
+            for (int i = 0; i < n_res_eff; ++i) {
+                const int e = order[(size_t) i];
+                if (new_slot[(size_t) e] >= 0) continue;
+                const int sl = free_slots[fi++];
+                new_slot[(size_t) e] = sl;
+                l.h_owner[(size_t) sl] = e;
+                promote_slot[(size_t) e] = sl;
+            }
+            l.h_score.resize((size_t) NE);
+            const float norm = 4.0f / (float) max_c;
+            for (int e = 0; e < NE; ++e) l.h_score[(size_t) e] = (float) l.pf_counts[(size_t) e] * norm;
+        }
+    }
+
+    auto run_set_on = [&](Gpu& g, const MacroBufs& gb, int t0, int T_sub, const uint8_t* wbase, const int* slot_map,
+                          int n_slots, int max_rows, bool accumulate) {
+        if (max_rows <= 0 && n_res_eff < NE) return;
+        uint16_t* h16 = nullptr;
+        float* y = nullptr;
+        scratch_ptrs(g, h16, y);
+        const int* ids_p = gb.ids + (size_t) t0 * NU;
+        const float* w_p = gb.w + (size_t) t0 * NU;
+        const float* cur_p = gb.cur + (size_t) t0 * E;
+        float* moe_p = gb.moe + (size_t) t0 * E;
+        hy::moe_sort(ids_p, T_sub, NU, NE, g.pf_bounds, gb.tok, gb.row_of, g.s, slot_map, nullptr, n_slots);
+        if (max_rows <= 0) {
+            k::max_rows_from_bounds(g.pf_bounds, n_slots, g.d_max_rows, g.s);
+            CK(cudaMemcpyAsync(g.h_max_rows, g.d_max_rows, sizeof(int), cudaMemcpyDeviceToHost, g.s));
+            CK(cudaStreamSynchronize(g.s));
+            max_rows = *g.h_max_rows;
+            if (max_rows <= 0) return;
+        }
         iq::SetArgs a;
         a.wbase = wbase;
         a.stride = l.blob;
         a.tr[0] = l.tr[0];
         a.tr[1] = l.tr[1];
         a.tr[2] = l.tr[2];
-        a.bounds = gp.pf_bounds;
+        a.bounds = g.pf_bounds;
         a.row0 = 0;
-        a.max_rows = T * NU;
+        a.max_rows = max_rows;
         a.n_exp = n_slots;
         a.n_embd = E;
         a.n_ff = FE;
         a.limit = c.clamp_exp[il] > 1e-6f ? -c.clamp_exp[il] : 0.0f;
-        a.xf = gp.pf_cur;
-        a.idx = gp.pf_tok;
+        a.xf = cur_p;
+        a.idx = gb.tok;
         a.ldx = E;
-        a.h = pf_h16;
+        a.h = h16;
         a.ldo = FE;
         a.tg = l.etg;
         a.td = l.etd;
         a.act = iq::kActSwiglu;
-        if (!iq::set_gate_up(a, s)) throw std::runtime_error("moe prefill: set_gate_up failed");
+        if (!iq::set_gate_up(a, g.s)) throw std::runtime_error("moe prefill: set_gate_up failed");
         iq::SetArgs d = a;
         d.xf = nullptr;
         d.idx = nullptr;
-        d.xh = pf_h16;
+        d.xh = h16;
         d.ldx = FE;
         d.h = nullptr;
-        d.y = pf_y;
+        d.y = y;
         d.ldo = E;
-        if (!iq::set_down(d, s)) throw std::runtime_error("moe prefill: set_down failed");
-        hy::moe_combine(pf_y, gp.pf_row_of, gp.pf_w, T, NU, E, gp.pf_moe, s, accumulate);
+        if (!iq::set_down(d, g.s)) throw std::runtime_error("moe prefill: set_down failed");
+        hy::moe_combine(y, gb.row_of, w_p, T_sub, NU, E, moe_p, g.s, accumulate);
     };
 
-    const bool cpu_miss = !miss_list.empty() && lane_ && T <= 48;
-    const size_t n_batches = cpu_miss ? 0 : (miss_list.size() + (size_t) kPfBatch - 1) / (size_t) kPfBatch;
-    auto stage_batch = [&](size_t bi) {
-        const int buf = (int) (bi & 1u);
-        const size_t off = bi * (size_t) kPfBatch;
-        const int B = (int) std::min<size_t>((size_t) kPfBatch, miss_list.size() - off);
-        if (bi >= 2) {
-            // Wait until stream s finished using buf from batch bi-2 before overwriting h_pf_pmap/pf_stage[buf]
-            CK(cudaEventSynchronize(gp.ev_comp[buf]));
+    // Pack an expert list into row-bounded batches (each <= kPfBatch experts AND <= max_set_rows total rows)
+    auto make_batches = [&](const std::vector<int>& elist) {
+        std::vector<std::vector<int>> out;
+        std::vector<int> cur;
+        int cur_rows = 0;
+        for (int e : elist) {
+            const int rc = chunk_counts[(size_t) e];
+            if (!cur.empty() && ((int) cur.size() >= kPfBatch || cur_rows + rc > max_set_rows)) {
+                out.push_back(std::move(cur));
+                cur.clear();
+                cur_rows = 0;
+            }
+            cur.push_back(e);
+            cur_rows += rc;
         }
-        int* pmap_h = gp.h_pf_pmap[buf];
-        std::fill(pmap_h, pmap_h + NE, -1);
-        for (int b = 0; b < B; ++b) pmap_h[miss_list[off + (size_t) b]] = b;
-        CK(cudaMemcpyAsync(gp.pf_pmap[buf], pmap_h, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, sc));
+        if (!cur.empty()) out.push_back(std::move(cur));
+        return out;
+    };
+
+    auto stage_batch_on = [&](Gpu& g, const std::vector<std::vector<int>>& batches, size_t bi) {
+        const int buf = (int) (bi & 1u);
+        const int ring = (int) (bi % (size_t) kPfPmapRing);
+        const auto& blist = batches[bi];
+        const int Bn = (int) blist.size();
+        set_dev(g.dev);
         if (l.host_pinned) {
-            for (int b = 0; b < B; ++b) {
-                const int e = miss_list[off + (size_t) b];
-                CK(cudaMemcpyAsync(gp.pf_stage[buf] + (size_t) b * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob,
-                                   cudaMemcpyHostToDevice, sc));
+            if (bi >= 2) CK(cudaStreamWaitEvent(g.s_copy, g.ev_comp[buf], 0));
+            if (bi >= (size_t) kPfPmapRing) CK(cudaEventSynchronize(g.ev_copy[buf]));
+            int* pmap_h = g.h_pf_pmap[ring];
+            std::fill(pmap_h, pmap_h + NE, -1);
+            for (int b = 0; b < Bn; ++b) pmap_h[blist[(size_t) b]] = b;
+            CK(cudaMemcpyAsync(g.pf_pmap[buf], pmap_h, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, g.s_copy));
+            for (int b = 0; b < Bn; ++b) {
+                const int e = blist[(size_t) b];
+                CK(cudaMemcpyAsync(g.pf_stage[buf] + (size_t) b * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob,
+                                   cudaMemcpyHostToDevice, g.s_copy));
             }
         } else {
+            if (bi >= 2) {
+                CK(cudaEventSynchronize(g.ev_copy[buf]));
+                CK(cudaStreamWaitEvent(g.s_copy, g.ev_comp[buf], 0));
+            }
+            int* pmap_h = g.h_pf_pmap[ring];
+            std::fill(pmap_h, pmap_h + NE, -1);
+            for (int b = 0; b < Bn; ++b) pmap_h[blist[(size_t) b]] = b;
+            CK(cudaMemcpyAsync(g.pf_pmap[buf], pmap_h, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, g.s_copy));
             auto cp = [&](int b) {
-                const int e = miss_list[off + (size_t) b];
-                std::memcpy(gp.h_pf_stage[buf] + (size_t) b * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob);
+                const int e = blist[(size_t) b];
+                std::memcpy(g.h_pf_stage[buf] + (size_t) b * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob);
             };
-            if (lane_ && B >= 4) lane_->parallel_for(B, cp);
-            else for (int b = 0; b < B; ++b) cp(b);
-            CK(cudaMemcpyAsync(gp.pf_stage[buf], gp.h_pf_stage[buf], (size_t) B * l.blob, cudaMemcpyHostToDevice, sc));
+            if (lane_ && Bn >= 4) lane_->parallel_for(Bn, cp);
+            else for (int b = 0; b < Bn; ++b) cp(b);
+            CK(cudaMemcpyAsync(g.pf_stage[buf], g.h_pf_stage[buf], (size_t) Bn * l.blob, cudaMemcpyHostToDevice,
+                               g.s_copy));
         }
-        CK(cudaEventRecord(gp.ev_copy[buf], sc));
+        CK(cudaEventRecord(g.ev_copy[buf], g.s_copy));
     };
 
-    // Start first DMA batch on s_copy immediately so it overlaps with VRAM-resident experts on stream s
-    if (n_batches > 0) stage_batch(0);
+    const bool cpu_miss = !miss_list.empty() && lane_ && B <= 48;
+    const bool use_ep = o_.ep_prefill && !cpu_miss && ngpu >= 2 && B >= 256 && (int) miss_list.size() >= 32 &&
+                        l.host_pinned;
 
-    bool accum = false;
-    if (vram_hits > 0) {
-        run_set(l.fl.vram, l.n_res == NE ? nullptr : l.fl.slot, l.n_res, false);
-        accum = true;
-    }
-
-    // Fast path for tiny prompts when CPU lane is active: compute misses on CPU in parallel with VRAM hits
-    if (cpu_miss) {
-        std::vector<float> h_x((size_t) T * E);
-        std::vector<float> h_o((size_t) T * E);
-        CK(cudaMemcpyAsync(h_x.data(), gp.pf_cur, (size_t) T * E * 4, cudaMemcpyDeviceToHost, sc));
-        CK(cudaStreamSynchronize(sc));
-        std::vector<hy4::CpuEntry> entries;
-        entries.reserve((size_t) T * NU);
-        for (int t = 0; t < T; ++t) {
-            for (int j = 0; j < NU; ++j) {
-                const int e = gp.h_pf_ids[t * NU + j];
-                if (l.h_slot[(size_t) e] < 0) entries.push_back({t, e, gp.h_pf_w[t * NU + j]});
+    // 4. Partition misses across owner GPU + idle helper GPUs (EP Prefill Relay)
+    std::vector<std::vector<int>> gpu_misses((size_t) ngpu);
+    if (!cpu_miss && !miss_list.empty()) {
+        if (!use_ep) {
+            gpu_misses[(size_t) gi] = miss_list;
+        } else {
+            std::vector<int> free_misses;
+            free_misses.reserve(miss_list.size());
+            for (int e : miss_list) {
+                if (do_warm_commit && promote_slot[(size_t) e] >= 0) gpu_misses[(size_t) gi].push_back(e);
+                else free_misses.push_back(e);
+            }
+            const size_t total_m = miss_list.size();
+            const size_t owner_target = (n_res_eff > NE / 2) ? (total_m * 42) / (size_t) (100 * (ngpu - 1) + 42)
+                                                             : total_m / (size_t) ngpu;
+            std::vector<int> helpers;
+            for (int hj = 0; hj < ngpu; ++hj)
+                if (hj != gi) helpers.push_back(hj);
+            size_t h_rr = 0;
+            for (int e : free_misses) {
+                if (gpu_misses[(size_t) gi].size() < owner_target) {
+                    gpu_misses[(size_t) gi].push_back(e);
+                } else {
+                    gpu_misses[(size_t) helpers[h_rr % helpers.size()]].push_back(e);
+                    ++h_rr;
+                }
             }
         }
-        hy4::cpu_experts(*lane_, l.cex, entries, h_x.data(), T, h_o.data());
-        CK(cudaMemcpyAsync(gp.pf_out, h_o.data(), (size_t) T * E * 4, cudaMemcpyHostToDevice, s));
-        if (accum) hy::add(gp.pf_moe, gp.pf_out, (size_t) T * E, s);
-        else CK(cudaMemcpyAsync(gp.pf_moe, gp.pf_out, (size_t) T * E * 4, cudaMemcpyDeviceToDevice, s));
+    }
+
+    std::vector<std::vector<std::vector<int>>> gpu_batches((size_t) ngpu);
+    for (int gj = 0; gj < ngpu; ++gj) {
+        if (!gpu_misses[(size_t) gj].empty()) gpu_batches[(size_t) gj] = make_batches(gpu_misses[(size_t) gj]);
+    }
+
+    // 5. Kick off DMA batch 0 on ALL active GPUs immediately + send cur/ids/w to helpers
+    for (int gj = 0; gj < ngpu; ++gj) {
+        if (!gpu_batches[(size_t) gj].empty()) {
+            stage_batch_on(gpus_[(size_t) gj], gpu_batches[(size_t) gj], 0);
+        }
+    }
+    for (int hj = 0; hj < ngpu; ++hj) {
+        if (hj == gi || gpu_batches[(size_t) hj].empty()) continue;
+        const MacroBufs& hb = mbufs[(size_t) hj];
+        transfer_bytes(gi, hj, mb.cur, hb.cur, (size_t) B * E * sizeof(float));
+        transfer_bytes(gi, hj, mb.ids, hb.ids, (size_t) B * NU * sizeof(int));
+        transfer_bytes(gi, hj, mb.w, hb.w, (size_t) B * NU * sizeof(float));
+    }
+
+    // Queue all helper GPU batches asynchronously before owner runs so all GPUs and PCIe links overlap
+    for (int hj = 0; hj < ngpu; ++hj) {
+        if (hj == gi || gpu_batches[(size_t) hj].empty()) continue;
+        Gpu& hg = gpus_[(size_t) hj];
+        const MacroBufs& hb = mbufs[(size_t) hj];
+        const auto& hbatches = gpu_batches[(size_t) hj];
+        set_dev(hg.dev);
+        for (size_t bi = 0; bi < hbatches.size(); ++bi) {
+            const int buf = (int) (bi & 1u);
+            const auto& blist = hbatches[bi];
+            int bmax = 0;
+            for (int e : blist) bmax = std::max(bmax, chunk_counts[(size_t) e]);
+            CK(cudaStreamWaitEvent(hg.s, hg.ev_copy[buf], 0));
+            run_set_on(hg, hb, 0, B, hg.pf_stage[buf], hg.pf_pmap[buf], (int) blist.size(), bmax, bi > 0);
+            CK(cudaEventRecord(hg.ev_comp[buf], hg.s));
+            if (bi + 1 < hbatches.size()) stage_batch_on(hg, hbatches, bi + 1);
+        }
+    }
+
+    // 6. Owner GPU: Shared expert (tiled by P, accumulated directly into mb.x) overlapped with DMA batch 0
+    set_dev(gp.dev);
+    for (int t0 = 0; t0 < B; t0 += P) {
+        const int T = std::min(P, B - t0);
+        float* sh_g = gp.pf_tmp;
+        float* sh_u = sh_g + (size_t) T * FS;
+        hy::to_f16(mb.cur + (size_t) t0 * E, (size_t) E, T, E, gp.pf_x16, (size_t) E, s);
+        gemm_mat(gp, l.fg, gp.pf_x16, T, sh_g);
+        gemm_mat(gp, l.fu, gp.pf_x16, T, sh_u);
+        k::swiglu_clamp_out(sh_g, sh_u, T, FS, c.clamp_shexp[il], nullptr, nullptr, nullptr, gp.pf_x16, s);
+        gemm_mat(gp, l.fd, gp.pf_x16, T, gp.pf_out);
+        hy::add(mb.x + (size_t) t0 * E, gp.pf_out, (size_t) T * E, s);
+    }
+
+    // 7. Owner GPU: VRAM-resident hits (greedily pack max tokens per pass up to max_set_rows to cut redundant dequant)
+    bool accum = false;
+    if (vram_hits > 0) {
+        const int* vslot = (n_res_eff == NE) ? nullptr : l.fl.slot;
+        if (vram_hits <= max_set_rows) {
+            run_set_on(gp, mb, 0, B, l.fl.vram, vslot, n_res_eff, n_res_eff == NE ? 0 : vram_max_rows, false);
+        } else if (n_res_eff == NE) {
+            for (int t0 = 0; t0 < B; t0 += P) {
+                const int T = std::min(P, B - t0);
+                run_set_on(gp, mb, t0, T, l.fl.vram, nullptr, NE, 0, false);
+            }
+        } else {
+            std::vector<int> scnt((size_t) NE, 0);
+            int t0 = 0;
+            while (t0 < B) {
+                std::fill(scnt.begin(), scnt.end(), 0);
+                int sub_rows = 0, sub_max = 0, t1 = t0;
+                while (t1 < B) {
+                    int tok_hits = 0;
+                    for (int j = 0; j < NU; ++j)
+                        if (l.h_slot[(size_t) gp.h_pf_ids[t1 * NU + j]] >= 0) ++tok_hits;
+                    if (t1 > t0 && sub_rows + tok_hits > max_set_rows) break;
+                    sub_rows += tok_hits;
+                    for (int j = 0; j < NU; ++j) {
+                        const int e = gp.h_pf_ids[t1 * NU + j];
+                        if (l.h_slot[(size_t) e] >= 0) sub_max = std::max(sub_max, ++scnt[(size_t) e]);
+                    }
+                    ++t1;
+                }
+                const int T = t1 - t0;
+                if (sub_max == 0) {
+                    CK(cudaMemsetAsync(mb.moe + (size_t) t0 * E, 0, (size_t) T * E * sizeof(float), s));
+                } else {
+                    run_set_on(gp, mb, t0, T, l.fl.vram, vslot, n_res_eff, sub_max, false);
+                }
+                t0 = t1;
+            }
+        }
         accum = true;
     }
 
-    if (n_batches > 0) {
-        for (size_t bi = 0; bi < n_batches; ++bi) {
+    // 8. Tiny-prompt CPU lane fast path
+    if (cpu_miss) {
+        std::vector<float> h_x((size_t) B * E);
+        std::vector<float> h_o((size_t) B * E);
+        CK(cudaMemcpyAsync(h_x.data(), mb.cur, (size_t) B * E * 4, cudaMemcpyDeviceToHost, sc));
+        CK(cudaStreamSynchronize(sc));
+        std::vector<hy4::CpuEntry> entries;
+        entries.reserve((size_t) B * NU);
+        for (int t = 0; t < B; ++t) {
+            for (int j = 0; j < NU; ++j) {
+                const int e = gp.h_pf_ids[t * NU + j];
+                if (n_res_eff == 0 || l.h_slot[(size_t) e] < 0) entries.push_back({t, e, gp.h_pf_w[t * NU + j]});
+            }
+        }
+        hy4::cpu_experts(*lane_, l.cex, entries, h_x.data(), B, h_o.data());
+        CK(cudaMemcpyAsync(gp.pf_out, h_o.data(), (size_t) B * E * 4, cudaMemcpyHostToDevice, s));
+        if (accum) hy::add(mb.moe, gp.pf_out, (size_t) B * E, s);
+        else CK(cudaMemcpyAsync(mb.moe, gp.pf_out, (size_t) B * E * 4, cudaMemcpyDeviceToDevice, s));
+        accum = true;
+    }
+
+    // 9. Owner GPU: cold staging batches + inline D2D cache promotion
+    const auto& obatches = gpu_batches[(size_t) gi];
+    if (!obatches.empty()) {
+        for (size_t bi = 0; bi < obatches.size(); ++bi) {
             const int buf = (int) (bi & 1u);
-            const size_t off = bi * (size_t) kPfBatch;
-            const int B = (int) std::min<size_t>((size_t) kPfBatch, miss_list.size() - off);
+            const auto& blist = obatches[bi];
+            int bmax = 0;
+            for (int e : blist) bmax = std::max(bmax, chunk_counts[(size_t) e]);
             CK(cudaStreamWaitEvent(s, gp.ev_copy[buf], 0));
-            run_set(gp.pf_stage[buf], gp.pf_pmap[buf], B, accum);
+            run_set_on(gp, mb, 0, B, gp.pf_stage[buf], gp.pf_pmap[buf], (int) blist.size(), bmax, accum);
+            if (do_warm_commit) {
+                for (size_t b = 0; b < blist.size(); ++b) {
+                    const int e = blist[b];
+                    const int sl = promote_slot[(size_t) e];
+                    if (sl >= 0) {
+                        CK(cudaMemcpyAsync(l.fl.vram + (size_t) sl * l.blob, gp.pf_stage[buf] + b * l.blob, l.blob,
+                                           cudaMemcpyDeviceToDevice, s));
+                        promoted_done[(size_t) e] = 1;
+                    }
+                }
+            }
             CK(cudaEventRecord(gp.ev_comp[buf], s));
             accum = true;
-            if (bi + 1 < n_batches) stage_batch(bi + 1);
+            if (bi + 1 < obatches.size()) stage_batch_on(gp, obatches, bi + 1);
         }
-        // Ensure final batch completed before host returns or reuses buffers next layer
-        CK(cudaEventSynchronize(gp.ev_comp[(n_batches - 1) & 1u]));
+        if (!l.host_pinned) CK(cudaEventSynchronize(gp.ev_comp[(obatches.size() - 1) & 1u]));
     }
-    if (!accum) CK(cudaMemsetAsync(gp.pf_moe, 0, (size_t) T * E * 4, s));
+    if (!accum) CK(cudaMemsetAsync(mb.moe, 0, (size_t) B * E * 4, s));
 
-    // Shared expert
-    float* sh_g = gp.pf_tmp;
-    float* sh_u = sh_g + (size_t) T * FS;
-    hy::to_f16(gp.pf_cur, (size_t) E, T, E, gp.pf_x16, (size_t) E, s);
-    gemm_mat(gp, l.fg, gp.pf_x16, T, sh_g);
-    gemm_mat(gp, l.fu, gp.pf_x16, T, sh_u);
-    k::swiglu_clamp_out(sh_g, sh_u, T, FS, c.clamp_shexp[il], nullptr, nullptr, nullptr, gp.pf_x16, s);
-    gemm_mat(gp, l.fd, gp.pf_x16, T, gp.pf_out);
-    k::add2(gp.pf_x, gp.pf_moe, gp.pf_out, (int64_t) T * E, s);
+    // 10. Gather helper GPU partial MoE outputs back into owner mb.moe (tiled by P through gp.pf_out)
+    for (int hj = 0; hj < ngpu; ++hj) {
+        if (hj == gi || gpu_batches[(size_t) hj].empty()) continue;
+        const MacroBufs& hb = mbufs[(size_t) hj];
+        for (int t0 = 0; t0 < B; t0 += P) {
+            const int T = std::min(P, B - t0);
+            transfer_buf(hj, gi, hb.moe + (size_t) t0 * E, gp.pf_out, (size_t) T * E);
+            set_dev(gp.dev);
+            hy::add(mb.moe + (size_t) t0 * E, gp.pf_out, (size_t) T * E, s);
+        }
+        set_dev(gp.dev);
+        CK(cudaEventRecord(gp.ev_xfer, s));
+        set_dev(gpus_[(size_t) hj].dev);
+        CK(cudaStreamWaitEvent(gpus_[(size_t) hj].s, gp.ev_xfer, 0));
+    }
+
+    set_dev(gp.dev);
+    if (do_warm_commit) {
+        for (int e = 0; e < NE; ++e) {
+            const int sl = promote_slot[(size_t) e];
+            if (sl >= 0 && !promoted_done[(size_t) e]) {
+                CK(cudaMemcpyAsync(l.fl.vram + (size_t) sl * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob,
+                                   cudaMemcpyHostToDevice, s));
+            }
+        }
+        l.h_slot = std::move(new_slot);
+        CK(cudaMemcpyAsync(l.fl.slot, l.h_slot.data(), (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(l.fl.owner, l.h_owner.data(), (size_t) n_res_eff * sizeof(int), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(l.fl.score, l.h_score.data(), (size_t) NE * sizeof(float), cudaMemcpyHostToDevice, s));
+        std::fill(l.pf_counts.begin(), l.pf_counts.end(), 0);
+    }
+
+    hy::add(mb.x, mb.moe, (size_t) B * E, s);
 }
 
 void Model::warm_vram_cache() {
@@ -1697,38 +2129,262 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
     }
 
     const Config& c = c_;
-    const int E = c.n_embd, ngpu = (int) gpus_.size();
+    const int E = c.n_embd, NU = c.n_used, NE = c.n_expert, ngpu = (int) gpus_.size();
     const int P = gpus_[0].pf_cap;
-    std::vector<float> row_tmp;
-    if (all_logits_host != nullptr) row_tmp.resize((size_t) c_.vocab);
 
-    for (int off = 0; off < n; off += P) {
-        const int T = std::min(P, n - off);
-        const int cp0 = pos0 + off;
+    bool any_offloaded = false;
+    for (int il = c.n_dense_lead; il < c.n_layers; ++il) {
+        if (layers_[(size_t) il].n_res < NE && layers_[(size_t) il].host_blobs != nullptr) {
+            any_offloaded = true;
+            break;
+        }
+    }
+
+    // Use stage pipelining across GPUs when ngpu >= 2 and we have >= 2 blocks (no all_logits_host sync)
+    // Choose optimal macro-block size:
+    // - 1 GPU: maximize B up to 16384 to minimize repeated PCIe cold expert loads.
+    // - 2+ GPUs: on n >= 8192, prefer B such that n / B >= 2*ngpu (e.g. B=8192 for 32K -> 4 pipelined stages = 80%
+    //   parallel overlap; B=4096 for 8K -> 2 stages = 67% overlap; B=16384 for >=64K -> 90%+ overlap!).
+    const bool want_pipe_buf = (ngpu >= 2 && all_logits_host == nullptr && !o_.ep_prefill);
+    auto macro_bytes_for = [&](int B, bool with_pipe) -> size_t {
+        const size_t x_cnt = with_pipe ? 4u : 3u;
+        return align256((size_t) B * E * sizeof(float)) * x_cnt +
+               align256((size_t) B * NU * sizeof(int)) * 3 +
+               align256((size_t) B * NU * sizeof(float)) + 2048;
+    };
+
+    int B_max = P;
+    size_t borrow_bytes = 0;
+    bool has_pipe_x = false;
+    std::vector<bool> layer_borrowed((size_t) c.n_layers, false);
+    if ((any_offloaded || ngpu >= 2) && n > P && o_.prefill_block > P) {
+        int want_cap = std::min(std::min(o_.prefill_block, gpus_[0].h_pf_cap), ((n + P - 1) / P) * P);
+        if (ngpu >= 2 && !o_.ep_prefill && all_logits_host == nullptr) {
+            // Keep at least 2*ngpu blocks when n >= 16K (B=8192 on 32K, B=16384 on 64K+), and 2 blocks on 8K (B=4096)
+            if (n <= 8192) want_cap = std::min(want_cap, 4096);
+            else if (n <= 49152) want_cap = std::min(want_cap, 8192);
+        }
+        for (int cand : {16384, 8192, 4096}) {
+            if (cand > want_cap || cand <= P) continue;
+            const bool need_pipe = want_pipe_buf && (n > cand);
+            const size_t need = macro_bytes_for(cand, need_pipe);
+            bool fits = true;
+            for (int gi = 0; gi < ngpu; ++gi) {
+                const Gpu& gp = gpus_[(size_t) gi];
+                if (gp.vram_pool == nullptr || need * 4 > gp.vram_pool_bytes) {
+                    fits = false;
+                    break;
+                }
+                const size_t cut = gp.vram_pool_bytes - need;
+                for (int il = std::max(gp.l0, c.n_dense_lead); il < gp.l1; ++il) {
+                    const Layer& l = layers_[(size_t) il];
+                    if (l.n_res > 0 && l.vram_pool_off + (size_t) l.n_res * l.blob > cut && l.host_blobs == nullptr) {
+                        fits = false;
+                        break;
+                    }
+                }
+                if (!fits) break;
+            }
+            if (fits) {
+                B_max = cand;
+                borrow_bytes = need;
+                has_pipe_x = need_pipe;
+                break;
+            }
+        }
+    }
+
+    std::vector<MacroBufs> mbufs((size_t) ngpu);
+    if (borrow_bytes > 0) {
         for (int gi = 0; gi < ngpu; ++gi) {
             Gpu& gp = gpus_[(size_t) gi];
-            set_dev(gp.dev);
-            if (gi == 0) {
-                CK(cudaMemcpyAsync(gp.pf_tok_ids, tokens + off, (size_t) T * sizeof(int), cudaMemcpyHostToDevice, gp.s));
-                if (!k::emb_rows(emb_.p, emb_.type, emb_.k, gp.pf_tok_ids, T, gp.pf_x, gp.s))
+            const size_t cut = gp.vram_pool_bytes - borrow_bytes;
+            for (int il = std::max(gp.l0, c.n_dense_lead); il < gp.l1; ++il) {
+                const Layer& l = layers_[(size_t) il];
+                if (l.n_res > 0 && l.vram_pool_off + (size_t) l.n_res * l.blob > cut)
+                    layer_borrowed[(size_t) il] = true;
+            }
+            uint8_t* p = gp.vram_pool + cut;
+            auto take = [&](size_t bytes) -> uint8_t* {
+                uint8_t* r = p;
+                p += align256(bytes);
+                return r;
+            };
+            mbufs[(size_t) gi].x = (float*) take((size_t) B_max * E * sizeof(float));
+            mbufs[(size_t) gi].pipe_x = has_pipe_x ? (float*) take((size_t) B_max * E * sizeof(float)) : nullptr;
+            mbufs[(size_t) gi].cur = (float*) take((size_t) B_max * E * sizeof(float));
+            mbufs[(size_t) gi].moe = (float*) take((size_t) B_max * E * sizeof(float));
+            mbufs[(size_t) gi].ids = (int*) take((size_t) B_max * NU * sizeof(int));
+            mbufs[(size_t) gi].w = (float*) take((size_t) B_max * NU * sizeof(float));
+            mbufs[(size_t) gi].tok = (int*) take((size_t) B_max * NU * sizeof(int));
+            mbufs[(size_t) gi].row_of = (int*) take((size_t) B_max * NU * sizeof(int));
+        }
+    } else {
+        for (int gi = 0; gi < ngpu; ++gi) {
+            Gpu& gp = gpus_[(size_t) gi];
+            mbufs[(size_t) gi] = {gp.pf_x, gp.pf_cur, gp.pf_moe, gp.pf_w, nullptr, gp.pf_ids, gp.pf_tok, gp.pf_row_of};
+        }
+    }
+
+    const int n_blocks = (n + B_max - 1) / B_max;
+    const bool use_stage_pipe = (ngpu >= 2 && n_blocks >= 2 && has_pipe_x && all_logits_host == nullptr && !o_.ep_prefill);
+
+    auto run_gpu_stage = [&](int gi, int off, int B, bool is_last, float* x_buf) {
+        Gpu& gp = gpus_[(size_t) gi];
+        std::vector<MacroBufs> local_mb = mbufs;
+        local_mb[(size_t) gi].x = x_buf;
+        const int cp0 = pos0 + off;
+        set_dev(gp.dev);
+        if (gi == 0) {
+            for (int t0 = 0; t0 < B; t0 += P) {
+                const int T = std::min(P, B - t0);
+                CK(cudaMemcpyAsync(gp.pf_tok_ids, tokens + off + t0, (size_t) T * sizeof(int),
+                                   cudaMemcpyHostToDevice, gp.s));
+                if (!k::emb_rows(emb_.p, emb_.type, emb_.k, gp.pf_tok_ids, T, x_buf + (size_t) t0 * E, gp.s))
                     throw std::runtime_error("prefill: emb_rows failed");
+            }
+        }
+        for (int il = gp.l0; il < gp.l1; ++il) {
+            Layer& l = layers_[(size_t) il];
+            set_dev(gp.dev);
+            for (int t0 = 0; t0 < B; t0 += P) {
+                const int T = std::min(P, B - t0);
+                float* x_t = x_buf + (size_t) t0 * E;
+                hy::rmsnorm(x_t, (size_t) E, T, E, l.attn_norm, c.eps, gp.pf_cur, (size_t) E, gp.s);
+                if (l.kda) kda_prefill(gp, l, T, x_t);
+                else mla_prefill(gp, l, T, cp0 + t0, x_t);
+            }
+            if (il < c.n_dense_lead) {
+                for (int t0 = 0; t0 < B; t0 += P) {
+                    const int T = std::min(P, B - t0);
+                    float* x_t = x_buf + (size_t) t0 * E;
+                    hy::rmsnorm(x_t, (size_t) E, T, E, l.ffn_norm, c.eps, gp.pf_cur, (size_t) E, gp.s);
+                    ffn_dense_prefill(gp, l, il, T, x_t);
+                }
             } else {
-                transfer_x(gi - 1, gi, T, true);
+                ffn_moe_prefill_macro(gi, l, il, B, is_last, layer_borrowed[(size_t) il], local_mb);
             }
-            for (int il = gp.l0; il < gp.l1; ++il) {
-                Layer& l = layers_[(size_t) il];
-                hy::rmsnorm(gp.pf_x, (size_t) E, T, E, l.attn_norm, c.eps, gp.pf_cur, (size_t) E, gp.s);
-                if (l.kda) kda_prefill(gp, l, T);
-                else mla_prefill(gp, l, T, cp0);
-                hy::rmsnorm(gp.pf_x, (size_t) E, T, E, l.ffn_norm, c.eps, gp.pf_cur, (size_t) E, gp.s);
-                if (il < c.n_dense_lead) ffn_dense_prefill(gp, l, il, T);
-                else ffn_moe_prefill(gp, l, il, T);
+        }
+        if (gi == ngpu - 1 && is_last && all_logits_host == nullptr) {
+            set_dev(gp.dev);
+            hy::rmsnorm(x_buf + (size_t) (B - 1) * E, (size_t) E, 1, E, out_norm_, c.eps, gp.hn, (size_t) E, gp.s,
+                        {gp.xq, gp.xd});
+            iq::MvJob j{out_w_.p, out_w_.ld, out_w_.type, E, c.vocab, 1, gp.xq, gp.xd, gp.logits, (size_t) c.vocab,
+                        nullptr, 1.0f};
+            if (!iq::mv(&j, 1, gp.s)) throw std::runtime_error("prefill: output failed");
+        }
+    };
+
+    if (use_stage_pipe) {
+        // Multi-GPU macro-block stage pipeline: 1 worker thread per GPU stage, ping-pong [0/1] x buffers.
+        // Stage gi produces block m into slot (m & 1), transfers it into stage gi+1's slot (m & 1), and signals
+        // stage gi+1 while immediately starting block m+1 into slot ((m+1) & 1)!
+        struct Link {
+            std::mutex mu;
+            std::condition_variable cv;
+            int ready[2] = {-1, -1};      // block index ready for consumer in slot s
+            int consumed[2] = {-1, -1};   // last block index consumer finished reading from slot s
+        };
+        std::vector<Link> links((size_t) (ngpu - 1));
+        std::exception_ptr err_ptr;
+        std::mutex err_mu;
+
+        auto stage_worker = [&](int gi) {
+            try {
+                Gpu& gp = gpus_[(size_t) gi];
+                float* x_slots[2] = {mbufs[(size_t) gi].x, mbufs[(size_t) gi].pipe_x};
+                for (int blk = 0; blk < n_blocks; ++blk) {
+                    const int slot = blk & 1;
+                    const int off = blk * B_max;
+                    const int B = std::min(B_max, n - off);
+                    const bool is_last = (blk + 1 == n_blocks);
+
+                    if (gi > 0) {
+                        Link& in_link = links[(size_t) (gi - 1)];
+                        std::unique_lock<std::mutex> lk(in_link.mu);
+                        in_link.cv.wait(lk, [&] { return in_link.ready[slot] == blk; });
+                    }
+
+                    run_gpu_stage(gi, off, B, is_last, x_slots[slot]);
+
+                    if (gi + 1 < ngpu) {
+                        // Wait until next stage finished using x_slots_next[slot] from blk - 2
+                        Link& out_link = links[(size_t) gi];
+                        if (blk >= 2) {
+                            std::unique_lock<std::mutex> lk(out_link.mu);
+                            out_link.cv.wait(lk, [&] { return out_link.consumed[slot] >= blk - 2; });
+                        }
+                        Gpu& gn = gpus_[(size_t) (gi + 1)];
+                        float* dst_p = (slot == 0) ? mbufs[(size_t) (gi + 1)].x : mbufs[(size_t) (gi + 1)].pipe_x;
+                        const size_t bytes = (size_t) B * E * sizeof(float);
+                        set_dev(gp.dev);
+                        CK(cudaStreamSynchronize(gp.s));
+                        if (p2p_mat_[(size_t) gi][(size_t) (gi + 1)]) {
+                            CK(cudaMemcpyPeerAsync(dst_p, gn.dev, x_slots[slot], gp.dev, bytes, gp.s));
+                            CK(cudaStreamSynchronize(gp.s));
+                        } else {
+                            const size_t chunk = (size_t) std::max(1, gp.pf_cap) * (size_t) E * sizeof(float);
+                            const uint8_t* sp = (const uint8_t*) x_slots[slot];
+                            uint8_t* dp = (uint8_t*) dst_p;
+                            for (size_t bo = 0; bo < bytes; bo += chunk) {
+                                const size_t nb = std::min(chunk, bytes - bo);
+                                set_dev(gp.dev);
+                                CK(cudaMemcpyAsync(gp.h_xfer, sp + bo, nb, cudaMemcpyDeviceToHost, gp.s));
+                                CK(cudaStreamSynchronize(gp.s));
+                                set_dev(gn.dev);
+                                CK(cudaMemcpyAsync(dp + bo, gp.h_xfer, nb, cudaMemcpyHostToDevice, gn.s_copy));
+                                CK(cudaStreamSynchronize(gn.s_copy));
+                            }
+                        }
+                        {
+                            std::lock_guard<std::mutex> lk(out_link.mu);
+                            out_link.ready[slot] = blk;
+                        }
+                        out_link.cv.notify_all();
+                    }
+
+                    if (gi > 0) {
+                        set_dev(gp.dev);
+                        CK(cudaStreamSynchronize(gp.s));
+                        Link& in_link = links[(size_t) (gi - 1)];
+                        {
+                            std::lock_guard<std::mutex> lk(in_link.mu);
+                            in_link.consumed[slot] = blk;
+                        }
+                        in_link.cv.notify_all();
+                    }
+                }
+                set_dev(gp.dev);
+                CK(cudaStreamSynchronize(gp.s));
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (!err_ptr) err_ptr = std::current_exception();
             }
-            if (gi == ngpu - 1) {
-                if (all_logits_host != nullptr) {
-                    for (int t = 0; t < T; ++t) {
-                        hy::rmsnorm(gp.pf_x + (size_t) t * E, (size_t) E, 1, E, out_norm_, c.eps, gp.hn, (size_t) E,
-                                    gp.s, {gp.xq, gp.xd});
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve((size_t) ngpu);
+        for (int gi = 0; gi < ngpu; ++gi) threads.emplace_back(stage_worker, gi);
+        for (auto& th : threads) th.join();
+        if (err_ptr) std::rethrow_exception(err_ptr);
+    } else {
+        std::vector<float> row_tmp;
+        if (all_logits_host != nullptr) row_tmp.resize((size_t) c_.vocab);
+
+        for (int off = 0; off < n; off += B_max) {
+            const int B = std::min(B_max, n - off);
+            const bool is_last = (off + B == n);
+            for (int gi = 0; gi < ngpu; ++gi) {
+                if (gi > 0) {
+                    transfer_buf(gi - 1, gi, mbufs[(size_t) (gi - 1)].x, mbufs[(size_t) gi].x, (size_t) B * E);
+                }
+                run_gpu_stage(gi, off, B, is_last, mbufs[(size_t) gi].x);
+                if (gi == ngpu - 1 && all_logits_host != nullptr) {
+                    Gpu& gp = gpus_[(size_t) gi];
+                    set_dev(gp.dev);
+                    for (int t = 0; t < B; ++t) {
+                        hy::rmsnorm(mbufs[(size_t) gi].x + (size_t) t * E, (size_t) E, 1, E, out_norm_, c.eps, gp.hn,
+                                    (size_t) E, gp.s, {gp.xq, gp.xd});
                         iq::MvJob j{out_w_.p, out_w_.ld, out_w_.type, E, c.vocab, 1, gp.xq, gp.xd, gp.logits,
                                     (size_t) c.vocab, nullptr, 1.0f};
                         if (!iq::mv(&j, 1, gp.s)) throw std::runtime_error("prefill: output failed");
@@ -1737,22 +2393,72 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
                         CK(cudaStreamSynchronize(gp.s));
                         all_logits_host->insert(all_logits_host->end(), row_tmp.begin(), row_tmp.end());
                     }
-                } else if (off + T == n) {
-                    hy::rmsnorm(gp.pf_x + (size_t) (T - 1) * E, (size_t) E, 1, E, out_norm_, c.eps, gp.hn, (size_t) E,
-                                gp.s, {gp.xq, gp.xd});
-                    iq::MvJob j{out_w_.p, out_w_.ld, out_w_.type, E, c.vocab, 1, gp.xq, gp.xd, gp.logits,
-                                (size_t) c.vocab, nullptr, 1.0f};
-                    if (!iq::mv(&j, 1, gp.s)) throw std::runtime_error("prefill: output failed");
                 }
             }
         }
+        for (auto& gp : gpus_) {
+            set_dev(gp.dev);
+            CK(cudaStreamSynchronize(gp.s));
+        }
     }
 
-    for (auto& gp : gpus_) {
-        set_dev(gp.dev);
-        CK(cudaStreamSynchronize(gp.s));
+    // Restore the 1-2 borrowed tail layers (warming them directly from pf_counts if cache_warm is enabled)
+    if (borrow_bytes > 0) {
+        const auto t_r0 = std::chrono::steady_clock::now();
+        for (int il = c.n_dense_lead; il < c.n_layers; ++il) {
+            if (!layer_borrowed[(size_t) il]) continue;
+            Layer& l = layers_[(size_t) il];
+            if (l.n_res <= 0 || l.host_blobs == nullptr) continue;
+            Gpu& gp = gpus_[(size_t) l.dev_idx];
+            set_dev(gp.dev);
+
+            uint32_t max_c = 0;
+            for (uint32_t v : l.pf_counts) max_c = std::max(max_c, v);
+            std::vector<int> pick;
+            pick.reserve((size_t) l.n_res);
+            if (o_.cache_warm && max_c > 0) {
+                std::vector<int> order((size_t) NE);
+                std::iota(order.begin(), order.end(), 0);
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                    if (l.pf_counts[(size_t) a] != l.pf_counts[(size_t) b])
+                        return l.pf_counts[(size_t) a] > l.pf_counts[(size_t) b];
+                    return (l.h_slot[(size_t) a] >= 0) > (l.h_slot[(size_t) b] >= 0);
+                });
+                for (int i = 0; i < l.n_res; ++i) pick.push_back(order[(size_t) i]);
+            } else {
+                for (int e = 0; e < NE && (int) pick.size() < l.n_res; ++e)
+                    if (l.h_slot[(size_t) e] >= 0) pick.push_back(e);
+                for (int e = 0; e < NE && (int) pick.size() < l.n_res; ++e)
+                    if (l.h_slot[(size_t) e] < 0) pick.push_back(e);
+            }
+            l.h_slot.assign((size_t) NE, -1);
+            l.h_owner.assign((size_t) l.n_res, -1);
+            for (int sl = 0; sl < l.n_res; ++sl) {
+                const int e = pick[(size_t) sl];
+                l.h_slot[(size_t) e] = sl;
+                l.h_owner[(size_t) sl] = e;
+                CK(cudaMemcpyAsync(l.fl.vram + (size_t) sl * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob,
+                                   cudaMemcpyHostToDevice, gp.s_copy));
+            }
+            l.h_score.assign((size_t) NE, 0.0f);
+            if (max_c > 0) {
+                const float norm = 4.0f / (float) max_c;
+                for (int e = 0; e < NE; ++e) l.h_score[(size_t) e] = (float) l.pf_counts[(size_t) e] * norm;
+            }
+            CK(cudaMemcpyAsync(l.fl.slot, l.h_slot.data(), (size_t) NE * sizeof(int), cudaMemcpyHostToDevice,
+                               gp.s_copy));
+            CK(cudaMemcpyAsync(l.fl.owner, l.h_owner.data(), (size_t) l.n_res * sizeof(int), cudaMemcpyHostToDevice,
+                               gp.s_copy));
+            CK(cudaMemcpyAsync(l.fl.score, l.h_score.data(), (size_t) NE * sizeof(float), cudaMemcpyHostToDevice,
+                               gp.s_copy));
+            std::fill(l.pf_counts.begin(), l.pf_counts.end(), 0);
+        }
+        for (auto& gp : gpus_) {
+            set_dev(gp.dev);
+            CK(cudaStreamSynchronize(gp.s_copy));
+        }
+        last_warm_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_r0).count();
     }
-    warm_vram_cache();
     return gpus_.back().logits;
 }
 
@@ -1771,10 +2477,7 @@ const float* Model::mtp_step(const float* h_nextn_dev, int next_token, int pos) 
     if (!k::emb_rows(emb_.p, emb_.type, emb_.k, g0.d_step, 1, g0.dev == gl.dev ? mtp_.emb_buf : g0.out, g0.s))
         throw std::runtime_error("mtp: emb_rows failed");
     if (g0.dev != gl.dev) {
-        CK(cudaEventRecord(g0.ev_xfer, g0.s));
-        set_dev(gl.dev);
-        CK(cudaStreamWaitEvent(gl.s, g0.ev_xfer, 0));
-        CK(cudaMemcpyPeerAsync(mtp_.emb_buf, gl.dev, g0.out, g0.dev, (size_t) E * 4, gl.s));
+        transfer_buf(0, (int) gpus_.size() - 1, g0.out, mtp_.emb_buf, (size_t) E);
     } else {
         set_dev(gl.dev);
     }
