@@ -45,6 +45,7 @@
 #include <array>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -2838,6 +2839,16 @@ struct Model::Impl {
             info.push_back(nb);
         }
         summer = std::make_unique<Summer>(helpers, cpus);
+        // (tensor parallel with the CPU lane: a token window's sums on the caller's thread alone.  Its helpers spin on
+        //  the members' flags through the lane member's FFN - tens of ms - on the cores the lane's workers need; on an
+        //  18-core i9 with 3 RX 7900 XTX the windows took 120 ms with them, 72 alone.  A prompt chunk's sums keep the
+        //  helpers.  Measured on AMD only: NVIDIA's path as before.)
+#if defined(MAYA_USE_HIP)
+        if (!tp_cap.empty() && std::accumulate(tp_cap.begin(), tp_cap.end(), 0LL) < (long long) g.n_expert) {
+            summer->windows_solo(true);
+            info.push_back("INFO tensor parallel with the CPU lane: a token window's sums on one host thread");
+        }
+#endif
         // (a decode round's next window starts some 10 ms after a member's thread has queued this one: watched for)
         crew = std::make_unique<Crew>(tp + H, 0.025);
         pin_cpus = cpus;
