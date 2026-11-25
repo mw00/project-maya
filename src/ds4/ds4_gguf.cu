@@ -1313,6 +1313,131 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
             else a.y[lr * a.ldo + c0 + cc] = fg[j][i];
         }
 }
+
+template <bool GATE_UP>
+__global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    pdl_wait();
+    pdl_trigger();
+    using i2v = int __attribute__((ext_vector_type(2)));
+    struct Tiles {
+        i2v x[BM][4], wg[BN][4], wu[GATE_UP ? BN : 1][4];
+        float xs[BM], gs[BN], us[GATE_UP ? BN : 1];
+    };
+    __shared__ Tiles t;
+    __shared__ int src[BM];
+    // E4M3 bytes for the exact values in lut_init, including signed zero.
+    __shared__ uint8_t codes[16];
+    const int tid = threadIdx.x;
+    if (tid < 16) {
+        constexpr uint8_t magnitude[] = {0x00, 0x38, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54};
+        codes[tid] = magnitude[tid & 7] | ((tid & 8) << 4);
+    }
+    const int e = blockIdx.z, lo = a.bounds[e] - a.row0, end = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + blockIdx.x * BM, c0 = blockIdx.y * BN;
+    if (r0 >= end || end - lo <= a.skip_le) return;
+    const int nr = min(BM, end - r0);
+    if (tid < BM) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    __syncthreads();
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GATE_UP ? a.n_embd : a.n_ff;
+    const size_t rb = mx_row_bytes(K);
+    const int lane = tid & 31, l16 = lane & 15, hi = lane >> 4, warp = tid >> 5;
+    const int mr = (warp >> 1) * 16, nc = (warp & 1) * 32;
+    const int tr = tid >> 2, tq = tid & 3;
+    f8v gate[2]{}, up[2]{};
+    for (int kb = 0; kb < K / kMxBlock; ++kb) {
+#pragma unroll
+        for (int m = 0; m < (GATE_UP ? 2 : 1); ++m) {
+            const uint8_t* q = blob + a.tr[GATE_UP ? m : 2] + (size_t) (c0 + tr) * rb + (size_t) kb * kMxBytes;
+            i2v w{};
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint32_t b = q[1 + (tq & 1) * 8 + j];
+                const uint32_t nibble = (tq & 2) ? (b >> 4) : (b & 15u);
+                w[j / 4] |= (uint32_t) codes[nibble] << ((j & 3) * 8);
+            }
+            (m == 0 ? t.wg : t.wu)[tr][tq] = w;
+            if (tq == 0) (m == 0 ? t.gs : t.us)[tr] = e8m0_half(q[0]);
+        }
+        float values[8];
+        float peak = 0.0f;
+        const int sr = src[tr];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const size_t at = (size_t) max(sr, 0) * a.ldx + (size_t) kb * kMxBlock + tq * 8 + j;
+            values[j] = sr < 0 ? 0.0f : GATE_UP && !a.xh_vec
+                ? (float) (_Float16) a.xf[at] : __half2float(a.xh[at]);
+            peak = fmaxf(peak, fabsf(values[j]));
+        }
+        peak = fmaxf(peak, __shfl_xor(peak, 1));
+        peak = fmaxf(peak, __shfl_xor(peak, 2));
+        const float inv = peak > 0.0f ? 448.0f / peak : 0.0f;
+        if (tq == 0) t.xs[tr] = peak * (1.0f / 448.0f);
+        i2v x;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int i = j * 4;
+            const int pair = __builtin_amdgcn_cvt_pk_fp8_f32(values[i] * inv, values[i + 1] * inv, 0, false);
+            x[j] = __builtin_amdgcn_cvt_pk_fp8_f32(values[i + 2] * inv, values[i + 3] * inv, pair, true);
+        }
+        t.x[tr][tq] = x;
+        __syncthreads();
+        const i2v a0 = t.x[mr + l16][hi], a1 = t.x[mr + l16][hi + 2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int c = nc + 16 * j + l16;
+            f8v g = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a0, t.wg[c][hi], f8v{});
+            g = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a1, t.wg[c][hi + 2], g);
+            f8v u{};
+            if (GATE_UP) {
+                u = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a0, t.wu[c][hi], u);
+                u = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a1, t.wu[c][hi + 2], u);
+            }
+            // Weight and activation scales vary by K block. Restore them before the next block is accumulated.
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float d = t.xs[mr + set_wmma_row(i, hi)];
+                gate[j][i] = fmaf(g[i], d * t.gs[c], gate[j][i]);
+                if (GATE_UP) up[j][i] = fmaf(u[i], d * t.us[c], up[j][i]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int r = mr + set_wmma_row(i, hi), c = nc + 16 * j + l16;
+            if (r >= nr) continue;
+            const size_t out = (size_t) (r0 + r) * a.ldo + c0 + c;
+            if (GATE_UP) a.h[out] = __float2half_rn(swiglu(gate[j][i], up[j][i], a.limit));
+            else a.y[out] = gate[j][i];
+        }
+#else
+    (void) a;
+    __builtin_trap();
+#endif
+}
+
+bool fp8_wmma_ok() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("MAYA_DS4_MXFP4_WMMA_FP8");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    static std::atomic<int> known[64];
+    int dev = 0;
+    if (!enabled || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+        cudaDeviceProp prop{};
+        const bool supported = cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+            (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
+        k = supported ? 2 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k == 2;
+}
 #endif
 // sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); MAYA_DS4_NO_TC=1 keeps the F32 kernel - per device
 // (the GPUs of a run need not be of one generation: a card before sm_70 beside newer ones keeps its F32 kernel)
@@ -2113,13 +2238,16 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     k.ldo = ldh;
     k.xh_vec = x16 != nullptr && ((uintptr_t) x16 & 15) == 0 && (ldx & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_ff / BN), (unsigned) sa.n_exp);
+    if (tc_ok()) {
 #if !defined(MAYA_USE_HIP)
-    if (tc_ok()) pdl_launch(mx_set_tc_kernel<true>, grid, kThreads, 0, s, k);
+        pdl_launch(mx_set_tc_kernel<true>, grid, kThreads, 0, s, k);
 #else
-    if (tc_ok()) pdl_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
+        if (fp8_wmma_ok()) pdl_launch(mx_set_fp8_wmma_kernel<true>, grid, kThreads, 0, s, k);
+        else pdl_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
 #endif
-    else
+    } else {
         pdl_launch(mx_set_kernel<true>, grid, kThreads, 0, s, k);
+    }
     check("set_gate_up");
 }
 
@@ -2171,13 +2299,16 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     k.ldo = ldy;
     k.xh_vec = ((uintptr_t) h16 & 15) == 0 && (ldh & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_embd / BN), (unsigned) sa.n_exp);
+    if (tc_ok()) {
 #if !defined(MAYA_USE_HIP)
-    if (tc_ok()) pdl_launch(mx_set_tc_kernel<false>, grid, kThreads, 0, s, k);
+        pdl_launch(mx_set_tc_kernel<false>, grid, kThreads, 0, s, k);
 #else
-    if (tc_ok()) pdl_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
+        if (fp8_wmma_ok()) pdl_launch(mx_set_fp8_wmma_kernel<false>, grid, kThreads, 0, s, k);
+        else pdl_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
 #endif
-    else
+    } else {
         pdl_launch(mx_set_kernel<false>, grid, kThreads, 0, s, k);
+    }
     check("set_down");
 }
 

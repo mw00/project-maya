@@ -353,6 +353,38 @@ void ref_expert(const Experts& E, int e, const float* x, double lim, std::vector
     for (int d = 0; d < E.D; ++d) y[d] = mx_dot(emat(E, e, 2), E.F, d, hr.data());
 }
 
+// Independent E4M3 reference using the ordered positive codes and ties-to-even.
+std::vector<float> fp8_round(const float* input, int k) {
+    static const auto values = [] {
+        std::vector<float> v(127);
+        for (int i = 0; i < 127; ++i) {
+            const int exponent = i >> 3, fraction = i & 7;
+            v[i] = exponent == 0 ? std::ldexp((float) fraction, -9)
+                                 : std::ldexp(1.0f + fraction / 8.0f, exponent - 7);
+        }
+        return v;
+    }();
+    std::vector<float> output(k);
+    for (int i = 0; i < k; i += 32) {
+        float x[32], peak = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            x[j] = __half2float(__float2half_rn(input[i + j]));
+            peak = std::max(peak, std::abs(x[j]));
+        }
+        if (peak == 0.0f) continue;
+        for (int j = 0; j < 32; ++j) {
+            const float y = std::abs(x[j]) * (448.0f / peak);
+            int hi = std::min(126, (int) (std::lower_bound(values.begin(), values.end(), y) - values.begin()));
+            if (hi > 0) {
+                const float left = y - values[hi - 1], right = values[hi] - y;
+                if (left < right || (left == right && (hi & 1))) --hi;
+            }
+            output[i + j] = std::copysign(values[hi] * (peak * (1.0f / 448.0f)), x[j]);
+        }
+    }
+    return output;
+}
+
 void test_experts(int D, int F, cudaStream_t s) {
     const int n_exp = 12, k = 6, T = 5;
     const float lim = 10.0f;
@@ -472,6 +504,21 @@ void test_experts(int D, int F, cudaStream_t s) {
 
     // the prompt path's set: rows sorted by expert (bounds), each row a token index (row_idx) - experts of a few rows (the
     // light kernels), then of more (the tiles)
+    const char* no_light = std::getenv("MAYA_DS4_NO_LIGHT");
+    const bool light_enabled = no_light == nullptr || no_light[0] != '1';
+    bool fp8 = false;
+#if defined(MAYA_USE_HIP)
+    const char* use_fp8 = std::getenv("MAYA_DS4_MXFP4_WMMA_FP8");
+    const char* no_tc = std::getenv("MAYA_DS4_NO_TC");
+    if (use_fp8 && std::strcmp(use_fp8, "1") == 0 && (!no_tc || no_tc[0] != '1')) {
+        int device = 0;
+        cudaDeviceProp prop{};
+        CU(cudaGetDevice(&device));
+        CU(cudaGetDeviceProperties(&prop, device));
+        fp8 = std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
+              std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0;
+    }
+#endif
     for (int R : {100, 200, 400}) {
         std::vector<int> owner(R), idx(R);
         for (int r = 0; r < R; ++r) owner[r] = (int) (rng() % n_exp);
@@ -486,6 +533,7 @@ void test_experts(int D, int F, cudaStream_t s) {
         const int NT = 40;
         std::vector<float> xs((size_t) NT * D);
         for (auto& v : xs) v = frand();
+        std::fill_n(xs.data(), 32, 0.0f);
         for (int r = 0; r < R; ++r) idx[r] = (int) (rng() % NT);
         float* dxs = dev(xs);
         int *dbd = dev(bounds), *didx = dev(idx);
@@ -522,15 +570,26 @@ void test_experts(int D, int F, cudaStream_t s) {
             if (!same) ++g_fail;
             cudaFree(dx16), cudaFree(dh2);
         }
+        if (!light_enabled) {
+            auto digest = [](const auto& values) {
+                uint64_t hash = 14695981039346656037ull;
+                const auto* bytes = reinterpret_cast<const unsigned char*>(values.data());
+                for (size_t i = 0; i < values.size() * sizeof(values[0]); ++i)
+                    hash = (hash ^ bytes[i]) * 1099511628211ull;
+                return (unsigned long long) hash;
+            };
+            std::printf("WMMA_DIGEST rows=%d h=%016llx down=%016llx\n", R, digest(h16), digest(y));
+        }
         std::vector<float> hgot((size_t) R * F);
         std::vector<double> hwant((size_t) R * F), ywant((size_t) R * D);
         // (an expert of at most 16 rows takes the light kernels: its inputs rounded to int8 per 32, as the token path's)
         int n_light = 0;
-        for (int e = 0; e < n_exp; ++e) n_light += bounds[e + 1] - bounds[e] <= 16 ? bounds[e + 1] - bounds[e] : 0;
+        for (int e = 0; e < n_exp; ++e) n_light += light_enabled && bounds[e + 1] - bounds[e] <= 16 ? bounds[e + 1] - bounds[e] : 0;
         for (int r = 0; r < R; ++r) {
-            const bool light = bounds[owner[r] + 1] - bounds[owner[r]] <= 16;
-            const std::vector<float> xq = light ? q8_round(xs.data() + (size_t) idx[r] * D, D) : std::vector<float>();
-            const float* xr = light ? xq.data() : xs.data() + (size_t) idx[r] * D;
+            const bool light = light_enabled && bounds[owner[r] + 1] - bounds[owner[r]] <= 16;
+            const float* x = xs.data() + (size_t) idx[r] * D;
+            const std::vector<float> xq = light ? q8_round(x, D) : fp8 ? fp8_round(x, D) : std::vector<float>();
+            const float* xr = xq.empty() ? x : xq.data();
             std::vector<float> hr(F);
             for (int f = 0; f < F; ++f) {
                 hwant[(size_t) r * F + f] =
@@ -539,6 +598,7 @@ void test_experts(int D, int F, cudaStream_t s) {
                 hr[f] = hgot[(size_t) r * F + f];   // the down from the F16 h the kernel kept
             }
             if (light) hr = q8_round(hr.data(), F);
+            else if (fp8) hr = fp8_round(hr.data(), F);
             for (int d = 0; d < D; ++d) ywant[(size_t) r * D + d] = mx_dot(emat(E, owner[r], 2), F, d, hr.data());
         }
         char sw[64];
@@ -1922,6 +1982,47 @@ void bench_cpu(int nth) {
 }
 
 // the decode kernels' speed: GB/s of weights read (a token's dense GEMVs and its experts)
+void bench_mx_prompt(cudaStream_t s, int F, int R) {
+    const int D = 5120, NE = 32;
+    Experts S = make_experts(D, F, NE);
+    std::vector<int> bounds(NE + 1), idx(NE * R);
+    for (int e = 0; e <= NE; ++e) bounds[e] = e * R;
+    for (int i = 0; i < NE * R; ++i) idx[i] = i;
+    int *db = dev(bounds), *di = dev(idx);
+    float* xs = dev(std::vector<float>((size_t) NE * R * D, 0.01f));
+    uint16_t* h16 = dev(std::vector<uint16_t>((size_t) NE * R * F));
+    float* y = dev(std::vector<float>((size_t) NE * R * D));
+    x3::SetArgs sa;
+    sa.wbase = S.dev;
+    sa.stride = S.blob;
+    sa.lay = S.lay;
+    sa.n_exp = NE;
+    sa.bounds = db;
+    sa.max_rows = R;
+    sa.n_embd = D;
+    sa.n_ff = F;
+    sa.limit = 10.0f;
+    const double flops = 2.0 * NE * R * 3.0 * D * F;
+    cudaEvent_t a0, a1;
+    cudaEventCreate(&a0);
+    cudaEventCreate(&a1);
+    gg::set_gate_up(sa, xs, D, di, h16, F, s);
+    gg::set_down(sa, h16, F, y, D, s);
+    cudaEventRecord(a0, s);
+    for (int i = 0; i < 5; ++i) {
+        gg::set_gate_up(sa, xs, D, di, h16, F, s);
+        gg::set_down(sa, h16, F, y, D, s);
+    }
+    cudaEventRecord(a1, s);
+    CU(cudaEventSynchronize(a1));
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a0, a1);
+    std::printf("MXFP4 prompt 32 experts x %d rows %8.3f ms  %6.1f TFLOP/s\n", R, ms / 5,
+                flops / (ms / 5 * 1e-3) / 1e12);
+    cudaFree(S.dev), cudaFree(db), cudaFree(di), cudaFree(xs), cudaFree(h16), cudaFree(y);
+    cudaEventDestroy(a0), cudaEventDestroy(a1);
+}
+
 void bench(cudaStream_t s) {
     cudaEvent_t a, b;
     cudaEventCreate(&a);
@@ -1988,45 +2089,7 @@ void bench(cudaStream_t s) {
             gg::moe_down(ma, dh, nullptr, dout, s);
         });
         cudaFree(E.dev);
-        {   // the prompt path: 32 experts x 128 rows each (an 8K chunk's share of 384 experts)
-            const int NE = 32, R = 128;
-            Experts S = make_experts(D, F, NE);
-            std::vector<int> bounds(NE + 1), idx(NE * R);
-            for (int e = 0; e <= NE; ++e) bounds[e] = e * R;
-            for (int i = 0; i < NE * R; ++i) idx[i] = i;
-            int *db = dev(bounds), *di = dev(idx);
-            float* xs = dev(std::vector<float>((size_t) NE * R * D, 0.01f));
-            uint16_t* h16 = dev(std::vector<uint16_t>((size_t) NE * R * F));
-            float* y = dev(std::vector<float>((size_t) NE * R * D));
-            x3::SetArgs sa;
-            sa.wbase = S.dev;
-            sa.stride = S.blob;
-            sa.lay = S.lay;
-            sa.n_exp = NE;
-            sa.bounds = db;
-            sa.max_rows = R;
-            sa.n_embd = D;
-            sa.n_ff = F;
-            sa.limit = 10.0f;
-            const double flops = 2.0 * NE * R * 3.0 * D * F;
-            cudaEvent_t a0, a1;
-            cudaEventCreate(&a0);
-            cudaEventCreate(&a1);
-            gg::set_gate_up(sa, xs, D, di, h16, F, s);
-            gg::set_down(sa, h16, F, y, D, s);
-            cudaEventRecord(a0, s);
-            for (int i = 0; i < 5; ++i) {
-                gg::set_gate_up(sa, xs, D, di, h16, F, s);
-                gg::set_down(sa, h16, F, y, D, s);
-            }
-            cudaEventRecord(a1, s);
-            CU(cudaEventSynchronize(a1));
-            float ms = 0;
-            cudaEventElapsedTime(&ms, a0, a1);
-            std::printf("bench %-40s %8.1f ms  %6.1f TFLOP/s\n", "prompt set: 32 experts x 128 rows", ms / 5,
-                        flops / (ms / 5 * 1e-3) / 1e12);
-            cudaFree(S.dev), cudaFree(db), cudaFree(di), cudaFree(xs), cudaFree(h16), cudaFree(y);
-        }
+        bench_mx_prompt(s, F, 128);
         E.dev = nullptr;
         E = make_experts(D, F, 6);
         for (int i = 0; i < 6; ++i) pp[i] = (unsigned long long) (E.dev + (size_t) i * E.blob);
@@ -3512,6 +3575,18 @@ int main(int argc, char** argv) {
             return same ? 0 : 1;
         }
         return check_rows(t, w, k, n, argc >= 8 ? argv[7] : "real rows", s) ? 0 : 1;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--mx-prompt") == 0) {
+        test_experts(5120, 1152, s);
+        if (gg::launch_errors() != 0) ++g_fail;
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 3 && std::strcmp(argv[1], "--bench-mx-prompt") == 0) {
+        const int rows = std::atoi(argv[2]);
+        if (rows < 17 || rows > 256) return 2;
+        bench_mx_prompt(s, 1152, rows);
+        return gg::launch_errors() == 0 ? 0 : 1;
     }
     if (argc >= 2 && std::strcmp(argv[1], "--bench") == 0) {
         bench(s);
