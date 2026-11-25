@@ -122,7 +122,7 @@ void check_kernel(const char* name, RowsFn fn, void (*set_q5k)(bool) noexcept, i
     const std::vector<int> widths = type == GGML_TYPE_IQ1_M ? std::vector<int>{256, 512, 2048, 2304, 4096, 5120}
                                                          : std::vector<int>{2048, 4096};
     for (int n : widths)
-        for (int nt = 1; nt <= 11; ++nt) {
+        for (int nt = 1; nt <= 17; ++nt) {
             bad += compare(fn, type, n, 17, nt, rng);
             total += 17 * nt;
         }
