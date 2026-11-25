@@ -537,7 +537,7 @@ void test_experts(int D, int F, cudaStream_t s) {
 #if defined(MAYA_USE_HIP)
     const char* use_fp8 = std::getenv("MAYA_DS4_MXFP4_WMMA_FP8");
     const char* no_tc = std::getenv("MAYA_DS4_NO_TC");
-    bf16 = use_fp8 != nullptr && std::strcmp(use_fp8, "2") == 0;
+    bf16 = use_fp8 == nullptr || std::strcmp(use_fp8, "2") == 0;
     if ((bf16 || (use_fp8 != nullptr && std::strcmp(use_fp8, "1") == 0)) && (!no_tc || no_tc[0] != '1')) {
         int device = 0;
         cudaDeviceProp prop{};

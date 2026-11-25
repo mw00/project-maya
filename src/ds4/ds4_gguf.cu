@@ -1440,7 +1440,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a)
 int fp8_wmma_mode() {
     static const int mode = [] {
         const char* v = std::getenv("MAYA_DS4_MXFP4_WMMA_FP8");
-        if (v != nullptr && std::strcmp(v, "2") == 0) return 2;
+        if (v == nullptr || std::strcmp(v, "2") == 0) return 2;
         return v != nullptr && std::strcmp(v, "1") == 0 ? 1 : 0;
     }();
     static std::atomic<int> known[64];
@@ -1454,7 +1454,7 @@ int fp8_wmma_mode() {
         k = supported ? 2 : 1;
         if (supported)
             std::fprintf(stderr, "ds4: GPU%d MXFP4 prefill FP8 WMMA uses %s activation scales\n", dev,
-                         mode == 2 ? "E8M0 power-of-two (BF16 for paired MXFP4)" : "amax/448");
+                         mode == 2 ? "E8M0 power-of-two (paired MXFP4, BF16 inputs)" : "amax/448");
         known[dev].store(k, std::memory_order_relaxed);
     }
     return k == 2 ? mode : 0;
@@ -2267,7 +2267,6 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         // Only the paired MXFP4 kernels share a BF16 SwiGLU buffer.
         if (fp8 == 2 && mx_role(sa.lay, false))
             pdl_launch((mx_set_fp8_wmma_kernel<true, true, true>), grid, kThreads, 0, s, k);
-        else if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<true, true>), grid, kThreads, 0, s, k);
         else if (fp8 == 1) pdl_launch((mx_set_fp8_wmma_kernel<true, false>), grid, kThreads, 0, s, k);
         else pdl_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
 #endif
@@ -2333,7 +2332,6 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
         // Only the paired MXFP4 kernels share a BF16 SwiGLU buffer.
         if (fp8 == 2 && mx_role(sa.lay, true))
             pdl_launch((mx_set_fp8_wmma_kernel<false, true, true>), grid, kThreads, 0, s, k);
-        else if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<false, true>), grid, kThreads, 0, s, k);
         else if (fp8 == 1) pdl_launch((mx_set_fp8_wmma_kernel<false, false>), grid, kThreads, 0, s, k);
         else pdl_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
 #endif
