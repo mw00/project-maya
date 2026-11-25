@@ -85,7 +85,8 @@ class Lowering(unittest.TestCase):
 class Field(unittest.TestCase):
     def test_default_and_range(self):
         cfg = {"exe": "x/maya-ik2", "args": ["--model", "m.gguf"], "installer": {"family": "ik2"}}
-        self.assertEqual(maya_quants.default_thinking_budget(cfg), 32768)
+        self.assertEqual(maya_quants.default_thinking_budget(cfg), 0)       # (an option: none unless set)
+        self.assertIsNone(maya_quants.thinking_budget_for(dict(cfg, thinking_budget=8192)))
         for ok in (0, 256, 32768, 131072, 262144):
             self.assertEqual(maya_quants.check_thinking_budget(ok), ok)
 

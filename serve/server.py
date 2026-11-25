@@ -8327,7 +8327,8 @@ def main() -> int:
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
     svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
-                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.has_think_budget else 0
+                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else
+                           0 if getattr(svc.template, "inkling", False) else 32768)         if svc.has_think_budget else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
     # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)
