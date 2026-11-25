@@ -6957,20 +6957,34 @@ struct Model::Impl {
                                                                             (size_t) sf}}, gp.xf, E, T, xf_pre);
             }
             bool sh_early = false;   // (the shared expert's down already queued - one GPU's token windows, below)
+            bool routed_early = false;
             if (lane_on) {
                 CK(cudaMemcpyAsync(h_ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaMemcpyAsync(h_w, gp.rw, sizeof(float) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaMemcpyAsync(h_lat, gp.lat, sizeof(float) * T * lat, cudaMemcpyDeviceToHost, s));
                 if (fxl) CK(cudaMemcpyAsync(h_who, gp.fxs.who, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaEventRecord(gp.ev, s));
-                if (T <= W)
+                if (T <= W && !forked)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
-                                                                                (size_t) sf}}, gp.xf, E, T);
-                if (T <= W && l.tpm < 0) {   // (its down as well, beside the lane: off the GPU's path after the lane's
+                                                                                (size_t) sf}}, gp.xf, E, T, xf_pre);
+                if (T <= W && l.tpm < 0 && !forked) {   // (its down as well, beside the lane: off the GPU's path after the lane's
                     //  sum - the same kernels on the same rows, gp.cur added after the up-projection as before)
-                    k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
-                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+                    const bool hd_pre = k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s,
+                                                  q8o(f8 && l.sh_down.k == sf, gp.xq, gp.xd));
+                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E, 1.0f, hd_pre);
                     sh_early = true;
+                }
+                if (T <= W) {
+                    // Queue GPU routed experts before blocking on gp.ev: stream ordering guarantees the D2H copies
+                    // above finish before routed_token zeroes CPU weights in gp.rw, eliminating the host-wakeup bubble.
+                    if (fxl) {
+                        CK(cudaStreamWaitEvent(s, gp.fx_ev1, 0));
+                        ok = ok && routed_token(l, gp, T, nullptr, gp.latout, gp.fxs.eptr,
+                                                fx.mode == 2 ? gp.fxs.who : nullptr);
+                    } else {
+                        ok = ok && routed_token(l, gp, T, l.slot_d, gp.latout, nullptr, nullptr, nullptr, forked);
+                    }
+                    routed_early = true;
                 }
                 k::submit(s);   // (AMD under Windows: the copies and the shared expert started now, not at the wait)
                 const double tw = now_s();
@@ -7032,10 +7046,10 @@ struct Model::Impl {
                         route_side = -1;
                     }
                 }
-            } else if (fxl) {   // (the GPU's misses copied first)
+            } else if (!routed_early && fxl) {   // (the GPU's misses copied first)
                 CK(cudaStreamWaitEvent(s, gp.fx_ev1, 0));
                 ok = ok && routed_token(l, gp, T, nullptr, gp.latout, gp.fxs.eptr, fx.mode == 2 ? gp.fxs.who : nullptr);
-            } else {
+            } else if (!routed_early) {
                 ok = ok && routed_token(l, gp, T, slot, gp.latout, nullptr, nullptr,
                                         l.tpm >= 0 && model_sum && !lane_on ? &lat_pre : nullptr, forked);
             }
@@ -7826,26 +7840,30 @@ struct Model::Impl {
         const size_t rb = sizeof(float) * (size_t) E;
         const bool dmp = dfly_dump != nullptr && df.rounds == (std::getenv("HY4_DFLY_DUMP_ROUND") ? std::atoll(std::getenv("HY4_DFLY_DUMP_ROUND")) : 0);
         ++df.rounds;
-        // the picks of pos - 1 to the host, each layer's lists made there
-        df_pk.resize((size_t) df.n * maxk);
-        df_hk.resize((size_t) df.n * W * df.ldk);
-        df_hn.resize((size_t) df.n * (W + 1));
-        for (int i = 0; i < df.n; ++i) {
-            CK(cudaMemcpyAsync(df_pk.data() + (size_t) i * maxk, df.snap + ((size_t) i * W + (size_t) row) * maxk,
-                               sizeof(int) * maxk, cudaMemcpyDeviceToHost, s));
-            CK(cudaMemcpyAsync(df_hn.data() + (size_t) df.n * W + i, df.snap_nk + (size_t) i * W + row, sizeof(int),
-                               cudaMemcpyDeviceToHost, s));
-        }
-        CK(cudaStreamSynchronize(s));
-        for (int i = 0; i < df.n; ++i) {
-            const int np = df_hn[(size_t) df.n * W + i];
-            int* hk = df_hk.data() + (size_t) i * W * df.ldk;
-            if (np < 0 || np > maxk || !dfly_keys(df_pk.data() + (size_t) i * maxk, np, pos, T, hk, df.ldk, df_hn.data() + (size_t) i * W)) {
-                err = "the DFly2 drafter: a trunk layer's picks do not fit its lists";
-                return false;
+        // Build each drafter layer's key lists directly on the GPU (no D2H/sync/H2D round-trip unless dumping)
+        if (!dmp) {
+            k::dfly_expand_keys(df.snap, df.snap_nk, df.n, W, (int) row, maxk, (int) pos, T, df.keys, df.ldk, df.nk, s);
+        } else {
+            df_pk.resize((size_t) df.n * maxk);
+            df_hk.resize((size_t) df.n * W * df.ldk);
+            df_hn.resize((size_t) df.n * (W + 1));
+            for (int i = 0; i < df.n; ++i) {
+                CK(cudaMemcpyAsync(df_pk.data() + (size_t) i * maxk, df.snap + ((size_t) i * W + (size_t) row) * maxk,
+                                   sizeof(int) * maxk, cudaMemcpyDeviceToHost, s));
+                CK(cudaMemcpyAsync(df_hn.data() + (size_t) df.n * W + i, df.snap_nk + (size_t) i * W + row, sizeof(int),
+                                   cudaMemcpyDeviceToHost, s));
             }
-            CK(cudaMemcpyAsync(df.keys + (size_t) i * W * df.ldk, hk, sizeof(int) * (size_t) T * df.ldk, cudaMemcpyHostToDevice, s));
-            CK(cudaMemcpyAsync(df.nk + (size_t) i * W, df_hn.data() + (size_t) i * W, sizeof(int) * T, cudaMemcpyHostToDevice, s));
+            CK(cudaStreamSynchronize(s));
+            for (int i = 0; i < df.n; ++i) {
+                const int np = df_hn[(size_t) df.n * W + i];
+                int* hk = df_hk.data() + (size_t) i * W * df.ldk;
+                if (np < 0 || np > maxk || !dfly_keys(df_pk.data() + (size_t) i * maxk, np, pos, T, hk, df.ldk, df_hn.data() + (size_t) i * W)) {
+                    err = "the DFly2 drafter: a trunk layer's picks do not fit its lists";
+                    return false;
+                }
+                CK(cudaMemcpyAsync(df.keys + (size_t) i * W * df.ldk, hk, sizeof(int) * (size_t) T * df.ldk, cudaMemcpyHostToDevice, s));
+                CK(cudaMemcpyAsync(df.nk + (size_t) i * W, df_hn.data() + (size_t) i * W, sizeof(int) * T, cudaMemcpyHostToDevice, s));
+            }
         }
         // the block: the token's embedding, then the mask's
         tok_row(tok_type, tok_embd + (size_t) tok * tok_ld, E, df.h_emb);

@@ -246,6 +246,10 @@ void ix_pack(const int* keys, int ldk, int T, const int* pos, int kpool, int top
              cudaStream_t s);
 void ix_unpack(const uint16_t* wire, int ldw, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
                cudaStream_t s);
+/// DFly2 drafter's per-layer key lists built directly on the GPU from snap[i][row][0..snap_nk[i][row]):
+/// each row j < T gets the picks in [0, pos) in order followed by pos .. pos + j, into keys[i][j][0..ldk) and nk[i][j].
+void dfly_expand_keys(const int* snap, const int* snap_nk, int n_layers, int W, int row, int maxk, int pos, int T,
+                      int* keys, int ldk, int* nk, cudaStream_t s);
 
 /// The prompt path's attention as two GEMMs (the model's cuBLAS calls) and this between them: S [T H][nkr] (rows ldS
 /// apart) the scores of tokens t (positions pos[t]) and heads h against the keys at positions k0 .. k0 + nkr - 1 ->
