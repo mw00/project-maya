@@ -472,8 +472,10 @@ routes them with its own table and runs the picks it holds with the token path's
 those picks' places before the sum - so every row and the sum's order are one card's, and the answers do not depend
 on which card holds an expert (two cards of one kind: the one-card offload path's answers, checked on the CLI and the
 server's answers, tool calls, pictures and loop guard). Copies between the cards: peer to peer only where the driver
-offers it, the IOMMU translates neither card and a test copy at load arrives intact, else through pinned host memory
-(`IK2_HOST_STAGE=1` forces that; the same answers). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
+offers it, the IOMMU translates neither card and a test copy at load arrives intact, else the shorter wait of the
+driver's copy and pinned host memory, timed at load (`IK2_HOST_STAGE=1` forces the latter, `MAYA_LINK_PICK=driver` the
+former; the same answers: on an RTX 5080 + RTX 4060 Ti without P2P, 97-116 us a round trip against 120-170 us by the
+driver). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
 rows sent back - the split's plain answers; `--drafting auto` measures it). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
 tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
 second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers one card (two
