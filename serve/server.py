@@ -59,7 +59,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, hy4_vision, ling_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
@@ -253,7 +253,7 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 CONTEXT_MIN, CONTEXT_FALLBACK_MAX = models.CONTEXT_MIN, models.CONTEXT_FALLBACK_MAX
 CONTEXT_TESTED, CONTEXT_TESTED_DEFAULT = models.CONTEXT_TESTED, models.CONTEXT_TESTED_DEFAULT
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|ERR|error|"
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|maya-ling:|ling (?:prompt|stat|split|vram|cal|numa|profile|env|draft)|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -1026,6 +1026,31 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
     return out
 
 
+def ling_restore_points(ids, human_seq, tail=512, least=RESTORE_LEAST) -> dict:
+    """Ling-3.2-air restore points: shared system+tools prefix (first <role>HUMAN</role>), last user turn,
+    and optional tail point before the end.  maya-ling also checkpoints every 16K and persists restore points."""
+    if not human_seq or len(ids) < len(human_seq) + 2:
+        return {}
+    m = len(human_seq)
+    first = last = None
+    h0 = human_seq[0]
+    for i in range(len(ids) - m + 1):
+        if ids[i] == h0 and ids[i : i + m] == human_seq:
+            first = i if first is None else first
+            last = i
+    marks, out = [], {}
+    if first is not None and first >= least:
+        out["shared"] = first
+    if last is not None and last >= least and last != first:
+        marks.append(last)
+    t = len(ids) - tail
+    if tail > 0 and t >= least and (last is None or t > last):
+        out["tail"] = t
+    if marks:
+        out["marks"] = sorted(marks)
+    return out
+
+
 HY4_MEASURE_LEFT = re.compile(r"measuring this PC: (\d+) of (\d+) choices done in \d+ s - about (\d+) s more")
 # (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
 #  with the CPU lane; tools/setup_bridge.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
@@ -1220,6 +1245,8 @@ class StrataEngine:
         args = list(args)
         if "--max-context" in args[:-1]:
             args[args.index("--max-context") + 1] = str(int(n))
+        elif "--ctx" in args[:-1]:
+            args[args.index("--ctx") + 1] = str(int(n))
         else:
             args += ["--max-context", str(int(n))]
         self.spawn = (exe, args, cwd, log, env)
@@ -2477,7 +2504,7 @@ def engine_args(cfg: dict) -> list[str]:
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
     # (maya-ik2 on two GPUs splits by experts, not layers - its --gpus 2 is in the config's args)
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) != "ik2":
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) not in ("ik2", "ling"):
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
     # needs its own room there.  On a card the model already fills (Maya-XS leaves ~130 MB) the third
@@ -3050,6 +3077,8 @@ class Service:
                             _special_ids("[e~[") + _special_ids("]~b]") +
                             # Inkling 2 with <|content_model_end_sampling|>
                             _special_ids("<|content_model_end_sampling|>") +
+                            # Ling-3.2-air ends a turn with <|role_end|>
+                            _special_ids("<|role_end|>") +
                             # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
                             (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
                              _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
@@ -3057,6 +3086,7 @@ class Service:
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
+        self.ling_human_seq = list(self.tok.encode("<role>HUMAN</role>")) if getattr(template, "ling", False) else []
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
@@ -3428,6 +3458,8 @@ class Service:
             args = list(cfg.get("args") or [])
             if "--max-context" in args[:-1]:
                 args[args.index("--max-context") + 1] = str(int(n))
+            elif "--ctx" in args[:-1]:
+                args[args.index("--ctx") + 1] = str(int(n))
             else:
                 args += ["--max-context", str(int(n))]
             cfg["args"] = args
@@ -4257,7 +4289,8 @@ class Service:
         if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
             # the engines' own vision towers (DeepSeek, MiniMax, Hy4) read pictures only: say so instead of dropping
             # the video (with a picture next to it) or failing on a missing video encoder (without one)
-            raise ValueError(("Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
+            raise ValueError(("Ling-3.2-air" if isinstance(self.vision, ling_vision.Vision) else
+                              "Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
                               "MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
                              + " reads pictures, not videos")
         if images and isinstance(self.vision, ENGINE_VISION):
@@ -5173,6 +5206,10 @@ class Service:
                 if on and getattr(self.template, "deepseek", False):
                     pts = (deepseek_restore_points_fast if prompt_memo_on() and isinstance(ids, list)
                            else deepseek_restore_points)(ids, self.ds_user_id, self.ds_system_id, tail)
+                    if pts:
+                        sampling = {**(sampling or {}), "_restore": pts}
+                elif on and getattr(self.template, "ling", False) and self.ling_human_seq:
+                    pts = ling_restore_points(ids, self.ling_human_seq, tail)
                     if pts:
                         sampling = {**(sampling or {}), "_restore": pts}
 
@@ -6910,7 +6947,7 @@ def make_handler(svc: Service):
                         rec["reasoning_effort"] = svc.template.effort_shown(svc.default_effort) or \
                             rec["reasoning_effort"]
                 # Hy4-flash alone: its two levels (the page offers these and no others)
-                levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
+                levels = svc.template.thinking_levels()
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -8255,6 +8292,13 @@ def main() -> int:
                      + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
             print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}: "
                   f"{where}), up to {vision.g.max_tokens} tokens a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("vision") == "ling":
+            vision = ling_vision.Vision(ling_vision.Geometry.from_info(engine.info),
+                                        Path(tempfile.mkdtemp(prefix="maya-ling-pictures-")), Vision.load)
+            where = (f"; no permanent VRAM (~{engine.info.get('vision_room_mib')} MiB lent while encoding)"
+                     if engine.info.get("vision_room") == "tail" else "")
+            print(f"[maya] images: Ling-3.2-air vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
+                  f"({vision.g.max_tokens} tokens) a picture{where}", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "hy4":
             # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
             vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
@@ -8371,10 +8415,12 @@ def main() -> int:
         if kept:
             print(f"[maya] {kept} web-chat answer(s) of the last day kept for the page (answers/)", flush=True)
     args = [str(x) for x in cfg.get("args") or []]
-    flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
+    flag = next((f for f in ("--glm-pack", "--gguf", "--model", "-m") if f in args[:-1]), None)
     if flag:                                            # the model's folder: the parent of the pack or GGUF file
-        svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
-        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
+        target_p = Path(args[args.index(flag) + 1]).resolve()
+        svc.model_dir = target_p.parent
+        tc_src = target_p if target_p.is_file() else svc.model_dir
+        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(tc_src)),
                          daemon=True).start()
     elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])

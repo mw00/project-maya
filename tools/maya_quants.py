@@ -16,15 +16,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2", "ling")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 # ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini; the 594B
 #  Inkling-2-Small runs by hand, docs/INKLING2.md)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
-         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
+         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini", "ling": "Ling-3.2-air"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
          "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
-         "ik2": "Inkling 2 Mini"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "ik2": "Inkling 2 Mini", "ling": "Ling 3.2 Air"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -60,6 +60,8 @@ MODEL_DEFAULTS = {
     # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
     # (QUANT_SAMPLING / QUANT_THINK_BUDGET are keyed by this key, not by the family both share)
     "glm53": ({"temperature": 1.0, "top_p": 0.95}, "max"),
+    # Ling-3.2-air (maya-ling): generation_config.json - temperature 1.0, top_p 0.95, top_k 20; thinking on by default
+    "ling": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "high"),
 }
 GLM53 = "glm53"
 
@@ -282,6 +284,8 @@ def config_stem(family: str, key: str | None) -> str | None:
         return "maya-hy4-flash"
     if family == "ik2":                                # (Inkling-2-Mini: its one file set)
         return "maya-inkling-2-mini"
+    if family == "ling":
+        return "maya-ling-3.2-air"
     return f"maya-{setup_id(family, key)}" if family in ("minimax", "hy4") and setup_id(family, key) else None
 
 
@@ -308,6 +312,9 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "hy4", None
     if low in IK2_IDS:                                 # (Inkling-2-Mini: one file set, unsloth's UD-Q4_K_XL)
         return "ik2", IK2_QUANT
+    if low in ("ling", "ling-3.2-air", "ling32", "ling32-air", "ling-maya-s", "ling-maya-xs", "ling-q8"):
+        qmap = {"ling-maya-xs": "Ling-3.2-air-Maya-XS", "ling-maya-s": "Ling-3.2-air-Maya-S", "ling-q8": "Ling-3.2-air-Q8_0"}
+        return "ling", qmap.get(low)
     for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None
@@ -324,6 +331,8 @@ def family_of(cfg: dict) -> str:
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
+    if inst.get("family") == "ling" or exe.startswith("maya-ling"):
+        return "ling"
     if inst.get("family") == "ik2" or exe.startswith("maya-ik2"):   # (Inkling-2-Mini: the setup's; Inkling-2-Small: by hand)
         return "ik2"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):

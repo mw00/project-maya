@@ -878,10 +878,12 @@ HY4_CHUNK_UP_GIB = 0.95
 # the card (the context): tools/ik2_fit.py, shared with the Models page.  Its defaults: maya_quants.MODEL_DEFAULTS
 # ["ik2-mini"] (its author's); thinkingmachines' chat template (tools/ik2/chat_template.jinja) in the tokenizer
 # folder.  One request at a time.
-import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on the card
+import ik2_fit as IK2F
+import ling_fit as LINGF  # noqa: E402  (tools/) what fits on the card
 IK2 = Q.MODEL["ik2"]                               # "Inkling-2-Mini" (its id: the installer record, --model)
 IK2_SHOWN = Q.SHOWN["ik2"]
 IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
+LING_EXE = BUILD / ("maya-ling.exe" if WIN else "maya-ling")
 IK2_MANIFEST = ROOT / "tools" / "ik2" / "download.json"
 IK2_TEMPLATE = ROOT / "tools" / "ik2" / "chat_template.jinja"
 IK2_TOKENIZER_TOOLS = ("tools/strata_tokenizer.py", "tools/ik2/chat_template.jinja")
@@ -889,6 +891,11 @@ IK2_DIR = "maya-ik2"                               # (in the model's folder: tok
 IK2_MODEL_NAME = "inkling-2-mini"
 IK2_MIN_CC = IK2F.MIN_CC
 IK2_PROFILE = ROOT / "data" / "expert-profile-ik2mini.bin"   # (the offload path's starting VRAM tier: maya-ik2's IK2_WARM)
+LING = "Ling-3.2-air"
+LING_SHOWN = "Ling-3.2-air"
+LING_MODEL_NAME = "ling-3.2-air"
+LING_DIR = "maya-ling"
+LING_PROFILE = ROOT / "data" / "expert-profile-ling32.bin"
 FAMILIES =("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
@@ -898,6 +905,8 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     if target == "maya-glm-helper":                    # (GLM's AMD helper program for the two-GPU mode: mixed_builds)
         return BUILD / ("maya-glm-helper.exe" if WIN else "maya-glm-helper")
+    if target == "maya-ling":
+        return BUILD / ("maya-ling.exe" if WIN else "maya-ling")
     return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-ik2": IK2_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 
@@ -1101,13 +1110,14 @@ def fix_config_names(cfg: dict) -> bool:
 
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE
+    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE, LING_EXE
     BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal"}.get(backend, "build")
     EXE = BUILD / ("maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
     IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
+    LING_EXE = BUILD / ("maya-ling.exe" if WIN else "maya-ling")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -2065,7 +2075,7 @@ def config_family(cfg: dict) -> str:
 
 
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+FAMILY_TITLE = {**{k: v for k, v in Q.MODEL.items() if k in FAMILIES}, "qwen": "Qwen-3.8-Flash-Next"}
 
 
 def setup_title(cfg: dict) -> str:
@@ -2073,7 +2083,8 @@ def setup_title(cfg: dict) -> str:
     is GLM-5.3's own name, not GLM-5.3-Flash."""
     if G53.config_is_glm_dsa(cfg):
         return G53.SHOWN
-    return FAMILY_TITLE.get(config_family(cfg), "")
+    fam = config_family(cfg)
+    return FAMILY_TITLE.get(fam, Q.MODEL.get(fam, ""))
 
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
@@ -2085,7 +2096,7 @@ PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
         model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else \
-            IK2_SHOWN if family == "ik2" else QWEN_SHOWN
+            IK2_SHOWN if family == "ik2" else LING if family == "ling" else QWEN_SHOWN
         fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
              "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
@@ -2101,7 +2112,7 @@ def choose_family(a, prev: dict) -> str:
     is the default."""
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else \
-            "hy4" if a.model == HY4 else "ik2" if a.model == IK2 else "glm"
+            "hy4" if a.model == HY4 else "ik2" if a.model == IK2 else "ling" if a.model == LING else "glm"
     if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
         return "qwen"
     if getattr(a, "hy4_quant", None):                  # (--hy4-quant alone: Hy4-Flash's)
@@ -3174,7 +3185,7 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     return meta
 
 
-ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2")
+ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-ling")
 
 
 def target_of_exe(exe) -> str | None:
@@ -3324,7 +3335,7 @@ def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
     and, for GLM, the AMD GPU's helper program (build-hip/maya-glm-helper).  A build that stops does not stop the setup
     or the start: the model then runs on the AMD GPU alone.  Elsewhere (Windows, no NVIDIA card, a CUDA or Metal
     setup): nothing, not a line.  quiet (a start): a line only when something is compiled."""
-    global BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE
+    global BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE, LING_EXE
     if WIN or pc.get("backend") != "hip" or target not in ("maya", "maya-ds4"):
         return
     try:
@@ -3359,9 +3370,10 @@ def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
             return
     if not need_cuda:
         return
-    old = (BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE)
+    old = (BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE, LING_EXE)
     BUILD, STAMP = cuda_dir, cuda_dir / "MAYA-BUILD.json"
-    EXE, DS4_EXE, MM3_EXE, HY4_EXE = BUILD / "maya", BUILD / "maya-ds4", BUILD / "maya-mm3", BUILD / "maya-hy4"
+    EXE, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE, LING_EXE = (
+        BUILD / "maya", BUILD / "maya-ds4", BUILD / "maya-mm3", BUILD / "maya-hy4", BUILD / "maya-ik2", BUILD / "maya-ling")
     try:
         nvcc, hc = toolchain_for(archs, (a.nvcc if a else None) or cuda_meta.get("nvcc"),
                                  (a.host_compiler if a else None) or cuda_meta.get("host_compiler"))
@@ -3374,7 +3386,7 @@ def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
     except SystemExit:
         warn("the NVIDIA card's engine did not compile (the reason is above): the model runs on the AMD GPU alone")
     finally:
-        BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE = old
+        BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE, LING_EXE = old
 
 
 def refresh_mixed_builds(cfg: dict) -> None:
@@ -3399,8 +3411,10 @@ def refresh_engine(cfg: dict) -> None:
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
     target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else \
-        "maya-hy4" if exe == HY4_EXE.resolve() else "maya-ik2" if exe == IK2_EXE.resolve() else "maya"
-    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve(), IK2_EXE.resolve()):
+        "maya-hy4" if exe == HY4_EXE.resolve() else "maya-ik2" if exe == IK2_EXE.resolve() else \
+        "maya-ling" if exe == LING_EXE.resolve() else "maya"
+    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve(),
+                               IK2_EXE.resolve(), LING_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src and target in (meta.get("targets") or ["maya"]):
@@ -5309,7 +5323,7 @@ def busy_gpus(cfg: dict) -> list:
 DISPLAY_MIB = 1536
 
 # Maya's engines as the GPU's process list names them (and the names they had before the rename)
-ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-glm-helper", "strata", "strata-ds4")
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-ling", "maya-glm-helper", "strata", "strata-ds4")
 
 
 def maya_engines_on(cfg: dict) -> list:
@@ -5378,6 +5392,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     if config_family(cfg) == "qwen":      # (the Qwen path sizes its CPU pool and its prompt chunks itself; what can be
         #  measured is its drafter)
         return bool(qwen_draft_calibration(cfg_path) is not None)
+    if config_family(cfg) == "ling":
+        return reset_ling_calibration(cfg)
     if config_family(cfg) == "hy4":       # (maya-hy4 sizes its CPU lane and its expert pool by this PC at every start)
         ok(f"{HY4}: nothing to tune - its engine sizes its CPU lane and its expert pool by this PC at every start")
         return True
@@ -6928,7 +6944,7 @@ REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm st
                           r"^ds4: (?!copying experts |experts \d+ / |loading \d)|^ds4 (?:slots|cache):|^maya-ds4:|"
                           r"^(?:prompt|decode): \d+ tokens in |^decode per token:|^decode (?:reads|left out)|^dspark|"
                           # maya-mm3's: where the model went (its --serve start) and each answer's prompt / decode speed
-                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:|"
+                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:|^maya-ling:|^ling |"
                           # the Monitor's GPU readings: a reading that failed, a reader that stopped and why
                           r"^\[maya\] (?:a GPU reading failed|the GPU readings)",
                           re.I)
@@ -7139,7 +7155,7 @@ def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
     return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4",
-                           "ik2": "maya-ik2"}.get(config_family(cfg), "maya"))
+                           "ik2": "maya-ik2", "ling": "maya-ling"}.get(config_family(cfg), "maya"))
 
 
 
@@ -7167,6 +7183,14 @@ def bench_chat(family: str, tokenizer_dir: Path):
         tpl = ChatTemplate(path if path.exists() else ROOT / "tools" / "ik2" / "chat_template.jinja")
         return lambda q: tpl.render([{"role": "user", "content": q}], reasoning_effort="none",
                                     enable_thinking=False) + "<|message_model|><|content_text|>"
+    if family == "ling":       # (Ling-3.2-air: its verbatim chat template with thinking off)
+        from serve.frontend import ChatTemplate
+        path = Path(tokenizer_dir) / "chat_template.jinja"
+        tpl_p = path if path.exists() else ROOT / "tools" / "ling" / "chat_template.jinja"
+        if tpl_p.exists():
+            tpl = ChatTemplate(tpl_p)
+            return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False)
+        return "<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>{}<|role_end|><role>ASSISTANT</role>\n<think></think>".format
     if family == "qwen":       # (Qwen's turns, the think block closed: the answer itself)
         return "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".format
     return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
@@ -7182,7 +7206,7 @@ def bench_model_name(cfg: dict) -> str:
     q = (cfg.get("installer") or {}).get("quant")
     if not q:
         a = [str(x) for x in cfg.get("args") or []]
-        for k in ("--glm-pack", "--pack", "--model"):
+        for k in ("--glm-pack", "--pack", "--model", "--gguf"):
             if k in a[:-1]:
                 p = Path(a[a.index(k) + 1])
                 q = (p.parent.name if p.name in ("pack", "maya-hy4", "maya-ik2") or p.suffix == ".gguf" else p.name)
@@ -7586,7 +7610,7 @@ def _set_up(a, prev: dict) -> Path | None:
     config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
     Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
     family = choose_family(a, prev)
-    S.model_named(FAMILY_TITLE[family])
+    S.model_named(FAMILY_TITLE.get(family, Q.MODEL.get(family, family)))
     check_parallel(a, family)
     if config_family(prev) != family:
         prev = next((c for c in map(read_json, configs()) if config_family(c) == family and
@@ -7601,6 +7625,8 @@ def _set_up(a, prev: dict) -> Path | None:
         return set_up_hy4(a, prev)
     if family == "ik2":
         return set_up_ik2(a, prev)
+    if family == "ling":
+        return set_up_ling(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -11984,6 +12010,228 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     return cfg_path
 
 
+
+
+def ling_avx2_available() -> bool:
+    """Check whether the host CPU supports AVX2 (required for maya-ling CPU expert lane)."""
+    if WIN:
+        return True
+    try:
+        txt = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
+        return " avx2" in txt or "	avx2" in txt
+    except OSError:
+        return True
+
+
+def ling_find_gguf_and_mmproj(folder: Path) -> tuple[Path | None, Path | None]:
+    """Locate Ling-3.2-air model GGUF (excluding mmproj) and optional mmproj GGUF in `folder`."""
+    if folder.is_file() and folder.suffix == ".gguf":
+        parent = folder.parent
+        mm = next((p for p in sorted(parent.glob("*.gguf")) if "mmproj" in p.name.lower()), None)
+        return folder, mm
+    if not folder.is_dir():
+        return None, None
+    ggufs = [p for p in sorted(folder.rglob("*.gguf")) if p.is_file()]
+    mm = next((p for p in ggufs if "mmproj" in p.name.lower()), None)
+    main_g = next((p for p in ggufs if "mmproj" not in p.name.lower() and "00001-of-" in p.name), None)
+    if main_g is None:
+        main_g = next((p for p in ggufs if "mmproj" not in p.name.lower()), None)
+    return main_g, mm
+
+
+def ling_tokenizer_step(a, d: Path, gguf: Path) -> Path:
+    """Ensure tokenizer folder exists beside the model with Ling's verbatim chat_template.jinja."""
+    step(6, "the tokenizer and the chat template")
+    out = d / LING_DIR / "tokenizer"
+    out.mkdir(parents=True, exist_ok=True)
+    # Copy tokenizer.json if present alongside the GGUF or extract from GGUF via strata_tokenizer.py
+    src_tok = next((p for p in (gguf.parent / "tokenizer.json", d / "tokenizer.json") if p.is_file()), None)
+    if src_tok is not None and not (out / "tokenizer.json").exists():
+        shutil.copy2(src_tok, out / "tokenizer.json")
+    elif not (out / "tokenizer.json").exists() and not (out / "vocab.json").exists():
+        # Try tools/strata_tokenizer.py extraction from GGUF
+        st_py = ROOT / "tools" / "strata_tokenizer.py"
+        if st_py.exists():
+            run([sys.executable, str(st_py), "--gguf", str(gguf), "--out", str(d / LING_DIR)], check=False)
+    tpl_src = ROOT / "tools" / "ling" / "chat_template.jinja"
+    if tpl_src.exists():
+        shutil.copy2(tpl_src, out / "chat_template.jinja")
+    ok(f"tokenizer & verbatim chat template: {out}")
+    return out
+
+
+def write_config_ling(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, kv: str, drafting: str,
+                      models_root: Path, d: Path, mmproj: Path | None, quant_name: str, prev: dict) -> Path:
+    """Write maya-ling-3.2-air.json preserving prior user settings, backing up `.bak-*` and reporting changes."""
+    step(8, "the config")
+    cfg_path = ROOT / "maya-ling-3.2-air.json"
+    before = {str(cfg_path): cfg_path.read_text(encoding="utf-8-sig")} if cfg_path.exists() else {}
+    inst = dict(prev.get("installer") or {})
+    gpus = [int(g["index"]) for g in pc["gpus"]]
+    args = [
+        "--serve",
+        "--gguf", str(gguf),
+        "--max-context", str(ctx),
+        "--kv", "fp16" if LINGF.normalize_kv(kv) == "f16" else "q8",
+    ]
+    if len(gpus) > 1:
+        args += ["--gpus", ",".join(str(i) for i in range(len(gpus)))]
+    if drafting == "auto":
+        args += ["--drafting", "auto"]
+    elif drafting == "mtp":
+        args += ["--drafting", "mtp"]
+    else:
+        args += ["--drafting", "off"]
+    if mmproj is not None and not getattr(a, "no_vision", False):
+        args += ["--mmproj", str(mmproj)]
+    cal_file = d / LING_DIR / "ling-calibration.txt"
+    restore_dir = d / LING_DIR / "restore-points"
+    args += ["--cal-file", str(cal_file), "--restore-dir", str(restore_dir)]
+    if LING_PROFILE.is_file():
+        args += ["--profile", str(LING_PROFILE)]
+
+    sampling, effort = Q.MODEL_DEFAULTS["ling"]
+    cfg = {
+        "exe": str(LING_EXE),
+        "backend": pc.get("backend", "cuda"),
+        "gpu": gpus,
+        "args": args,
+        "tokenizer": str(tok),
+        "chat_template": str(tok / "chat_template.jinja"),
+        "model_name": prev.get("model_name") or LING_MODEL_NAME,
+        "port": int(getattr(a, "port", None) or prev.get("port") or 8080),
+        "sampling": dict(prev.get("sampling") or sampling),
+        "reasoning_effort": prev.get("reasoning_effort") or effort,
+        "log": str(cfg_path.with_suffix(".log")),
+    }
+    env = dict(prev.get("env") or {})
+    if getattr(a, "env", None):
+        env.update(parse_env(a.env))
+    if env:
+        cfg["env"] = env
+    for k in ("host", "api_key"):
+        v = getattr(a, k, None) or prev.get(k)
+        if v:
+            cfg[k] = v
+    cfg["installer"] = {
+        **inst,
+        "family": "ling",
+        "quant": quant_name,
+        "models_dir": str(models_root),
+        "model_dir": str(d),
+        "cal_file": str(cal_file),
+        "restore_dir": str(restore_dir),
+        "written": time.strftime("%Y-%m-%d %H:%M"),
+    }
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    if before:
+        keep_config_backups(before)
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
+    return cfg_path
+
+
+def reset_ling_calibration(cfg: dict) -> bool:
+    """Remove saved Ling calibration file so the next start re-measures split mode & drafting."""
+    inst = cfg.get("installer") or {}
+    cf = inst.get("cal_file")
+    if not cf:
+        args = [str(x) for x in cfg.get("args") or []]
+        if "--cal-file" in args[:-1]:
+            cf = args[args.index("--cal-file") + 1]
+    if cf and Path(cf).is_file():
+        Path(cf).unlink()
+        ok(f"cleared Ling calibration store: {cf} (next start will re-measure)")
+        return True
+    return False
+
+
+def set_up_ling(a, prev: dict) -> Path | None:
+    """Ling-3.2-air setup (steps 1-8): PC check, quant/fit/context/KV/drafting choices, tools,
+    build maya-ling (CUDA archs from chosen cards, never native), model & vision files, tokenizer, config."""
+    inst = prev.get("installer") or {}
+    prev_args = [str(x) for x in (prev.get("args") or [])]
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    prev_kv = prev_args[prev_args.index("--kv") + 1] if "--kv" in prev_args[:-1] else LINGF.DEFAULT_KV
+    prev_draft = prev_args[prev_args.index("--drafting") + 1] if "--drafting" in prev_args[:-1] else "auto"
+    a.gpus_before = prev.get("gpu")
+
+    pc = check_pc(a)                                   # 1
+    ram_gb = mem_gb()[0]
+    why = LINGF.unsupported(pc.get("backend", "cuda"), WIN, pc.get("gpus") or [], ram_gb, ling_avx2_available())
+    if why:
+        fail(why)
+
+    step(2, "your choices")                            # 2
+    manifest = LINGF.download_manifest()
+    quant_names = list((manifest.get("quants") or LINGF.QUANTS).keys())
+    quant_name = getattr(a, "ling_quant", None) or inst.get("quant") or LINGF.DEFAULT_QUANT
+    if quant_name not in LINGF.QUANTS:
+        quant_name = LINGF.DEFAULT_QUANT
+    vrams = [float(g.get("vram_gb") or 0) for g in pc["gpus"]]
+    kv = LINGF.normalize_kv(getattr(a, "kv", None) or prev_kv)
+    rec_ctx = LINGF.recommended_context(vrams, kv, quant_name)
+    ctx = choose_context(a, prev_ctx, LINGF.CONTEXTS, rec_ctx)
+
+    # Unified planner fit verdict & hints
+    word, line = LINGF.verdict(vrams, ram_gb, ctx, kv, quant_name)
+    if word == "does not fit":
+        if getattr(a, "force_fit", False):
+            warn(f"{quant_name} at {ctx}: {line} - continuing (--force-fit)")
+        else:
+            fail(f"{quant_name} does not fit at {ctx}: {line}", "pass --force-fit to try anyway, or pick a shorter --context / --kv q8")
+    elif word == "runs slowly":
+        warn(f"{quant_name} at {ctx} will run slowly: {line}")
+    else:
+        ok(f"fit plan ({quant_name}, {ctx} ctx, {kv.upper()} KV): {line}")
+
+    drafting = getattr(a, "drafting", None) or prev_draft or "auto"
+    if drafting in ("off", "none", "0"):
+        drafting = "none"
+    elif drafting in ("mtp", "on", "1"):
+        drafting = "mtp"
+    else:
+        drafting = "auto"
+
+    models_root = (Path(a.models_dir).expanduser().resolve() if getattr(a, "models_dir", None) else
+                   Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    if getattr(a, "model_dir", None):
+        d = Path(a.model_dir).expanduser().resolve()
+    elif inst.get("model_dir"):
+        d = Path(inst["model_dir"])
+    else:
+        d = models_root / quant_name
+    ok(f"model folder: {d}")
+
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama, "maya-ling")       # 4
+    if not LING_EXE.exists():
+        fail(f"maya-ling was not built ({LING_EXE})", "check the build log above (maya-ling requires CUDA sm_70+ on Linux)")
+
+    step(5, "the model files")                         # 5
+    gguf, mmproj = ling_find_gguf_and_mmproj(d)
+    if gguf is None:
+        fail(f"no Ling-3.2-air .gguf found in {d}",
+             f"pass --model-dir <folder with Ling-3.2-air .gguf> (direct downloads turn on once tools/ling/download.json names a published revision)")
+    ok(f"model GGUF: {gguf} ({gguf.stat().st_size / 1e9:.2f} GB)")
+    if rotational(gguf.parent):
+        warn(f"{gguf.parent} is on a spinning hard disk (HDD): expert reads will be slow; prefer an NVMe SSD")
+
+    tok = ling_tokenizer_step(a, gguf.parent if gguf.parent.is_dir() else d, gguf)  # 6
+
+    step(7, "vision projector")                        # 7
+    if mmproj is not None and not getattr(a, "no_vision", False):
+        ok(f"vision mmproj: {mmproj} ({mmproj.stat().st_size / 1e6:.1f} MB; 0 permanent VRAM, lent while encoding)")
+    elif getattr(a, "no_vision", False):
+        ok("vision disabled (--no-vision)")
+        mmproj = None
+    else:
+        ok("no mmproj GGUF found beside model (text-only start; place Ling-3.2-air-mmproj-BF16.gguf beside model to enable pictures)")
+
+    return write_config_ling(a, pc, meta, gguf, tok, ctx, kv, drafting, models_root,
+                             gguf.parent if gguf.parent.is_dir() else d, mmproj, quant_name, prev)
+
+
 def set_up_and_serve(a, prev: dict) -> tuple | None:
     """On the setup's screen: the setup, then Maya running on the same screen - its server's output there, Ctrl+C
     stops it.  (The config, the server's exit code or None when it was not started), or None when the model was not
@@ -12027,6 +12275,11 @@ def model_option(a) -> str | None:
         return None
     if family == "ik2":                                  # (Inkling-2-Mini: its one file set, unsloth's UD-Q4_K_XL)
         a.model = IK2
+        return None
+    if family == "ling":
+        a.model = LING
+        if key is not None:
+            a.ling_quant = key
         return None
     a.model, flag = {"deepseek": (DS4, "ds4_quant"), "hy4": (HY4, "hy4_quant")}.get(family, (MM3, "mm3_quant"))
     if key is not None:

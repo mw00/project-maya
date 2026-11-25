@@ -1,0 +1,89 @@
+"""tools/test_ling_fit.py - Unit tests for the unified Ling-3.2-air planner (tools/ling_fit.py)
+and its parity with serve/models.py.
+"""
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
+
+import ling_fit as LINGF  # noqa: E402
+from serve import models  # noqa: E402
+
+
+class TestLingFit(unittest.TestCase):
+    def test_exact_kv_and_kda_bytes(self):
+        self.assertEqual(LINGF.KV_BYTES["f16"], 8064)
+        self.assertEqual(LINGF.KV_BYTES["q8"], 4704)
+        self.assertEqual(LINGF.DEFAULT_KV, "f16")
+        self.assertAlmostEqual(LINGF.kv_gib(262144, "f16"), 1.96875, places=4)
+        self.assertAlmostEqual(LINGF.kv_gib(262144, "q8"), 1.1484375, places=4)
+        self.assertAlmostEqual(LINGF.KDA_STATE_GIB, 0.073165, places=4)
+
+    def test_single_and_multi_gpu_plans(self):
+        # 1x 24 GB at 32K FP16: ~6400-7000 VRAM expert slots, rest in RAM
+        p1 = LINGF.plan(24.0, 32768, "f16", "Ling-3.2-air-Maya-S", ram_gb=128.0)
+        self.assertTrue(p1["fits_trunk"])
+        self.assertFalse(p1["resident"])
+        self.assertGreater(p1["vram_slots"], 5000)
+        self.assertEqual(p1["ssd_slots"], 0)
+        self.assertEqual(p1["vision_permanent_gib"], 0.0)
+
+        # 4x 24 GB at 32K FP16: ALL 20,480 experts fit in VRAM!
+        p4 = LINGF.plan([24.0, 24.0, 24.0, 24.0], 32768, "f16", "Ling-3.2-air-Maya-S", ram_gb=128.0)
+        self.assertTrue(p4["fits_trunk"])
+        self.assertTrue(p4["resident"])
+        self.assertEqual(p4["vram_slots"], LINGF.TOTAL_TRUNK_EXPERTS)
+
+    def test_emulated_small_cards_and_ram_cap_ssd(self):
+        # Emulated 8 GB card: zero-expert VRAM pool must still fit trunk & say "runs slowly"
+        p8 = LINGF.plan(8.0, 131072, "f16", "Ling-3.2-air-Maya-S", ram_gb=128.0, reserve_gb=1.2)
+        self.assertTrue(p8["fits_trunk"])
+        self.assertEqual(p8["vram_slots"], 0)
+        word, line = LINGF.verdict(8.0, 128.0, 131072, "f16", "Ling-3.2-air-Maya-S", reserve_gb=1.2)
+        self.assertEqual(word, "runs slowly")
+        self.assertIn("zero-expert", line)
+
+        # RAM below model size -> SSD streaming verdict with smaller-quant hint
+        word_ssd, line_ssd = LINGF.verdict(24.0, 32.0, 32768, "f16", "Ling-3.2-air-Maya-S")
+        self.assertEqual(word_ssd, "runs slowly")
+        self.assertIn("NVMe SSD", line_ssd)
+        self.assertIn("Maya-XS", line_ssd)
+
+        # Card too small -> "does not fit"
+        word_no, _ = LINGF.verdict(4.0, 64.0, 32768, "f16", "Ling-3.2-air-Maya-S")
+        self.assertEqual(word_no, "does not fit")
+
+    def test_unsupported_refusals(self):
+        self.assertIsNotNone(LINGF.unsupported("cuda", True, [{"vram_gb": 24, "cc": 86}], 128, True))
+        self.assertIsNotNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 61}], 128, True))
+        self.assertIsNotNone(LINGF.unsupported("cuda", False, [{"vram_gb": 6, "cc": 86}], 128, True))
+        self.assertIsNotNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 86}], 128, False))
+        self.assertIsNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 86}], 128, True))
+
+    def test_models_py_uses_same_planner_and_defaults(self):
+        cfg = {
+            "exe": str(ROOT / "build" / "maya-ling"),
+            "backend": "cuda",
+            "gpu": [0],
+            "args": ["--serve", "--gguf", "/tmp/Ling-3.2-air.gguf", "--max-context", "32768"],
+            "installer": {"family": "ling", "quant": "Ling-3.2-air-Maya-S"},
+        }
+        shown = models.shown_settings(cfg)
+        self.assertEqual(shown["kv"], "f16")
+        self.assertEqual(shown["parallel"], 1)
+        # Parallel > 1 rejected cleanly with plain explanation
+        with self.assertRaises(ValueError) as ctx:
+            models.apply(cfg, {"parallel": 2})
+        self.assertIn("one request at a time", str(ctx.exception))
+        # Parallel == 1 accepted as no-op
+        applied = models.apply(cfg, {"parallel": 1, "kv": "q8"})
+        self.assertIn("--kv", applied["args"])
+        self.assertEqual(applied["args"][applied["args"].index("--kv") + 1], "q8")
+
+
+if __name__ == "__main__":
+    unittest.main()

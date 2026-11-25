@@ -1,0 +1,192 @@
+[
+ {
+  "name": "single user (thinking on)",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "kwargs": {
+   "enable_thinking": true
+  },
+  "rendered": "<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Hello<|role_end|><role>ASSISTANT</role>\n<think>"
+ },
+ {
+  "name": "single user (thinking off)",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "kwargs": {
+   "enable_thinking": false
+  },
+  "rendered": "<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>Hello<|role_end|><role>ASSISTANT</role>\n<think></think>"
+ },
+ {
+  "name": "system + user",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are concise."
+   },
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "kwargs": {
+   "enable_thinking": true
+  },
+  "rendered": "<role>SYSTEM</role>You are concise.\ndetailed thinking on<|role_end|><role>HUMAN</role>What is 2+2?<|role_end|><role>ASSISTANT</role>\n<think>"
+ },
+ {
+  "name": "multi-turn with reasoning",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Greet back.",
+    "content": "Hello!"
+   },
+   {
+    "role": "user",
+    "content": "Next?"
+   }
+  ],
+  "kwargs": {
+   "enable_thinking": true
+  },
+  "rendered": "<role>SYSTEM</role>Be brief.\ndetailed thinking on<|role_end|><role>HUMAN</role>Hi<|role_end|><role>ASSISTANT</role>\n<think>Greet back.</think>Hello!<|role_end|><role>HUMAN</role>Next?<|role_end|><role>ASSISTANT</role>\n<think>"
+ },
+ {
+  "name": "tool call turn",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "units": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "enable_thinking": true
+  },
+  "rendered": "<role>SYSTEM</role># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"units\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf none of the functions can be used, point it out. If the given question lacks the parameters required by the function, also point it out.\nIf you need to use a function, for each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}\n<arg_key>{arg-key-1}</arg_key>\n<arg_value>{arg-value-1}</arg_value>\n<arg_key>{arg-key-2}</arg_key>\n<arg_value>{arg-value-2}</arg_value>\n...\n</tool_call>\ndetailed thinking on<|role_end|><role>HUMAN</role>Weather in Paris?<|role_end|><role>ASSISTANT</role>\n<think>"
+ },
+ {
+  "name": "tool call + observation",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Call tool.",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "units": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "{\"temp\": 18}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "units": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "enable_thinking": true
+  },
+  "rendered": "<role>SYSTEM</role># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"units\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf none of the functions can be used, point it out. If the given question lacks the parameters required by the function, also point it out.\nIf you need to use a function, for each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}\n<arg_key>{arg-key-1}</arg_key>\n<arg_value>{arg-value-1}</arg_value>\n<arg_key>{arg-key-2}</arg_key>\n<arg_value>{arg-value-2}</arg_value>\n...\n</tool_call>\ndetailed thinking on<|role_end|><role>HUMAN</role>Weather in Paris?<|role_end|><role>ASSISTANT</role>\n<think>Call tool.</think><tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n<arg_key>units</arg_key>\n<arg_value>celsius</arg_value>\n</tool_call><|role_end|><role>OBSERVATION</role>\n<tool_response>\n{\"temp\": 18}\n</tool_response><|role_end|><role>ASSISTANT</role>\n<think>"
+ },
+ {
+  "name": "image turn",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "Describe this."
+     }
+    ]
+   }
+  ],
+  "kwargs": {
+   "enable_thinking": false
+  },
+  "rendered": "<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role><|vision_start|><|image_pad|><|vision_end|>Describe this.<|role_end|><role>ASSISTANT</role>\n<think></think>"
+ }
+]

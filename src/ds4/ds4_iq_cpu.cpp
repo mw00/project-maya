@@ -1592,13 +1592,18 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
                 if (limit > 0.0f) {
                     g = std::fmin(g, limit);
                     u = std::fmin(std::fmax(u, -limit), limit);
+                    ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
+                } else if (limit < 0.0f) {
+                    const float L = -limit;
+                    ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
+                } else {
+                    ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
                 }
-                ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
             }
         return;
     }
     kc::native_gu_rows_split(native(f), gate, up, act, nt, ff, r0, r1,
-                             limit > 0.0f ? limit : std::numeric_limits<float>::infinity());
+                             limit != 0.0f ? limit : std::numeric_limits<float>::infinity());
 }
 
 void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
@@ -1680,8 +1685,13 @@ void iq_cpu_q4x_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, 
             if (limit > 0.0f) {
                 g = std::fmin(g, limit);
                 u = std::fmin(std::fmax(u, -limit), limit);
+                ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
+            } else if (limit < 0.0f) {
+                const float L = -limit;
+                ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
+            } else {
+                ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
             }
-            ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
         }
 #else
     (void) f, (void) gate, (void) up, (void) act, (void) nt, (void) ff, (void) r0, (void) r1, (void) limit;

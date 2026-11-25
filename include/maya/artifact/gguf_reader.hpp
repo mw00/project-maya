@@ -382,6 +382,7 @@ public:
         return false;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
+    uint64_t tensor_file_offset(const TensorInfo& t) const { return data_start_ + t.offset; }
 
 private:
     void open() {

@@ -344,7 +344,8 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
                           const void* const* act, int nt, float* const* ff, int r0, int r1,
                           float swiglu_limit) {
     const int n = (int) f.n_embd;
-    const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
+    const bool pre_clamp = swiglu_limit > 0.0f && swiglu_limit != std::numeric_limits<float>::infinity();
+    const bool post_clamp = swiglu_limit < 0.0f;
     if (r1 > r0) {
         if (const RowsFn fn = exact_rows_nt(f.gu_type, nt)) {
             // every gate row of the range for all tokens (each row decoded once per group of tokens), then every up
@@ -364,17 +365,22 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             for (int t = 0; t < nt; ++t) {
                 for (int r = 0; r < nr; ++r) {
                     float g = go[(size_t) t][r], u = uo[(size_t) t][r];
-                    if (clamp) {
+                    if (pre_clamp) {
                         g = std::fmin(g, swiglu_limit);
                         u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
+                        ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
+                    } else if (post_clamp) {
+                        const float L = -swiglu_limit;
+                        ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
+                    } else {
+                        ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
                     }
-                    ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
                 }
             }
             return;
         }
     }
-    if (nt == 1 && lane_row4_gu(f, gate_base, up_base, act[0], ff[0], r0, r1, swiglu_limit)) return;   // glm-dsa: MAYA_GLM_LANE_ROW4
+    if (!post_clamp && nt == 1 && lane_row4_gu(f, gate_base, up_base, act[0], ff[0], r0, r1, swiglu_limit)) return;   // glm-dsa: MAYA_GLM_LANE_ROW4
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = gate_base + (size_t) r * f.gu_row;
@@ -383,11 +389,16 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
-            if (clamp) {   // GLM's clamped swiglu (glm_ffn's semantics), matching the device path
+            if (pre_clamp) {   // GLM's clamped swiglu (glm_ffn's semantics), matching the device path
                 g = std::fmin(g, swiglu_limit);
                 u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            } else if (post_clamp) {
+                const float L = -swiglu_limit;
+                ff[t][r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
+            } else {
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
             }
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
         }
     }
 }
