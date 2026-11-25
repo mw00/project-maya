@@ -103,6 +103,25 @@ class ReportLines(unittest.TestCase):
                 self.assertFalse(REPORT_LINES.search(line))
 
 
+class StartLineSettings(unittest.TestCase):
+    def test_env_line_lists_only_variables_that_are_read(self):
+        root = Path(__file__).resolve().parents[1]
+        main = (root / "src" / "ling" / "ling_main.cu").read_text(encoding="utf-8")
+        block = re.search(r"kVars\[\] = \{(.*?)\};", main, re.S)
+        self.assertIsNotNone(block)
+        names = re.findall(r'"([A-Z][A-Z0-9_]+)"', block.group(1))
+        self.assertTrue(names)
+        code = "\n".join(p.read_text(encoding="utf-8", errors="replace")
+                         for p in sorted((root / "src" / "ling").glob("*")) if p.suffix in (".cu", ".cpp", ".hpp", ".cuh"))
+        for name in names:
+            with self.subTest(var=name):
+                if name == "CUDA_VISIBLE_DEVICES":     # (read by the CUDA runtime: it decides which cards exist)
+                    continue
+                self.assertRegex(code, r'getenv\(\s*"%s"\s*\)' % name)
+        for gone in ("MAYA_LING_KV", "MAYA_LING_DRAFT", "MAYA_ENGINE_QUIT_S", "OMP_NUM_THREADS"):
+            self.assertNotIn(gone, names)
+
+
 if __name__ == "__main__":
     from serve import models as M
     with tempfile.TemporaryDirectory() as td:

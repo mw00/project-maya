@@ -427,10 +427,12 @@ static void beat(const char* stage = nullptr) {
 }
 
 static void log_env_settings() {
+    // Only variables something reads: the CUDA runtime reads CUDA_VISIBLE_DEVICES, the rest are read with getenv in
+    // src/ling (the cache and drafting are the --kv / --drafting flags; MAYA_ENGINE_QUIT_S is the server's).
+    // serve/test_ling_shared.py checks that every name here is read.
     static const char* kVars[] = {
         "CUDA_VISIBLE_DEVICES", "LING_PROFILE", "LING_CAL_FILE", "LING_SEAM_DIR",
-        "LING_WATCHDOG_S", "LING_PYTHON", "MAYA_LING_KV", "MAYA_LING_DRAFT",
-        "MAYA_ENGINE_QUIT_S", "OMP_NUM_THREADS"
+        "LING_WATCHDOG_S", "LING_PYTHON"
     };
     std::ostringstream os;
     os << "ling env:";
