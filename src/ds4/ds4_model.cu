@@ -2267,6 +2267,7 @@ struct Model::Impl {
     std::vector<std::vector<cudaEvent_t>> prof_pool;   // CUDA events belong to the device that created them
     bool prof_failed = false;
     bool prof_window = false;   // (decode windows only: T == 1)
+    int prof_T = 1;             // (the profiled window's rows: Stats::prof_rows)
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
@@ -2320,9 +2321,20 @@ struct Model::Impl {
     void prof_collect() {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
+        // (the caller's current device given back however this returns: the loops below select each mark's device, and a
+        //  tensor-parallel head group's lead (CUDA0) left on CUDA1 sent the main thread's next GPU0 work astray - the pair
+        //  then hung, CUDA1 spinning in an all-reduce for a partner that never started; TP1's head is the last GPU, whose
+        //  device the loops end on anyway)
+        int prof_cur_dev = 0;
+        cudaGetDevice(&prof_cur_dev);
+        struct DevBack {
+            int d;
+            ~DevBack() { cudaSetDevice(d); }
+        } prof_dev_back{prof_cur_dev};
         const bool chunk_sample = prof_chunk;
         bool sample_ok = !prof_failed;
         double sample_ms[8] = {};
+        double dev_ms[2][8] = {};   // (CUDA0 / CUDA1 apart: a tensor-parallel pair's members run the same layer at once)
         std::vector<std::pair<int, cudaEvent_t>> last;
         int current_dev = -1;
         if (sample_ok) {
@@ -2353,6 +2365,7 @@ struct Model::Impl {
                         break;
                     }
                     sample_ms[m.stage] += ms;
+                    if (m.dev < 2) dev_ms[m.dev][m.stage] += ms;
                     it->second = m.ev;
                 } else {
                     last.push_back({m.dev, m.ev});
@@ -2363,6 +2376,11 @@ struct Model::Impl {
             double* total = chunk_sample ? cprof_ms : st.prof_ms;
             const int stages = chunk_sample ? 8 : 6;
             for (int i = 0; i < stages; ++i) total[i] += sample_ms[i];
+            if (!chunk_sample) {
+                for (int dv = 0; dv < 2; ++dv)
+                    for (int i = 0; i < 6; ++i) st.prof_dev_ms[dv][i] += dev_ms[dv][i];
+                st.prof_rows += prof_T;
+            }
             for (const ProfMark& m : prof_marks) prof_pool[(size_t) m.dev].push_back(m.ev);
             prof_marks.clear();
             if (!chunk_sample) ++st.prof_tokens;
@@ -21894,6 +21912,7 @@ struct Model::Impl {
         if (helper_n > 0 && wplan.async) helper_window(T, wplan);   // (DS4_HELPER: its share, in seq order)
         static const bool prof_any_t = std::getenv("DS4_PROF_T") != nullptr;   // (DS4_PROF_T: the verify windows too)
         prof_window = prof_on && (T == 1 || prof_any_t);
+        prof_T = T;   // (DS4_PROF: the rows of the step being profiled - per GPU and per row in the request's line)
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
         if (par) {
