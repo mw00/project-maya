@@ -2254,6 +2254,79 @@ __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__
     }
     score[(size_t) t * ld + g] = out;
 }
+// Coalesced + multi-token tiled ix_score for Hy4-flash's indexer (16 heads x 128 dims): a block of 256 threads scores
+// TB tokens x (256 / TB) pools, staging dim=128 in 4 tiles of 32 floats with coalesced 16-byte loads.  Every token's
+// per-head FMA order matches ix_score_kernel bit-for-bit.
+template <typename P, int TB>
+__global__ void __launch_bounds__(256) ix_score_tiled_kernel(const float* __restrict__ q, const float* __restrict__ wt,
+                                                             int T, const P* __restrict__ pooled,
+                                                             const int* __restrict__ pos, int kpool, int n_pool,
+                                                             float* __restrict__ score, size_t ld) {
+    constexpr int GP = 256 / TB;
+    __shared__ float sp[GP][33];
+    __shared__ float sq[TB][16][32];
+    __shared__ float sw[TB][16];
+    const int tid = threadIdx.x;
+    const int dt = tid / GP, dg = tid % GP;
+    const int t0 = blockIdx.y * TB, g0 = blockIdx.x * GP;
+    const int t = t0 + dt, g = g0 + dg;
+    if (tid < TB * 16) {
+        const int tt = t0 + (tid >> 4), hh = tid & 15;
+        sw[tid >> 4][hh] = tt < T ? wt[(size_t) tt * 16 + hh] : 0.0f;
+    }
+    const bool live_t = t < T, live_g = g < n_pool;
+    const int nv = live_t ? pos[t] / kpool : 0;
+    const bool active = live_t && live_g && g < nv;
+    float acc[16];
+#pragma unroll
+    for (int h = 0; h < 16; ++h) acc[h] = 0.0f;
+    for (int d0 = 0; d0 < 128; d0 += 32) {
+        for (int it = tid; it < GP * 8; it += 256) {
+            const int r = it >> 3, c = it & 7;
+            if (g0 + r < n_pool) {
+                const float4 v = pooled4(pooled + (size_t) (g0 + r) * 128 + d0, c);
+                sp[r][4 * c + 0] = v.x;
+                sp[r][4 * c + 1] = v.y;
+                sp[r][4 * c + 2] = v.z;
+                sp[r][4 * c + 3] = v.w;
+            }
+        }
+        for (int it = tid; it < TB * 128; it += 256) {
+            const int tt_l = it >> 7, hh = (it >> 3) & 15, c = it & 7;
+            const int tt = t0 + tt_l;
+            if (tt < T) {
+                const float4 v = ((const float4*) (q + ((size_t) tt * 16 + hh) * 128 + d0))[c];
+                sq[tt_l][hh][4 * c + 0] = v.x;
+                sq[tt_l][hh][4 * c + 1] = v.y;
+                sq[tt_l][hh][4 * c + 2] = v.z;
+                sq[tt_l][hh][4 * c + 3] = v.w;
+            }
+        }
+        __syncthreads();
+        if (active) {
+            const float* pk = sp[dg];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float k0 = pk[4 * i + 0], k1 = pk[4 * i + 1], k2 = pk[4 * i + 2], k3 = pk[4 * i + 3];
+#pragma unroll
+                for (int h = 0; h < 16; ++h) {
+                    const float* qh = sq[dt][h] + 4 * i;
+                    acc[h] = fmaf(qh[0], k0, fmaf(qh[1], k1, fmaf(qh[2], k2, fmaf(qh[3], k3, acc[h]))));
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (live_t && live_g) {
+        float out = -INFINITY;
+        if (g < nv) {
+            out = 0.0f;
+#pragma unroll
+            for (int h = 0; h < 16; ++h) out = fmaf(fmaxf(acc[h], 0.0f), sw[dt][h], out);
+        }
+        score[(size_t) t * ld + g] = out;
+    }
+}
 // The same scores on an RDNA GPU's matrix cores (16 heads of 128 dimensions): maya-ds4's WMMA indexer pattern on these
 // pools - a warp a token, its 16 heads' query split into an F16 high and a low part held as A (8 k-steps); the pools
 // in tiles of 64 staged into shared memory as F16 for the block's 8 tokens (the next tile's loads in flight under this
@@ -2397,7 +2470,7 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
             const uint32_t pre = s_prefix, msk = s_mask;
             for (int g = tid; g < nv; g += nth) {
                 const uint32_t kk = ord_key(sc[g]);
-                if ((kk & msk) == pre) atomicAdd(&hist[(kk >> shift) & 255], 1);
+                if ((kk & msk) == pre) atomicAdd(&hist[(kk >> shift) & 255u], 1);
             }
             __syncthreads();
             if (tid == 0) {
@@ -2509,6 +2582,61 @@ __global__ void ix_unpack_kernel(const uint16_t* wire, int ldw, const int* __res
     const int ntail = p % kpool + 1;
     for (int k = threadIdx.x; k < ntail; k += blockDim.x) kt[nsel * kpool + k] = nv * kpool + k;
     if (threadIdx.x == 0) nk[t] = nsel * kpool + ntail;
+}
+// DFly2 drafter's per-layer key lists built directly on the GPU (replaces D2H + CPU dfly_keys + H2D):
+// 1 block (256 threads) per drafter layer; compacts snap[i][row][0..np) in [0, pos) into shared memory, then fills
+// keys[i][j] = valid picks + [pos .. pos + j] and nk[i][j] = n + j + 1 for j < T.
+__global__ void __launch_bounds__(256) dfly_expand_keys_kernel(const int* __restrict__ snap,
+                                                               const int* __restrict__ snap_nk, int W, int row,
+                                                               int maxk, int pos, int T, int* __restrict__ keys,
+                                                               int ldk, int* __restrict__ nk) {
+    extern __shared__ int sh_picks[];
+    __shared__ int s_warp[8];
+    __shared__ int s_total;
+    const int i = blockIdx.x, tid = threadIdx.x, nth = blockDim.x;
+    const int lane = tid & 31, wp = tid >> 5;
+    const int np = min(maxk, max(0, snap_nk[(size_t) i * W + row]));
+    const int* src = snap + ((size_t) i * W + (size_t) row) * maxk;
+    // Compact valid picks (0 <= p < pos) preserving order via block prefix sum
+    const int per = (np + nth - 1) / nth;
+    const int b0 = min(np, tid * per), b1 = min(np, b0 + per);
+    int cnt = 0;
+    for (int k = b0; k < b1; ++k) {
+        const int v = src[k];
+        cnt += (v >= 0 && v < pos);
+    }
+    int ia = cnt;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int pa = __shfl_up_sync(0xffffffffu, ia, o);
+        if (lane >= o) ia += pa;
+    }
+    if (lane == 31) s_warp[wp] = ia;
+    __syncthreads();
+    if (tid < 8) {
+        int wa = s_warp[tid];
+#pragma unroll
+        for (int o = 1; o < 8; o <<= 1) {
+            const int pa = __shfl_up_sync(0xffu, wa, o);
+            if (tid >= o) wa += pa;
+        }
+        if (tid == 7) s_total = wa;
+        s_warp[tid] = wa - s_warp[tid];
+    }
+    __syncthreads();
+    int off = s_warp[wp] + ia - cnt;
+    for (int k = b0; k < b1; ++k) {
+        const int v = src[k];
+        if (v >= 0 && v < pos) sh_picks[off++] = v;
+    }
+    __syncthreads();
+    const int n = min(s_total, ldk - T);
+    for (int j = 0; j < T; ++j) {
+        int* dst = keys + ((size_t) i * W + (size_t) j) * ldk;
+        for (int k = tid; k < n; k += nth) dst[k] = sh_picks[k];
+        if (tid <= j) dst[n + tid] = pos + tid;
+        if (tid == 0) nk[(size_t) i * W + j] = n + j + 1;
+    }
 }
 
 }  // namespace
@@ -2974,10 +3102,30 @@ void ix_pool(const float* ivg, int ring, int g0, int n, int kpool, int dim, cons
 }
 void ix_score(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos, int kpool,
               int n_pool, float* score, size_t ld, cudaStream_t s, bool f16) {
-    if (n_pool <= 0) return;
+    if (n_pool <= 0 || T <= 0) return;
     if (dim % 8 || heads > 16) {
         std::fprintf(stderr, "maya-hy4 ix_score: %d heads of %d (16 at most, a multiple of 8)\n", heads, dim);
         g_err.fetch_add(1);
+        return;
+    }
+    if (heads == 16 && dim == 128) {
+        if (T >= 4) {
+            constexpr int TB = 4, GP = 256 / TB;
+            const dim3 grid((unsigned) ((n_pool + GP - 1) / GP), (unsigned) ((T + TB - 1) / TB));
+            if (f16) ix_score_tiled_kernel<__half, TB><<<grid, 256, 0, s>>>(q, wt, T, (const __half*) pooled, pos, kpool, n_pool, score, ld);
+            else ix_score_tiled_kernel<float, TB><<<grid, 256, 0, s>>>(q, wt, T, pooled, pos, kpool, n_pool, score, ld);
+        } else if (T >= 2) {
+            constexpr int TB = 2, GP = 256 / TB;
+            const dim3 grid((unsigned) ((n_pool + GP - 1) / GP), (unsigned) ((T + TB - 1) / TB));
+            if (f16) ix_score_tiled_kernel<__half, TB><<<grid, 256, 0, s>>>(q, wt, T, (const __half*) pooled, pos, kpool, n_pool, score, ld);
+            else ix_score_tiled_kernel<float, TB><<<grid, 256, 0, s>>>(q, wt, T, pooled, pos, kpool, n_pool, score, ld);
+        } else {
+            constexpr int TB = 1, GP = 256 / TB;
+            const dim3 grid((unsigned) ((n_pool + GP - 1) / GP), 1);
+            if (f16) ix_score_tiled_kernel<__half, TB><<<grid, 256, 0, s>>>(q, wt, T, (const __half*) pooled, pos, kpool, n_pool, score, ld);
+            else ix_score_tiled_kernel<float, TB><<<grid, 256, 0, s>>>(q, wt, T, pooled, pos, kpool, n_pool, score, ld);
+        }
+        check("ix_score");
         return;
     }
     const size_t sh = (size_t) (heads * dim + heads) * sizeof(float);
@@ -3026,6 +3174,13 @@ void ix_unpack(const uint16_t* wire, int ldw, int T, const int* pos, int kpool, 
     if (T <= 0) return;
     ix_unpack_kernel<<<T, 256, (size_t) (top + 7) / 8 * 16, s>>>(wire, ldw, pos, kpool, top, keys, ldk, nk);
     check("ix_unpack");
+}
+void dfly_expand_keys(const int* snap, const int* snap_nk, int n_layers, int W, int row, int maxk, int pos, int T,
+                      int* keys, int ldk, int* nk, cudaStream_t s) {
+    if (n_layers <= 0 || T <= 0) return;
+    dfly_expand_keys_kernel<<<n_layers, 256, (size_t) maxk * sizeof(int), s>>>(snap, snap_nk, W, row, maxk, pos, T,
+                                                                               keys, ldk, nk);
+    check("dfly_expand_keys");
 }
 void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, const int* pos, int window,
                   const float* mask, size_t ldm, float scale, const float* sinks, uint16_t* P, size_t ldP,
