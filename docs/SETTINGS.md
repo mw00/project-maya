@@ -2834,6 +2834,48 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_INJECT`, `HY4_INJECT_FROM`, `HY4_SAVE` | off | debugging: a layer's inputs taken from a reference dump to compare one layer at a time |
 | `HY4_VISION_FP16` | on on HIP `gfx906`/`gfx10`, else off | `1`: run `maya-hy4` vision tower GEMMs in IEEE FP16 (`CUDA_R_16F` with NaN-preserving `[-65504, 65504]` clamp and GPU-side BF16->FP16 stage conversion) where hardware BF16 BLAS is unavailable; `0`: keep BF16 (`CUDA_R_16BF`) |
 
+### Hy4-Flash: conversations kept (an agent's parent and workers on one model)
+
+Hy4-Flash's engine holds one conversation, like DeepSeek's before its [conversations kept](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model):
+a prompt that continues it reads only its new tokens, any other starts over - and at Hy4-Flash's prompt speed (~400
+tok/s on two RTX 5090s with most experts on the CPU lane) an agent's worker of 16K tokens is ~40 s read again, a 100K
+one ~4 min, on every switch between the parent and its workers. With `MAYA_HY4_SLOT_KEEP=1` the conversation in the
+model is set aside when another one takes its place, and a prompt that continues a kept one takes it back: a
+12K-token conversation back in 0.03 s from RAM (its next turn in ~1.2 s instead of ~12 s), from the folder after a
+restart in a few seconds. The design and the settings are DeepSeek's (#356), under `MAYA_HY4_`.
+
+What a conversation keeps: every indexed layer's and the MTP block's cache row of each position (the latent row and
+the indexer's pooled keys: ~16 KB a position with F16 rows, ~9 KB with `--kv q8`), the last `MAYA_HY4_SLOT_RING`
+positions' rows of every ring - the sliding-window layers' latent rows, the indexer's value and gate, the trunk's
+final states the MTP block reads (~60 KB a position) - and its tokens. The Engram keeps nothing: its rows depend on
+the tokens alone. A 12K-token conversation is ~0.45 GB, a 100K-token one ~1.9 GB. A kept conversation is taken back
+whole, or at any position its rings reach back to (`MAYA_HY4_SLOT_RING` less the 512-position window: a history whose
+last answer was rendered again). A picture is kept as its place and fingerprint, and the conversation comes back
+only for a prompt with the same pictures at the same places. The state is saved by position, so a start with another
+ring size (another `--chunk` or context) reads it; under tensor parallel one copy is saved and every member's is
+written back.
+
+Taken back, a conversation gives the answers it gives continued in place, token for token - `tools/hy4/slot_keep_test.py`
+checks it (greedy, with `HY4_HOT=0` and `HY4_ROUTE=lane`): A, B, A's next turn and B's cut-back turn each against the
+same turns with no switch; a turn sent again after a switch, its conversation back from a slot, against its first
+answer in the same process (the layer split and tensor parallel, `--tp 2`: a tensor-parallel start's plan can move the
+last bits between processes, so there the check within one process is the one claimed); a restart from the folder,
+and the folder's cap. Not with KV streaming or KV spill yet (their rows partly in RAM or on the drive):
+there the engine says so at the start and keeps no conversations.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_HY4_SLOT_KEEP` | off | `1`: keep the conversation when another one takes the model, and across runs in the folder |
+| `MAYA_HY4_SLOT_CAP` | 4 | the conversations kept in RAM; past it (or past `MAYA_HY4_SLOT_RAM_GB`) the least recently used is written to the folder; `0` = none kept |
+| `MAYA_HY4_SLOT_RAM_GB` | 8 | their RAM at most (GB; one is always kept, even alone over it): a Hy4-Flash conversation is large and the RAM holds the CPU lane's experts; `0` = the count alone |
+| `MAYA_HY4_SLOT_GB` | 64 | the folder's conversations' total size (GB): the least recently used removed past it, never the one just written |
+| `MAYA_HY4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its rows) and a `.meta` (the identity, its tokens, its rings' rows, its pictures), each written under a temporary name first; less than 8 GB free beside one: not written |
+| `MAYA_HY4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens) |
+| `MAYA_HY4_SLOT_RING` | 4096 | the ring rows a conversation keeps (positions before its end): how far back before its end it can be taken (less 512); each 4096 costs ~0.25 GB a conversation |
+| `MAYA_HY4_SLOT_DAYS` | 7 | a slot unused for this many days is removed at start, and so is any file not this model's or this engine version's, or incomplete; QUIT writes the conversations in RAM to the folder (the server gives it `MAYA_ENGINE_QUIT_S`) |
+
+The log says what happened (`hy4 slots: saved / took back / wrote ...`, the server's `[maya] sessions: ...`).
+
 ## Inkling-2-Small
 
 thinkingmachines' [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) (594B, ~17B active) on
