@@ -7782,6 +7782,123 @@ void two_take_rows_g(const uint8_t* const* blob, const int* n, const int* row, c
     two_take_rows_g_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) G), 256, 0, s>>>(blob, n, row, other, C, y);
     check("two_take_rows_g");
 }
+
+#ifndef MAYA_USE_HIP
+// ---- the hand-off through host memory both map (two GPUs, IK2_PEER_DIRECT_SIGNAL=1: ik2_kernels.cuh, "Two GPUs, a visit's
+// hand-off").  A word another GPU writes is read with ld.cv (a line kept from a read before counts as stale) and
+// written with st.wt; a wait is one thread's, a short sleep between two reads, bounded on the card's timer.
+namespace {
+
+__device__ __forceinline__ unsigned mail_word(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ float mail_value(const float* p) {
+    float v;
+    asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ void mail_put(unsigned* p, unsigned v) {
+    asm volatile("st.global.wt.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ unsigned long long mail_clock() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+// the block's thread 0 waits for the word to read n (false out of time: err has n); the block is together again
+__device__ __forceinline__ bool mail_wait(const unsigned* p, unsigned n, unsigned* err) {
+    __shared__ bool seen;
+    if (threadIdx.x == 0) {
+        const unsigned long long t0 = mail_clock();
+        seen = true;
+        while (mail_word(p) != n) {
+            if (mail_clock() - t0 > kMailWaitNs) {
+                mail_put(err, n);
+                seen = false;
+                break;
+            }
+            __nanosleep(200);
+        }
+    }
+    __syncthreads();
+    return seen;
+}
+// (the block's writes to the host memory, then its word: a system fence by every thread, the block together, one more)
+__device__ __forceinline__ void mail_signal(unsigned* word, unsigned n) {
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        mail_put(word, n);
+    }
+}
+
+__global__ void mail_send_kernel(const float* x, const float* logits, int C, int E, float* slot_x, const unsigned* freed,
+                                 unsigned n, unsigned free_n, unsigned* err) {
+    if (!mail_wait(freed, free_n, err)) return;
+    for (int i = threadIdx.x; i < C + E; i += blockDim.x) slot_x[i] = i < C ? x[i] : logits[i - C];
+    __threadfence_system();   // (through to the host memory by the end: GPU 1 reads the slot after this kernel's event)
+}
+__global__ void mail_recv_kernel(const float* slot_x, int C, int E, float* x, float* logits, unsigned* freed, unsigned n) {
+    for (int i = threadIdx.x; i < C + E; i += blockDim.x) (i < C ? x[i] : logits[i - C]) = mail_value(slot_x + i);
+    mail_signal(freed, n);   // (the slot's message read: its next one may come)
+}
+__global__ void mail_publish_kernel(const uint8_t* const* blob, const float* y, int K, int C, float* rows,
+                                    unsigned* rows_word, unsigned n) {
+    for (int s = 0; s < K; ++s) {
+        if (!blob[s] || (uintptr_t) blob[s] == kHeldElsewhere) continue;
+        for (int i = threadIdx.x; i < C; i += blockDim.x) rows[(size_t) s * C + i] = y[(size_t) s * C + i];
+    }
+    mail_signal(rows_word, n);
+}
+__global__ void two_take_rows_mail_kernel(const uint8_t* const* blob, const float* rows, const unsigned* rows_word,
+                                          unsigned n, int C, float* y, unsigned* err) {
+    const int s = blockIdx.y;
+    if ((uintptr_t) blob[s] != kHeldElsewhere) return;   // (a pick GPU 0 ran: nothing to take, nothing to wait for)
+    if (!mail_wait(rows_word, n, err)) return;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
+        y[(size_t) s * C + i] = mail_value(rows + (size_t) s * C + i);
+}
+
+}  // namespace
+
+MailLayout mail_layout(int C, int E, int K) {
+    const size_t line = 128;
+    const auto up = [line](size_t b) { return (b + line - 1) / line * line; };
+    MailLayout m;
+    m.logits = (size_t) C * 4;
+    m.rows = up(m.logits + (size_t) E * 4);
+    m.freed = up(m.rows + (size_t) K * C * 4);
+    m.rows_word = m.freed + line;
+    m.slot = m.freed + 2 * line;
+    m.ring = m.slot * (size_t) kMailSlots;
+    m.err = m.ring;
+    return m;
+}
+void mail_send(const float* x, const float* logits, int C, int E, float* slot_x, const unsigned* freed, unsigned n,
+               unsigned free_n, unsigned* err, cudaStream_t s) {
+    mail_send_kernel<<<1, 256, 0, s>>>(x, logits, C, E, slot_x, freed, n, free_n, err);
+    check("mail_send");
+}
+void mail_recv(const float* slot_x, int C, int E, float* x, float* logits, unsigned* freed, unsigned n, cudaStream_t s) {
+    mail_recv_kernel<<<1, 256, 0, s>>>(slot_x, C, E, x, logits, freed, n);
+    check("mail_recv");
+}
+void mail_publish(const uint8_t* const* blob, const float* y, int K, int C, float* rows, unsigned* rows_word, unsigned n,
+                  cudaStream_t s) {
+    mail_publish_kernel<<<1, 256, 0, s>>>(blob, y, K, C, rows, rows_word, n);
+    check("mail_publish");
+}
+void two_take_rows_mail(const uint8_t* const* blob, const float* rows, const unsigned* rows_word, unsigned n, int S, int C,
+                        float* y, unsigned* err, cudaStream_t s) {
+    if (S <= 0) return;
+    two_take_rows_mail_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S), 256, 0, s>>>(blob, rows, rows_word, n, C, y,
+                                                                                               err);
+    check("two_take_rows_mail");
+}
+#endif  // MAYA_USE_HIP
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s) {
     if (!n) return;
     add_kernel<<<grid(n), kBlk, 0, s>>>(a, b, n, y);

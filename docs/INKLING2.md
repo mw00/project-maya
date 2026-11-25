@@ -496,7 +496,11 @@ those picks' places before the sum - so every row and the sum's order are one ca
 on which card holds an expert (two cards of one kind: the one-card offload path's answers, checked on the CLI and the
 server's answers, tool calls, pictures and loop guard). Copies between the cards: peer to peer only where the driver
 offers it, the IOMMU translates neither card and a test copy at load arrives intact, else through pinned host memory
-(`IK2_HOST_STAGE=1` forces that; the same answers). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
+(`IK2_HOST_STAGE=1` forces that; the same answers). `IK2_PEER_DIRECT_SIGNAL=1` takes the copies out of a visit altogether: a ring of four slots in host memory both cards map -
+GPU 0 writes x and the router's logits into one, GPU 1 (woken by an event) copies them in and writes its rows back with
+the visit's number, and GPU 0 takes the rows only where it has a pick of GPU 1's, which most visits do not. With the
+copies the first card is busy 55 percent of a token (it waits for the round trip of each of the 48 visits); with the ring
+77: 67.4 -> 84.4 tok/s (Q4_K_XL, a 302-token prompt, the same tokens; a verify window of drafting keeps the copies). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
 rows sent back - the split's plain answers; `--drafting auto` measures it). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
 tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
 second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers one card (two

@@ -985,6 +985,13 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
         add_test(NAME ik2_off_test COMMAND ik2_off_test)
         set_tests_properties(ik2_off_test PROPERTIES TIMEOUT 300 LABELS gpu)
         list(APPEND _ik2_targets ik2_off_test)
+        # the hand-off through host memory both map (two GPUs): visits handed over the way the engine hands a layer's,
+        # each against what the host works out, the slots used again and the numbers' wrap, and waits that run out of time
+        add_executable(ik2_mail_test tests/ik2_mail_test.cu)
+        target_link_libraries(ik2_mail_test PRIVATE ik2_kernels)
+        add_test(NAME ik2_mail_test COMMAND ik2_mail_test)
+        set_tests_properties(ik2_mail_test PROPERTIES TIMEOUT 300 LABELS gpu)
+        list(APPEND _ik2_targets ik2_mail_test)
       endif()
     endif()
     if(_ik2_filter)
