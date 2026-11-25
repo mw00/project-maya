@@ -2,6 +2,7 @@
 // double-buffered batched prefill (KDA + MLA WMMA + grouped MoE), multi-GPU layer split, and optional MTP block.
 #include "ling_model.hpp"
 
+#include "ling_dense.hpp"
 #include "ling_kernels.cuh"
 #include "ling_parity.hpp"
 #include "ling_sys.hpp"
@@ -308,6 +309,14 @@ void* Model::host_alloc(Gpu& g, size_t bytes) {
     return p;
 }
 
+// One line, the first time a full-precision matrix is turned into Q8_0 (not one for each of the layers' matrices).
+static void note_dense_converted(const maya::TensorInfo& t) {
+    static std::atomic<bool> said{false};
+    if (said.exchange(true)) return;
+    std::fprintf(stderr, "ling load: %s is %s - full-precision matrices are quantised to Q8_0 as they load "
+                 "(the format the kernels read)\n", t.name.c_str(), std::string(t.type_name()).c_str());
+}
+
 void Model::load_layer_weights(Layer& l, int il, Gpu& g, const GgufSet& gf,
                                const std::map<std::string, const maya::TensorInfo*>& want) {
     set_dev(g.dev);
@@ -322,13 +331,27 @@ void Model::load_layer_weights(Layer& l, int il, Gpu& g, const GgufSet& gf,
         if (t.type != 0) throw std::runtime_error("GGUF: " + t.name + ": F32 expected");
         return (const float*) dev_copy(t);
     };
+    // an F32 / F16 / BF16 matrix: Q8_0 rows from the load on (ling_dense.hpp), the type the kernels read
+    auto dev_q8 = [&](const maya::TensorInfo& t, int k) -> const uint8_t* {
+        note_dense_converted(t);
+        const std::vector<uint8_t> q = ling::dense::to_q8_0((int) t.type, gf.tensor_data(t), t.elements(), (uint64_t) k, t.name);
+        void* p = dev_alloc(g, q.size());
+        CK(cudaMemcpyAsync(p, q.data(), q.size(), cudaMemcpyHostToDevice, g.s));
+        CK(cudaStreamSynchronize(g.s));   // (q ends here)
+        return (const uint8_t*) p;
+    };
     auto dev_mat = [&](const maya::TensorInfo& t, int k, int n) -> Mat {
         expect_shape(t, {k, n});
-        if (!iq::mv_supported((int) t.type))
-            throw std::runtime_error("GGUF: " + t.name + ": type " + std::string(t.type_name()) + " not supported");
         Mat m;
-        m.p = dev_copy(t);
-        m.type = (int) t.type;
+        if (ling::dense::is_float_type((int) t.type)) {
+            m.p = dev_q8(t, k);
+            m.type = ling::dense::kQ8_0;
+        } else {
+            if (!iq::mv_supported((int) t.type))
+                throw std::runtime_error("GGUF: " + t.name + ": type " + std::string(t.type_name()) + " not supported");
+            m.p = dev_copy(t);
+            m.type = (int) t.type;
+        }
         m.k = k;
         m.n = n;
         m.ld = iq::row_bytes(m.type, k);
@@ -400,9 +423,19 @@ void Model::load_layer_weights(Layer& l, int il, Gpu& g, const GgufSet& gf,
     } else {
         const maya::TensorInfo& tr = at(b + "ffn_gate_inp.weight");
         expect_shape(tr, {E, c.n_expert});
-        if (tr.type != 0 && tr.type != 30) throw std::runtime_error("GGUF: " + tr.name + ": F32 or BF16 expected");
-        l.router_w = dev_copy(tr);
-        l.router_type = (int) tr.type;
+        if (tr.type != 0 && tr.type != 30 && tr.type != 1)
+            throw std::runtime_error("GGUF: " + tr.name + ": F32, F16 or BF16 expected");
+        if (tr.type == 1) {                      // F16 -> F32 is exact; the kernels read the router in F32 or BF16
+            const std::vector<float> rf = ling::dense::to_f32(1, gf.tensor_data(tr), tr.elements());
+            void* rp = dev_alloc(g, rf.size() * sizeof(float));
+            CK(cudaMemcpyAsync(rp, rf.data(), rf.size() * sizeof(float), cudaMemcpyHostToDevice, g.s));
+            CK(cudaStreamSynchronize(g.s));
+            l.router_w = (const uint8_t*) rp;
+            l.router_type = 0;
+        } else {
+            l.router_w = dev_copy(tr);
+            l.router_type = (int) tr.type;
+        }
         const maya::TensorInfo& tb = at(b + "exp_probs_b.bias");
         expect_shape(tb, {c.n_expert});
         l.rb_dev = dev_float(tb);
@@ -653,11 +686,20 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
 
         const maya::TensorInfo& tow = *want.at("output.weight");
         expect_shape(tow, {E, c_.vocab});
-        if (!iq::mv_supported((int) tow.type))
-            throw std::runtime_error("GGUF: output.weight type not supported");
-        void* pow = dev_alloc(glast, tensor_bytes(tow));
-        CK(cudaMemcpyAsync(pow, gf.tensor_data(tow), tensor_bytes(tow), cudaMemcpyHostToDevice, glast.s));
-        out_w_ = {(const uint8_t*) pow, (int) tow.type, E, c_.vocab, iq::row_bytes((int) tow.type, E)};
+        if (ling::dense::is_float_type((int) tow.type)) {   // F32 / F16 / BF16 head: Q8_0 rows (ling_dense.hpp)
+            note_dense_converted(tow);
+            const std::vector<uint8_t> q = ling::dense::to_q8_0((int) tow.type, gf.tensor_data(tow), tow.elements(), (uint64_t) E, tow.name);
+            void* pow = dev_alloc(glast, q.size());
+            CK(cudaMemcpyAsync(pow, q.data(), q.size(), cudaMemcpyHostToDevice, glast.s));
+            CK(cudaStreamSynchronize(glast.s));
+            out_w_ = {(const uint8_t*) pow, ling::dense::kQ8_0, E, c_.vocab, iq::row_bytes(ling::dense::kQ8_0, E)};
+        } else {
+            if (!iq::mv_supported((int) tow.type))
+                throw std::runtime_error("GGUF: output.weight type " + std::string(tow.type_name()) + " not supported");
+            void* pow = dev_alloc(glast, tensor_bytes(tow));
+            CK(cudaMemcpyAsync(pow, gf.tensor_data(tow), tensor_bytes(tow), cudaMemcpyHostToDevice, glast.s));
+            out_w_ = {(const uint8_t*) pow, (int) tow.type, E, c_.vocab, iq::row_bytes((int) tow.type, E)};
+        }
     }
 
     // Load trunk layers in parallel across GPUs (1 thread per GPU)
@@ -1005,7 +1047,18 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         mtp_.out_norm = (const float*) dev_copy(at(mtp_prefix + "layer_output_norm.weight"));
         const maya::TensorInfo& teh = at(mtp_prefix + "nextn.eh_proj.weight");
         expect_shape(teh, {2 * E, E});
-        mtp_.eh_proj = {dev_copy(teh), (int) teh.type, 2 * E, E, iq::row_bytes((int) teh.type, 2 * E)};
+        if (ling::dense::is_float_type((int) teh.type)) {    // F32 / F16 / BF16: Q8_0 rows (ling_dense.hpp)
+            note_dense_converted(teh);
+            const std::vector<uint8_t> q = ling::dense::to_q8_0((int) teh.type, gf.tensor_data(teh), teh.elements(), (uint64_t) (2 * E), teh.name);
+            void* pq = dev_alloc(glast, q.size());
+            CK(cudaMemcpyAsync(pq, q.data(), q.size(), cudaMemcpyHostToDevice, glast.s));
+            CK(cudaStreamSynchronize(glast.s));
+            mtp_.eh_proj = {(const uint8_t*) pq, ling::dense::kQ8_0, 2 * E, E, iq::row_bytes(ling::dense::kQ8_0, 2 * E)};
+        } else {
+            if (!iq::mv_supported((int) teh.type))
+                throw std::runtime_error("GGUF: " + teh.name + ": type " + std::string(teh.type_name()) + " not supported");
+            mtp_.eh_proj = {dev_copy(teh), (int) teh.type, 2 * E, E, iq::row_bytes((int) teh.type, 2 * E)};
+        }
         mtp_.layer.dev_idx = ngpu - 1;
         mtp_.layer.kda = false;
         load_layer_weights(mtp_.layer, c.n_layers, glast, gf, mtp_want);

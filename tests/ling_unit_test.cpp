@@ -5,11 +5,14 @@
 //   4. .lingrp folder size cap eviction & default-off check
 //   5. Linux NUMA topology / cpuset builder helper
 //   6. DirectGgufReader O_DIRECT + buffered + deterministic fallback + /dev/shm tmpfs
+//   7. Full-precision (F32 / F16 / BF16) dense matrices -> Q8_0 at load (ling_dense.hpp)
+#include "ling_dense.hpp"
 #include "ling_restore.hpp"
 #include "ling_sys.hpp"
 
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -439,11 +442,101 @@ static void test_split_gguf_fingerprint() {
     std::printf("PASS test_split_gguf_fingerprint\n");
 }
 
+// F32 / F16 / BF16 dense matrices become Q8_0 rows (ggml's quantize_row_q8_0_ref) while the model loads.
+static void test_dense_to_q8_0() {
+    namespace D = ling::dense;
+    bool half_ok = true;
+    for (uint32_t h = 0; h < 65536; ++h) {
+        if ((h & 0x7c00u) == 0x7c00u && (h & 0x3ffu) != 0) continue;   // NaN
+        if (D::f32_to_f16(D::f16_to_f32((uint16_t) h)) != (uint16_t) h) { half_ok = false; break; }
+    }
+    EXPECT(half_ok, "every F16 value survives F16 -> F32 -> F16");
+    EXPECT(D::f16_to_f32(0x3c00) == 1.0f && D::f16_to_f32(0xc000) == -2.0f && D::f16_to_f32(0x0001) == std::ldexp(1.0f, -24),
+           "F16 one, minus two, smallest subnormal");
+    EXPECT(D::f32_to_f16(65519.0f) == 0x7bff && D::f32_to_f16(65520.0f) == 0x7c00, "F16 rounding at the top of the range");
+    EXPECT(D::f32_to_f16(1.0f + std::ldexp(1.0f, -11)) == 0x3c00, "F16 ties go to even");
+    EXPECT(D::bf16_to_f32(0x3f80) == 1.0f && D::bf16_to_f32(0xc040) == -3.0f, "BF16 one and minus three");
+
+    // two rows of 64 values (2 blocks a row); small integers are exact in all three types
+    const uint64_t rows = 2, k = 64;
+    std::vector<float> v((size_t) (rows * k));
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (float) ((int) (i % 37) - 18);
+    for (size_t i = 32; i < 64; ++i) v[i] = 0.0f;   // an all-zero block
+    std::vector<uint8_t> f32b(v.size() * 4), f16b(v.size() * 2), bf16b(v.size() * 2);
+    for (size_t i = 0; i < v.size(); ++i) {
+        std::memcpy(&f32b[i * 4], &v[i], 4);
+        const uint16_t h = D::f32_to_f16(v[i]);
+        std::memcpy(&f16b[i * 2], &h, 2);
+        uint32_t bits;
+        std::memcpy(&bits, &v[i], 4);
+        const uint16_t b = (uint16_t) (bits >> 16);
+        std::memcpy(&bf16b[i * 2], &b, 2);
+    }
+    const std::vector<uint8_t> q32 = D::to_q8_0(D::kF32, f32b.data(), rows * k, k, "t");
+    const std::vector<uint8_t> q16 = D::to_q8_0(D::kF16, f16b.data(), rows * k, k, "t");
+    const std::vector<uint8_t> qbf = D::to_q8_0(D::kBF16, bf16b.data(), rows * k, k, "t");
+    EXPECT(q32.size() == D::q8_0_bytes(rows, k) && q32.size() == 2 * 2 * 34, "Q8_0 size: 2 rows x 2 blocks x 34 bytes");
+    EXPECT(q32 == q16 && q32 == qbf, "F32, F16 and BF16 of the same values give the same Q8_0 bytes");
+
+    bool layout_ok = true;
+    for (size_t b = 0; b < 4; ++b) {                 // block b = row b / 2, block b % 2
+        const uint8_t* blk = &q32[b * 34];
+        uint16_t dh;
+        std::memcpy(&dh, blk, 2);
+        float amax = 0;
+        for (size_t j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(v[b * 32 + j]));
+        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        if (dh != D::f32_to_f16(d)) layout_ok = false;
+        for (size_t j = 0; j < 32; ++j)
+            if ((int8_t) blk[2 + j] != (int8_t) std::lround(v[b * 32 + j] * id)) layout_ok = false;
+    }
+    EXPECT(layout_ok, "scale (F16) and int8 values as ggml's quantize_row_q8_0_ref");
+    const std::vector<uint8_t> zero34(34, 0);
+    EXPECT(std::memcmp(&q32[34], zero34.data(), 34) == 0, "an all-zero block is all zero bytes");
+    EXPECT((int8_t) q32[2 + 0] == (int8_t) std::lround(v[0] / (18.0f / 127.0f)), "the first value, quantised as expected");
+
+    {   // dequantised values within half a step of the originals (plus the F16 scale's rounding: 127 x 2^-11 steps)
+        std::vector<float> w(32 * 4);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = std::sin((float) i * 0.37f) * (1.0f + (float) (i / 32));
+        std::vector<uint8_t> wb(w.size() * 4);
+        std::memcpy(wb.data(), w.data(), wb.size());
+        const auto q = D::to_q8_0(D::kF32, wb.data(), w.size(), 64, "w");
+        bool close = true;
+        for (size_t i = 0; i < w.size(); ++i) {
+            const uint8_t* blk = &q[(i / 32) * 34];
+            uint16_t dh;
+            std::memcpy(&dh, blk, 2);
+            const float d = D::f16_to_f32(dh);
+            if (std::fabs(d * (float) (int8_t) blk[2 + i % 32] - w[i]) > 0.57f * d + 1e-6f) close = false;   // half a step + 127 x the F16 scale's rounding
+        }
+        EXPECT(close, "dequantised values within half a quantisation step (plus the F16 scale's rounding)");
+    }
+
+    auto throws = [&](auto&& fn) {
+        try { fn(); } catch (const std::exception&) { return true; }
+        return false;
+    };
+    EXPECT(throws([&] { D::to_q8_0(D::kF32, f32b.data(), 40, 40, "bad_k"); }), "rows that are not a multiple of 32 values are refused");
+    EXPECT(throws([&] { D::to_q8_0(8, f32b.data(), 64, 64, "not_float"); }), "a block type is not a full-precision one");
+    {
+        std::vector<float> bad(32, 1.0f);
+        bad[5] = std::numeric_limits<float>::infinity();
+        std::vector<uint8_t> bb(32 * 4);
+        std::memcpy(bb.data(), bad.data(), bb.size());
+        EXPECT(throws([&] { D::to_q8_0(D::kF32, bb.data(), 32, 32, "inf"); }), "a value that is not finite is refused");
+    }
+    EXPECT(D::to_f32(D::kF16, f16b.data(), rows * k) == v, "F16 -> F32 (the router's weights) is exact");
+    EXPECT(D::is_float_type(0) && D::is_float_type(1) && D::is_float_type(30) && !D::is_float_type(8) && !D::is_float_type(14),
+           "which types count as full precision");
+    std::printf("PASS test_dense_to_q8_0\n");
+}
+
 int main() {
     test_expert_slot_order_regression();
     test_restore_validation_and_model_keys();
     test_restore_dir_cap_eviction();
     test_split_gguf_fingerprint();
+    test_dense_to_q8_0();
     test_numa_helpers();
     test_direct_reader();
     if (g_fail != 0) {
