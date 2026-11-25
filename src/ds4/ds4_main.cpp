@@ -257,6 +257,17 @@ void prof_line(const maya::ds4::Stats& s0, const maya::ds4::Stats& s) {
                  (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
                  (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt,
                  (long long) (s.prof_tokens - s0.prof_tokens));
+    // (each GPU apart, a step - a step being one token, or one verify window with DS4_PROF_T - and its rows)
+    const double rows = (double) (s.prof_rows - s0.prof_rows) / pt;
+    for (int dv = 0; dv < 2; ++dv) {
+        double d[6], sd = 0;
+        for (int i = 0; i < 6; ++i) sd += (d[i] = (s.prof_dev_ms[dv][i] - s0.prof_dev_ms[dv][i]) / pt);
+        if (sd <= 0) continue;
+        std::fprintf(stderr, "GPU%d per step (DS4_PROF): %.3f ms - between layers %.3f, attention %.3f, routing + shared "
+                             "expert %.3f, experts gate/up %.3f, waiting for the CPU lane %.3f, down + post %.3f; %.2f rows a "
+                             "step, %lld steps\n",
+                     dv, sd, d[0], d[1], d[2], d[3], d[4], d[5], rows, (long long) (s.prof_tokens - s0.prof_tokens));
+    }
 }
 
 // The drafts between two stats: each draft position (1st, 2nd, ..) - how often it was verified with every draft
