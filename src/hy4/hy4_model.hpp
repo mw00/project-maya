@@ -168,6 +168,9 @@ public:
     /// the most tokens a forward reads at once (the prompt path's chunk): a prompt in calls of this many reports its
     /// progress between them
     int chunk() const;
+    /// (HY4_PP) whether a forward of n prompt tokens now would take HY4_PP's pipelined path (its gates, side-effect
+    /// free; false with HY4_PP unset) - the server reads such a prompt in one forward instead of a chunk a call
+    bool pipelines(int n) const;
     /// the GPUs a layer is split over (tensor parallel: 2 or more; 1: the layer split or one GPU)
     int tensor_parallel() const;
     int eos() const;
