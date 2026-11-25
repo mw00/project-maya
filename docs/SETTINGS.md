@@ -2146,6 +2146,7 @@ the first read of the chat 16.7 -> 17.7 s.
 | `MAYA_DS4_RESTORE_TAIL` | 512 | how many tokens before the prompt's end the tail point sits; `0`: no tail point |
 | `MAYA_DS4_RESTORE_TAIL_AUTO` | 1 | the engine leaves the tail point out where it measured its cost higher than reading its tokens again (above); `0`: kept on every read, as before |
 | `MAYA_DS4_MARKS_INSIDE` | on (1) | `0`: the read stops at every point, as before |
+| `MAYA_DS4_RESUMED_BATCH_MIN` | off (0) | A minimum of 2–128 fresh tokens enables batched prefill for an idle text request with a reused prefix when the whole remaining suffix fits in one piece and has at most 128 tokens. Requests with images, queued work, or a split suffix take the existing path. |
 
 ### New conversations behind the same system prompt and tools
 

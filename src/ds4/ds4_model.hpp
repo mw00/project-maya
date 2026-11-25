@@ -186,7 +186,7 @@ public:
     /// feed() of a prompt's end that also keeps the state before its last token in checkpoint `slot` (a prompt's
     /// last token then rides along in the run of chunks instead of a window of its own); the same as
     /// feed(n - 1), checkpoint(slot), feed(1)
-    bool feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err);
+    bool feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err, bool batch = false);
     /// feed_mark() that also keeps the restore points `inner` on the way (positions inside the read - past its first
     /// token, short of its last - in order, with mark()'s `shared`), each the state a read up to it leaves: the same as
     /// feed() up to each and mark() there, then feed_mark() of the rest - but a run of chunks keeps them in one run
@@ -425,7 +425,7 @@ public:
 
 private:
     bool feed_(const int* tokens, int n, int logits_rows, std::string& err, int after);
-    bool feed_mark_(const int* tokens, int n, int logits_rows, int slot, std::string& err);
+    bool feed_mark_(const int* tokens, int n, int logits_rows, int slot, std::string& err, bool batch);
     bool feed_marks_(const int* tokens, int n, int logits_rows, int slot,
                      const std::vector<std::pair<int64_t, bool>>& inner, std::string& err);
     bool feed_part_(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err);

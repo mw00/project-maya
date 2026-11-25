@@ -23793,12 +23793,12 @@ bool Model::feed_(const int* tokens, int n, int logits_rows, std::string& err, i
     }
     return p.feed_windows(tokens, n, logits_rows, err);
 }
-bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
+bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err, bool batch) {
     Impl& p = *p_;
     const int64_t p0 = p.pos;
-    return pool_guard(p, p0, false, err, [&] { return feed_mark_(tokens, n, logits_rows, slot, err); });
+    return pool_guard(p, p0, false, err, [&] { return feed_mark_(tokens, n, logits_rows, slot, err, batch); });
 }
-bool Model::feed_mark_(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
+bool Model::feed_mark_(const int* tokens, int n, int logits_rows, int slot, std::string& err, bool batch) {
     Impl& p = *p_;
     if (!feed_release(err)) return false;   // (another read: a prompt's room kept between its parts handed back first)
     p.main_at.store("reading a prompt", std::memory_order_relaxed);
@@ -23806,7 +23806,7 @@ bool Model::feed_mark_(const int* tokens, int n, int logits_rows, int slot, std:
     p.halted = false;
     p.fed_n = n;
     const double t0 = now_ms();
-    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
+    if (n >= 2 && p.chunk > 0 && (batch || (n >= p.chunk_min && p.pick_path(n)))) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
         return ok;
