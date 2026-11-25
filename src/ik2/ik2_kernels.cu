@@ -7345,6 +7345,19 @@ __global__ void mail_publish_kernel(const uint8_t* const* blob, const float* y, 
     }
     mail_signal(rows_word, n);
 }
+__global__ void mail_publish_g_kernel(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* y,
+                                      int G, int C, float* rows, unsigned* rows_word, unsigned visit_n) {
+    for (int grp = 0; grp < G; ++grp) {
+        const int n = n_g[grp];
+        if (n <= 0) break;
+        if (!blob[grp] || (uintptr_t) blob[grp] == kHeldElsewhere) continue;
+        for (int m = 0; m < n; ++m) {
+            const size_t s = (size_t) row_g[grp * kGroupMax + m];
+            for (int i = threadIdx.x; i < C; i += blockDim.x) rows[s * C + i] = y[s * C + i];
+        }
+    }
+    mail_signal(rows_word, visit_n);
+}
 __global__ void two_take_rows_mail_kernel(const uint8_t* const* blob, const float* rows, const unsigned* rows_word,
                                           unsigned n, int C, float* y, unsigned* err) {
     const int s = blockIdx.y;
@@ -7353,16 +7366,29 @@ __global__ void two_take_rows_mail_kernel(const uint8_t* const* blob, const floa
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
         y[(size_t) s * C + i] = mail_value(rows + (size_t) s * C + i);
 }
+__global__ void two_take_rows_mail_g_kernel(const uint8_t* const* blob, const int* n_g, const int* row_g,
+                                            const float* rows, const unsigned* rows_word, unsigned visit_n, int C,
+                                            float* y, unsigned* err) {
+    const int grp = blockIdx.y, n = n_g[grp];
+    if (n <= 0 || (uintptr_t) blob[grp] != kHeldElsewhere) return;
+    if (!mail_wait(rows_word, visit_n, err)) return;
+    for (int m = 0; m < n; ++m) {
+        const size_t s = (size_t) row_g[grp * kGroupMax + m];
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
+            y[s * C + i] = mail_value(rows + s * C + i);
+    }
+}
 
 }  // namespace
 
-MailLayout mail_layout(int C, int E, int K) {
+MailLayout mail_layout(int C, int E, int K, int max_t) {
     const size_t line = 128;
     const auto up = [line](size_t b) { return (b + line - 1) / line * line; };
     MailLayout m;
-    m.logits = (size_t) C * 4;
-    m.rows = up(m.logits + (size_t) E * 4);
-    m.freed = up(m.rows + (size_t) K * C * 4);
+    m.logits = (size_t) max_t * C * 4;
+    const size_t msg_b = std::max((size_t) E, (size_t) 2 * max_t * K) * 4;
+    m.rows = up(m.logits + msg_b);
+    m.freed = up(m.rows + (size_t) max_t * K * C * 4);
     m.rows_word = m.freed + line;
     m.slot = m.freed + 2 * line;
     m.ring = m.slot * (size_t) kMailSlots;
@@ -7383,12 +7409,26 @@ void mail_publish(const uint8_t* const* blob, const float* y, int K, int C, floa
     mail_publish_kernel<<<1, 256, 0, s>>>(blob, y, K, C, rows, rows_word, n);
     check("mail_publish");
 }
+void mail_publish_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* y, int G, int C,
+                    float* rows, unsigned* rows_word, unsigned visit_n, cudaStream_t s) {
+    if (G <= 0) return;
+    mail_publish_g_kernel<<<1, 256, 0, s>>>(blob, n_g, row_g, y, G, C, rows, rows_word, visit_n);
+    check("mail_publish_g");
+}
 void two_take_rows_mail(const uint8_t* const* blob, const float* rows, const unsigned* rows_word, unsigned n, int S, int C,
                         float* y, unsigned* err, cudaStream_t s) {
     if (S <= 0) return;
     two_take_rows_mail_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S), 256, 0, s>>>(blob, rows, rows_word, n, C, y,
                                                                                                err);
     check("two_take_rows_mail");
+}
+void two_take_rows_mail_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* rows,
+                          const unsigned* rows_word, unsigned visit_n, int G, int C, float* y, unsigned* err,
+                          cudaStream_t s) {
+    if (G <= 0) return;
+    two_take_rows_mail_g_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) G), 256, 0, s>>>(
+        blob, n_g, row_g, rows, rows_word, visit_n, C, y, err);
+    check("two_take_rows_mail_g");
 }
 #endif  // MAYA_USE_HIP
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s) {

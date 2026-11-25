@@ -200,7 +200,7 @@ struct MailLayout {
     size_t ring = 0;                               // the slots' bytes
     size_t err = 0;                                // after them, on a line of its own
 };
-MailLayout mail_layout(int C, int E, int K);
+MailLayout mail_layout(int C, int E, int K, int max_t = 1);
 /// GPU 0, visit n: waits for the slot's freed word to read free_n (n - kMailSlots: the visit that used the slot last was
 /// read; 0 on the first turn), writes x and the logits into the slot (its writes through to the host memory by the end).
 void mail_send(const float* x, const float* logits, int C, int E, float* slot_x, const unsigned* freed, unsigned n,
@@ -212,11 +212,18 @@ void mail_recv(const float* slot_x, int C, int E, float* x, float* logits, unsig
 /// not a null, not kHeldElsewhere) written into the slot's rows; the slot's rows word set to n.
 void mail_publish(const uint8_t* const* blob, const float* y, int K, int C, float* rows, unsigned* rows_word, unsigned n,
                   cudaStream_t s);
+/// Grouped form of mail_publish for a verify window (groups 0..G-1 from group_route).
+void mail_publish_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* y, int G, int C,
+                    float* rows, unsigned* rows_word, unsigned visit_n, cudaStream_t s);
 /// GPU 0, visit n: the rows of its picks marked kHeldElsewhere (blob [K]) taken from the slot's rows into y [K][C].  A
 /// block with no such pick leaves at once - most visits have none (GPU 1 holds the experts the profile picks rarely);
 /// one with waits for the rows word to read n.
 void two_take_rows_mail(const uint8_t* const* blob, const float* rows, const unsigned* rows_word, unsigned n, int S, int C,
                         float* y, unsigned* err, cudaStream_t s);
+/// Grouped form of two_take_rows_mail for a verify window.
+void two_take_rows_mail_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* rows,
+                          const unsigned* rows_word, unsigned visit_n, int G, int C, float* y, unsigned* err,
+                          cudaStream_t s);
 
 /// y = a + b, n values (y may alias either).
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
