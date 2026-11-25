@@ -1,0 +1,47 @@
+{
+ "name": "M",
+ "note": "RTX 3090 24 GB + 48 GB RAM. IQ3_S gate/up (GPTQ), IQ4_XS down; the first and last two MoE layers one step up (IQ4_XS / Q5_K); the MTP layer IQ2_S / IQ3_XXS; Q6_K attention, KDA and shared experts; Q8_0 token embeddings (what maya-ling reads)",
+ "rules": [
+  {
+   "match": "^blk\\.42\\.ffn_(gate|up)_exps",
+   "type": "IQ2_S"
+  },
+  {
+   "match": "^blk\\.42\\.ffn_down_exps",
+   "type": "IQ3_XXS"
+  },
+  {
+   "match": "^blk\\.(2|3|40|41)\\.ffn_(gate|up)_exps",
+   "type": "IQ4_XS"
+  },
+  {
+   "match": "^blk\\.(2|3|40|41)\\.ffn_down_exps",
+   "type": "Q5_K"
+  },
+  {
+   "match": "ffn_(gate|up)_exps",
+   "type": "IQ3_S"
+  },
+  {
+   "match": "ffn_down_exps",
+   "type": "IQ4_XS"
+  },
+  {
+   "match": "ffn_gate_inp|exp_probs_b|ssm_a|ssm_dt|ssm_conv1d",
+   "type": "F32"
+  },
+  {
+   "match": "ssm_beta|attn_gate|attn_k_b|attn_v_b",
+   "type": "Q8_0"
+  },
+  {
+   "match": "^token_embd",
+   "type": "Q8_0"
+  },
+  {
+   "match": "^output\\.weight",
+   "type": "Q6_K"
+  }
+ ],
+ "default": "Q6_K"
+}
