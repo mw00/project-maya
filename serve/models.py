@@ -1081,9 +1081,19 @@ def describe(path: Path, running: str | None) -> dict:
         gguf_gib = None
         if gg_p:
             try:
-                st = Path(gg_p).stat()
-                if st.st_size > 0:
-                    gguf_gib = st.st_size / LINGF.GIB
+                gp = Path(gg_p)
+                m = re.match(r"^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$", gp.name)
+                if m and int(m.group(3)) > 1:
+                    n_sh = int(m.group(3))
+                    tot = sum((gp.parent / f"{m.group(1)}-{i:05d}-of-{n_sh:05d}.gguf").stat().st_size
+                              for i in range(1, n_sh + 1)
+                              if (gp.parent / f"{m.group(1)}-{i:05d}-of-{n_sh:05d}.gguf").is_file())
+                    if tot > 0:
+                        gguf_gib = tot / LINGF.GIB
+                else:
+                    st = gp.stat()
+                    if st.st_size > 0:
+                        gguf_gib = st.st_size / LINGF.GIB
             except OSError:
                 pass
         own.update(ling_fit={kv: {str(c): LINGF.plan(vrams, c, kv, gguf_gib=gguf_gib) for c in ctxs}

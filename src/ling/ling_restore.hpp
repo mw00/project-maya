@@ -65,23 +65,31 @@ inline bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t& out) {
     return true;
 }
 
-inline uint64_t compute_gguf_fingerprint(const std::string& path) {
+inline uint64_t compute_gguf_set_fingerprint(const std::vector<std::string>& paths) {
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const void* p, size_t n) {
         const auto* b = (const uint8_t*) p;
         for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ULL;
     };
-    std::error_code ec;
-    const uint64_t fsz = std::filesystem::file_size(path, ec);
-    if (!ec) mix(&fsz, sizeof fsz);
-    std::ifstream f(path, std::ios::binary);
-    if (f) {
-        std::vector<uint8_t> buf(65536);
-        f.read((char*) buf.data(), (std::streamsize) buf.size());
-        const auto got = (size_t) std::max<std::streamsize>(0, f.gcount());
-        if (got > 0) mix(buf.data(), got);
+    const uint64_t nfiles = (uint64_t) paths.size();
+    mix(&nfiles, sizeof nfiles);
+    std::vector<uint8_t> buf(65536);
+    for (const std::string& path : paths) {
+        std::error_code ec;
+        const uint64_t fsz = std::filesystem::file_size(path, ec);
+        if (!ec) mix(&fsz, sizeof fsz);
+        std::ifstream f(path, std::ios::binary);
+        if (f) {
+            f.read((char*) buf.data(), (std::streamsize) buf.size());
+            const auto got = (size_t) std::max<std::streamsize>(0, f.gcount());
+            if (got > 0) mix(buf.data(), got);
+        }
     }
     return h;
+}
+
+inline uint64_t compute_gguf_fingerprint(const std::string& path) {
+    return compute_gguf_set_fingerprint(std::vector<std::string>{path});
 }
 
 inline uint64_t restore_snapshot_hash(const RestoreSnapshotData& snap, const RestoreKey& key) {

@@ -361,10 +361,41 @@ static void test_direct_reader() {
     std::printf("PASS test_direct_reader (tmp_direct=%d, buffered & fallback verified)\n", (int) dir_tmp);
 }
 
+static void test_split_gguf_fingerprint() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("ling_split_fp_" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path s1 = dir / "m-00001-of-00002.gguf";
+    const fs::path s2 = dir / "m-00002-of-00002.gguf";
+    {
+        std::ofstream f1(s1, std::ios::binary);
+        f1 << "GGUF-shard-one-payload";
+        std::ofstream f2(s2, std::ios::binary);
+        f2 << "GGUF-shard-two-payload";
+    }
+    const std::vector<std::string> set_a{s1.string(), s2.string()};
+    const uint64_t fp_a1 = ling::sys::compute_gguf_set_fingerprint(set_a);
+    const uint64_t fp_a2 = ling::sys::compute_gguf_set_fingerprint(set_a);
+    EXPECT(fp_a1 == fp_a2, "split fingerprint is deterministic");
+    const uint64_t fp_one = ling::sys::compute_gguf_fingerprint(s1.string());
+    EXPECT(fp_one != fp_a1, "2-shard set fingerprint differs from 1-shard fingerprint");
+    {
+        std::ofstream f2(s2, std::ios::binary);
+        f2 << "GGUF-shard-TWO-changed";
+    }
+    const uint64_t fp_b = ling::sys::compute_gguf_set_fingerprint(set_a);
+    EXPECT(fp_b != fp_a1, "modifying shard 2 changes split GGUF fingerprint");
+    fs::remove_all(dir, ec);
+    std::printf("PASS test_split_gguf_fingerprint\n");
+}
+
 int main() {
     test_expert_slot_order_regression();
     test_restore_validation_and_model_keys();
     test_restore_dir_cap_eviction();
+    test_split_gguf_fingerprint();
     test_numa_helpers();
     test_direct_reader();
     if (g_fail != 0) {

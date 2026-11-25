@@ -4,6 +4,7 @@
 // FP16 / INT8 MLA latent KV cache up to 262K context, persistent restore points, vision, and blk.42 MTP + lookup.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -29,6 +30,8 @@ struct TensorInfo;
 }
 
 namespace ling {
+
+class GgufSet;   // ling_model.cu: a GGUF whole or in llama.cpp's shards
 
 // Recoverable request-scoped routing/input error (fails the request, engine stays alive).
 struct RouteError : public std::runtime_error {
@@ -145,7 +148,10 @@ public:
     const std::string& cal_file() const { return cal_file_; }
     const std::string& cal_key() const { return cal_key_; }
     int cpu_threads() const { return o_.cpu_threads; }
-    bool direct_io_active() const { return ssd_reader_.direct_active(); }
+    bool direct_io_active() const {   // every shard's reader (a shard can fall back to buffered reads on its own)
+        return !ssd_readers_.empty() && std::all_of(ssd_readers_.begin(), ssd_readers_.end(),
+                                                    [](const auto& r) { return r->direct_active(); });
+    }
     bool lookahead_active() const { return lookahead_on_; }
     double kv_gb() const { return total_kv_gb_; }
     double vram_gb() const { return total_vram_gb_; }
@@ -261,6 +267,7 @@ private:
         size_t blob = 0;
         // GGUF file offsets for SSD-backed / file-order reads
         uint64_t gate_file_off = 0, up_file_off = 0, down_file_off = 0;
+        int gate_file = 0, up_file = 0, down_file = 0;   // the shard of each (split GGUF)
         size_t eg_stride = 0, eu_stride = 0, ed_stride = 0;
         bool ssd_backed = false;
         // Expert memory tiers
@@ -419,7 +426,7 @@ private:
     sys::CpuTopology cpu_topo_;
     sys::RestoreExpect restore_expect_;
     std::unique_ptr<hy4::Lane> lane_;
-    sys::DirectGgufReader ssd_reader_;
+    std::vector<std::unique_ptr<sys::DirectGgufReader>> ssd_readers_;   // one a shard
     std::vector<Gpu> gpus_;
     std::vector<std::vector<bool>> p2p_mat_;
     std::vector<Layer> layers_;
@@ -477,7 +484,7 @@ private:
     void peer_setup_verified();
     void start_warmup_async();
     void calibrate_split_and_threads();
-    void load_layer_weights(Layer& l, int il, Gpu& g, const maya::GgufFile& gf,
+    void load_layer_weights(Layer& l, int il, Gpu& g, const GgufSet& gf,
                             const std::map<std::string, const maya::TensorInfo*>& want);
     void transfer_x(int g_from, int g_to, int T, bool prefill_buf);
     void transfer_buf(int g_from, int g_to, const float* p_src, float* p_dst, size_t floats);
