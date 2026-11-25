@@ -5324,7 +5324,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_mv && S <= 64) {
+        if (g_mv && S <= 64 && !g_off) {
             const double te0 = now();
             // the token path: each slot (token t's pick i) its expert's blob straight from the cache
             // The slots already in VRAM first, then the ones copied in now: the first group's experts run while the
