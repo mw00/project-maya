@@ -202,9 +202,12 @@ class _Reader:
         for t in (self.pump, self.err_pump):         # (their pipes' ends once the process is gone)
             if t is not None:
                 t.join(timeout=2)
-        for f in (p.stdin, p.stdout, p.stderr):
+        # (a pipe a pump thread still reads is left to that thread: close() on it waits for the reader's lock, which a
+        # pump that got no CPU in the 2 s above still holds, so on a loaded machine that wait may not end)
+        alive = {id(t) for t in (self.pump, self.err_pump) if t is not None and t.is_alive()}
+        for f, t in ((p.stdin, None), (p.stdout, self.pump), (p.stderr, self.err_pump)):
             try:
-                if f is not None:
+                if f is not None and (t is None or id(t) not in alive):
                     f.close()
             except (OSError, ValueError):
                 pass
