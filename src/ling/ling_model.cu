@@ -49,20 +49,72 @@ namespace glmb = maya::kernels::glmb;
 
 static inline size_t align256(size_t n) { return (n + 255u) & ~size_t(255u); }
 
+// A GGUF whole or in llama.cpp's shards (NAME-00001-of-0000N.gguf ...): the tensors of every shard in one list, each
+// read from the shard that holds it; metadata from the first shard.
+class GgufSet {
+public:
+    explicit GgufSet(const std::string& first) {
+        std::vector<std::string> ps{first};
+        const size_t at = first.find("-00001-of-");
+        if (at != std::string::npos) {
+            const int n = std::atoi(first.c_str() + at + 10);
+            for (int i = 2; i <= n; ++i) {
+                char num[16];
+                std::snprintf(num, sizeof num, "%05d", i);
+                std::string p = first;
+                p.replace(at + 1, 5, num);
+                ps.push_back(p);
+            }
+        }
+        size_t total = 0;
+        for (const auto& p : ps) {
+            files_.emplace_back(new maya::GgufFile(p));
+            total += files_.back()->tensors().size();
+        }
+        paths_ = ps;
+        all_.reserve(total);
+        owner_.reserve(total);
+        for (size_t f = 0; f < files_.size(); ++f)
+            for (const auto& t : files_[f]->tensors()) {
+                all_.push_back(t);
+                owner_.push_back((int) f);
+            }
+    }
+    const std::vector<maya::TensorInfo>& tensors() const { return all_; }
+    const uint8_t* tensor_data(const maya::TensorInfo& t) const { return files_[(size_t) file_of(t)]->tensor_data(t); }
+    uint64_t tensor_file_offset(const maya::TensorInfo& t) const {
+        return files_[(size_t) file_of(t)]->tensor_file_offset(t);
+    }
+    int file_of(const maya::TensorInfo& t) const {
+        const size_t i = (size_t) (&t - all_.data());
+        if (i >= all_.size()) throw std::runtime_error("GGUF: " + t.name + ": not a tensor of this file set");
+        return owner_[i];
+    }
+    const std::vector<std::string>& paths() const { return paths_; }
+    const maya::MetaValue* get(const std::string& key) const { return files_[0]->get(key); }
+    bool get_full(const std::string& key, maya::MetaValue& out) const { return files_[0]->get_full(key, out); }
+
+private:
+    std::vector<std::unique_ptr<maya::GgufFile>> files_;
+    std::vector<std::string> paths_;
+    std::vector<maya::TensorInfo> all_;
+    std::vector<int> owner_;
+};
+
 // ------------------------------ metadata ------------------------------
 
-static double req_num(const maya::GgufFile& g, const std::string& key) {
+static double req_num(const GgufSet& g, const std::string& key) {
     const maya::MetaValue* v = g.get(key);
     if (v == nullptr || !v->is_num()) throw std::runtime_error("GGUF: missing key " + key);
     return v->num();
 }
 
-static double opt_num(const maya::GgufFile& g, const std::string& key, double dflt) {
+static double opt_num(const GgufSet& g, const std::string& key, double dflt) {
     const maya::MetaValue* v = g.get(key);
     return v != nullptr && v->is_num() ? v->num() : dflt;
 }
 
-static std::vector<double> get_array(const maya::GgufFile& g, const std::string& key, bool required) {
+static std::vector<double> get_array(const GgufSet& g, const std::string& key, bool required) {
     maya::MetaValue v;
     if (!g.get_full(key, v)) {
         if (required) throw std::runtime_error("GGUF: missing key " + key);
@@ -75,7 +127,7 @@ static std::vector<double> get_array(const maya::GgufFile& g, const std::string&
     return out;
 }
 
-static Config parse_config(const maya::GgufFile& g) {
+static Config parse_config(const GgufSet& g) {
     const std::string a = "bailingmoe3.";
     Config c;
     c.n_layer_all = (int) req_num(g, a + "block_count");
@@ -229,7 +281,7 @@ void* Model::host_alloc(Gpu& g, size_t bytes) {
     return p;
 }
 
-void Model::load_layer_weights(Layer& l, int il, Gpu& g, const maya::GgufFile& gf,
+void Model::load_layer_weights(Layer& l, int il, Gpu& g, const GgufSet& gf,
                                const std::map<std::string, const maya::TensorInfo*>& want) {
     set_dev(g.dev);
     auto at = [&](const std::string& n) -> const maya::TensorInfo& { return *want.at(n); };
@@ -365,8 +417,8 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             cudaSetDevice(d);
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            cudaDeviceProp dp{};
-            int disp = (cudaGetDeviceProperties(&dp, d) == cudaSuccess && dp.kernelExecTimeoutEnabled) ? 1 : 0;
+            int tmo = 0;   // (cudaDeviceProp lost kernelExecTimeoutEnabled in CUDA 13; the attribute is in 12 and 13)
+            int disp = (cudaDeviceGetAttribute(&tmo, cudaDevAttrKernelExecTimeout, d) == cudaSuccess && tmo) ? 1 : 0;
             rk.push_back({d, disp, fb});
         }
         std::stable_sort(rk.begin(), rk.end(), [](const GpuRank& a, const GpuRank& b) {
@@ -376,8 +428,8 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         o_.gpus.clear();
         for (const auto& r : rk) o_.gpus.push_back(r.dev);
     }
-    auto gf_u = std::make_unique<maya::GgufFile>(path);
-    maya::GgufFile& gf = *gf_u;
+    auto gf_u = std::make_unique<GgufSet>(path);
+    GgufSet& gf = *gf_u;
     const maya::MetaValue* arch = gf.get("general.architecture");
     if (arch == nullptr || arch->s != "bailingmoe3")
         throw std::runtime_error("GGUF: not a bailingmoe3 file (" + path + ")");
@@ -620,6 +672,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         l.gate_file_off = gf.tensor_file_offset(tg);
         l.up_file_off = gf.tensor_file_offset(tu);
         l.down_file_off = gf.tensor_file_offset(td);
+        l.gate_file = gf.file_of(tg);
+        l.up_file = gf.file_of(tu);
+        l.down_file = gf.file_of(td);
         l.tr[0] = 0;
         l.tr[1] = align256(l.eg_stride);
         l.tr[2] = align256(l.tr[1] + l.eu_stride);
@@ -912,6 +967,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         mtp_.layer.gate_file_off = gf.tensor_file_offset(tg);
         mtp_.layer.up_file_off = gf.tensor_file_offset(tu);
         mtp_.layer.down_file_off = gf.tensor_file_offset(td);
+        mtp_.layer.gate_file = gf.file_of(tg);
+        mtp_.layer.up_file = gf.file_of(tu);
+        mtp_.layer.down_file = gf.file_of(td);
         mtp_.layer.tr[0] = 0;
         mtp_.layer.tr[1] = align256(mtp_.layer.eg_stride);
         mtp_.layer.tr[2] = align256(mtp_.layer.tr[1] + mtp_.layer.eu_stride);
@@ -1070,11 +1128,17 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
 
     if (any_ssd) {
         std::string derr;
-        if (!ssd_reader_.open(path, o_.direct_io, derr)) throw std::runtime_error("maya-ling: " + derr);
+        ssd_readers_.clear();
+        for (const std::string& p : gf.paths()) {
+            ssd_readers_.emplace_back(new sys::DirectGgufReader());
+            if (!ssd_readers_.back()->open(p, o_.direct_io, derr)) throw std::runtime_error("maya-ling: " + derr);
+        }
         if (!tasks.empty()) {
-            const size_t cal_cb = ssd_reader_.calibrate_chunk(tasks[file_order[0]].min_off, std::min<size_t>(max_blob_, 2u << 20));
+            auto& r0 = *ssd_readers_[(size_t) gf.file_of(*tasks[file_order[0]].tg)];
+            const size_t cal_cb = r0.calibrate_chunk(tasks[file_order[0]].min_off, std::min<size_t>(max_blob_, 2u << 20));
+            for (auto& r : ssd_readers_) r->set_chunk_bytes(cal_cb);
             std::fprintf(stderr, "ling ssd: O_DIRECT=%s chunk=%zu KiB ssd_slots=%zu (%.2f GiB) ram_slots=%zu (%.2f GiB)\n",
-                         ssd_reader_.direct_active() ? "on" : "fallback-buffered", cal_cb >> 10, ssd_slots_cnt,
+                         direct_io_active() ? "on" : "fallback-buffered", cal_cb >> 10, ssd_slots_cnt,
                          (double) planned_ssd_bytes / (double) (1ULL << 30), ram_slots_cnt,
                          (double) planned_ram_bytes / (double) (1ULL << 30));
         }
@@ -1663,11 +1727,11 @@ bool Model::read_expert_blob(const Layer& l, int e, uint8_t* dst) const {
         ++ram_fetch_picks_;
         return true;
     }
-    if (!l.ssd_backed || !ssd_reader_.is_open()) return false;
+    if (!l.ssd_backed || ssd_readers_.empty()) return false;
     const bool ok =
-        ssd_reader_.read_span(l.gate_file_off + (uint64_t) e * l.eg_stride, l.eg_stride, dst + l.tr[0]) &&
-        ssd_reader_.read_span(l.up_file_off + (uint64_t) e * l.eu_stride, l.eu_stride, dst + l.tr[1]) &&
-        ssd_reader_.read_span(l.down_file_off + (uint64_t) e * l.ed_stride, l.ed_stride, dst + l.tr[2]);
+        ssd_readers_[(size_t) l.gate_file]->read_span(l.gate_file_off + (uint64_t) e * l.eg_stride, l.eg_stride, dst + l.tr[0]) &&
+        ssd_readers_[(size_t) l.up_file]->read_span(l.up_file_off + (uint64_t) e * l.eu_stride, l.eu_stride, dst + l.tr[1]) &&
+        ssd_readers_[(size_t) l.down_file]->read_span(l.down_file_off + (uint64_t) e * l.ed_stride, l.ed_stride, dst + l.tr[2]);
     if (ok) ++ssd_fetch_picks_;
     return ok;
 }
