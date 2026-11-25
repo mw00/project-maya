@@ -44,6 +44,7 @@
 #include <ctime>
 #include <array>
 #include <fstream>
+#include <filesystem>
 #include <map>
 #include <numeric>
 #include <mutex>
@@ -9443,6 +9444,292 @@ bool Model::resumable(int64_t pos) const {
     return ring_holds(pos, m->end, m->ring_lo, m->ring, (int64_t) std::max(m->g.n_swa, m->g.ix_kpool) - 1);
 }
 int64_t Model::end() const { return m->end; }
+
+// ---- conversations kept aside (hy4_main.cpp's MAYA_HY4_SLOT_*; DeepSeek's slot_save / slot_load, #356).  A slot, by
+// position (u64 little endian but the tokens, int32): "HY4SLOT1", the identity's length and bytes, n, keep, the MTP
+// cache's valid rows, the n tokens; then each layer of the trunk in order and the MTP block, a block each - its byte
+// count, then (an indexed layer) its latent rows of positions [0, n), its pooled keys of the n / kpool complete groups,
+// its value | gate rows of positions [n - keep, n), or (a sliding-window layer) its latent rows of [n - keep, n); the
+// final-state ring's rows of [n - keep, n) (a block too); "HY4SLOT1" again.  Under tensor parallel member 0's copy is
+// saved (the members' are the same: the same sums feed every one) and a load writes every member's.
+namespace {
+constexpr uint64_t kHy4SlotMagic = 0x31544f4c53345948ull;   // "HY4SLOT1"
+}
+
+int64_t Model::ring_rows() const { return m->ring; }
+
+bool Model::slot_supported(std::string& why) const {
+    if (m->kv_res() > 0) {
+        why = "KV streaming is on (the indexed layers' rows partly in pinned RAM): conversations are not kept with it";
+        return false;
+    }
+    if (m->spill()) {
+        why = "KV spill is on (the indexed layers' rows partly on the drive): conversations are not kept with it";
+        return false;
+    }
+    return true;
+}
+
+std::string Model::slot_identity() const {
+    const Impl& I = *m;
+    std::string id = std::string("maya-hy4-session-1 engine=") + MAYA_VERSION + " layers=" + std::to_string(I.g.n_layer) +
+                     " embd=" + std::to_string(I.g.n_embd) + " kv=" + std::to_string(I.g.kv_row()) +
+                     (I.kv_q8 ? "q8" : "f16") + " swa=" + std::to_string(I.g.n_swa) + " ix=" +
+                     std::to_string(I.g.ix_dim) + "/" + std::to_string(I.g.ix_kpool) + " mtp=" + (I.M.mtp ? "1" : "0");
+    std::vector<std::pair<std::string, uintmax_t>> files;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(I.pk.dir, ec))
+        if (e.is_regular_file(ec)) files.emplace_back(e.path().filename().string(), e.file_size(ec));
+    std::sort(files.begin(), files.end());
+    for (const auto& [name, size] : files)
+        if (name.find("expert-hot") == std::string::npos && name.find("vram-late") == std::string::npos &&
+            name.rfind("slot", 0) != 0)   // (the files a start writes itself are not the model)
+            id += " " + name + ":" + std::to_string(size);
+    return id;
+}
+
+uint64_t Model::slot_bytes(int64_t n, int64_t keep) const {
+    const Impl& I = *m;
+    const uint64_t kvb = I.kv_rb(), pb = I.pool_b(), D = (uint64_t) I.g.ix_dim, kp = (uint64_t) I.g.ix_kpool;
+    uint64_t b = 8 * 6 + slot_identity().size() + 4 * (uint64_t) n;   // (the two magics, four sizes; the tokens)
+    auto layer = [&](const Layer& l) {
+        b += 8;
+        if (l.swa) b += (uint64_t) keep * kvb;
+        else b += (uint64_t) n * kvb + (uint64_t) n / kp * D * pb + (uint64_t) keep * 2 * D * pb;
+    };
+    for (int il = 0; il < I.g.n_layer; ++il) layer(I.tp > 1 ? I.TL[0][(size_t) il] : I.L[(size_t) il]);
+    if (I.M.mtp) layer(I.M);
+    if (I.hring) b += 8 + (uint64_t) keep * (uint64_t) I.g.n_embd * 4;
+    return b;
+}
+
+uint64_t Model::slot_save(const std::vector<int>& toks, int64_t keep, std::vector<uint8_t>& out, std::string& err) {
+    Impl& I = *m;
+    if (!slot_supported(err)) return 0;
+    const int64_t n = (int64_t) toks.size(), R = I.ring;
+    if (n <= 0 || n > I.end) {
+        err = n <= 0 ? "no conversation" : "the tokens go past the caches";
+        return 0;
+    }
+    if ((int64_t) I.tokens.size() < n || !std::equal(toks.begin(), toks.end(), I.tokens.begin())) {
+        err = "the tokens are not the caches' own";
+        return 0;
+    }
+    // the ring rows kept: at most what the ring still holds of [n - keep, n), and at least the window a forward at n reads
+    const int64_t lo = std::max(I.ring_lo, I.end - R), back = std::max(I.g.n_swa, I.g.ix_kpool) - 1;
+    keep = std::min({std::max<int64_t>(keep, 0), n, R, n - std::max<int64_t>(lo, 0)});
+    if (keep < std::min(n, back + 1)) {
+        err = "the rings no longer hold the window before the conversation's end";
+        return 0;
+    }
+    I.mtp_settle();
+    for (Gpu& gp : I.G) {
+        cudaSetDevice(gp.dev);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            err = std::string("a GPU: ") + cudaGetErrorString(cudaGetLastError());
+            return 0;
+        }
+    }
+    const std::string id = slot_identity();
+    out.assign(slot_bytes(n, keep), 0);
+    size_t off = 0;
+    auto put = [&](uint64_t v) {
+        std::memcpy(out.data() + off, &v, 8);
+        off += 8;
+    };
+    put(kHy4SlotMagic);
+    put(id.size());
+    std::memcpy(out.data() + off, id.data(), id.size());
+    off += id.size();
+    put((uint64_t) n);
+    put((uint64_t) keep);
+    put((uint64_t) std::min(I.mtp_done, n));
+    std::memcpy(out.data() + off, toks.data(), 4 * (size_t) n);
+    off += 4 * (size_t) n;
+    bool ok = true;
+    auto get_rows = [&](const void* dev, size_t rb, int64_t p0, int64_t cnt, int64_t ring) {   // (positions -> out)
+        const uint8_t* d = static_cast<const uint8_t*>(dev);
+        if (!ring) {
+            ok = ok && cudaMemcpy(out.data() + off, d + (size_t) p0 * rb, (size_t) cnt * rb, cudaMemcpyDeviceToHost) == cudaSuccess;
+        } else if (cnt > 0) {
+            const int64_t s = p0 % ring, a = std::min(cnt, ring - s);
+            ok = ok && cudaMemcpy(out.data() + off, d + (size_t) s * rb, (size_t) a * rb, cudaMemcpyDeviceToHost) == cudaSuccess;
+            if (cnt > a)
+                ok = ok && cudaMemcpy(out.data() + off + (size_t) a * rb, d, (size_t) (cnt - a) * rb,
+                                      cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        off += (size_t) cnt * rb;
+    };
+    const size_t kvb = I.kv_rb(), pb = I.pool_b(), D = (size_t) I.g.ix_dim, kp = (size_t) I.g.ix_kpool;
+    auto layer = [&](const Layer& l) {
+        cudaSetDevice(I.G[(size_t) l.gpu].dev);
+        const size_t at = off;
+        off += 8;
+        if (l.swa) {
+            get_rows(l.kv, kvb, n - keep, keep, l.ring);
+        } else {
+            get_rows(l.kv, kvb, 0, n, 0);
+            get_rows(l.pooled, D * pb, 0, n / (int64_t) kp, 0);
+            get_rows(l.ivg, 2 * D * pb, n - keep, keep, R);
+        }
+        const uint64_t b = off - at - 8;
+        std::memcpy(out.data() + at, &b, 8);
+    };
+    for (int il = 0; il < I.g.n_layer && ok; ++il) layer(I.tp > 1 ? I.TL[0][(size_t) il] : I.L[(size_t) il]);
+    if (I.M.mtp && ok) layer(I.M);
+    if (I.hring && ok) {
+        cudaSetDevice(I.G[(size_t) I.head_gpu].dev);
+        const size_t at = off;
+        off += 8;
+        get_rows(I.hring, (size_t) I.g.n_embd * 4, n - keep, keep, R);
+        const uint64_t b = off - at - 8;
+        std::memcpy(out.data() + at, &b, 8);
+    }
+    if (!ok) {
+        err = std::string("a copy from a GPU: ") + cudaGetErrorString(cudaGetLastError());
+        out.clear();
+        return 0;
+    }
+    put(kHy4SlotMagic);
+    if (off != out.size()) {
+        err = "the slot's size is not its plan's (a bug)";
+        out.clear();
+        return 0;
+    }
+    return out.size();
+}
+
+bool Model::slot_load(const uint8_t* data, size_t bytes, std::vector<int>& toks, int64_t& keep, std::string& err) {
+    Impl& I = *m;
+    if (!slot_supported(err)) return false;
+    size_t off = 0;
+    auto get = [&](uint64_t& v) {
+        if (off + 8 > bytes) return false;
+        std::memcpy(&v, data + off, 8);
+        off += 8;
+        return true;
+    };
+    uint64_t magic = 0, idn = 0, n = 0, kp_ = 0, md = 0;
+    if (!get(magic) || magic != kHy4SlotMagic || !get(idn) || idn == 0 || idn > (1u << 20) || off + idn > bytes) {
+        err = "not a maya-hy4 slot";
+        return false;
+    }
+    const std::string id(reinterpret_cast<const char*>(data + off), (size_t) idn), mine = slot_identity();
+    off += (size_t) idn;
+    if (id != mine) {
+        err = "a slot of another engine or model";
+        return false;
+    }
+    if (!get(n) || !get(kp_) || !get(md)) {
+        err = "a slot cut short";
+        return false;
+    }
+    const int64_t R = I.ring, back = std::max(I.g.n_swa, I.g.ix_kpool) - 1;
+    if (n == 0 || (int64_t) n > I.o.max_ctx || (int64_t) kp_ > (int64_t) n || (int64_t) kp_ > R ||
+        (int64_t) kp_ < std::min<int64_t>((int64_t) n, back + 1) || md > n) {
+        err = "a slot this start's context or rings do not take";
+        return false;
+    }
+    keep = (int64_t) kp_;
+    if (bytes != slot_bytes((int64_t) n, keep)) {
+        err = "a slot of the wrong size";
+        return false;
+    }
+    toks.assign((size_t) n, 0);
+    std::memcpy(toks.data(), data + off, 4 * (size_t) n);
+    off += 4 * (size_t) n;
+    I.mtp_settle();
+    for (Gpu& gp : I.G) {
+        cudaSetDevice(gp.dev);
+        cudaDeviceSynchronize();
+    }
+    // (from the first row written on, a failure leaves the model empty: never two conversations' rows mixed)
+    bool ok = true, wrote = false;
+    auto put_rows = [&](void* dev, size_t rb, int64_t p0, int64_t cnt, int64_t ring, size_t src) {
+        uint8_t* d = static_cast<uint8_t*>(dev);
+        wrote = true;
+        if (!ring) {
+            ok = ok && cudaMemcpy(d + (size_t) p0 * rb, data + src, (size_t) cnt * rb, cudaMemcpyHostToDevice) == cudaSuccess;
+        } else if (cnt > 0) {
+            const int64_t s = p0 % ring, a = std::min(cnt, ring - s);
+            ok = ok && cudaMemcpy(d + (size_t) s * rb, data + src, (size_t) a * rb, cudaMemcpyHostToDevice) == cudaSuccess;
+            if (cnt > a)
+                ok = ok && cudaMemcpy(d, data + src + (size_t) a * rb, (size_t) (cnt - a) * rb,
+                                      cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+    };
+    const int64_t N = (int64_t) n;
+    const size_t kvb = I.kv_rb(), pb = I.pool_b(), D = (size_t) I.g.ix_dim, kp = (size_t) I.g.ix_kpool;
+    // a block into every copy of the layer (tensor parallel: each member's)
+    auto layer = [&](std::vector<Layer*> copies) {
+        uint64_t b = 0;
+        if (!get(b) || off + b > bytes) {
+            ok = false;
+            return;
+        }
+        for (Layer* l : copies) {
+            cudaSetDevice(I.G[(size_t) l->gpu].dev);
+            size_t src = off;
+            if (l->swa) {
+                put_rows(l->kv, kvb, N - keep, keep, l->ring, src);
+            } else {
+                put_rows(l->kv, kvb, 0, N, 0, src);
+                src += (size_t) N * kvb;
+                put_rows(l->pooled, D * pb, 0, N / (int64_t) kp, 0, src);
+                src += (size_t) (N / (int64_t) kp) * D * pb;
+                put_rows(l->ivg, 2 * D * pb, N - keep, keep, R, src);
+            }
+        }
+        off += (size_t) b;
+    };
+    for (int il = 0; il < I.g.n_layer && ok; ++il) {
+        std::vector<Layer*> copies;
+        if (I.tp > 1)
+            for (auto& tl : I.TL) copies.push_back(&tl[(size_t) il]);
+        else
+            copies.push_back(&I.L[(size_t) il]);
+        layer(copies);
+    }
+    if (I.M.mtp && ok) layer({&I.M});
+    if (I.hring && ok) {
+        uint64_t b = 0;
+        if (!get(b) || off + b > bytes) ok = false;
+        else {
+            cudaSetDevice(I.G[(size_t) I.head_gpu].dev);
+            put_rows(I.hring, (size_t) I.g.n_embd * 4, N - keep, keep, R, off);
+            off += (size_t) b;
+        }
+    }
+    uint64_t tail = 0;
+    if (ok && (!get(tail) || tail != kHy4SlotMagic || off != bytes)) ok = false;
+    if (ok)
+        for (Gpu& gp : I.G) {
+            cudaSetDevice(gp.dev);
+            ok = ok && cudaDeviceSynchronize() == cudaSuccess;
+        }
+    if (!ok) {
+        err = "a slot that did not load whole";
+        if (wrote) {   // (the caches hold part of it: nothing of either conversation is trusted)
+            I.end = 0;
+            I.tokens.clear();
+            I.ring_lo = 0;
+            I.mtp_done = 0;
+            I.mtp_apos = -1;
+        }
+        return false;
+    }
+    // the caches now hold the slot's conversation: as after a rewind to its end (a forward from n, or back to any
+    // position whose window is kept, continues it)
+    I.tokens = toks;
+    I.end = N;
+    I.ring_lo = N - keep;
+    I.mtp_done = (int64_t) md;
+    I.mtp_apos = -1;
+    I.mtp_atok = -1;
+    I.df.snap_p0 = -1;
+    I.df.snap_T = 0;
+    return true;
+}
 
 bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err) {
     if (n <= 0) {
