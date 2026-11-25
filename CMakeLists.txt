@@ -965,6 +965,13 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
       add_test(NAME ik2_kernels_test COMMAND ik2_kernels_test)
       set_tests_properties(ik2_kernels_test PROPERTIES TIMEOUT 300)
       list(APPEND _ik2_targets ik2_kernels_test)
+      add_executable(ik2_cpu_test tests/ik2_cpu_test.cpp src/ik2/ik2_cpu.cpp src/hy4/hy4_lane.cpp
+                                  src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+      target_include_directories(ik2_cpu_test PRIVATE include src/ik2 src/hy4 third_party/ggml)
+      target_link_libraries(ik2_cpu_test PRIVATE maya_kernels_cpu Threads::Threads maya_warnings)
+      target_compile_definitions(ik2_cpu_test PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
+      add_test(NAME ik2_cpu_test COMMAND ik2_cpu_test)
+      set_tests_properties(ik2_cpu_test PROPERTIES TIMEOUT 120)
       if(NOT _ik2_hip)   # (AMD: no offload path there yet - its lane test is NVIDIA's)
         # the offload path's exact lane: the GPU's rows against the CPU's forms (AVX-512, AVX2, the reference) bit for
         # bit, on random NVFP4 and Q8_0 experts; the staging plan and the GPU fetch

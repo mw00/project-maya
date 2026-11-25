@@ -150,7 +150,7 @@ most (a profile written with `IK2_POP_OUT`). The attention is one fused kernel (
 and clips; FP16 MMA, and wgmma on Hopper).
 
 **Decode** is bound by the PCIe link (~47 expert misses a token on the H200). `IK2_CPU=1` computes a missing
-expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512).
+expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512 or AVX2).
 
 **Two GPUs** (`--gpus 2`, outside the hardware section 8 lists: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
 (`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
