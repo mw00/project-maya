@@ -354,7 +354,7 @@ void ref_expert(const Experts& E, int e, const float* x, double lim, std::vector
 }
 
 // Independent E4M3 reference using the ordered positive codes and ties-to-even.
-std::vector<float> fp8_round(const float* input, int k) {
+std::vector<float> fp8_round(const float* input, int k, bool e8m0) {
     static const auto values = [] {
         std::vector<float> v(127);
         for (int i = 0; i < 127; ++i) {
@@ -372,14 +372,22 @@ std::vector<float> fp8_round(const float* input, int k) {
             peak = std::max(peak, std::abs(x[j]));
         }
         if (peak == 0.0f) continue;
+        float scale = peak * (1.0f / 448.0f), inverse = 448.0f / peak;
+        if (e8m0) {
+            const float scaled = std::max(peak, 1e-4f) * (1.0f / 448.0f);
+            int exponent = 0;
+            const float fraction = std::frexp(scaled, &exponent);
+            scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+            inverse = 1.0f / scale;
+        }
         for (int j = 0; j < 32; ++j) {
-            const float y = std::abs(x[j]) * (448.0f / peak);
+            const float y = std::abs(x[j]) * inverse;
             int hi = std::min(126, (int) (std::lower_bound(values.begin(), values.end(), y) - values.begin()));
             if (hi > 0) {
                 const float left = y - values[hi - 1], right = values[hi] - y;
                 if (left < right || (left == right && (hi & 1))) --hi;
             }
-            output[i + j] = std::copysign(values[hi] * (peak * (1.0f / 448.0f)), x[j]);
+            output[i + j] = std::copysign(values[hi] * scale, x[j]);
         }
     }
     return output;
@@ -506,11 +514,12 @@ void test_experts(int D, int F, cudaStream_t s) {
     // light kernels), then of more (the tiles)
     const char* no_light = std::getenv("MAYA_DS4_NO_LIGHT");
     const bool light_enabled = no_light == nullptr || no_light[0] != '1';
-    bool fp8 = false;
+    bool fp8 = false, e8m0 = false;
 #if defined(MAYA_USE_HIP)
     const char* use_fp8 = std::getenv("MAYA_DS4_MXFP4_WMMA_FP8");
     const char* no_tc = std::getenv("MAYA_DS4_NO_TC");
-    if (use_fp8 && std::strcmp(use_fp8, "1") == 0 && (!no_tc || no_tc[0] != '1')) {
+    e8m0 = use_fp8 != nullptr && std::strcmp(use_fp8, "2") == 0;
+    if ((e8m0 || (use_fp8 != nullptr && std::strcmp(use_fp8, "1") == 0)) && (!no_tc || no_tc[0] != '1')) {
         int device = 0;
         cudaDeviceProp prop{};
         CU(cudaGetDevice(&device));
@@ -534,6 +543,11 @@ void test_experts(int D, int F, cudaStream_t s) {
         std::vector<float> xs((size_t) NT * D);
         for (auto& v : xs) v = frand();
         std::fill_n(xs.data(), 32, 0.0f);
+        if (D >= 128) {
+            std::fill_n(xs.data() + 32, 32, std::ldexp(1.0f, -15));
+            std::fill_n(xs.data() + 64, 32, 0.875f);
+            std::fill_n(xs.data() + 96, 32, 0.8759765625f);
+        }
         for (int r = 0; r < R; ++r) idx[r] = (int) (rng() % NT);
         float* dxs = dev(xs);
         int *dbd = dev(bounds), *didx = dev(idx);
@@ -588,7 +602,7 @@ void test_experts(int D, int F, cudaStream_t s) {
         for (int r = 0; r < R; ++r) {
             const bool light = light_enabled && bounds[owner[r] + 1] - bounds[owner[r]] <= 16;
             const float* x = xs.data() + (size_t) idx[r] * D;
-            const std::vector<float> xq = light ? q8_round(x, D) : fp8 ? fp8_round(x, D) : std::vector<float>();
+            const std::vector<float> xq = light ? q8_round(x, D) : fp8 ? fp8_round(x, D, e8m0) : std::vector<float>();
             const float* xr = xq.empty() ? x : xq.data();
             std::vector<float> hr(F);
             for (int f = 0; f < F; ++f) {
@@ -598,7 +612,7 @@ void test_experts(int D, int F, cudaStream_t s) {
                 hr[f] = hgot[(size_t) r * F + f];   // the down from the F16 h the kernel kept
             }
             if (light) hr = q8_round(hr.data(), F);
-            else if (fp8) hr = fp8_round(hr.data(), F);
+            else if (fp8) hr = fp8_round(hr.data(), F, e8m0);
             for (int d = 0; d < D; ++d) ywant[(size_t) r * D + d] = mx_dot(emat(E, owner[r], 2), F, d, hr.data());
         }
         char sw[64];

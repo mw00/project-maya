@@ -1314,7 +1314,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
         }
 }
 
-template <bool GATE_UP>
+template <bool GATE_UP, bool E8M0>
 __global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     pdl_wait();
@@ -1372,8 +1372,16 @@ __global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a)
         }
         peak = fmaxf(peak, __shfl_xor(peak, 1));
         peak = fmaxf(peak, __shfl_xor(peak, 2));
-        const float inv = peak > 0.0f ? 448.0f / peak : 0.0f;
-        if (tq == 0) t.xs[tr] = peak * (1.0f / 448.0f);
+        float scale = peak * (1.0f / 448.0f);
+        float inv = peak > 0.0f ? 448.0f / peak : 0.0f;
+        if constexpr (E8M0) {
+            // DeepSeek's act_quant uses ceil(log2(max(amax, 1e-4) / 448)).
+            const uint32_t bits = __float_as_uint(fmaxf(peak, 1e-4f) * (1.0f / 448.0f));
+            const uint32_t exponent = (bits >> 23) + ((bits & 0x7fffffu) != 0);
+            scale = __uint_as_float(exponent << 23);
+            inv = __uint_as_float((254u - exponent) << 23);
+        }
+        if (tq == 0) t.xs[tr] = scale;
         i2v x;
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
@@ -1420,23 +1428,27 @@ __global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a)
 #endif
 }
 
-bool fp8_wmma_ok() {
-    static const bool enabled = [] {
+int fp8_wmma_mode() {
+    static const int mode = [] {
         const char* v = std::getenv("MAYA_DS4_MXFP4_WMMA_FP8");
-        return v && std::strcmp(v, "1") == 0;
+        if (v != nullptr && std::strcmp(v, "2") == 0) return 2;
+        return v != nullptr && std::strcmp(v, "1") == 0 ? 1 : 0;
     }();
     static std::atomic<int> known[64];
     int dev = 0;
-    if (!enabled || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (mode == 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
     int k = known[dev].load(std::memory_order_relaxed);
     if (k == 0) {
         cudaDeviceProp prop{};
         const bool supported = cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
             (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
         k = supported ? 2 : 1;
+        if (supported)
+            std::fprintf(stderr, "ds4: GPU%d MXFP4 prefill FP8 WMMA uses %s activation scales\n", dev,
+                         mode == 2 ? "E8M0 power-of-two" : "amax/448");
         known[dev].store(k, std::memory_order_relaxed);
     }
-    return k == 2;
+    return k == 2 ? mode : 0;
 }
 #endif
 // sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); MAYA_DS4_NO_TC=1 keeps the F32 kernel - per device
@@ -2242,7 +2254,9 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
 #if !defined(MAYA_USE_HIP)
         pdl_launch(mx_set_tc_kernel<true>, grid, kThreads, 0, s, k);
 #else
-        if (fp8_wmma_ok()) pdl_launch(mx_set_fp8_wmma_kernel<true>, grid, kThreads, 0, s, k);
+        const int fp8 = fp8_wmma_mode();
+        if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<true, true>), grid, kThreads, 0, s, k);
+        else if (fp8 == 1) pdl_launch((mx_set_fp8_wmma_kernel<true, false>), grid, kThreads, 0, s, k);
         else pdl_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
 #endif
     } else {
@@ -2303,7 +2317,9 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
 #if !defined(MAYA_USE_HIP)
         pdl_launch(mx_set_tc_kernel<false>, grid, kThreads, 0, s, k);
 #else
-        if (fp8_wmma_ok()) pdl_launch(mx_set_fp8_wmma_kernel<false>, grid, kThreads, 0, s, k);
+        const int fp8 = fp8_wmma_mode();
+        if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<false, true>), grid, kThreads, 0, s, k);
+        else if (fp8 == 1) pdl_launch((mx_set_fp8_wmma_kernel<false, false>), grid, kThreads, 0, s, k);
         else pdl_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
 #endif
     } else {
