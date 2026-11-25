@@ -11529,11 +11529,22 @@ struct Model::Impl {
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
     // (DS4_LANE_PARITY: the device's arithmetic instead, cpu_experts_par, where the layer's types have its rows)
+    // Rows a CPU-lane job: 64 by default, or about rows / (jobs x pool threads), rounded down to `unit`.
+    int lane_rows(int rows, int unit) const {
+        static const long jobs = [] {
+            const char* v = ds4_env("DS4_LANE_JOBS");
+            return v != nullptr ? std::max(0L, std::strtol(v, nullptr, 10)) : 0L;
+        }();
+        if (jobs == 0) return 64;
+        const int per_job = (int) ((rows / jobs) / pools[0]->size());
+        return std::clamp(per_job / unit * unit, unit, 64);
+    }
+
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
         if (lane_par_layer(l)) return cpu_experts_par(l, x, ents, ldx, ord);
-        constexpr int RB = 64;   // rows a job
-        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, ne = (int) ents.size();
+        const int RB = lane_rows(ne * FFh, 8), RD = lane_rows(ne * Eh, 8);   // rows a job: gate / up, down
+        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RD - 1) / RD;
         gg::IqCpu fm;
         std::string ferr;
         if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
@@ -11598,7 +11609,7 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
-                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                const int r0 = X * Eh + (j % DB) * RD, r1 = std::min(X * Eh + Eh, r0 + RD);
                 const void* hp[gg::kMxCpuMaxN];
                 float* yp[gg::kMxCpuMaxN];
                 for (int i = 0; i < en.n; ++i) {
@@ -11616,9 +11627,10 @@ struct Model::Impl {
     // token t's at row t, then a row a slot), both kinds' fit there.
     void cpu_experts_both(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord,
                           bool mx_gu) {
-        constexpr int RB = 64;   // rows a job
-        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, ne = (int) ents.size();
+        // rows a job: gate / up, down - an MXFP4 role's whole 32-row groups (mx_rows sees the groups it saw at 64)
+        const int RB = lane_rows(ne * FFh, mx_gu ? 32 : 8), RD = lane_rows(ne * Eh, mx_gu ? 8 : 32);
+        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RD - 1) / RD;
         const int tq = gg::expert_type(l.lay, mx_gu ? 2 : 0);   // (the low-bit role's type: its activation's)
         gg::IqCpu fm;
         std::string ferr;
@@ -11672,7 +11684,7 @@ struct Model::Impl {
                                        r0 - X * FFh, r1 - X * FFh, lim);
                     return;
                 }
-                float yg[gg::kMxCpuMaxN][RB], yu[gg::kMxCpuMaxN][RB];
+                float yg[gg::kMxCpuMaxN][64], yu[gg::kMxCpuMaxN][64];   // (RB <= 64)
                 float *gp[gg::kMxCpuMaxN], *up[gg::kMxCpuMaxN];
                 for (int i = 0; i < en.n; ++i) gp[i] = yg[i], up[i] = yu[i];
                 gg::mx_rows(ent_part(l, en, 0, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, gp);
@@ -11697,7 +11709,7 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
-                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                const int r0 = X * Eh + (j % DB) * RD, r1 = std::min(X * Eh + Eh, r0 + RD);
                 const void* hp[gg::kMxCpuMaxN];
                 float* yp[gg::kMxCpuMaxN];
                 for (int i = 0; i < en.n; ++i) {
