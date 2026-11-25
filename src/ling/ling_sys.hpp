@@ -16,6 +16,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <string>
@@ -23,6 +24,7 @@
 
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -123,19 +125,37 @@ inline bool is_rotational_disk(const std::string& path, std::string& dev_name) {
 #endif
 }
 
-// ---- Physical cores honoring process CPU affinity mask + NUMA topology ----
+// ---- Physical cores honoring process CPU affinity mask + Linux NUMA topology & pinning ----
 struct CpuTopology {
     int physical_cores = 1;
     int numa_nodes = 1;
+    std::vector<int> node_ids;
     std::vector<int> node_core_counts;
+    std::map<int, std::vector<int>> node_cpus;  // allowed logical CPUs per NUMA node
     std::string summary;
 };
+
+inline std::vector<int> parse_cpulist(const std::string& text) {
+    std::vector<int> cpus;
+    std::stringstream ss(text);
+    for (std::string part; std::getline(ss, part, ',');) {
+        while (!part.empty() && std::isspace((unsigned char) part.back())) part.pop_back();
+        if (part.empty()) continue;
+        const size_t dash = part.find('-');
+        const int a = std::atoi(part.c_str());
+        const int b = (dash == std::string::npos) ? a : std::atoi(part.c_str() + dash + 1);
+        if (a < 0 || b < a || b - a > 4096) continue;
+        for (int c = a; c <= b; ++c) cpus.push_back(c);
+    }
+    return cpus;
+}
 
 inline CpuTopology detect_cpu_topology() {
     CpuTopology top;
 #if defined(_WIN32)
     top.physical_cores = std::max(1, (int) std::thread::hardware_concurrency() / 2);
     top.numa_nodes = 1;
+    top.node_ids = {0};
     top.node_core_counts = {top.physical_cores};
     top.summary = "1 node, " + std::to_string(top.physical_cores) + " physical cores";
     return top;
@@ -145,8 +165,18 @@ inline CpuTopology detect_cpu_topology() {
     const bool have_mask = (::sched_getaffinity(0, sizeof mask, &mask) == 0);
     std::set<std::pair<int, int>> seen_phys;
     std::map<int, std::set<std::pair<int, int>>> node_phys;
+    std::map<int, std::vector<int>> node_cpus;
     const long ncpu = ::sysconf(_SC_NPROCESSORS_CONF);
     const int lim = (ncpu > 0 && ncpu < 4096) ? (int) ncpu : 256;
+
+    std::map<int, int> cpu_to_node;
+    for (int n = 0; n < 64; ++n) {
+        std::ifstream nf("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
+        std::string line;
+        if (!nf || !std::getline(nf, line)) continue;
+        for (int c : parse_cpulist(line)) cpu_to_node[c] = n;
+    }
+
     for (int cpu = 0; cpu < lim; ++cpu) {
         if (have_mask && !CPU_ISSET(cpu, &mask)) continue;
         char p_core[128], p_pkg[128];
@@ -161,38 +191,86 @@ inline CpuTopology detect_cpu_topology() {
             std::ifstream f(p_pkg);
             f >> pkg_id;
         }
-        int nid = 0;
-        for (int n = 0; n < 16; ++n) {
-            char p_node[128];
-            std::snprintf(p_node, sizeof p_node, "/sys/devices/system/node/node%d/cpu%d", n, cpu);
-            if (::access(p_node, F_OK) == 0) {
-                nid = n;
-                break;
-            }
-        }
+        auto it = cpu_to_node.find(cpu);
+        const int nid = (it != cpu_to_node.end()) ? it->second : 0;
         seen_phys.insert({pkg_id, core_id});
         node_phys[nid].insert({pkg_id, core_id});
+        node_cpus[nid].push_back(cpu);
     }
     if (seen_phys.empty()) {
         int cnt = 0;
         if (have_mask) cnt = CPU_COUNT(&mask);
         top.physical_cores = std::max(1, cnt > 0 ? cnt : 1);
         top.numa_nodes = 1;
+        top.node_ids = {0};
         top.node_core_counts = {top.physical_cores};
+        for (int cpu = 0; cpu < lim; ++cpu)
+            if (!have_mask || CPU_ISSET(cpu, &mask)) top.node_cpus[0].push_back(cpu);
     } else {
         top.physical_cores = (int) seen_phys.size();
         top.numa_nodes = std::max(1, (int) node_phys.size());
-        for (const auto& kv : node_phys) top.node_core_counts.push_back((int) kv.second.size());
+        top.node_cpus = std::move(node_cpus);
+        for (const auto& kv : node_phys) {
+            top.node_ids.push_back(kv.first);
+            top.node_core_counts.push_back((int) kv.second.size());
+        }
     }
     std::ostringstream oss;
     oss << top.numa_nodes << " node(s), " << top.physical_cores << " physical core(s) in affinity mask [";
     for (size_t i = 0; i < top.node_core_counts.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "n" << i << ":" << top.node_core_counts[i];
+        oss << "n" << top.node_ids[i] << ":" << top.node_core_counts[i];
     }
     oss << "]";
     top.summary = oss.str();
     return top;
+#endif
+}
+
+inline int gpu_numa_node(const char* pci_bus_id) {
+#if defined(__linux__)
+    if (pci_bus_id == nullptr || pci_bus_id[0] == '\0') return -1;
+    std::string bus(pci_bus_id);
+    for (char& ch : bus)
+        if (ch >= 'A' && ch <= 'Z') ch = (char) (ch - 'A' + 'a');
+    std::ifstream f("/sys/bus/pci/devices/" + bus + "/numa_node");
+    int nid = -1;
+    if (f >> nid && nid >= 0) return nid;
+    return -1;
+#else
+    (void) pci_bus_id;
+    return -1;
+#endif
+}
+
+inline bool build_numa_cpuset(const CpuTopology& top, int node_id, std::vector<int>& out_cpus) {
+    out_cpus.clear();
+    if (top.numa_nodes <= 1 || node_id < 0) return false;
+    auto it = top.node_cpus.find(node_id);
+    if (it == top.node_cpus.end() || it->second.empty()) return false;
+    out_cpus = it->second;
+    return true;
+}
+
+inline bool pin_thread_to_numa_node(const CpuTopology& top, int node_id) {
+#if defined(__linux__)
+    std::vector<int> cpus;
+    if (!build_numa_cpuset(top, node_id, cpus)) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int added = 0;
+    for (int c : cpus) {
+        if (c >= 0 && c < CPU_SETSIZE) {
+            CPU_SET(c, &set);
+            ++added;
+        }
+    }
+    if (added == 0) return false;
+    return ::pthread_setaffinity_np(::pthread_self(), sizeof set, &set) == 0;
+#else
+    (void) top;
+    (void) node_id;
+    return false;
 #endif
 }
 
@@ -397,6 +475,34 @@ struct ExpertProfile {
         return counts.data() + (size_t) moe_idx * n_expert;
     }
 };
+
+// ---- Expert VRAM slot placement planner (shared with model-free regression tests) ----
+inline void plan_expert_slots(int n_expert, int n_res, const uint32_t* profile_counts,
+                              std::vector<int>& h_slot, std::vector<int>& h_owner,
+                              std::vector<float>& h_score, std::vector<int>& ranked) {
+    n_expert = std::max(0, n_expert);
+    n_res = std::max(0, std::min(n_res, n_expert));
+    h_slot.assign((size_t) n_expert, -1);
+    h_owner.assign((size_t) std::max(1, n_res), -1);
+    h_score.assign((size_t) n_expert, 0.0f);
+    ranked.resize((size_t) n_expert);
+    std::iota(ranked.begin(), ranked.end(), 0);
+    if (profile_counts != nullptr && n_expert > 0) {
+        uint32_t maxc = 1;
+        for (int e = 0; e < n_expert; ++e) maxc = std::max(maxc, profile_counts[e]);
+        for (int e = 0; e < n_expert; ++e) h_score[(size_t) e] = 4.0f * (float) profile_counts[e] / (float) maxc;
+        if (n_res < n_expert) {
+            std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+                return profile_counts[a] > profile_counts[b];
+            });
+        }
+    }
+    for (int sl = 0; sl < n_res; ++sl) {
+        const int e = ranked[(size_t) sl];
+        h_slot[(size_t) e] = sl;
+        h_owner[(size_t) sl] = e;
+    }
+}
 
 // ---- Keyed per-PC calibration store (key<TAB>k=v ...) ----
 // Key includes: host, model, quant, ctx, gpus, driver, kernel_hash.

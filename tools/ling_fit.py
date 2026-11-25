@@ -60,43 +60,40 @@ RAM_SPARE_GIB = 8.0
 MIN_VRAM_GIB = 7.5   # 8 GB class card minimum (zero-expert VRAM pool works)
 MIN_CC = 70          # Volta / Turing+ (sm_70+)
 
-DEFAULT_QUANT = "Ling-3.2-air-Maya-S"
-QUANTS = {
-    "Ling-3.2-air-Maya-XS": {
-        "dense_gib": 3.73,
-        "experts_gib": 39.00,
-        "mtp_exp_gib": 1.20,
-        "memory_gb": 46,
-        "about": "IQ2_XXS/IQ2_S experts (~2.3 bpw), Q8_0 dense",
-    },
-    "Ling-3.2-air-Maya-S": {
-        "dense_gib": 3.73,
-        "experts_gib": 51.83,
-        "mtp_exp_gib": 1.58,
-        "memory_gb": 60,
-        "about": "IQ3_XXS gate/up + Q4_K down (~3.4 bpw), Q8_0 dense",
-    },
-    "Ling-3.2-air-Q8_0": {
-        "dense_gib": 3.73,
-        "experts_gib": 119.00,
-        "mtp_exp_gib": 3.55,
-        "memory_gb": 132,
-        "about": "Uniform Q8_0 reference quant (~126 GiB)",
-    },
-}
+# Neutral fallback sizing when no local GGUF file size is supplied (maintainers add official quants in download.json).
+DEFAULT_EXPERTS_GIB = 52.0
+DEFAULT_QUANT = "local"
 
 
 def download_manifest() -> dict:
     p = Path(__file__).resolve().parent / "ling" / "download.json"
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
-    return {"quants": QUANTS}
+    return {"name": "Ling-3.2-air", "default_kv": DEFAULT_KV, "quants": {}}
 
 
-def quant_spec(quant: str | None) -> dict:
-    if quant and quant in QUANTS:
-        return QUANTS[quant]
-    return QUANTS[DEFAULT_QUANT]
+def quant_spec(quant: str | None = None, gguf_gib: float | None = None,
+               experts_gib: float | None = None) -> dict:
+    manifest = download_manifest()
+    quants = manifest.get("quants") or {}
+    if quant and quant in quants:
+        q = quants[quant]
+        return {
+            "dense_gib": float(q.get("dense_gib", DENSE_GIB)),
+            "experts_gib": float(q.get("experts_gib", DEFAULT_EXPERTS_GIB)),
+            "memory_gb": float(q.get("memory_gb", DENSE_GIB + DEFAULT_EXPERTS_GIB)),
+        }
+    if experts_gib is not None and experts_gib > 0:
+        eg = float(experts_gib)
+    elif gguf_gib is not None and gguf_gib > 0:
+        eg = max(1.0, float(gguf_gib) - DENSE_GIB)
+    else:
+        eg = DEFAULT_EXPERTS_GIB
+    return {
+        "dense_gib": round(DENSE_GIB, 2),
+        "experts_gib": round(eg, 2),
+        "memory_gb": round(DENSE_GIB + eg + 4.0, 1),
+    }
 
 
 def normalize_kv(kv: str | None) -> str:
@@ -137,13 +134,14 @@ def _layer_split(n_gpu: int) -> list[tuple[int, int]]:
 
 
 def plan(vram_gbs: list[float] | float, ctx: int, kv: str = DEFAULT_KV, quant: str | None = None,
-         ram_gb: float = 0.0, reserve_gb: float = 0.0) -> dict:
+         ram_gb: float = 0.0, reserve_gb: float = 0.0, gguf_gib: float | None = None,
+         experts_gib: float | None = None) -> dict:
     """Compute exact per-GPU & host placement plan matching maya-ling's runtime planner.
 
     Invariant: trunk KV format and trunk_vram_slots do NOT depend on whether MTP drafting is loaded.
     """
     kv = normalize_kv(kv)
-    qs = quant_spec(quant)
+    qs = quant_spec(quant, gguf_gib=gguf_gib, experts_gib=experts_gib)
     gbs = [float(vram_gbs)] if isinstance(vram_gbs, (int, float)) else [float(x) for x in vram_gbs]
     if not gbs:
         gbs = [0.0]
@@ -293,28 +291,30 @@ def unsupported(backend: str, win: bool, gpus: list[dict], ram_gb: float = 0.0, 
     return None
 
 
-def smaller_quant_hint(vram_gbs: list[float] | float, ram_gb: float, ctx: int, kv: str, current_quant: str | None) -> str:
-    """Name a smaller quant (or shorter context) that fits better on this PC."""
-    order = ["Ling-3.2-air-Maya-XS", "Ling-3.2-air-Maya-S", "Ling-3.2-air-Q8_0"]
-    cur_p = plan(vram_gbs, ctx, kv, current_quant, ram_gb=ram_gb)
-    cur_mem = quant_spec(current_quant)["memory_gb"]
-    for q in order:
-        if QUANTS[q]["memory_gb"] < cur_mem:
-            p = plan(vram_gbs, ctx, kv, q, ram_gb=ram_gb)
-            if p["fits_trunk"] and (p["ssd_slots"] == 0 or p["ssd_slots"] < cur_p["ssd_slots"]):
-                note = "fits RAM without SSD streaming" if p["ssd_slots"] == 0 else f"cuts SSD spill to {p['ssd_gib']:.1f} GiB"
-                return f"try {q} (~{QUANTS[q]['memory_gb']} GB total, {note})"
+def smaller_quant_hint(vram_gbs: list[float] | float, ram_gb: float, ctx: int, kv: str,
+                       current_quant: str | None = None, gguf_gib: float | None = None) -> str:
+    """Suggest a smaller published quant (when download.json lists any), shorter context, or --kv q8."""
+    quants = download_manifest().get("quants") or {}
+    if quants:
+        cur_p = plan(vram_gbs, ctx, kv, current_quant, ram_gb=ram_gb, gguf_gib=gguf_gib)
+        cur_mem = quant_spec(current_quant, gguf_gib=gguf_gib)["memory_gb"]
+        for q, qspec in sorted(quants.items(), key=lambda kvp: float(kvp[1].get("memory_gb", 999))):
+            if float(qspec.get("memory_gb", 999)) < cur_mem:
+                p = plan(vram_gbs, ctx, kv, q, ram_gb=ram_gb)
+                if p["fits_trunk"] and (p["ssd_slots"] == 0 or p["ssd_slots"] < cur_p["ssd_slots"]):
+                    note = "fits RAM without SSD streaming" if p["ssd_slots"] == 0 else f"cuts SSD spill to {p['ssd_gib']:.1f} GiB"
+                    return f"try {q} (~{qspec['memory_gb']} GB total, {note})"
     if ctx > 16384:
-        return f"try a shorter context (--context 16384 or 32768) or --kv q8"
-    return "use --force-fit to proceed anyway"
+        return "try a smaller quant, a shorter context (--context 16384 or 32768), or --kv q8"
+    return "try a smaller quant or use --force-fit to proceed anyway"
 
 
 def verdict(vram_gbs: list[float] | float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV,
-            quant: str | None = None, reserve_gb: float = 0.0) -> tuple[str, str]:
+            quant: str | None = None, reserve_gb: float = 0.0, gguf_gib: float | None = None) -> tuple[str, str]:
     """Return (verdict, human_line): verdict in {'fits', 'runs slowly', 'does not fit'}."""
-    p = plan(vram_gbs, ctx, kv, quant, ram_gb=ram_gb, reserve_gb=reserve_gb)
+    p = plan(vram_gbs, ctx, kv, quant, ram_gb=ram_gb, reserve_gb=reserve_gb, gguf_gib=gguf_gib)
     if not p["fits_trunk"]:
-        hint = smaller_quant_hint(vram_gbs, ram_gb, ctx, kv, quant)
+        hint = smaller_quant_hint(vram_gbs, ram_gb, ctx, kv, quant, gguf_gib=gguf_gib)
         return "does not fit", (
             f"trunk + KV ({p['need_non_exp_gib']:.1f} GiB non-expert) does not fit available VRAM at {ctx} ctx ({kv}); {hint}"
         )
@@ -323,16 +323,16 @@ def verdict(vram_gbs: list[float] | float, ram_gb: float, ctx: int, kv: str = DE
             f"all {p['total_experts']} routed experts fit in VRAM ({p['vram_exp_gib']:.1f} GiB) at {ctx} ctx ({kv.upper()} KV {p['kv_gib']:.2f} GiB)"
         )
     if p["vram_slots"] == 0:
-        hint = smaller_quant_hint(vram_gbs, ram_gb, ctx, kv, quant)
+        hint = smaller_quant_hint(vram_gbs, ram_gb, ctx, kv, quant, gguf_gib=gguf_gib)
         where = f"RAM + SSD ({p['ssd_gib']:.1f} GiB on NVMe)" if p["ssd_slots"] > 0 else f"host RAM ({p['ram_gib']:.1f} GiB)"
         return "runs slowly", (
             f"zero-expert VRAM pool (trunk + KV leave no room for expert slots); all routed experts run from {where}; {hint}"
         )
     if p["ssd_slots"] > 0:
-        hint = smaller_quant_hint(vram_gbs, ram_gb, ctx, kv, quant)
+        hint = smaller_quant_hint(vram_gbs, ram_gb, ctx, kv, quant, gguf_gib=gguf_gib)
         return "runs slowly", (
             f"{p['vram_pct']:.1f}% of experts in VRAM ({p['vram_exp_gib']:.1f} GiB), "
-            f"{p['ram_gib']:.1f} GiB in RAM, {p['ssd_gib']:.1f} GiB streamed from NVMe SSD (O_DIRECT); {hint}"
+            f"{p['ram_gib']:.1f} GiB in RAM, {p['ssd_gib']:.1f} GiB streamed from NVMe SSD; {hint}"
         )
     return "fits", (
         f"{p['vram_pct']:.1f}% of experts in VRAM ({p['vram_slots']}/{p['total_experts']}, {p['vram_exp_gib']:.1f} GiB), "

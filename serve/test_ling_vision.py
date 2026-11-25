@@ -121,6 +121,16 @@ class LingModelsConfig(unittest.TestCase):
             self.assertEqual((cur["context"], cur["kv"], cur["draft"]), (32768, "q8", "auto"))
             can = M.choices(cfg)
             self.assertEqual(can["kv"], ["f16", "q8"])
+
+            # Non-Ling engines must NOT have their Models page context range changed by --model / --gguf
+            for fam_exe, fam_name in (("maya-ik2", "ik2"), ("maya-hy4", "hy4"), ("maya-ds4", "deepseek"), ("maya", "qwen")):
+                other_cfg = {
+                    "exe": str(d / fam_exe),
+                    "model_name": fam_name,
+                    "args": ["--model", str(gguf), "--max-context", "32768"],
+                    "installer": {"family": fam_name},
+                }
+                self.assertIsNone(M.trained_context_of(other_cfg), f"{fam_name} must not read Ling GGUF context_length")
             self.assertIn("auto", can["draft"])
             desc = M.describe(cfg_p, None)
             self.assertIn(262144, desc["contexts"])

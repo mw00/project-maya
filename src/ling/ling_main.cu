@@ -933,11 +933,12 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
     const std::string& rdir = model.opts().restore_dir;
     if (!rdir.empty()) {
         std::vector<ling::Model::KdaSnapshot> disk_snaps;
-        if (model.load_restore_disk(rdir, disk_snaps)) {
-            for (auto& ds : disk_snaps) snaps.push_back(std::move(ds));
-            std::fprintf(stderr, "ling restore: loaded %zu persisted restore point(s) from %s\n",
-                         snaps.size(), rdir.c_str());
-        }
+        std::vector<std::string> skipped;
+        (void) model.load_restore_disk(rdir, disk_snaps, &skipped);
+        for (const auto& sline : skipped) std::fprintf(stderr, "%s\n", sline.c_str());
+        for (auto& ds : disk_snaps) snaps.push_back(std::move(ds));
+        std::fprintf(stderr, "ling restore: disk restore points enabled at %s (cap %zu MiB, loaded %zu)\n",
+                     rdir.c_str(), model.opts().restore_dir_max_mb, snaps.size());
     }
     std::vector<int> live_tokens;
     std::vector<std::pair<int64_t, uint64_t>> live_pics;
@@ -960,7 +961,9 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
         model.save_kda_snapshot(sp, toks, pics, persist_disk || !rdir.empty());
         if (persist_disk && !rdir.empty()) {
             std::string serr;
-            (void) model.save_restore_disk(sp, rdir, serr);
+            if (!model.save_restore_disk(sp, rdir, serr) && !serr.empty()) {
+                std::fprintf(stderr, "ling restore: skipping save: %s\n", serr.c_str());
+            }
         }
         if (snaps.size() >= max_snaps) snaps.pop_front();
         snaps.push_back(std::move(sp));
@@ -1562,7 +1565,10 @@ int main(int argc, char** argv) {
         else if (a == "--ram-cap-gib") opt.ram_cap_gib = std::atof(val("--ram-cap-gib").c_str());
         else if (a == "--repeatable") opt.repeatable = true;
         else if (a == "--lane-parity") opt.lane_parity = true;
+        else if (a == "--no-promo") opt.no_promo = true;
         else if (a == "--auto-sort-gpus") opt.auto_sort_gpus = true;
+        else if (a == "--no-auto-sort-gpus") opt.auto_sort_gpus = false;
+        else if (a == "--direct") opt.direct_io = true;
         else if (a == "--no-direct") opt.direct_io = false;
         else if (a == "--recalibrate") opt.recalibrate = true;
         else if (a == "--no-profile") opt.no_profile = true;
@@ -1570,6 +1576,7 @@ int main(int argc, char** argv) {
         else if (a == "--profile-out") opt.profile_out = val("--profile-out");
         else if (a == "--cal-file") opt.cal_file = val("--cal-file");
         else if (a == "--restore-dir") opt.restore_dir = val("--restore-dir");
+        else if (a == "--restore-dir-max-mb") opt.restore_dir_max_mb = (size_t) std::max(0, std::atoi(val("--restore-dir-max-mb").c_str()));
         else if (a == "--lookahead") {
             const std::string v = val("--lookahead");
             opt.lookahead = (v == "on" || v == "1") ? 1 : (v == "off" || v == "0" ? 0 : -1);

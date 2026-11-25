@@ -1,5 +1,5 @@
 {
- "_": "Ling-3.2-air (inclusionAI/Ling-3.2-air, 128B MoE: 42 trunk layers = 35 KDA + 7 MLA + 1 optional MTP blk.42, 512 routed experts with top-8 active + 1 shared expert, 262,144 native context, Qwen3-VL-compatible vision tower) on maya-ling. A quant entry with empty 'files' is ready for --model-dir today and becomes a direct download once 'revision' and 'files' (size + sha256) are published.",
+ "_": "Ling-3.2-air (inclusionAI/Ling-3.2-air, bailingmoe3) on maya-ling. Official quant names, sizes, and hashes will be added here by maintainers when published; pass --model-dir <folder with local .gguf> today.",
  "name": "Ling-3.2-air",
  "repo": "",
  "revision": "",
@@ -12,41 +12,9 @@
  },
  "reasoning_effort": "high",
  "vision": {
-  "_": "Ling-3.2-air vision projector (mmproj-BF16, built with tools/ling/convert_mmproj.py; ~829 MiB weights, ~1.2 GiB transient activation room lent from the expert pool tail while encoding a picture).",
+  "_": "Ling-3.2-air vision projector (mmproj-BF16, built with tools/ling/convert_mmproj.py; 0 permanent VRAM, lent from the expert pool tail while encoding).",
   "files": {},
-  "legacy_names": ["Ling-3.2-air-mmproj-BF16.gguf", "mmproj-BF16.gguf", "mmproj-Ling-3.2-air-BF16.gguf"],
-  "size_gb": 0.81
+  "legacy_names": ["Ling-3.2-air-mmproj-BF16.gguf", "mmproj-BF16.gguf", "mmproj-Ling-3.2-air-BF16.gguf"]
  },
- "quants": {
-  "Ling-3.2-air-Maya-XS": {
-   "about": "routed experts IQ2_XXS/IQ2_S (~2.3 bits), dense attention/head Q8_0; fits 64 GB RAM + 8-24 GB GPU",
-   "memory_gb": 46,
-   "dense_gib": 3.73,
-   "experts_gib": 39.0,
-   "mtp_gib": 1.25,
-   "for_gb": [56, 64],
-   "files": {},
-   "plan": {"chunk": 1024, "reserve_gb": 0.5}
-  },
-  "Ling-3.2-air-Maya-S": {
-   "about": "routed experts IQ3_XXS gate/up + Q4_K down (~3.4 bits), dense attention/head Q8_0 (~57.2 GiB total)",
-   "memory_gb": 60,
-   "dense_gib": 3.73,
-   "experts_gib": 51.83,
-   "mtp_gib": 1.64,
-   "for_gb": [64, 96],
-   "files": {},
-   "plan": {"chunk": 1024, "reserve_gb": 0.5}
-  },
-  "Ling-3.2-air-Q8_0": {
-   "about": "uniform Q8_0 reference quant (~126.3 GiB total); for 128-256+ GB RAM or multi-GPU rigs",
-   "memory_gb": 132,
-   "dense_gib": 3.73,
-   "experts_gib": 119.0,
-   "mtp_gib": 3.60,
-   "for_gb": [144, 192],
-   "files": {},
-   "plan": {"chunk": 1024, "reserve_gb": 0.5}
-  }
- }
+ "quants": {}
 }

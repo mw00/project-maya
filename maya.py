@@ -894,7 +894,6 @@ IK2_MODEL_NAME = "inkling-2-mini"
 IK2_MIN_CC = IK2F.MIN_CC
 IK2_PROFILE = ROOT / "data" / "expert-profile-ik2mini.bin"   # (the offload path's starting VRAM tier: maya-ik2's IK2_WARM)
 LING = "Ling-3.2-air"
-LING_SHOWN = "Ling-3.2-air"
 LING_MODEL_NAME = "ling-3.2-air"
 LING_DIR = "maya-ling"
 LING_PROFILE = ROOT / "data" / "expert-profile-ling32.bin"
@@ -11907,8 +11906,8 @@ def write_config_ling(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, 
     if mmproj is not None and not getattr(a, "no_vision", False):
         args += ["--mmproj", str(mmproj)]
     cal_file = d / LING_DIR / "ling-calibration.txt"
-    restore_dir = d / LING_DIR / "restore-points"
-    args += ["--cal-file", str(cal_file), "--restore-dir", str(restore_dir)]
+    args += ["--cal-file", str(cal_file)]
+    # Disk restore points stay OFF by default (opt-in via --restore-dir).
     if LING_PROFILE.is_file():
         args += ["--profile", str(LING_PROFILE)]
 
@@ -11942,7 +11941,6 @@ def write_config_ling(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, 
         "models_dir": str(models_root),
         "model_dir": str(d),
         "cal_file": str(cal_file),
-        "restore_dir": str(restore_dir),
         "written": time.strftime("%Y-%m-%d %H:%M"),
     }
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
@@ -11986,10 +11984,8 @@ def set_up_ling(a, prev: dict) -> Path | None:
 
     step(2, "your choices")                            # 2
     manifest = LINGF.download_manifest()
-    quant_names = list((manifest.get("quants") or LINGF.QUANTS).keys())
-    quant_name = getattr(a, "ling_quant", None) or inst.get("quant") or LINGF.DEFAULT_QUANT
-    if quant_name not in LINGF.QUANTS:
-        quant_name = LINGF.DEFAULT_QUANT
+    quants = manifest.get("quants") or {}
+    quant_name = getattr(a, "ling_quant", None) or inst.get("quant") or (next(iter(quants)) if quants else LINGF.DEFAULT_QUANT)
     vrams = [float(g.get("vram_gb") or 0) for g in pc["gpus"]]
     kv = LINGF.normalize_kv(getattr(a, "kv", None) or prev_kv)
     rec_ctx = LINGF.recommended_context(vrams, kv, quant_name)

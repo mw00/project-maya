@@ -353,13 +353,13 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
                          path.c_str(), hdd_dev.c_str());
         }
     }
-    const sys::CpuTopology topo = sys::detect_cpu_topology();
-    std::fprintf(stderr, "ling numa: %s\n", topo.summary.c_str());
-    if (o_.cpu_threads < 0) o_.cpu_threads = sys::default_cpu_threads(topo);
+    cpu_topo_ = sys::detect_cpu_topology();
+    if (o_.cpu_threads < 0) o_.cpu_threads = sys::default_cpu_threads(cpu_topo_);
 
-    // Optional GPU auto-sort: non-display cards first, then larger free VRAM first
+    // Default GPU auto-sort (disable with --no-auto-sort-gpus): headless cards first, then larger VRAM first
+    // (bucketed to 512 MiB so identical cards keep their original index order).
     if (o_.auto_sort_gpus && o_.gpus.size() > 1) {
-        struct GpuRank { int dev; int display; size_t free_b; };
+        struct GpuRank { int dev; int display; uint64_t vram_bucket; };
         std::vector<GpuRank> rk;
         for (int d : o_.gpus) {
             cudaSetDevice(d);
@@ -367,11 +367,12 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             cudaMemGetInfo(&fb, &tb);
             cudaDeviceProp dp{};
             int disp = (cudaGetDeviceProperties(&dp, d) == cudaSuccess && dp.kernelExecTimeoutEnabled) ? 1 : 0;
-            rk.push_back({d, disp, fb});
+            const uint64_t bucket = (tb > 0 ? (uint64_t) tb : (uint64_t) fb) >> 29;
+            rk.push_back({d, disp, bucket});
         }
         std::stable_sort(rk.begin(), rk.end(), [](const GpuRank& a, const GpuRank& b) {
             if (a.display != b.display) return a.display < b.display;
-            return a.free_b > b.free_b;
+            return a.vram_bucket > b.vram_bucket;
         });
         o_.gpus.clear();
         for (const auto& r : rk) o_.gpus.push_back(r.dev);
@@ -500,10 +501,37 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             CK(cudaEventCreateWithFlags(&gp.ev_pmap[r], cudaEventDisableTiming));
             CK(cudaEventRecord(gp.ev_pmap[r], gp.s_copy));
         }
+        char bus_id[64] = {};
+        if (cudaDeviceGetPCIBusId(bus_id, sizeof bus_id, gp.dev) == cudaSuccess) {
+            gp.numa_node = sys::gpu_numa_node(bus_id);
+        }
+        if (gp.numa_node < 0 && !cpu_topo_.node_ids.empty()) gp.numa_node = cpu_topo_.node_ids[0];
         const int m0 = (n_moe * gi) / ngpu;
         const int m1 = (n_moe * (gi + 1)) / ngpu;
         gp.l0 = gi == 0 ? 0 : (c.n_dense_lead + m0);
         gp.l1 = c.n_dense_lead + m1;
+    }
+    if (ngpu > 1) {
+        std::ostringstream go;
+        for (int gi = 0; gi < ngpu; ++gi) {
+            if (gi > 0) go << ",";
+            go << gpus_[(size_t) gi].dev;
+        }
+        std::fprintf(stderr, "ling gpus: order=[%s] auto_sort=%s\n", go.str().c_str(),
+                     o_.auto_sort_gpus ? "on" : "off");
+    }
+    if (cpu_topo_.numa_nodes > 1) {
+        std::ostringstream nm;
+        for (int gi = 0; gi < ngpu; ++gi) {
+            if (gi > 0) nm << ",";
+            nm << "gpu" << gpus_[(size_t) gi].dev << "->n" << gpus_[(size_t) gi].numa_node;
+        }
+        std::fprintf(stderr, "ling numa: %s; pinning GPU workers & host expert arenas (%s)\n",
+                     cpu_topo_.summary.c_str(), nm.str().c_str());
+    } else {
+        std::fprintf(stderr,
+                     "ling numa: %s; single-node host (hy4::Lane pins CPU workers to physical cores; cross-node pinning inactive)\n",
+                     cpu_topo_.summary.c_str());
     }
 
     // Startup bit-for-bit self-check of fused kernels (refuses start on any mismatch)
@@ -563,6 +591,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             lthreads.emplace_back([&, gi] {
                 try {
                     Gpu& gp = gpus_[(size_t) gi];
+                    (void) sys::pin_thread_to_numa_node(cpu_topo_, gp.numa_node);
                     for (int il = gp.l0; il < gp.l1; ++il) {
                         Layer& l = layers_[(size_t) il];
                         l.dev_idx = gi;
@@ -774,6 +803,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             gp.pf_cap = P;
             gp.pf_tok_ids = (int*) dev_alloc(gp, (size_t) P * sizeof(int));
             gp.pf_x = (float*) dev_alloc(gp, (size_t) P * E * 4);
+            if (ngpu >= 2) gp.pf_pipe_x = (float*) dev_alloc(gp, (size_t) P * E * 4);
             gp.pf_cur = (float*) dev_alloc(gp, (size_t) P * E * 4);
             gp.pf_out = (float*) dev_alloc(gp, (size_t) P * E * 4);
             gp.pf_moe = (float*) dev_alloc(gp, (size_t) P * E * 4);
@@ -1053,6 +1083,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             l.host_bytes = bytes;
             l.host_blobs = (uint8_t*) sys::alloc_nohuge(bytes);
             if (l.host_blobs != nullptr) {
+                if (cpu_topo_.numa_nodes > 1 && gpus_[(size_t) l.dev_idx].numa_node >= 0) {
+                    (void) hy4::Lane::move_to_node(l.host_blobs, bytes, gpus_[(size_t) l.dev_idx].numa_node);
+                }
                 l.host_nohuge = true;
                 l.ssd_backed = false;
                 planned_ram_bytes += bytes;
@@ -1073,8 +1106,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         if (!ssd_reader_.open(path, o_.direct_io, derr)) throw std::runtime_error("maya-ling: " + derr);
         if (!tasks.empty()) {
             const size_t cal_cb = ssd_reader_.calibrate_chunk(tasks[file_order[0]].min_off, std::min<size_t>(max_blob_, 2u << 20));
+            const char* io_tag = ssd_reader_.direct_active() ? "on" : (o_.direct_io ? "fallback-buffered" : "off (buffered)");
             std::fprintf(stderr, "ling ssd: O_DIRECT=%s chunk=%zu KiB ssd_slots=%zu (%.2f GiB) ram_slots=%zu (%.2f GiB)\n",
-                         ssd_reader_.direct_active() ? "on" : "fallback-buffered", cal_cb >> 10, ssd_slots_cnt,
+                         io_tag, cal_cb >> 10, ssd_slots_cnt,
                          (double) planned_ssd_bytes / (double) (1ULL << 30), ram_slots_cnt,
                          (double) planned_ram_bytes / (double) (1ULL << 30));
         }
@@ -1171,26 +1205,13 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         Layer& l = *tk.l;
         Gpu& gp = gpus_[(size_t) l.dev_idx];
         set_dev(gp.dev);
-        l.h_slot.assign((size_t) c.n_expert, -1);
         l.pf_counts.assign((size_t) c.n_expert, 0);
         l.profile_counts.assign((size_t) c.n_expert, 0);
         l.la_next.assign((size_t) c.n_expert, -1);
-        l.h_owner.assign((size_t) std::max(1, l.n_res), -1);
-        l.h_score.assign((size_t) c.n_expert, 0.0f);
 
-        std::vector<int> ranked((size_t) c.n_expert);
-        std::iota(ranked.begin(), ranked.end(), 0);
-        if (has_profile) {
-            const uint32_t* pc = profile.layer_counts(tk.moe_idx);
-            if (pc != nullptr) {
-                uint32_t maxc = 1;
-                for (int e = 0; e < c.n_expert; ++e) maxc = std::max(maxc, pc[e]);
-                for (int e = 0; e < c.n_expert; ++e) l.h_score[(size_t) e] = 4.0f * (float) pc[e] / (float) maxc;
-                if (l.n_res < c.n_expert) {
-                    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) { return pc[a] > pc[b]; });
-                }
-            }
-        }
+        std::vector<int> ranked;
+        const uint32_t* pc = has_profile ? profile.layer_counts(tk.moe_idx) : nullptr;
+        sys::plan_expert_slots(c.n_expert, l.n_res, pc, l.h_slot, l.h_owner, l.h_score, ranked);
 
         l.fl.n_res = l.n_res;
         l.fl.n_exp = c.n_expert;
@@ -1285,6 +1306,29 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         const std::string khash = "ling-v2-" + std::to_string(o_.kv_q8 ? 1 : 0);
         cal_key_ = sys::cal_key(sys::host_name(), std::filesystem::path(path).filename().string(), qtag, o_.ctx,
                                 gstr.str(), std::to_string(drv), khash);
+        {
+            uint32_t n_kda = 0, n_mla = 0;
+            for (int il = 0; il < c.n_layers; ++il) {
+                if (c.kda[il]) ++n_kda;
+                else ++n_mla;
+            }
+            restore_expect_.key.model_id = std::filesystem::path(path).filename().string();
+            restore_expect_.key.quant_tag = "etg=" + std::to_string(quant_tg) + ",etd=" + std::to_string(quant_td) +
+                                            ",emb=" + std::to_string(emb_.type) + ",out=" + std::to_string(out_w_.type);
+            restore_expect_.key.engine_version = sys::kRestoreEngineVersion;
+            restore_expect_.key.gguf_fingerprint = sys::compute_gguf_fingerprint(path);
+            restore_expect_.key.ctx = (uint32_t) o_.ctx;
+            restore_expect_.key.kv_q8 = o_.kv_q8 ? 1u : 0u;
+            restore_expect_.n_kda_layers = n_kda;
+            restore_expect_.n_mla_layers = n_mla;
+            restore_expect_.vocab = (uint32_t) c_.vocab;
+            restore_expect_.kda_state_bytes = (uint64_t) c.n_head * (uint64_t) c.kda_head * (uint64_t) c.kda_head * sizeof(float);
+            restore_expect_.kda_conv_bytes = (uint64_t) 3 * (uint64_t) c.d_inner() * (uint64_t) (c.d_conv - 1) * sizeof(float);
+            restore_expect_.mla_lat_row_bytes =
+                o_.kv_q8 ? ((uint64_t) c.kv_lora + (uint64_t) (c.kv_lora / 32) * 2ULL)
+                         : ((uint64_t) c.kv_lora * sizeof(uint16_t));
+            restore_expect_.mla_kpe_row_bytes = (uint64_t) c.n_rot * sizeof(uint16_t);
+        }
         cal_file_ = o_.cal_file.empty() ? (std::getenv("LING_CAL_FILE") ? std::string(std::getenv("LING_CAL_FILE"))
                                                                         : std::string("data/ling-calibration.txt"))
                                         : o_.cal_file;
@@ -2032,7 +2076,7 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* ne
     }
 
     if (!use_lane) {
-        k::fetch_resolve_fast(gp.d_ids, 1, NU, l.fl, gp.fxs, -1, l.n_res > 0 && !o_.repeatable, 0.98f, s);
+        k::fetch_resolve_fast(gp.d_ids, 1, NU, l.fl, gp.fxs, -1, l.n_res > 0 && !o_.repeatable && !o_.no_promo, 0.98f, s);
         hy::fetch_copy(gp.fxs, l.blob, 32, s);
         hy::plan_experts(gp.d_ids, NU, nullptr, 0, gp.d_plan, s, nullptr, gp.d_w, gp.fxs.eptr, gp.fxs.who);
         if (!iq::gate_up(a, NU, 1, s)) throw std::runtime_error("moe: gate_up failed");
@@ -2063,7 +2107,7 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* ne
     const int k_gpu = (!o_.repeatable && l.host_pinned && (active_offload_ == OffloadMode::kMix || busy_pc_shift_ > 0))
                           ? std::max(o_.mix_k_gpu, busy_pc_shift_)
                           : 0;
-    const bool adapt = (k_gpu > 0 && l.n_res > 0 && !o_.repeatable);
+    const bool adapt = (k_gpu > 0 && l.n_res > 0 && !o_.repeatable && !o_.no_promo);
     k::fetch_resolve_fast(gp.d_ids, 1, NU, l.fl, gp.fxs, k_gpu, adapt, 0.98f, s);
     k::pack_route_cpu(gp.d_ids, gp.d_w, gp.fxs.who, NU, gp.d_route_pack, s);
     CK(cudaEventRecord(gp.ev_route, s));
@@ -2238,7 +2282,7 @@ void Model::decode_segment(int gi, bool capture_safe) {
             hy::rmsnorm(gp.x, (size_t) E, 1, E, l.ffn_norm, c.eps, gp.cur, (size_t) E, s, {gp.xq, gp.xd});
         }
         const float* next_norm = nullptr;
-        if (!seam) {
+        if (!seam && !o_.repeatable && !o_.lane_parity) {
             if (il + 1 < gp.l1) next_norm = layers_[(size_t) (il + 1)].attn_norm;
             else if (gi == (int) gpus_.size() - 1) next_norm = out_norm_;
         }
@@ -2263,7 +2307,7 @@ void Model::decode_segment(int gi, bool capture_safe) {
 const float* Model::step(int token, int pos) {
     wait_warmup();
     check_token_id(token, "step");
-    tok_promo_budget_ = 32;
+    tok_promo_budget_ = (o_.no_promo || o_.repeatable) ? 0 : 32;
     promo_rr_ = c_.n_dense_lead + ((pos * 7) % std::max(1, c_.n_layers - c_.n_dense_lead));
     const int ngpu = (int) gpus_.size();
     const bool graph_ok = o_.use_graph && active_offload_ == OffloadMode::kGpu && !any_host_unpinned_ &&
@@ -2640,8 +2684,8 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
     }
 
     // 3. Inline D2D cache warming plan on last macro-block (skipped for borrowed layers, restored post-prefill)
-    const bool warm_inline =
-        is_last_block && !layer_borrowed && o_.cache_warm && n_res_eff > 0 && n_res_eff < NE && l.host_blobs != nullptr;
+    const bool warm_inline = is_last_block && !layer_borrowed && o_.cache_warm && !o_.no_promo &&
+                             n_res_eff > 0 && n_res_eff < NE && l.host_blobs != nullptr;
     std::vector<int> promote_slot;
     std::vector<int> new_slot;
     std::vector<uint8_t> promoted_done;
@@ -3024,7 +3068,7 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
 
 void Model::warm_vram_cache() {
     last_warm_s_ = 0.0;
-    if (!o_.cache_warm || o_.repeatable) return;
+    if (!o_.cache_warm || o_.repeatable || o_.no_promo) return;
     const auto t0 = std::chrono::steady_clock::now();
     const Config& c = c_;
     const int NE = c.n_expert;
@@ -3312,9 +3356,14 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
             mbufs[(size_t) gi].row_of = (int*) take((size_t) B_max * NU * sizeof(int));
         }
     } else {
+        const bool can_resident_pipe = (want_pipe_buf && !o_.repeatable && !o_.lane_parity && n > P &&
+                                        gpus_[0].pf_pipe_x != nullptr);
+        if (can_resident_pipe) has_pipe_x = true;
         for (int gi = 0; gi < ngpu; ++gi) {
             Gpu& gp = gpus_[(size_t) gi];
-            mbufs[(size_t) gi] = {gp.pf_x, gp.pf_cur, gp.pf_moe, gp.pf_w, nullptr, gp.pf_ids, gp.pf_tok, gp.pf_row_of};
+            mbufs[(size_t) gi] = {gp.pf_x, gp.pf_cur, gp.pf_moe, gp.pf_w,
+                                  can_resident_pipe ? gp.pf_pipe_x : nullptr,
+                                  gp.pf_ids, gp.pf_tok, gp.pf_row_of};
         }
     }
 
@@ -3431,6 +3480,7 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
         auto stage_worker = [&](int gi) {
             try {
                 Gpu& gp = gpus_[(size_t) gi];
+                (void) sys::pin_thread_to_numa_node(cpu_topo_, gp.numa_node);
                 float* x_slots[2] = {mbufs[(size_t) gi].x, mbufs[(size_t) gi].pipe_x};
                 for (int blk = 0; blk < n_blocks; ++blk) {
                     if (check_stop()) break;
@@ -3505,8 +3555,10 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
                     }
 
                     if (gi > 0) {
-                        set_dev(gp.dev);
-                        CK(cudaStreamSynchronize(gp.s));
+                        if (gi + 1 == ngpu) {
+                            set_dev(gp.dev);
+                            CK(cudaStreamSynchronize(gp.s));
+                        }
                         Link& in_link = links[(size_t) (gi - 1)];
                         {
                             std::lock_guard<std::mutex> lk(in_link.mu);
@@ -3879,7 +3931,7 @@ void Model::ffn_moe_decode_win(Gpu& gp, Layer& l, int il, int W, const float* ne
     const int k_gpu = (!o_.repeatable && l.host_pinned && (active_offload_ == OffloadMode::kMix || busy_pc_shift_ > 0))
                           ? std::max(o_.mix_k_gpu, busy_pc_shift_)
                           : 0;
-    const bool adapt = (k_gpu > 0 && l.n_res > 0 && !o_.repeatable);
+    const bool adapt = (k_gpu > 0 && l.n_res > 0 && !o_.repeatable && !o_.no_promo);
     k::fetch_resolve_fast(gp.d_ids, W, NU, l.fl, gp.fxs, k_gpu, adapt, 0.98f, s);
     k::pack_route_win_cpu(gp.d_ids, gp.d_w, gp.fxs.who, W * NU, gp.d_route_win, s);
     CK(cudaEventRecord(gp.ev_route, s));
@@ -4023,8 +4075,10 @@ void Model::decode_segment_win(int gi, int W, bool capture_safe) {
         else mla_decode_win(gp, l, il, W, false);
         k::add_rmsnorm_q8(gp.x, gp.out, l.ffn_norm, W, E, c.eps, gp.cur, gp.xq, gp.xd, s);
         const float* next_norm = nullptr;
-        if (il + 1 < gp.l1) next_norm = layers_[(size_t) (il + 1)].attn_norm;
-        else if (gi == (int) gpus_.size() - 1) next_norm = out_norm_;
+        if (!o_.repeatable && !o_.lane_parity) {
+            if (il + 1 < gp.l1) next_norm = layers_[(size_t) (il + 1)].attn_norm;
+            else if (gi == (int) gpus_.size() - 1) next_norm = out_norm_;
+        }
         if (il < c.n_dense_lead) ffn_dense_decode_win(gp, l, il, W, next_norm);
         else ffn_moe_decode_win(gp, l, il, W, next_norm);
         normed = (next_norm != nullptr);
@@ -4043,7 +4097,7 @@ const float* Model::step_window(const int* tokens, int W, int pos0) {
     if (W <= 1) return step(tokens[0], pos0);
     if (W > kMaxWin) throw std::runtime_error("step_window requires W <= 4");
     for (int t = 0; t < W; ++t) check_token_id(tokens[t], "step_window");
-    tok_promo_budget_ = 32;
+    tok_promo_budget_ = (o_.no_promo || o_.repeatable) ? 0 : 32;
     promo_rr_ = c_.n_dense_lead + ((pos0 * 7) % std::max(1, c_.n_layers - c_.n_dense_lead));
     const int ngpu = (int) gpus_.size();
     const bool graph_ok = o_.use_graph && active_offload_ == OffloadMode::kGpu && !any_host_unpinned_ && o_.seam_dir.empty();
@@ -4519,6 +4573,24 @@ void Model::restore_kda_snapshot(const KdaSnapshot& snap) {
     const Config& c = c_;
     const size_t st_elems = (size_t) c.n_head * (size_t) c.kda_head * (size_t) c.kda_head;
     const size_t cs_elems = (size_t) 3 * (size_t) c.d_inner() * (size_t) (c.d_conv - 1);
+    const size_t max_lat_bytes = (size_t) o_.ctx * (size_t) restore_expect_.mla_lat_row_bytes;
+    const size_t max_kpe_elems = (size_t) o_.ctx * (size_t) c.n_rot;
+    if (snap.kv_q8 != o_.kv_q8 || snap.states.size() != restore_expect_.n_kda_layers ||
+        snap.convs.size() != restore_expect_.n_kda_layers) {
+        throw std::runtime_error("restore_kda_snapshot: layer or KV format mismatch");
+    }
+    for (size_t i = 0; i < snap.states.size(); ++i) {
+        if (snap.states[i].size() != st_elems || snap.convs[i].size() != cs_elems)
+            throw std::runtime_error("restore_kda_snapshot: KDA buffer size mismatch");
+    }
+    if (!snap.mla_lat.empty()) {
+        if (snap.mla_lat.size() != restore_expect_.n_mla_layers || snap.mla_kpe.size() != restore_expect_.n_mla_layers)
+            throw std::runtime_error("restore_kda_snapshot: MLA layer count mismatch");
+        for (size_t i = 0; i < snap.mla_lat.size(); ++i) {
+            if (snap.mla_lat[i].size() > max_lat_bytes || snap.mla_kpe[i].size() > max_kpe_elems)
+                throw std::runtime_error("restore_kda_snapshot: MLA buffer exceeds GPU KV allocation");
+        }
+    }
     size_t ki = 0, mi = 0;
     for (int il = 0; il < c.n_layers; ++il) {
         Layer& l = layers_[(size_t) il];
@@ -4545,136 +4617,17 @@ void Model::restore_kda_snapshot(const KdaSnapshot& snap) {
     mtp_tokens_ = snap.tokens;
 }
 
-static uint64_t snap_hash(const Model::KdaSnapshot& snap) {
-    uint64_t h = 1469598103934665603ULL;
-    auto mix = [&](const void* p, size_t n) {
-        const uint8_t* b = (const uint8_t*) p;
-        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ULL;
-    };
-    mix(snap.tokens.data(), snap.tokens.size() * sizeof(int));
-    for (const auto& pr : snap.pics) {
-        mix(&pr.first, sizeof pr.first);
-        mix(&pr.second, sizeof pr.second);
-    }
-    const uint8_t q8 = snap.kv_q8 ? 1 : 0;
-    mix(&q8, 1);
-    return h;
-}
-
 bool Model::save_restore_disk(const KdaSnapshot& snap, const std::string& dir, std::string& err) const {
     if (dir.empty() || snap.tokens.empty() || snap.mla_lat.empty()) return false;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    char fname[64];
-    std::snprintf(fname, sizeof fname, "%016llx.lingrp", (unsigned long long) snap_hash(snap));
-    const std::string final_p = (std::filesystem::path(dir) / fname).string();
-    const std::string tmp_p = final_p + ".tmp";
-    std::ofstream f(tmp_p, std::ios::binary);
-    if (!f) {
-        err = "cannot open restore point file " + tmp_p;
-        return false;
-    }
-    const char magic[4] = {'L', 'R', 'P', '1'};
-    const uint32_t ver = 1;
-    const uint32_t kvq8 = snap.kv_q8 ? 1u : 0u;
-    const uint32_t nt = (uint32_t) snap.tokens.size();
-    const uint32_t np = (uint32_t) snap.pics.size();
-    const uint32_t nk = (uint32_t) snap.states.size();
-    const uint32_t nm = (uint32_t) snap.mla_lat.size();
-    f.write(magic, 4);
-    f.write((const char*) &ver, 4);
-    f.write((const char*) &kvq8, 4);
-    f.write((const char*) &snap.rope_delta, 4);
-    f.write((const char*) &nt, 4);
-    f.write((const char*) &np, 4);
-    f.write((const char*) &nk, 4);
-    f.write((const char*) &nm, 4);
-    f.write((const char*) snap.tokens.data(), (std::streamsize) (nt * sizeof(int)));
-    for (const auto& pr : snap.pics) {
-        f.write((const char*) &pr.first, sizeof pr.first);
-        f.write((const char*) &pr.second, sizeof pr.second);
-    }
-    for (uint32_t i = 0; i < nk; ++i) {
-        const uint64_t sb = snap.states[i].size() * sizeof(float);
-        const uint64_t cb = snap.convs[i].size() * sizeof(float);
-        f.write((const char*) &sb, 8);
-        f.write((const char*) snap.states[i].data(), (std::streamsize) sb);
-        f.write((const char*) &cb, 8);
-        f.write((const char*) snap.convs[i].data(), (std::streamsize) cb);
-    }
-    for (uint32_t i = 0; i < nm; ++i) {
-        const uint64_t lb = snap.mla_lat[i].size();
-        const uint64_t kb = snap.mla_kpe[i].size() * sizeof(uint16_t);
-        f.write((const char*) &lb, 8);
-        f.write((const char*) snap.mla_lat[i].data(), (std::streamsize) lb);
-        f.write((const char*) &kb, 8);
-        f.write((const char*) snap.mla_kpe[i].data(), (std::streamsize) kb);
-    }
-    f.close();
-    if (!f) {
-        err = "write failed on " + tmp_p;
-        return false;
-    }
-    std::filesystem::rename(tmp_p, final_p, ec);
-    return !ec;
+    const uint64_t cap_b = (uint64_t) o_.restore_dir_max_mb * (1ULL << 20);
+    return sys::save_restore_file(snap, restore_expect_, dir, cap_b, err);
 }
 
-bool Model::load_restore_disk(const std::string& dir, std::vector<KdaSnapshot>& out) const {
+bool Model::load_restore_disk(const std::string& dir, std::vector<KdaSnapshot>& out,
+                              std::vector<std::string>* skipped_logs) const {
     if (dir.empty()) return false;
-    std::error_code ec;
-    if (!std::filesystem::is_directory(dir, ec)) return false;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (entry.path().extension() != ".lingrp") continue;
-        std::ifstream f(entry.path(), std::ios::binary);
-        if (!f) continue;
-        char magic[4] = {};
-        uint32_t ver = 0, kvq8 = 0, nt = 0, np = 0, nk = 0, nm = 0;
-        int rdelta = 0;
-        f.read(magic, 4);
-        f.read((char*) &ver, 4);
-        f.read((char*) &kvq8, 4);
-        f.read((char*) &rdelta, 4);
-        f.read((char*) &nt, 4);
-        f.read((char*) &np, 4);
-        f.read((char*) &nk, 4);
-        f.read((char*) &nm, 4);
-        if (!f || std::memcmp(magic, "LRP1", 4) != 0 || ver != 1 || (kvq8 != 0) != o_.kv_q8) continue;
-        if ((int) nt >= o_.ctx) continue;
-        KdaSnapshot sp;
-        sp.kv_q8 = (kvq8 != 0);
-        sp.rope_delta = rdelta;
-        sp.tokens.resize(nt);
-        f.read((char*) sp.tokens.data(), (std::streamsize) (nt * sizeof(int)));
-        sp.pics.resize(np);
-        for (uint32_t i = 0; i < np; ++i) {
-            f.read((char*) &sp.pics[i].first, sizeof(int64_t));
-            f.read((char*) &sp.pics[i].second, sizeof(uint64_t));
-        }
-        sp.states.resize(nk);
-        sp.convs.resize(nk);
-        for (uint32_t i = 0; i < nk; ++i) {
-            uint64_t sb = 0, cb = 0;
-            f.read((char*) &sb, 8);
-            sp.states[i].resize(sb / sizeof(float));
-            f.read((char*) sp.states[i].data(), (std::streamsize) sb);
-            f.read((char*) &cb, 8);
-            sp.convs[i].resize(cb / sizeof(float));
-            f.read((char*) sp.convs[i].data(), (std::streamsize) cb);
-        }
-        sp.mla_lat.resize(nm);
-        sp.mla_kpe.resize(nm);
-        for (uint32_t i = 0; i < nm; ++i) {
-            uint64_t lb = 0, kb = 0;
-            f.read((char*) &lb, 8);
-            sp.mla_lat[i].resize(lb);
-            f.read((char*) sp.mla_lat[i].data(), (std::streamsize) lb);
-            f.read((char*) &kb, 8);
-            sp.mla_kpe[i].resize(kb / sizeof(uint16_t));
-            f.read((char*) sp.mla_kpe[i].data(), (std::streamsize) kb);
-        }
-        if (f) out.push_back(std::move(sp));
-    }
-    return !out.empty();
+    const uint64_t cap_b = (uint64_t) o_.restore_dir_max_mb * (1ULL << 20);
+    return sys::load_restore_dir(dir, restore_expect_, cap_b, out, skipped_logs) > 0;
 }
 
 }  // namespace ling
