@@ -107,5 +107,60 @@ class VswhereDiscovery(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class ToolsetChoice(unittest.TestCase):
+    """#992: CUDA 13.3 with MSVC 14.52 (VS 2026, Build Tools 18.12.0) crashes nvcc's cudafe++; an older toolset is asked
+    for where one is installed.  A fake Visual Studio folder and a fake `nvcc --version`; nothing is compiled."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.install = Path(temp.name) / "18/BuildTools"
+        self.vcvars = self.install / "VC/Auxiliary/Build/vcvars64.bat"
+        self.vcvars.parent.mkdir(parents=True)
+        self.vcvars.touch()
+
+    def toolsets(self, *names):
+        for n in names:
+            (self.install / "VC/Tools/MSVC" / n).mkdir(parents=True)
+
+    def pick(self, release):
+        with patch.object(S, "out", return_value=f"Cuda compilation tools, release {release}, V{release}.0"):
+            return S.vcvars_args(self.vcvars, "nvcc.exe")
+
+    def test_lists_the_installed_toolsets(self):
+        self.toolsets("14.52.36231", "14.44.35207", "14.50.35717")
+        (self.install / "VC/Tools/MSVC/stray.txt").touch()
+        self.assertEqual(S.msvc_toolsets(self.vcvars), [(14, 44), (14, 50), (14, 52)])
+        self.assertEqual(S.msvc_toolsets(self.install / "nothing/Build/vcvars64.bat"), [])
+
+    def test_newest_good_toolset_where_the_newest_is_the_bad_pair(self):
+        self.toolsets("14.52.36231", "14.44.35207", "14.50.35717")
+        args, note = self.pick("13.3")
+        self.assertEqual(args, " -vcvars_ver=14.50")
+        self.assertIn("MSVC 14.52", note)
+        self.assertIn("14.50", note)
+        (self.install / "VC/Tools/MSVC/14.50.35717").rmdir()
+        self.assertEqual(self.pick("13.3")[0], " -vcvars_ver=14.44")
+        self.assertEqual(self.pick("13.4")[0], " -vcvars_ver=14.44")      # (newer CUDA: the same pair holds)
+
+    def test_only_the_bad_toolset_installed_says_the_fix(self):
+        self.toolsets("14.52.36231")
+        args, note = self.pick("13.3")
+        self.assertEqual(args, "")                          # (the default stays: nothing else to ask for)
+        self.assertIn("14.44", note)
+        self.assertIn("MSVC v143", note)
+        self.assertIn("no older toolset", note)
+
+    def test_everything_else_is_left_alone(self):
+        self.toolsets("14.52.36231", "14.44.35207")
+        for release in ("12.8", "13.1", "13.2"):            # (an older CUDA: no change)
+            self.assertEqual(self.pick(release), ("", None), release)
+        with patch.object(S, "out", return_value=""):       # (no readable nvcc)
+            self.assertEqual(S.vcvars_args(self.vcvars, "nvcc.exe"), ("", None))
+        self.assertEqual(S.vcvars_args(self.vcvars, None), ("", None))
+        (self.install / "VC/Tools/MSVC/14.52.36231").rmdir()   # (the newest is not the bad one: nothing to avoid)
+        self.assertEqual(self.pick("13.3"), ("", None))
+
+
 if __name__ == "__main__":
     unittest.main()

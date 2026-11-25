@@ -2935,7 +2935,10 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None, what="t
         if vcvars is None:
             return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
         bat = ROOT / bat_name
-        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(conf)} || exit /b 3\r\n{cmdline(build)} && exit /b 0'
+        extra, note = S.vcvars_args(vcvars, nvcc)           # (the toolset a CUDA release takes: issue #992)
+        if note:
+            warn(note)
+        bat.write_text(f'@echo off\r\ncall "{vcvars}"{extra} >nul\r\n{cmdline(conf)} || exit /b 3\r\n{cmdline(build)} && exit /b 0'
                        '\r\necho   (the build stopped - trying it once more: it continues where it stopped)\r\n'
                        f'{cmdline(build)} || exit /b 4\r\n', encoding="utf-8")
         env = vs_env(env)
@@ -3016,7 +3019,8 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
                       (["-ccbin", shutil.which(c) or c] if c else [])
                 if vcvars:                             # cl.exe is on PATH only inside Visual Studio's environment
                     bat = Path(t) / "probe.bat"
-                    bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(cmd)}\r\n', encoding="utf-8")
+                    bat.write_text(f'@echo off\r\ncall "{vcvars}"{S.vcvars_args(vcvars, nv)[0]} >nul\r\n{cmdline(cmd)}\r\n',
+                                   encoding="utf-8")
                     cmd = ["cmd", "/c", str(bat)]
                 if subprocess.run(cmd, capture_output=True, text=True,
                                   env=vs_env() if vcvars else None).returncode == 0:

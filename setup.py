@@ -612,6 +612,47 @@ def find_vcvars(cuda=True, nvcc=None):
     return None
 
 
+BAD_MSVC_CUDA = ((14, 52), (13, 3))     # MSVC toolset 14.52 or newer with CUDA 13.3 or newer: nvcc's cudafe++ dies with
+                                        # 0xC0000005 (issue #992; Build Tools 18.12.0).  14.50 and 14.44 build fine.
+
+
+def msvc_toolsets(vcvars) -> list[tuple[int, int]]:
+    """The (major, minor) of each MSVC toolset installed beside that vcvars64.bat (VC/Tools/MSVC/14.44.35207 ->
+    (14, 44)), oldest first."""
+    try:
+        root = Path(vcvars).parents[2] / "Tools" / "MSVC"
+        names = [d.name for d in root.iterdir() if d.is_dir()]
+    except (OSError, IndexError):
+        return []
+    found = set()
+    for n in names:
+        m = re.match(r"(\d+)\.(\d+)\.", n)
+        if m:
+            found.add((int(m.group(1)), int(m.group(2))))
+    return sorted(found)
+
+
+def vcvars_args(vcvars, nvcc) -> tuple[str, str | None]:
+    """(what to put after the vcvars64.bat call, one line for the screen or None): vcvars64.bat takes the newest
+    MSVC toolset, and CUDA 13.3 with 14.52 or newer crashes in cudafe++ (BAD_MSVC_CUDA).  Where that pair would be
+    built, the newest toolset that is not part of it is asked for (` -vcvars_ver=14.50`); where there is none, the
+    default stays and the line names the fix.  Anything else (no nvcc, an older CUDA, an older toolset): "", None."""
+    v = nvcc_version(nvcc)
+    if v is None or v < BAD_MSVC_CUDA[1]:
+        return "", None
+    sets = msvc_toolsets(vcvars)
+    if not sets or sets[-1] < BAD_MSVC_CUDA[0]:
+        return "", None
+    good = [t for t in sets if t < BAD_MSVC_CUDA[0]]
+    bad = f"{sets[-1][0]}.{sets[-1][1]}"
+    if good:
+        t = f"{good[-1][0]}.{good[-1][1]}"
+        return f" -vcvars_ver={t}", f"MSVC {bad} crashes CUDA {v[0]}.{v[1]}'s compiler: building with the MSVC {t} toolset"
+    return "", (f"MSVC {bad} crashes CUDA {v[0]}.{v[1]}'s compiler (cudafe++ 0xC0000005) and no older toolset is "
+                "installed: in the Visual Studio Installer add the 'MSVC v143 - VS 2022 C++ x64/x86 build tools' "
+                "component (toolset 14.44), then run this again")
+
+
 # ------------------------------------------------------------------------------------------------ downloads
 def download(url, dst: Path, what=None, headers=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
