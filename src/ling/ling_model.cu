@@ -1440,6 +1440,10 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         CK(cudaStreamSynchronize(gp.s));
     }
     const std::vector<std::string> gf_paths = gf.paths();
+    std::vector<sys::FingerprintTensor> fp_tensors;   // (the restore points' file fingerprint reads the tensor table)
+    fp_tensors.reserve(gf.tensors().size());
+    for (const auto& t : gf.tensors())
+        fp_tensors.push_back({t.name, t.type, t.offset, t.elements(), (uint32_t) gf.file_of(t)});
     gf_u.reset();  // unmap GGUF now that VRAM and RAM tensors are copied (RAM counted once)
 
     // Build keyed calibration ID: host|model|quant|ctx|gpus|driver|kernel_hash
@@ -1469,7 +1473,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             restore_expect_.key.quant_tag = "etg=" + std::to_string(quant_tg) + ",etd=" + std::to_string(quant_td) +
                                             ",emb=" + std::to_string(emb_.type) + ",out=" + std::to_string(out_w_.type);
             restore_expect_.key.engine_version = sys::kRestoreEngineVersion;
-            restore_expect_.key.gguf_fingerprint = sys::compute_gguf_set_fingerprint(gf_paths);
+            // (the files' sampled bytes, then the tensor table: names, types, offsets, sizes)
+            restore_expect_.key.gguf_fingerprint =
+                sys::mix_tensor_table(sys::compute_gguf_set_fingerprint(gf_paths), std::move(fp_tensors));
             restore_expect_.key.ctx = (uint32_t) o_.ctx;
             restore_expect_.key.kv_q8 = o_.kv_q8 ? 1u : 0u;
             restore_expect_.n_kda_layers = n_kda;

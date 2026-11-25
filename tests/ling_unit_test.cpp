@@ -5,7 +5,8 @@
 //   4. .lingrp folder size cap eviction & default-off check
 //   5. Linux NUMA topology / cpuset builder helper
 //   6. DirectGgufReader O_DIRECT + buffered + deterministic fallback + /dev/shm tmpfs
-//   7. Full-precision (F32 / F16 / BF16) dense matrices -> Q8_0 at load (ling_dense.hpp)
+//   7. GGUF fingerprint: same size + same first 64 KiB but different quant bytes / tensor table never collide
+//   8. Full-precision (F32 / F16 / BF16) dense matrices -> Q8_0 at load (ling_dense.hpp)
 #include "ling_dense.hpp"
 #include "ling_restore.hpp"
 #include "ling_sys.hpp"
@@ -226,6 +227,33 @@ static void test_restore_validation_and_model_keys() {
         auto ex_fp = ex;
         ex_fp.key.gguf_fingerprint ^= 1ULL;
         EXPECT(!ling::sys::load_restore_file(saved_p, ex_fp, loaded, reason), "reject GGUF fingerprint mismatch");
+        EXPECT(reason.find("fingerprint") != std::string::npos, "fingerprint mismatch says so (got '%s')", reason.c_str());
+    }
+    {   // a restore file written under the old fingerprint (size + first 64 KiB) carries a value the deeper one never
+        // equals for the same model, so it is skipped with the usual one line
+        namespace fsx = std::filesystem;
+        const fsx::path probe = td / "old_fp_probe.bin";
+        {
+            std::ofstream pf(probe, std::ios::binary);
+            const std::string blob(3u << 20, 'a');
+            pf << blob;
+        }
+        uint64_t old_style = 1469598103934665603ULL;   // FNV-1a of (1 file, its size, its first 64 KiB): the old formula
+        auto mix_old = [&](const void* p, size_t n) {
+            const auto* bp = (const uint8_t*) p;
+            for (size_t i = 0; i < n; ++i) old_style = (old_style ^ bp[i]) * 1099511628211ULL;
+        };
+        const uint64_t one = 1, sz = 3u << 20;
+        mix_old(&one, 8);
+        mix_old(&sz, 8);
+        const std::string head(65536, 'a');
+        mix_old(head.data(), head.size());
+        EXPECT(old_style != ling::sys::compute_gguf_fingerprint(probe.string()), "the deeper fingerprint is not the old one");
+        auto ex_old = ex;
+        ex_old.key.gguf_fingerprint = old_style;
+        EXPECT(!ling::sys::load_restore_file(saved_p, ex_old, loaded, reason), "reject a file with the old-style fingerprint");
+        std::error_code ec_old;
+        fsx::remove(probe, ec_old);
     }
     {
         auto ex_ver = ex;
@@ -245,7 +273,7 @@ static void test_restore_validation_and_model_keys() {
     EXPECT(skipped.size() == 8, "load_restore_dir reports 8 skipped damaged files (got %zu)", skipped.size());
 
     fs::remove_all(td, ec);
-    std::printf("PASS test_restore_validation_and_model_keys (8 corruption cases + 6 key mismatches)\n");
+    std::printf("PASS test_restore_validation_and_model_keys (8 corruption cases + 7 key mismatches)\n");
 }
 
 static void test_restore_dir_cap_eviction() {
@@ -442,6 +470,86 @@ static void test_split_gguf_fingerprint() {
     std::printf("PASS test_split_gguf_fingerprint\n");
 }
 
+// Two different quants of one model have the same size and often the same first 64 KiB: the fingerprint must tell
+// them apart from bytes elsewhere in the file and from the tensor table.
+static void test_gguf_fingerprint_depth() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("ling_fp_depth_" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const size_t N = 6u << 20;
+    std::vector<uint8_t> a(N);
+    for (size_t i = 0; i < N; ++i) a[i] = (uint8_t) ((i * 2654435761u) >> 24);
+    auto write = [&](const char* name, const std::vector<uint8_t>& b) {
+        const fs::path p = dir / name;
+        std::ofstream f(p, std::ios::binary);
+        f.write((const char*) b.data(), (std::streamsize) b.size());
+        return p.string();
+    };
+    const std::string pa = write("a.gguf", a);
+    const std::string pa2 = write("a_copy.gguf", a);
+    EXPECT(ling::sys::compute_gguf_fingerprint(pa) == ling::sys::compute_gguf_fingerprint(pa2), "equal files, equal fingerprint");
+
+    // "another quant": same size, same first 64 KiB, every later byte different
+    std::vector<uint8_t> q = a;
+    for (size_t i = 65536; i < N; ++i) q[i] = (uint8_t) (q[i] ^ 0x5Au);
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("q.gguf", q)) != ling::sys::compute_gguf_fingerprint(pa),
+           "same size + same first 64 KiB, other bytes after: other fingerprint");
+
+    // the end of the file alone differs
+    std::vector<uint8_t> t = a;
+    t[N - 100] ^= 1;
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("t.gguf", t)) != ling::sys::compute_gguf_fingerprint(pa),
+           "a change in the last 64 KiB: other fingerprint");
+
+    // one sampled window changes (the middle of the file)
+    std::vector<uint8_t> m = a;
+    const uint64_t step = (N - ling::sys::kFpSample) / (ling::sys::kFpSamples - 1);
+    m[(size_t) (step * 64 + 10)] ^= 0x80;
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("m.gguf", m)) != ling::sys::compute_gguf_fingerprint(pa),
+           "a change inside a sampled window: other fingerprint");
+
+    // a small file is read whole
+    std::vector<uint8_t> s1(300000, 7), s2 = s1;
+    s2[299999] = 8;
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("s1.gguf", s1)) != ling::sys::compute_gguf_fingerprint(write("s2.gguf", s2)),
+           "a small file's last byte counts");
+
+    // the tensor table
+    using FT = ling::sys::FingerprintTensor;
+    const uint64_t base = ling::sys::compute_gguf_fingerprint(pa);
+    const std::vector<FT> tab{{"blk.0.attn_q.weight", 8, 0, 4096, 0}, {"output.weight", 14, 4096, 8192, 0},
+                              {"token_embd.weight", 30, 9000, 100, 1}};
+    const uint64_t f0 = ling::sys::mix_tensor_table(base, tab);
+    EXPECT(f0 == ling::sys::mix_tensor_table(base, tab), "tensor-table fingerprint is deterministic");
+    EXPECT(f0 != base, "the tensor table changes the fingerprint");
+    auto shuffled = tab;
+    std::swap(shuffled[0], shuffled[2]);
+    EXPECT(f0 == ling::sys::mix_tensor_table(base, shuffled), "the order the tensors were read in does not matter");
+    auto other_type = tab;
+    other_type[1].type = 8;   // (the output head Q6_K -> Q8_0 at the same place)
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_type), "another tensor type: other fingerprint");
+    auto other_off = tab;
+    other_off[2].offset += 32;
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_off), "another tensor offset: other fingerprint");
+    auto other_size = tab;
+    other_size[0].elements += 32;
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_size), "another tensor size: other fingerprint");
+    auto other_name = tab;
+    other_name[0].name = "blk.0.attn_k.weight";
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_name), "another tensor name: other fingerprint");
+    auto other_shard = tab;
+    other_shard[2].shard = 0;
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_shard), "another shard: other fingerprint");
+    auto fewer = tab;
+    fewer.pop_back();
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, fewer), "a tensor fewer: other fingerprint");
+
+    fs::remove_all(dir, ec);
+    std::printf("PASS test_gguf_fingerprint_depth\n");
+}
+
 // F32 / F16 / BF16 dense matrices become Q8_0 rows (ggml's quantize_row_q8_0_ref) while the model loads.
 static void test_dense_to_q8_0() {
     namespace D = ling::dense;
@@ -536,6 +644,7 @@ int main() {
     test_restore_validation_and_model_keys();
     test_restore_dir_cap_eviction();
     test_split_gguf_fingerprint();
+    test_gguf_fingerprint_depth();
     test_dense_to_q8_0();
     test_numa_helpers();
     test_direct_reader();
