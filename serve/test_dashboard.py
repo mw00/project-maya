@@ -740,6 +740,19 @@ class PageLogic(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         return json.loads(r.stdout.strip().splitlines()[-1])
 
+    def test_hy4_auto_tp_allows_other_model_settings_to_be_saved(self):
+        got = self.node("""
+const {validModelNumbers} = await import(web + "/models.js");
+const draft = {tp: "auto", cpu_threads: "12", reserve_gb: "0.5"};
+const valid = (edits = {}, family = "hy4") => validModelNumbers(family, {...draft, ...edits});
+console.log(JSON.stringify({
+  auto: valid(), off: valid({tp: 0}), two: valid({tp: 2}),
+  badTp: valid({tp: "invalid"}), badThreads: valid({cpu_threads: "1.5"}),
+  badReserve: valid({reserve_gb: "bad"}), dsAuto: valid({}, "deepseek")
+}));""")
+        self.assertEqual(got, {"auto": True, "off": True, "two": True, "badTp": False,
+                               "badThreads": False, "badReserve": False, "dsAuto": False})
+
     def test_glm53_keeps_its_own_chat_defaults(self):
         # GLM-5.3 (744B, "glm-5.3") and GLM-5.3-Flash shared "maya.sampling" before v1.1.59: the 744B gets its own
         # key, which starts once from what was saved there - Flash's stays as it was, and nothing is lost

@@ -270,6 +270,14 @@ async function reloadContext(n) {
 const whole = (v) => v === "" || v == null || /^\s*\d+\s*$/.test(String(v));
 const decimal = (v) => v === "" || v == null || /^\s*(\d+\.?\d*|\.\d+)\s*$/.test(String(v));
 
+export function validModelNumbers(family, draft) {
+  return Object.entries(draft).every(([k, v]) => {
+    if (family === "hy4" && k === "tp" && v === "auto") return true;
+    if (NUMS.includes(k)) return whole(v);
+    return !DECS.includes(k) || decimal(v);
+  });
+}
+
 function Row({label, flag, hint, changed, children, below, warn}) {
   return html`<div class="mdl-field">
     <div class="mdl-field__top">
@@ -674,8 +682,7 @@ function Editor({m}) {
   const keys = Object.keys(s);
   const changed = keys.filter((k) => !same(sent[k], s[k]));
   const envChanged = !same(sent.env, s.env);
-  const bad = Object.entries(d).some(([k, v]) => (NUMS.includes(k) && !whole(v)) || (DECS.includes(k) && !decimal(v)));
-  const canSave = changed.length > 0 && !bad && !MS.check && !MS.saving && !MS.restart;
+  const canSave = changed.length > 0 && validModelNumbers(m.family, d) && !MS.check && !MS.saving && !MS.restart;
   const restarts = m.running && MS.data.restarts;
   // (the running model's context size alone, on a server that reloads it in place: Settings' reload, not a restart)
   const ctxOnly = m.running && changed.length === 1 && changed[0] === "context" && !envChanged && !!S.ctxInfo && !S.reload;
