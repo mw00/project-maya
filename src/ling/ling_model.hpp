@@ -4,6 +4,7 @@
 // FP16 / INT8 MLA latent KV cache up to 262K context, persistent restore points, vision, and blk.42 MTP + lookup.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -144,7 +145,10 @@ public:
     const std::string& cal_file() const { return cal_file_; }
     const std::string& cal_key() const { return cal_key_; }
     int cpu_threads() const { return o_.cpu_threads; }
-    bool direct_io_active() const { return !ssd_readers_.empty() && ssd_readers_[0]->direct_active(); }
+    bool direct_io_active() const {   // every shard's reader (a shard can fall back to buffered reads on its own)
+        return !ssd_readers_.empty() && std::all_of(ssd_readers_.begin(), ssd_readers_.end(),
+                                                    [](const auto& r) { return r->direct_active(); });
+    }
     bool lookahead_active() const { return lookahead_on_; }
     double kv_gb() const { return total_kv_gb_; }
     double vram_gb() const { return total_vram_gb_; }
