@@ -140,6 +140,32 @@ class AblationKept(unittest.TestCase):
         self.assertEqual(c["args"][c["args"].index("--ablate") + 1], str(hand))
 
 
+class ThinkingBudgetKept(unittest.TestCase):
+    """A setup again keeps the thinking budget the config before had (DeepSeek, MiniMax, Hy4-flash and Inkling: their
+    writers dropped it, and Inkling has none by default, so a budget the user set was gone)."""
+
+    def test_the_budget_and_its_mark_stay(self):
+        cfg = {"installer": {"family": "ik2"}}
+        maya.keep_thinking_budget(cfg, {"thinking_budget": 4096, "installer": {"thinking_budget_set": True}})
+        self.assertEqual((cfg["thinking_budget"], cfg["installer"]["thinking_budget_set"]), (4096, True))
+
+    def test_a_budget_written_by_hand_stays_without_the_mark(self):
+        cfg = {"installer": {"family": "ik2"}}
+        maya.keep_thinking_budget(cfg, {"thinking_budget": 0})
+        self.assertEqual(cfg["thinking_budget"], 0)
+        self.assertNotIn("thinking_budget_set", cfg["installer"])
+
+    def test_none_before_none_after(self):
+        for old in ({}, None, {"installer": {"thinking_budget_set": True}}):
+            cfg = {"installer": {"family": "ik2"}}
+            maya.keep_thinking_budget(cfg, old)
+            self.assertNotIn("thinking_budget", cfg)
+
+    def test_every_other_writer_calls_it(self):
+        src = (HERE.parent / "maya.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count("    keep_thinking_budget(cfg, old)"), 4)   # (DeepSeek, MiniMax, Hy4-flash, Inkling)
+
+
 class Backups(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

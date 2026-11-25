@@ -150,7 +150,9 @@ THINK_BUDGET_MIN, THINK_BUDGET_MAX = 256, 262144
 
 def default_thinking_budget(cfg: dict) -> int:
     """The thinking budget a config without one runs with: its quant's (QUANT_THINK_BUDGET, by model_key), else
-    32768."""
+    32768.  Inkling 2 has none unless one is set (0: the owner, 2026-11-25 - its budget is an option, not a default)."""
+    if family_of(cfg) == "ik2":
+        return 0
     return QUANT_THINK_BUDGET.get((model_key(cfg), tier_of(cfg)), OLD_THINK_BUDGET)
 
 
@@ -159,7 +161,7 @@ def thinking_budget_for(cfg: dict) -> int | None:
     set (installer.thinking_budget_set, written by the dashboard's field) or any value but the old default stays; a
     config of a quant with its own default (QUANT_THINK_BUDGET) and none set, or still at the old 32768, gets it."""
     new = default_thinking_budget(cfg)
-    if new == OLD_THINK_BUDGET or (cfg.get("installer") or {}).get("thinking_budget_set"):
+    if new in (OLD_THINK_BUDGET, 0) or (cfg.get("installer") or {}).get("thinking_budget_set"):
         return None
     value = cfg.get("thinking_budget")
     return new if value is None or value == OLD_THINK_BUDGET else None

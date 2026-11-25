@@ -93,7 +93,8 @@ class Proc:
                                   encoding="utf-8", errors="replace", bufsize=1, **kw)
         self.lines: queue.Queue = queue.Queue()
         self.seen: list = []
-        threading.Thread(target=self._pump, daemon=True).start()
+        self.pump = threading.Thread(target=self._pump, daemon=True)
+        self.pump.start()
 
     def _pump(self):
         for line in self.p.stdout:
@@ -118,7 +119,11 @@ class Proc:
         if self.p.poll() is None:
             self.p.kill()
         self.p.wait(timeout=30)
-        for f in (self.p.stdin, self.p.stdout):
+        # (the output pipe is closed only once its reader is done: a process the server left behind keeps the pipe
+        #  open, the reader then never sees its end, and close() on a pipe a thread still reads waits for that thread
+        #  without end - the suite hung there, intermittently, on a test that had already failed)
+        self.pump.join(timeout=5)
+        for f in (self.p.stdin, None if self.pump.is_alive() else self.p.stdout):
             if f is not None:
                 try:
                     f.close()
