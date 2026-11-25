@@ -1314,7 +1314,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
         }
 }
 
-template <bool GATE_UP, bool E8M0>
+template <bool GATE_UP, bool E8M0, bool BF16 = false>
 __global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     pdl_wait();
@@ -1366,8 +1366,13 @@ __global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a)
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const size_t at = (size_t) max(sr, 0) * a.ldx + (size_t) kb * kMxBlock + tq * 8 + j;
-            values[j] = sr < 0 ? 0.0f : GATE_UP && !a.xh_vec
-                ? (float) (_Float16) a.xf[at] : __half2float(a.xh[at]);
+            if (sr < 0) values[j] = 0.0f;
+            else if constexpr (BF16) {
+                const uint16_t bits = GATE_UP ? bf16_rn(a.xf[at]) : reinterpret_cast<const uint16_t*>(a.xh)[at];
+                values[j] = __uint_as_float((uint32_t) bits << 16);
+            } else {
+                values[j] = GATE_UP && !a.xh_vec ? (float) (_Float16) a.xf[at] : __half2float(a.xh[at]);
+            }
             peak = fmaxf(peak, fabsf(values[j]));
         }
         peak = fmaxf(peak, __shfl_xor(peak, 1));
@@ -1419,7 +1424,11 @@ __global__ void __launch_bounds__(kThreads) mx_set_fp8_wmma_kernel(const SetK a)
             const int r = mr + set_wmma_row(i, hi), c = nc + 16 * j + l16;
             if (r >= nr) continue;
             const size_t out = (size_t) (r0 + r) * a.ldo + c0 + c;
-            if (GATE_UP) a.h[out] = __float2half_rn(swiglu(gate[j][i], up[j][i], a.limit));
+            if constexpr (GATE_UP) {
+                const float h = swiglu(gate[j][i], up[j][i], a.limit);
+                if constexpr (BF16) reinterpret_cast<uint16_t*>(a.h)[out] = bf16_rn(h);
+                else a.h[out] = __float2half_rn(h);
+            }
             else a.y[out] = gate[j][i];
         }
 #else
@@ -1445,7 +1454,7 @@ int fp8_wmma_mode() {
         k = supported ? 2 : 1;
         if (supported)
             std::fprintf(stderr, "ds4: GPU%d MXFP4 prefill FP8 WMMA uses %s activation scales\n", dev,
-                         mode == 2 ? "E8M0 power-of-two" : "amax/448");
+                         mode == 2 ? "E8M0 power-of-two (BF16 for paired MXFP4)" : "amax/448");
         known[dev].store(k, std::memory_order_relaxed);
     }
     return k == 2 ? mode : 0;
@@ -2255,7 +2264,10 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         pdl_launch(mx_set_tc_kernel<true>, grid, kThreads, 0, s, k);
 #else
         const int fp8 = fp8_wmma_mode();
-        if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<true, true>), grid, kThreads, 0, s, k);
+        // Only the paired MXFP4 kernels share a BF16 SwiGLU buffer.
+        if (fp8 == 2 && mx_role(sa.lay, false))
+            pdl_launch((mx_set_fp8_wmma_kernel<true, true, true>), grid, kThreads, 0, s, k);
+        else if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<true, true>), grid, kThreads, 0, s, k);
         else if (fp8 == 1) pdl_launch((mx_set_fp8_wmma_kernel<true, false>), grid, kThreads, 0, s, k);
         else pdl_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
 #endif
@@ -2318,7 +2330,10 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
         pdl_launch(mx_set_tc_kernel<false>, grid, kThreads, 0, s, k);
 #else
         const int fp8 = fp8_wmma_mode();
-        if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<false, true>), grid, kThreads, 0, s, k);
+        // Only the paired MXFP4 kernels share a BF16 SwiGLU buffer.
+        if (fp8 == 2 && mx_role(sa.lay, true))
+            pdl_launch((mx_set_fp8_wmma_kernel<false, true, true>), grid, kThreads, 0, s, k);
+        else if (fp8 == 2) pdl_launch((mx_set_fp8_wmma_kernel<false, true>), grid, kThreads, 0, s, k);
         else if (fp8 == 1) pdl_launch((mx_set_fp8_wmma_kernel<false, false>), grid, kThreads, 0, s, k);
         else pdl_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
 #endif
