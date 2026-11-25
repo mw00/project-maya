@@ -111,17 +111,55 @@ class TestDirectRead(unittest.TestCase):
                 finally:
                     rdr.close()
 
+    def test_preadv_refusal_falls_back_to_buffered(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "sample.bin"
+            f.write_bytes(self.payload)
+            real_open = os.open
+
+            def fake_open(path, flags, *a, **kw):
+                if hasattr(os, "O_DIRECT") and (flags & os.O_DIRECT):
+                    return real_open(path, flags & ~os.O_DIRECT, *a, **kw)
+                return real_open(path, flags, *a, **kw)
+
+            with mock.patch("os.open", side_effect=fake_open), mock.patch(
+                "os.preadv", side_effect=OSError(errno.EINVAL, "Invalid argument")
+            ) as mock_preadv:
+                rdr = DirectReaderPy(f, want_direct=True)
+                try:
+                    if hasattr(os, "O_DIRECT"):
+                        self.assertTrue(rdr.direct_active)
+                    self.assertEqual(rdr.read_span(4095, 65537), self.payload[4095 : 4095 + 65537])
+                    self.assertFalse(rdr.direct_active)
+                    calls_after_first = mock_preadv.call_count
+                    self.assertEqual(rdr.read_span(500003, 300000), self.payload[500003 : 500003 + 300000])
+                    self.assertEqual(mock_preadv.call_count, calls_after_first)
+                finally:
+                    rdr.close()
+
     @unittest.skipUnless(sys.platform.startswith("linux") and Path("/dev/shm").is_dir(), "Linux /dev/shm tmpfs check")
-    def test_tmpfs_odirect_refusal_fallback(self):
+    def test_tmpfs_odirect_or_fallback(self):
         f = Path("/dev/shm") / f"maya_ling_odirect_ut_{os.getpid()}.bin"
+        spans = ((0, 4096), (13, 5000), (4095, 65537), (500003, 300000), (len(self.payload) - 19, 19))
         try:
             f.write_bytes(self.payload)
-            rdr = DirectReaderPy(f, want_direct=True)
+            # Linux >= 6.8 supports O_DIRECT on tmpfs while older kernels refuse it with EINVAL;
+            # accept either mode and verify exact byte-for-byte reads in both direct and buffered modes.
+            rdr_dir = DirectReaderPy(f, want_direct=True)
             try:
-                self.assertFalse(rdr.direct_active)
-                self.assertEqual(rdr.read_span(4095, 65537), self.payload[4095 : 4095 + 65537])
+                self.assertIsInstance(rdr_dir.direct_active, bool)
+                for off, n in spans:
+                    self.assertEqual(rdr_dir.read_span(off, n), self.payload[off : off + n])
             finally:
-                rdr.close()
+                rdr_dir.close()
+
+            rdr_buf = DirectReaderPy(f, want_direct=False)
+            try:
+                self.assertFalse(rdr_buf.direct_active)
+                for off, n in spans:
+                    self.assertEqual(rdr_buf.read_span(off, n), self.payload[off : off + n])
+            finally:
+                rdr_buf.close()
         finally:
             if f.exists():
                 f.unlink()

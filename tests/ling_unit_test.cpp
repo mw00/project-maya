@@ -4,10 +4,11 @@
 //   3. .lingrp v2 model-key enforcement (model, quant, fingerprint, context, KV format, engine version)
 //   4. .lingrp folder size cap eviction & default-off check
 //   5. Linux NUMA topology / cpuset builder helper
-//   6. DirectGgufReader O_DIRECT + buffered + tmpfs fallback
+//   6. DirectGgufReader O_DIRECT + buffered + deterministic fallback + /dev/shm tmpfs
 #include "ling_restore.hpp"
 #include "ling_sys.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -328,37 +329,84 @@ static void test_direct_reader() {
         of.write((const char*) data.data(), (std::streamsize) data.size());
     }
 
+    const std::vector<std::pair<uint64_t, size_t>> spans{
+        {0, 4096}, {13, 5000}, {4095, 131073}, {500003, 300000}, {N - 19, 19}};
+
+    auto verify_spans = [&](const ling::sys::DirectGgufReader& r, const char* tag) {
+        for (const auto& sp : spans) {
+            std::vector<uint8_t> dst(sp.second);
+            EXPECT(r.read_span(sp.first, sp.second, dst.data()), "%s read_span off=%llu len=%zu",
+                   tag, (unsigned long long) sp.first, sp.second);
+            EXPECT(std::memcmp(dst.data(), data.data() + sp.first, sp.second) == 0,
+                   "%s exact byte match off=%llu len=%zu", tag, (unsigned long long) sp.first, sp.second);
+        }
+    };
+
     auto verify_reader = [&](const std::string& path, bool want_direct) {
         ling::sys::DirectGgufReader r;
         std::string err;
         EXPECT(r.open(path, want_direct, err), "open %s (direct=%d): %s", path.c_str(), (int) want_direct, err.c_str());
-        for (const std::pair<uint64_t, size_t>& sp : std::vector<std::pair<uint64_t, size_t>>{
-                 {0, 4096}, {13, 5000}, {4095, 131073}, {500003, 300000}}) {
-            std::vector<uint8_t> dst(sp.second);
-            EXPECT(r.read_span(sp.first, sp.second, dst.data()), "read_span off=%llu len=%zu",
-                   (unsigned long long) sp.first, sp.second);
-            EXPECT(std::memcmp(dst.data(), data.data() + sp.first, sp.second) == 0, "exact byte match");
-        }
+        verify_spans(r, want_direct ? "direct" : "buffered");
         return r.direct_active();
     };
     const bool dir_tmp = verify_reader(p.string(), true);
     const bool buf_tmp = verify_reader(p.string(), false);
     EXPECT(!buf_tmp, "want_direct=false keeps direct_active=false");
+
+    // Deterministic open-time O_DIRECT -> buffered fallback (simulates EINVAL on older tmpfs / unsupported FS).
+    {
+        ling::sys::DirectGgufReader r_open_refused;
+        std::string err;
+        EXPECT(r_open_refused.open_direct_refused_for_test(p.string(), EINVAL, err),
+               "open_direct_refused_for_test: %s", err.c_str());
+        EXPECT(!r_open_refused.direct_active(), "simulated O_DIRECT open EINVAL falls back to buffered");
+        verify_spans(r_open_refused, "open_einval_fallback");
+    }
+
+#if !defined(_WIN32)
+    // Deterministic read-time O_DIRECT -> buffered fallback (pread_direct failure marks fd refused and uses pread_full).
+    {
+        ling::sys::DirectGgufReader r_read_refused;
+        std::string err;
+        EXPECT(r_read_refused.open(p.string(), true, err), "open for read refusal test: %s", err.c_str());
+        EXPECT(r_read_refused.force_direct_read_refusal_for_test(), "arm O_DIRECT read refusal");
+        EXPECT(r_read_refused.direct_active(), "direct_active before refused O_DIRECT read");
+        for (size_t i = 0; i < spans.size(); ++i) {
+            const auto& sp = spans[i];
+            std::vector<uint8_t> dst(sp.second);
+            EXPECT(r_read_refused.read_span(sp.first, sp.second, dst.data()),
+                   "read_refused fallback read_span off=%llu len=%zu",
+                   (unsigned long long) sp.first, sp.second);
+            EXPECT(std::memcmp(dst.data(), data.data() + sp.first, sp.second) == 0,
+                   "read_refused fallback exact byte match");
+            if (i == 0) {
+                EXPECT(!r_read_refused.direct_active(),
+                       "refused O_DIRECT read disables direct_active and falls back to buffered");
+            }
+        }
+    }
+#endif
+
     std::error_code ec;
     fs::remove(p, ec);
 
+    bool shm_dir = false;
     if (fs::is_directory("/dev/shm", ec)) {
         const fs::path sp = fs::path("/dev/shm") / ("ling_direct_shm_" + std::to_string(::getpid()) + ".bin");
         {
             std::ofstream of(sp, std::ios::binary);
             of.write((const char*) data.data(), (std::streamsize) data.size());
         }
-        const bool shm_dir = verify_reader(sp.string(), true);
-        EXPECT(!shm_dir, "/dev/shm tmpfs falls back cleanly to buffered reads");
+        // Linux >= 6.8 natively supports O_DIRECT on tmpfs while older kernels return EINVAL and fall back;
+        // accept either mode as long as aligned and unaligned reads match byte-for-byte.
+        shm_dir = verify_reader(sp.string(), true);
+        const bool shm_buf = verify_reader(sp.string(), false);
+        EXPECT(!shm_buf, "/dev/shm want_direct=false keeps direct_active=false");
         fs::remove(sp, ec);
     }
 
-    std::printf("PASS test_direct_reader (tmp_direct=%d, buffered & fallback verified)\n", (int) dir_tmp);
+    std::printf("PASS test_direct_reader (tmp_direct=%d, shm_direct=%d, buffered & fallback verified)\n",
+                (int) dir_tmp, (int) shm_dir);
 }
 
 static void test_split_gguf_fingerprint() {

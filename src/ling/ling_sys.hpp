@@ -288,23 +288,27 @@ public:
     DirectGgufReader& operator=(const DirectGgufReader&) = delete;
 
     bool open(const std::string& path, bool want_direct, std::string& err) {
-        close();
-        path_ = path;
-        fd_buf_ = maya::ds4::os::open_ro(path);
-        if (fd_buf_ == maya::ds4::os::kBadFd) {
-            err = "cannot open GGUF for expert I/O: " + path;
-            return false;
+        return open_impl(path, want_direct, 0, err);
+    }
+
+    // Test hooks to exercise open-time and read-time O_DIRECT -> buffered fallback deterministically.
+    bool open_direct_refused_for_test(const std::string& path, int simulated_errno, std::string& err) {
+        return open_impl(path, true, simulated_errno, err);
+    }
+#if !defined(_WIN32)
+    bool force_direct_read_refusal_for_test() {
+        if (!is_open()) return false;
+        if (fd_dir_ != maya::ds4::os::kBadFd) {
+            maya::ds4::os::direct_forget((int) fd_dir_);
+            maya::ds4::os::close_fd(fd_dir_);
+            fd_dir_ = maya::ds4::os::kBadFd;
         }
-        if (want_direct) {
-            fd_dir_ = maya::ds4::os::open_direct(path);
-            if (fd_dir_ == maya::ds4::os::kBadFd) {
-                std::fprintf(stderr,
-                             "maya-ling: O_DIRECT open refused on %s (errno %d: %s) - using buffered page-cache reads\n",
-                             path.c_str(), errno, std::strerror(errno));
-            }
-        }
+        const int wfd = ::open(path_.c_str(), O_WRONLY);
+        if (wfd < 0) return false;
+        fd_dir_ = (maya::ds4::os::fd_t) wfd;
         return true;
     }
+#endif
 
     void close() {
         if (fd_dir_ != maya::ds4::os::kBadFd) {
@@ -390,6 +394,30 @@ public:
     }
 
 private:
+    bool open_impl(const std::string& path, bool want_direct, int simulated_direct_errno, std::string& err) {
+        close();
+        path_ = path;
+        fd_buf_ = maya::ds4::os::open_ro(path);
+        if (fd_buf_ == maya::ds4::os::kBadFd) {
+            err = "cannot open GGUF for expert I/O: " + path;
+            return false;
+        }
+        if (want_direct) {
+            if (simulated_direct_errno != 0) {
+                errno = simulated_direct_errno;
+                fd_dir_ = maya::ds4::os::kBadFd;
+            } else {
+                fd_dir_ = maya::ds4::os::open_direct(path);
+            }
+            if (fd_dir_ == maya::ds4::os::kBadFd) {
+                std::fprintf(stderr,
+                             "maya-ling: O_DIRECT open refused on %s (errno %d: %s) - using buffered page-cache reads\n",
+                             path.c_str(), errno, std::strerror(errno));
+            }
+        }
+        return true;
+    }
+
     std::string path_;
     maya::ds4::os::fd_t fd_buf_ = maya::ds4::os::kBadFd;
     maya::ds4::os::fd_t fd_dir_ = maya::ds4::os::kBadFd;
