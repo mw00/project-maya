@@ -1468,6 +1468,15 @@ class StrataEngine:
         else:
             self._last = v
 
+    def own_progress(self):
+        """The prompt progress of the request this thread runs, (read, total, reuse, ms) or None: with several
+        conversations at once (multi), from its own PP lines.  `progress` is the engine's latest of any request (the
+        Monitor's), and a heartbeat that read it put another conversation's read in this request's prompt_progress: a
+        request waiting behind a 600K read reported that read as its own, and its own count once the other ended."""
+        if self.multi:
+            return getattr(self._tls, "progress", None)
+        return self.progress
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -1881,6 +1890,7 @@ class StrataEngine:
         with self._routes_lock:
             self._routes[rid] = q
         self._tls.rid = rid
+        self._tls.progress = None                       # (own_progress: this request's, from its own PP lines)
         self.progress = None
         self.prefill_tok_s_mean = None
         keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
@@ -1959,9 +1969,9 @@ class StrataEngine:
                         yield t
                 elif line.startswith("PP "):
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
-                        self.progress = (int(f[2]), int(f[3]),
-                                         int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
-                                         float(f[4]) if len(f) >= 5 else 0.0)
+                        self.progress = self._tls.progress = (int(f[2]), int(f[3]),
+                                                              int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
+                                                              float(f[4]) if len(f) >= 5 else 0.0)
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
                     if cancel.is_set():
                         return
@@ -5288,7 +5298,8 @@ class Service:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
-                            pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            own = getattr(self.engine, "own_progress", None)   # this request's (multi: not the latest
+                            pr = own() if callable(own) else getattr(self.engine, "progress", None)   # of any)
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
