@@ -859,8 +859,14 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         }();
         const bool alone = r.ids.size() - from > 1 && last_alone;
         const size_t body = alone ? r.ids.size() - 1 : r.ids.size();
-        for (size_t a = from; a < r.ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
+        // (HY4_PP: a body of more than a chunk that Model::forward would pipeline reads in one forward, its chunks
+        //  overlapped over the two GPUs, then the last token alone as before; cancel looked at before and after it -
+        //  a pipelined body is not stopped part way.  Unset, or not pipelined: a chunk a call as before)
+        const bool pp_body = body > from && body - from > (size_t) C && m.pipelines((int) (body - from));
+        if (pp_body && in.stop.load()) cancel = true;
+        for (size_t a = from; !cancel && a < r.ids.size();) {
+            const int T = pp_body && a == from ? (int) (body - from)
+                                               : (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
             const bool last = a + (size_t) T == r.ids.size();
             if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
                 ok = false;
