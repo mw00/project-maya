@@ -282,6 +282,8 @@ def config_stem(family: str, key: str | None) -> str | None:
         return "maya-hy4-flash"
     if family == "ik2":                                # (Inkling-2-Mini: its one file set)
         return "maya-inkling-2-mini"
+    if family == "ling":
+        return "maya-ling-3.2-air"
     return f"maya-{setup_id(family, key)}" if family in ("minimax", "hy4") and setup_id(family, key) else None
 
 
@@ -308,6 +310,9 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "hy4", None
     if low in IK2_IDS:                                 # (Inkling-2-Mini: one file set, unsloth's UD-Q4_K_XL)
         return "ik2", IK2_QUANT
+    if low in ("ling", "ling-3.2-air", "ling32", "ling32-air", "ling-maya-s", "ling-maya-xs", "ling-q8"):
+        qmap = {"ling-maya-xs": "Ling-3.2-air-Maya-XS", "ling-maya-s": "Ling-3.2-air-Maya-S", "ling-q8": "Ling-3.2-air-Q8_0"}
+        return "ling", qmap.get(low)
     for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None

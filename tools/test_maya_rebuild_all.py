@@ -42,6 +42,8 @@ class RebuildAll(unittest.TestCase):
                     patch.object(maya, "DS4_EXE", self.build / "maya-ds4"),
                     patch.object(maya, "MM3_EXE", self.build / "maya-mm3"),
                     patch.object(maya, "HY4_EXE", self.build / "maya-hy4"),
+                    patch.object(maya, "IK2_EXE", self.build / "maya-ik2"),
+                    patch.object(maya, "LING_EXE", self.build / "maya-ling"),
                     patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "step"),
                     patch.object(maya, "warn", side_effect=lambda m, *x: self.warned.append(m)),
                     patch.object(maya.S, "source_hash", return_value="new"),

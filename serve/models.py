@@ -45,7 +45,6 @@ DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepS
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
 HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]          # ... and Hy4-Flash (maya.py's HY4_CONTEXTS)
-LING_CONTEXTS = [8192, 32768, 65536, 131072, 262144]              # ... and Ling-3.2-air (trained for 262,144)
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
@@ -91,8 +90,12 @@ HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a 
 # Inkling-2-Mini (maya-ik2, an experimental preview): its settings, and what its engine does not have yet - said in
 # plain words when a client asks for it (each one's "off": IK2_OFF)
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on its card: the setup's own figures
+import ling_fit as LINGF  # noqa: E402  (tools/) Ling-3.2-air unified memory & fit planner
+LING_CONTEXTS = list(LINGF.CONTEXTS)
 IK2_KEYS = ("context", "images", "gpus", "env", "kv", "draft", "parallel")
 LING_KEYS = ("context", "images", "gpus", "env", "kv", "draft", "prefill_chunk", "cpu_threads")
+LING_OFF = {"parallel": 1}
+LING_NOT_YET = {"parallel": "Answers at once: Ling-3.2-air answers one request at a time for now"}
 IK2_OFF: dict = {}
 IK2_NOT_YET: dict = {}   # (v1.1.74: --parallel, Answers at once, is in - the engine's resident path on one GPU)
 
@@ -447,7 +450,7 @@ def _choices(cfg: dict) -> dict:
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
     if family(cfg) == "ling":
         args = cfg.get("args") or []
-        return {"draft": ["auto", "mtp", "none"], "images": bool(flag(args, "--mmproj")), "kv": ["q8", "fp16"]}
+        return {"draft": ["auto", "mtp", "none"], "images": bool(flag(args, "--mmproj")), "kv": ["f16", "q8"]}
     if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off)
         # (drafting: auto - measured once on this PC; the drafter by hand where the setup downloaded it; none)
         ctx = int(flag(cfg.get("args") or [], "--max-context") or 0)
@@ -500,8 +503,10 @@ def settings_of(cfg: dict) -> dict:
         return out
     if family(cfg) == "ling":                          # (maya-ling's own defaults where the config names none)
         dr = flag(args, "--drafting") or ("auto" if flag(args, "--spec-k") == "auto" else "mtp" if "--mtp" in args else "none")
+        kv_raw = flag(args, "--kv", LINGF.DEFAULT_KV)
+        kv_norm = LINGF.normalize_kv(kv_raw)
         out.update(images=bool(flag(args, "--mmproj")) and flag(args, "--vision") != "off",
-                   kv=flag(args, "--kv", "q8"), draft=dr,
+                   kv=kv_norm, draft=dr, parallel=1,
                    prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
         return out
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
@@ -615,6 +620,12 @@ def apply(cfg: dict, settings: dict) -> dict:
         if not_yet:
             raise ValueError(IK2_NOT_YET[not_yet[0]])
         known += tuple(IK2_NOT_YET)
+    if fam == "ling":
+        not_yet = sorted(k for k in set(settings) & set(LING_NOT_YET)
+                         if settings[k] not in (None, "") and settings[k] != LING_OFF.get(k))
+        if not_yet:
+            raise ValueError(LING_NOT_YET[not_yet[0]])
+        known += tuple(LING_NOT_YET)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
@@ -759,9 +770,9 @@ def apply(cfg: dict, settings: dict) -> dict:
         if gpus != gpus_of(cfg):
             n = len(set(gpus))
             args = set_flag(args, "--gpus", ",".join(str(i) for i in range(n))) if n > 1 else drop_flag(args, "--gpus")
-        kv = str(s.get("kv") or "q8").lower()
+        kv = str(s.get("kv") or LINGF.DEFAULT_KV).lower()
         if kv not in ("q8", "fp16", "f16", "int8"):
-            raise ValueError("KV cache: q8 or fp16")
+            raise ValueError("KV cache: f16 or q8")
         args = set_flag(args, "--kv", "fp16" if kv in ("fp16", "f16") else "q8")
         if s.get("draft") in ("auto", "mtp", "none"):
             args = set_flag(args, "--drafting", s["draft"])
@@ -1060,6 +1071,14 @@ def describe(path: Path, running: str | None) -> dict:
         own.update(ik2_fit={kv: {str(c): {k: v for k, v in IK2F.plan(vram, c, kv, ik2_apu(cfg)).items() if k != "need_gib"}
                                  for c in ctxs} for kv in IK2F.KV_BYTES} if vram else None,
                    ik2_kv_bytes=IK2F.KV_BYTES)
+    elif family(cfg) == "ling":
+        gpus_cfg = gpus_of(cfg) or [0]
+        cards = [g for g in machine_gpus("cuda") if g.get("index") in gpus_cfg]
+        vrams = [float(g.get("vram_gb") or 0) for g in cards] or [24.0] * len(gpus_cfg)
+        ctxs = sorted({*LINGF.CONTEXTS, int(cur.get("context") or 0)} - {0})
+        qname = (inst.get("quant") or LINGF.DEFAULT_QUANT)
+        own.update(ling_fit={kv: {str(c): LINGF.plan(vrams, c, kv, qname) for c in ctxs} for kv in LINGF.KV_BYTES},
+                   ling_kv_bytes=LINGF.KV_BYTES)
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),

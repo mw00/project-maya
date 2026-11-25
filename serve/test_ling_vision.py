@@ -120,7 +120,7 @@ class LingModelsConfig(unittest.TestCase):
             cur = M.settings_of(cfg)
             self.assertEqual((cur["context"], cur["kv"], cur["draft"]), (32768, "q8", "auto"))
             can = M.choices(cfg)
-            self.assertEqual(can["kv"], ["q8", "fp16"])
+            self.assertEqual(can["kv"], ["f16", "q8"])
             self.assertIn("auto", can["draft"])
             desc = M.describe(cfg_p, None)
             self.assertIn(262144, desc["contexts"])
@@ -128,7 +128,7 @@ class LingModelsConfig(unittest.TestCase):
             self.assertEqual(desc["context_range"]["trained"], 262144)
             upd = M.apply(cfg, {"context": 262144, "kv": "fp16", "draft": "none"})
             self.assertEqual(M.settings_of(upd)["context"], 262144)
-            self.assertEqual(M.settings_of(upd)["kv"], "fp16")
+            self.assertEqual(M.settings_of(upd)["kv"], "f16")
             self.assertEqual(M.settings_of(upd)["draft"], "none")
 
 if __name__ == "__main__":

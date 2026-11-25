@@ -252,7 +252,7 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 CONTEXT_MIN, CONTEXT_FALLBACK_MAX = models.CONTEXT_MIN, models.CONTEXT_FALLBACK_MAX
 CONTEXT_TESTED, CONTEXT_TESTED_DEFAULT = models.CONTEXT_TESTED, models.CONTEXT_TESTED_DEFAULT
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|ERR|error|"
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|maya-ling:|ling (?:prompt|stat|split|vram|cal|numa|profile|env|draft)|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -996,6 +996,31 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
             first = i if first is None else first
             last = i
         elif t == system_id and first is not None:
+            last = i
+    marks, out = [], {}
+    if first is not None and first >= least:
+        out["shared"] = first
+    if last is not None and last >= least and last != first:
+        marks.append(last)
+    t = len(ids) - tail
+    if tail > 0 and t >= least and (last is None or t > last):
+        out["tail"] = t
+    if marks:
+        out["marks"] = sorted(marks)
+    return out
+
+
+def ling_restore_points(ids, human_seq, tail=512, least=RESTORE_LEAST) -> dict:
+    """Ling-3.2-air restore points: shared system+tools prefix (first <role>HUMAN</role>), last user turn,
+    and optional tail point before the end.  maya-ling also checkpoints every 16K and persists restore points."""
+    if not human_seq or len(ids) < len(human_seq) + 2:
+        return {}
+    m = len(human_seq)
+    first = last = None
+    h0 = human_seq[0]
+    for i in range(len(ids) - m + 1):
+        if ids[i] == h0 and ids[i : i + m] == human_seq:
+            first = i if first is None else first
             last = i
     marks, out = [], {}
     if first is not None and first >= least:
@@ -2955,6 +2980,7 @@ class Service:
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
+        self.ling_human_seq = list(self.tok.encode("<role>HUMAN</role>")) if getattr(template, "ling", False) else []
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
@@ -5003,6 +5029,10 @@ class Service:
                            else deepseek_restore_points)(ids, self.ds_user_id, self.ds_system_id, tail)
                     if pts:
                         sampling = {**(sampling or {}), "_restore": pts}
+                elif on and getattr(self.template, "ling", False) and self.ling_human_seq:
+                    pts = ling_restore_points(ids, self.ling_human_seq, tail)
+                    if pts:
+                        sampling = {**(sampling or {}), "_restore": pts}
 
                 def attempts(prompt, left):
                     """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
@@ -6664,7 +6694,7 @@ def make_handler(svc: Service):
                         rec["reasoning_effort"] = svc.template.effort_shown(svc.default_effort) or \
                             rec["reasoning_effort"]
                 # Hy4-flash alone: its two levels (the page offers these and no others)
-                levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
+                levels = svc.template.thinking_levels()
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
