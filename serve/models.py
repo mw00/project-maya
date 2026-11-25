@@ -15,7 +15,7 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              prefill_chunk, cpu_threads, kv ("auto" | "q8": the latent cache's rows, --kv - 8-bit rows are the setup's
              opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
              file: --vision off when off); one answer at a time
-  Inkling-2-Mini (maya-ik2, an experimental preview - it stops at a flag it does not know, only its own are written):
+  Inkling-2-Mini (maya-ik2, it stops at a flag it does not know, only its own are written):
              kv ("fp8" | "f16": IK2_KV); one GPU, one answer at a time, text only, no drafting offered for now; whether
              a context keeps every expert in VRAM: tools/ik2_fit.py, the setup's
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
@@ -87,7 +87,7 @@ HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a 
                "kv_cache": "KV cache: Hy4-Flash's cache rows are auto or 8-bit (its setting kv)",
                "kv_streaming": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it",
                "kv_resident": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it"}
-# Inkling-2-Mini (maya-ik2, an experimental preview): its settings, and what its engine does not have yet - said in
+# Inkling-2-Mini (maya-ik2): its settings, and what its engine does not have yet - said in
 # plain words when a client asks for it (each one's "off": IK2_OFF)
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on its card: the setup's own figures
 IK2_KEYS = ("context", "images", "gpus", "env", "kv", "draft", "parallel")
@@ -367,9 +367,10 @@ def mm3_pack_has(cfg: dict, key: str) -> bool:
 
 # ------------------------------------------------------------------ refusal ablation (an optional direction file)
 # The engines that project a direction out per request (GEN ablate=1; loaded with --ablate FILE --ablate-default off):
-# maya-ds4, maya-mm3 and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac engine).  Qwen
+# maya-ds4, maya-mm3, maya-ik2 (Inkling-2-Mini) and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac
+# engine).  Qwen
 # (CYBER-FROST) has none; without a direction file the dashboard shows no switch.
-ABLATE_FAMILIES = ("deepseek", "minimax", "glm")
+ABLATE_FAMILIES = ("deepseek", "minimax", "glm", "ik2")
 # a model repo's direction file (phase 2: fitted and shipped by us): <Model>-refusal-direction.gguf - a control vector
 # GGUF (general.architecture "controlvector", direction.1 F32 [n_embd]) with maya.ablate.scale / .fit_layer / .model
 # / .fitted_on / .version metadata; the setup downloads it with the model and records it as cfg["ablate"]["file"]
@@ -593,7 +594,7 @@ def apply(cfg: dict, settings: dict) -> dict:
         if not_yet:
             raise ValueError(HY4_NOT_YET[not_yet[0]])
         known += tuple(HY4_NOT_YET)
-    if fam == "ik2":                                   # (Inkling-2-Mini's preview: what it does not have yet, said)
+    if fam == "ik2":                                   # (Inkling-2-Mini: what it does not support yet, said)
         not_yet = sorted(k for k in set(settings) & set(IK2_NOT_YET)
                          if settings[k] not in (None, "") and settings[k] != IK2_OFF.get(k))
         if not_yet:

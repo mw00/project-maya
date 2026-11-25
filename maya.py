@@ -867,7 +867,7 @@ HY4_KV_RESIDENT = 32768                            # (KV streaming: the global l
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
-# Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
+# Inkling-2-Mini (PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
 # docs/INKLING2.md section 8) - NVIDIA only, Linux only, V100 / RTX 20 and newer with 8 GB or more (the engine's
 # kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); the experts the card does not hold
 # stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 from 12 GB (the same
@@ -1745,7 +1745,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     ik2 = family == "ik2"
-    if ik2:   # (Inkling-2-Mini, an experimental preview: NVIDIA, Linux, one GPU - refused in one line before anything)
+    if ik2:   # (Inkling-2-Mini: NVIDIA, Linux, one GPU - refused in one line before anything)
         why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [])
         if why:
             fail(why)
@@ -2172,8 +2172,8 @@ def choose_family(a, prev: dict) -> str:
                       "and newer, Linux." if q4 else "")))
     else:
         keys = tuple(k for k in keys if k != "hy4")
-    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 12 GB
-    rows.append((f"{IK2_SHOWN} (experimental)", None, ik2_about()))
+    # Inkling-2-Mini, after it (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 12 GB
+    rows.append((f"{IK2_SHOWN}", None, ik2_about()))
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
     if pick in ("glm", "glm53"):
@@ -2719,6 +2719,23 @@ def g53_drafting_default(pc: dict, pack, ctx: int, env: dict) -> dict | None:
         gpu = max(gpu, mem_gb()[0] - headroom)
     on, out = G53.drafting_estimate(gpu, sizes, ctx * per / 2**30, reserve)
     return {"on": on, "outside": out}
+
+
+def g53_drafting_line(pc: dict, choice: tuple | None, draft: str) -> str:
+    """The setup's "drafting: ..." line for a model of the GLM-5.3 (744B, glm-dsa) family - what the engine will do
+    (glm_mtp.cu mtp_decode_wanted): on one discrete GPU it keeps the MTP block off (the experts stream from RAM and a
+    verify window reads the union of its rows' experts: measured slower), unless MAYA_GLM_MTP_DECODE=1; on one APU the
+    speed calibration decides (g53_drafting_default sets the first value); on two GPUs or more it drafts."""
+    gpus = pc.get("gpus") or []
+    if draft == "dflash2":
+        return "drafting: a DFlash2 drafter (downloaded with the model)"
+    if pc.get("backend") == "metal" or len(gpus) != 1:
+        return "drafting: the MTP block"
+    if pc.get("backend") == "hip" and hip_unified_memory(gpus[0]):
+        return ("drafting: the MTP block where this PC's memory holds the experts, off where it does not - the first "
+                "speed calibration measures it")
+    return ("drafting: off on this PC (one GPU: GLM-5.3's experts stream from RAM and a drafted window reads more "
+            "of them, so it decodes slower; two GPUs or more draft with the MTP block; MAYA_GLM_MTP_DECODE=1 forces it)")
 
 
 def g53_one_gpu_drafting(cfg: dict) -> bool:
@@ -4321,7 +4338,8 @@ def fetch(url: str, dst: Path, want: str | None) -> None:
 ABLATE_DIRECTIONS = {"glm": ("GLM-5.3-Flash", "peasantsmith/GLM-5.3-Flash-Maya-GGUF"),
                      "glm-dsa": ("GLM-5.3", "peasantsmith/GLM-5.3-Maya-GGUF"),
                      "deepseek": ("DeepSeek-V4.1-Flash", "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"),
-                     "minimax": ("MiniMax-M3.1-Flash", "peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF")}
+                     "minimax": ("MiniMax-M3.1-Flash", "peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"),
+                     "ik2": ("Inkling-2-Mini", "peasantsmith/Inkling-2-Mini-Maya-GGUF")}
 ABLATE_DIR = "refusal-directions"
 ABLATE_MAX_BYTES = 1 << 20
 
@@ -4354,6 +4372,16 @@ def fetch_ablate_direction(key: str, models: Path) -> Path | None:
     dst = models / ABLATE_DIR / name
     part = dst.with_name(name + ".part")
     why = ""
+    pin = ablate_pin(key, name)
+    if pin is not None:   # (a pinned file - Inkling's, once its manifest names the revision: that revision, its size and sha256)
+        got = _fetch_ablate_file(hf_url(repo, pin[0], ABLATE_DIR, name), dst, part, model, repo, name, pin[1:])
+        if got is True:
+            return dst
+        why = got
+        if dst.is_file() and not ablate_direction_check(dst, model) and sha256_ok(dst, pin[2]):
+            ok(f"refusal ablation: the {name} from an earlier setup ({why})")
+            return dst
+        return None
     # the file sits in the repo's refusal-directions/ folder (at the repo's top the Hub took it for the model and showed
     # its few thousand values as the parameter count); a repo that still has it at the top is read there
     for url in (hf_url(repo, "main", ABLATE_DIR, name), hf_url(repo, "main", "", name)):
@@ -4370,8 +4398,24 @@ def fetch_ablate_direction(key: str, models: Path) -> Path | None:
     return None
 
 
-def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, name: str):
-    """One try of fetch_ablate_direction's download: True (checked, in place) or why it failed."""
+def ablate_pin(key: str, name: str):
+    """(revision, size, sha256) of a direction file the model's manifest pins (tools/ik2/download.json's "ablate"),
+    or None: no entry, or its revision / sha256 still a PLACEHOLDER (the file is not uploaded yet: the repo's main,
+    checked by its shape alone, as every other model's)."""
+    if key != "ik2":
+        return None
+    ent = read_json(IK2_MANIFEST).get("ablate") or {}
+    f = (ent.get("files") or {}).get(name)
+    rev = ent.get("revision")
+    if not (isinstance(rev, str) and re.fullmatch(r"[0-9a-f]{40}", rev) and isinstance(f, list) and len(f) == 2 and
+            isinstance(f[0], int) and isinstance(f[1], str) and re.fullmatch(r"[0-9a-f]{64}", f[1])):
+        return None
+    return rev, f[0], f[1]
+
+
+def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, name: str, pin=None):
+    """One try of fetch_ablate_direction's download: True (checked, in place) or why it failed.  pin: (size, sha256)
+    the file must have."""
     why = ""
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -4394,6 +4438,8 @@ def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, n
                 why = str(e)
         if not why:
             why = ablate_direction_check(part, model)
+            if not why and pin is not None and (part.stat().st_size != pin[0] or not sha256_ok(part, pin[1])):
+                why = "not the pinned file (size or sha256)"
             if not why:
                 os.replace(part, dst)
                 ok(f"refusal ablation: {name} from https://huggingface.co/{repo} (off until you switch it on: the "
@@ -4464,6 +4510,50 @@ def ablate_step(cfg_path: Path, key: str, models: Path, a=None) -> None:
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
 
 
+VISION_BUILD_TIME = "1 to 6 minutes, up to about 10 minutes on a small PC"   # (measured clean installs; the engine: 1.5-4)
+
+
+def vision_build_backend(build: Path) -> str | None:
+    """"hip", "cuda" or "cpu" (Metal / CPU only) - which backend a picture-reader build folder was configured for (its
+    CMakeCache.txt), None when it has no configuration."""
+    try:
+        cache = (build / "CMakeCache.txt").read_text(errors="replace")
+    except OSError:
+        return None
+    if re.search(r"^MAYA_VISION_HIP:BOOL=ON\s*$", cache, re.M):
+        return "hip"
+    if re.search(r"^MAYA_VISION_CUDA:BOOL=ON\s*$", cache, re.M):
+        return "cuda"
+    return "cpu"
+
+
+def vision_build_for(backend: str) -> None:
+    """One install folder set up with --backend hip and then --backend cuda (or back): build-vision keeps its CMake
+    cache, whose compilers, generator and MAYA_VISION_HIP / _CUDA switches belong to the other backend - the configure
+    stopped at "MAYA_VISION_CUDA and MAYA_VISION_HIP are mutually exclusive" and the model read text only.  The old
+    folder is set aside as build-vision-<its backend> (the one set aside before for this backend comes back), so
+    each backend keeps its own build and nothing is deleted."""
+    old = vision_build_backend(VBUILD)
+    if old is None or old == backend:
+        return
+    aside = VBUILD.with_name(f"{VBUILD.name}-{old}")
+    back = VBUILD.with_name(f"{VBUILD.name}-{backend}")
+    try:
+        n = 1
+        while aside.exists():                          # (one set aside before: this one gets a number, nothing is deleted)
+            n += 1
+            aside = VBUILD.with_name(f"{VBUILD.name}-{old}-{n}")
+        VBUILD.rename(aside)
+        if back.exists() and vision_build_backend(back) == backend:
+            back.rename(VBUILD)
+    except OSError as e:
+        warn(f"the picture reader's build folder of the {old} backend could not be set aside ({e}): "
+             f"build-vision is configured again")
+        return
+    say(f"  The picture reader was built for {old} before: its folder is kept as {aside.name}, this one is built "
+        f"fresh for {backend}.")
+
+
 def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's and Inkling 2's vision towers added
     (tools/vision/glm5next_patch.py, inkling2v_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
@@ -4472,6 +4562,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         return False
     run([sys.executable, str(ROOT / "tools" / "vision" / "glm5next_patch.py"), str(llama)])
     run([sys.executable, str(ROOT / "tools" / "vision" / "inkling2v_patch.py"), str(llama)])
+    vision_build_for("hip" if pc.get("backend") == "hip" else "cpu" if pc.get("backend") == "metal" else "cuda")
     gen = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.*)$", (VBUILD / "CMakeCache.txt").read_text(errors="replace"), re.M) \
         if (VBUILD / "CMakeCache.txt").exists() else None
     ninja = venv_tool("ninja") or shutil.which("ninja")
@@ -4485,7 +4576,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     hip = pc.get("backend") == "hip"
     env = vcvars = bindir = None
     if hip:
-        conf += ["-DMAYA_VISION_HIP=ON",
+        conf += ["-DMAYA_VISION_HIP=ON", "-DMAYA_VISION_CUDA=OFF",
                  "-DMAYA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs)]
@@ -4501,7 +4592,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         if S.ARM and S.arm_cpu_arch():
             conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     elif not metal:                                    # (macOS: ggml builds its Metal backend by default, no CUDA)
-        conf += ["-DMAYA_VISION_CUDA=ON",
+        conf += ["-DMAYA_VISION_CUDA=ON", "-DMAYA_VISION_HIP=OFF",
                  "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
                  f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
                  *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
@@ -4511,7 +4602,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
-        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: a few minutes") +
+        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: " + VISION_BUILD_TIME) +
         ", once) ...")
     def steps(more=()) -> bool:
         return not cmake_steps(conf + list(more), [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j",
@@ -6671,7 +6762,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         for line in hy4_first_start_said(cfg):
             say("  " + line)
     elif config_family(cfg) == "ik2":
-        say(f"  {IK2_SHOWN} is an experimental preview: loading takes a few seconds to a minute (every expert is")
+        say(f"  {IK2_SHOWN}: loading takes a few seconds to a minute (every expert is")
         say("  copied into VRAM); one answer at a time" + (", pictures read by the image encoder when one arrives."
                                                           if cfg.get("vision") else ", text only."))
     elif config_family(cfg) == "qwen":
@@ -7182,10 +7273,13 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         base = {"machine": socket.gethostname().split(".")[0], "gpus": gpu_text, "driver": driver,
                 "model": bench_model_name(cfg), "date": time.strftime("%Y-%m-%d")}
         choices = MB.choice_files(ROOT, cfg) if tokens_file else {}   # (the saved per-PC choices this run starts from)
+        MB.clean_kept_logs(ROOT)                 # (each round's engine log is kept in .bench-logs: this run's only)
+        info = (args, cfg.get("env") or {}, config_family(cfg))
         if not compare:
             before = MB.learned_listing(ROOT, cfg)
             run = MB.run_session(here, chats, prompts, warm, "", say,
-                                 MB.SMOKE_TOKENS if smoke else MB.DECODE_TOKENS)
+                                 MB.SMOKE_TOKENS if smoke else MB.DECODE_TOKENS,
+                                 keep=ROOT / MB.KEEP_DIR / "this-r1.log", drafting_info=info)
             runs = {"this": [run]}
             res = MB.summarize([run], prompts)
             drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"],
@@ -7199,6 +7293,8 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
                        note="; ".join(x for x in ("first start: rough" if new else "",
                                                   "prompt reuse seen" if run["reused"] else "") if x))
             lines = bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, [run], t_quiet, t_all)
+            lines.insert(len(lines) - 1, "layout: " + MB.layout_line(run["facts"]) +
+                         (f" (engine log kept: {run['log_kept']})" if run["log_kept"] else ""))
             records = [MB.record_line(rec)]
             if smoke and any(a["produced"] == 0 for a in run["answers"]):
                 fail("the model answered nothing (0 tokens) in the smoke run",
@@ -7299,7 +7395,9 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
                 learned.restore(other if side == "other" else None)
                 say(f"  round {r + 1} of {rounds}: {side} build")
                 runs[side].append(MB.run_session(here if side == "this" else there, chats, prompts, warm,
-                                                 f"[{side}] ", say))
+                                                 f"[{side}] ", say,
+                                                 keep=ROOT / MB.KEEP_DIR / f"{side}-r{r + 1}.log",
+                                                 drafting_info=(args, cfg.get("env") or {}, config_family(cfg))))
                 if r == 0 and side == "this":
                     learned = learned.adopt(cfg)  # (learned at a first start: kept, so no later round learns again)
     finally:
@@ -7319,6 +7417,7 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
         lines += [f"{side} build {names[side]}: {root}"] + [
             "  " + x for x in bench_text(ver, cfg_path, cfg, ctx, gpu_text, res[side], drafting, runs[side],
                                          t_quiet, t_all)[2:]]
+        lines += [f"  start {i + 1} layout: " + MB.layout_line(r["facts"]) for i, r in enumerate(runs[side])]
     lines.append("exactness (greedy tokens of every bench request, this vs other, every pairing of rounds): " +
                  verdict + ("" if not exact else " - " + "; ".join(exact)))
     for side, d in again.items():
@@ -7326,6 +7425,8 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
     if any(again.values()):
         lines.append("  (a build that differs from itself between starts: this engine is not repeatable start to "
                      "start on this PC, so a difference between the builds is not proof of an answer change)")
+    if exact or any(again.values()):             # (tokens differ: which start's engine log states something different)
+        lines += ["the starts' engine logs, compared (facts the logs state about placement and speed):"] +             MB.layout_report(runs)
     lines.append(f"wall time all: {time.time() - t_all:.0f} s (quiet check {t_quiet:.0f} s)")
     records.append(MB.compare_line(res["other"], res["this"], names["other"], names["this"], verdict))
     return lines, records, runs
@@ -7531,7 +7632,8 @@ def _set_up(a, prev: dict) -> Path | None:
             ctx = choose_context(a, prev_ctx, recommended=rec_ctx)
     ok(f"context: {ctx} tokens")
     draft = choose_draft(a, pc, inst)
-    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
+    ok(g53_drafting_line(pc, choice, draft) if g53_choice(choice) else
+       "drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
     mixed_builds(a, pc, llama, "maya")                 # (an NVIDIA card beside an AMD GPU: its engine too)
@@ -11477,7 +11579,7 @@ def ik2_about() -> str:
     """The setup's model row for Inkling-2-Mini."""
     files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
     gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
-    return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
+    return ("thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
             f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA V100 / "
             "RTX 20 and newer with 8 GB or more (experts that do not fit in VRAM stay in RAM: about 13 GB of RAM with an 8 GB card), or "
             "AMD RDNA 3 / 3.5 / 4 with 12 GB or more (the same: experts that do not fit stay in RAM) or a Halo / APU "
@@ -11770,7 +11872,7 @@ def ik2_engine_vram(pc: dict, probe=None, saved: dict | None = None, busy: dict 
 
 
 def set_up_ik2(a, prev: dict) -> Path | None:
-    """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
+    """Inkling-2-Mini's steps 1-8: the PC (refused in one line where it does not
     run: a Mac, AMD on Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
     GPU older than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
     (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
@@ -11801,10 +11903,10 @@ def set_up_ik2(a, prev: dict) -> Path | None:
                "Windows keeps the rest for the display)")
             vram = pc["gpus"][0]["ik2_vram_gb"] = round(room, 2)
     step(2, "your choices")                            # 2
-    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux) and by Maya's "
+    warn(f"{IK2_SHOWN} is run by its contributor on RTX 3090 cards (Linux) and by Maya's "
          "team on V100s (Linux) and an RTX 3050 8 GB (Windows), not yet on every card - tell us how it goes in "
          "an issue" if not amd else
-         f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
+         f"{IK2_SHOWN} on AMD is run by Maya's team on a Radeon 8065S (Gorgon Halo, "
          "Linux, also set as a 12 and a 16 GB card), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes "
          "in an issue")
     m = ik2_entry()
@@ -11861,7 +11963,9 @@ def set_up_ik2(a, prev: dict) -> Path | None:
         drafter = ik2_drafter_step(a, d, vram, ctx, kv, amd)   # (5: its drafter)
     tok = ik2_tokenizer_step(a, d, gguf)              # 6
     vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
-    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
+    cfg_path = write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
+    ablate_step(cfg_path, "ik2", models, a)            # (its refusal direction, loaded and off by default, when the repo has one)
+    return cfg_path
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:
@@ -11892,7 +11996,7 @@ def model_option(a) -> str | None:
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (experimental), or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
         a.model = key
@@ -11927,7 +12031,7 @@ def main() -> int:
                          "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--ablation", choices=["on", "off"],
-                    help="GLM, DeepSeek and MiniMax: the model's refusal direction loaded (on - each request still "
+                    help="GLM, DeepSeek, MiniMax and Inkling-2-Mini: the model's refusal direction loaded (on - each request still "
                          "asks for it, off by default) or left out (off). Not given: a new config loads it, a setup "
                          "again keeps what its config had")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
@@ -11949,7 +12053,7 @@ def main() -> int:
                     help="which model and files (default: asked): a Maya quant - "
                          + ", ".join(i for _, _, _, i in Q.QUANTS) +
                          f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
-                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (an experimental preview),"
+                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN},"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
     ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4} or {QWEN_SHOWN}: their "

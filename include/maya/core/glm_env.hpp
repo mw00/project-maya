@@ -55,7 +55,7 @@ inline int switch_value(const char* name, const char* v, int dflt, bool allow_au
     int r = parse(v);
     if (r == kAuto && !allow_auto) r = kInvalid;
     if (r == kInvalid) {
-        std::fprintf(stderr, "strata: %s=\"%s\" is not a switch value (1/0, on/off, true/false, yes/no%s): %s (the "
+        std::fprintf(stderr, "maya: %s=\"%s\" is not a switch value (1/0, on/off, true/false, yes/no%s): %s (the "
                              "default)\n", name, v, allow_auto ? ", auto" : "",
                      dflt == kAuto ? "auto" : dflt == kOff ? "off" : "on");
         return dflt;
@@ -71,6 +71,10 @@ inline int env_switch(const char* name, int dflt, bool allow_auto = false) {
 /// An on/off switch from the environment.
 inline bool env_flag(const char* name, bool dflt) { return env_switch(name, dflt ? kOn : kOff) == kOn; }
 
+/// True when MAYA_GLM_NO_REUSE disables snapshot, conversation-slot, checkpoint, and prompt-cache reuse.
+/// Unset, empty, "0", "off", "false", and "no" keep reuse enabled.
+inline bool no_reuse_env() { return env_flag("MAYA_GLM_NO_REUSE", false); }
+
 /// An integer from a value: null or "" -> dflt; a whole decimal integer; anything else -> a warning and dflt.
 inline long long int_value(const char* name, const char* v, long long dflt) {
     if (v == nullptr || v[0] == '\0') return dflt;
@@ -78,7 +82,7 @@ inline long long int_value(const char* name, const char* v, long long dflt) {
     errno = 0;
     const long long x = std::strtoll(v, &end, 10);
     if (end == v || *end != '\0' || errno == ERANGE) {
-        std::fprintf(stderr, "strata: %s=\"%s\" is not an integer: %lld (the default)\n", name, v, dflt);
+        std::fprintf(stderr, "maya: %s=\"%s\" is not an integer: %lld (the default)\n", name, v, dflt);
         return dflt;
     }
     return x;
@@ -91,7 +95,7 @@ inline double num_value(const char* name, const char* v, double dflt) {
     char* end = nullptr;
     const double x = std::strtod(v, &end);
     if (end == v || *end != '\0' || !std::isfinite(x)) {
-        std::fprintf(stderr, "strata: %s=\"%s\" is not a number: %g (the default)\n", name, v, dflt);
+        std::fprintf(stderr, "maya: %s=\"%s\" is not a number: %g (the default)\n", name, v, dflt);
         return dflt;
     }
     return x;

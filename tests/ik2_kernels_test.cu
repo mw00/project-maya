@@ -223,6 +223,50 @@ void test_conv() {
     cudaFree(dx), cudaFree(dw), cudaFree(dd), cudaFree(dy);
 }
 
+// --ablate: project_res against the double-precision projection, and a row's bits do not depend on the rows beside it
+void test_project_res() {
+    const int T = 9, C = 1536;
+    auto y = fvec((size_t) T * C, 3.0f), res = fvec((size_t) T * C), r = fvec(C);
+    double n2 = 0;
+    for (float v : r) n2 += (double) v * v;
+    for (auto& v : r) v = (float) (v / std::sqrt(n2));
+    const float scale = 1.25f;
+    std::vector<double> want((size_t) T * C), want0((size_t) T * C);
+    for (int t = 0; t < T; ++t) {
+        double dot = 0;
+        for (int e = 0; e < C; ++e) dot += (double) r[e] * y[(size_t) t * C + e];
+        for (int e = 0; e < C; ++e) {
+            const size_t i = (size_t) t * C + e;
+            want[i] = (double) res[i] + (y[i] - scale * dot * r[e]);
+            want0[i] = (double) y[i] + res[i];
+        }
+    }
+    float *dy = dev(y), *dr = dev(r), *dres = dev(res);
+    k::project_res(dy, dr, scale, dres, T, C, 0);
+    const auto got = host(dy, want.size());
+    expect("project_res: y - s r (r.y), the residual added", got, want, 2e-5);
+    // the same row alone, and in a launch of other rows: the same bits
+    for (int t : {0, 4, T - 1}) {
+        float* d1 = dev(std::vector<float>(y.begin() + (size_t) t * C, y.begin() + (size_t) (t + 1) * C));
+        float* dres1 = dev(std::vector<float>(res.begin() + (size_t) t * C, res.begin() + (size_t) (t + 1) * C));
+        k::project_res(d1, dr, scale, dres1, 1, C, 0);
+        const auto one = host(d1, C);
+        bool same = std::memcmp(one.data(), got.data() + (size_t) t * C, (size_t) C * sizeof(float)) == 0;
+        expect_true("project_res: a row's bits do not depend on T", same);
+        cudaFree(d1), cudaFree(dres1);
+    }
+    // no residual: y alone; scale 0: y + res as the fused conv adds it
+    float* dy2 = dev(y);
+    k::project_res(dy2, dr, scale, nullptr, T, C, 0);
+    std::vector<double> want_nores((size_t) T * C);
+    for (size_t i = 0; i < want_nores.size(); ++i) want_nores[i] = want[i] - (double) res[i];
+    expect("project_res: no residual", host(dy2, want.size()), want_nores, 2e-5);
+    CU(cudaMemcpy(dy2, y.data(), y.size() * sizeof(float), cudaMemcpyHostToDevice));
+    k::project_res(dy2, dr, 0.0f, dres, T, C, 0);
+    expect("project_res: scale 0 is y + res", host(dy2, want.size()), want0, 0.0);
+    cudaFree(dy), cudaFree(dr), cudaFree(dres), cudaFree(dy2);
+}
+
 void test_attn_res() {
     const int T = 9, C = 4608;
     for (int n : {1, 2, 9})
@@ -3236,6 +3280,7 @@ int main() {
 #endif
     test_window_exact(p.major >= 7);   // (Volta and Turing: their own tensor-core kernels)
     test_window_launches();
+    test_project_res();   // (last: it draws no numbers from the shared rng the earlier checks use)
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

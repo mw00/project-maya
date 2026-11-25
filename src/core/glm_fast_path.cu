@@ -27,6 +27,7 @@
 #include "maya/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
 #include "maya/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
 #include "maya/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
+#include "maya/core/glm_numa_diag.hpp"
 #include "maya/kernels/glmd_graph.hpp"   // glm-dsa B15.6
 #include "maya/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
 #include "maya/core/glm_mtp_state.hpp"   // glm-dsa B15.3
@@ -490,6 +491,13 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
                 }
                 std::fprintf(stderr, "glm fast: CUDA%d RAM arena %.2f GB in row halves (nodes %d / %d, %zu slots)\n", dev,
                              bytes / 1073741824.0, n0, n1, bytes / rl->stride);
+                static std::atomic<bool> nb_warned{false};
+                if (!nb_warned.load(std::memory_order_relaxed) && maya::core::glmnuma::proc_numa_balancing_enabled() &&
+                    !nb_warned.exchange(true, std::memory_order_relaxed)) {
+                    std::fprintf(stderr, "glm fast: note - kernel.numa_balancing=1 is active while MAYA_GLM_ROW_HALVES=1 "
+                                         "pins row halves across NUMA nodes (auto-migration can erode node-local placement; "
+                                         "consider sysctl kernel.numa_balancing=0)\n");
+                }
                 return p;
             }
             std::fprintf(stderr, "glm fast: CUDA%d row halves: mbind refused - interleaved\n", dev);
@@ -4157,6 +4165,28 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     for (int s = 0; s < R.n && (int) cal_all.size() < 4 * kCalSets; ++s)
         if (R.st[(size_t) s] == FastState::kRHold && R.key[(size_t) s] / g.n_expert == il_cal)
             cal_all.push_back(R.slot((size_t) s));
+    const size_t cal_primary = cal_all.size();
+    if (cal_primary > 0 && (int) cal_all.size() < 4 * kCalSets &&
+        getenv("MAYA_GLM_CPU_LANE_CHECK") == nullptr && !F->L[(size_t) il_cal].exl3) {
+        const auto& L0 = F->L[(size_t) il_cal];
+        const auto& F0 = F->cpu_fmt[(size_t) il_cal];
+        for (int s = 0; s < R.n && (int) cal_all.size() < 4 * kCalSets; ++s) {
+            if (R.st[(size_t) s] != FastState::kRHold || R.key[(size_t) s] < 0) continue;
+            const int il2 = R.key[(size_t) s] / g.n_expert;
+            if (il2 == il_cal || il2 < l0_ || il2 >= lt_ || il2 >= (int) F->cpu_fmt.size()) continue;
+            const auto& L2 = F->L[(size_t) il2];
+            const auto& F2 = F->cpu_fmt[(size_t) il2];
+            if (L2.exl3 || L2.blob != L0.blob || L2.gu_bytes != L0.gu_bytes || L2.down_off != L0.down_off ||
+                F2.gu_type != F0.gu_type || F2.u_type != F0.u_type || F2.d_type != F0.d_type ||
+                F2.n_embd != F0.n_embd || F2.n_ff != F0.n_ff)
+                continue;
+            cal_all.push_back(R.slot((size_t) s));
+        }
+        if (cal_all.size() > cal_primary)
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane calibration sample expanded across compatible layers: "
+                                 "%zu -> %zu experts (%.1f MiB)\n",
+                         dev_, cal_primary, cal_all.size(), (double) (cal_all.size() * L0.blob) / 1048576.0);
+    }
     if (cal_all.empty()) {   // nothing in RAM: the lane would never run (a complete pool: every expert in VRAM)
         std::fprintf(stderr, "glm fast: CUDA%d CPU lane off: the RAM tier holds no expert\n", dev_);
         return true;

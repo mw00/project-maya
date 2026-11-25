@@ -552,7 +552,7 @@ function qwenFields(m, d, s, ch, gpus) {
   ];
 }
 
-// Inkling-2-Mini's (maya-ik2, an experimental preview: it stops at a flag it does not know, so only its own are offered).
+// Inkling-2-Mini's (maya-ik2: it stops at a flag it does not know, so only its own are offered).
 // Its cache's VRAM a context token: the 8 visits of the layers without a window, by its format (m.ik2_kv_bytes, the
 // setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card; drafting auto / DSpark / off
 function ik2Fields(m, d, ch) {

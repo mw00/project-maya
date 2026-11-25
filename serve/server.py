@@ -665,6 +665,16 @@ def think_stop_tables(tok) -> str:
     return f" think_stop={j(stop)} think_weak={j(weak)} think_dig={j(dig)}" if stop or weak else ""
 
 
+def openings_left(starts: list[list[int]], written: list[int]) -> list[list[int]] | None:
+    """GEN's starts= (the answer opens with one of these sequences: Service.prepare) for a later engine call of the
+    same answer, after its tokens `written`: what the sequences it still matches have left - None once one is written
+    whole, or none matches."""
+    n = len(written)
+    if any(q == written[:len(q)] for q in starts):
+        return None
+    return [q[n:] for q in starts if q[:n] == written and len(q) > n] or None
+
+
 def think_boundary(text: str) -> bool:
     """The reasoning so far (its last characters will do) ends a line or a sentence: a newline, or . ! ? after
     something other than a digit or another dot (not "3." of "3.0", not "..."), closing quotes or brackets allowed
@@ -1490,6 +1500,11 @@ class StrataEngine:
         tb, te = sampling.get("_think_budget"), sampling.get("_think_end")   # the run config's (StrataService.run)
         think = f" think_budget={tb} think_end={te}" if isinstance(tb, int) and isinstance(te, int) and tb > 0 and \
             te >= 0 else ""
+        ink = sampling.get("_think_ink")      # (Inkling 2: its segment's close, ik2's GEN think_*)
+        if isinstance(ink, dict):
+            think = (f" think_open={ink['open']} think_end={ink['end']} think_soft={ink['soft']} think_hard={ink['hard']}"
+                     f" think_after=" + ";".join(",".join(str(int(i)) for i in q) for q in ink["after"]) +
+                     (ink.get("stops") or ""))
         soft, stops = sampling.get("_think_soft"), sampling.get("_think_stops")
         if think and isinstance(soft, int) and soft > 0 and isinstance(stops, str) and stops:
             think += f" think_soft={soft}{stops}"   # (#746: the engine closes at the sentence's end, a prefix of the state)
@@ -1528,6 +1543,9 @@ class StrataEngine:
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
+        starts = sampling.get("_starts")      # (Service.prepare: the answer opens with one of these)
+        if starts:
+            bias_key += " starts=" + ";".join(",".join(str(int(i)) for i in q) for q in starts)
         penalty_keys = StrataEngine.penalty_keys(sampling)
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
@@ -3058,6 +3076,16 @@ class Service:
             (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
             if getattr(template, "hy4", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        # Inkling 2 writes no think tags: its reasoning is a typed segment, <|content_thinking|> ... <|end_message|>,
+        # and its answer the next message's <|message_model|><|content_text|> (or a call).  Its thinking budget closes
+        # a segment with think_close_ids (the segment's end and the next message's opening); the engine does it
+        # (maya-ik2's GEN think_*: its decode forces the close, no stop and restart) - think_end_id stays None
+        self.think_open_id, self.think_close_ids, self.think_text_id = None, [], None
+        if getattr(template, "inkling", False):
+            op, em, mm, tx = (_special_ids(s) for s in ("<|content_thinking|>", "<|end_message|>", "<|message_model|>",
+                                                       "<|content_text|>"))
+            if op and em and mm and tx:
+                self.think_open_id, self.think_close_ids, self.think_text_id = op[0], [em[0], mm[0]], tx[0]
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
         # GLM/Qwen engine ends at every turn-end token of its vocabulary (GLM: <|endoftext|>, <|user|>,
@@ -3421,12 +3449,18 @@ class Service:
             return glm_dsa_product.LABEL
         return None
 
+    @property
+    def has_think_budget(self) -> bool:
+        """The model closes its thinking with a token of its own (</think>) or, Inkling 2, with a segment's end."""
+        return self.think_end_id is not None or (bool(getattr(self, "think_close_ids", None)) and
+                                                 (getattr(self.engine, "info", None) or {}).get("think") == 1)
+
     def think_budget_info(self) -> dict:
         """The dashboard's Thinking budget: tokens (0 = no limit), whether this model has a think block at all; and
         GLM-5.3's for a request that asks for Max itself while the budget is the default ("max_level":
         think_budget_max, the most it gets - absent for every other model)."""
         top = getattr(self, "think_budget_max", 0)
-        return {"budget": int(self.think_budget or 0), "supported": self.think_end_id is not None,
+        return {"budget": int(self.think_budget or 0), "supported": self.has_think_budget,
                 "saved": bool(self.config_path), **({"max_level": top} if top else {})}
 
     @staticmethod
@@ -3441,7 +3475,7 @@ class Service:
         """The dashboard's Thinking budget: 0 or 256..262144 tokens.  It applies from the next request (think_budget is
         read per request, no restart) and is saved into the run config - marked as the user's own, so a setup or a
         switch keeps it."""
-        if self.think_end_id is None:
+        if not self.has_think_budget:
             raise ValueError("this model has no thinking budget")
         n = maya_quants.check_thinking_budget(value)
         self.think_budget = n
@@ -4116,6 +4150,27 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def _call_openings(self, tools) -> list[list[int]] | None:
+        """Inkling 2, a call to any tool: each tool's name and the call's segment as the model writes them after
+        <|message_model|> (GEN's starts=, the engine's choice among them); None where the engine does not read it."""
+        if (getattr(self.engine, "info", None) or {}).get("starts") != 1:
+            return None
+        seg = (getattr(self.tok, "special_tokens", None) or {}).get("<|content_invoke_tool_json|>")
+        names = [t.get("name") for t in tools or [] if isinstance(t, dict) and t.get("name")]
+        if seg is None or not names:
+            return None
+        return [self.tok.encode(n) + [seg] for n in names]
+
+    def _think_after(self, tools) -> list[list[int]] | None:
+        """Inkling 2, what may follow its thinking when the budget closes it (GEN's starts=, the engine's pick among
+        them): its text segment, or a call to any of the request's tools - so a request with tools is still free to
+        call one.  None with no tools (the text segment follows the close as it is) or where the engine does not read
+        starts= - it too gets the text segment."""
+        if not self.think_close_ids or not tools:
+            return None
+        calls = self._call_openings(tools)
+        return [[self.think_text_id]] + calls if calls else None
+
     def prepare(self, messages, tools, kwargs, max_new=None, cancel=None, guard=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
@@ -4147,7 +4202,7 @@ class Service:
             # default) - and its prompt is rendered at Max: run() may give it the long budget (think_budget_max,
             # asked_max).  It goes to run() with the request, as _think_resume does
             given["_think_max"] = True if own_level == "max" and self.template.think_level(kwargs) == "max" else None
-        prefill = ""
+        prefill, starts = "", None
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>, DeepSeek's DSML with its calls block
             glm_calls = "<arg_key>" in self.template.source
@@ -4159,6 +4214,11 @@ class Service:
                 # Inkling 2: a call is a model message of its own, <|message_model|>NAME<|content_invoke_tool_json|>
                 # {"name": .., "args": ..}: the prompt opens it; the parser reads it through InklingRewriter
                 prefill = "<|message_model|>" + (force + "<|content_invoke_tool_json|>" if force else "")
+                if not force:
+                    # any tool: the name comes first, so the prompt cannot open "a call" - only the model's message,
+                    # which the model may still go on with in words.  Where the engine reads starts= (maya-ik2), the
+                    # message opens with one of the tools' names and the call's segment, as the model picks
+                    starts = self._call_openings(tools)
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         if not prefill and not tools and getattr(self.template, "inkling", False) and \
@@ -4170,6 +4230,8 @@ class Service:
             kwargs = {**kwargs, "enable_thinking": False}
             prefill = "<|message_model|><|content_text|>"
         given["_prefill"] = prefill
+        given["_starts"] = starts
+        given["_think_after"] = self._think_after(tools) if not prefill else None
         if prefill and getattr(self.template, "hy4", False):
             # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
             # the opening as its template writes it; the parser reads it in GLM's spelling, as it reads the answer
@@ -4507,6 +4569,22 @@ class Service:
                 self.fifo.leave(place)
 
     @staticmethod
+    def lowered_think_budget(budget: int, max_new, forced: int = 1) -> tuple[int, int | None]:
+        """-> (budget, soft) for a request whose output limit is `max_new` (None or 0: none): `forced` tokens of the
+        close count toward that limit (</think>: 1; Inkling 2's segment end, message opening and text segment: 3).  A
+        limit of THINK_TINY_LIMIT or less lowers the budget (a side request such as a title must still get an answer:
+        a reserve is kept for it); a larger one is the client's cap on the whole output and leaves it.  Otherwise
+        `soft` is the budget at which the reasoning is closed at its next sentence or line end, and `budget` the hard
+        one THINK_GRACE tokens later (at most half the room the limit leaves after it; no room: no soft, #613)."""
+        if max_new and int(max_new) <= THINK_TINY_LIMIT:
+            reserve_floor = max(0, int(os.environ.get("MAYA_GLM_THINK_RESERVE", "1024") or 1024))
+            reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
+            return max(1, min(budget, int(max_new) - reserve - forced)), None
+        room = (int(max_new) - budget - forced) // 2 if max_new else THINK_GRACE
+        grace = max(0, min(THINK_GRACE, room))
+        return (budget + grace, budget) if grace > 0 else (budget, None)
+
+    @staticmethod
     def _resumed_sampling(sampling, produced):
         """The sampling for an engine call that goes on after `produced`: the thinking budget counts from where it got
         to (and is gone once the thinking was closed)."""
@@ -4765,6 +4843,7 @@ class Service:
         of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
         engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
+        starts0 = (sampling or {}).get("_starts")       # (the answer's opening, Service.prepare: its first call's)
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
         # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
@@ -4775,6 +4854,8 @@ class Service:
         tail_text = ""
         while True:
             last0 = getattr(self.engine, "last", None)
+            if produced and starts0:   # (a later call - a fair slice, a restart - goes on after the opening)
+                smp = {**(smp or {}), "_starts": openings_left(starts0, produced)}
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
             gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, n_call, smp_call, cancel)
@@ -5034,6 +5115,10 @@ class Service:
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
                 budgeted = in_think and self.think_budget > 0   # (0 = no budget: the end token is still tracked)
+                # Inkling 2 (no think tags): the server closes a thinking segment itself (_sliced: think_close_ids)
+                ink_think = bool(thinking) and bool(self.think_close_ids) and self.think_budget > 0 and \
+                    (getattr(self.engine, "info", None) or {}).get("think") == 1
+                budgeted = budgeted or ink_think
                 # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
                 # side request such as a title, which must still get an answer: a reserve is kept for it (a quarter,
@@ -5050,18 +5135,23 @@ class Service:
                 if top > think_budget > 0 and max_new and self.asked_max(sampling):
                     think_budget = min(top, max(think_budget, int(max_new) - THINK_LONG_RESERVE))
                 soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
-                if budgeted and max_new and int(max_new) <= THINK_TINY_LIMIT:
-                    reserve_floor = max(0, int(os.environ.get("MAYA_GLM_THINK_RESERVE", "1024") or 1024))
-                    reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
-                    think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
-                elif budgeted:
-                    # the engine's own close THINK_GRACE tokens later (at most half the room max_tokens leaves after
-                    # the budget); the reasoning ends at its first sentence or line end past the budget (#613)
-                    room = (int(max_new) - think_budget - 1) // 2 if max_new else THINK_GRACE
-                    grace = max(0, min(THINK_GRACE, room))
-                    if grace > 0:
-                        soft, think_budget = think_budget, think_budget + grace
                 if budgeted:
+                    # Inkling: the forced close is its segment's end, the next message's opening and the text segment
+                    think_budget, soft = self.lowered_think_budget(
+                        think_budget, max_new, len(self.think_close_ids) + 1 if ink_think else 1)
+                if ink_think:
+                    # (the engine closes the segment in its decode, GEN's think_*: StrataEngine.sampling_keys; the
+                    #  forced tokens are the segment's end and the next message's opening, then its pick among `after`:
+                    #  its text segment, or a call to one of the request's tools)
+                    after = (sampling or {}).get("_think_after") or [[self.think_text_id]]
+                    stops = getattr(self, "_think_stops", None)
+                    if stops is None:
+                        stops = self._think_stops = think_stop_tables(self.tok)
+                    sampling = {**{k: v for k, v in (sampling or {}).items() if k != "_think_after"},
+                                "_think_ink": {"soft": soft if soft is not None else think_budget, "hard": think_budget,
+                                               "open": self.think_open_id, "end": self.think_close_ids[0],
+                                               "after": [[self.think_close_ids[1], *q] for q in after], "stops": stops}}
+                elif budgeted:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
                     if soft is not None:
                         sampling["_think_soft"] = soft
@@ -5670,12 +5760,13 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                                         for c in calls]})
         messages += [{"role": "tool", "tool_call_id": c.id, "content": r} for c, r in zip(calls, results)]
         # a required tool call applies to the first answer only: after the tools ran, the model answers freely
-        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked")}
-        sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
+        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked", "_starts")}
+        sampling = {k: v for k, v in (sampling or {}).items() if k not in ("_prefill", "_starts")}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
         sampling["_blocked"] = kw.get("_blocked")
         sampling["_think_resume"] = kw.get("_think_resume")
         sampling["_think_max"] = kw.get("_think_max")          # (GLM-5.3: Max's long budget, Service.asked_max)
+        sampling["_think_after"] = kw.get("_think_after")      # (Inkling 2: what may follow a closed thinking)
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -6482,9 +6573,10 @@ def make_handler(svc: Service):
             max_new = int(oreq.get("max_tokens") or 0)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
             if kw.get("_prefill"):
-                oreq = {**oreq, "_prefill": kw["_prefill"]}
+                oreq = {**oreq, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume"),
-                    "_think_max": kw.get("_think_max")}         # (GLM-5.3: Max's long budget, Service.asked_max)
+                    "_think_max": kw.get("_think_max"),         # (GLM-5.3: Max's long budget, Service.asked_max)
+                    "_think_after": kw.get("_think_after")}      # (Inkling 2: what may follow a closed thinking)
             cancel = threading.Event()
             watch_client(self, cancel)
             chunks = openai_chunks(svc, oreq, ids, thinking, tools, max_new, cancel)
@@ -7352,9 +7444,11 @@ def make_handler(svc: Service):
                                                      guard=svc._loop_guard_on(sampling))
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
+                    sampling["_starts"] = kw.get("_starts")
                 sampling["_blocked"] = kw.get("_blocked")
                 sampling["_think_resume"] = kw.get("_think_resume")
                 sampling["_think_max"] = kw.get("_think_max")          # (GLM-5.3: Max's long budget, Service.asked_max)
+                sampling["_think_after"] = kw.get("_think_after")      # (Inkling 2: what may follow a closed thinking)
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
                 config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
                 run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
@@ -7389,10 +7483,11 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             turn_mark("prepared")
             if kw.get("_prefill"):                             # a required tool call starts the answer
-                req = {**req, "_prefill": kw["_prefill"]}
+                req = {**req, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
+            req = {**req, "_think_after": kw.get("_think_after")}      # (Inkling 2: what may follow a closed thinking)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -7487,10 +7582,11 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
-                req = {**req, "_prefill": kw["_prefill"]}
+                req = {**req, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
+            req = {**req, "_think_after": kw.get("_think_after")}      # (Inkling 2: what may follow a closed thinking)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             watch_client(self, cancel)
@@ -8231,7 +8327,7 @@ def main() -> int:
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
     svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
-                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.think_end_id is not None else 0
+                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.has_think_budget else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
     # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)

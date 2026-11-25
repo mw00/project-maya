@@ -956,7 +956,7 @@ console.log(JSON.stringify(out));""")
                                        "ram_fetch,disk,promo"])                   # (the other engines': unchanged)
 
     def test_ik2_its_levels_its_own_settings_its_name_and_its_monitor(self):
-        # Inkling 2 Mini ("inkling-2-mini", maya-ik2, an experimental preview): its template's effort levels by name -
+        # Inkling 2 Mini ("inkling-2-mini", maya-ik2): its template's effort levels by name -
         # Off, Low, Medium, High (its default: 0.9), Max - chat settings of its own; a level of another model's goes to
         # the nearest it has; its name from its id; no maker's mark in lobe-icons (the page's chip); the Monitor: no
         # tiers card (maya-ik2 writes no STAT lines) and the other engines' sets as they were

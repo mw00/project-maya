@@ -453,5 +453,29 @@ class Download(unittest.TestCase):
         self.assertIn("about 176 GB of VRAM and RAM together", maya.g53_memory_note(quant="GLM-5.3-Maya-XS"))
 
 
+class DraftingLine(unittest.TestCase):
+    """The setup's drafting line says what the engine does (glm_mtp.cu mtp_decode_wanted): off on one discrete GPU."""
+    G = ("download", "GLM-5.3-Maya-XS")
+
+    def test_one_gpu_is_off(self):
+        line = maya.g53_drafting_line({"backend": "cuda", "gpus": [{"vram_gb": 32}]}, self.G, "mtp")
+        self.assertIn("drafting: off on this PC", line)
+        self.assertNotIn("the MTP block:", line)
+
+    def test_two_gpus_draft(self):
+        pc = {"backend": "cuda", "gpus": [{"vram_gb": 32}, {"vram_gb": 32}]}
+        self.assertEqual(maya.g53_drafting_line(pc, self.G, "mtp"), "drafting: the MTP block")
+
+    def test_dflash2_and_metal_unchanged(self):
+        self.assertIn("DFlash2", maya.g53_drafting_line({"backend": "cuda", "gpus": [{}]}, self.G, "dflash2"))
+        self.assertEqual(maya.g53_drafting_line({"backend": "metal", "gpus": [{}]}, self.G, "mtp"),
+                         "drafting: the MTP block")
+
+    def test_apu_says_it_is_measured(self):
+        with patch.object(maya, "hip_unified_memory", return_value=True):
+            line = maya.g53_drafting_line({"backend": "hip", "gpus": [{}]}, self.G, "mtp")
+        self.assertIn("speed calibration", line)
+
+
 if __name__ == "__main__":
     unittest.main()

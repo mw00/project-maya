@@ -1584,6 +1584,39 @@ class LiveRate(unittest.TestCase):
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
 
+    def test_ik2_chunk_path_lines_reach_the_page(self):
+        """maya-ik2's prompt read in chunks (resident, offload, 2 GPUs, drafting) prints `PP read total ms tok/s reused`
+        per chunk with a cached prefix, then DONE: the Monitor's live bar and prompt speed come from these.  The
+        engine source prints PP on every serve prompt path (the chunk path printed none: no bar, no prompt speed)."""
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO())
+        engine.lines = queue.Queue()
+        engine.can_stop = False
+        engine.max_context = 262144
+        for ln in ("PP 6144 10000 2000 1024.0 4096", "PP 10000 10000 3800 1500.0 4096",
+                   "DONE 5 10000 3800 50 stop 0 0 4096"):
+            engine.lines.put(ln)
+        gen = engine.generate([1], 5, {}, threading.Event())
+        self.assertIsNone(next(gen))
+        self.assertEqual(engine.progress, (6144, 10000, 4096, 2000.0))
+        self.svc.engine = engine
+        self.svc.status.update(busy=True)
+        self.svc.latest_request = RequestStat()
+        live = self.metrics()["live"]
+        self.assertEqual((live["state"], live["prompt_read"], live["prompt_total"], live["prompt_reused"],
+                          live["prefill_tok_s_mean"]), ("reading", 6144, 10000, 4096, 1024.0))
+        self.assertIsNone(next(gen))
+        self.assertEqual(list(gen), [])
+        t = request_timings(10000, 5, engine.last)
+        self.assertEqual((t["cache_n"], t["prompt_n"], t["prompt_per_second"]), (4096, 5904, 1553.7))
+        self.svc.status["busy"] = False
+        src = (ROOT / "src/ik2/ik2_main.cu").read_text(encoding="utf-8")
+        body = src[src.index("const int cached = (int) L;"):src.index("if (cancelled) {", src.index("const int cached = (int) L;"))]
+        self.assertEqual(body.count('std::printf("PP '), 2)       # the layer-major pass and the chunk loop
+
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
 

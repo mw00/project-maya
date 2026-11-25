@@ -37,6 +37,14 @@ jobs:
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/glm_memory_test.cpp -o "$RUNNER_TEMP/glm_memory_test"
           "$RUNNER_TEMP/glm_memory_test"
+      - name: GLM MAYA_GLM_NO_REUSE boolean switch parsing (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -Iinclude -Itests/glm_dsa tests/glm_dsa/glm_no_reuse_test.cpp -o "$RUNNER_TEMP/glm_no_reuse_test"
+          "$RUNNER_TEMP/glm_no_reuse_test"
+      - name: GLM multi-NUMA startup diagnostics (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -Iinclude tests/glm_dsa/glm_numa_diag_test.cpp -o "$RUNNER_TEMP/glm_numa_diag_test"
+          "$RUNNER_TEMP/glm_numa_diag_test"
       - name: DeepSeek CPU row preparation (CPU only)
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/ds4_cpu_prepare_rows_test.cpp -o "$RUNNER_TEMP/ds4_cpu_prepare_rows_test"
@@ -44,6 +52,16 @@ jobs:
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -DDS4_CPU_PREPARE_STUB_TEST=1 tests/ds4_cpu_prepare_rows_test.cpp src/ds4/ds4_iq_cpu.cpp -o "$RUNNER_TEMP/ds4_cpu_prepare_stub_test"
           "$RUNNER_TEMP/ds4_cpu_prepare_stub_test"
       - name: Server tests
-        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
+        # a hang prints every thread's stack (faulthandler, after 10 minutes, repeated) and ends the
+        # step at 14 minutes instead of the job's 20 with nothing to read
+        timeout-minutes: 14
+        run: |
+          cat > "$RUNNER_TEMP/run_server_tests.py" <<'PYEOF'
+          import faulthandler, sys, unittest
+          faulthandler.dump_traceback_later(600, repeat=True, file=sys.stderr)
+          unittest.main(module=None, argv=["x", "discover", "-s", "serve", "-p", "test_*.py", "-t", ".", "-v"])
+          PYEOF
+          "$RUNNER_TEMP/venv/bin/python" -X faulthandler "$RUNNER_TEMP/run_server_tests.py" 2>&1 | tee "$RUNNER_TEMP/server-tests.log" | grep -vE "^\[maya\]" | cut -c1-300
+          exit "${PIPESTATUS[0]}"
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'

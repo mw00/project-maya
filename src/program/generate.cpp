@@ -58,6 +58,7 @@
 #include "maya/core/vram_mark.hpp"
 #include "maya/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
 #include "maya/core/glm_prompt_cache.hpp"   // glm-dsa B14.14
+#include "maya/core/glm_env.hpp"
 #include "maya/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "maya/program/logits_selection.hpp"
 #include "maya/program/conv_cache.hpp"
@@ -1397,7 +1398,8 @@ static int glm_pack_generate(const Options& o) {
     uint64_t slot_clock = 0, slot_seq = 0;
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
     const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
-    int slot_max = model.fast() && getenv("MAYA_GLM_NO_REUSE") == nullptr ? (int) env_num("MAYA_GLM_SLOTS", 4) : 0;
+    const bool no_reuse = maya::glmenv::no_reuse_env();
+    int slot_max = model.fast() && !no_reuse ? (int) env_num("MAYA_GLM_SLOTS", 4) : 0;
     if (slot_max > 0 && maya::core::glmpc::engine_on(model)) slot_max = 0;   // glm-dsa B14.14: the prompt cache replaces the slots
     const size_t slot_min = (size_t) std::max(1.0, env_num("MAYA_GLM_SLOT_MIN", 1024));
     const uint64_t slot_budget = (uint64_t) (env_num("MAYA_GLM_SLOT_GB", 16) * 1073741824.0);
@@ -1727,7 +1729,7 @@ static int glm_pack_generate(const Options& o) {
     int ckpt_base = 0;         // the bound context's first checkpoint slot in the model (0 with one conversation)
     const bool multi_ckpts = model.seq_count() > 1 && env_num("MAYA_GLM_MULTI_CKPTS", 0) != 0;
     const int ckpt_max = [&] {
-        if (!model.fast() || getenv("MAYA_GLM_NO_REUSE") != nullptr) return 0;
+        if (!model.fast() || no_reuse) return 0;
         const int want = std::max(0, std::min(16, (int) env_num("MAYA_GLM_CKPTS", 4)));
         if (model.seq_count() <= 1) return want;
         if (!multi_ckpts) return 0;
@@ -1883,7 +1885,7 @@ static int glm_pack_generate(const Options& o) {
         const bool abl_flip = model.ablate_loaded() && abl_want != model.ablating();
         const bool snap_ok = !abl_flip && model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
                              std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
-                             img_hash(snap_tokens.size()) == snap_img_hash && getenv("MAYA_GLM_NO_REUSE") == nullptr;
+                             img_hash(snap_tokens.size()) == snap_img_hash && !no_reuse;
         // the longest checkpoint this prompt starts with (it holds less than the snapshot when both match)
         int ck = -1;
         if (ckpt_max > 0 && cur_img_pos.empty() && !abl_flip)
@@ -2229,7 +2231,7 @@ static int glm_pack_generate(const Options& o) {
     // Text only, and only when the state stands exactly there (the decode paths leave pos = fed tokens).
     const auto pause_snapshot = [&](const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted,
                                     bool keep) {
-        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && getenv("MAYA_GLM_NO_REUSE") == nullptr) {
+        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && !no_reuse) {
             const int64_t p = model.position();
             const int64_t full = (int64_t) (prompt.size() + emitted.size());
             if (keep && slot_max > 0 && p > (int64_t) prompt.size() && p < full) {

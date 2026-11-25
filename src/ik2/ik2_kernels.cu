@@ -8436,4 +8436,34 @@ void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, 
 }
 bool experts_block_exact() { return experts_mma_split(true) == 8 && experts_mma_split(false) == 4; }
 
+// ---- refusal ablation (--ablate, docs/SETTINGS.md): a residual write y [T][C] - a short conv's output, the residual
+// not yet added - loses its component along the unit direction r, then the residual joins it:
+//     y <- res + (y - scale * r (r . y))        (res null: y alone), in place, a block a row
+// The dot is a fixed tree over the row (256 threads, each its strided partial, summed in shared memory in a fixed
+// order), so a row comes out the same bits whatever T the launch holds and whichever path launched it - the token
+// path, a verify window, a prompt chunk and a --parallel step all call this with the same row.
+__global__ void __launch_bounds__(kBlk) project_res_kernel(float* __restrict__ y, const float* __restrict__ r,
+                                                           float scale, const float* __restrict__ res, int C) {
+    __shared__ float sh[kBlk];
+    const size_t o = (size_t) blockIdx.x * (size_t) C;
+    float dot = 0.0f;
+    for (int e = threadIdx.x; e < C; e += kBlk) dot = fmaf(r[e], y[o + e], dot);
+    sh[threadIdx.x] = dot;
+    __syncthreads();
+    for (int h = kBlk / 2; h > 0; h >>= 1) {
+        if ((int) threadIdx.x < h) sh[threadIdx.x] += sh[threadIdx.x + h];
+        __syncthreads();
+    }
+    const float a = scale * sh[0];
+    for (int e = threadIdx.x; e < C; e += kBlk) {
+        const float v = y[o + e] - a * r[e];
+        y[o + e] = res != nullptr ? res[o + e] + v : v;
+    }
+}
+void project_res(float* y, const float* r, float scale, const float* res, int T, int C, cudaStream_t s) {
+    if (T <= 0) return;
+    project_res_kernel<<<(unsigned) T, kBlk, 0, s>>>(y, r, scale, res, C);
+    check("project_res");
+}
+
 }  // namespace ik2::k

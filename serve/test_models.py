@@ -317,7 +317,7 @@ class Settings(unittest.TestCase):
 
     def ik2_cfg(self, **extra) -> Path:
         """Inkling-2-Mini as the setup writes it (maya.write_config_ik2): its GGUF in the model's folder, the tokenizer
-        folder beside it (no drafter in the preview)."""
+        folder beside it (no drafter for it)."""
         d = self.d / "models" / "Inkling-2-Mini"
         (d / "maya-ik2" / "tokenizer").mkdir(parents=True, exist_ok=True)
         (d / "Inkling-2-Mini-UD-Q4_K_XL.gguf").write_bytes(b"x" * 1000)
@@ -1566,6 +1566,30 @@ class Ablate(unittest.TestCase):
         self.assertFalse(M.choices(cfg)["ablate"]["available"])
         self.assertEqual(M.choices(cfg)["ablate"]["why"], "not available for this model")
         self.assertNotIn("--ablate", M.ablate_args(cfg, list(cfg["args"])))
+
+    def test_ik2_loads_it(self):
+        """Inkling-2-Mini (maya-ik2): the switch with its direction file, loaded off by default, as the other engines."""
+        d = self.d / "models" / "Inkling-2-Mini"
+        (d / "maya-ik2" / "tokenizer").mkdir(parents=True)
+        (d / "Inkling-2-Mini-UD-Q4_K_XL.gguf").write_bytes(b"x" * 1000)
+        cfg = {"exe": "/b/maya-ik2", "args": ["--model", str(d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"), "--max-context", "262144"],
+               "tokenizer": str(d / "maya-ik2" / "tokenizer"), "model_name": "inkling-2-mini", "gpu": [0],
+               "env": {"IK2_KV": "fp8"}, "installer": {"family": "ik2", "ik2_quant": "ud-q4_k_xl"}}
+        self.assertFalse(M.choices(cfg)["ablate"]["available"])
+        self.assertIn("no refusal direction", M.choices(cfg)["ablate"]["why"])
+        f = self.d / ("Inkling-2-Mini" + M.ABLATE_SUFFIX)
+        f.write_bytes(b"GGUF")
+        cfg["ablate"] = {"file": str(f), "model": "Inkling-2-Mini"}
+        self.assertTrue(M.choices(cfg)["ablate"]["available"])
+        cfg["args"] = M.ablate_args(cfg, list(cfg["args"]))
+        self.assertEqual(M.flag(cfg["args"], "--ablate"), str(f))
+        self.assertEqual(M.flag(cfg["args"], "--ablate-default"), "off")
+        self.assertEqual(M.flag(cfg["args"], "--model"), str(d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"))
+        on = M.apply(cfg, {"ablate": True})
+        self.assertTrue(on["ablate"]["default"])
+        self.assertTrue(M.settings_of(on)["ablate"])
+        self.assertEqual(M.flag(on["args"], "--ablate-default"), "off")   # (the engine's flag stays: each request asks)
+        self.assertFalse(M.settings_of(M.apply(on, {"ablate": False}))["ablate"])
 
     def test_qwen_greyed_out(self):
         cfg = M.read(glm_cfg(self.d))

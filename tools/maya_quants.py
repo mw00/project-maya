@@ -18,7 +18,7 @@ from pathlib import Path
 
 FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
-# ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini, an experimental preview; the 594B
+# ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini; the 594B
 #  Inkling-2-Small runs by hand, docs/INKLING2.md)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
          "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
@@ -50,7 +50,7 @@ MODEL_DEFAULTS = {
     # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (no
     # generation_config.json), so plain sampling - temperature 1.0, top_p 1.0; "auto" its template's own effort (0.9)
     "ik2": ({"temperature": 1.0, "top_p": 1.0}, "auto"),
-    # Inkling-2-Mini (the setup's Inkling 2, an experimental preview; model_key "ik2-mini"), its author's values (PR
+    # Inkling-2-Mini (the setup's Inkling 2; model_key "ik2-mini"), its author's values (PR
     # #1095): thinkingmachines/Inkling-2-Mini's generation_config.json - temperature 1.0, top_p 1.0, no top-k, no
     # penalties; the level its template's own default, 0.9 - "high" by name (the page offers none / low / medium /
     # high / max: its xhigh is max's 0.99, and the server reads a client's "minimal" as off, as for every model)
@@ -238,7 +238,7 @@ QWEN_UD_IDS = ("qwen-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2_xs", "qwen3.8-ud-iq2
 # Hy4-flash: AngelSlim's Q4_K_M GGUF (two shards) - the setup ids it is asked for by (the first: the Models page's).
 # "hy4-flash" and "hy4" alone are the model: its files are then asked (Maya's quants and this one), or --hy4-quant
 HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
-# Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL, its one file set - the setup ids it is asked
+# Inkling-2-Mini (maya-ik2): unsloth's UD-Q4_K_XL, its one file set - the setup ids it is asked
 # for by (the first: the Models page's)
 IK2_IDS = ("inkling-2-mini", "inkling-2-mini-ud-q4_k_xl", "inkling2-mini", "ik2-mini")
 IK2_QUANT = "ud-q4_k_xl"

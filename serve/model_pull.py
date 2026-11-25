@@ -36,7 +36,7 @@ GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
 # (Qwen3.8-Flash-Next itself: unsloth's UD-IQ2_XS only - its other UD quants run on the same code but are not listed;
 #  the setup id: maya_quants.QWEN_UD_IDS[0])
 QWEN_OTHER = (("qwen-ud-iq2_xs", "qwen", "ud-iq2_xs", "unsloth"),)
-# (Inkling-2-Mini on maya-ik2, an experimental preview: unsloth's UD-Q4_K_XL - the setup id: maya_quants.IK2_IDS[0])
+# (Inkling-2-Mini on maya-ik2: unsloth's UD-Q4_K_XL - the setup id: maya_quants.IK2_IDS[0])
 IK2_OTHER = ((Q.IK2_IDS[0], "ik2", Q.IK2_QUANT, "unsloth"),)
 OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [("minimax-exl3", "minimax", "exl3", "Mia-AiLab")] +
               [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER) + list(IK2_OTHER))
@@ -67,7 +67,7 @@ def _note(fam: str, key: str, backend: str) -> str:
     if key in GATED:
         out.append("gated repo: needs your Hugging Face token (HF_TOKEN or `hf auth login`)")
     if fam == "ik2":
-        out.append("experimental preview: one NVIDIA GPU with 24 GB or more, Linux; text only")
+        out.append("text only; an NVIDIA GPU of 8 GB or more (Linux or Windows) or an AMD one of 12 GB or more (Linux)")
     return "; ".join(out)
 
 

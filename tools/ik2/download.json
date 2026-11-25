@@ -1,5 +1,5 @@
 {
- "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8), an experimental preview: unsloth's UD-Q4_K_XL GGUF at the repo's top - Unsloth's looped layout (general.architecture inkling2: inkling2.num_loops, inkling2.loop.core_start), which maya-ik2 reads; the files in Mainline_Support/ (inkling2_loop, llama.cpp master's) are not offered. Experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. The drafter: \"drafter\" below (the model's own, from Maya's repo; drafting auto by default). The file pinned by revision, size and sha256: the setup checks them.",
+ "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8): unsloth's UD-Q4_K_XL GGUF at the repo's top - Unsloth's looped layout (general.architecture inkling2: inkling2.num_loops, inkling2.loop.core_start), which maya-ik2 reads; the files in Mainline_Support/ (inkling2_loop, llama.cpp master's) are not offered. Experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. The drafter: \"drafter\" below (the model's own, from Maya's repo; drafting auto by default). The file pinned by revision, size and sha256: the setup checks them.",
  "name": "Inkling-2-Mini-UD-Q4_K_XL",
  "repo": "unsloth/Inkling-2-Mini-GGUF",
  "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",
@@ -33,5 +33,14 @@
   },
   "default": "dspark-Inkling-2-Mini-Q8_0.gguf",
   "amd": "dspark-Inkling-2-Mini-Q8_0.gguf"
+ },
+ "ablate": {
+  "_": "Refusal ablation: the model's direction file (a control vector, tools/ablate_fit.py) from Maya's own repo, folder refusal-directions/. Pinned by revision and sha256 (maya.ablate_pin).",
+  "repo": "peasantsmith/Inkling-2-Mini-Maya-GGUF",
+  "revision": "435f1723e836f0acd6400b041ec76fd453d6b7dd",
+  "folder": "refusal-directions",
+  "files": {
+   "Inkling-2-Mini-refusal-direction.gguf": [9760, "0b953fc37e8490a95b2af9e11ff11ad5b33f8a873c3a49f328f19ebe047b129f"]
+  }
  }
 }

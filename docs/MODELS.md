@@ -9,7 +9,7 @@ special about it. Back to the [README](../README.md).
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Hy4-Flash](#hy4-flash)
-- [Inkling-2-Mini (experimental preview)](#inkling-2-mini-experimental-preview)
+- [Inkling-2-Mini](#inkling-2-mini)
 - [Inkling-2-Small (by hand, for now)](#inkling-2-small-by-hand-for-now)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
@@ -296,11 +296,11 @@ Other GGUF sets of the model are not offered by the setup; `tools/hy4/pack_gguf.
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
 
-## Inkling-2-Mini (experimental preview)
+## Inkling-2-Mini
 
 **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (thinkingmachines; 26 B, a looped model:
 layers 6-17 run three times, 8 of 128 experts a token; Apache 2.0) runs on its own engine, `maya-ik2`, from unsloth's
-GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-mini`, or the Models page's list.
+GGUF as it is: `maya.py --setup --model inkling-2-mini`, or the Models page's list.
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
@@ -321,6 +321,10 @@ GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-m
 - **Pictures:** on by default - the setup fetches the model's vision tower (`mmproj-Inkling-2-Mini-BF16.gguf`, 0.6 GB, from Maya's repo - unsloth's file byte for byte, a copy you already have is kept; `--no-vision` skips it) and builds Maya's image encoder; the encoder starts only when a picture arrives
   (on the GPU where its free VRAM holds it, else on the CPU), so the context's fit is the same. Images on the Models
   page turns them off and on.
+- **Refusal ablation:** as on the other models - the setup fetches the model's direction file from Maya's repo
+  (`Inkling-2-Mini-refusal-direction.gguf`, a few KB, `refusal-directions/`; `--ablation off` skips it), loaded and off
+  by default; the Models page's **Refusal ablation** switch and a request's `"ablate": true` turn it on
+  ([docs/SETTINGS.md](SETTINGS.md#refusal-ablation-per-request-ablate)). Drafting stays exact with it on.
 - One request at a time for now.
 
 ## Inkling-2-Small (by hand, for now)

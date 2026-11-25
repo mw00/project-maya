@@ -230,7 +230,7 @@ Hy4-Flash also sets up on an AMD GPU under Windows - a Strix Halo / Gorgon Halo,
 
 **If it does not work.** A start that stops, an answer that never comes (the engine waiting with the GPU idle) or answers that look wrong: please open an issue with your GPU, Windows version, the setup's output and the engine's log from the start (its first line says the platform is experimental), and, if it stops or hangs, whether it runs with `"GPU_FLUSH_ON_EXECUTION": "1"` in the config's `"env"` (AMD's runtime then sends the GPU its work at once - slower, but it tells us where to look). Meanwhile: turn drafting off (`--drafting off` at the setup), or run Hy4-Flash on Linux on the same PC (see above), or pick another model - GLM-5.3-Flash and DeepSeek-V4.1-Flash have been run on AMD under Windows.
 
-### Inkling-2-Mini (experimental preview)
+### Inkling-2-Mini
 
 `./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) runs on an RDNA 3 / 3.5 / 4
 GPU (gfx11 / gfx12) with 12 GB of VRAM or more - under 24 GB the experts the card does not hold stay in RAM (about 9 GB

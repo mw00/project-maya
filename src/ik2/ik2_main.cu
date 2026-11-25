@@ -31,6 +31,8 @@
 #include "maya/artifact/gguf_reader.hpp"
 #include "maya/spec/suffix_drafter.hpp"
 #include "../ds4/ds4_watchdog.hpp"   // (--serve's heartbeat rule, maya-ds4's)
+#include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: tools/ablate_fit.py's read-out)
+#include "../mm3/mm3_ablate.hpp"   // (--ablate's direction file: the control vector's loader)
 #ifdef MAYA_USE_HIP
 #include "ds4_lt.hpp"   // (AMD: the prompt's FP16 GEMMs on hipBLASLt, the kernel a shape measured and kept)
 #endif
@@ -97,6 +99,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -1306,6 +1309,59 @@ void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, in
     CU(cudaMemcpyAsync(Ly.rec_x[which], x, (size_t) T * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
 }
 
+// ---- refusal ablation (--ablate FILE, docs/SETTINGS.md "Refusal ablation per request"): a unit direction r [C]
+// projected out of every residual write of every layer VISIT - the attention's (the short conv's output, before it
+// joins the stream or starts a block) and the MoE's - y <- y - scale * r (r . y), so a looped core's three passes each
+// project their own writes.  Per conversation (GEN ablate=0|1; a --parallel slot each): a conversation that does not
+// ask runs the launches it always did.  The drafter only proposes, the main layers check every draft.
+int g_slot_cur = 0;   // (--parallel: the conversation bound to the visits)
+int g_cur = -1;       // (the GPU in use: use_dev)
+namespace abl {
+constexpr int kSlots = 16;
+bool loaded = false;                 // a direction is loaded (INFO ablate=1)
+bool on[kSlots] = {};                // per conversation slot: its forwards project it out
+bool dflt = true;                    // --ablate-default (the server starts the engine with off)
+float scale = 1.0f;
+std::vector<float> dir;
+std::vector<float*> dev;             // a copy on each GPU
+std::string what;
+std::string path;                    // --ablate FILE (empty: none)
+int layer = 0;                       // --ablate-layer N (0: the file's only direction)
+float want_scale = 0.0f;             // --ablate-scale F (0: the file's)
+inline bool cur() { return loaded && on[g_slot_cur]; }
+inline bool row(int slot) { return loaded && slot >= 0 && slot < kSlots && on[slot]; }
+}  // namespace abl
+inline const float* abl_r() { return abl::dev.empty() ? nullptr : abl::dev[(size_t) std::max(0, g_cur)]; }
+// y [T][C] is a residual write (the conv's output, res not added): project it (or, in a fitting run, read it out and
+// add res alone - the plain model's answer), then add res (null: none).  In place.
+void abl_write(float* y, const float* res, int T, int C, bool ablating = true) {
+    if (!ablating) {
+        if (res != nullptr) k::project_res(y, abl_r(), 0.0f, res, T, C, g_s);
+        return;
+    }
+    if (maya::ablcap::on()) {
+        maya::ablcap::put(y, T, C, g_s);
+        k::project_res(y, abl_r(), 0.0f, res, T, C, g_s);
+        return;
+    }
+    k::project_res(y, abl_r(), abl::scale, res, T, C, g_s);
+}
+// the short conv with its residual (res null: none) into out [T][C]; ablating: the conv alone, projected, then the
+// residual added (the fused kernel's sum split in two where the write must be seen)
+void conv_write(const float* x, float* hist, const float* w, int T, int C, const float* res, float* out) {
+    if (!abl::cur()) {
+        k::conv4_res(x, hist, w, nullptr, 0, T, C, res, out, g_s);
+        return;
+    }
+    k::conv4_res(x, hist, w, nullptr, 0, T, C, nullptr, out, g_s);
+    abl_write(out, res, T, C);
+}
+// one token's MoE write: the combine and the conv after it (W.y32 -> W.h, the stream W.r added), `ablating` as above
+void combine_write(const Work& W, const Layer& Ly, int K, int C, bool ablating) {
+    k::moe_combine_conv(W.y32, W.inv, W.wt, K, C, Ly.h_mlp, Ly.sc_mlp, ablating ? nullptr : W.r, W.h, g_s);
+    if (ablating) abl_write(W.h, W.r, 1, C);
+}
+
 // The pictures of the request running (GENI): the image encoder's rows (maya-vision's SVE1 records, [n][C] F32), each
 // in place of one image token of the prompt - the model reads them as they are, without the embedding's norm.
 struct Pictures {
@@ -1381,7 +1437,6 @@ struct DevCtx {
     ExpertCache EC;
 };
 std::vector<DevCtx> g_dev;
-int g_cur = -1;
 Work& dev_work(int d) { return g_dev[d].W; }
 ExpertCache& dev_cache(int d) { return g_dev[d].EC; }
 void use_dev(int d) {
@@ -1836,9 +1891,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
-        k::conv4(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, r_out, g_s);
+        conv_write(W.tmp, Ly.h_attn, Ly.sc_attn, T, C, nullptr, r_out);
     } else {
-        k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
+        conv_write(W.tmp, Ly.h_attn, Ly.sc_attn, T, C, h_in, r_out);
     }
 }
 
@@ -2347,7 +2402,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     g_pf.lap(g_pf.experts);
     t_exp += now() - te0;
     conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-    k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
+    conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, r_in, h_out);
 }
 
 void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
@@ -2424,7 +2479,28 @@ struct FastGraph {
     cudaGraphExec_t exec = nullptr;
 };
 FastGraph g_fgraph[4];      // by OutMode
-int g_slot_cur = 0, g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits, the one g_fgraph holds)
+bool g_graph_full = false;  // the card has no device memory left for one more graph: no new ones, the launches go one by one
+// G's capture has ended: its graph instantiated.  False when the card has no device memory left for it (a graph's
+// executable holds device memory, and --parallel records one a set of conversations): then G stays empty, no graph is
+// recorded after it, and the caller launches its kernels itself - the same kernels, one by one
+bool graph_exec(FastGraph& G) {
+    size_t fr = 0, tot = 0;
+    const bool low = cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < ((size_t) 256 << 20);
+    if (!low) {
+        const cudaError_t e = cudaGraphInstantiate(&G.exec, G.graph, 0);
+        if (e == cudaSuccess) return true;
+        if (e != cudaErrorMemoryAllocation) CU(e);
+        (void) cudaGetLastError();
+    }
+    cudaGraphDestroy(G.graph);
+    G.graph = nullptr, G.exec = nullptr;
+    if (!g_graph_full)
+        std::fprintf(stderr, "maya-ik2: no device memory left for more CUDA graphs: the other steps run one by one\n");
+    g_graph_full = true;
+    return false;
+}
+int g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits (g_slot_cur above), the one g_fgraph holds)
+bool g_fgraph_abl = false, g_bgraph_abl = false;   // (--ablate: the projection the graphs were recorded with)
 
 // ---- two GPUs (--gpus 2, the split): GPU 0 runs the offload path (the dense weights, the K / V cache, every prompt,
 // its tier of the experts, the misses fetched from host memory); GPU 1 holds the next experts by the profile's picks a
@@ -2726,7 +2802,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         // stream joins the blocks and starts again)
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
-        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
+        const bool ab = abl::cur();   // (--ablate: the conv's output alone, projected, then the stream added)
+        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first || ab ? nullptr : W.h, W.r});
+        if (ab) abl_write(W.r, first ? nullptr : W.h, 1, C);
         if (first) ++nb;
         // the MoE: its input, the router and the picks' tables on the device, the experts
         {
@@ -2769,7 +2847,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                  c.up_cap, g_offs.hx, g_s);
                 k::off_down_x(W.blob, g_offs.cls, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], g_offs.hx, C, c.F, W.y32, g_s);
                 k::off_lane_wait(g_offs.ls, g_offs.done_d, C, W.y32, g_s);
-                k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+                combine_write(W, Ly, c.K, C, abl::cur());
                 continue;
             }
             k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
@@ -2786,7 +2864,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
         if (g_two.on) two_take(M, W);
-        k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+        combine_write(W, Ly, c.K, C, abl::cur());
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head
@@ -3372,22 +3450,23 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     kv_swing(M, false, pos);
-    if (g_graph && g_fgraph_slot != g_slot_cur) {   // (--parallel: the graphs hold a conversation's state pointers)
-        for (auto& G : g_fgraph)
+    if (g_graph && (g_fgraph_slot != g_slot_cur || g_fgraph_abl != abl::cur())) {   // (--parallel: the graphs hold a
+        for (auto& G : g_fgraph)                                  //  conversation's state pointers; --ablate: its launches)
             if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
-        g_fgraph_slot = g_slot_cur;
+        g_fgraph_slot = g_slot_cur, g_fgraph_abl = abl::cur();
     }
     if (!g_graph || g_kv_streaming) {   // (streamed visits: the copies follow the position - launched as they go)
         fast_token_launches(M, W, out_mode);
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
-        if (!G.exec) {   // the first token of this kind: its launches recorded
+        if (!G.exec && !g_graph_full) {   // the first token of this kind: its launches recorded
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_token_launches(M, W, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else fast_token_launches(M, W, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
     if (out_mode == OutMode::kArgmax) {
@@ -3751,8 +3830,10 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         if (ex) exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
         else tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
-        k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
+        bool ab = abl::cur();   // (--ablate: as the token path's - the conv alone, projected, the stream added)
+        k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first || ab ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
+        if (ab) abl_write(W.r, first ? nullptr : W.h, T, C);
         if (first) ++nb;
         // the MoE: its input, the router, the picks grouped by expert on the device, the experts
         {
@@ -3818,8 +3899,10 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
         //  tokens' picks - it took 9.4 us where the two take 7)
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
-        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
-                      g_s);
+        ab = abl::cur();   // (the MoE write, as the attention write above)
+        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, ab ? nullptr : W.r, C, W.h, C, Ly.rec_old[3],
+                      Ly.rec_x[3], g_s);
+        if (ab) abl_write(W.h, W.r, T, C);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits
@@ -3870,14 +3953,21 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     if (!g_graph || g_kv_streaming) {   // (the swing visit's rows move between RAM and VRAM: no recorded pointers)
         fast_block_launches(M, W, T, out_mode);
     } else {
+        if (g_bgraph_abl != abl::cur()) {   // (--ablate: the windows' graphs hold the launches of one setting)
+            for (auto& row : g_bgraph)
+                for (auto& G : row)
+                    if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
+            g_bgraph_abl = abl::cur();
+        }
         FastGraph& G = g_bgraph[T][(int) out_mode];
-        if (!G.exec) {
+        if (!G.exec && !g_graph_full) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_block_launches(M, W, T, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else fast_block_launches(M, W, T, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
     if (out_mode == OutMode::kArgmax) {
@@ -4171,9 +4261,12 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
-        for (int t = 0; t < T; ++t)
+        for (int t = 0; t < T; ++t) {
+            const bool ab = abl::row(sl[t]);   // (--ablate: this row's conversation asks)
             k::conv_block(W.tmp + (size_t) t * C, C, g_slots[sl[t]][vis].h_attn, Ly.sc_attn, nullptr, 0, 0, 1, C,
-                          first ? nullptr : W.h + (size_t) t * C, C, W.r + (size_t) t * C, C, nullptr, nullptr, g_s);
+                          first || ab ? nullptr : W.h + (size_t) t * C, C, W.r + (size_t) t * C, C, nullptr, nullptr, g_s);
+            if (ab) abl_write(W.r + (size_t) t * C, first ? nullptr : W.h + (size_t) t * C, 1, C);
+        }
         if (first) ++nb;
         // the MoE: its input and the router for all rows, then each row's experts as the one-token path's
         {
@@ -4209,8 +4302,10 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
                                           c.gate_cap, c.up_cap, W.h16, g_s);
                 k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             }
-            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, g_slots[sl[t]][vis].h_mlp, Ly.sc_mlp, W.r + (size_t) t * C,
-                                W.h + (size_t) t * C, g_s);
+            const bool ab = abl::row(sl[t]);
+            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, g_slots[sl[t]][vis].h_mlp, Ly.sc_mlp,
+                                ab ? nullptr : W.r + (size_t) t * C, W.h + (size_t) t * C, g_s);
+            if (ab) abl_write(W.h + (size_t) t * C, W.r + (size_t) t * C, 1, C);
         }
     }
     {   // the head: every row's argmax (on the raw logits, as the token path's), and with cand its candidates
@@ -4247,18 +4342,20 @@ void par_step(Model& M, int T, const int* tok, const int* pos, const int* sl, bo
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_parb.emb_h + (size_t) t * c.C);
         g_parb.pos_h[t] = pos[t];
         key |= 2 << sl[t];
+        if (abl::row(sl[t])) key |= 1 << (12 + sl[t]);   // (--ablate: the rows that project - their launches)
     }
     if (!g_graph) {
         par_launches(M, W, T, sl, cand);
     } else {
         FastGraph& G = g_pgraph[key];
-        if (!G.exec) {
+        if (!G.exec && !g_graph_full) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             par_launches(M, W, T, sl, cand);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else par_launches(M, W, T, sl, cand);
     }
     CU(cudaStreamSynchronize(g_s));
     for (int t = 0; t < T; ++t) am[t] = W.argmax_h[t];
@@ -4285,6 +4382,150 @@ bool par_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) {
 // ---- speculative decoding on the resident path: the drafter's tokens verified as one window (fast_block)
 
 void embed_row(Model& M, int t, float* raw, float* out);
+
+// GEN's starts=<ids>;<ids>;..: the answer opens with one of these token sequences - the server's required tool call
+// on Inkling's form (serve/server.py's Service.prepare), a call to any tool: its name comes first, so the prompt can
+// open only the model's message and the sequences are each tool's name and the call's segment.  While more than one
+// still matches, a token is the model's pick among the ones they go on with; with one left, its tokens follow
+// (`alive`: the sequences still matching, `sd`: the tokens of them written)
+struct Starts {
+    std::vector<std::vector<int>> seqs;
+    std::vector<int> alive;
+    int sd = 0;
+    void parse(const std::string& v, int vocab) {   // "1,2,3;4,5" (a sequence with a token outside 0..vocab-1 is dropped)
+        seqs.clear();
+        for (size_t a = 0; a <= v.size();) {
+            size_t b = v.find(';', a);
+            if (b == std::string::npos) b = v.size();
+            std::vector<int> q;
+            bool ok = true;
+            for (size_t x = a; x < b;) {
+                const long tk = std::strtol(v.c_str() + x, nullptr, 10);
+                if (tk < 0 || tk >= vocab) ok = false;
+                q.push_back((int) tk);
+                while (x < b && v[x] != ',') ++x;
+                ++x;
+            }
+            if (ok && !q.empty()) seqs.push_back(q);
+            a = b + 1;
+        }
+        alive.clear(), sd = 0;
+        for (int j = 0; j < (int) seqs.size(); ++j) alive.push_back(j);
+    }
+    bool on() const { return !alive.empty(); }
+    std::vector<int> opts() const {   // the tokens the matching sequences go on with
+        std::vector<int> o;
+        for (int j : alive)
+            if (std::find(o.begin(), o.end(), seqs[j][sd]) == o.end()) o.push_back(seqs[j][sd]);
+        return o;
+    }
+    void took(int t) {   // a token written: the sequences it matches; once one is whole, the answer goes on freely
+        if (alive.empty()) return;
+        std::vector<int> keep;
+        for (int j : alive)
+            if (seqs[j][sd] == t) keep.push_back(j);
+        alive.swap(keep), ++sd;
+        for (int j : alive)
+            if ((int) seqs[j].size() == sd) {
+                alive.clear();
+                break;
+            }
+    }
+};
+// GEN's think_open=<id> think_end=<id> think_soft=<n> think_hard=<n> think_stop=<ids> think_weak=<ids> think_dig=<ids>
+// think_after=<ids>;<ids>..: the thinking budget.  Inkling's reasoning is a segment (think_open, the model's
+// <|content_thinking|>, to think_end, its <|end_message|>), its tokens counted from the request's start: past
+// think_soft the first token that ends a sentence or line (think_stop; think_weak: a bare . ! ? that does not follow a
+// token ending in a digit or a dot, think_dig), at think_hard whatever the token, closes the segment IN THE DECODE - the
+// tokens that follow are forced through Starts: think_end, then one of think_after (the next message's opening: its
+// text segment, or a call to one of the request's tools - the model's pick among them) - and the thinking is closed
+// once (`done`).  The state is never cut: no stop and restart, which this engine could not take back past a
+// token or two.  A window of drafts is cut short of think_soft and single steps follow, so a close lands on its token.
+struct ThinkCut {
+    int open = -1, end = -1, soft = 0, hard = 0, prev = -1;
+    std::unordered_set<int> stop, weak, dig;
+    std::vector<std::vector<int>> after;
+    bool in = false, done = false;
+    int n = 0;
+    bool on() const { return soft > 0 && open >= 0 && end >= 0 && !after.empty() && !done; }
+    void parse_set(std::unordered_set<int>& o, const std::string& v, int vocab) {
+        o.clear();
+        for (size_t a = 0; a < v.size();) {
+            const long t = std::strtol(v.c_str() + a, nullptr, 10);
+            if (t >= 0 && t < vocab) o.insert((int) t);
+            const size_t b = v.find(',', a);
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+    }
+    // a token written (every one, in order): true when the segment must close now
+    bool saw(int t) {
+        if (!on()) return false;
+        const int before = prev;
+        prev = t;
+        if (!in) {
+            in = t == open;
+            return false;
+        }
+        if (t == end) {
+            in = false;
+            return false;
+        }
+        ++n;
+        if (n >= hard || (n >= soft && (stop.count(t) || (weak.count(t) && !dig.count(before))))) {
+            done = true, in = false;
+            return true;
+        }
+        return false;
+    }
+    // the room a window of drafts may take: none may carry the count to think_soft (a close lands on a single step)
+    int room(int r) const {
+        if (!on() || !in) return r;
+        return std::min(r, std::max(1, soft - n - 1));
+    }
+    void close(Starts& st) const {   // the forced close: think_end, then the next message's opening
+        st.seqs.clear(), st.alive.clear(), st.sd = 0;
+        for (const auto& a : after) {
+            std::vector<int> q{end};
+            q.insert(q.end(), a.begin(), a.end());
+            st.alive.push_back((int) st.seqs.size());
+            st.seqs.push_back(q);
+        }
+    }
+};
+// one GEN key of the thinking budget into tc: true when it is one
+inline bool think_key(ThinkCut& tc, const std::string& k, const std::string& v, int vocab) {
+    if (k == "think_open") tc.open = std::atoi(v.c_str());
+    else if (k == "think_end") tc.end = std::atoi(v.c_str());
+    else if (k == "think_soft") tc.soft = std::atoi(v.c_str());
+    else if (k == "think_hard") tc.hard = std::atoi(v.c_str());
+    else if (k == "think_stop") tc.parse_set(tc.stop, v, vocab);
+    else if (k == "think_weak") tc.parse_set(tc.weak, v, vocab);
+    else if (k == "think_dig") tc.parse_set(tc.dig, v, vocab);
+    else if (k == "think_after") {
+        Starts st;
+        st.parse(v, vocab);
+        tc.after = st.seqs;
+    } else return false;
+    if (tc.hard < tc.soft) tc.hard = tc.soft;
+    return true;
+}
+// the pick among opts o from (logit, token) candidates: greedy the largest (ties: the lower token), else `sample` of
+// them; a token missing from cd (outside the candidates a step keeps) is none of it, and with none there, o's first
+template <class F>
+int pick_among(const std::vector<int>& o, const std::vector<std::pair<float, int>>& cd, double temp, F sample) {
+    if (o.size() == 1) return o[0];
+    std::vector<std::pair<float, int>> in;
+    for (const auto& e : cd)
+        if (std::find(o.begin(), o.end(), e.second) != o.end()) in.push_back(e);
+    if (in.empty()) return o[0];
+    if (temp <= 0)
+        return std::min_element(in.begin(), in.end(),
+                                [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                                })->second;
+    return sample(in);
+}
 
 struct SampleCfg {   // temp <= 0: greedy
     double temp = 0, top_p = 1;
@@ -4922,7 +5163,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -5012,7 +5253,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -5078,7 +5319,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -5275,7 +5516,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -5566,7 +5807,7 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 
 }  // namespace
 
-// The Inkling 2 preview: Linux, one NVIDIA GPU of 24 GB, Ampere (sm_80) or newer.  Outside it the engine stops with one
+// Hardware check: what Inkling 2 is supported on is listed in docs/INKLING2.md.  Outside it the engine stops with one
 // line saying why; IK2_UNSUPPORTED=1 runs it anyway where it can run at all (two GPUs, smaller cards with the experts
 // streamed from RAM, Windows: untested).
 // Greedy decode on the resident path from `anchor` (chosen, not run yet) at position P until out holds gen tokens
@@ -5884,7 +6125,7 @@ int check_sampling() {
     return fails ? 1 : 0;
 }
 
-void check_preview(int n_gpu, bool serve) {
+void check_hardware(int n_gpu, bool serve) {
     auto refuse = [&](const std::string& m) {   // (--serve: the server prints a NOTE line)
         if (serve) std::printf("NOTE maya-ik2: %s\n", m.c_str()), std::fflush(stdout);
         die(m);
@@ -5892,7 +6133,7 @@ void check_preview(int n_gpu, bool serve) {
     const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
     const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
 #if defined(_WIN32) && defined(MAYA_USE_HIP)
-    if (!force) refuse("Inkling 2 on AMD runs on Linux only, Windows is outside it" + run_anyway);
+    if (!force) refuse("Inkling 2 on AMD is supported on Linux only, not on Windows" + run_anyway);
 #endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
@@ -5903,15 +6144,15 @@ void check_preview(int n_gpu, bool serve) {
 #endif
     if (e != cudaSuccess || nd < 1)
         refuse(std::string("no ") + vendor + " GPU visible (" + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
-            "): the Inkling 2 preview runs on one " + vendor + " GPU");
+            "): Inkling 2 needs one " + vendor + " GPU");
     if (n_gpu < 1 || n_gpu > 2)
-        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more are not in it yet)");
+        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more GPUs are not supported)");
     const bool old_two = (getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) || (getenv("IK2_TP") && std::atoi(getenv("IK2_TP")));
     if (n_gpu == 2 && old_two && !force)
-        refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are outside the preview (without them: "
+        refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are not supported (without them: "
                "the two-GPU split)" + run_anyway);
 #ifdef MAYA_USE_HIP   // (the split runs GPU 0 on the offload path, not checked on AMD yet)
-    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not in the Inkling 2 preview yet" + run_anyway);
+    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not supported yet" + run_anyway);
 #endif
     if (n_gpu == 2 && nd < 2)
         refuse("--gpus 2: " + std::to_string(nd) + " GPU visible");
@@ -5949,14 +6190,14 @@ void check_preview(int n_gpu, bool serve) {
         if (p.totalGlobalMem < ((p.integrated ? 22ull : 11ull) << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs " +
+            refuse(gpu + " has " + m + ", Inkling 2 needs " +
                    (p.integrated ? "24 GB of the APU's memory" : "an AMD card of 12 GB or more") + run_anyway);
         }
 #else
         if (p.totalGlobalMem < (7ull << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs a card of 8 GB or more" + run_anyway);
+            refuse(gpu + " has " + m + ", Inkling 2 needs a card of 8 GB or more" + run_anyway);
         }
 #endif
     }
@@ -6014,6 +6255,24 @@ int main(int argc, char** argv) {
         else if (a == "--kv-resident") g_kv_resident = std::max(0, std::atoi(next().c_str()));
         else if (a == "--parallel") g_par = std::clamp(std::atoi(next().c_str()), 1, kParMax);
         else if (a == "--dump") dump = next();
+        else if (a == "--ablate") {   // (a control vector: the refusal direction, projected out per conversation)
+            abl::path = next();
+            if (abl::path.empty()) die("--ablate needs a file (a control vector GGUF)");
+        }
+        else if (a == "--ablate-layer") {
+            abl::layer = std::atoi(next().c_str());
+            if (abl::layer < 1 || abl::layer > 4096) die("--ablate-layer takes 1..4096");
+        }
+        else if (a == "--ablate-scale") {
+            const double v = std::atof(next().c_str());
+            if (!(v >= 1e-6 && v <= 1e6)) die("--ablate-scale takes 1e-6..1e6");
+            abl::want_scale = (float) v;
+        }
+        else if (a == "--ablate-default") {   // on (every conversation, as a startup flag) | off (GEN ablate=1 turns it on)
+            const std::string v = next();
+            if (v != "on" && v != "off" && v != "1" && v != "0") die("--ablate-default: on or off");
+            abl::dflt = v == "on" || v == "1";
+        }
         else if (a == "--drafting") {   // (auto: measured once on this PC; on: the drafter and the prompt lookup; off)
             drafting = next();
             if (drafting != "auto" && drafting != "on" && drafting != "off") die("--drafting: auto, on or off");
@@ -6069,7 +6328,7 @@ int main(int argc, char** argv) {
         while (*p && *p != ',') ++p;
         if (*p == ',') ++p;
     }
-    check_preview(n_gpu, serve);
+    check_hardware(n_gpu, serve);
     // --gpus 2: the split (TwoGpu) - the engine runs as on one GPU (GPU 0), GPU 1 added to the token path at load;
     // IK2_EP=1 / IK2_TP=1: the older two-GPU modes on the cache path instead (IK2_UNSUPPORTED)
     if (n_gpu == 2 && !(getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) &&
@@ -6278,6 +6537,25 @@ int main(int argc, char** argv) {
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
+    if (abl::path.empty() && (abl::layer != 0 || abl::want_scale != 0.0f))
+        die(std::string(abl::layer != 0 ? "--ablate-layer" : "--ablate-scale") + " without --ablate FILE: nothing to project out");
+    if (!abl::path.empty() && dual()) {   // (the expert-parallel / tensor-parallel modes sum the residual on the other GPU)
+        std::fprintf(stderr, "NOTE: IK2_EP / IK2_TP: no --ablate (those modes do not project; the layer split does)\n");
+    } else if (!abl::path.empty()) {   // (the direction read once, a copy on every GPU)
+        abl::scale = abl::want_scale;
+        std::string err;
+        if (!::mm3::ablate::load(abl::path, abl::layer, c.C, abl::scale, abl::dir, abl::what, err, "maya-ik2")) die(err);
+        abl::dev.assign((size_t) n_gpu, nullptr);
+        for (int d = 0; d < n_gpu; ++d) {
+            CU(cudaSetDevice(d));
+            CU(cudaMalloc(&abl::dev[(size_t) d], abl::dir.size() * 4));
+            CU(cudaMemcpy(abl::dev[(size_t) d], abl::dir.data(), abl::dir.size() * 4, cudaMemcpyHostToDevice));
+        }
+        CU(cudaSetDevice(0));
+        abl::loaded = true;
+        for (bool& o : abl::on) o = abl::dflt;
+        std::fprintf(stderr, "%s (default %s)\n", abl::what.c_str(), abl::dflt ? "on" : "off");
+    }
     if (dual()) {
         // (their copies are the runtime's peer copies: peer access only where mm3_link.cuh's test copy passes, and
         //  not at all where the IOMMU translates - those modes have no host-memory hand-off: refused there)
@@ -6345,7 +6623,7 @@ int main(int argc, char** argv) {
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
-    g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+    g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH"))) && !maya::ablcap::on();   // (a fitting run reads each write out on the host)
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_block_exact = !(getenv("IK2_BLOCK_EXACT") && !std::atoi(getenv("IK2_BLOCK_EXACT")));
     g_window_check = getenv("IK2_WINDOW_CHECK") ? std::atoi(getenv("IK2_WINDOW_CHECK")) : 0;
@@ -8019,8 +8297,10 @@ int main(int argc, char** argv) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
             const bool sp = (drafter || g_lookup) && spec_path();
             const char* wd = getenv("IK2_WATCHDOG_S");
+            // (starts=1: GEN's starts= is read - the server's required tool call, Service.prepare)
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
-                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx,
+                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s starts=1 think=1\n",
+                        g_kv_fp8 ? "fp8" : "f16", ctx,
                         g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0, drafting.c_str(),
                         c.n_layer * c.E, g_par, wd && *wd ? std::max(0, std::atoi(wd)) : 600,
                         g_fast ? "resident" : g_off ? "offload" : "cache");
@@ -8043,6 +8323,8 @@ int main(int argc, char** argv) {
                             g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes());
             }
             use_dev(0);
+            if (abl::loaded)   // (--ablate: GEN ablate=0|1 turns its projection off / on for a request)
+                std::printf("INFO ablate=1 ablate_default=%d\n", abl::dflt ? 1 : 0);
             // (the split's GPU 1 was made current above without use_dev: back to GPU 0 - else the first request's
             //  launches met GPU 1's context, "invalid resource handle": two GPUs through the server since v1.1.74)
             if (g_two.on) CU(cudaSetDevice(0));
@@ -8148,10 +8430,13 @@ int main(int argc, char** argv) {
                 double temp = 0, top_p = 1;
                 std::mt19937_64 rng;
                 int slot = -1, phase = 0;   // 1: reading its prompt, 2: writing
+                bool abl = false;           // --ablate: this request projects the direction out (GEN ablate=, else the default)
                 size_t p0 = 0;
                 int cached = 0, n_out = 0, tok = -1;
                 double t0 = 0, t1 = 0;
                 bool cancel = false;
+                Starts starts;   // (GEN's starts=: the answer's opening)
+                ThinkCut tc;     // (GEN's think_*: the thinking budget)
             };
             struct SlotH {
                 std::vector<int> hist;
@@ -8159,6 +8444,7 @@ int main(int argc, char** argv) {
                 std::vector<float> last;
                 double used = 0;
                 bool busy = false;
+                bool abl = false;   // (--ablate: the setting its kept state was read with)
             };
             std::vector<SlotH> sh(g_par);
             std::deque<Req> waiting;
@@ -8233,7 +8519,17 @@ int main(int argc, char** argv) {
                 }
                 r.t1 = now();
                 r.phase = 2;
-                r.tok = pick_last(r, S.last);
+                if (r.starts.on()) {   // (an opening: the first token among its sequences')
+                    const std::vector<int> o = r.starts.opts();
+                    std::vector<std::pair<float, int>> cd;
+                    if (o.size() > 1)
+                        for (int t : o) cd.push_back({S.last[t], t});
+                    r.tok = pick_among(o, cd, r.temp,
+                                       [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
+                } else {
+                    r.tok = pick_last(r, S.last);
+                }
+                r.starts.took(r.tok);
             };
             auto admit = [&](Req&& rq) {
                 int s = -1;
@@ -8242,8 +8538,8 @@ int main(int argc, char** argv) {
                     if (sh[i].busy) continue;
                     size_t L = 0;
                     const auto& H = sh[i].hist;
-                    while (L < H.size() && L < rq.ids.size() && H[L] == rq.ids[L] &&
-                           (L < sh[i].sig.size() ? sh[i].sig[L] : 0) == rq.sig[L])
+                    while (sh[i].abl == rq.abl && L < H.size() && L < rq.ids.size() && H[L] == rq.ids[L] &&
+                           (L < sh[i].sig.size() ? sh[i].sig[L] : 0) == rq.sig[L])   // (another setting's cache: no prefix)
                         ++L;
                     if (s < 0 || L > bestL || (L == bestL && sh[i].used < sh[s].used)) s = i, bestL = L;
                 }
@@ -8253,6 +8549,7 @@ int main(int argc, char** argv) {
                 sh[s].busy = true;
                 bind_slot(M, s);
                 SlotH& S = sh[s];
+                if (abl::loaded) abl::on[s] = r.abl, S.abl = r.abl;   // (the slot's conversation from here on)
                 size_t L = bestL;
                 if (L < S.hist.size() || L == r.ids.size()) {
                     int best = -1;
@@ -8304,6 +8601,7 @@ int main(int argc, char** argv) {
                 const bool geni = cmd == "GENI";
                 if (cmd != "GEN" && !geni) return;
                 Req r;
+                r.abl = abl::loaded && abl::dflt;   // (--ablate: GEN ablate= overrides)
                 std::string w, ids_s, emb_path;
                 long long seed = -1;
                 in >> r.max_new;
@@ -8322,6 +8620,9 @@ int main(int argc, char** argv) {
                     else if (k == "top_k") r.top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "rid") r.rid = std::atoi(v.c_str());
+                    else if (k == "starts") r.starts.parse(v, c.n_vocab);
+                    else if (think_key(r.tc, k, v, c.n_vocab)) {}
+                    else if (k == "ablate") r.abl = abl::loaded && std::atoi(v.c_str()) != 0;
                 }
                 r.ids = parse_ints(ids_s);
                 r.rng.seed(seed >= 0 ? (uint64_t) seed : rng_g());
@@ -8418,6 +8719,7 @@ int main(int argc, char** argv) {
                     }
                     ++r->n_out;
                     std::printf("T %d %d\n", r->rid, r->tok);
+                    if (r->tc.saw(r->tok)) r->tc.close(r->starts);   // (the thinking budget: forced on from here)
                     if (std::find(eos_ids.begin(), eos_ids.end(), r->tok) != eos_ids.end()) {
                         done_line(*r, "stop");
                         r->phase = 3;
@@ -8434,20 +8736,27 @@ int main(int argc, char** argv) {
                     bool cand = false;
                     for (int t = 0; t < T; ++t) {
                         tk[t] = go[t]->tok, ps[t] = (int) sh[go[t]->slot].hist.size(), sl[t] = go[t]->slot;
-                        cand = cand || go[t]->temp > 0;
+                        cand = cand || go[t]->temp > 0 || (go[t]->starts.on() && go[t]->starts.opts().size() > 1);
                     }
                     beat("a decode step (--parallel, the conversations' tokens together)");
                     par_step(M, T, tk, ps, sl, cand, am);
                     for (int t = 0; t < T; ++t) {
                         Req& r = *go[t];
                         sh[r.slot].hist.push_back(r.tok);
-                        if (r.temp <= 0) {
+                        if (r.starts.on()) {   // (an opening: among its tokens, from this step's candidates)
+                            const std::vector<int> o = r.starts.opts();
+                            std::vector<std::pair<float, int>> cd;
+                            if (o.size() > 1) par_cands(M, t, cd);
+                            r.tok = pick_among(o, cd, r.temp,
+                                               [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
+                        } else if (r.temp <= 0) {
                             r.tok = am[t];
                         } else {
                             std::vector<std::pair<float, int>> cd;
                             par_cands(M, t, cd);
                             r.tok = sample(r, cd);
                         }
+                        r.starts.took(r.tok);
                     }
                     stat_tok += T;
                     if (++steps % 16 == 0) {
@@ -8481,7 +8790,7 @@ int main(int argc, char** argv) {
         while (next_line(line)) {
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
-            int max_new = 0, top_k = 0, spec_key = 0;
+            int max_new = 0, top_k = 0, spec_key = 0, abl_key = -1;   // (abl_key: GEN ablate=0|1, -1 as started)
             double temp = 0, top_p = 1;
             long long seed = -1;
             in >> cmd;
@@ -8500,6 +8809,8 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::vector<int> stops;
+            Starts starts;   // (GEN's starts=: the answer's opening, one of these sequences)
+            ThinkCut tc;     // (GEN's think_*: the thinking budget, closed in the decode)
             if (serve_maya) {
                 in >> max_new;
                 std::string w;
@@ -8518,6 +8829,9 @@ int main(int argc, char** argv) {
                     else if (k == "top_k") top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "spec") spec_key = std::atoi(v.c_str());   // (1: no drafting; 2 .. 8: the widest window)
+                    else if (k == "starts") starts.parse(v, c.n_vocab);
+                    else if (think_key(tc, k, v, c.n_vocab)) {}
+                    else if (k == "ablate") abl_key = std::atoi(v.c_str()) != 0 ? 1 : 0;   // (--ablate: this request's)
                 }
                 stops = eos_ids;
             } else {
@@ -8584,6 +8898,11 @@ int main(int argc, char** argv) {
                 stat_n = made, stat_t = t_now;
             };
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
+            if (abl::loaded) {   // (--ablate: the conversation's setting; the state kept was read with one - the other starts over)
+                const bool want = abl_key >= 0 ? abl_key != 0 : abl::dflt;
+                if (want != abl::on[g_slot_cur]) reset();
+                abl::on[g_slot_cur] = want;
+            }
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
             if (L < hist.size() || L == ids.size()) {
@@ -8658,6 +8977,13 @@ int main(int argc, char** argv) {
                         if (drafter) {   // (the drafter's context for these positions, from their taps)
                             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                        }
+                        if (serve_maya) {   // (read, total, ms, tok/s, reused: the page's live bar and prompt speed;
+                                            //  the layer-major path above and --parallel print theirs, this path none)
+                            const double ms = (now() - t0) * 1e3;
+                            std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,
+                                        (p0 + n - L) / std::max(1e-3, ms / 1e3), (int) L);
+                            std::fflush(stdout);
                         }
                     }
                 }
@@ -8739,7 +9065,16 @@ int main(int argc, char** argv) {
             int pending_sample = -1;   // (a speculative window's last token, sampled already)
             const char* reason = "length";
             int n_out = 0;
-            int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
+            // (starts=: a token among the opening's - from the logits of the step before it, asked for below - and
+            //  no drafts until the opening is written)
+            auto among = [&](const float* r) -> int {
+                const std::vector<int> o = starts.opts();
+                std::vector<std::pair<float, int>> cd;
+                if (o.size() > 1)
+                    for (int t : o) cd.push_back({r[t], t});
+                return pick_among(o, cd, temp, [&](std::vector<std::pair<float, int>>& x) { return pick_top(x); });
+            };
+            int greedy_tok = temp <= 0 && !last.empty() ? (starts.on() ? among(last.data()) : pick(last.data())) : -1;
             stat_t = t1;
             unsigned long long ph0 = 0, pn0 = 0;
             pick_counts(0, ph0, pn0);
@@ -8752,9 +9087,14 @@ int main(int argc, char** argv) {
                 if (serve_maya && !req_spec && n_out && n_out % 32 == 0) stat_line(n_out, now());
                 const int tok = temp <= 0             ? greedy_tok
                                 : pending_sample >= 0 ? pending_sample
+                                : starts.on()         ? among(last.data())
                                 : cand                ? pick_cand()
                                                       : pick(last.data());
                 pending_sample = -1;
+                starts.took(tok);
+                if (tc.saw(tok)) tc.close(starts);   // (the thinking budget: the segment ends here, forced on)
+                // the next token is a choice among the opening's: this step gives the whole logits
+                const bool choice = starts.on() && starts.opts().size() > 1;
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
@@ -8767,8 +9107,8 @@ int main(int argc, char** argv) {
                 // (the step: a plain token, or a window of the drafter's or the prompt lookup's drafts)
                 int B = 1, src = 0;
                 int32_t ld[kBlockMax];
-                if (req_spec) {
-                    const int room = std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax});
+                if (req_spec && !starts.on()) {
+                    const int room = tc.room(std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax}));
                     const int k = g_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
                     src = sctl.pick(room, k, B);
                     if (src == 1 && !drafter) src = 0, B = 1;
@@ -8790,6 +9130,7 @@ int main(int argc, char** argv) {
                     hist.push_back(tok);
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
                         std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
+                        tc.saw(next[j]);   // (a window stops short of the budget: this never closes)
                         hist.push_back(next[j]);
                         lk.append(next[j]);
                     }
@@ -8808,11 +9149,17 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const double tp0 = now();
-                if (temp <= 0) {
+                if (choice) {
+                    std::vector<float> lo;
+                    forward(M, &tok, 1, (int) hist.size(), false, OutMode::kLogits, std::string(), lo, nullptr, t_exp);
+                    last = std::move(lo);
+                    cand = false;
+                    if (temp <= 0) greedy_tok = among(last.data());
+                } else if (temp <= 0) {
                     std::vector<float> lo;
                     std::vector<int> ag;
                     forward(M, &tok, 1, (int) hist.size(), false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
-                    greedy_tok = ag[0];
+                    greedy_tok = starts.on() ? starts.opts()[0] : ag[0];   // (one way on: its token)
                     last.clear();
                 } else {
                     std::vector<float> lo;

@@ -389,13 +389,13 @@ class Picker(unittest.TestCase):
     def test_not_listed_until_published(self):
         got = self.rows()
         self.assertNotIn("Hy4-Flash", got["rows"])
-        self.assertEqual(got["rows"][-2:], ["Qwen-3.8-Flash-Next", "Inkling 2 Mini (experimental)"])   # (as before;
+        self.assertEqual(got["rows"][-2:], ["Qwen-3.8-Flash-Next", "Inkling 2 Mini"])   # (as before;
         #  Inkling-2-Mini's preview the last row)
         self.assertEqual(got["family"], "glm")
 
     def test_listed_once_published(self):
         got = self.rows(man=manifest())
-        self.assertEqual(got["rows"][-2:], ["Hy4-Flash", "Inkling 2 Mini (experimental)"])
+        self.assertEqual(got["rows"][-2:], ["Hy4-Flash", "Inkling 2 Mini"])
         about = got["about"]["Hy4-Flash"]
         for part in ("Tencent's Hy4-flash", "Hy4-Flash-Maya-XS (108 GB)", "NVIDIA from V100 on", "Linux or Windows",
                      "pictures (its vision tower", "thinking High or Off", "tool calls", "Tencent's own Q4_K_M (AngelSlim",

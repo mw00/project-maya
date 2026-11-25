@@ -401,5 +401,91 @@ class EngineStartMatchesServer(unittest.TestCase):
         self.assertIn("SV.engine_args", src)
 
 
+GLM_LOG = """glm split auto: layers [0, 17) on CUDA0, [17, 31) on CUDA1, [31, 45) on CUDA2 - a token 10.9 ms predicted (CUDA0 4.0 ms)
+glm fast: CUDA0 layers [0,17) expert pool 27.20 GB, 291-291 slots/layer (4074 total)
+glm fast: CUDA2 layers [31,45) expert pool 27.58 GB, 252-280 slots/layer, the draft layer 270 (4058 total)
+glm fast: CUDA0 RAM tier 2.46 GB pinned, 368 slots
+glm fast: CUDA0 warming the expert tiers 10% (2.9 of 28.9 GB, 1 s)
+glm fast: CUDA0 tiers warm: 4032 experts (28.9 GB) in 23 s (1262.1 MB/s; slot order, parallel reads)
+glm fast: CUDA0 CPU lane off: the RAM tier holds no expert
+glm tier: CUDA2 CPU lane pool mode: one shared pool (MAYA_GLM_CPU_SHARED=unset, 3 part(s), 2 NUMA node(s))
+glm fast: CUDA2 CPU lane: 36 threads (one pool, shared), an expert 0.224 ms on the CPU vs 0.576 ms over PCIe -> of 0..8 RAM-tier experts the CPU takes 0 1 2 2 3 4 4 5 6
+glm fast: CUDA2 CPU lane: those times from /x/data/glm-cpu-cal.txt (not timed)
+INFO context=32768 kv=int8 engine_kind=glm-fast experts=12096 vram_slots=12206 ram_slots=1405 mtp=1 dflash=0 v
+maya serve: CUDA0: 1088 MiB of VRAM free with everything loaded
+glm mtp: 97 rounds
+"""
+
+
+class LayoutFingerprint(unittest.TestCase):
+    def test_facts_from_a_glm_log(self):
+        f = MB.layout_facts(GLM_LOG.splitlines(), "MTP")
+        self.assertEqual(f["GPUs"], "CUDA0,CUDA1,CUDA2")  # (the split line names all three)
+        self.assertEqual(f["split"], "[0, 17) on CUDA0, [17, 31) on CUDA1, [31, 45) on CUDA2")
+        self.assertEqual(f["slots a layer"], "CUDA0 291-291 / CUDA2 252-280")
+        self.assertEqual(f["RAM-tier slots"], "CUDA0 368")
+        self.assertEqual(f["warmed experts"], "CUDA0 4032")
+        self.assertIn("CUDA0 off", f["lane"])
+        self.assertIn("CUDA2 36 threads, takes 0 1 2 2 3 4 4 5 6", f["lane"])
+        self.assertEqual(f["lane times"], "read from the saved file")
+        self.assertEqual(f["lane pool"], "one shared pool")
+        self.assertEqual(f["VRAM free MiB"], "CUDA0 1088")
+        self.assertIn("vram_slots=12206", f["engine"])
+        self.assertEqual(f["drafting"], "MTP")
+
+    def test_seconds_of_the_start_are_not_facts(self):
+        a = MB.layout_facts(GLM_LOG.splitlines())
+        b = MB.layout_facts(GLM_LOG.replace("in 23 s", "in 31 s").replace("1 s)", "2 s)").splitlines())
+        self.assertEqual(MB.layout_diff(a, b), [])
+
+    def test_diff_names_the_fact(self):
+        a = MB.layout_facts(GLM_LOG.splitlines())
+        b = MB.layout_facts(GLM_LOG.replace("368 slots", "300 slots").replace("1088 MiB", "900 MiB").splitlines())
+        d = MB.layout_diff(a, b)
+        self.assertEqual(len(d), 2)
+        self.assertTrue(any(x.startswith("RAM-tier slots: CUDA0 368 -> CUDA0 300") for x in d))
+
+    def test_no_facts_is_said(self):
+        self.assertEqual(MB.layout_facts(["hello"]), {})
+        self.assertIn("no placement facts", MB.layout_line({}))
+
+    def test_report_for_differing_rounds(self):
+        a = {"facts": MB.layout_facts(GLM_LOG.splitlines()), "log_kept": "x/this-r1.log"}
+        b = {"facts": MB.layout_facts(GLM_LOG.replace("368 slots", "300 slots").splitlines()),
+             "log_kept": "x/this-r2.log"}
+        out = MB.layout_report({"this": [a, b], "other": [a]})
+        self.assertEqual(len(out), 2)
+        self.assertIn("this build, round 1 vs round 2: RAM-tier slots", out[0])
+        self.assertIn("x/this-r2.log", out[0])
+        self.assertIn("same facts", out[1])
+
+    def test_logs_are_kept_per_round_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "maya-bench.log"
+            src.write_text("one\n", encoding="utf-8")
+            k1 = MB.keep_log(src, root / MB.KEEP_DIR / "this-r1.log")
+            src.write_text("two\n", encoding="utf-8")
+            k2 = MB.keep_log(src, root / MB.KEEP_DIR / "this-r2.log")
+            self.assertEqual(Path(k1).read_text(encoding="utf-8"), "one\n")
+            self.assertEqual(Path(k2).read_text(encoding="utf-8"), "two\n")
+            self.assertIsNone(MB.keep_log(src, None))
+            MB.clean_kept_logs(root)
+            self.assertFalse((root / MB.KEEP_DIR).exists())
+
+
+
+class SetupWording(unittest.TestCase):
+    def test_picture_reader_time_is_an_honest_range(self):
+        self.assertIn("up to about 10 minutes", maya.VISION_BUILD_TIME)
+        self.assertNotIn("a few", maya.VISION_BUILD_TIME)
+        src = Path(maya.__file__).read_text(encoding="utf-8")
+        self.assertIn('" kernels: " + VISION_BUILD_TIME', src)
+        self.assertNotIn('"CUDA") + " kernels: a few minutes"', src)
+        setup = (Path(maya.__file__).parent / "docs" / "SETUP.md").read_text(encoding="utf-8")
+        self.assertIn("compiles the image encoder (1 to 6 minutes, up to about 10 minutes on a small PC; once)", setup)
+        self.assertIn("compiles the engine for your GPU(s) (a few minutes, once)", setup)   # (the engine's text stays)
+
+
 if __name__ == "__main__":
     unittest.main()
