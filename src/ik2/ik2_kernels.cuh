@@ -183,6 +183,41 @@ void two_take_rows(const uint8_t* const* blob, const float* other, int S, int C,
 void two_take_rows_g(const uint8_t* const* blob, const int* n, const int* row, const float* other, int G, int C,
                      float* y, cudaStream_t s);
 
+/// Two GPUs, a visit's hand-off through host memory both map (maya-ik2, IK2_PEER_DIRECT_SIGNAL=1; CUDA, NVIDIA sm_70 and newer):
+/// a ring of kMailSlots slots, each holding a visit's x [C] and router logits [E], its rows [K][C], and two words that
+/// carry the visit's number n (1, 2, ..) - the slot's "free again" once GPU 1 read the message, the rows' once GPU 1
+/// wrote them.  GPU 0 writes the message and GPU 1 is woken by an event (the host waits its stream on it); GPU 0 takes the
+/// rows by waiting for the rows word.  A word of host memory another GPU writes is read again each time (never a line
+/// kept from a read before) and written through.  A wait is bounded: out of time (kMailWaitNs) the kernel puts n into
+/// err, which the host reads once the token is done.  mail_layout: where each of them is in a slot (the words each on a
+/// line of 128 bytes of its own).
+constexpr int kMailSlots = 4;
+constexpr unsigned long long kMailWaitNs = 5000000000ull;   // (5 s: a hand-off is tens of microseconds)
+struct MailLayout {
+    size_t x = 0, logits = 0, rows = 0;            // in a slot: the visit's x, its router logits, its rows
+    size_t freed = 0, rows_word = 0;               // in a slot: the visit's number, once each is in place
+    size_t slot = 0;                               // a slot's bytes
+    size_t ring = 0;                               // the slots' bytes
+    size_t err = 0;                                // after them, on a line of its own
+};
+MailLayout mail_layout(int C, int E, int K);
+/// GPU 0, visit n: waits for the slot's freed word to read free_n (n - kMailSlots: the visit that used the slot last was
+/// read; 0 on the first turn), writes x and the logits into the slot (its writes through to the host memory by the end).
+void mail_send(const float* x, const float* logits, int C, int E, float* slot_x, const unsigned* freed, unsigned n,
+               unsigned free_n, unsigned* err, cudaStream_t s);
+/// GPU 1, visit n, its stream ordered after GPU 0's mail_send (the host waits it on an event): copies the slot's x and
+/// logits into its own memory (x, the logits), sets the slot's freed word to n.
+void mail_recv(const float* slot_x, int C, int E, float* x, float* logits, unsigned* freed, unsigned n, cudaStream_t s);
+/// GPU 1, visit n, its picks run (y [K][C] on its device): the rows of the slots it ran (blob [K]: a block's pointer -
+/// not a null, not kHeldElsewhere) written into the slot's rows; the slot's rows word set to n.
+void mail_publish(const uint8_t* const* blob, const float* y, int K, int C, float* rows, unsigned* rows_word, unsigned n,
+                  cudaStream_t s);
+/// GPU 0, visit n: the rows of its picks marked kHeldElsewhere (blob [K]) taken from the slot's rows into y [K][C].  A
+/// block with no such pick leaves at once - most visits have none (GPU 1 holds the experts the profile picks rarely);
+/// one with waits for the rows word to read n.
+void two_take_rows_mail(const uint8_t* const* blob, const float* rows, const unsigned* rows_word, unsigned n, int S, int C,
+                        float* y, unsigned* err, cudaStream_t s);
+
 /// y = a + b, n values (y may alias either).
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
 /// FP16 copies of n values.

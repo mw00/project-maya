@@ -2529,6 +2529,17 @@ struct TwoGpu {
     uint16_t* wlimbs = nullptr;
     int *wroute = nullptr, *wn = nullptr, *wtok = nullptr, *wrow = nullptr;
     const uint8_t** wblob = nullptr;
+    // (IK2_PEER_DIRECT_SIGNAL=1: the hand-off through host memory both map - a ring of k::MailLayout slots and the visits'
+    //  numbers in its words; two_send_mail.  CUDA, NVIDIA sm_70 and newer.)
+    bool mail = false;
+    unsigned char* mail_h = nullptr;   // the ring: pinned host memory
+    unsigned char* mail_d0 = nullptr;  // its bytes as GPU 0 addresses them
+    unsigned char* mail_d1 = nullptr;  // ... as GPU 1 does
+    float* rcv = nullptr;              // on GPU 1: a visit's x and logits, copied in from the slot
+    k::MailLayout ml;
+    unsigned long long visits = 0;    // the visits handed over; their numbers are the low 32 bits (T.n)
+    unsigned n = 0;                    // the last visit's number: a slot's words are compared with it
+    cudaEvent_t ev_mail = nullptr;     // GPU 0's stream, after a visit's message: GPU 1's stream waits it
     gpulink::Links link;
     int n_exp = 0;
     size_t bytes = 0;
@@ -2582,6 +2593,73 @@ void two_take(const Model& M, Work& W) {
     else if (!T.link.copy(1, T.s, T.y32, 0, g_s, T.y_in, (size_t) c.K * c.C * 4, g_s, err)) die(err);
     CU(cudaSetDevice(0));
     k::two_take_rows(W.blob, T.y_in, c.K, c.C, W.y32, g_s);
+}
+
+#if !defined(MAYA_USE_HIP)
+// (IK2_PEER_DIRECT_SIGNAL=1: the same visit, its hand-off through host memory both map, without a copy - k::mail_send,
+// mail_recv, mail_publish, two_take_rows_mail.  GPU 0 writes x and the logits into the ring's slot; GPU 1's stream,
+// woken by an event once they are, copies the bytes in, routes and runs its picks as above and writes their rows into
+// the slot; GPU 0 takes the rows only where it has a pick of GPU 1's - a visit without one (most: GPU 1 holds the
+// experts the profile picks rarely) waits for nothing at all.)
+void two_send_mail(const Model& M, int l, Work& W, bool exp_tc) {
+    const Config& c = M.c;
+    const Layer& Ly = M.L[l];
+    TwoGpu& T = g_two;
+    const int C = c.C;
+    int* rtop = T.route_d;
+    float* rw = (float*) (T.route_d + c.K);
+    // (the numbers are the visits' low 32 bits, so they wrap: the visit that used the slot last is then visits - kMailSlots
+    //  as well - 0 only on the first turn)
+    const unsigned long long v = ++T.visits;
+    const unsigned n = T.n = (unsigned) v;
+    const size_t off = (n % k::kMailSlots) * T.ml.slot;
+    unsigned char* d0 = T.mail_d0 + off;
+    unsigned char* d1 = T.mail_d1 + off;
+    k::mail_send(W.xq, W.rlog, C, c.E, (float*) (d0 + T.ml.x), (const unsigned*) (d0 + T.ml.freed),
+                 n, v > (unsigned long long) k::kMailSlots ? (unsigned) (v - k::kMailSlots) : 0u,
+                 (unsigned*) (T.mail_d0 + T.ml.err), g_s);
+    CU(cudaEventRecord(T.ev_mail, g_s));   // (GPU 1's stream after the message: woken by the event, not polling for it)
+    CU(cudaSetDevice(T.dev));
+    CU(cudaStreamWaitEvent(T.s, T.ev_mail, 0));
+    float* const xq = T.rcv;
+    float* const rlog = T.rcv + C;
+    k::mail_recv((const float*) (d1 + T.ml.x), C, c.E, xq, rlog, (unsigned*) (d1 + T.ml.freed), n, T.s);
+    k::route_token(rlog, T.bias[l], c.E, c.K, c.route_scale, T.tab[l], T.sc[0][l], T.sc[1][l], T.sc[2][l], rtop, rw, T.blob,
+                   T.tok, T.inv, T.sg, T.su, T.wt, T.s, xq, C, exp_tc ? (uint16_t*) T.gu32 : nullptr);
+    if (exp_tc) {
+        k::experts_gate_up_swiglu_mma(T.blob, c.K, Ly.eb[0], (const uint16_t*) T.gu32, C, c.F, T.sg, T.su, c.gate_cap, c.up_cap,
+                                      T.h16, T.s);
+        k::experts_down_mma(T.blob, c.K, Ly.eb[0] + Ly.eb[1], T.h16, C, c.F, T.y32, T.s);
+    } else {
+        k::experts_gate_up_swiglu(T.blob, T.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], xq, C, c.F, T.sg, T.su, c.gate_cap, c.up_cap,
+                                  T.h16, T.s);
+        k::experts_down(T.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], T.h16, C, c.F, T.y32, T.s);
+    }
+    k::mail_publish(T.blob, T.y32, c.K, C, (float*) (d1 + T.ml.rows), (unsigned*) (d1 + T.ml.rows_word), n, T.s);
+#if defined(_WIN32)
+    (void) cudaStreamQuery(T.s);
+#endif
+    CU(cudaSetDevice(0));
+}
+void two_take_mail(const Model& M, Work& W) {
+    const Config& c = M.c;
+    TwoGpu& T = g_two;
+    unsigned char* d0 = T.mail_d0 + (T.n % k::kMailSlots) * T.ml.slot;
+    k::two_take_rows_mail(W.blob, (const float*) (d0 + T.ml.rows), (const unsigned*) (d0 + T.ml.rows_word), T.n, c.K, c.C, W.y32,
+                          (unsigned*) (T.mail_d0 + T.ml.err), g_s);
+}
+#endif
+// (IK2_PEER_DIRECT_SIGNAL=1: a hand-off's wait that ran out of time is seen once the token's work is done - never an answer from
+// rows that are not there)
+void two_mail_check() {
+#if !defined(MAYA_USE_HIP)
+    if (!g_two.mail) return;
+    const unsigned n = *reinterpret_cast<volatile unsigned*>(g_two.mail_h + g_two.ml.err);
+    if (n)
+        die("two GPUs, the hand-off through host memory (IK2_PEER_DIRECT_SIGNAL=1): visit " + std::to_string(n) +
+            " waited more than " + std::to_string(k::kMailWaitNs / 1000000) + " ms for the other GPU - its work stopped or"
+            " failed; the answers would not be its rows");
+#endif
 }
 
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
@@ -2832,7 +2910,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
 #endif
         const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
-        if (g_two.on) two_send(M, l, W, exp_tc);   // (two GPUs: GPU 1's picks there, beside GPU 0's)
+        if (g_two.on) {   // (two GPUs: GPU 1's picks there, beside GPU 0's - through the ring when IK2_PEER_DIRECT_SIGNAL=1)
+            if (g_two.mail) two_send_mail(M, l, W, exp_tc);
+            else two_send(M, l, W, exp_tc);
+        }
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                        exp_tc ? (uint16_t*) W.gu32 : nullptr);
@@ -2863,7 +2944,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                       c.gate_cap, c.up_cap, W.h16, g_s);
             k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
-        if (g_two.on) two_take(M, W);
+        if (g_two.on) {
+            if (g_two.mail) two_take_mail(M, W);
+            else two_take(M, W);
+        }
         combine_write(W, Ly, c.K, C, abl::cur());
     }
     if (out_mode == OutMode::kNone) return;
@@ -3050,6 +3134,25 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
                       hs && std::atoi(hs), hp && std::atoi(hp), yb, yb, "IK2_HOST_STAGE", err))
         die(err);
     CU(cudaSetDevice(0));
+#ifndef MAYA_USE_HIP
+    // (IK2_PEER_DIRECT_SIGNAL=1: the ring in host memory both cards map, its words at 0 - two_send_mail)
+    if (const char* m = getenv("IK2_PEER_DIRECT_SIGNAL"); m && std::atoi(m)) {
+        T.ml = k::mail_layout(C, c.E, K);
+        if (cudaHostAlloc((void**) &T.mail_h, T.ml.ring + 128, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+            (void) cudaGetLastError();
+            die("IK2_PEER_DIRECT_SIGNAL=1: the ring's host memory (" + std::to_string(T.ml.ring >> 10) + " KiB, pinned and mapped) did not come");
+        }
+        std::memset(T.mail_h, 0, T.ml.ring + 128);
+        CU(cudaSetDevice(0));
+        CU(cudaHostGetDevicePointer((void**) &T.mail_d0, T.mail_h, 0));
+        CU(cudaEventCreateWithFlags(&T.ev_mail, cudaEventDisableTiming));
+        CU(cudaSetDevice(T.dev));
+        CU(cudaHostGetDevicePointer((void**) &T.mail_d1, T.mail_h, 0));
+        T.rcv = dalloc<float>((size_t) C + c.E);
+        T.mail = true;
+        CU(cudaSetDevice(0));   // (the caller left GPU 0 current: back there)
+    }
+#endif
     T.on = true;
     g_offs.tick = ~0ull;   // (GPU 0's tables again: GPU 1's experts marked)
     off_tables(M);
@@ -3059,7 +3162,9 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
                 "a token's experts on both GPUs, every prompt on GPU 0",
                 cls0 == cls1 ? "one kind (one GPU's answers)" : "two kinds (each GPU's own kernels; the split kept "
                                                                 "in whole GiB, so it repeats from start to start)",
-                T.link.say.c_str());
+                (T.mail ? "through host memory both map (IK2_PEER_DIRECT_SIGNAL=1: a ring of " + std::to_string(k::kMailSlots) +
+                                                                " slots)"
+                                          : T.link.say).c_str());
     std::fflush(stdout);
     return true;
 }
@@ -3469,6 +3574,7 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         else fast_token_launches(M, W, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
+    two_mail_check();
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(1, W.argmax_h[0]);
     } else if (out_mode == OutMode::kLogits) {
@@ -3970,6 +4076,7 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         else fast_block_launches(M, W, T, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
+    two_mail_check();
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(W.argmax_h, W.argmax_h + T);
     } else if (out_mode == OutMode::kLogits) {
@@ -8006,7 +8113,7 @@ int main(int argc, char** argv) {
         // two GPUs: GPU 1's experts - a token's launches on both devices one by one (2x V100, 2x 12 GB: 78.7 tok/s,
         // against 73.1 as one CUDA graph across them; IK2_TWO_GRAPH=1: the graph, where every copy is a peer one)
         if (g_two.want && two_setup(M, EC, off_value))
-            g_graph = g_graph && g_two.link.all_peer && getenv("IK2_TWO_GRAPH") && std::atoi(getenv("IK2_TWO_GRAPH"));
+            g_graph = g_graph && !g_two.mail && g_two.link.all_peer && getenv("IK2_TWO_GRAPH") && std::atoi(getenv("IK2_TWO_GRAPH"));
         int n_tier = 0;
         for (int i = 0; i < c.n_layer * c.E; ++i) n_tier += EC.loc[i] >= 0;
         size_t st_b = 0;
