@@ -4,6 +4,21 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.79 - 2026-11-25
+
+Inkling 2 Mini becomes a fully supported model, with a thinking budget, the ablation option and forced tool calls.
+
+- **Inkling 2 Mini: a thinking budget.** Like the other models, Inkling now closes its thinking once it reaches the budget and goes on to the answer, so a long output limit is no longer spent on thinking alone. The default is 32,768 tokens; set it in Settings > Chat defaults > Thinking budget, with `"thinking_budget"` in the config, or `0` for no limit. Answers that think for less than the budget are unchanged.
+- **Inkling 2 Mini: the ablation option**, as for the other models: `--ablation on` in the setup, the switch on the Models page, or `"ablate"` in a request. It is off by default; the small file it needs comes from Maya's model repo.
+- **Inkling 2 Mini: `tool_choice: "required"` now always opens with a tool call (#1160).**
+- **Inkling 2 Mini is a supported model.** The "experimental preview" label is gone; the Models page and the engine's messages say plainly which hardware it runs on.
+- **Inkling 2 Mini: prompt progress on the dashboard.** Long prompts show "reading the prompt: N of M tokens" while they are read, and the finished answer shows the prompt speed.
+- **Fix: Inkling 2 Mini with `--parallel` could fail requests when VRAM was almost full (#1196).** It keeps running.
+- **Setup:** the Inkling drafter estimate now agrees with the engine at long contexts; a folder first set up for AMD and then for NVIDIA builds its picture reader correctly; for the full GLM-5.3 on one GPU the setup no longer says drafting is on when the engine keeps it off; the picture reader's build time is stated honestly.
+- **GLM, from the community:** `MAYA_GLM_NO_REUSE=0` now means off (#1210); warnings at start for two settings that slow GLM down on PCs with two CPU sockets (#1214); the one-time CPU timing uses a wider sample, so a fresh measurement is steadier (#1209); the `MAYA_GLM_PRESTAGE` documentation matches the code (#1213).
+- **Benchmark:** `--bench` keeps each round's engine log and prints a layout line per start, and `--compare` names what differed between rounds.
+- **Credits.** #1160 was contributed by @OscarSheng; #1209, #1210, #1213 and #1214 by @oscarlius. The rest of this release is by @mw00 (peasantsmith).
+
 ## v1.1.78 - 2026-11-24
 
 The full GLM-5.3 runs again, Inkling 2 Mini keeps its drafter with pictures on, and the setup is shorter and quieter.
