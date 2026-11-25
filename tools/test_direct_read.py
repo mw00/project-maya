@@ -68,6 +68,10 @@ class DirectReaderPy:
         return os.pread(self.fd_buf, length, off)
 
 
+HAVE_PREAD = hasattr(os, "pread")
+HAVE_PREADV = hasattr(os, "preadv")
+
+
 class TestDirectRead(unittest.TestCase):
     def setUp(self):
         self.payload = bytes((i * 131 + 17) & 0xFF for i in range(1 << 20))  # 1 MiB
@@ -78,6 +82,7 @@ class TestDirectRead(unittest.TestCase):
         self.assertEqual(direct_span(4095, 131073), (0, 135168))
         self.assertEqual(direct_span(8192, 1), (8192, 4096))
 
+    @unittest.skipUnless(HAVE_PREAD and HAVE_PREADV, "needs os.pread and os.preadv (not on Windows)")
     def test_direct_and_buffered_exact_bytes(self):
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "sample.bin"
@@ -92,6 +97,7 @@ class TestDirectRead(unittest.TestCase):
                 finally:
                     rdr.close()
 
+    @unittest.skipUnless(HAVE_PREAD, "needs os.pread (not on Windows)")
     def test_einval_refusal_falls_back_to_buffered(self):
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "sample.bin"
@@ -111,6 +117,7 @@ class TestDirectRead(unittest.TestCase):
                 finally:
                     rdr.close()
 
+    @unittest.skipUnless(HAVE_PREAD and HAVE_PREADV, "needs os.pread and os.preadv (not on Windows)")
     def test_preadv_refusal_falls_back_to_buffered(self):
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "sample.bin"
