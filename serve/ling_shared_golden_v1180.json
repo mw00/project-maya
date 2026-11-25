@@ -1,0 +1,1739 @@
+{
+ "deepseek/ctx-both": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--ctx",
+   "49152",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": null
+ },
+ "deepseek/ctx-only": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--ctx",
+   "49152",
+   "--max-context",
+   "32768",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 32768,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": null
+ },
+ "deepseek/dash-m": {
+  "applied_args": [
+   "-m",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": null
+ },
+ "deepseek/dspack": {
+  "applied_args": [
+   "--pack",
+   "<d>/dspack",
+   "--max-context",
+   "65536",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/dspack",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": null
+ },
+ "deepseek/gguf": {
+  "applied_args": [
+   "--gguf",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": null
+ },
+ "deepseek/pack": {
+  "applied_args": [
+   "--glm-pack",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model/m.gguf",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": 131072
+ },
+ "deepseek/plain": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": null
+ },
+ "glm/ctx-both": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--ctx",
+   "49152"
+  ],
+  "choices": {
+   "draft": [
+    "mtp"
+   ],
+   "images": false
+  },
+  "family": "glm",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "mtp",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "glm/ctx-only": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--ctx",
+   "49152",
+   "--max-context",
+   "32768"
+  ],
+  "choices": {
+   "draft": [
+    "mtp"
+   ],
+   "images": false
+  },
+  "family": "glm",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 32768,
+   "draft": "mtp",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "glm/dash-m": {
+  "applied_args": [
+   "-m",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "mtp"
+   ],
+   "images": false
+  },
+  "family": "glm",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "mtp",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "glm/dspack": {
+  "applied_args": [
+   "--pack",
+   "<d>/dspack",
+   "--max-context",
+   "65536",
+   "--tp",
+   "2"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": true
+  },
+  "family": "deepseek",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/dspack",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "fast_prefill": false,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": true,
+   "mmap": "auto",
+   "parallel": 1,
+   "prefill_chunk": null,
+   "prompt_lookup": true,
+   "reserve_mib": null,
+   "tp": 2
+  },
+  "trained": null
+ },
+ "glm/gguf": {
+  "applied_args": [
+   "--gguf",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "mtp"
+   ],
+   "images": false
+  },
+  "family": "glm",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "mtp",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "glm/pack": {
+  "applied_args": [
+   "--glm-pack",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "mtp"
+   ],
+   "images": false
+  },
+  "family": "glm",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model/m.gguf",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "mtp",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill": null,
+   "reserve_mib": null
+  },
+  "trained": 131072
+ },
+ "glm/plain": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "mtp"
+   ],
+   "images": false
+  },
+  "family": "glm",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "mtp",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "hy4/ctx-both": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--ctx",
+   "49152"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "hy4",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "auto",
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": "auto"
+  },
+  "trained": null
+ },
+ "hy4/ctx-only": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--ctx",
+   "49152",
+   "--max-context",
+   "32768"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "hy4",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 32768,
+   "cpu_threads": null,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "auto",
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": "auto"
+  },
+  "trained": null
+ },
+ "hy4/dash-m": {
+  "applied_args": [
+   "-m",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "hy4",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "auto",
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": "auto"
+  },
+  "trained": null
+ },
+ "hy4/dspack": {
+  "applied_args": [
+   "--pack",
+   "<d>/dspack",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "hy4",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/dspack",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "auto",
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": "auto"
+  },
+  "trained": null
+ },
+ "hy4/gguf": {
+  "applied_args": [
+   "--gguf",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "hy4",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "auto",
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": "auto"
+  },
+  "trained": null
+ },
+ "hy4/pack": {
+  "applied_args": [
+   "--glm-pack",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "hy4",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model/m.gguf",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "auto",
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": "auto"
+  },
+  "trained": 131072
+ },
+ "hy4/plain": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "hy4",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "auto",
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": "auto"
+  },
+  "trained": null
+ },
+ "ik2/ctx-both": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--ctx",
+   "49152"
+  ],
+  "choices": {
+   "draft": [
+    "auto",
+    "none"
+   ],
+   "images": false,
+   "kv": [
+    "fp8",
+    "f16"
+   ]
+  },
+  "family": "ik2",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "f16",
+   "parallel": 1
+  },
+  "trained": null
+ },
+ "ik2/ctx-only": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--ctx",
+   "49152",
+   "--max-context",
+   "32768"
+  ],
+  "choices": {
+   "draft": [
+    "auto",
+    "none"
+   ],
+   "images": false,
+   "kv": [
+    "fp8",
+    "f16"
+   ]
+  },
+  "family": "ik2",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model",
+  "settings": {
+   "ablate": false,
+   "context": 32768,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "f16",
+   "parallel": 1
+  },
+  "trained": null
+ },
+ "ik2/dash-m": {
+  "applied_args": [
+   "-m",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "auto",
+    "none"
+   ],
+   "images": false,
+   "kv": [
+    "fp8",
+    "f16"
+   ]
+  },
+  "family": "ik2",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "f16",
+   "parallel": 1
+  },
+  "trained": null
+ },
+ "ik2/dspack": {
+  "applied_args": [
+   "--pack",
+   "<d>/dspack",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "auto",
+    "none"
+   ],
+   "images": false,
+   "kv": [
+    "fp8",
+    "f16"
+   ]
+  },
+  "family": "ik2",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/dspack",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "f16",
+   "parallel": 1
+  },
+  "trained": null
+ },
+ "ik2/gguf": {
+  "applied_args": [
+   "--gguf",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "auto",
+    "none"
+   ],
+   "images": false,
+   "kv": [
+    "fp8",
+    "f16"
+   ]
+  },
+  "family": "ik2",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "f16",
+   "parallel": 1
+  },
+  "trained": null
+ },
+ "ik2/pack": {
+  "applied_args": [
+   "--glm-pack",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "auto",
+    "none"
+   ],
+   "images": false,
+   "kv": [
+    "fp8",
+    "f16"
+   ]
+  },
+  "family": "ik2",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model/m.gguf",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "f16",
+   "parallel": 1
+  },
+  "trained": 131072
+ },
+ "ik2/plain": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536"
+  ],
+  "choices": {
+   "draft": [
+    "auto",
+    "none"
+   ],
+   "images": false,
+   "kv": [
+    "fp8",
+    "f16"
+   ]
+  },
+  "family": "ik2",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "f16",
+   "parallel": 1
+  },
+  "trained": null
+ },
+ "minimax/ctx-both": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--ctx",
+   "49152",
+   "--kv-streaming",
+   "off"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "minimax",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "cache_gb": null,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_cache": "int8",
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": 0
+  },
+  "trained": null
+ },
+ "minimax/ctx-only": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--ctx",
+   "49152",
+   "--max-context",
+   "32768",
+   "--kv-streaming",
+   "off"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "minimax",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "cache_gb": null,
+   "context": 32768,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_cache": "int8",
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": 0
+  },
+  "trained": null
+ },
+ "minimax/dash-m": {
+  "applied_args": [
+   "-m",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--kv-streaming",
+   "off"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "minimax",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "cache_gb": null,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_cache": "int8",
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": 0
+  },
+  "trained": null
+ },
+ "minimax/dspack": {
+  "applied_args": [
+   "--pack",
+   "<d>/dspack",
+   "--max-context",
+   "65536",
+   "--kv-streaming",
+   "off"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "minimax",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/dspack",
+  "settings": {
+   "ablate": false,
+   "cache_gb": null,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_cache": "int8",
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": 0
+  },
+  "trained": null
+ },
+ "minimax/gguf": {
+  "applied_args": [
+   "--gguf",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--kv-streaming",
+   "off"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "minimax",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "cache_gb": null,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_cache": "int8",
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": 0
+  },
+  "trained": null
+ },
+ "minimax/pack": {
+  "applied_args": [
+   "--glm-pack",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--kv-streaming",
+   "off"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "minimax",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model/m.gguf",
+  "settings": {
+   "ablate": false,
+   "cache_gb": null,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_cache": "int8",
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": 0
+  },
+  "trained": 131072
+ },
+ "minimax/plain": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--kv-streaming",
+   "off"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "minimax",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "cache_gb": null,
+   "context": 65536,
+   "cpu_threads": null,
+   "draft": "none",
+   "dspark_conf": null,
+   "env": {},
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv_cache": "int8",
+   "kv_resident": null,
+   "kv_streaming": false,
+   "parallel": 1,
+   "prefill_chunk": null,
+   "reserve_gb": null,
+   "tp": 0
+  },
+  "trained": null
+ },
+ "qwen/ctx-both": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--ctx",
+   "49152",
+   "--mtp-max-t",
+   "1",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "qwen",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "fp16",
+   "prefill": null,
+   "ram_gb": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "qwen/ctx-only": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--ctx",
+   "49152",
+   "--max-context",
+   "32768",
+   "--mtp-max-t",
+   "1",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "qwen",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 32768,
+   "draft": "none",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "fp16",
+   "prefill": null,
+   "ram_gb": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "qwen/dash-m": {
+  "applied_args": [
+   "-m",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--mtp-max-t",
+   "1",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "qwen",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "fp16",
+   "prefill": null,
+   "ram_gb": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "qwen/dspack": {
+  "applied_args": [
+   "--pack",
+   "<d>/dspack",
+   "--max-context",
+   "65536",
+   "--mtp-max-t",
+   "1",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "qwen",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/dspack",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "fp16",
+   "prefill": null,
+   "ram_gb": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "qwen/gguf": {
+  "applied_args": [
+   "--gguf",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--mtp-max-t",
+   "1",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "qwen",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "fp16",
+   "prefill": null,
+   "ram_gb": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ },
+ "qwen/pack": {
+  "applied_args": [
+   "--glm-pack",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--mtp-max-t",
+   "1",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "qwen",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": "<d>/model/m.gguf",
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "fp16",
+   "prefill": null,
+   "ram_gb": null,
+   "reserve_mib": null
+  },
+  "trained": 131072
+ },
+ "qwen/plain": {
+  "applied_args": [
+   "--model",
+   "<d>/model/m.gguf",
+   "--max-context",
+   "65536",
+   "--mtp-max-t",
+   "1",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto"
+  ],
+  "choices": {
+   "draft": [
+    "none"
+   ],
+   "images": false
+  },
+  "family": "qwen",
+  "gpus": [
+   0,
+   1
+  ],
+  "pack": null,
+  "settings": {
+   "ablate": false,
+   "context": 65536,
+   "draft": "none",
+   "env": {},
+   "expert_cache": null,
+   "gpus": [
+    0,
+    1
+   ],
+   "images": false,
+   "kv": "fp16",
+   "prefill": null,
+   "ram_gb": null,
+   "reserve_mib": null
+  },
+  "trained": null
+ }
+}

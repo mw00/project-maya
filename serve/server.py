@@ -1228,7 +1228,7 @@ class StrataEngine:
         args = list(args)
         if "--max-context" in args[:-1]:
             args[args.index("--max-context") + 1] = str(int(n))
-        elif "--ctx" in args[:-1]:
+        elif "--ctx" in args[:-1] and Path(str(exe)).name.startswith("maya-ling"):   # (maya-ling's own name for it)
             args[args.index("--ctx") + 1] = str(int(n))
         else:
             args += ["--max-context", str(int(n))]
@@ -3342,7 +3342,7 @@ class Service:
             args = list(cfg.get("args") or [])
             if "--max-context" in args[:-1]:
                 args[args.index("--max-context") + 1] = str(int(n))
-            elif "--ctx" in args[:-1]:
+            elif "--ctx" in args[:-1] and models.family(cfg) == "ling":   # (maya-ling's own name for it)
                 args[args.index("--ctx") + 1] = str(int(n))
             else:
                 args += ["--max-context", str(int(n))]
