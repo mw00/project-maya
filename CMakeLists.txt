@@ -1188,10 +1188,12 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
   endif()
   if(MAYA_ENABLE_CUDA AND NOT WIN32 AND (_ling_archs OR NOT _ling_filter))
     add_executable(maya-ling src/ling/ling_main.cu src/ling/ling_model.cu src/ling/ling_kernels.cu src/ling/ling_vision.cu
+                             src/ling/ling_parity.cpp
                              src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp
                              src/kernels/cuda/glmd_dec.cu src/kernels/cuda/glmd_batch.cu
-                             src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                             src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_lane_parity.cpp
                              src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_lt.cu)
+    set_source_files_properties(src/ling/ling_parity.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     target_include_directories(maya-ling PRIVATE ${_maya_gpu_include_directories} include src/ling src/hy4
                                                  src/ds4 src/mm3 src/kernels/cuda third_party/ggml)
     target_link_libraries(maya-ling PRIVATE maya_kernels maya_kernels_cpu ${_maya_gpu_runtime_target}

@@ -364,11 +364,77 @@ static void test_router_and_argmax() {
     std::printf("PASS test_router_and_argmax (T=%d, 512x8)\n", T);
 }
 
+static void test_router_nan_guard_and_fused_selfcheck() {
+    constexpr int NE = 512, NU = 8;
+    std::vector<float> h_log(NE, 0.1f), h_bias(NE, 0.0f);
+    h_log[137] = std::nanf("");
+    float *d_log = nullptr, *d_bias = nullptr, *d_w = nullptr;
+    int *d_ids = nullptr, *d_err = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_log, NE * 4));
+    CHECK_CUDA(cudaMalloc(&d_bias, NE * 4));
+    CHECK_CUDA(cudaMalloc(&d_w, NU * 4));
+    CHECK_CUDA(cudaMalloc(&d_ids, NU * 4));
+    CHECK_CUDA(cudaMalloc(&d_err, 4));
+    CHECK_CUDA(cudaMemcpy(d_log, h_log.data(), NE * 4, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_bias, h_bias.data(), NE * 4, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(d_err, 0, 4));
+    ling::k::router_grouped(d_log, d_bias, 1, NE, NU, 8, 4, true, 2.5f, d_ids, d_w, 0, d_err);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    int h_err = 0;
+    std::vector<int> ids(NU, -1);
+    std::vector<float> w(NU, -1.0f);
+    CHECK_CUDA(cudaMemcpy(&h_err, d_err, 4, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(ids.data(), d_ids, NU * 4, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(w.data(), d_w, NU * 4, cudaMemcpyDeviceToHost));
+    EXPECT(h_err == 1, "NaN router logit was not caught (err=%d)", h_err);
+    for (int k = 0; k < NU; ++k) EXPECT(ids[k] == 0 && w[k] == 0.0f, "NaN router did not zero fallback slot %d", k);
+    cudaFree(d_log); cudaFree(d_bias); cudaFree(d_w); cudaFree(d_ids); cudaFree(d_err);
+
+    std::string ferr;
+    cudaStream_t st = nullptr;
+    CHECK_CUDA(cudaStreamCreate(&st));
+    const bool fok = ling::k::verify_fused_kernels(st, ferr);
+    EXPECT(fok, "verify_fused_kernels failed: %s", ferr.c_str());
+
+    // Verify q8k_rows bit-exact against CPU Q8_K rounding
+    constexpr int K = 512;
+    std::vector<float> hx(K), hd(K / 32);
+    std::vector<int8_t> hq(K);
+    for (int i = 0; i < K; ++i) hx[i] = std::sin((float) i * 0.31f) * 3.0f;
+    float *dx = nullptr, *dd = nullptr;
+    int8_t *dq = nullptr;
+    CHECK_CUDA(cudaMalloc(&dx, K * 4));
+    CHECK_CUDA(cudaMalloc(&dq, K));
+    CHECK_CUDA(cudaMalloc(&dd, (K / 32) * 4));
+    CHECK_CUDA(cudaMemcpyAsync(dx, hx.data(), K * 4, cudaMemcpyHostToDevice, st));
+    ling::k::q8k_rows(dx, 1, K, dq, dd, st);
+    CHECK_CUDA(cudaMemcpyAsync(hq.data(), dq, K, cudaMemcpyDeviceToHost, st));
+    CHECK_CUDA(cudaMemcpyAsync(hd.data(), dd, (K / 32) * 4, cudaMemcpyDeviceToHost, st));
+    CHECK_CUDA(cudaStreamSynchronize(st));
+    for (int b = 0; b < K / 256; ++b) {
+        float am = 0.0f; int ix = 0;
+        for (int j = 0; j < 256; ++j) if (std::fabs(hx[b * 256 + j]) > am) { am = std::fabs(hx[b * 256 + j]); ix = j; }
+        const float iscale = -127.0f / hx[b * 256 + ix];
+        const float ref_d = 1.0f / iscale;
+        EXPECT(std::fabs(hd[b * 8] - ref_d) <= 1e-7f, "q8k_rows d mismatch blk %d: %g vs %g", b, hd[b * 8], ref_d);
+        for (int j = 0; j < 256; ++j) {
+            const float val = iscale * hx[b * 256 + j] + 12582912.0f;
+            int32_t bits; std::memcpy(&bits, &val, 4);
+            const int8_t ref_q = (int8_t) std::min(127, (bits & 0x007fffff) - 0x00400000);
+            EXPECT(hq[b * 256 + j] == ref_q, "q8k_rows q mismatch at %d: %d vs %d", b * 256 + j, (int) hq[b * 256 + j], (int) ref_q);
+        }
+    }
+    cudaFree(dx); cudaFree(dq); cudaFree(dd);
+    cudaStreamDestroy(st);
+    std::printf("PASS test_router_nan_guard_and_fused_selfcheck\n");
+}
+
 int main() {
     test_kda_window_and_rollback();
     test_mrope_3d();
     test_mla_dec_wmma();
     test_router_and_argmax();
+    test_router_nan_guard_and_fused_selfcheck();
     if (g_fail > 0) {
         std::fprintf(stderr, "ling_kernels_test: %d failures\n", g_fail);
         return 1;

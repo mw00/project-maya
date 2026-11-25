@@ -11,6 +11,9 @@
 #include <cstring>
 // src/ling/ling_main.cu - maya-ling CLI for Ling-3.2-air (bailingmoe3).
 #include "ling_model.hpp"
+#include "ling_parity.hpp"
+#include "ling_sys.hpp"
+#include "ds4_watchdog.hpp"
 
 #include "hy4_kernels.cuh"
 
@@ -406,6 +409,175 @@ static bool read_ppm_or_image(const std::string& path, const ling::VisionGeo& g,
 }
 
 
+
+namespace {
+
+static std::atomic<bool> g_sig_quit{false};
+static std::atomic<bool> g_wd_busy{false};
+static std::atomic<uint64_t> g_wd_beats{0};
+static std::atomic<const char*> g_wd_stage{"idle"};
+
+static void ling_sig_handler(int) {
+    g_sig_quit.store(true);
+}
+
+static void beat(const char* stage = nullptr) {
+    if (stage != nullptr) g_wd_stage.store(stage);
+    g_wd_beats.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void log_env_settings() {
+    static const char* kVars[] = {
+        "CUDA_VISIBLE_DEVICES", "LING_PROFILE", "LING_CAL_FILE", "LING_SEAM_DIR",
+        "LING_WATCHDOG_S", "LING_PYTHON", "MAYA_LING_KV", "MAYA_LING_DRAFT",
+        "MAYA_ENGINE_QUIT_S", "OMP_NUM_THREADS"
+    };
+    std::ostringstream os;
+    os << "ling env:";
+    for (const char* k : kVars) {
+        const char* v = std::getenv(k);
+        os << " " << k << "=" << (v && *v ? v : "<unset>");
+    }
+    std::fprintf(stderr, "%s\n", os.str().c_str());
+}
+
+// Prompt lookup (suffix drafter): find longest recent suffix match of length [2..8] in token history, propose up to max_k tokens.
+static void suffix_draft(const std::vector<int>& hist, int max_k, std::vector<int>& out) {
+    out.clear();
+    if (max_k <= 0 || hist.size() < 4) return;
+    const size_t n = hist.size();
+    const size_t max_gram = std::min<size_t>(8, n - 1);
+    const size_t scan_lo = n > 16384 ? n - 16384 : 0;
+    for (size_t g = max_gram; g >= 2; --g) {
+        // Search backwards so most recent match wins (critical for code/text edits)
+        if (n < g + 2) continue;
+        for (size_t pos = n - g - 1; ; --pos) {
+            bool eq = true;
+            for (size_t j = 0; j < g; ++j) {
+                if (hist[pos + j] != hist[n - g + j]) { eq = false; break; }
+            }
+            if (eq) {
+                const size_t avail = n - (pos + g);
+                const size_t take = std::min<size_t>((size_t) max_k, avail);
+                for (size_t k = 0; k < take; ++k) out.push_back(hist[pos + g + k]);
+                return;
+            }
+            if (pos <= scan_lo) break;
+        }
+    }
+}
+
+struct DraftDecision {
+    bool use_mtp = false;
+    bool use_lookup = true;
+    int base_k = 1;
+    int max_k = 2;
+    float cum_min = 0.25f;
+    double gain_pct = 0.0;
+};
+
+// Calibrate drafting once per PC on 3 short synthetic probes (chat / code / tool-call) and persist in keyed cal file.
+static DraftDecision calibrate_drafting(ling::Model& model, bool force_recal) {
+    DraftDecision dec;
+    dec.use_lookup = true;
+    if (!model.has_mtp() || model.opts().repeatable) {
+        dec.use_mtp = false;
+        return dec;
+    }
+    const std::string& cf = model.cal_file();
+    const std::string& ck = model.cal_key();
+    if (!force_recal && !cf.empty()) {
+        auto rec = ling::sys::cal_load(cf, ck);
+        if (rec.count("draft_mtp") && rec.count("draft_gain")) {
+            dec.use_mtp = (rec["draft_mtp"] == "1");
+            dec.base_k = rec.count("draft_k") ? std::max(1, std::atoi(rec["draft_k"].c_str())) : 1;
+            dec.max_k = std::min(ling::Model::kMaxWin - 1, dec.base_k + 1);
+            dec.gain_pct = std::atof(rec["draft_gain"].c_str());
+            std::fprintf(stderr, "ling draft-cal: cached mtp=%d base_k=%d gain=%+.1f%% lookup=1 (key=%s)\n",
+                         dec.use_mtp ? 1 : 0, dec.base_k, dec.gain_pct, ck.c_str());
+            return dec;
+        }
+    }
+    const int V = model.cfg().vocab;
+    // 3 short domain probes (chat / code / tool-call style token patterns)
+    const std::vector<std::vector<int>> probes = {
+        {1, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100},
+        {1, 150, 250, 350, 450, 150, 250, 350, 450, 550, 650, 750},
+        {1, 120, 220, 320, 420, 520, 620, 720, 820, 920, 1020, 1120},
+    };
+    auto time_mode = [&](int mk) -> double {
+        double tot_s = 0.0;
+        int tot_tok = 0;
+        for (const auto& raw : probes) {
+            std::vector<int> pr;
+            for (int x : raw) pr.push_back(x % std::max(16, V - 16));
+            model.reset();
+            const float* lg = model.prefill(pr.data(), (int) pr.size(), 0);
+            int cur = model.argmax_logits(lg);
+            int pos = (int) pr.size();
+            const auto t0 = std::chrono::steady_clock::now();
+            int prod = 0;
+            std::vector<int> dr;
+            std::vector<float> cfv;
+            while (prod < 16 && pos < model.max_ctx() - 2) {
+                if (mk == 0) {
+                    lg = model.step(cur, pos++);
+                    cur = model.argmax_logits(lg);
+                    ++prod;
+                } else {
+                    model.mtp_draft(cur, pos, mk, 0.45f, dr, cfv, 0.25f, 0.25f);
+                    const int K = (int) dr.size();
+                    if (K == 0) {
+                        lg = model.step(cur, pos++);
+                        cur = model.argmax_logits(lg);
+                        ++prod;
+                    } else {
+                        int wt[ling::Model::kMaxWin];
+                        wt[0] = cur;
+                        for (int i = 0; i < K; ++i) wt[1 + i] = dr[(size_t) i];
+                        const float* wl = model.step_window(wt, 1 + K, pos);
+                        int pred[ling::Model::kMaxWin];
+                        model.argmax_rows(wl, 1 + K, pred);
+                        int kept = 0;
+                        while (kept < K && pred[kept] == dr[(size_t) kept]) ++kept;
+                        model.commit_window(1 + kept, 1 + K, pos, wt);
+                        pos += 1 + kept;
+                        prod += 1 + kept;
+                        cur = pred[kept];
+                    }
+                }
+            }
+            tot_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            tot_tok += prod;
+        }
+        model.reset();
+        return tot_s > 0.0 ? (double) tot_tok / tot_s : 0.0;
+    };
+    const double tps0 = time_mode(0);
+    const double tps1 = time_mode(1);
+    const double tps2 = time_mode(2);
+    const double best_mtp = std::max(tps1, tps2);
+    const double gain = tps0 > 0.0 ? 100.0 * (best_mtp - tps0) / tps0 : 0.0;
+    dec.gain_pct = gain;
+    dec.use_mtp = (gain >= 3.0);
+    dec.base_k = (tps2 > tps1 * 1.02) ? 2 : 1;
+    dec.max_k = std::min(ling::Model::kMaxWin - 1, dec.base_k + 1);
+    if (!cf.empty()) {
+        auto rec = ling::sys::cal_load(cf, ck);
+        char gb[32];
+        std::snprintf(gb, sizeof gb, "%.2f", gain);
+        rec["draft_mtp"] = dec.use_mtp ? "1" : "0";
+        rec["draft_k"] = std::to_string(dec.base_k);
+        rec["draft_gain"] = gb;
+        ling::sys::cal_save(cf, ck, rec);
+    }
+    std::fprintf(stderr, "ling draft-cal: measured none=%.2f mtp1=%.2f mtp2=%.2f t/s -> gain=%+.1f%% keep_mtp=%d base_k=%d\n",
+                 tps0, tps1, tps2, gain, dec.use_mtp ? 1 : 0, dec.base_k);
+    return dec;
+}
+
+}  // namespace
+
 namespace {
 
 struct ServeLines {
@@ -449,7 +621,9 @@ struct ServeLines {
 
     bool next(std::string& out) {
         std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&] { return !q.empty() || eof; });
+        while (q.empty() && !eof && !g_sig_quit.load()) {
+            cv.wait_for(lk, std::chrono::milliseconds(50));
+        }
         if (q.empty()) return false;
         out = std::move(q.front());
         q.pop_front();
@@ -470,7 +644,12 @@ struct ServeReq {
     float pen_present = 0.0f;
     int64_t think_budget = 0;
     int think_end = -1;
-    int spec = -2;  // -2 = inherit default, 0 = off, >0 = fixed, -1 = auto
+    int spec = -2;         // -2 = inherit default, 0 = off, >0 = fixed, -1 = auto
+    int suffix_draft = -1; // -1 = inherit default, 0 = off, 1 = on
+    float spec_cum = -1.0f;
+    std::vector<size_t> marks;
+    size_t shared_mark = 0;
+    size_t tail_mark = 0;
     std::string file;
     std::vector<int> ids;
 };
@@ -522,7 +701,19 @@ static bool parse_serve_gen(const std::string& line, ServeReq& r) {
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
         else if (k == "spec") {
             const int sv = std::atoi(v.c_str());
-            r.spec = sv <= 1 ? 0 : std::min(sv - 1, ling::Model::kMaxWin - 1);
+            if (sv == 1) r.spec = -1;  // spec=1 enables engine drafting (spec=0 disables it)
+            else if (sv <= 0) r.spec = 0;
+            else r.spec = std::min(sv, ling::Model::kMaxWin - 1);
+        } else if (k == "suffix_draft" || k == "lookup") {
+            r.suffix_draft = std::atoi(v.c_str()) != 0 ? 1 : 0;
+        } else if (k == "spec_cum") {
+            r.spec_cum = std::strtof(v.c_str(), nullptr);
+        } else if (k == "shared") {
+            r.shared_mark = (size_t) std::max(0, std::atoi(v.c_str()));
+        } else if (k == "tail") {
+            r.tail_mark = (size_t) std::max(0, std::atoi(v.c_str()));
+        } else if (k == "marks") {
+            for (int mv : parse_ints(v)) if (mv > 0) r.marks.push_back((size_t) mv);
         }
     }
     return !r.ids.empty();
@@ -637,26 +828,85 @@ static int draw_from_dist(const std::vector<std::pair<int, double>>& dist, std::
     return dist[0].first;
 }
 
-static int serve_loop(ling::Model& model, int default_spec_k, float default_floor) {
+static int serve_loop(ling::Model& model, int default_spec_k, float default_floor, float default_cum,
+                      int default_lookup, bool recalibrate_draft) {
     const ling::Config& c = model.cfg();
     const bool has_mtp = model.has_mtp();
-    std::printf("INFO engine=ling engine_kind=ling model=Ling-3.2-air ctx=%d vram_gb=%.2f dspark=0 mtp=%d "
-                "experts=%zu vram_slots=%zu expert_slots=%zu\n",
-                model.max_ctx(), model.vram_gb(), (has_mtp && default_spec_k != 0) ? 1 : 0, model.experts_all(),
-                model.experts_vram(), model.experts_vram());
+
+#if defined(SIGPIPE)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    std::signal(SIGINT, ling_sig_handler);
+    std::signal(SIGTERM, ling_sig_handler);
+
+    // Watchdog thread: detects stalled prefill/decode stage and names it before exiting with code 3
+    double wd_limit_s = 600.0;
+    if (const char* ws = std::getenv("LING_WATCHDOG_S")) wd_limit_s = std::atof(ws);
+    std::atomic<bool> wd_stop{false};
+    std::thread wd_thread([&] {
+        maya::ds4::StallRule rule{wd_limit_s};
+        const auto t_boot = std::chrono::steady_clock::now();
+        while (!wd_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (wd_stop.load()) break;
+            const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_boot).count();
+            if (rule.stalled(g_wd_busy.load(), g_wd_beats.load(), now_s)) {
+                const char* stg = g_wd_stage.load();
+                std::fprintf(stderr, "maya-ling: WATCHDOG stalled > %.0fs in stage '%s' (issue #29); aborting\n",
+                             wd_limit_s, stg ? stg : "unknown");
+                std::fflush(stderr);
+                ::_exit(3);
+            }
+        }
+    });
+    struct WdJoin {
+        std::atomic<bool>& stop;
+        std::thread& th;
+        ~WdJoin() {
+            stop.store(true);
+            if (th.joinable()) th.join();
+        }
+    } wd_guard{wd_stop, wd_thread};
+
+    // PC-measured auto-drafting decision when default_spec_k < 0
+    DraftDecision cal_dec;
+    if (has_mtp && default_spec_k < 0) {
+        cal_dec = calibrate_drafting(model, recalibrate_draft);
+    } else {
+        cal_dec.use_mtp = has_mtp && (default_spec_k > 0);
+        cal_dec.use_lookup = (default_lookup != 0);
+        cal_dec.base_k = std::max(1, default_spec_k);
+        cal_dec.max_k = std::max(1, default_spec_k);
+    }
+    if (default_lookup == 0) cal_dec.use_lookup = false;
+    else if (default_lookup == 1) cal_dec.use_lookup = true;
+
+    const size_t cache_mib = (model.experts_vram() > 0 && model.vram_gb() > 0.0)
+                                 ? (size_t) std::llround(model.vram_gb() * 1024.0)
+                                 : 0u;
+    const int vis_on = model.vision() != nullptr ? 1 : 0;
+    const int vis_lend = (vis_on && std::strcmp(model.vision_room(), "tail") == 0) ? 1 : 0;
+    const char* spec_str = cal_dec.use_mtp ? (cal_dec.use_lookup ? "mtp+lookup" : "mtp")
+                                           : (cal_dec.use_lookup ? "lookup" : "off");
+
+    std::printf("INFO engine=ling arch=bailingmoe3 engine_kind=ling model=Ling-3.2-air context=%d ctx=%d kv=%s "
+                "vram_gb=%.2f ram_gb=%.2f ssd_gb=%.2f dspark=0 mtp=%d spec=%s vision=%d vision_lend=%d "
+                "experts=%zu vram_slots=%zu ram_slots=%zu ssd_slots=%zu expert_slots=%zu expert_cache_mib=%zu "
+                "cpu_threads=%d pcie_share=%.2f\n",
+                model.max_ctx(), model.max_ctx(), model.kv_q8() ? "q8" : "f16",
+                model.vram_gb(), model.ram_gb(), model.ssd_gb(),
+                (has_mtp && (default_spec_k != 0)) ? 1 : 0, spec_str, vis_on, vis_lend,
+                model.experts_all(), model.experts_vram(), model.experts_ram(), model.experts_ssd(),
+                model.experts_vram(), cache_mib, model.cpu_threads(), model.pcie_share());
     if (const ling::VisionGeo* vg = model.vision()) {
         std::printf("INFO vision=ling image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d vision_room=%s vision_room_mib=%zu\n",
                     vg->image_token, vg->image_start, vg->image_end, vg->patch, vg->merge, vg->max_pixels,
                     vg->min_pixels, model.vision_room(), model.vision_room_bytes() >> 20);
     }
-    std::printf("READY %d stop\n", model.max_ctx());
+    std::printf("READY %d stop pause\n", model.max_ctx());
     std::fflush(stdout);
-    std::fprintf(stderr, "maya-ling serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT\n");
-
-#if defined(SIGPIPE)
-    std::signal(SIGPIPE, SIG_IGN);
-#endif
+    std::fprintf(stderr, "maya generate: maya-ling serve (GEN/GENI/VLEND/VRECLAIM/STOP/WRAP/QUIT)\n");
 
     ServeLines& in = *new ServeLines;
     in.start();
@@ -664,45 +914,54 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
     auto now_ms = []() -> double {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
     };
-    auto is_eos = [&](int tok) -> bool {
-        return c.is_stop_id(tok);
-    };
+    auto is_eos = [&](int tok) -> bool { return c.is_stop_id(tok); };
 
-    // Derive rolling KDA snapshot count from model snapshot footprint and host RAM remaining after load
+    // Restore points: in-memory rolling cache + optional disk persistence across restarts
     const size_t snap_bytes = model.kda_snapshot_bytes();
     const uint64_t avail_after = hy4::ram_available();
     const uint64_t total_ram = hy4::ram_total();
     const uint64_t snap_headroom = std::max<uint64_t>(4ULL << 30, total_ram / 10);
     size_t max_snaps = 0;
     if (snap_bytes > 0) {
-        if (avail_after == 0) {
-            max_snaps = 2;  // host RAM unavailable: conservative fallback
-        } else if (avail_after > snap_headroom) {
-            const uint64_t budget = std::min<uint64_t>((avail_after - snap_headroom) / 20, 1ULL << 30);
-            max_snaps = std::min<size_t>((size_t) (budget / snap_bytes), 16);
+        if (avail_after == 0) max_snaps = 2;
+        else if (avail_after > snap_headroom) {
+            const uint64_t budget = std::min<uint64_t>((avail_after - snap_headroom) / 20, 2ULL << 30);
+            max_snaps = std::min<size_t>((size_t) (budget / snap_bytes), 24);
         }
     }
     std::deque<ling::Model::KdaSnapshot> snaps;
+    const std::string& rdir = model.opts().restore_dir;
+    if (!rdir.empty()) {
+        std::vector<ling::Model::KdaSnapshot> disk_snaps;
+        if (model.load_restore_disk(rdir, disk_snaps)) {
+            for (auto& ds : disk_snaps) snaps.push_back(std::move(ds));
+            std::fprintf(stderr, "ling restore: loaded %zu persisted restore point(s) from %s\n",
+                         snaps.size(), rdir.c_str());
+        }
+    }
     std::vector<int> live_tokens;
     std::vector<std::pair<int64_t, uint64_t>> live_pics;
 
     auto pics_match_prefix = [](const std::vector<std::pair<int64_t, uint64_t>>& a,
                                 const std::vector<std::pair<int64_t, uint64_t>>& b, size_t prefix_len) -> bool {
         std::vector<std::pair<int64_t, uint64_t>> fa, fb;
-        for (const auto& p : a)
-            if ((size_t) p.first < prefix_len) fa.push_back(p);
-        for (const auto& p : b)
-            if ((size_t) p.first < prefix_len) fb.push_back(p);
+        for (const auto& p : a) if ((size_t) p.first < prefix_len) fa.push_back(p);
+        for (const auto& p : b) if ((size_t) p.first < prefix_len) fb.push_back(p);
         return fa == fb;
     };
 
-    auto push_snap = [&](const std::vector<int>& toks, const std::vector<std::pair<int64_t, uint64_t>>& pics) {
-        if (max_snaps == 0 || toks.size() < 16) return;
-        // Avoid duplicating an identical checkpoint length
-        for (const auto& s : snaps)
+    auto push_snap = [&](const std::vector<int>& toks, const std::vector<std::pair<int64_t, uint64_t>>& pics,
+                         bool persist_disk) {
+        if (max_snaps == 0 || toks.size() < 8) return;
+        for (const auto& s : snaps) {
             if (s.tokens.size() == toks.size() && s.tokens == toks && s.pics == pics) return;
+        }
         ling::Model::KdaSnapshot sp;
-        model.save_kda_snapshot(sp, toks, pics);
+        model.save_kda_snapshot(sp, toks, pics, persist_disk || !rdir.empty());
+        if (persist_disk && !rdir.empty()) {
+            std::string serr;
+            (void) model.save_restore_disk(sp, rdir, serr);
+        }
         if (snaps.size() >= max_snaps) snaps.pop_front();
         snaps.push_back(std::move(sp));
     };
@@ -712,8 +971,23 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
     uint64_t req_counter = 0;
     std::string line;
 
-    while (in.next(line)) {
+    while (!g_sig_quit.load() && in.next(line)) {
         if (line == "QUIT") break;
+        if (line == "VLEND") {
+            size_t mib = 0;
+            std::string verr;
+            if (model.vlend(mib, verr)) std::printf("VLENT %zu\n", mib);
+            else std::printf("ERR %s\n", verr.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        if (line == "VRECLAIM") {
+            std::string verr;
+            if (model.vreclaim(verr)) std::printf("VRECLAIMED\n");
+            else std::printf("ERR %s\n", verr.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
             std::printf("ERR unsupported command '%s'\n", line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
@@ -721,100 +995,93 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
         }
         in.stop.store(false);
         in.wrap.store(false);
+        g_wd_busy.store(true);
+        beat("parse");
+
         ServeReq r;
         if (!parse_serve_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
-            std::printf("ERR malformed GEN/GENI request\n");
-            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+            std::printf("ERR bad GEN syntax\nDONE 0 0 0.0 0.0 cancel 0 0 0 0 0\n");
             std::fflush(stdout);
-            continue;
-        }
-        bool bad_tok = false;
-        for (size_t i = 0; i < r.ids.size(); ++i) {
-            if (r.ids[i] < 0 || r.ids[i] >= c.vocab) {
-                std::printf("ERR token id %d at index %zu out of range [0, %d)\n", r.ids[i], i, c.vocab);
-                std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
-                std::fflush(stdout);
-                bad_tok = true;
-                break;
-            }
-        }
-        if (bad_tok) continue;
-        if (r.think_end != -1 && (r.think_end < 0 || r.think_end >= c.vocab)) {
-            std::printf("ERR think_end token id %d out of range [0, %d)\n", r.think_end, c.vocab);
-            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
-            std::fflush(stdout);
+            g_wd_busy.store(false);
             continue;
         }
         if ((int) r.ids.size() >= model.max_ctx()) {
-            std::printf("ERR prompt (%zu) exceeds context (%d)\n", r.ids.size(), model.max_ctx());
-            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+            std::printf("ERR prompt length %zu exceeds max context %d\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n",
+                        r.ids.size(), model.max_ctx(), r.ids.size());
             std::fflush(stdout);
+            g_wd_busy.store(false);
             continue;
+        }
+        {
+            int bad_pos = -1, bad_id = 0;
+            for (size_t idx = 0; idx < r.ids.size(); ++idx) {
+                if (r.ids[idx] < 0 || r.ids[idx] >= c.vocab) {
+                    bad_pos = (int) idx;
+                    bad_id = r.ids[idx];
+                    break;
+                }
+            }
+            if (bad_pos >= 0) {
+                std::printf("ERR token id %d at index %d out of range [0, %d)\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n",
+                            bad_id, bad_pos, c.vocab, r.ids.size());
+                std::fflush(stdout);
+                g_wd_busy.store(false);
+                continue;
+            }
+        }
+
+        std::vector<CliPic> cli_pics;
+        std::vector<std::pair<int64_t, uint64_t>> req_pic_sig;
+        if (!r.file.empty()) {
+            beat("vision_read");
+            std::string err;
+            if (!read_mmi1_file(r.file, cli_pics, err, /*restrict_temp=*/true)) {
+                std::printf("ERR %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", err.c_str(), r.ids.size());
+                std::fflush(stdout);
+                g_wd_busy.store(false);
+                continue;
+            }
+            req_pic_sig.reserve(cli_pics.size());
+            for (const auto& q : cli_pics) req_pic_sig.push_back({q.start, q.hash});
         }
 
         const double t0 = now_ms();
-        std::vector<CliPic> pics;
-        std::vector<std::pair<int64_t, uint64_t>> req_pic_sig;
-        std::string err;
-        if (!r.file.empty()) {
-            if (!read_mmi1_file(r.file, pics, err, /*restrict_temp=*/true)) {
-                std::printf("ERR %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", err.c_str(), r.ids.size());
-                std::fflush(stdout);
-                continue;
+        size_t reused = 0;
+        const bool can_reuse_live =
+            !live_tokens.empty() && live_tokens.size() < r.ids.size() &&
+            std::equal(live_tokens.begin(), live_tokens.end(), r.ids.begin()) &&
+            pics_match_prefix(live_pics, req_pic_sig, live_tokens.size());
+        if (can_reuse_live) {
+            reused = live_tokens.size();
+        } else {
+            int best_snap = -1;
+            size_t best_len = 0;
+            for (int si = 0; si < (int) snaps.size(); ++si) {
+                const auto& sp = snaps[(size_t) si];
+                if (sp.tokens.size() < r.ids.size() && sp.tokens.size() > best_len &&
+                    std::equal(sp.tokens.begin(), sp.tokens.end(), r.ids.begin()) &&
+                    pics_match_prefix(sp.pics, req_pic_sig, sp.tokens.size())) {
+                    best_len = sp.tokens.size();
+                    best_snap = si;
+                }
             }
-            for (const auto& q : pics) req_pic_sig.push_back({q.start, q.hash});
+            if (best_snap >= 0) {
+                beat("restore");
+                model.restore_kda_snapshot(snaps[(size_t) best_snap]);
+                reused = best_len;
+            } else {
+                model.reset();
+                reused = 0;
+            }
         }
 
-        // Find longest reusable prefix across live GPU state and host-RAM KDA snapshots (strictly < r.ids.size())
-        size_t reused = 0;
-        int best_snap = -1;  // -1 = reset, -2 = live GPU state matches exactly
-        if (!live_tokens.empty() && live_tokens.size() < r.ids.size() &&
-            std::equal(live_tokens.begin(), live_tokens.end(), r.ids.begin()) &&
-            pics_match_prefix(live_pics, req_pic_sig, live_tokens.size())) {
-            reused = live_tokens.size();
-            best_snap = -2;
-        }
-        for (size_t si = 0; si < snaps.size(); ++si) {
-            const auto& sp = snaps[si];
-            if (sp.tokens.size() > reused && sp.tokens.size() < r.ids.size() &&
-                std::equal(sp.tokens.begin(), sp.tokens.end(), r.ids.begin()) &&
-                pics_match_prefix(sp.pics, req_pic_sig, sp.tokens.size())) {
-                reused = sp.tokens.size();
-                best_snap = (int) si;
-            }
-        }
-        if (best_snap == -1) {
-            model.reset();
-            reused = 0;
-        } else if (best_snap >= 0) {
-            model.restore_kda_snapshot(snaps[(size_t) best_snap]);
-        }
-        // Encode any images overlapping [reused .. r.ids.size())
         std::vector<ling::Model::Image> mimgs;
-        if (!pics.empty()) {
-            const ling::VisionGeo* vg = model.vision();
-            if (!vg) {
-                std::printf("ERR no vision tower loaded (pass --mmproj)\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n",
-                            r.ids.size());
-                std::fflush(stdout);
-                live_tokens.clear();
-                live_pics.clear();
-                continue;
-            }
+        if (!cli_pics.empty()) {
+            beat("vision_encode");
+            std::string err;
             bool vis_ok = true;
-            for (const auto& q : pics) {
-                const int ntok = vg->tokens(q.width, q.height);
-                if (ntok <= 0 || q.start + ntok > (int64_t) r.ids.size()) {
-                    err = "invalid picture span";
-                    vis_ok = false;
-                    break;
-                }
-                if (q.start + ntok > (int64_t) reused) {
-                    if (q.start < (int64_t) reused) {
-                        // Partial overlap with cached image span -> safely reset to before image
-                        model.reset();
-                        reused = 0;
-                    }
+            for (const auto& q : cli_pics) {
+                if ((size_t) q.start >= reused) {
                     ling::Model::Image im;
                     im.start = q.start;
                     im.width = q.width;
@@ -831,34 +1098,90 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
                 std::fflush(stdout);
                 live_tokens.clear();
                 live_pics.clear();
+                g_wd_busy.store(false);
                 continue;
             }
         }
         model.set_images(std::move(mimgs));
 
-        const int to_read = (int) (r.ids.size() - reused);
+        // Build restore-point cut positions within the unread part of the prompt:
+        // shared start (system+tools), explicit marks, last user turn (tail), and every 16K tokens.
+        std::vector<size_t> cuts;
+        auto add_cut = [&](size_t cpos) {
+            if (cpos > reused && cpos < r.ids.size()) cuts.push_back(cpos);
+        };
+        if (r.shared_mark > 0) add_cut(r.shared_mark);
+        if (r.tail_mark > 0) add_cut(r.tail_mark);
+        for (size_t mk : r.marks) add_cut(mk);
+        for (size_t ck = 16384; ck < r.ids.size(); ck += 16384) add_cut(ck);
+        std::sort(cuts.begin(), cuts.end());
+        cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+        cuts.push_back(r.ids.size());
+
         bool cancelled = false;
+        bool fatal_gpu = false;
         const float* logits = nullptr;
+        size_t cur_pos = reused;
         try {
-            logits = model.prefill(
-                r.ids.data() + reused, to_read, (int) reused, nullptr, [&](int done_rel, int /*tot_rel*/) -> bool {
-                    const double ms = now_ms() - t0;
-                    const size_t done_abs = reused + (size_t) done_rel;
-                    std::printf("PP %zu %zu %.1f %.1f %zu\n", done_abs, r.ids.size(), ms,
-                                ms > 0.0 ? 1000.0 * (double) done_rel / ms : 0.0, reused);
-                    std::fflush(stdout);
-                    if (in.stop.load() && done_rel < to_read) {
-                        cancelled = true;
-                        return false;
-                    }
-                    return true;
-                });
+            for (size_t seg_end : cuts) {
+                const int seg_n = (int) (seg_end - cur_pos);
+                if (seg_n <= 0) continue;
+                beat("prefill");
+                logits = model.prefill(
+                    r.ids.data() + cur_pos, seg_n, (int) cur_pos, nullptr, [&](int done_rel, int /*tot_rel*/) -> bool {
+                        beat("prefill");
+                        const double ms = now_ms() - t0;
+                        const size_t done_abs = cur_pos + (size_t) done_rel;
+                        const size_t tot_new = done_abs - reused;
+                        std::printf("PP %zu %zu %.1f %.1f %zu\n", done_abs, r.ids.size(), ms,
+                                    ms > 0.0 ? 1000.0 * (double) tot_new / ms : 0.0, reused);
+                        std::fflush(stdout);
+                        if (in.stop.load() || g_sig_quit.load()) {
+                            cancelled = true;
+                            return false;
+                        }
+                        return true;
+                    },
+                    &in.stop);
+                if (in.stop.load() || g_sig_quit.load() || logits == nullptr) {
+                    cancelled = true;
+                    break;
+                }
+                cur_pos = seg_end;
+                if (seg_end < r.ids.size()) {
+                    // Save intermediate restore point (shared start / last user turn / every 16K), persisted to disk if configured
+                    std::vector<int> pref(r.ids.begin(), r.ids.begin() + (ptrdiff_t) seg_end);
+                    std::vector<std::pair<int64_t, uint64_t>> pref_pics;
+                    for (const auto& pp : req_pic_sig) if ((size_t) pp.first < seg_end) pref_pics.push_back(pp);
+                    const bool persist_it = (seg_end == r.shared_mark || seg_end == r.tail_mark || (seg_end % 16384 == 0) ||
+                                             std::find(r.marks.begin(), r.marks.end(), seg_end) != r.marks.end());
+                    push_snap(pref, pref_pics, persist_it);
+                }
+            }
+        } catch (const ling::GpuFaultError& e) {
+            std::printf("ERR %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", e.what(), r.ids.size());
+            std::fflush(stdout);
+            fatal_gpu = true;
+        } catch (const ling::RouteError& e) {
+            std::printf("ERR route error: %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", e.what(), r.ids.size());
+            std::fflush(stdout);
+            live_tokens.clear();
+            live_pics.clear();
+            model.reset();
+            g_wd_busy.store(false);
+            continue;
         } catch (const std::exception& e) {
             std::printf("ERR prefill failed: %s\nDONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", e.what(), r.ids.size());
             std::fflush(stdout);
             live_tokens.clear();
             live_pics.clear();
+            model.reset();
+            g_wd_busy.store(false);
             continue;
+        }
+        if (fatal_gpu) {
+            g_wd_busy.store(false);
+            return 3;
         }
         const double t1 = now_ms();
         const double prompt_ms = t1 - t0;
@@ -867,13 +1190,19 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
             std::fflush(stdout);
             live_tokens.clear();
             live_pics.clear();
+            model.reset();
+            g_wd_busy.store(false);
             continue;
         }
 
-        // Prompt fully evaluated: live state matches r.ids exactly; checkpoint it for instant retries / branching!
+        // Emit guaranteed final PP line
+        std::printf("PP %zu %zu %.1f %.1f %zu\n", r.ids.size(), r.ids.size(), prompt_ms,
+                    prompt_ms > 0.0 ? 1000.0 * (double) (r.ids.size() - reused) / prompt_ms : 0.0, reused);
+        std::fflush(stdout);
+
         live_tokens = r.ids;
         live_pics = req_pic_sig;
-        push_snap(live_tokens, live_pics);
+        push_snap(live_tokens, live_pics, !rdir.empty());
 
         const ling::TierStats st0 = model.stats();
         ++req_counter;
@@ -882,12 +1211,16 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
         const int max_new = std::min(r.max_new > 0 ? r.max_new : model.max_ctx(),
                                      std::max(0, model.max_ctx() - (int) r.ids.size() - 1));
         const int eff_spec = (r.spec == -2) ? default_spec_k : r.spec;
-        const bool use_spec = has_mtp && (eff_spec != 0) && !has_penalties(r);
+        const bool req_mtp = has_mtp && !has_penalties(r) &&
+                             ((eff_spec > 0) || (eff_spec < 0 && cal_dec.use_mtp));
+        const bool req_lookup = !has_penalties(r) && !model.opts().repeatable &&
+                                ((r.suffix_draft >= 0) ? (r.suffix_draft != 0) : (cal_dec.use_lookup && eff_spec != 0));
+        const bool use_spec = req_mtp || req_lookup;
         const bool auto_spec = (eff_spec < 0);
-        const bool high_vram = model.vram_res_frac() >= 0.65;
-        const int base_k = auto_spec ? (high_vram ? 1 : 2) : std::max(0, eff_spec);
-        const int max_k_lim = auto_spec ? 2 : std::max(0, eff_spec);
+        const int base_k = auto_spec ? cal_dec.base_k : (eff_spec > 0 ? eff_spec : 2);
+        const int max_k_lim = auto_spec ? cal_dec.max_k : (eff_spec > 0 ? eff_spec : 3);
         const float f0 = auto_spec ? 0.25f : 0.0f;
+        const float cum_cut = r.spec_cum >= 0.0f ? r.spec_cum : default_cum;
 
         auto fetch_row = [&](const float* dev_lg) {
             cudaSetDevice(model.output_dev());
@@ -905,168 +1238,232 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
         int produced = 0;
         int pos = (int) r.ids.size();
         const char* finish = "length";
-        unsigned long long d_off = 0, d_acc = 0;
+        unsigned long long d_off = 0, d_acc = 0, d_rounds = 0;
+        double draft_ms_tot = 0.0, verify_ms_tot = 0.0;
         bool in_think = (r.think_budget > 0 && r.think_end >= 0);
+
+        auto emit_stat = [&]() {
+            const double dms = now_ms() - t1;
+            const ling::TierStats st = model.stats();
+            const unsigned long long dp = st.picks - st0.picks;
+            const unsigned long long dh = st.vram_hits - st0.vram_hits;
+            const unsigned long long dram = st.ram_fetch - st0.ram_fetch;
+            const unsigned long long dssd = st.ssd_fetch - st0.ssd_fetch;
+            const unsigned long long dpro = st.admitted - st0.admitted;
+            const double per_tok = produced > 0 ? 1.0 / (double) produced : 0.0;
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.2f disk=%.2f promo=%.2f "
+                        "vram_used=%zu vram_slots=%zu ram_used=%zu ram_slots=%zu ssd_slots=%zu "
+                        "vram_gb=%.2f ram_gb=%.2f ssd_gb=%.2f kv_gb=%.3f "
+                        "draft_rounds=%llu draft_acc=%llu draft_off=%llu draft_ms=%.1f verify_ms=%.1f "
+                        "vision_room=%s graphs=%llu launches=%llu\n",
+                        dms > 0.0 ? 1000.0 * (double) produced / dms : 0.0,
+                        produced > 0 ? dms / (double) produced : 0.0,
+                        dp > 0 ? (double) dh / (double) dp : 1.0,
+                        (double) dram * per_tok, (double) dssd * per_tok, (double) dpro * per_tok,
+                        model.experts_vram(), model.experts_vram(), model.experts_ram(), model.experts_ram(),
+                        model.experts_ssd(), model.vram_gb(), model.ram_gb(), model.ssd_gb(), model.kv_gb(),
+                        d_rounds, d_acc, d_off, draft_ms_tot, verify_ms_tot,
+                        model.vision_room(), st.graph_captures, st.launches_per_tok);
+            std::fflush(stdout);
+        };
 
         auto emit_token = [&](int tok) -> bool {
             std::printf("T %d\n", tok);
             std::fflush(stdout);
             ++produced;
+            beat("decode");
             if (is_eos(tok)) {
                 finish = "stop";
                 return false;
             }
             if (in_think && tok == r.think_end) in_think = false;
-            if ((produced & 15) == 0) {
-                const double dms = now_ms() - t1;
-                const ling::TierStats st = model.stats();
-                const unsigned long long dp = st.picks - st0.picks;
-                const unsigned long long dh = st.vram_hits - st0.vram_hits;
-                std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f\n",
-                            dms > 0.0 ? 1000.0 * (double) produced / dms : 0.0,
-                            produced > 0 ? dms / (double) produced : 0.0,
-                            dp > 0 ? (double) dh / (double) dp : 1.0);
-                std::fflush(stdout);
-            }
-            if (in.stop.load()) {
+            if ((produced & 7) == 0) emit_stat();
+            if (in.stop.load() || g_sig_quit.load()) {
                 finish = "cancel";
                 return false;
             }
             return produced < max_new;
         };
 
-        if (max_new > 0) {
-            int cur_tok = sample_one(logits, live_tokens);
-            bool alive = emit_token(cur_tok);
+        try {
+            if (max_new > 0) {
+                int cur_tok = sample_one(logits, live_tokens);
+                bool alive = emit_token(cur_tok);
 
-            if (!use_spec) {
-                while (alive && pos < model.max_ctx() - 1) {
-                    if (in_think && produced >= r.think_budget) {
-                        cur_tok = r.think_end;
-                        in_think = false;
-                        alive = emit_token(cur_tok);
-                        if (!alive) break;
-                    }
-                    logits = model.step(cur_tok, pos++);
-                    live_tokens.push_back(cur_tok);
-                    cur_tok = sample_one(logits, live_tokens);
-                    alive = emit_token(cur_tok);
-                }
-            } else {
-                int streak = 0, pause = 0, wait_p = 16;
-                double acc_ema = 0.65;
-                std::vector<int> drafts;
-                std::vector<float> confs;
-                while (alive && pos < model.max_ctx() - 1) {
-                    const int rem = std::min(max_new - produced, model.max_ctx() - 1 - pos);
-                    int want_k = base_k;
-                    if (auto_spec) {
-                        if (pause > 0) {
-                            --pause;
-                            want_k = 0;
-                        } else {
-                            want_k = std::min(max_k_lim, base_k + (streak >= 2 ? 1 : 0));
+                if (!use_spec) {
+                    while (alive && pos < model.max_ctx() - 1) {
+                        if (in_think && (produced >= r.think_budget || in.wrap.load())) {
+                            cur_tok = r.think_end;
+                            in_think = false;
+                            in.wrap.store(false);
+                            alive = emit_token(cur_tok);
+                            if (!alive) break;
                         }
-                    }
-                    want_k = std::min(want_k, std::min(ling::Model::kMaxWin - 1, rem - 1));
-                    drafts.clear();
-                    if (want_k > 0) {
-                        model.mtp_draft(cur_tok, pos, want_k, default_floor, drafts, confs, f0);
-                    }
-                    const int K = (int) drafts.size();
-                    if (K == 0) {
                         logits = model.step(cur_tok, pos++);
                         live_tokens.push_back(cur_tok);
                         cur_tok = sample_one(logits, live_tokens);
                         alive = emit_token(cur_tok);
-                        continue;
                     }
-                    int win_toks[ling::Model::kMaxWin];
-                    win_toks[0] = cur_tok;
-                    for (int i = 0; i < K; ++i) win_toks[1 + i] = drafts[(size_t) i];
-                    const int W = 1 + K;
-                    const float* wlogits = model.step_window(win_toks, W, pos);
+                } else {
+                    int streak = 0, pause = 0, wait_p = 16;
+                    double acc_ema = 0.65;
+                    std::vector<int> drafts;
+                    std::vector<float> confs;
+                    while (alive && pos < model.max_ctx() - 1) {
+                        if (in_think && (produced >= r.think_budget || in.wrap.load())) {
+                            cur_tok = r.think_end;
+                            in_think = false;
+                            in.wrap.store(false);
+                            alive = emit_token(cur_tok);
+                            if (!alive) break;
+                        }
+                        const int rem = std::min(max_new - produced, model.max_ctx() - 1 - pos);
+                        const int think_rem = in_think ? std::max(0, (int) (r.think_budget - produced)) : rem;
+                        const int cap_k = std::min({ling::Model::kMaxWin - 1, rem - 1, std::max(0, think_rem - 1)});
 
-                    int kept = 0;
-                    int bonus_tok = 0;
-                    if (r.temperature <= 0.0f) {
-                        int pred[ling::Model::kMaxWin];
-                        model.argmax_rows(wlogits, W, pred);
-                        while (kept < K && pred[kept] == drafts[(size_t) kept]) ++kept;
-                        bonus_tok = pred[kept];
-                    } else {
-                        // Exact lossless rejection sampling for deterministic drafter q(x)=delta(x, d):
-                        // accept d with prob p(d); else draw from p(x | x != d).
-                        cudaSetDevice(model.output_dev());
-                        cudaMemcpyAsync(h_wlogits.data(), wlogits, (size_t) W * (size_t) c.vocab * sizeof(float),
-                                        cudaMemcpyDeviceToHost, model.output_stream());
-                        cudaStreamSynchronize(model.output_stream());
-                        std::uniform_real_distribution<double> u01(0.0, 1.0);
-                        bool rejected = false;
-                        for (int i = 0; i < K; ++i) {
-                            const auto dist =
-                                build_target_dist(h_wlogits.data() + (size_t) i * c.vocab, c.vocab, r, live_tokens);
-                            double pd = 0.0;
-                            for (const auto& kv : dist) {
-                                if (kv.first == drafts[(size_t) i]) {
-                                    pd = kv.second;
+                        drafts.clear();
+                        const double td0 = now_ms();
+                        if (cap_k > 0 && req_lookup) {
+                            // Try prompt lookup first (zero-cost suffix match for copy/edit prompts)
+                            std::vector<int> hist_plus = live_tokens;
+                            hist_plus.push_back(cur_tok);
+                            suffix_draft(hist_plus, cap_k, drafts);
+                        }
+                        if (drafts.empty() && cap_k > 0 && req_mtp) {
+                            int want_k = base_k;
+                            if (auto_spec) {
+                                if (pause > 0) { --pause; want_k = 0; }
+                                else want_k = std::min(max_k_lim, base_k + (streak >= 2 ? 1 : 0));
+                            }
+                            want_k = std::min(want_k, cap_k);
+                            if (want_k > 0) {
+                                model.mtp_draft(cur_tok, pos, want_k, default_floor, drafts, confs, f0, cum_cut);
+                            }
+                        }
+                        draft_ms_tot += now_ms() - td0;
+
+                        const int K = (int) drafts.size();
+                        if (K == 0) {
+                            logits = model.step(cur_tok, pos++);
+                            live_tokens.push_back(cur_tok);
+                            cur_tok = sample_one(logits, live_tokens);
+                            alive = emit_token(cur_tok);
+                            continue;
+                        }
+                        int win_toks[ling::Model::kMaxWin];
+                        win_toks[0] = cur_tok;
+                        for (int i = 0; i < K; ++i) win_toks[1 + i] = drafts[(size_t) i];
+                        const int W = 1 + K;
+                        const double tv0 = now_ms();
+                        const float* wlogits = model.step_window(win_toks, W, pos);
+
+                        int kept = 0;
+                        int bonus_tok = 0;
+                        if (r.temperature <= 0.0f) {
+                            int pred[ling::Model::kMaxWin];
+                            model.argmax_rows(wlogits, W, pred);
+                            while (kept < K && pred[kept] == drafts[(size_t) kept]) ++kept;
+                            bonus_tok = pred[kept];
+                        } else {
+                            // Exact lossless rejection sampling for deterministic drafter q(x)=delta(x, d):
+                            // accept d with prob p(d); else draw from p(x | x != d).
+                            cudaSetDevice(model.output_dev());
+                            cudaMemcpyAsync(h_wlogits.data(), wlogits, (size_t) W * (size_t) c.vocab * sizeof(float),
+                                            cudaMemcpyDeviceToHost, model.output_stream());
+                            cudaStreamSynchronize(model.output_stream());
+                            std::uniform_real_distribution<double> u01(0.0, 1.0);
+                            bool rejected = false;
+                            for (int i = 0; i < K; ++i) {
+                                const auto dist =
+                                    build_target_dist(h_wlogits.data() + (size_t) i * c.vocab, c.vocab, r, live_tokens);
+                                double pd = 0.0;
+                                for (const auto& kv : dist) {
+                                    if (kv.first == drafts[(size_t) i]) { pd = kv.second; break; }
+                                }
+                                if (u01(rng) < pd) {
+                                    ++kept;
+                                } else {
+                                    bonus_tok = draw_from_dist(dist, rng, drafts[(size_t) i]);
+                                    rejected = true;
                                     break;
                                 }
                             }
-                            if (u01(rng) < pd) {
-                                ++kept;
-                            } else {
-                                bonus_tok = draw_from_dist(dist, rng, drafts[(size_t) i]);
-                                rejected = true;
-                                break;
+                            if (!rejected) {
+                                const auto dist =
+                                    build_target_dist(h_wlogits.data() + (size_t) K * c.vocab, c.vocab, r, live_tokens);
+                                bonus_tok = draw_from_dist(dist, rng);
                             }
                         }
-                        if (!rejected) {
-                            const auto dist =
-                                build_target_dist(h_wlogits.data() + (size_t) K * c.vocab, c.vocab, r, live_tokens);
-                            bonus_tok = draw_from_dist(dist, rng);
+                        verify_ms_tot += now_ms() - tv0;
+
+                        const int n_accept = 1 + kept;
+                        model.commit_window(n_accept, W, pos, win_toks);
+                        for (int t = 0; t < n_accept; ++t) live_tokens.push_back(win_toks[t]);
+                        pos += n_accept;
+                        d_off += (unsigned long long) K;
+                        d_acc += (unsigned long long) kept;
+                        ++d_rounds;
+
+                        if (auto_spec && req_mtp) {
+                            streak = (kept == K) ? (streak + 1) : 0;
+                            const double step_rate = (double) kept / (double) K;
+                            acc_ema = 0.85 * acc_ema + 0.15 * step_rate;
+                            if (acc_ema < 0.25) {
+                                pause = wait_p;
+                                wait_p = std::min(wait_p * 2, 128);
+                                acc_ema = 0.55;
+                            } else if (kept > 0) {
+                                wait_p = 16;
+                            }
                         }
+
+                        for (int i = 0; i < kept && alive; ++i) alive = emit_token(drafts[(size_t) i]);
+                        if (!alive) break;
+                        cur_tok = bonus_tok;
+                        alive = emit_token(cur_tok);
                     }
-
-                    const int n_accept = 1 + kept;
-                    model.commit_window(n_accept, W, pos, win_toks);
-                    for (int t = 0; t < n_accept; ++t) live_tokens.push_back(win_toks[t]);
-                    pos += n_accept;
-                    d_off += (unsigned long long) K;
-                    d_acc += (unsigned long long) kept;
-
-                    if (auto_spec) {
-                        streak = (kept == K) ? (streak + 1) : 0;
-                        const double step_rate = (double) kept / (double) K;
-                        acc_ema = 0.85 * acc_ema + 0.15 * step_rate;
-                        if (acc_ema < 0.25) {
-                            pause = wait_p;
-                            wait_p = std::min(wait_p * 2, 128);
-                            acc_ema = 0.55;
-                        } else if (kept > 0) {
-                            wait_p = 16;
-                        }
-                    }
-
-                    for (int i = 0; i < kept && alive; ++i) alive = emit_token(drafts[(size_t) i]);
-                    if (!alive) break;
-                    cur_tok = bonus_tok;
-                    alive = emit_token(cur_tok);
                 }
             }
-            // Step the final non-EOS token? No — live_tokens matches the exact GPU state currently in KDA/MLA caches!
+        } catch (const ling::GpuFaultError& e) {
+            std::printf("ERR %s\nDONE %d %zu %.1f %.1f cancel %llu %llu %zu 0 0\n",
+                        e.what(), produced, r.ids.size(), prompt_ms, now_ms() - t1, d_acc, d_off, reused);
+            std::fflush(stdout);
+            g_wd_busy.store(false);
+            return 3;
+        } catch (const ling::RouteError& e) {
+            std::printf("ERR route error: %s\nDONE %d %zu %.1f %.1f cancel %llu %llu %zu 0 0\n",
+                        e.what(), produced, r.ids.size(), prompt_ms, now_ms() - t1, d_acc, d_off, reused);
+            std::fflush(stdout);
+            live_tokens.clear();
+            live_pics.clear();
+            model.reset();
+            g_wd_busy.store(false);
+            continue;
+        } catch (const std::exception& e) {
+            std::printf("ERR decode failed: %s\nDONE %d %zu %.1f %.1f cancel %llu %llu %zu 0 0\n",
+                        e.what(), produced, r.ids.size(), prompt_ms, now_ms() - t1, d_acc, d_off, reused);
+            std::fflush(stdout);
+            live_tokens.clear();
+            live_pics.clear();
+            model.reset();
+            g_wd_busy.store(false);
+            continue;
         }
 
-        // Checkpoint the post-generation conversation state so the next turn reuses 100% of prompt + assistant reply!
-        push_snap(live_tokens, live_pics);
+        if (produced > 0 && (produced & 7) != 0) emit_stat();
+        push_snap(live_tokens, live_pics, false);
 
         const double decode_ms = now_ms() - t1;
         const ling::TierStats st1 = model.stats();
         const unsigned long long dh = st1.vram_hits - st0.vram_hits;
         const unsigned long long dp = st1.picks - st0.picks;
+        std::fprintf(stderr, "ling stat: decode %.2f ms/tok (%.2f t/s) prompt %.1f ms\n",
+                     produced > 0 ? decode_ms / (double) produced : 0.0,
+                     decode_ms > 0.0 ? 1000.0 * (double) produced / decode_ms : 0.0, prompt_ms);
         std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %zu %llu %llu\n", produced, r.ids.size(), prompt_ms, decode_ms,
                     finish, d_acc, d_off, reused, dh, dp);
         std::fflush(stdout);
+        g_wd_busy.store(false);
     }
     return 0;
 }
@@ -1082,7 +1479,11 @@ int main(int argc, char** argv) {
     unsigned seed = 42;
     bool print_text = false, no_stop = false, mtp_check = false, serve_mode = false;
     int spec_k = 0;           // 0=off, 1..3=fixed max drafts, -1=auto
+    int lookup_mode = -1;     // -1=auto (on where wins), 0=off, 1=on
     float draft_floor = 0.50f;
+    float draft_cum = 0.25f;
+    bool bench_lane = false;
+    std::string dump_decode_logits;
     std::string mmi1_file, image_file, vision_dump_emb;
 
     for (int i = 1; i < argc; ++i) {
@@ -1157,7 +1558,29 @@ int main(int argc, char** argv) {
         } else if (a == "--vision") {
             const std::string v = val("--vision");
             if (v == "off" || v == "0") opt.mmproj_path.clear();
-        } else if (a == "--temp") temp = (float) std::atof(val("--temp").c_str());
+        } else if (a == "--reserve-gb") opt.reserve_gb = std::atof(val("--reserve-gb").c_str());
+        else if (a == "--ram-cap-gib") opt.ram_cap_gib = std::atof(val("--ram-cap-gib").c_str());
+        else if (a == "--repeatable") opt.repeatable = true;
+        else if (a == "--lane-parity") opt.lane_parity = true;
+        else if (a == "--auto-sort-gpus") opt.auto_sort_gpus = true;
+        else if (a == "--no-direct") opt.direct_io = false;
+        else if (a == "--recalibrate") opt.recalibrate = true;
+        else if (a == "--no-profile") opt.no_profile = true;
+        else if (a == "--profile") opt.profile_path = val("--profile");
+        else if (a == "--profile-out") opt.profile_out = val("--profile-out");
+        else if (a == "--cal-file") opt.cal_file = val("--cal-file");
+        else if (a == "--restore-dir") opt.restore_dir = val("--restore-dir");
+        else if (a == "--lookahead") {
+            const std::string v = val("--lookahead");
+            opt.lookahead = (v == "on" || v == "1") ? 1 : (v == "off" || v == "0" ? 0 : -1);
+        } else if (a == "--lookup") {
+            const std::string v = val("--lookup");
+            lookup_mode = (v == "on" || v == "1") ? 1 : (v == "off" || v == "0" ? 0 : -1);
+        } else if (a == "--draft-cum") draft_cum = (float) std::atof(val("--draft-cum").c_str());
+        else if (a == "--prefill") (void) val("--prefill");  // accepted for contract compatibility
+        else if (a == "--bench-lane") bench_lane = true;
+        else if (a == "--dump-decode-logits") dump_decode_logits = val("--dump-decode-logits");
+        else if (a == "--temp") temp = (float) std::atof(val("--temp").c_str());
         else if (a == "--top-k") top_k = std::atoi(val("--top-k").c_str());
         else if (a == "--top-p") top_p = (float) std::atof(val("--top-p").c_str());
         else if (a == "--seed") seed = (unsigned) std::strtoul(val("--seed").c_str(), nullptr, 10);
@@ -1166,6 +1589,11 @@ int main(int argc, char** argv) {
         else throw std::runtime_error("unknown argument " + a);
     }
 
+    if (bench_lane) {
+        const bool ok = ling::par::bench_lane_verify(300);
+        return ok ? 0 : 1;
+    }
+    log_env_settings();
     if (gguf.empty() || (!serve_mode && ids_file.empty() && prompt.empty() && vision_dump_emb.empty())) {
         std::fprintf(stderr,
                      "maya-ling --gguf MODEL.gguf [--prompt-ids ids.txt | --prompt text [--tokenize-bin PATH]]\n"
@@ -1187,7 +1615,7 @@ int main(int argc, char** argv) {
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
         std::fprintf(stderr, "%s\nload: %.2f s\n", model.info().c_str(), load_s);
         print_mem(opt.gpus);
-        if (serve_mode) return serve_loop(model, spec_k, draft_floor);
+        if (serve_mode) return serve_loop(model, spec_k, draft_floor, draft_cum, lookup_mode, opt.recalibrate);
 
         if (!vision_dump_emb.empty()) {
             const ling::VisionGeo* vg = model.vision();
@@ -1321,6 +1749,17 @@ int main(int argc, char** argv) {
         const float* logits = model.prefill(ids.data(), (int) ids.size(), 0, lf != nullptr ? &all_logits : nullptr);
         cudaSetDevice(model.output_dev());
         cudaStreamSynchronize(model.output_stream());
+        FILE* dlf = !dump_decode_logits.empty() ? std::fopen(dump_decode_logits.c_str(), "wb") : nullptr;
+        auto dump_one_logit = [&](const float* dev_lg) {
+            if (dlf == nullptr) return;
+            std::vector<float> hlg((size_t) c.vocab);
+            cudaSetDevice(model.output_dev());
+            cudaMemcpyAsync(hlg.data(), dev_lg, (size_t) c.vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                            model.output_stream());
+            cudaStreamSynchronize(model.output_stream());
+            std::fwrite(hlg.data(), sizeof(float), (size_t) c.vocab, dlf);
+        };
+        dump_one_logit(logits);
         const double pf_total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pf0).count();
         const double warm_s = model.last_warm_s();
         const double pf_compute_s = std::max(1e-6, pf_total_s - warm_s);
@@ -1363,8 +1802,9 @@ int main(int argc, char** argv) {
             for (int g = 0; g < n_predict; ++g) {
                 const int next_id = pick_token(logits);
                 if (!emit_tok(next_id)) break;
-                if (g + 1 < n_predict || lf != nullptr) {
+                if (g + 1 < n_predict || lf != nullptr || dlf != nullptr) {
                     logits = model.step(next_id, pos++);
+                    dump_one_logit(logits);
                     if (lf != nullptr) {
                         cudaSetDevice(model.output_dev());
                         cudaMemcpyAsync(h_logits.data(), logits, (size_t) c.vocab * 4, cudaMemcpyDeviceToHost,
@@ -1407,6 +1847,7 @@ int main(int argc, char** argv) {
                 const int K = (int) drafts.size();
                 if (K == 0) {
                     logits = model.step(cur_tok, pos++);
+                dump_one_logit(logits);
                     cur_tok = pick_token(logits);
                     alive = emit_tok(cur_tok);
                     ++spec_steps;
@@ -1493,6 +1934,7 @@ int main(int argc, char** argv) {
         if (int ke = hy4::k::errors(); ke > 0)
             std::fprintf(stderr, "WARNING: %d kernel launch errors (%s)\n", ke, hy4::k::first_fault().c_str());
         if (lf != nullptr) std::fclose(lf);
+        if (dlf != nullptr) std::fclose(dlf);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "maya-ling: %s\n", e.what());
         return 1;

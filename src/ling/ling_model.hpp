@@ -1,22 +1,26 @@
 // src/ling/ling_model.hpp - Ling-3.2-air (llama.cpp bailingmoe3) inference engine.
-// Supports 1..N GPUs (layer split), adaptive per-expert VRAM cache, GPU PCIe fetch (CUDA-graphable),
-// optional AVX2 CPU lane for offloaded experts, double-buffered batched prefill (KDA + MLA WMMA + grouped MoE),
-// FP16 / INT8 MLA latent KV cache up to 262K context, and optional MTP block (blk.42).
+// Supports 1..N GPUs (layer split with verified peer copies), adaptive per-expert VRAM/RAM/NVMe-SSD tiers,
+// GPU PCIe fetch (CUDA-graphable), AVX2 CPU lane with GPU-parity mode, double-buffered batched prefill,
+// FP16 / INT8 MLA latent KV cache up to 262K context, persistent restore points, vision, and blk.42 MTP + lookup.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
-#include <map>
 #include <functional>
+#include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
 #include "hy4_kernels.cuh"
-#include "ling_kernels.cuh"
-#include "ling_vision.hpp"
 #include "hy4_lane.hpp"
+#include "ling_kernels.cuh"
+#include "ling_sys.hpp"
+#include "ling_vision.hpp"
 
 namespace maya {
 class GgufFile;
@@ -25,8 +29,18 @@ struct TensorInfo;
 
 namespace ling {
 
+// Recoverable request-scoped routing/input error (fails the request, engine stays alive).
+struct RouteError : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// Fatal sticky GPU error (names the first faulting kernel; engine exits cleanly for server restart).
+struct GpuFaultError : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 enum class OffloadMode {
-    kAuto = 0,   // gpu (CUDA graph) when host experts fit pinned RAM, else cpu lane
+    kAuto = 0,   // measured per-PC split between GPU PCIe fetch, mix, and CPU lane
     kGpu  = 1,   // GPU adaptive VRAM cache + GPU fetch_copy (CUDA graph)
     kMix  = 2,   // GPU adaptive VRAM cache + up to mix_k_gpu misses on GPU + CPU lane for rest
     kCpu  = 3,   // GPU VRAM hits + CPU lane for all misses (no pinning required)
@@ -62,19 +76,32 @@ struct Options {
     int ctx = 8192;
     int prefill_chunk = 2048;        // 1: token-by-token prefill; >1: attention/tile chunk size
     int prefill_block = 0;           // <= 0: derive from GPU VRAM pool & expert count; > 0: explicit macro-block cap
-    bool ep_prefill = false;         // opt-in multi-GPU EP prefill relay (default off; stage pipeline wins on multi-block)
+    bool ep_prefill = false;         // opt-in multi-GPU EP prefill relay
     double expert_vram_gib = -1.0;   // < 0: free VRAM minus headroom per GPU
+    double reserve_gb = 0.0;         // extra VRAM held free per GPU (also used for 8/12/16 GB emulation)
     double pin_ram_gib = -1.0;       // < 0: derive from host available RAM; 0: off; > 0: explicit cap in GiB
+    double ram_cap_gib = -1.0;       // < 0: auto (avail - 8 GiB); >= 0: cap RAM expert tier (remainder goes to NVMe SSD)
     std::vector<int> gpus = {0};     // CUDA device ordinals (layer split when size > 1)
+    bool auto_sort_gpus = false;     // sort GPUs by free VRAM descending and skip display cards when headless exist
     OffloadMode offload = OffloadMode::kAuto;
     int mix_k_gpu = 1;               // in kMix mode, max misses fetched on GPU per layer
-    int cpu_threads = -1;            // hy4::Lane threads (-1: physical cores - 1)
-    bool kv_q8 = false;              // INT8 MLA latent cache (544 B/cell vs 1024 B FP16)
-    bool use_graph = true;           // CUDA graph for single-token decode (in kGpu / full-VRAM mode)
+    int cpu_threads = -1;            // hy4::Lane threads (-1: physical cores in affinity mask - 2)
+    bool kv_q8 = false;              // INT8 MLA latent cache (672 B/layer/tok vs 1152 B FP16)
+    bool use_graph = true;           // CUDA graph for single-token / windowed decode
     bool cache_warm = true;          // warm VRAM expert cache from prompt routing frequencies
     bool load_mtp = false;           // also load blk.<n_layers> MTP block
+    bool repeatable = false;         // deterministic mode: placement/timing-invariant output, Q8_K lane parity
+    bool lane_parity = false;        // CPU = GPU Q8_K per-256 rounding & exact warp-lane reduction
+    int lookahead = -1;              // -1: auto (measure & keep if faster), 0: off, 1: on
+    bool direct_io = true;           // use O_DIRECT on NVMe SSD expert path (with automatic fallback)
+    bool recalibrate = false;        // ignore cached per-PC calibration and re-measure
+    bool no_profile = false;         // disable default expert placement profile
+    std::string profile_path;        // binary LNGP expert profile path
+    std::string profile_out;         // optional output path to save accumulated routing profile
+    std::string cal_file;            // keyed per-PC calibration file (default data/ling-calibration.txt)
+    std::string restore_dir;         // optional directory for persistent disk restore points
     std::string seam_dir;
-    std::string mmproj_path;            // optional per-layer seam dump dir (parity testing)
+    std::string mmproj_path;
 };
 
 struct TierStats {
@@ -84,6 +111,10 @@ struct TierStats {
     unsigned long long zero_copy = 0;
     unsigned long long cpu_lane = 0;
     unsigned long long admitted = 0;
+    unsigned long long ram_fetch = 0;
+    unsigned long long ssd_fetch = 0;
+    unsigned long long graph_captures = 0;
+    unsigned long long launches_per_tok = 0;
 };
 
 class Model {
@@ -95,22 +126,50 @@ public:
 
     const Config& cfg() const { return c_; }
     const std::string& info() const { return info_; }
+    const std::string& start_plan_line() const { return start_plan_line_; }
+    const std::string& cal_key_str() const { return cal_key_; }
+    const std::string& cal_file_path() const { return cal_file_; }
+    const std::string& gguf_path() const { return gguf_path_; }
+    const Options& opts() const { return o_; }
     int output_dev() const { return gpus_.back().dev; }
     cudaStream_t output_stream() const { return gpus_.back().s; }
     bool has_mtp() const { return mtp_loaded_; }
+    bool kv_q8() const { return o_.kv_q8; }
     const float* last_h_nextn() const { return gpus_.back().hn; }
     double last_warm_s() const { return last_warm_s_; }
+    int cpu_threads_used() const { return lane_ ? lane_->threads() + 1 : 0; }
+    double pcie_share() const { return pcie_share_; }
+    const std::string& cal_file() const { return cal_file_; }
+    const std::string& cal_key() const { return cal_key_; }
+    int cpu_threads() const { return o_.cpu_threads; }
+    bool direct_io_active() const { return ssd_reader_.direct_active(); }
+    bool lookahead_active() const { return lookahead_on_; }
+    double kv_gb() const { return total_kv_gb_; }
+    double vram_gb() const { return total_vram_gb_; }
+    double ram_gb() const { return total_ram_gb_; }
+    double ssd_gb() const { return total_ssd_gb_; }
+    size_t experts_all() const { return total_experts_; }
+    size_t experts_vram() const { return total_vram_experts_; }
+    size_t experts_ram() const { return total_ram_experts_; }
+    size_t experts_ssd() const { return total_ssd_experts_; }
+    int active_offload_mode() const { return (int) active_offload_; }
+
+    // Wait for background library/kernel warmup to complete (idempotent, called automatically before compute).
+    void wait_warmup();
 
     struct Image {
-        int64_t start = 0;   // prompt index of first <|image_pad|>
+        int64_t start = 0;
         int width = 0;
         int height = 0;
-        std::vector<float> rows;  // [tokens * n_embd] F32
+        std::vector<float> rows;
     };
     const VisionGeo* vision() const { return (vision_ && vision_->loaded()) ? &vision_->geo() : nullptr; }
     const char* vision_room() const;
     size_t vision_room_bytes() const { return (vision_ && vision_->loaded()) ? vision_->max_room_bytes() : 0; }
     bool encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& out_rows, std::string& err);
+    bool vlend(size_t& lent_mib, std::string& err);
+    bool vreclaim(std::string& err);
+    bool is_vlent() const { return vlent_; }
     void set_images(std::vector<Image> imgs);
     int rope_delta() const { return rope_delta_; }
     void set_rope_delta(int d) { rope_delta_ = d; }
@@ -118,65 +177,55 @@ public:
     int prefill_block() const { return prefill_block_; }
     size_t kda_snapshot_bytes() const;
     int prefill_chunk_size() const { return gpus_.empty() ? o_.prefill_chunk : gpus_[0].pf_cap; }
-    double vram_gb() const { return total_vram_gb_; }
-    size_t experts_all() const { return total_experts_; }
-    size_t experts_vram() const { return total_vram_experts_; }
 
     struct KdaSnapshot {
         std::vector<int> tokens;
         std::vector<std::pair<int64_t, uint64_t>> pics;
         int rope_delta = 0;
+        bool kv_q8 = false;
         std::vector<std::vector<float>> states;
         std::vector<std::vector<float>> convs;
+        std::vector<std::vector<uint8_t>> mla_lat;   // [n_mla][n_tok * lat_row_bytes]
+        std::vector<std::vector<uint16_t>> mla_kpe;  // [n_mla][n_tok * n_rot]
     };
     void save_kda_snapshot(KdaSnapshot& snap, const std::vector<int>& tokens,
-                           const std::vector<std::pair<int64_t, uint64_t>>& pics) const;
+                           const std::vector<std::pair<int64_t, uint64_t>>& pics, bool include_mla = true) const;
     void restore_kda_snapshot(const KdaSnapshot& snap);
+    bool save_restore_disk(const KdaSnapshot& snap, const std::string& dir, std::string& err) const;
+    bool load_restore_disk(const std::string& dir, std::vector<KdaSnapshot>& out) const;
+    bool save_profile_now(const std::string& path, std::string& err) const;
 
-    // Reset KDA states and prompt frequency counters for a fresh sequence.
     void reset();
 
-    // One token at position pos -> logits (vocab F32 on output_dev(), valid until next step/prefill).
     const float* step(int token, int pos);
 
-    // Batched prefill for tokens[0..n-1] starting at pos0.
-    // Returns logits of the final token (vocab F32 on output_dev()).
-    // If all_logits_host != nullptr, appends all n positions' F32 logits (n * vocab floats).
     const float* prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host = nullptr,
-                         const std::function<bool(int, int)>& on_progress = nullptr);
+                         const std::function<bool(int, int)>& on_progress = nullptr,
+                         const std::atomic<bool>* stop_flag = nullptr);
 
-    // Run MTP block (blk.<n_layers>) on trunk h_nextn (E F32 on output_dev()) paired with next_token at pos.
-    // Returns MTP logits (vocab F32 on output_dev()).
     const float* mtp_step(const float* h_nextn_dev, int next_token, int pos);
 
-    // Batched token-window verify (1 <= W <= kMaxWin): returns [W][vocab] logits on output_dev().
     static constexpr int kMaxWin = 4;
     const float* step_window(const int* tokens, int W, int pos0);
     void commit_window(int n_accept, int W, int pos0, const int* tokens);
 
-    // Batched greedy argmax for W rows of logits [W][vocab] -> fills out_ids[0..W-1].
+    // Propose up to max_k draft tokens using blk.42 MTP with per-token floor + cumulative confidence cut.
+    // Optionally outputs full draft distributions (for exact Leviathan rejection sampling when temp > 0).
+    void mtp_draft(int base_tok, int base_pos, int max_k, float floor, std::vector<int>& drafts,
+                   std::vector<float>& confs, float floor0 = 0.0f, float cum_min = 0.0f,
+                   std::vector<std::vector<float>>* draft_logits_out = nullptr);
+
+    int argmax_logits(const float* logits_dev);
     void argmax_rows(const float* logits_dev, int W, int* out_ids);
 
-    // Autoregressively draft up to max_k tokens via blk.42 MTP after accepted (base_tok, base_pos).
-    void mtp_draft(int base_tok, int base_pos, int max_k, float floor, std::vector<int>& drafts,
-                   std::vector<float>& confs, float floor0 = 0.0f);
-
-    // Fraction of trunk MoE experts resident in VRAM (0.0 .. 1.0).
     double vram_res_frac() const { return vram_res_frac_; }
-
-    // Greedy argmax on output_dev() logits -> token id on host.
-    int argmax_logits(const float* logits_dev);
-
-    // Read cumulative expert-tier statistics across all GPUs.
     TierStats stats() const;
-
-    // Decode token IDs using GGUF tokenizer.ggml.tokens (GPT-2 byte-level BPE).
-    std::string detokenize(const std::vector<int>& ids) const;
     std::string detokenize_one(int id) const;
+    std::string detokenize(const std::vector<int>& ids) const;
 
 private:
-    static constexpr int kPfBatch = 64;   // experts per double-buffered prefill staging half (2 x 64 = 128 slots)
-    static constexpr int kPfPmapRing = 32; // host pmap slots so pinned DMA never stalls host
+    static constexpr int kPfBatch = 32;
+    static constexpr int kPfPmapRing = 8;
 
     struct Mat {
         const uint8_t* p = nullptr;
@@ -192,56 +241,63 @@ private:
         const float* ffn_norm = nullptr;
         // KDA
         Mat wq, wk, wv, wo, wf, wbeta, wg;
-        const float* conv_q = nullptr;
-        const float* conv_k = nullptr;
-        const float* conv_v = nullptr;
-        const float* dt_bias = nullptr;
-        const float* ssm_a = nullptr;       // positive exp(A_log)
-        const float* ssm_a_neg = nullptr;   // -exp(A_log) for glmb::kda_rec_split
-        const float* ssm_norm = nullptr;
-        float* conv_state = nullptr;        // [3][d_inner][d_conv - 1]
+        const float *conv_q = nullptr, *conv_k = nullptr, *conv_v = nullptr;
+        const float *dt_bias = nullptr, *ssm_a = nullptr, *ssm_a_neg = nullptr, *ssm_norm = nullptr;
+        float* conv_state = nullptr;
         float* state = nullptr;
-        float *conv_bak = nullptr, *state_tmp = nullptr, *w_kda_buf = nullptr;             // [n_head][kda_head][kda_head]
+        float* conv_bak = nullptr;
+        float* state_tmp = nullptr;
+        float* w_kda_buf = nullptr;
         // MLA
         Mat wqm, wkva, wkb, wvb, wgate, wom;
         const float* kv_a_norm = nullptr;
-        void* lat = nullptr;                // FP16 [ctx][kv_lora] or INT8 [ctx][544 B]
-        uint16_t* k_pe = nullptr;           // FP16 [ctx][n_rot]
-        // FFN / MoE
+        void* lat = nullptr;
+        uint16_t* k_pe = nullptr;
+        // Dense or Shared FFN
         Mat fg, fu, fd;
+        // MoE
         const void* router_w = nullptr;
-        int router_type = 0;                // 0: F32, 30: BF16
-        const float* rb_dev = nullptr;      // exp_probs_b on GPU
+        int router_type = 0;
+        const float* rb_dev = nullptr;
         int etg = 0, etu = 0, etd = 0;
         size_t eg_ld = 0, eu_ld = 0, ed_ld = 0;
-        size_t tr[3] = {0, 0, 0};           // offsets inside packed blob
-        size_t blob = 0;                    // 256-aligned bytes per packed expert [gate|up|down]
-        int n_res = 0;                      // experts resident in VRAM (0..n_expert)
-        size_t vram_pool_off = 0;           // byte offset inside Gpu::vram_pool
-        bool host_pinned = false;           // GPU-accessible pinned RAM (cudaHostRegister or cudaMallocHost)
-        bool host_registered = false;       // allocated via ram_alloc + cudaHostRegister
-        uint8_t* host_blobs = nullptr;      // [n_expert][blob] packed experts in RAM (null if n_res == n_expert)
+        size_t tr[3] = {0, 0, 0};
+        size_t blob = 0;
+        // GGUF file offsets for SSD-backed / file-order reads
+        uint64_t gate_file_off = 0, up_file_off = 0, down_file_off = 0;
+        size_t eg_stride = 0, eu_stride = 0, ed_stride = 0;
+        bool ssd_backed = false;
+        // Expert memory tiers
+        uint8_t* host_blobs = nullptr;
         size_t host_bytes = 0;
-        hy4::k::FetchLayer fl;              // GPU adaptive cache metadata
-        hy4::CpuExperts cex;                // CPU lane view of host_blobs
-        std::vector<int> h_slot;            // host mirror of fl.slot for prefill
-        std::vector<int> h_owner;           // host mirror of fl.owner for async warm
-        std::vector<float> h_score;         // host mirror of fl.score for async warm
-        std::vector<uint32_t> pf_counts;    // prompt pick counts for cache warm
-        // Async background cache promotion in kCpu decode mode
+        bool host_pinned = false;
+        bool host_registered = false;
+        bool host_nohuge = false;
+        int n_res = 0;
+        size_t vram_pool_off = 0;
+        hy4::k::FetchLayer fl;
+        hy4::CpuExperts cex;
+        std::vector<int> h_slot;
+        std::vector<int> h_owner;
+        std::vector<float> h_score;
+        std::vector<uint32_t> pf_counts;
+        std::vector<uint32_t> profile_counts;  // cumulative routing counts across session
         bool cpu_cache_ready = false;
         int promo_pending_e = -1;
         int promo_pending_v = -1;
         int promo_pending_sl = -1;
         cudaEvent_t ev_promo = nullptr;
+        // Lookahead prefetch transition table: next_top[prev_e] -> predicted expert in next layer
+        std::vector<int16_t> la_next;
+        int last_top_e = -1;
     };
 
     struct Gpu {
         int dev = 0;
-        int l0 = 0, l1 = 0;                 // assigned trunk layers [l0, l1)
+        int l0 = 0, l1 = 0;
         cudaStream_t s = nullptr;
-        cudaStream_t s_copy = nullptr;      // dedicated DMA / shared-expert overlap stream
-        cudaStream_t s_d2h = nullptr;       // dedicated tiny D2H stream for kCpu routing readback
+        cudaStream_t s_copy = nullptr;
+        cudaStream_t s_d2h = nullptr;
         cublasHandle_t blas = nullptr;
         cudaEvent_t ev_xfer = nullptr;
         cudaEvent_t ev_route = nullptr;
@@ -267,6 +323,9 @@ private:
         float *gu = nullptr, *eh = nullptr, *shact = nullptr, *part = nullptr, *shout = nullptr, *moe = nullptr;
         float *rlog = nullptr, *d_w = nullptr, *d_cpu_out = nullptr, *logits = nullptr;
         int *d_ids = nullptr, *d_step = nullptr, *d_iota = nullptr;
+        int* d_route_err = nullptr;
+        int* h_route_err = nullptr;
+        unsigned long long* h_stats = nullptr;
         int* d_mrope_pos = nullptr;
         int mrope_cap = 0;
         unsigned long long* d_plan = nullptr;
@@ -295,7 +354,6 @@ private:
         float* d_top_pair = nullptr;
         float* h_top_pair = nullptr;
         hy4::k::FetchScratch fxs;
-        // pinned host buffers
         int* h_step = nullptr;
         int* h_ids = nullptr;
         float* h_w = nullptr;
@@ -324,7 +382,7 @@ private:
         int* d_max_rows = nullptr;
         int* h_max_rows = nullptr;
         uint8_t* h_pf_stage[2] = {nullptr, nullptr};
-        // CUDA graphs for single-token and windowed verify decode (index W - 1 for W = 1..kMaxWin)
+        // CUDA graphs
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t graph_exec = nullptr;
         bool graph_ready = false;
@@ -347,11 +405,22 @@ private:
         static constexpr int kRing = 256;
     };
 
+    struct VlendSaved {
+        Layer* l = nullptr;
+        std::vector<int> owners;
+        int sl_first = 0;
+    };
+
     Config c_;
     Options o_;
+    std::string gguf_path_;
     OffloadMode active_offload_ = OffloadMode::kGpu;
     std::string info_;
+    std::string start_plan_line_;
+    std::string cal_key_;
+    std::string cal_file_;
     std::unique_ptr<hy4::Lane> lane_;
+    sys::DirectGgufReader ssd_reader_;
     std::vector<Gpu> gpus_;
     std::vector<std::vector<bool>> p2p_mat_;
     std::vector<Layer> layers_;
@@ -365,23 +434,50 @@ private:
     std::vector<std::string> vocab_tokens_;
     unsigned long long cpu_lane_picks_ = 0;
     unsigned long long cpu_admitted_ = 0;
+    mutable unsigned long long ram_fetch_picks_ = 0;
+    mutable unsigned long long ssd_fetch_picks_ = 0;
+    unsigned long long graph_captures_ = 0;
+    unsigned long long launches_per_tok_ = 0;
     int tok_promo_budget_ = 0;
     int promo_rr_ = 0;
     double last_warm_s_ = 0.0;
     double vram_res_frac_ = 1.0;
+    double pcie_share_ = 0.0;
+    double total_vram_gb_ = 0.0;
+    double total_ram_gb_ = 0.0;
+    double total_ssd_gb_ = 0.0;
+    double total_kv_gb_ = 0.0;
+    size_t total_experts_ = 0;
+    size_t total_vram_experts_ = 0;
+    size_t total_ram_experts_ = 0;
+    size_t total_ssd_experts_ = 0;
+    bool lookahead_on_ = false;
+    double base_cpu_ms_per_exp_ = 0.0;
+    double cpu_ema_ms_per_exp_ = 0.0;
+    int busy_pc_shift_ = 0;
     int mtp_done_ = 0;
     std::vector<int> mtp_tokens_;
+    std::vector<float> mtp_pf_h_host_;  // prompt final hidden states for full-prompt MTP catch-up
+    int mtp_pf_pos0_ = 0;
     std::unique_ptr<VisionTower> vision_;
     std::vector<Image> images_;
     int rope_delta_ = 0;
-    double total_vram_gb_ = 0.0;
-    size_t total_experts_ = 0;
-    size_t total_vram_experts_ = 0;
+    bool vlent_ = false;
+    std::vector<VlendSaved> vlend_saved_;
+    std::thread warmup_thread_;
+    std::atomic<bool> warmup_done_{true};
+    std::string last_kernel_;
 
     void* dev_alloc(Gpu& g, size_t bytes);
     void* host_alloc(Gpu& g, size_t bytes);
     void set_dev(int dev);
     void check_token_id(int tok, const char* where) const;
+    void check_route_and_fault(const char* stage);
+    bool read_expert_blob(const Layer& l, int e, uint8_t* dst) const;
+    void run_cpu_entries(Layer& l, const std::vector<hy4::CpuEntry>& entries, const float* x, int T, float* out);
+    void peer_setup_verified();
+    void start_warmup_async();
+    void calibrate_split_and_threads();
     void load_layer_weights(Layer& l, int il, Gpu& g, const maya::GgufFile& gf,
                             const std::map<std::string, const maya::TensorInfo*>& want);
     void transfer_x(int g_from, int g_to, int T, bool prefill_buf);
@@ -398,11 +494,12 @@ private:
     void mla_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x = true);
     void ffn_dense_decode(Gpu& gp, Layer& l, int il, bool seam, const float* next_norm = nullptr);
     void ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* next_norm = nullptr);
+    void mtp_prefill_prompt(const int* tokens, int n, int pos0);
 
     void gemm_mat(Gpu& gp, const Mat& m, const uint16_t* a16, int T, float* out_f32);
     struct MacroBufs {
         float *x = nullptr, *cur = nullptr, *moe = nullptr, *w = nullptr;
-        float *pipe_x = nullptr;     // second ping-pong x buffer for multi-GPU stage pipelining
+        float *pipe_x = nullptr;
         int *ids = nullptr, *tok = nullptr, *row_of = nullptr;
     };
     void kda_prefill(Gpu& gp, Layer& l, int T, float* x_io);

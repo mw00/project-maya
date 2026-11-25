@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <cuda_runtime.h>
 #include "hy4_kernels.cuh"
 
@@ -28,7 +29,7 @@ void kda_rec_q8(const float* q, const float* k, const float* v, const float* g1,
 /// p = sigmoid(logits), sel = p + bias, top-2 sum per group, keep top n_group_used groups, top-n_used by sel,
 /// weights = p / max(sum(p), 2^-14) * w_scale.  Deterministic lower-index tie-breaking matching ref/ling.py.
 void router_grouped(const float* logits, const float* bias, int T, int n_exp, int n_used, int n_group, int n_group_used,
-                    bool w_norm, float w_scale, int* ids_out, float* w_out, cudaStream_t s);
+                    bool w_norm, float w_scale, int* ids_out, float* w_out, cudaStream_t s, int* err_flag = nullptr);
 
 /// Write T tokens of kv_a_mqa output ([T][kv_lora + n_rot]) into split (lat, k_pe) buffers matching glmd::mla_dec
 /// and glmd::mla_prompt_wmma: RMSNorm(kv_lora) -> lat (FP16 or 544-byte INT8 records), double-precision NORM RoPE
@@ -166,6 +167,13 @@ void store_hring(const float* src, int W, int E, float* ring, int R, int pos0, c
 void set_step(int* d_step, int tok, int pos, int n_kv, int rope_delta, cudaStream_t s);
 void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, int rope_delta,
                   cudaStream_t s);
+
+/// Per-256 Q8_K activation quantization matching maya::ds4::par::quant bit-for-bit (for --lane-parity / --repeatable).
+void q8k_rows(const float* x, int rows, int k, int8_t* xq, float* xd, cudaStream_t s);
+
+/// Startup bit-for-bit self-check of fused kernels (add_rmsnorm_q8, add2_rmsnorm_q8, swiglu_clamp_out, kda_prep_full).
+/// Returns true on exact match; writes mismatch detail into `err` and returns false otherwise.
+bool verify_fused_kernels(cudaStream_t s, std::string& err);
 
 }  // namespace ling::k
 

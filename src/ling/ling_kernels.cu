@@ -5,6 +5,8 @@
 #include <mma.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 namespace ling::k {
 namespace {
@@ -191,8 +193,10 @@ __device__ __forceinline__ void warp_best(float& v, int& id) {
 __global__ void __launch_bounds__(256)
     router_grouped_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_exp, int n_used,
                           int n_group, int n_group_used, int w_norm, float w_scale, int* __restrict__ ids_out,
-                          float* __restrict__ w_out) {
+                          float* __restrict__ w_out, int* __restrict__ err_flag) {
     __shared__ float sp[512];
+    __shared__ int s_bad;
+    if (threadIdx.x == 0) s_bad = 0;
     __shared__ float sv[512];
     __shared__ float gscore[16];
     __shared__ int gslot[16];
@@ -210,8 +214,11 @@ __global__ void __launch_bounds__(256)
         if (w < n_group) {
             const int a_id = w * 64 + lane;
             const int b_id = a_id + 32;
-            const float pa = sigmoid_exact(lr[a_id]);
-            const float pb = sigmoid_exact(lr[b_id]);
+            const float la = lr[a_id];
+            const float lb = lr[b_id];
+            if (!isfinite(la) || !isfinite(lb)) atomicOr(&s_bad, 1);
+            const float pa = isfinite(la) ? sigmoid_exact(la) : 0.0f;
+            const float pb = isfinite(lb) ? sigmoid_exact(lb) : 0.0f;
             sp[a_id] = pa;
             sp[b_id] = pb;
             float va = pa + (bias != nullptr ? bias[a_id] : 0.0f);
@@ -300,10 +307,23 @@ __global__ void __launch_bounds__(256)
                     if (mi == ci) mv = -INFINITY;
                 }
                 if (lane == 0) {
+                    bool bad = (s_bad != 0) || !isfinite(sum);
                     const float inv = (w_norm != 0 && sum > 0.0f) ? (w_scale / sum) : w_scale;
+                    if (!isfinite(inv)) bad = true;
                     for (int k = 0; k < n_used; ++k) {
-                        idr[k] = pk_id[k];
-                        wr[k] = pk_p[k] * inv;
+                        if (pk_id[k] < 0 || pk_id[k] >= n_exp || !isfinite(pk_p[k])) bad = true;
+                    }
+                    if (bad) {
+                        if (err_flag != nullptr) atomicExch(err_flag, 1);
+                        for (int k = 0; k < n_used; ++k) {
+                            idr[k] = 0;
+                            wr[k] = 0.0f;
+                        }
+                    } else {
+                        for (int k = 0; k < n_used; ++k) {
+                            idr[k] = pk_id[k];
+                            wr[k] = pk_p[k] * inv;
+                        }
                     }
                 }
             }
@@ -323,11 +343,15 @@ __global__ void __launch_bounds__(256)
     float p0 = 0.0f, v0 = -INFINITY;
     float p1 = 0.0f, v1 = -INFINITY;
     if (e0 < n_exp) {
-        p0 = sigmoid_exact(lr[e0]);
+        const float l0 = lr[e0];
+        if (!isfinite(l0)) atomicOr(&s_bad, 1);
+        p0 = isfinite(l0) ? sigmoid_exact(l0) : 0.0f;
         v0 = p0 + (bias != nullptr ? bias[e0] : 0.0f);
     }
     if (e1 < n_exp) {
-        p1 = sigmoid_exact(lr[e1]);
+        const float l1 = lr[e1];
+        if (!isfinite(l1)) atomicOr(&s_bad, 1);
+        p1 = isfinite(l1) ? sigmoid_exact(l1) : 0.0f;
         v1 = p1 + (bias != nullptr ? bias[e1] : 0.0f);
     }
     sp[e0] = p0;
@@ -410,11 +434,24 @@ __global__ void __launch_bounds__(256)
     }
     if (tid == 0) {
         float sum = 0.0f;
-        for (int k = 0; k < n_used; ++k) sum += picked_p[k];
-        const float inv = (w_norm != 0 && sum > 0.0f) ? (w_scale / sum) : w_scale;
+        bool bad = (s_bad != 0);
         for (int k = 0; k < n_used; ++k) {
-            idr[k] = picked_id[k];
-            wr[k] = picked_p[k] * inv;
+            if (picked_id[k] < 0 || picked_id[k] >= n_exp || !isfinite(picked_p[k])) bad = true;
+            sum += picked_p[k];
+        }
+        const float inv = (w_norm != 0 && sum > 0.0f) ? (w_scale / sum) : w_scale;
+        if (!isfinite(sum) || !isfinite(inv)) bad = true;
+        if (bad) {
+            if (err_flag != nullptr) atomicExch(err_flag, 1);
+            for (int k = 0; k < n_used; ++k) {
+                idr[k] = 0;
+                wr[k] = 0.0f;
+            }
+        } else {
+            for (int k = 0; k < n_used; ++k) {
+                idr[k] = picked_id[k];
+                wr[k] = picked_p[k] * inv;
+            }
         }
     }
 }
@@ -566,6 +603,159 @@ __global__ void emb_rows_f32_kernel(const float* __restrict__ w, int64_t k, cons
     const int t = blockIdx.y;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < k) out[(size_t) t * k + i] = w[(int64_t) ids[t] * k + i];
+}
+
+__device__ __forceinline__ float emb_h2f(const uint8_t* p) {
+    uint16_t h;
+    memcpy(&h, p, 2);
+    return __half2float(__ushort_as_half(h));
+}
+
+__device__ __forceinline__ void emb_q4k_scale(const uint8_t* sc, int j, int& d, int& m) {
+    if (j < 4) {
+        d = sc[j] & 63;
+        m = sc[j + 4] & 63;
+    } else {
+        d = (sc[j + 4] & 0x0f) | ((sc[j - 4] >> 6) << 4);
+        m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+    }
+}
+
+__global__ void emb_rows_q4_0_kernel(const uint8_t* __restrict__ w, int64_t k, const int* __restrict__ ids,
+                                     float* __restrict__ out) {
+    const int t = blockIdx.y;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    const int64_t row_bytes = (k / 32) * 18;
+    const uint8_t* blk = w + (int64_t) ids[t] * row_bytes + (i / 32) * 18;
+    const float d = emb_h2f(blk);
+    const int j = (int) (i & 31);
+    const uint8_t byte = blk[2 + (j & 15)];
+    const int q = (j < 16) ? (byte & 0x0f) : (byte >> 4);
+    out[(size_t) t * k + i] = d * (float) (q - 8);
+}
+
+__global__ void emb_rows_q4_k_kernel(const uint8_t* __restrict__ w, int64_t k, const int* __restrict__ ids,
+                                     float* __restrict__ out) {
+    const int t = blockIdx.y;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    const int64_t row_bytes = (k / 256) * 144;
+    const uint8_t* blk = w + (int64_t) ids[t] * row_bytes + (i / 256) * 144;
+    const int off = (int) (i & 255);
+    const int ib = off >> 5;
+    const int r = off & 31;
+    int sc, m;
+    emb_q4k_scale(blk + 4, ib, sc, m);
+    const float d1 = emb_h2f(blk) * (float) sc;
+    const float m1 = emb_h2f(blk + 2) * (float) m;
+    const uint8_t byte = blk[16 + 32 * (ib >> 1) + r];
+    const int q = (ib & 1) ? (byte >> 4) : (byte & 0x0f);
+    out[(size_t) t * k + i] = d1 * (float) q - m1;
+}
+
+__global__ void emb_rows_q5_k_kernel(const uint8_t* __restrict__ w, int64_t k, const int* __restrict__ ids,
+                                     float* __restrict__ out) {
+    const int t = blockIdx.y;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    const int64_t row_bytes = (k / 256) * 176;
+    const uint8_t* blk = w + (int64_t) ids[t] * row_bytes + (i / 256) * 176;
+    const int off = (int) (i & 255);
+    const int ib = off >> 5;
+    const int r = off & 31;
+    int sc, m;
+    emb_q4k_scale(blk + 4, ib, sc, m);
+    const float d1 = emb_h2f(blk) * (float) sc;
+    const float m1 = emb_h2f(blk + 2) * (float) m;
+    const uint8_t byte = blk[48 + 32 * (ib >> 1) + r];
+    const int lo = (ib & 1) ? (byte >> 4) : (byte & 0x0f);
+    const int hi = ((blk[16 + r] >> ib) & 1) << 4;
+    out[(size_t) t * k + i] = d1 * (float) (lo | hi) - m1;
+}
+
+__global__ void emb_rows_q6_k_kernel(const uint8_t* __restrict__ w, int64_t k, const int* __restrict__ ids,
+                                     float* __restrict__ out) {
+    const int t = blockIdx.y;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    const int64_t row_bytes = (k / 256) * 210;
+    const uint8_t* blk = w + (int64_t) ids[t] * row_bytes + (i / 256) * 210;
+    const int off = (int) (i & 255);
+    const int ib = off >> 5;
+    const int r = off & 31;
+    const int hf = ib >> 2, qt = ib & 3;
+    const uint8_t ql = blk[64 * hf + 32 * (qt & 1) + r];
+    const uint8_t qh = blk[128 + 32 * hf + r];
+    const int8_t sc = ((const int8_t*) (blk + 192 + 8 * hf + 2 * qt))[r >> 4];
+    const int q = (((ql >> (4 * (qt >> 1))) & 15) | (((qh >> (2 * qt)) & 3) << 4)) - 32;
+    out[(size_t) t * k + i] = __fmul_rn(__fmul_rn(emb_h2f(blk + 208), (float) sc), (float) q);
+}
+
+// Per-256 Q8_K activation quantization matching maya::ds4::par::quant bit-for-bit.
+// Grid: (k / 256, rows), block: 256.
+__global__ void __launch_bounds__(256)
+    q8k_rows_kernel(const float* __restrict__ x, int k, int8_t* __restrict__ xq, float* __restrict__ xd) {
+    __shared__ float s_am[8];
+    __shared__ int s_ix[8];
+    const int b = blockIdx.x;
+    const int row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const float* xb = x + (size_t) row * k + (size_t) b * 256;
+    const float v = xb[tid];
+    float am = fabsf(v);
+    int ix = tid;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float oa = __shfl_xor_sync(0xffffffffu, am, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, ix, o);
+        if (oa > am || (oa == am && oi < ix)) {
+            am = oa;
+            ix = oi;
+        }
+    }
+    if (lane == 0) {
+        s_am[warp] = am;
+        s_ix[warp] = ix;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float bm = (lane < 8) ? s_am[lane] : -1.0f;
+        int bi = (lane < 8) ? s_ix[lane] : 256;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+            const float oa = __shfl_xor_sync(0xffffffffu, bm, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (oa > bm || (oa == bm && oi < bi)) {
+                bm = oa;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            s_am[0] = bm;
+            s_ix[0] = bi;
+        }
+    }
+    __syncthreads();
+    const float max_a = s_am[0];
+    const int max_i = s_ix[0];
+    int8_t* qb = xq + (size_t) row * k + (size_t) b * 256;
+    float* db = xd + (size_t) row * (k / 32) + (size_t) b * 8;
+    float dv = 0.0f;
+    int8_t qv = 0;
+    if (max_a > 0.0f) {
+        const float iscale = __fdiv_rn(-127.0f, xb[max_i]);
+        const float val = __fadd_rn(__fmul_rn(iscale, v), 12582912.0f);
+        const int32_t bits = __float_as_int(val);
+        int qi = (bits & 0x007fffff) - 0x00400000;
+        if (qi > 127) qi = 127;
+        qv = (int8_t) qi;
+        dv = __fdiv_rn(1.0f, iscale);
+    }
+    qb[tid] = qv;
+    if (tid < 8) db[tid] = dv;
 }
 
 // ---- MTP concat [rms(emb)*enorm ; rms(h)*hnorm] (grid: 2, block: 256) ----
@@ -1849,10 +2039,10 @@ void kda_rec_q8(const float* q, const float* k, const float* v, const float* g1,
 }
 
 void router_grouped(const float* logits, const float* bias, int T, int n_exp, int n_used, int n_group, int n_group_used,
-                    bool w_norm, float w_scale, int* ids_out, float* w_out, cudaStream_t s) {
+                    bool w_norm, float w_scale, int* ids_out, float* w_out, cudaStream_t s, int* err_flag) {
     if (T <= 0) return;
     router_grouped_kernel<<<(unsigned) T, 256, 0, s>>>(logits, bias, n_exp, n_used, n_group, n_group_used,
-                                                       w_norm ? 1 : 0, w_scale, ids_out, w_out);
+                                                       w_norm ? 1 : 0, w_scale, ids_out, w_out, err_flag);
 }
 
 void kv_store_split(const float* kv_in, int T, int kv_lora, int n_rot, const float* kv_a_norm, float eps,
@@ -1896,6 +2086,10 @@ bool emb_rows(const uint8_t* w, int type, int64_t k, const int* ids_dev, int T, 
     else if (type == 1) emb_rows_f16_kernel<<<grid, 256, 0, s>>>((const uint16_t*) w, k, ids_dev, out);
     else if (type == 30) emb_rows_bf16_kernel<<<grid, 256, 0, s>>>((const uint16_t*) w, k, ids_dev, out);
     else if (type == 0) emb_rows_f32_kernel<<<grid, 256, 0, s>>>((const float*) w, k, ids_dev, out);
+    else if (type == 2) emb_rows_q4_0_kernel<<<grid, 256, 0, s>>>(w, k, ids_dev, out);
+    else if (type == 12) emb_rows_q4_k_kernel<<<grid, 256, 0, s>>>(w, k, ids_dev, out);
+    else if (type == 13) emb_rows_q5_k_kernel<<<grid, 256, 0, s>>>(w, k, ids_dev, out);
+    else if (type == 14) emb_rows_q6_k_kernel<<<grid, 256, 0, s>>>(w, k, ids_dev, out);
     else return false;
     return true;
 }
@@ -1998,7 +2192,7 @@ bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off
     const int tile = lat_q8 != 0 ? mla_dec_wmma_tile_ok<1>() : mla_dec_wmma_tile_ok<0>();
     if (tile == 0) return false;
     const int sms = mla_dec_dev_sms();
-    const int s_max = (T > 1) ? std::min(kMlaMaxSplitsM, std::max(1, sms / T)) : std::min(kMlaMaxSplits1, sms);
+    const int s_max = std::min(kMlaMaxSplitsM, std::max(1, sms / 4));
     const dim3 grid((unsigned) s_max, (unsigned) T);
     if (tile == 32) {
         if (lat_q8 != 0)
@@ -2087,6 +2281,168 @@ void set_step(int* d_step, int tok, int pos, int n_kv, int rope_delta, cudaStrea
 void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, int rope_delta,
                   cudaStream_t s) {
     set_step_win_kernel<<<1, 1, 0, s>>>(d_step, d_tok, d_pos, t0, t1, t2, t3, W, pos0, rope_delta);
+}
+
+void q8k_rows(const float* x, int rows, int k, int8_t* xq, float* xd, cudaStream_t s) {
+    if (rows <= 0 || k <= 0) return;
+    q8k_rows_kernel<<<dim3((unsigned) (k / 256), (unsigned) rows), 256, 0, s>>>(x, k, xq, xd);
+}
+
+namespace {
+__global__ void ref_add_kernel(float* x, const float* a, const float* b, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = x[i] + a[i] + (b ? b[i] : 0.0f);
+}
+__global__ void ref_rmsnorm_q8_kernel(const float* x, const float* w, int E, float eps, float* cur_out, int8_t* xq,
+                                      float* xd) {
+    __shared__ float s_sum[16];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    float xv[8], wv[8];
+    float ss = 0.0f;
+    const int n_iter = (E + 511) >> 9;
+    for (int j = 0; j < n_iter; ++j) {
+        const int i = tid + j * 512;
+        if (i < E) {
+            xv[j] = x[i];
+            wv[j] = w[i];
+            ss += xv[j] * xv[j];
+        }
+    }
+    ss = warp_sum_f(ss);
+    if (lane == 0) s_sum[warp] = ss;
+    __syncthreads();
+    if (tid < 16) {
+        float v = s_sum[tid];
+        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0x0000ffffu, v, o);
+        if (tid == 0) s_sum[0] = rsqrtf(v / (float) E + eps);
+    }
+    __syncthreads();
+    const float inv = s_sum[0];
+    for (int j = 0; j < n_iter; ++j) {
+        const int i = tid + j * 512;
+        if (i < E) {
+            const float o = xv[j] * inv * wv[j];
+            if (cur_out) cur_out[i] = o;
+            q8_store_warp(o, (size_t) i, xq, xd);
+        }
+    }
+}
+__global__ void ref_swiglu_unfused_kernel(const float* g, const float* u, int n, float limit, float* h_out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float act = g[i] * sigmoid_exact(g[i]);
+    float uv = u[i];
+    if (limit > 0.0f) {
+        if (act > limit) act = limit;
+        uv = fminf(fmaxf(uv, -limit), limit);
+    }
+    h_out[i] = act * uv;
+}
+__global__ void ref_q8_kernel(const float* h, int n, int8_t* xq, float* xd) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) q8_store_warp(h[i], (size_t) i, xq, xd);
+}
+}  // namespace
+
+bool verify_fused_kernels(cudaStream_t s, std::string& err) {
+    constexpr int E = 2560, FE = 768;
+    const float eps = 1e-6f;
+    float *dx1 = nullptr, *dx2 = nullptr, *da = nullptr, *db = nullptr, *dw = nullptr;
+    float *dc1 = nullptr, *dc2 = nullptr, *dd1 = nullptr, *dd2 = nullptr;
+    int8_t *dq1 = nullptr, *dq2 = nullptr;
+    auto cleanup = [&] {
+        cudaFree(dx1); cudaFree(dx2); cudaFree(da); cudaFree(db); cudaFree(dw);
+        cudaFree(dc1); cudaFree(dc2); cudaFree(dd1); cudaFree(dd2);
+        cudaFree(dq1); cudaFree(dq2);
+    };
+    auto alloc = [&](void** p, size_t n) -> bool { return cudaMalloc(p, n) == cudaSuccess; };
+    if (!alloc((void**) &dx1, E * 4) || !alloc((void**) &dx2, E * 4) || !alloc((void**) &da, E * 4) ||
+        !alloc((void**) &db, E * 4) || !alloc((void**) &dw, E * 4) || !alloc((void**) &dc1, E * 4) ||
+        !alloc((void**) &dc2, E * 4) || !alloc((void**) &dd1, (E / 32) * 4) || !alloc((void**) &dd2, (E / 32) * 4) ||
+        !alloc((void**) &dq1, E) || !alloc((void**) &dq2, E)) {
+        cleanup();
+        err = "verify_fused_kernels: cudaMalloc failed";
+        return false;
+    }
+    std::vector<float> hx(E), ha(E), hb(E), hw(E);
+    for (int i = 0; i < E; ++i) {
+        hx[i] = sinf((float) i * 0.13f) * 2.5f;
+        ha[i] = cosf((float) i * 0.27f) * 1.7f;
+        hb[i] = sinf((float) i * 0.41f + 0.5f) * 0.9f;
+        hw[i] = 0.8f + 0.4f * cosf((float) i * 0.09f);
+    }
+    cudaMemcpyAsync(dx1, hx.data(), E * 4, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(dx2, hx.data(), E * 4, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(da, ha.data(), E * 4, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(db, hb.data(), E * 4, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(dw, hw.data(), E * 4, cudaMemcpyHostToDevice, s);
+
+    // 1. add_rmsnorm_q8 vs unfused add + rmsnorm_q8
+    add_rmsnorm_q8(dx1, da, dw, 1, E, eps, dc1, dq1, dd1, s);
+    ref_add_kernel<<<(E + 255) / 256, 256, 0, s>>>(dx2, da, nullptr, E);
+    ref_rmsnorm_q8_kernel<<<1, 512, 0, s>>>(dx2, dw, E, eps, dc2, dq2, dd2);
+    std::vector<float> rx1(E), rx2(E), rc1(E), rc2(E), rd1(E / 32), rd2(E / 32);
+    std::vector<int8_t> rq1(E), rq2(E);
+    cudaMemcpyAsync(rx1.data(), dx1, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rx2.data(), dx2, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rc1.data(), dc1, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rc2.data(), dc2, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rd1.data(), dd1, (E / 32) * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rd2.data(), dd2, (E / 32) * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rq1.data(), dq1, E, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rq2.data(), dq2, E, cudaMemcpyDeviceToHost, s);
+    cudaStreamSynchronize(s);
+    if (std::memcmp(rx1.data(), rx2.data(), E * 4) != 0 || std::memcmp(rc1.data(), rc2.data(), E * 4) != 0 ||
+        std::memcmp(rq1.data(), rq2.data(), E) != 0 || std::memcmp(rd1.data(), rd2.data(), (E / 32) * 4) != 0) {
+        cleanup();
+        err = "verify_fused_kernels: add_rmsnorm_q8 bit mismatch vs unfused reference";
+        return false;
+    }
+
+    // 2. add2_rmsnorm_q8 vs unfused add2 + rmsnorm_q8
+    cudaMemcpyAsync(dx1, hx.data(), E * 4, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(dx2, hx.data(), E * 4, cudaMemcpyHostToDevice, s);
+    add2_rmsnorm_q8(dx1, da, db, dw, 1, E, eps, dc1, dq1, dd1, s);
+    ref_add_kernel<<<(E + 255) / 256, 256, 0, s>>>(dx2, da, db, E);
+    ref_rmsnorm_q8_kernel<<<1, 512, 0, s>>>(dx2, dw, E, eps, dc2, dq2, dd2);
+    cudaMemcpyAsync(rx1.data(), dx1, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rx2.data(), dx2, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rc1.data(), dc1, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rc2.data(), dc2, E * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rd1.data(), dd1, (E / 32) * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rd2.data(), dd2, (E / 32) * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rq1.data(), dq1, E, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rq2.data(), dq2, E, cudaMemcpyDeviceToHost, s);
+    cudaStreamSynchronize(s);
+    if (std::memcmp(rx1.data(), rx2.data(), E * 4) != 0 || std::memcmp(rc1.data(), rc2.data(), E * 4) != 0 ||
+        std::memcmp(rq1.data(), rq2.data(), E) != 0 || std::memcmp(rd1.data(), rd2.data(), (E / 32) * 4) != 0) {
+        cleanup();
+        err = "verify_fused_kernels: add2_rmsnorm_q8 bit mismatch vs unfused reference";
+        return false;
+    }
+
+    // 3. swiglu_clamp_out vs unfused swiglu + q8_store
+    swiglu_clamp_out(da, db, 1, FE, 5.0f, dc1, dq1, dd1, nullptr, s);
+    ref_swiglu_unfused_kernel<<<(FE + 255) / 256, 256, 0, s>>>(da, db, FE, 5.0f, dc2);
+    ref_q8_kernel<<<(FE + 255) / 256, 256, 0, s>>>(dc2, FE, dq2, dd2);
+    cudaMemcpyAsync(rc1.data(), dc1, FE * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rc2.data(), dc2, FE * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rd1.data(), dd1, (FE / 32) * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rd2.data(), dd2, (FE / 32) * 4, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rq1.data(), dq1, FE, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(rq2.data(), dq2, FE, cudaMemcpyDeviceToHost, s);
+    cudaStreamSynchronize(s);
+    if (std::memcmp(rc1.data(), rc2.data(), FE * 4) != 0 || std::memcmp(rq1.data(), rq2.data(), FE) != 0 ||
+        std::memcmp(rd1.data(), rd2.data(), (FE / 32) * 4) != 0) {
+        cleanup();
+        err = "verify_fused_kernels: swiglu_clamp_out bit mismatch vs unfused reference";
+        return false;
+    }
+
+    cleanup();
+    return cudaGetLastError() == cudaSuccess;
 }
 
 }  // namespace ling::k
