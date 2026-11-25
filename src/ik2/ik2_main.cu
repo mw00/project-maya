@@ -3175,7 +3175,7 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
 #ifndef MAYA_USE_HIP
     // (IK2_PEER_DIRECT_SIGNAL=1: the ring in host memory both cards map, its words at 0 - two_send_mail)
     if (const char* m = getenv("IK2_PEER_DIRECT_SIGNAL"); m && std::atoi(m)) {
-        T.ml = k::mail_layout(C, c.E, K);
+        T.ml = k::mail_layout(C, c.E, K, kTwoWin);
         if (cudaHostAlloc((void**) &T.mail_h, T.ml.ring + 128, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
             (void) cudaGetLastError();
             die("IK2_PEER_DIRECT_SIGNAL=1: the ring's host memory (" + std::to_string(T.ml.ring >> 10) + " KiB, pinned and mapped) did not come");
@@ -3186,7 +3186,7 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
         CU(cudaEventCreateWithFlags(&T.ev_mail, cudaEventDisableTiming));
         CU(cudaSetDevice(T.dev));
         CU(cudaHostGetDevicePointer((void**) &T.mail_d1, T.mail_h, 0));
-        T.rcv = dalloc<float>((size_t) C + c.E);
+        T.rcv = dalloc<float>((size_t) kTwoWin * C + std::max(c.E, 2 * kTwoWin * K));
         T.mail = true;
         CU(cudaSetDevice(0));   // (the caller left GPU 0 current: back there)
     }
@@ -3715,6 +3715,18 @@ void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, fl
 // k::kHeldElsewhere.  Every member's row is the window kernels' - the token path's to the bit - wherever its expert
 // sits: drafting on two GPUs gives plain decoding's answers there.
 static_assert(kTwoWin == kBlockMax, "the two-GPU window's buffers");
+static void two_run_win_experts(const Layer& Ly, const Config& c, TwoGpu& G, int T, int S, bool tc) {
+    if (tc) {
+        k::f16_limbs_rows(G.wx, T, c.C, G.wlimbs, G.s);
+        k::experts_block_gu(G.wblob, G.wn, G.wtok, G.wrow, S, T, Ly.eb[0], c.C, c.F, G.wlimbs, G.sg, G.su, c.gate_cap,
+                            c.up_cap, G.h16, G.s);
+        k::experts_block_down(G.wblob, G.wn, G.wrow, S, Ly.eb[0] + Ly.eb[1], c.C, c.F, G.h16, G.y32, G.s);
+    } else {
+        k::experts_gate_up_swiglu_mem(G.wblob, G.wn, G.wtok, G.wrow, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], G.wx, c.C, c.F,
+                                      G.sg, G.su, c.gate_cap, c.up_cap, G.h16, G.s);
+        k::experts_down_mem(G.wblob, G.wn, G.wrow, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], G.h16, c.C, c.F, G.y32, G.s);
+    }
+}
 void two_send_win(const Model& M, int l, Work& W, int T, bool tc) {
     const Config& c = M.c;
     const Layer& Ly = M.L[l];
@@ -3733,16 +3745,7 @@ void two_send_win(const Model& M, int l, Work& W, int T, bool tc) {
     }
     k::group_route(G.wroute, (const float*) (G.wroute + S), S, c.K, G.tab[l], G.sc[0][l], G.sc[1][l], G.sc[2][l], G.wblob,
                    G.wn, G.wtok, G.wrow, G.sg, G.su, G.wt, G.inv, G.s);
-    if (tc) {
-        k::f16_limbs_rows(G.wx, T, C, G.wlimbs, G.s);
-        k::experts_block_gu(G.wblob, G.wn, G.wtok, G.wrow, S, T, Ly.eb[0], C, c.F, G.wlimbs, G.sg, G.su, c.gate_cap,
-                            c.up_cap, G.h16, G.s);
-        k::experts_block_down(G.wblob, G.wn, G.wrow, S, Ly.eb[0] + Ly.eb[1], C, c.F, G.h16, G.y32, G.s);
-    } else {
-        k::experts_gate_up_swiglu_mem(G.wblob, G.wn, G.wtok, G.wrow, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], G.wx, C, c.F, G.sg,
-                                      G.su, c.gate_cap, c.up_cap, G.h16, G.s);
-        k::experts_down_mem(G.wblob, G.wn, G.wrow, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], G.h16, C, c.F, G.y32, G.s);
-    }
+    two_run_win_experts(Ly, c, G, T, S, tc);
     CU(cudaEventRecord(G.ev_y, G.s));
 #if defined(_WIN32)
     if (!g_graph) (void) cudaStreamQuery(G.s);   // (Windows + AMD start queued work only at a host wait)
@@ -3760,6 +3763,46 @@ void two_take_win(const Model& M, Work& W, int T) {
     CU(cudaSetDevice(0));
     k::two_take_rows_g(g_blk.blob, g_blk.n, g_blk.row, G.y_in, S, c.C, W.y32, g_s);
 }
+#if !defined(MAYA_USE_HIP)
+void two_send_win_mail(const Model& M, int l, Work& W, int T, bool tc) {
+    const Config& c = M.c;
+    const Layer& Ly = M.L[l];
+    TwoGpu& G = g_two;
+    const int C = c.C, S = T * c.K;
+    const unsigned long long v = ++G.visits;
+    const unsigned n = G.n = (unsigned) v;
+    const size_t off = (n % k::kMailSlots) * G.ml.slot;
+    unsigned char* d0 = G.mail_d0 + off;
+    unsigned char* d1 = G.mail_d1 + off;
+    k::mail_send(W.xq, (const float*) W.route_d, T * C, 2 * S, (float*) (d0 + G.ml.x),
+                 (const unsigned*) (d0 + G.ml.freed), n,
+                 v > (unsigned long long) k::kMailSlots ? (unsigned) (v - k::kMailSlots) : 0u,
+                 (unsigned*) (G.mail_d0 + G.ml.err), g_s);
+    CU(cudaEventRecord(G.ev_mail, g_s));
+    CU(cudaSetDevice(G.dev));
+    CU(cudaStreamWaitEvent(G.s, G.ev_mail, 0));
+    k::mail_recv((const float*) (d1 + G.ml.x), T * C, 2 * S, G.wx, (float*) G.wroute,
+                 (unsigned*) (d1 + G.ml.freed), n, G.s);
+    k::group_route(G.wroute, (const float*) (G.wroute + S), S, c.K, G.tab[l], G.sc[0][l], G.sc[1][l], G.sc[2][l], G.wblob,
+                   G.wn, G.wtok, G.wrow, G.sg, G.su, G.wt, G.inv, G.s);
+    two_run_win_experts(Ly, c, G, T, S, tc);
+    k::mail_publish_g(G.wblob, G.wn, G.wrow, G.y32, S, C, (float*) (d1 + G.ml.rows),
+                      (unsigned*) (d1 + G.ml.rows_word), n, G.s);
+#if defined(_WIN32)
+    (void) cudaStreamQuery(G.s);
+#endif
+    CU(cudaSetDevice(0));
+}
+void two_take_win_mail(const Model& M, Work& W, int T) {
+    const Config& c = M.c;
+    TwoGpu& G = g_two;
+    const int S = T * c.K;
+    unsigned char* d0 = G.mail_d0 + (G.n % k::kMailSlots) * G.ml.slot;
+    k::two_take_rows_mail_g(g_blk.blob, g_blk.n, g_blk.row, (const float*) (d0 + G.ml.rows),
+                            (const unsigned*) (d0 + G.ml.rows_word), G.n, S, c.C, W.y32,
+                            (unsigned*) (G.mail_d0 + G.ml.err), g_s);
+}
+#endif
 
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
     const Config& c = M.c;
@@ -4021,7 +4064,14 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
 #endif
         // (two GPUs: GPU 1's groups there with the same kernels, beside GPU 0's - the exact window only: spec_path)
-        if (g_two.on) two_send_win(M, l, W, T, exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F));
+        if (g_two.on) {
+            const bool use_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+#if !defined(MAYA_USE_HIP)
+            if (g_two.mail) two_send_win_mail(M, l, W, T, use_tc);
+            else
+#endif
+            two_send_win(M, l, W, T, use_tc);
+        }
         if (ex && !(exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F))) {
             k::experts_gate_up_swiglu_mem(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0],
                                           W.xq, C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
@@ -4045,7 +4095,13 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
-        if (g_two.on) two_take_win(M, W, T);
+        if (g_two.on) {
+#if !defined(MAYA_USE_HIP)
+            if (g_two.mail) two_take_win_mail(M, W, T);
+            else
+#endif
+            two_take_win(M, W, T);
+        }
         // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
         //  tokens' picks - it took 9.4 us where the two take 7)
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
