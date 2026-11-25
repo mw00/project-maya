@@ -95,7 +95,7 @@ struct Options {
     bool cache_warm = true;          // warm VRAM expert cache from prompt routing frequencies
     bool no_promo = false;           // disable per-token async VRAM promotions (for isolated placement checks)
     bool load_mtp = false;           // also load blk.<n_layers> MTP block
-    bool repeatable = false;         // deterministic mode: placement/timing-invariant output, Q8_K lane parity
+    bool repeatable = false;         // --repeatable only: same answers for 1 or N GPUs and any VRAM/CPU expert split (Q8_K lane parity, no fused cross-layer norm); a normal run can differ in the last digit between 1 and N GPUs
     bool lane_parity = false;        // CPU = GPU Q8_K per-256 rounding & exact warp-lane reduction
     int lookahead = -1;              // -1: auto (measure & keep if faster), 0: off, 1: on
     bool direct_io = false;          // buffered SSD reads by default (wins on NVMe under cgroup caps); --direct opts in
