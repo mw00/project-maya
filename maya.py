@@ -4804,6 +4804,16 @@ def keep_server_settings(cfg: dict, old: dict, a, extra: tuple = ()) -> list:
     return kept
 
 
+def keep_thinking_budget(cfg: dict, old: dict) -> None:
+    """A setup again: the thinking budget the config before had stays, with the mark that the user set it (the
+    dashboard's field: installer.thinking_budget_set).  `cfg` has its installer record by now."""
+    if (old or {}).get("thinking_budget") is None:
+        return
+    cfg["thinking_budget"] = old["thinking_budget"]
+    if (old.get("installer") or {}).get("thinking_budget_set"):
+        cfg.setdefault("installer", {})["thinking_budget_set"] = True
+
+
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
                  choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
@@ -8728,6 +8738,7 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                f": {ds4_tuned(new)}")
             if cal.get("context"):
                 ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
+    keep_thinking_budget(cfg, old)                     # (a setup again keeps the budget the user set)
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
@@ -9341,6 +9352,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                         "quant": MM3 if quant == "exl3" else MM3_QUANTS[quant], "mm3_quant": quant,
                         "model_dir": str(d), **({"own": True} if own else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    keep_thinking_budget(cfg, old)                     # (a setup again keeps the budget the user set)
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
@@ -10728,6 +10740,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         ok("kept from the config before: " + ", ".join(kept))
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     cfg["installer"] = {**inst, "models_dir": str(models), "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+    keep_thinking_budget(cfg, old)                     # (a setup again keeps the budget the user set)
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
@@ -11835,6 +11848,7 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     cfg["installer"] = {**inst, "models_dir": str(models), "model_dir": str(d), "experimental": True,
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    keep_thinking_budget(cfg, old)                     # (a setup again keeps the budget the user set)
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")

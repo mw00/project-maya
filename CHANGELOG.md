@@ -9,6 +9,7 @@ only what changed and starts; the model is not downloaded again.
 Inkling 2 Mini's thinking budget is now an option, not a default.
 
 - **Inkling 2 Mini: no thinking budget unless you set one.** v1.1.79 capped Inkling's thinking at 32,768 tokens by default. It now thinks as long as it needs, as before v1.1.79; set a budget in Settings > Chat defaults > Thinking budget or with `"thinking_budget"` in the config when you want one. A budget you already set is kept. The other models are unchanged.
+- **Fix: running the setup again dropped a thinking budget you had set** (DeepSeek, MiniMax, Hy4-flash and Inkling 2 Mini). The setup now keeps it, as it already did for GLM.
 
 ## v1.1.79 - 2026-11-25
 
