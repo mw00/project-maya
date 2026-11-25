@@ -20,6 +20,7 @@
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
 #include "ling_kernels.cuh"
+#include "ling_restore.hpp"
 #include "ling_sys.hpp"
 #include "ling_vision.hpp"
 
@@ -85,24 +86,26 @@ struct Options {
     double pin_ram_gib = -1.0;       // < 0: derive from host available RAM; 0: off; > 0: explicit cap in GiB
     double ram_cap_gib = -1.0;       // < 0: auto (avail - 8 GiB); >= 0: cap RAM expert tier (remainder goes to NVMe SSD)
     std::vector<int> gpus = {0};     // CUDA device ordinals (layer split when size > 1)
-    bool auto_sort_gpus = false;     // sort GPUs by free VRAM descending and skip display cards when headless exist
+    bool auto_sort_gpus = true;      // sort GPUs non-display & larger VRAM first by default (--no-auto-sort-gpus opts out)
     OffloadMode offload = OffloadMode::kAuto;
     int mix_k_gpu = 1;               // in kMix mode, max misses fetched on GPU per layer
     int cpu_threads = -1;            // hy4::Lane threads (-1: physical cores in affinity mask - 2)
     bool kv_q8 = false;              // INT8 MLA latent cache (672 B/layer/tok vs 1152 B FP16)
     bool use_graph = true;           // CUDA graph for single-token / windowed decode
     bool cache_warm = true;          // warm VRAM expert cache from prompt routing frequencies
+    bool no_promo = false;           // disable per-token async VRAM promotions (for isolated placement checks)
     bool load_mtp = false;           // also load blk.<n_layers> MTP block
     bool repeatable = false;         // deterministic mode: placement/timing-invariant output, Q8_K lane parity
     bool lane_parity = false;        // CPU = GPU Q8_K per-256 rounding & exact warp-lane reduction
     int lookahead = -1;              // -1: auto (measure & keep if faster), 0: off, 1: on
-    bool direct_io = true;           // use O_DIRECT on NVMe SSD expert path (with automatic fallback)
+    bool direct_io = false;          // buffered SSD reads by default (wins on NVMe under cgroup caps); --direct opts in
     bool recalibrate = false;        // ignore cached per-PC calibration and re-measure
     bool no_profile = false;         // disable default expert placement profile
     std::string profile_path;        // binary LNGP expert profile path
     std::string profile_out;         // optional output path to save accumulated routing profile
     std::string cal_file;            // keyed per-PC calibration file (default data/ling-calibration.txt)
-    std::string restore_dir;         // optional directory for persistent disk restore points
+    std::string restore_dir;         // opt-in directory for persistent disk restore points (empty = OFF by default)
+    size_t restore_dir_max_mb = 2048; // total disk cap for restore_dir in MiB (oldest .lingrp evicted)
     std::string seam_dir;
     std::string mmproj_path;
 };
@@ -184,21 +187,14 @@ public:
     size_t kda_snapshot_bytes() const;
     int prefill_chunk_size() const { return gpus_.empty() ? o_.prefill_chunk : gpus_[0].pf_cap; }
 
-    struct KdaSnapshot {
-        std::vector<int> tokens;
-        std::vector<std::pair<int64_t, uint64_t>> pics;
-        int rope_delta = 0;
-        bool kv_q8 = false;
-        std::vector<std::vector<float>> states;
-        std::vector<std::vector<float>> convs;
-        std::vector<std::vector<uint8_t>> mla_lat;   // [n_mla][n_tok * lat_row_bytes]
-        std::vector<std::vector<uint16_t>> mla_kpe;  // [n_mla][n_tok * n_rot]
-    };
+    using KdaSnapshot = sys::RestoreSnapshotData;
+    const sys::RestoreExpect& restore_expect() const { return restore_expect_; }
     void save_kda_snapshot(KdaSnapshot& snap, const std::vector<int>& tokens,
                            const std::vector<std::pair<int64_t, uint64_t>>& pics, bool include_mla = true) const;
     void restore_kda_snapshot(const KdaSnapshot& snap);
     bool save_restore_disk(const KdaSnapshot& snap, const std::string& dir, std::string& err) const;
-    bool load_restore_disk(const std::string& dir, std::vector<KdaSnapshot>& out) const;
+    bool load_restore_disk(const std::string& dir, std::vector<KdaSnapshot>& out,
+                           std::vector<std::string>* skipped_logs = nullptr) const;
     bool save_profile_now(const std::string& path, std::string& err) const;
 
     void reset();
@@ -301,6 +297,7 @@ private:
 
     struct Gpu {
         int dev = 0;
+        int numa_node = -1;
         int l0 = 0, l1 = 0;
         cudaStream_t s = nullptr;
         cudaStream_t s_copy = nullptr;
@@ -372,7 +369,7 @@ private:
         // prefill scratch
         int pf_cap = 0;
         int* pf_tok_ids = nullptr;
-        float *pf_x = nullptr, *pf_cur = nullptr, *pf_out = nullptr, *pf_moe = nullptr;
+        float *pf_x = nullptr, *pf_pipe_x = nullptr, *pf_cur = nullptr, *pf_out = nullptr, *pf_moe = nullptr;
         uint16_t *pf_x16 = nullptr, *pf_w16 = nullptr;
         float *pf_tmp = nullptr;
         size_t pf_tmp_bytes = 0;
@@ -426,6 +423,8 @@ private:
     std::string start_plan_line_;
     std::string cal_key_;
     std::string cal_file_;
+    sys::CpuTopology cpu_topo_;
+    sys::RestoreExpect restore_expect_;
     std::unique_ptr<hy4::Lane> lane_;
     std::vector<std::unique_ptr<sys::DirectGgufReader>> ssd_readers_;   // one a shard
     std::vector<Gpu> gpus_;

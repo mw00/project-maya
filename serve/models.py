@@ -254,7 +254,7 @@ def trained_context_of(cfg: dict) -> int | None:
         key, read_it = ("gguf", str(Path(args[args.index("--glm-pack") + 1]).resolve().parent)), trained_context
     elif "--pack" in args[:-1]:
         key, read_it = ("pack", args[args.index("--pack") + 1]), trained_context_ds4
-    elif any(f in args[:-1] for f in ("--gguf", "--model", "-m")):
+    elif family(cfg) == "ling" and any(f in args[:-1] for f in ("--gguf", "--model", "-m")):
         f = next(f for f in ("--gguf", "--model", "-m") if f in args[:-1])
         gp = Path(args[args.index(f) + 1]).resolve()
         key, read_it = ("gguf", str(gp if gp.is_file() else gp.parent)), trained_context
@@ -1077,8 +1077,28 @@ def describe(path: Path, running: str | None) -> dict:
         cards = [g for g in machine_gpus("cuda") if g.get("index") in gpus_cfg]
         vrams = [float(g.get("vram_gb") or 0) for g in cards] or [24.0] * len(gpus_cfg)
         ctxs = sorted({*LINGF.CONTEXTS, int(cur.get("context") or 0)} - {0})
-        qname = (inst.get("quant") or LINGF.DEFAULT_QUANT)
-        own.update(ling_fit={kv: {str(c): LINGF.plan(vrams, c, kv, qname) for c in ctxs} for kv in LINGF.KV_BYTES},
+        args_l = [str(x) for x in cfg.get("args") or []]
+        gg_p = flag(args_l, "--gguf") or flag(args_l, "--model") or flag(args_l, "-m")
+        gguf_gib = None
+        if gg_p:
+            try:
+                gp = Path(gg_p)
+                m = re.match(r"^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$", gp.name)
+                if m and int(m.group(3)) > 1:
+                    n_sh = int(m.group(3))
+                    tot = sum((gp.parent / f"{m.group(1)}-{i:05d}-of-{n_sh:05d}.gguf").stat().st_size
+                              for i in range(1, n_sh + 1)
+                              if (gp.parent / f"{m.group(1)}-{i:05d}-of-{n_sh:05d}.gguf").is_file())
+                    if tot > 0:
+                        gguf_gib = tot / LINGF.GIB
+                else:
+                    st = gp.stat()
+                    if st.st_size > 0:
+                        gguf_gib = st.st_size / LINGF.GIB
+            except OSError:
+                pass
+        own.update(ling_fit={kv: {str(c): LINGF.plan(vrams, c, kv, gguf_gib=gguf_gib) for c in ctxs}
+                             for kv in LINGF.KV_BYTES},
                    ling_kv_bytes=LINGF.KV_BYTES)
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),

@@ -24,8 +24,8 @@ class TestLingFit(unittest.TestCase):
         self.assertAlmostEqual(LINGF.KDA_STATE_GIB, 0.073165, places=4)
 
     def test_single_and_multi_gpu_plans(self):
-        # 1x 24 GB at 32K FP16: ~6400-7000 VRAM expert slots, rest in RAM
-        p1 = LINGF.plan(24.0, 32768, "f16", "Ling-3.2-air-Maya-S", ram_gb=128.0)
+        # 1x 24 GB at 32K FP16 with ~55.6 GiB GGUF: ~6400-7000 VRAM expert slots, rest in RAM
+        p1 = LINGF.plan(24.0, 32768, "f16", ram_gb=128.0, gguf_gib=55.6)
         self.assertTrue(p1["fits_trunk"])
         self.assertFalse(p1["resident"])
         self.assertGreater(p1["vram_slots"], 5000)
@@ -33,28 +33,28 @@ class TestLingFit(unittest.TestCase):
         self.assertEqual(p1["vision_permanent_gib"], 0.0)
 
         # 4x 24 GB at 32K FP16: ALL 20,480 experts fit in VRAM!
-        p4 = LINGF.plan([24.0, 24.0, 24.0, 24.0], 32768, "f16", "Ling-3.2-air-Maya-S", ram_gb=128.0)
+        p4 = LINGF.plan([24.0, 24.0, 24.0, 24.0], 32768, "f16", ram_gb=128.0, gguf_gib=55.6)
         self.assertTrue(p4["fits_trunk"])
         self.assertTrue(p4["resident"])
         self.assertEqual(p4["vram_slots"], LINGF.TOTAL_TRUNK_EXPERTS)
 
     def test_emulated_small_cards_and_ram_cap_ssd(self):
         # Emulated 8 GB card: zero-expert VRAM pool must still fit trunk & say "runs slowly"
-        p8 = LINGF.plan(8.0, 131072, "f16", "Ling-3.2-air-Maya-S", ram_gb=128.0, reserve_gb=1.2)
+        p8 = LINGF.plan(8.0, 131072, "f16", ram_gb=128.0, reserve_gb=1.2, gguf_gib=55.6)
         self.assertTrue(p8["fits_trunk"])
         self.assertEqual(p8["vram_slots"], 0)
-        word, line = LINGF.verdict(8.0, 128.0, 131072, "f16", "Ling-3.2-air-Maya-S", reserve_gb=1.2)
+        word, line = LINGF.verdict(8.0, 128.0, 131072, "f16", reserve_gb=1.2, gguf_gib=55.6)
         self.assertEqual(word, "runs slowly")
         self.assertIn("zero-expert", line)
 
-        # RAM below model size -> SSD streaming verdict with smaller-quant hint
-        word_ssd, line_ssd = LINGF.verdict(24.0, 32.0, 32768, "f16", "Ling-3.2-air-Maya-S")
+        # RAM below model size -> SSD streaming verdict
+        word_ssd, line_ssd = LINGF.verdict(24.0, 32.0, 32768, "f16", gguf_gib=55.6)
         self.assertEqual(word_ssd, "runs slowly")
         self.assertIn("NVMe SSD", line_ssd)
-        self.assertIn("Maya-XS", line_ssd)
+        self.assertIn("smaller quant", line_ssd)
 
         # Card too small -> "does not fit"
-        word_no, _ = LINGF.verdict(4.0, 64.0, 32768, "f16", "Ling-3.2-air-Maya-S")
+        word_no, _ = LINGF.verdict(4.0, 64.0, 32768, "f16", gguf_gib=55.6)
         self.assertEqual(word_no, "does not fit")
 
     def test_unsupported_refusals(self):
@@ -70,16 +70,14 @@ class TestLingFit(unittest.TestCase):
             "backend": "cuda",
             "gpu": [0],
             "args": ["--serve", "--gguf", "/tmp/Ling-3.2-air.gguf", "--max-context", "32768"],
-            "installer": {"family": "ling", "quant": "Ling-3.2-air-Maya-S"},
+            "installer": {"family": "ling", "quant": "local"},
         }
         shown = models.shown_settings(cfg)
         self.assertEqual(shown["kv"], "f16")
         self.assertEqual(shown["parallel"], 1)
-        # Parallel > 1 rejected cleanly with plain explanation
         with self.assertRaises(ValueError) as ctx:
             models.apply(cfg, {"parallel": 2})
         self.assertIn("one request at a time", str(ctx.exception))
-        # Parallel == 1 accepted as no-op
         applied = models.apply(cfg, {"parallel": 1, "kv": "q8"})
         self.assertIn("--kv", applied["args"])
         self.assertEqual(applied["args"][applied["args"].index("--kv") + 1], "q8")

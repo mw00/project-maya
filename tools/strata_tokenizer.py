@@ -152,6 +152,9 @@ class _IsolatedSplits:
 # Inkling 2's pre-tokenizer under the names its GGUFs carry: "gpt-4o" (the conversion as unsloth's UD-Q4_K_XL was
 # made), "inkling" (as their UD-Q3_K_XL was, later) and "inkling2" (llama.cpp master's: Inkling-2-Mini's files) - the
 # same split, the same vocabulary and merges
+# Ling-3.2-air ("bailingmoe2") pre-tokenizer regex: transcribed from inclusionAI/Ling-3.2-air's
+# tokenizer.json (Copyright (c) inclusionAI / Ant Group, MIT License; also carried in
+# ggml-org/llama.cpp src/llama-vocab.cpp under LLAMA_VOCAB_PRE_TYPE_BAILINGMOE, MIT License).
 BAILINGMOE2_PATTERN = (
     r"'(?i:[sdmt]|ll|ve|re)"
     r"|[^\r\n\p{L}\p{N}]?+\p{L}+"

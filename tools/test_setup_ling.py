@@ -1,5 +1,5 @@
 """tools/test_setup_ling.py - Unit tests for maya.py set_up_ling(), backup preservation,
-calibration reset, and setup-claims vs planner consistency.
+calibration reset, default-off disk restore points, and clean download.json manifest.
 """
 from __future__ import annotations
 
@@ -28,19 +28,20 @@ class TestSetupLing(unittest.TestCase):
         self.assertEqual(maya.choose_family(A(), {}), "ling")
         self.assertEqual(maya.setup_title({"installer": {"family": "ling"}}), "Ling-3.2-air")
 
-    def test_model_resolution(self):
+    def test_model_resolution_without_invented_quants(self):
         self.assertEqual(Q.resolve("ling"), ("ling", None))
         self.assertEqual(Q.resolve("Ling-3.2-air"), ("ling", None))
-        self.assertEqual(Q.resolve("ling-maya-s"), ("ling", "Ling-3.2-air-Maya-S"))
+        self.assertIsNone(Q.resolve("ling-maya-s"))
+        self.assertNotIn("ling", Q.SHOWN)
         self.assertEqual(Q.config_stem("ling", None), "maya-ling-3.2-air")
 
-    def test_write_config_preserves_choices_and_writes_bak(self):
+    def test_write_config_preserves_choices_writes_bak_and_keeps_restore_dir_off(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             fake_root = td / "repo"
             fake_root.mkdir()
             (fake_root / "data").mkdir()
-            gguf = td / "Ling-3.2-air-R3-test.gguf"
+            gguf = td / "Ling-3.2-air-test.gguf"
             gguf.write_bytes(b"GGUF")
             mmproj = td / "Ling-3.2-air-mmproj-BF16.gguf"
             mmproj.write_bytes(b"GGUF")
@@ -56,11 +57,9 @@ class TestSetupLing(unittest.TestCase):
                 api_key = None
 
             pc = {"backend": "cuda", "gpus": [{"index": 0, "vram_gb": 24.0, "cc": 86}]}
-            with mock.patch.object(maya, "ROOT", fake_root), \
-                 mock.patch.object(maya, "LING_EXE", fake_root / "build" / "maya-ling"), \
-                 mock.patch.object(maya, "write_run_script", return_value=fake_root / "run.sh"):
+            with mock.patch.object(maya, "ROOT", fake_root),                  mock.patch.object(maya, "LING_EXE", fake_root / "build" / "maya-ling"),                  mock.patch.object(maya, "write_run_script", return_value=fake_root / "run.sh"):
                 p1 = maya.write_config_ling(Args(), pc, {}, gguf, tok, 32768, "f16", "auto",
-                                            td, td, mmproj, "Ling-3.2-air-Maya-S", {})
+                                            td, td, mmproj, "local", {})
                 c1 = json.loads(p1.read_text(encoding="utf-8"))
                 self.assertEqual(c1["port"], 8099)
                 self.assertEqual(c1["sampling"], {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
@@ -68,11 +67,14 @@ class TestSetupLing(unittest.TestCase):
                 self.assertEqual(c1["installer"]["family"], "ling")
                 self.assertIn("--kv", c1["args"])
                 self.assertEqual(c1["args"][c1["args"].index("--kv") + 1], "fp16")
+                # Disk restore points MUST stay OFF by default
+                self.assertNotIn("--restore-dir", c1["args"])
+                self.assertNotIn("restore_dir", c1["installer"])
 
                 # Re-run with a new context -> preserves port/sampling and creates .bak-*
                 Args.port = None
                 p2 = maya.write_config_ling(Args(), pc, {}, gguf, tok, 65536, "f16", "auto",
-                                            td, td, mmproj, "Ling-3.2-air-Maya-S", c1)
+                                            td, td, mmproj, "local", c1)
                 c2 = json.loads(p2.read_text(encoding="utf-8"))
                 self.assertEqual(c2["port"], 8099)
                 baks = list(fake_root.glob("maya-ling-3.2-air.json.bak-*"))
@@ -86,11 +88,11 @@ class TestSetupLing(unittest.TestCase):
             self.assertTrue(maya.reset_ling_calibration(cfg))
             self.assertFalse(cf.exists())
 
-    def test_download_json_manifest_valid(self):
+    def test_download_json_manifest_has_no_invented_quants(self):
         m = LINGF.download_manifest()
         self.assertEqual(m["name"], "Ling-3.2-air")
-        self.assertEqual(m["default_kv"], "f16")
-        self.assertIn("Ling-3.2-air-Maya-S", m["quants"])
+        self.assertEqual(m["license"], "MIT")
+        self.assertEqual(m["quants"], {})
 
 
 if __name__ == "__main__":

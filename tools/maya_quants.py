@@ -24,7 +24,7 @@ MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minima
          "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini", "ling": "Ling-3.2-air"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
          "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
-         "ik2": "Inkling 2 Mini", "ling": "Ling 3.2 Air"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "ik2": "Inkling 2 Mini"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -312,9 +312,8 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "hy4", None
     if low in IK2_IDS:                                 # (Inkling-2-Mini: one file set, unsloth's UD-Q4_K_XL)
         return "ik2", IK2_QUANT
-    if low in ("ling", "ling-3.2-air", "ling32", "ling32-air", "ling-maya-s", "ling-maya-xs", "ling-q8"):
-        qmap = {"ling-maya-xs": "Ling-3.2-air-Maya-XS", "ling-maya-s": "Ling-3.2-air-Maya-S", "ling-q8": "Ling-3.2-air-Q8_0"}
-        return "ling", qmap.get(low)
+    if low in ("ling", "ling-3.2-air", "ling32", "ling32-air"):
+        return "ling", None
     for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None

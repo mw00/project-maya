@@ -51,6 +51,10 @@ jobs:
           "$RUNNER_TEMP/ds4_cpu_prepare_rows_test"
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -DDS4_CPU_PREPARE_STUB_TEST=1 tests/ds4_cpu_prepare_rows_test.cpp src/ds4/ds4_iq_cpu.cpp -o "$RUNNER_TEMP/ds4_cpu_prepare_stub_test"
           "$RUNNER_TEMP/ds4_cpu_prepare_stub_test"
+      - name: Ling slot-order regression, restore-point validation, NUMA & direct-read (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -pthread -Isrc/ling -Isrc/ds4 tests/ling_unit_test.cpp -o "$RUNNER_TEMP/ling_unit_test"
+          "$RUNNER_TEMP/ling_unit_test"
       - name: Server tests
         # a hang prints every thread's stack (faulthandler, after 10 minutes, repeated) and ends the
         # step at 14 minutes instead of the job's 20 with nothing to read
