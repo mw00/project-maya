@@ -12,6 +12,8 @@
 // No model runs; this measures the drafter on text, not on the model's own outputs.
 #include "maya/spec/suffix_drafter.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -111,7 +113,87 @@ void unit_tests() {
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
     }
+    {   // restart (DS4_LOOKUP_KEEP): the kept index is the one a reset and an append of the whole history build -
+        // a history that extends the old one (kept), one that differs inside it, a shorter one, the same one, an
+        // empty one; past the nominal capacity too (a table that filled)
+        uint64_t x = 88172645463325252ull;
+        auto rnd = [&](int mod) {
+            x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+            return (int32_t) (x % (uint64_t) mod);
+        };
+        for (const size_t cap : {size_t(1) << 14, size_t(300)}) {
+            SuffixDrafter kept(3, 64, cap);
+            std::vector<int32_t> h;
+            for (int i = 0; i < 4000; ++i) h.push_back(rnd(50));   // (a small vocabulary: slots with several ways)
+            auto rebuilt_same = [&](const std::vector<int32_t>& t) {
+                SuffixDrafter fresh(3, 64, cap);
+                fresh.reset();
+                fresh.append(t.data(), t.size());
+                return kept.same(fresh);
+            };
+            check(kept.restart(h.data(), h.size()) == 0 && rebuilt_same(h), "restart: first history built");
+            for (int i = 0; i < 37; ++i) {   // (a decode's tokens, one at a time, with proposals between)
+                int32_t out[8];
+                kept.propose(8, out);
+                h.push_back(rnd(50));
+                kept.append(h.back());
+            }
+            std::vector<int32_t> t = h;   // append: the next turn
+            for (int i = 0; i < 500; ++i) t.push_back(rnd(50));
+            check(kept.restart(t.data(), t.size()) == h.size() && rebuilt_same(t), "restart: extended history kept, same index");
+            check(kept.restart(t.data(), t.size()) == t.size() && rebuilt_same(t), "restart: the same history kept, same index");
+            std::vector<int32_t> d = t;   // diverge: one token inside differs
+            d[d.size() - 300] += 1;
+            check(kept.restart(d.data(), d.size()) == 0 && rebuilt_same(d), "restart: a history that differs is rebuilt");
+            std::vector<int32_t> sh(d.begin(), d.begin() + 1000);   // shorter: a prefix of the old one
+            check(kept.restart(sh.data(), sh.size()) == 0 && rebuilt_same(sh), "restart: a shorter history is rebuilt");
+            std::vector<int32_t> dl = sh;   // diverge at the last token of the old history, and longer
+            dl.back() += 1;
+            for (int i = 0; i < 100; ++i) dl.push_back(rnd(50));
+            check(kept.restart(dl.data(), dl.size()) == 0 && rebuilt_same(dl), "restart: a different last token is rebuilt");
+            check(kept.restart(nullptr, 0) == 0 && rebuilt_same({}), "restart: an empty history");
+            check(kept.restart(sh.data(), sh.size()) == 0 && rebuilt_same(sh), "restart: after an empty history");
+            int32_t o1[8], o2[8];   // (and the proposals agree)
+            SuffixDrafter fresh(3, 64, cap);
+            fresh.append(sh.data(), sh.size());
+            const int n1 = kept.propose(8, o1), n2 = fresh.propose(8, o2);
+            check(n1 == n2 && std::memcmp(o1, o2, (size_t) n1 * 4) == 0 && kept.last_match() == fresh.last_match(),
+                  "restart: the same proposal");
+        }
+    }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
+}
+
+// --bench: a request's Lookup::start as the DeepSeek serve loop runs it (min match 3, max 64, the table sized for a
+// 1M context + 4096): reset + append of the whole context against restart() of a context that grew by a turn
+void bench() {
+    uint64_t x = 88172645463325252ull;
+    auto rnd = [&]() {
+        x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+        return (int32_t) (x % 150000u);
+    };
+    for (const size_t n : {size_t(30000), size_t(150000), size_t(350000)}) {
+        std::vector<int32_t> ctx;
+        for (size_t i = 0; i < n; ++i) ctx.push_back(rnd());
+        SuffixDrafter a(3, 64, 1052672), b(3, 64, 1052672);
+        a.append(ctx.data(), ctx.size());
+        b.restart(ctx.data(), ctx.size());
+        double t_full = 1e30, t_keep = 1e30;
+        for (int rep = 0; rep < 5; ++rep) {
+            for (int i = 0; i < 300; ++i) ctx.push_back(rnd());   // (a turn: 300 tokens more)
+            auto t0 = std::chrono::steady_clock::now();
+            a.reset();
+            a.append(ctx.data(), ctx.size());
+            auto t1 = std::chrono::steady_clock::now();
+            b.restart(ctx.data(), ctx.size());
+            auto t2 = std::chrono::steady_clock::now();
+            t_full = std::min(t_full, std::chrono::duration<double, std::milli>(t1 - t0).count());
+            t_keep = std::min(t_keep, std::chrono::duration<double, std::milli>(t2 - t1).count());
+            check(a.same(b), "bench: kept index equals the rebuilt one");
+        }
+        std::printf("context %7zu tokens + 300: reset + append %8.2f ms, restart %7.3f ms (same index: %s)\n", n, t_full,
+                    t_keep, g_fail ? "NO" : "yes");
+    }
 }
 }  // namespace
 
@@ -135,6 +217,10 @@ int main(int argc, char** argv) {
                         100.0 * p.proposals / p.steps, p.proposals ? (double) p.accepted / p.proposals : 0.0);
         }
         return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+        bench();
+        return g_fail ? 1 : 0;
     }
     unit_tests();
     return g_fail ? 1 : 0;

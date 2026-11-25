@@ -61,6 +61,29 @@ void SuffixDrafter::append(const int32_t* tokens, size_t n) {
     }
 }
 
+size_t SuffixDrafter::restart(const int32_t* tokens, size_t n) {
+    const size_t have = hist_.size();
+    if (have == 0 || have > n || !std::equal(hist_.begin(), hist_.end(), tokens)) {
+        reset();
+        append(tokens, n);
+        return 0;
+    }
+    last_match_ = 0;
+    append(tokens + have, n - have);
+    return have;
+}
+
+bool SuffixDrafter::same(const SuffixDrafter& o) const {
+    if (hist_ != o.hist_ || table_.size() != o.table_.size() || last_match_ != o.last_match_) return false;
+    for (size_t i = 0; i < table_.size(); ++i) {
+        const Slot &a = table_[i], &b = o.table_[i];
+        if (a.key != b.key || a.n != b.n) return false;
+        for (int w = 0; w < WAYS; ++w)
+            if (a.pos[w] != b.pos[w]) return false;
+    }
+    return true;
+}
+
 int SuffixDrafter::propose(int max_k, int32_t* out) {
     last_match_ = 0;
     const size_t n = hist_.size();
