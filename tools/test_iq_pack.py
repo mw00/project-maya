@@ -98,6 +98,24 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(iq_pack.index_standalone(source, root, iq_pack.Model(source)), 0)
             self.assertEqual((root / "dense.bin").read_bytes(), quants.quantize(values, Q.BF16).tobytes())
 
+    def test_ple_conv_bf16_and_f32_are_stored_as_f16(self):
+        for source_type in (Q.BF16, Q.F32):
+            with self.subTest(source_type=source_type.name):
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                    root = Path(tmp)
+                    source = root / "model.gguf"
+                    values = np.linspace(-0.25, 0.25, 32, dtype=np.float32).reshape(4, 8)
+                    write_gguf(source, [("blk.1.ple_conv1d.weight", values, source_type)])
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(iq_pack.index_standalone(source, root, iq_pack.Model(source)), 0)
+                    _, rows = iq_pack.read_index(root / "index.txt")
+                    row = rows["blk.1.ple_conv1d.weight"]
+                    self.assertEqual(row[2], "5")
+                    self.assertEqual(row[4], "64")
+                    actual = np.frombuffer((root / "dense.bin").read_bytes(), dtype=np.float16)
+                    expected = quants.dequantize(quants.quantize(values, source_type), source_type).astype(np.float16).ravel()
+                    np.testing.assert_array_equal(actual, expected)
+
     def test_quantized_control_weights_need_explicit_conversion(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
