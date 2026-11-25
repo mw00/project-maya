@@ -1287,6 +1287,45 @@ A small model-free regression test is available as `python tools/test_ds4_engram
 It checks file/RAM byte agreement, reads after unlink, split FP8 scales, MXFP8 extraction, bounds, and failure when
 the memlock limit is zero. Run it as an ordinary user without `CAP_IPC_LOCK`.
 
+## DeepSeek: MXFP4 on pre-AVX2 CPUs
+
+MXFP4 experts can use the `ssse3` CPU tier (Intel Core 2 and later, including Xeon E5 v2): 128-bit integer
+shuffles and dot products, without requiring SSE4.1, AVX2 or hardware FMA. Activation quantization, the fused
+floating-point accumulation and the scalar tier's addition order are preserved, so the outputs are bit-identical.
+On a CPU without the AVX2/FMA tier the start measures scalar against SSSE3 and keeps the faster one. The AVX2+
+auto-selection is unchanged. `DS4_MX_TIER=ssse3` or `DS4_MX_TIER=scalar` selects one manually (only where supported).
+These are read at engine startup; changing the environment does not switch a loaded engine's tier.
+
+SSSE3 decoding/integer dot products and software-FMA acceleration have separate switches:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `DS4_MX_SSSE3` | unset: automatic tier selection above | `0`: exclude SSSE3; `1`: explicitly select it where supported, taking precedence over `DS4_MX_TIER`. Unsupported CPUs retain a supported tier. |
+| `DS4_MX_FAST_FMA` | automatic: on for SSSE3, off for scalar | `0`: use the original `std::fma`. `1`: enable accelerated binary32 FMA in scalar/SSSE3. Unset: enable it when SSSE3 is selected, including during tier measurement. The guarded binary64 path is the default accelerated mode; AVX2+ kernels keep their existing arithmetic. |
+| `DS4_MX_FMA_UNGUARDED` | off | `1` with `DS4_MX_FAST_FMA=1`: experimental binary64 multiply/add followed by a binary32 cast in the scalar and SSSE3 tiers. Skips the per-operation midpoint and range checks. Uses the same x86-64 rounding-mode and FTZ/DAZ checks as the guarded path. |
+| `DS4_MX_FMA_VERIFY` | off | `1`: recompute accelerated matrix outputs with the original scalar `std::fma`, compare bits, and abort on a mismatch. Prints checked values/batches on clean exit. This is a slow diagnostic; leave it off when measuring speed. |
+
+For an E5 v2, the four combinations are `DS4_MX_SSSE3=0 DS4_MX_FAST_FMA=0` (original scalar),
+`1 0` (SSSE3 only), `0 1` (FMA acceleration only), and `1 1` (both). Set them in the engine environment
+before starting it. To restore automatic selection, unset `DS4_MX_SSSE3` and `DS4_MX_TIER`.
+With `DS4_MX_FAST_FMA` unset, an SSSE3 call uses guarded FMA automatically. A scalar call keeps `std::fma`.
+The decision uses each call's effective tier, so scalar fallback and startup tier measurement obey the same rule.
+`DS4_MX_FMA_UNGUARDED=1` selects the experimental mode only when accelerated FMA is enabled;
+`DS4_MX_FAST_FMA=0` takes precedence and keeps `std::fma`, even if the unguarded flag is set.
+
+The FMA shortcut requires x86-64, round-to-nearest/ties-to-even and gradual underflow. Other rounding modes
+or FTZ/DAZ retain `std::fma`. Midpoints between adjacent normal binary32 values, zeros, subnormals, overflow
+and nonfinite results also use `std::fma`. This avoids binary64-to-binary32 double rounding; it does not
+replace fused arithmetic with float multiplication/addition. The source is compiled with FP contraction
+disabled. The guarded shortcut preserves result bits; floating-point exception flags are not part of its API contract.
+
+For the experimental path, set `DS4_MX_FMA_UNGUARDED=1` before starting the engine. On the scalar tier,
+also set `DS4_MX_FAST_FMA=1`; on SSSE3 it is enabled automatically when the fast-FMA setting is unset.
+Double rounding can change finite results by one adjacent binary32 value per operation and can change overflow at the
+boundary. Such differences can propagate through a matrix or through generation. `DS4_MX_FMA_VERIFY=1` also checks
+this path against the original scalar result and aborts on any bit difference. Use it for diagnostics and use
+`DS4_MX_FMA_VERIFY=0` for speed measurements. Set `DS4_MX_FMA_UNGUARDED=0` to use guarded FAST_FMA.
+
 ## DeepSeek: the CPU lane's threads
 
 DeepSeek's engine computes the routed experts that are not in VRAM on the CPU (the CPU lane), a thread per physical
