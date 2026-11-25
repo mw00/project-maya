@@ -274,6 +274,10 @@ what you changed there):
 | `--prefill auto` | the largest chunk, in steps of 256 tokens, whose buffers each card's expert pool can lend - at most 90% of its slots (85% when under 90% of the experts' bytes are in VRAM or the pinned RAM tier), always keeping a route's experts and the spares - up to 32768 tokens on one GPU and 8192 on a split - each the faster there (one V100, 26K-token prompts: 559 tok/s at 32768, 367 at 8192; two V100s: 709 at 8192, 551 at 32768). On a split every card reads the same chunks, so the smallest card's sets it, and the log names a card that holds it below the first card's |
 | `--prefill N` | chunks of N tokens (`32768`, say), halved until each card's pool can lend them - only a route's experts and the spares must stay; `0` = token by token. On a split with 96 GB of RAM or more the setup points to `32768` |
 
+If the initial Auto chunk would leave too few expert slots in the measured pool, Maya trims the prestage buffer and
+tries a smaller chunk before falling back to one token at a time. For a fast GLM engine, `GET /metrics` reports
+`engine.prefill_batched` as `1` when all parts can read prompts in batches or `0` for the token path.
+
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
 
