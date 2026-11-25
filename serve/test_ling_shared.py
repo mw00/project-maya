@@ -89,6 +89,20 @@ class OtherModelsUnchanged(unittest.TestCase):
                 self.assertEqual(got[name], GOLDEN[name])
 
 
+class ReportLines(unittest.TestCase):
+    def test_ling_lines_are_anchored(self):
+        from serve.server import REPORT_LINES
+        for line in ("ling prompt: 4096 tokens in 1.2 s", "ling stat: decode 20 ms/tok", "ling split: 3 GPUs",
+                     "ling vram: 20 GiB", "ling numa: node 0", "ling draft: mtp on", "maya-ling: serving"):
+            with self.subTest(line=line):
+                self.assertTrue(REPORT_LINES.search(line))
+        # lines of other engines or tools that only contain the words must not be picked up
+        for line in ("compiling draft model for the kernel", "scaling stat of the table", "sampling profile loaded",
+                     "recalling env values", "kibling split 2 ways", "other-maya-ling: x"):
+            with self.subTest(line=line):
+                self.assertFalse(REPORT_LINES.search(line))
+
+
 if __name__ == "__main__":
     from serve import models as M
     with tempfile.TemporaryDirectory() as td:
