@@ -51,7 +51,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**<br><sub>zai-org · MIT · 321 B，激活 18 B · 最高 1M 上下文</sub> | **Maya-S** (默认) · `glm-maya-s` | 96.5 GB | 内存池 (内存与显存之和) 较小的电脑 |
 | | Maya-S24 · `glm-maya-s24` | 94.7 GB | 24 GB 及以下的显卡：显卡多出约 1.5 GB 用于专家，解码 +14% |
 | | Maya-XS · `glm-maya-xs` | 73.4 GB | 64 GB 内存加 24 GB 显卡的电脑，128K 上下文 |
-| | Maya-M · `glm-maya-m` | 116 GB | 更大的内存池；针对工具调用和前端代码做了校准 |
+| | Maya-M · `glm-maya-m` | 116 GB | 更大的内存池；面向工具调用和前端代码 |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | 经 [Blackfrost_AI](https://x.com/Blackfrost_AI) 修改权重、减少一刀切拒绝的 Maya-M；实验性 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大的内存池；最接近原版 |
 | **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [自有许可证](https://huggingface.co/zai-org/GLM-5.3) · 744 B，激活 40 B · 最高 1M 上下文 · 仅文本</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170.0 GB | 192 GB 内存池 (VRAM 与 RAM 合计) 即可容纳整个模型；NVIDIA (V100 及更新) 和 AMD ([详情](docs/GLM53.md)) |

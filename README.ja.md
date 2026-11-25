@@ -53,7 +53,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**<br><sub>zai-org · MIT · 321 B、アクティブ 18 B · 最大 1M コンテキスト</sub> | **Maya-S** (デフォルト) · `glm-maya-s` | 96.5 GB | メモリ (RAM と VRAM の合計) が小さめの PC |
 | | Maya-S24 · `glm-maya-s24` | 94.7 GB | 24 GB 以下のカード: カードの約 1.5 GB 分をエキスパートに多く回せ、デコード +14% |
 | | Maya-XS · `glm-maya-xs` | 73.4 GB | RAM 64 GB と 24 GB のカードの PC、128K コンテキスト |
-| | Maya-M · `glm-maya-m` | 116 GB | より大きなメモリ; ツール呼び出しとフロントエンドのコード向けにキャリブレーション |
+| | Maya-M · `glm-maya-m` | 116 GB | より大きなメモリ; ツール呼び出しとフロントエンドのコード向け |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | [Blackfrost_AI](https://x.com/Blackfrost_AI) による重み編集で、一律の拒否を減らした Maya-M; 実験的 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大クラスのメモリ; 元のモデルに最も近い |
 | **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [独自ライセンス](https://huggingface.co/zai-org/GLM-5.3) · 744 B、アクティブ 40 B · 最大 1M コンテキスト · テキストのみ</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170.0 GB | 192 GB のメモリ (VRAM と RAM の合計) にモデル全体が収まる; NVIDIA (V100 以降) と AMD ([詳細](docs/GLM53.md)) |

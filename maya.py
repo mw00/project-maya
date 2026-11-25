@@ -142,8 +142,8 @@ HF = "https://huggingface.co/{repo}/resolve/{revision}/{path}"
 # it names them, else the model's own repo.
 MODELS = {
     "Maya-S-v2-IQ2_XXS": {
-        "about": "Maya-S, Project Maya's compact quant: error-feedback-rounded IQ2_XXS gate/up experts, "
-                 "IQ2_S/IQ3_XXS down projections, Q6_K attention, the MTP draft block, made from Z.ai's FP8 release",
+        "about": "Maya-S, Project Maya's compact quant of GLM-5.3-Flash, "
+                 "with the MTP draft block, made from Z.ai's FP8 release",
         "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "Maya-S-v2-IQ2_XXS",
         "file": "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 96.5,
         "sha256": {
@@ -202,9 +202,8 @@ MODELS = {
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
     "Maya-M": {
-        "about": "Maya-M, Project Maya's larger quant: error-feedback-rounded IQ2_S gate/up experts, IQ3_XXS down "
-                 "projections (IQ3_S in the most sensitive layers), Q6_K attention, the MTP draft block, made from "
-                 "Z.ai's FP8 release",
+        "about": "Maya-M, Project Maya's larger quant of GLM-5.3-Flash, "
+                 "with the MTP draft block, made from Z.ai's FP8 release",
         "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "Maya-M",
         "file": "GLM-5.3-Flash-Maya-M-IQ2_S-{i:05d}-of-{n:05d}.gguf",
         "was": ["GLM-5.3-Flash-Maya-M-{i:05d}-of-{n:05d}.gguf"], "shards": 3, "download_gb": 116.0,
@@ -246,9 +245,8 @@ MODELS = {
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
     "Maya-L": {
-        "about": "Maya-L, Project Maya's largest quant: error-feedback-rounded IQ3_S gate/up experts, IQ4_XS down "
-                 "projections (Q5_K in the most sensitive layers), Q6_K attention, the MTP draft block, made from "
-                 "Z.ai's FP8 release",
+        "about": "Maya-L, Project Maya's largest quant of GLM-5.3-Flash, "
+                 "with the MTP draft block, made from Z.ai's FP8 release",
         "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "Maya-L",
         "file": "GLM-5.3-Flash-Maya-L-IQ3_S-{i:05d}-of-{n:05d}.gguf",
         "was": ["GLM-5.3-Flash-Maya-L-{i:05d}-of-{n:05d}.gguf"], "shards": 4, "download_gb": 156.3,

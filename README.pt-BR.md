@@ -51,7 +51,7 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**<br><sub>zai-org · MIT · 321 B, 18 B ativos · até 1M de contexto</sub> | **Maya-S** (padrão) · `glm-maya-s` | 96,5 GB | PCs com um pool de memória (RAM e VRAM juntas) menor |
 | | Maya-S24 · `glm-maya-s24` | 94,7 GB | placas de 24 GB ou menos: ~1,5 GB a mais da placa para especialistas, decodificação +14% |
 | | Maya-XS · `glm-maya-xs` | 73,4 GB | PCs com 64 GB de RAM e uma placa de 24 GB, com contexto de 128K |
-| | Maya-M · `glm-maya-m` | 116 GB | um pool de memória maior; calibrado para chamadas de ferramentas e código de front-end |
+| | Maya-M · `glm-maya-m` | 116 GB | um pool de memória maior; voltado a chamadas de ferramentas e código de front-end |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | Maya-M com uma edição de pesos de [Blackfrost_AI](https://x.com/Blackfrost_AI) que reduz as recusas generalizadas; experimental |
 | | Maya-L · `glm-maya-l` | 156,3 GB | os maiores pools de memória; o mais próximo do original |
 | **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [licença própria](https://huggingface.co/zai-org/GLM-5.3) · 744 B, 40 B ativos · até 1M de contexto · só texto</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170,0 GB | o modelo inteiro num pool de memória de 192 GB (VRAM e RAM juntas); NVIDIA a partir da V100 e AMD ([detalhes](docs/GLM53.md)) |

@@ -1,18 +1,7 @@
 # Maya-L - results
 
 Maya-L (156.3 GB, `Maya-L/` on [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF)) is Project
-Maya's largest quant of GLM-5.3-Flash: Maya-M's recipe one step up, made from Z.ai's FP8 release with Maya-M's
-statistics from the FP8 model itself:
-
-| Tensors | Type |
-| --- | --- |
-| routed experts' gate/up | IQ3_S, error-feedback (GPTQ-style) rounding with the FP8 model's activation statistics |
-| routed experts' down | IQ4_XS; Q5_K in the most sensitive MoE layers (the first and last four) |
-| attention, shared experts, dense layers | Q6_K (the KDA gates and the indexer Q8_0, the router F32) |
-| the NextN (MTP) draft block | Q4_K / Q5_K experts |
-
-The calibration text is Maya-M's, weighted toward tool calls and front-end code (HTML/CSS/JS, three.js, canvas).
-Recipe: `tools/maya_quant/recipes/maya-l.json`.
+Maya's largest quant of GLM-5.3-Flash: one step up from Maya-M, made from Z.ai's FP8 release.
 
 ## Against the FP8 model, token by token
 
@@ -44,7 +33,7 @@ Maya-M. Maya-S's row is its own release's measurement, with an earlier engine.
 
 The same 400 questions per task for every model, scored the way lm-evaluation-harness scores them (the answer with
 the highest log-likelihood; length-normalized where the choices differ in length) - the FP8 model run layer by layer
-in PyTorch, Maya-L through Project Maya's engine (`tools/maya_quant/zs_*.py`).
+in PyTorch, Maya-L through Project Maya's engine (Maya's scoring tools).
 
 ## Long answers
 

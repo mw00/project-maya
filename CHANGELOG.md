@@ -4,6 +4,10 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.81 - unreleased
+
+- **Docs:** the quant-making tools and recipes are no longer part of this repository.
+
 ## v1.1.80 - 2026-11-25
 
 Inkling 2 Mini's thinking budget is now an option, not a default.

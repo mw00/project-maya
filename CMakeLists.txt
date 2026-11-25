@@ -1833,7 +1833,7 @@ if(MAYA_NATIVE_EXPERTS)
     if(_maya_mmq_glu)
       target_compile_definitions(maya_mmq PRIVATE MAYA_MMQ_GLU=1)
     endif()
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k q5_0)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k q5_0)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts
       target_sources(maya_mmq PRIVATE ${_maya_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
     target_include_directories(maya_mmq PRIVATE ${_maya_gg}/include ${_maya_gg}/src ${_maya_mmq}

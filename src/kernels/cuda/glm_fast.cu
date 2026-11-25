@@ -890,7 +890,7 @@ template<> __device__ __forceinline__ float dw<23>(const uint8_t* row, int kbx, 
     sumi *= ls - 32;
     return __half2float(bq4->d) * x.d * sumi;
 }
-// ---- the other i-quants of the Maya quants (docs/QUANT-PLAN.md): vecdotq's IQ2_XS, IQ2_S, IQ3_S and IQ1_M (the
+// ---- the other i-quants of the Maya quants: vecdotq's IQ2_XS, IQ2_S, IQ3_S and IQ1_M (the
 // expressions iq_kernels.cu transcribes) in the same activation-preloaded, table-in-shared-memory form
 template<> __device__ __forceinline__ float dw<17>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
     const block_iq2_xs* bq2 = (const block_iq2_xs*) row + kbx;
