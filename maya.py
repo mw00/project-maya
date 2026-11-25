@@ -4974,6 +4974,8 @@ def add_profile(cfg: dict) -> bool:
     would write it: an update restarts the installed config without setting up again.  Not a pruned model's (its
     experts are not the profile's).  True when `cfg` changed."""
     args = cfg.get("args")
+    if config_family(cfg) != "glm":                    # (maya-ling's config names its GGUF with --gguf too)
+        return False
     if (not isinstance(args, list) or not any(f in args[:-1] for f in ("--glm-pack", "--gguf"))
             or "--expert-profile" in args or not PROFILE.exists()):
         return False
@@ -6538,10 +6540,12 @@ def server_command(cfg_path: Path, a) -> tuple:
     ds4 = config_family(cfg) == "deepseek"
     metal = cfg.get("backend") == "metal"
     ik2 = config_family(cfg) == "ik2"                  # (maya-ik2 reads its GGUF itself: --model, no pack)
-    flag = ("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--model" if ik2 else "--pack"   # (maya-ds4 and maya-mm3: --pack)
+    ling = config_family(cfg) == "ling"                # (maya-ling too: --gguf, the file or its first shard)
+    flag = (("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--model" if ik2 else
+            "--gguf" if ling else "--pack")            # (maya-ds4 and maya-mm3: --pack)
     pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None       # (Metal: the first GGUF file)
     for p, what in ((Path(cfg.get("exe", "")), "the engine"),
-                    (pack, "the model's GGUF file" if metal or ik2 else "the pack"),
+                    (pack, "the model's GGUF file" if metal or ik2 or ling else "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <numeric>
+#include <regex>
 #include <stdexcept>
 #include <condition_variable>
 #include <mutex>
@@ -49,20 +50,98 @@ namespace glmb = maya::kernels::glmb;
 
 static inline size_t align256(size_t n) { return (n + 255u) & ~size_t(255u); }
 
+// A GGUF whole or in llama.cpp's shards (NAME-00001-of-0000N.gguf ...): the tensors of every shard in one list, each
+// read from the shard that holds it; metadata from the first shard.  Any shard's name opens the whole set; each shard's
+// split.no / split.count must agree with its name, and the tensor names must be unique across the set.
+class GgufSet {
+public:
+    explicit GgufSet(const std::string& path) {
+        namespace fs = std::filesystem;
+        const fs::path p(path);
+        const std::string base = p.filename().string();
+        static const std::regex shard_re(R"(^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$)");
+        std::smatch m;
+        int n = 1;
+        if (std::regex_match(base, m, shard_re)) {
+            const int no = std::stoi(m[2].str());
+            n = std::stoi(m[3].str());
+            if (n < 1 || no < 1 || no > n)
+                throw std::runtime_error("GGUF: " + base + ": shard " + m[2].str() + " of " + m[3].str() + " is out of range");
+            for (int i = 1; i <= n; ++i) {
+                char tail[32];
+                std::snprintf(tail, sizeof tail, "-%05d-of-%05d.gguf", i, n);
+                paths_.push_back((p.parent_path() / (m[1].str() + tail)).string());
+            }
+        } else {
+            paths_.push_back(path);
+        }
+        size_t total = 0;
+        for (size_t f = 0; f < paths_.size(); ++f) {
+            if (n > 1 && !fs::exists(paths_[f]))
+                throw std::runtime_error("GGUF: shard " + std::to_string(f + 1) + " of " + std::to_string(n) +
+                                         " is missing: " + paths_[f]);
+            files_.push_back(std::make_unique<maya::GgufFile>(paths_[f]));
+            const maya::MetaValue* sc = files_.back()->get("split.count");
+            const maya::MetaValue* sn = files_.back()->get("split.no");
+            const uint64_t count = (sc != nullptr && sc->is_num()) ? sc->u : 1;
+            const uint64_t no = (sn != nullptr && sn->is_num()) ? sn->u : 0;
+            if (count != (uint64_t) n || no != (uint64_t) f)
+                throw std::runtime_error("GGUF: " + paths_[f] + ": its split metadata says shard " + std::to_string(no + 1) +
+                                         " of " + std::to_string(count) + ", its name shard " + std::to_string(f + 1) +
+                                         " of " + std::to_string(n) +
+                                         (n == 1 && count > 1 ? " (open a split model by its -NNNNN-of-NNNNN.gguf name)" : ""));
+            total += files_.back()->tensors().size();
+        }
+        all_.reserve(total);
+        owner_.reserve(total);
+        for (size_t f = 0; f < files_.size(); ++f)
+            for (const auto& t : files_[f]->tensors()) {
+                if (!index_.emplace(t.name, all_.size()).second)
+                    throw std::runtime_error("GGUF: tensor " + t.name + " appears twice (" + paths_[f] + ")");
+                all_.push_back(t);
+                owner_.push_back((int) f);
+            }
+        const maya::MetaValue* tc = files_[0]->get("split.tensors.count");
+        if (tc != nullptr && tc->is_num() && tc->u != (uint64_t) all_.size())
+            throw std::runtime_error("GGUF: the shards hold " + std::to_string(all_.size()) + " tensors, split.tensors.count says " +
+                                     std::to_string(tc->u));
+    }
+    const std::vector<maya::TensorInfo>& tensors() const { return all_; }
+    const uint8_t* tensor_data(const maya::TensorInfo& t) const { return files_[(size_t) file_of(t)]->tensor_data(t); }
+    uint64_t tensor_file_offset(const maya::TensorInfo& t) const {
+        return files_[(size_t) file_of(t)]->tensor_file_offset(t);
+    }
+    int file_of(const maya::TensorInfo& t) const {
+        const auto it = index_.find(t.name);
+        if (it == index_.end()) throw std::runtime_error("GGUF: " + t.name + ": not a tensor of this file set");
+        return owner_[it->second];
+    }
+    const std::vector<std::string>& paths() const { return paths_; }
+    const maya::MetaValue* get(const std::string& key) const { return files_[0]->get(key); }
+    bool get_full(const std::string& key, maya::MetaValue& out) const { return files_[0]->get_full(key, out); }
+
+private:
+    std::vector<std::unique_ptr<maya::GgufFile>> files_;
+    std::vector<std::string> paths_;
+    std::vector<maya::TensorInfo> all_;
+    std::vector<int> owner_;
+    std::unordered_map<std::string, size_t> index_;
+};
+
 // ------------------------------ metadata ------------------------------
 
-static double req_num(const maya::GgufFile& g, const std::string& key) {
+static double req_num(const GgufSet& g, const std::string& key) {
     const maya::MetaValue* v = g.get(key);
     if (v == nullptr || !v->is_num()) throw std::runtime_error("GGUF: missing key " + key);
     return v->num();
 }
 
-static double opt_num(const maya::GgufFile& g, const std::string& key, double dflt) {
+static double opt_num(const GgufSet& g, const std::string& key, double dflt) {
     const maya::MetaValue* v = g.get(key);
     return v != nullptr && v->is_num() ? v->num() : dflt;
 }
 
-static std::vector<double> get_array(const maya::GgufFile& g, const std::string& key, bool required) {
+static std::vector<double> get_array(const GgufSet& g, const std::string& key, bool required) {
     maya::MetaValue v;
     if (!g.get_full(key, v)) {
         if (required) throw std::runtime_error("GGUF: missing key " + key);
@@ -75,7 +154,7 @@ static std::vector<double> get_array(const maya::GgufFile& g, const std::string&
     return out;
 }
 
-static Config parse_config(const maya::GgufFile& g) {
+static Config parse_config(const GgufSet& g) {
     const std::string a = "bailingmoe3.";
     Config c;
     c.n_layer_all = (int) req_num(g, a + "block_count");
@@ -229,7 +308,7 @@ void* Model::host_alloc(Gpu& g, size_t bytes) {
     return p;
 }
 
-void Model::load_layer_weights(Layer& l, int il, Gpu& g, const maya::GgufFile& gf,
+void Model::load_layer_weights(Layer& l, int il, Gpu& g, const GgufSet& gf,
                                const std::map<std::string, const maya::TensorInfo*>& want) {
     set_dev(g.dev);
     auto at = [&](const std::string& n) -> const maya::TensorInfo& { return *want.at(n); };
@@ -365,8 +444,8 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             cudaSetDevice(d);
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            cudaDeviceProp dp{};
-            int disp = (cudaGetDeviceProperties(&dp, d) == cudaSuccess && dp.kernelExecTimeoutEnabled) ? 1 : 0;
+            int tmo = 0;   // (cudaDeviceProp lost kernelExecTimeoutEnabled in CUDA 13; the attribute is in 12 and 13)
+            int disp = (cudaDeviceGetAttribute(&tmo, cudaDevAttrKernelExecTimeout, d) == cudaSuccess && tmo) ? 1 : 0;
             rk.push_back({d, disp, fb});
         }
         std::stable_sort(rk.begin(), rk.end(), [](const GpuRank& a, const GpuRank& b) {
@@ -376,8 +455,8 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         o_.gpus.clear();
         for (const auto& r : rk) o_.gpus.push_back(r.dev);
     }
-    auto gf_u = std::make_unique<maya::GgufFile>(path);
-    maya::GgufFile& gf = *gf_u;
+    auto gf_u = std::make_unique<GgufSet>(path);
+    GgufSet& gf = *gf_u;
     const maya::MetaValue* arch = gf.get("general.architecture");
     if (arch == nullptr || arch->s != "bailingmoe3")
         throw std::runtime_error("GGUF: not a bailingmoe3 file (" + path + ")");
@@ -620,6 +699,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         l.gate_file_off = gf.tensor_file_offset(tg);
         l.up_file_off = gf.tensor_file_offset(tu);
         l.down_file_off = gf.tensor_file_offset(td);
+        l.gate_file = gf.file_of(tg);
+        l.up_file = gf.file_of(tu);
+        l.down_file = gf.file_of(td);
         l.tr[0] = 0;
         l.tr[1] = align256(l.eg_stride);
         l.tr[2] = align256(l.tr[1] + l.eu_stride);
@@ -912,6 +994,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         mtp_.layer.gate_file_off = gf.tensor_file_offset(tg);
         mtp_.layer.up_file_off = gf.tensor_file_offset(tu);
         mtp_.layer.down_file_off = gf.tensor_file_offset(td);
+        mtp_.layer.gate_file = gf.file_of(tg);
+        mtp_.layer.up_file = gf.file_of(tu);
+        mtp_.layer.down_file = gf.file_of(td);
         mtp_.layer.tr[0] = 0;
         mtp_.layer.tr[1] = align256(mtp_.layer.eg_stride);
         mtp_.layer.tr[2] = align256(mtp_.layer.tr[1] + mtp_.layer.eu_stride);
@@ -1009,6 +1094,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         int il;
         int moe_idx;
         uint64_t min_off;
+        int file_idx;   // the shard of tg (split GGUF)
     };
     std::vector<PackTask> tasks;
     for (int il = c.n_dense_lead; il < c.n_layers; ++il) {
@@ -1016,20 +1102,25 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         const maya::TensorInfo* tg = want.at(b + "ffn_gate_exps.weight");
         const maya::TensorInfo* tu = want.at(b + "ffn_up_exps.weight");
         const maya::TensorInfo* td = want.at(b + "ffn_down_exps.weight");
-        tasks.push_back({&layers_[(size_t) il], tg, tu, td, il, il - c.n_dense_lead, gf.tensor_file_offset(*tg)});
+        tasks.push_back({&layers_[(size_t) il], tg, tu, td, il, il - c.n_dense_lead, gf.tensor_file_offset(*tg),
+                         gf.file_of(*tg)});
     }
     if (mtp_loaded_) {
         const maya::TensorInfo* tg = mtp_want.at(mtp_prefix + "ffn_gate_exps.weight");
         const maya::TensorInfo* tu = mtp_want.at(mtp_prefix + "ffn_up_exps.weight");
         const maya::TensorInfo* td = mtp_want.at(mtp_prefix + "ffn_down_exps.weight");
-        tasks.push_back({&mtp_.layer, tg, tu, td, c.n_layers, c.n_layers - c.n_dense_lead, gf.tensor_file_offset(*tg)});
+        tasks.push_back({&mtp_.layer, tg, tu, td, c.n_layers, c.n_layers - c.n_dense_lead, gf.tensor_file_offset(*tg),
+                         gf.file_of(*tg)});
     }
 
     // Sort tasks in ascending file-offset order for sequential file-order warm-up!
     std::vector<size_t> file_order(tasks.size());
     std::iota(file_order.begin(), file_order.end(), 0);
     std::sort(file_order.begin(), file_order.end(),
-              [&](size_t a, size_t b) { return tasks[a].min_off < tasks[b].min_off; });
+              [&](size_t a, size_t b) {
+                  return std::make_pair(tasks[a].file_idx, tasks[a].min_off) <
+                         std::make_pair(tasks[b].file_idx, tasks[b].min_off);   // (per shard, then offset)
+              });
 
     const uint64_t avail_ram = hy4::ram_available();
     const uint64_t total_ram = hy4::ram_total();
@@ -1070,11 +1161,17 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
 
     if (any_ssd) {
         std::string derr;
-        if (!ssd_reader_.open(path, o_.direct_io, derr)) throw std::runtime_error("maya-ling: " + derr);
+        ssd_readers_.clear();
+        for (const std::string& p : gf.paths()) {
+            ssd_readers_.push_back(std::make_unique<sys::DirectGgufReader>());
+            if (!ssd_readers_.back()->open(p, o_.direct_io, derr)) throw std::runtime_error("maya-ling: " + derr);
+        }
         if (!tasks.empty()) {
-            const size_t cal_cb = ssd_reader_.calibrate_chunk(tasks[file_order[0]].min_off, std::min<size_t>(max_blob_, 2u << 20));
+            auto& r0 = *ssd_readers_[(size_t) tasks[file_order[0]].file_idx];
+            const size_t cal_cb = r0.calibrate_chunk(tasks[file_order[0]].min_off, std::min<size_t>(max_blob_, 2u << 20));
+            for (auto& r : ssd_readers_) r->set_chunk_bytes(cal_cb);
             std::fprintf(stderr, "ling ssd: O_DIRECT=%s chunk=%zu KiB ssd_slots=%zu (%.2f GiB) ram_slots=%zu (%.2f GiB)\n",
-                         ssd_reader_.direct_active() ? "on" : "fallback-buffered", cal_cb >> 10, ssd_slots_cnt,
+                         direct_io_active() ? "on" : "fallback-buffered", cal_cb >> 10, ssd_slots_cnt,
                          (double) planned_ssd_bytes / (double) (1ULL << 30), ram_slots_cnt,
                          (double) planned_ram_bytes / (double) (1ULL << 30));
         }
@@ -1663,11 +1760,12 @@ bool Model::read_expert_blob(const Layer& l, int e, uint8_t* dst) const {
         ++ram_fetch_picks_;
         return true;
     }
-    if (!l.ssd_backed || !ssd_reader_.is_open()) return false;
+    const size_t nr = ssd_readers_.size();
+    if (!l.ssd_backed || (size_t) l.gate_file >= nr || (size_t) l.up_file >= nr || (size_t) l.down_file >= nr) return false;
     const bool ok =
-        ssd_reader_.read_span(l.gate_file_off + (uint64_t) e * l.eg_stride, l.eg_stride, dst + l.tr[0]) &&
-        ssd_reader_.read_span(l.up_file_off + (uint64_t) e * l.eu_stride, l.eu_stride, dst + l.tr[1]) &&
-        ssd_reader_.read_span(l.down_file_off + (uint64_t) e * l.ed_stride, l.ed_stride, dst + l.tr[2]);
+        ssd_readers_[(size_t) l.gate_file]->read_span(l.gate_file_off + (uint64_t) e * l.eg_stride, l.eg_stride, dst + l.tr[0]) &&
+        ssd_readers_[(size_t) l.up_file]->read_span(l.up_file_off + (uint64_t) e * l.eu_stride, l.eu_stride, dst + l.tr[1]) &&
+        ssd_readers_[(size_t) l.down_file]->read_span(l.down_file_off + (uint64_t) e * l.ed_stride, l.ed_stride, dst + l.tr[2]);
     if (ok) ++ssd_fetch_picks_;
     return ok;
 }
