@@ -10,7 +10,7 @@
 //     up to 16384 tokens, so each pass streams every expert it misses once, the next layer's prefetched while this one
 //     runs; a scan-resistant eviction keeps a pass from flushing the cache.  IK2_WARM fills the cache at load with the
 //     experts tokens pick most (a profile written with IK2_POP_OUT).
-//   * Decode a token at a time; with IK2_CPU=1 a missing expert is computed on the CPU (AVX-512) when that is sooner
+//   * Decode a token at a time; with IK2_CPU=1 a missing expert is computed on the CPU (AVX-512 or AVX2) when that is sooner
 //     than its copy.  Two GPUs (--gpus 2): IK2_EP=1 deals each layer's experts to both (expert parallel - each with its
 //     own cache and PCIe link), else the layers are split between them.
 //
@@ -307,10 +307,10 @@ cudaStream_t g_s;
 cudaStream_t g_cs;          // the experts' copies of the token path, beside the compute stream
 cudaEvent_t g_ev;
 bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, before the experts
-// The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
+// The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory on hy4::Lane while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
-ik2::cpu::Pool* g_pool = nullptr;
-double g_t_cpu = 0.5e-3, g_t_up = 0.36e-3;   // seconds an expert: the pool's (measured as it runs), the link's
+std::unique_ptr<ik2::cpu::Lane> g_cpu;
+double g_t_cpu = 0.5e-3, g_t_up = 0.36e-3;   // seconds an expert: the lane's (measured as it runs), the link's
 uint64_t g_n_cpu = 0, g_n_wait = 0;
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
 constexpr int kRing = 256;
@@ -4803,7 +4803,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
-        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
+        const bool cpu_lane = g_cpu && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
                               Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
         if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
         CU(cudaStreamSynchronize(g_s));
@@ -5168,7 +5168,6 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             int ph = 0, pm = nh, pc = nh + nw;
             ik2::cpu::ExpertJob jobs[64];
             const int n_jobs = S - nh - nw;
-            const double tc0 = now();
             for (int i = 0; i < S; ++i) {
                 const int e = top[i], p = late[i] == 2 ? pc++ : late[i] ? pm++ : ph++;
                 blob[p] = where[i];
@@ -5185,7 +5184,6 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     J.x = W.x_h + (size_t) (i / c.K) * C;
                     J.sg = sg[p], J.su = su[p];
                     J.y = yh + (size_t) (p - nh - nw) * C;
-                    ik2::cpu::post_expert(*g_pool, &J, C, c.F, c.gate_cap, c.up_cap);
                 }
             }
             g_n_cpu += n_jobs, g_n_wait += nw;
@@ -5266,8 +5264,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                 W.y32 + (size_t) p0 * C, g_s);
             }
             if (n_jobs > 0) {
-                g_pool->wait();
-                g_t_cpu = 0.9 * g_t_cpu + 0.1 * (now() - tc0) / n_jobs;
+                const double tc0 = now();
+                g_cpu->run(jobs, n_jobs, C, c.F, c.gate_cap, c.up_cap);
+                const double dt = (now() - tc0) / n_jobs;
+                g_t_cpu = 0.9 * g_t_cpu + 0.1 * std::min(dt, std::max(2.0e-3, 3.0 * g_t_cpu));
                 CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) n_jobs * C * 4, cudaMemcpyHostToDevice,
                                    g_s));
             }
@@ -6318,7 +6318,7 @@ int main(int argc, char** argv) {
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
     if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available() && threads > 1 && n_gpu == 1)
-        g_pool = new ik2::cpu::Pool(threads - 1);
+        g_cpu = std::make_unique<ik2::cpu::Lane>(ik2::cpu::recommended_workers(threads));
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
     if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
@@ -6378,7 +6378,7 @@ int main(int argc, char** argv) {
             g_block = false;
         }
     }
-    if (n_gpu == 1 && !g_pool) {
+    if (n_gpu == 1 && !g_cpu) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         std::map<std::string, size_t> exp_layer;   // (a layer's experts: "blk.N" -> bytes)
         for (const auto& kv : S.by_name) {
@@ -6515,7 +6515,7 @@ int main(int argc, char** argv) {
         // the resident path's launches with a tier of the experts in VRAM and the others fetched by the GPU from
         // host memory (ik2_off.cuh).  IK2_OFF=0: the cache path instead (forward() a visit at a time); IK2_OFF=1:
         // the offload path even where every expert fits (tests).  Not with two GPUs or the CPU lane (n_gpu == 1,
-        // !g_pool here).
+        // !g_cpu here).
         const char* off_env = getenv("IK2_OFF");
         int off_set = off_env && *off_env ? std::atoi(off_env) : -1;
         // Two GPUs: where GPU 0 holds every expert, the resident path there alone (one GPU's speed, v1.1.73's path;
@@ -6978,7 +6978,7 @@ int main(int argc, char** argv) {
         pin_later = g_offs.tab = true;
 #endif
     if (host_mmap) {
-        if (g_pool) die("IK2_HOST=mmap with the CPU lane");
+        if (g_cpu) die("IK2_HOST=mmap with the CPU lane");
         if (g_off_want) die("IK2_HOST=mmap with the offload path (it reads pinned host memory: IK2_OFF=0)");
         for (const auto& J : exp_jobs) {
             Layer& Ly = M.L[J.l];
@@ -7261,7 +7261,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < Work::kPackRing; ++i) {
         CU(cudaHostAlloc(&W.pack_h[i], 8192, cudaHostAllocPortable));
         W.pack_d[i] = dalloc<uint8_t>(8192);
-        if (g_pool) CU(cudaHostAlloc(&W.y_h[i], (size_t) 64 * C * 4, cudaHostAllocPortable));
+        if (g_cpu) CU(cudaHostAlloc(&W.y_h[i], (size_t) 64 * C * 4, cudaHostAllocPortable));
     }
     W.T_host = (int) std::max<size_t>(T_buf, W.T_sup > 0 ? (size_t) ctx : 0);   // (a lent scratch can take up to ctx)
     const size_t S_host = (size_t) W.T_host * c.K;
@@ -8464,6 +8464,7 @@ int main(int argc, char** argv) {
                 g_wd_busy = !act.empty();
                 std::fflush(stdout);
             }
+            g_cpu.reset();
             g_offs.lane.reset();
             std::fflush(stdout);
             std::_Exit(0);   // (QUIT: out at once - the OS frees the pinned runs and the driver's state; a full teardown took >30 s)
@@ -8852,6 +8853,7 @@ int main(int argc, char** argv) {
             busy = false;
             g_wd_busy = false;
         }
+        g_cpu.reset();
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         std::fflush(stdout);
         std::_Exit(0);   // (QUIT / end of input: out at once, as maya-hy4 - the OS frees the pinned runs and the driver's state)
@@ -9207,9 +9209,9 @@ int main(int argc, char** argv) {
         for (int j = 0; j < ik2::draft::kBlock; ++j) std::printf("%d%s", acc_hist[j], j + 1 < ik2::draft::kBlock ? " " : "");
         std::printf("); drafting %.1f ms a step, verifying %.1f ms\n", t_draft * 1e3 / n_steps, t_verify * 1e3 / n_steps);
     }
-    if (g_pool)
+    if (g_cpu)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
-                    g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
+                    g_cpu->threads(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
@@ -9241,6 +9243,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     if (g_trace) std::fclose(g_trace);
     pop_dump();
+    g_cpu.reset();
     g_offs.lane.reset();
     return 0;
 }
