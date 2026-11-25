@@ -313,6 +313,11 @@ O Project Maya é gratuito e de código aberto. Cada versão é testada em nossa
 <p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="40"></a>
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <b>O Maya é gratuito e aberto para todos. Tornar-se patrocinador ajuda a mantê-lo assim e paga o hardware em que cada versão é testada. Obrigado!</b></p>
+<p align="center">
+<img src="https://cdn.simpleicons.org/dash/008DE4" alt="Dash" title="Dash" height="20" align="top"> <code>Xqp3JtJhCoRvGt8TXpyvS9qvukFGp5EPqd</code><br>
+<img src="https://cdn.simpleicons.org/bitcoin/F7931A" alt="Bitcoin" title="Bitcoin" height="20" align="top"> <code>3BCPYKcCSm4VdjUiRPbxGatqCP9h3bo61f</code><br>
+<img src="https://cdn.simpleicons.org/ethereum/627EEA" alt="Ethereum" title="Ethereum" height="20" align="top"> <code>0xE083E8e8eAb2E899F84c4488A0B6a8e522841Cc2</code>
+</p>
 
 Relatos de velocidade, relatos de bugs e pull requests são bem-vindos: o [CONTRIBUTING.md](CONTRIBUTING.md) diz o que mais ajuda.
 

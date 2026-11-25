@@ -314,6 +314,11 @@ Project Maya は無料のオープンソースです。すべてのリリース�
 <p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="40"></a>
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <b>Maya は誰でも無料で使えるオープンなプロジェクトです。スポンサーになっていただくと、それを続ける力になり、各リリースをテストするハードウェアの費用になります。ありがとうございます!</b></p>
+<p align="center">
+<img src="https://cdn.simpleicons.org/dash/008DE4" alt="Dash" title="Dash" height="20" align="top"> <code>Xqp3JtJhCoRvGt8TXpyvS9qvukFGp5EPqd</code><br>
+<img src="https://cdn.simpleicons.org/bitcoin/F7931A" alt="Bitcoin" title="Bitcoin" height="20" align="top"> <code>3BCPYKcCSm4VdjUiRPbxGatqCP9h3bo61f</code><br>
+<img src="https://cdn.simpleicons.org/ethereum/627EEA" alt="Ethereum" title="Ethereum" height="20" align="top"> <code>0xE083E8e8eAb2E899F84c4488A0B6a8e522841Cc2</code>
+</p>
 
 速度レポート、バグ報告、プルリクエストを歓迎します。何が最も助けになるかは [CONTRIBUTING.md](CONTRIBUTING.md) をご覧ください。
 
