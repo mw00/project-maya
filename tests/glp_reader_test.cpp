@@ -89,6 +89,16 @@ int main() {
         check(v3.spec == 1, "v1 spec 1 recorded");
     }
 
+
+    // GLP v2 is refused: rank-k and the scaling keys need a rank-k reader (this build is rank 1).
+    {
+        maya::core::glp::Vector v; std::string e; std::vector<std::string> w;
+        maya::core::glp::LoadOptions lo;
+        check(!maya::core::glp::load("/tmp/glp-v2-test.gguf", 2304, 48, lo, v, e, w), "v2 rank-2 file refuses");
+        std::fprintf(stderr, "   refusal: %s\n", e.c_str());
+        check(e.find("rank") != std::string::npos, "v2 refusal names rank-k");
+    }
+
     std::fprintf(stderr, fails ? "FAILURES: %d\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;
 }

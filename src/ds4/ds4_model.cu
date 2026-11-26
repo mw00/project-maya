@@ -3731,8 +3731,7 @@ struct Model::Impl {
             // the plain post-layer residual, which this engine does not have: refused.
             bool is_glp = false;
             try {
-                GgufFile probe(o.ablate);
-                for (const auto& [k, v] : probe.metadata()) { (void) v; if (k.rfind("glp.", 0) == 0) { is_glp = true; break; } }
+                is_glp = maya::core::glp::has_glp_metadata(o.ablate);
             } catch (const std::exception& e) {
                 err = o.ablate + ": " + e.what();
                 return false;

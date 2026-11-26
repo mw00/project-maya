@@ -34,6 +34,14 @@ namespace maya::core::glp {
 inline constexpr const char* kHookResidualPostLayer = "residual_stream_post_layer";
 inline constexpr const char* kHookFoldPreEngram = "hc_fold_pre_engram";   // spec_version 3: the fold + companion writer pair
 
+/// True when the GGUF carries glp.* metadata: a GLP vector, to load through load().  False: a
+/// legacy llama.cpp additive control vector.  Throws GgufFile's parse errors (a broken header
+/// is a load failure either way).
+inline bool has_glp_metadata(const std::string& path) {
+    GgufFile g(path);
+    for (const auto& [k, v] : g.metadata()) { (void) v; if (k.rfind("glp.", 0) == 0) return true; }
+    return false;
+}
 struct Vector {
     int64_t n_embd = 0;
     int64_t n_layers = 0;
@@ -244,14 +252,16 @@ inline bool load(const std::string& path, int64_t n_embd, int64_t n_layers, cons
         double rank = 1.0;
         if (!detail::meta_num(g, path, "glp.rank", rank, err)) return false;
         if (rank != 1.0) {
-            err = path + ": glp.rank=" + std::to_string((long long) rank) + " is not implemented (rank 1 only; a "
-                  "rank-k file needs spec_version 2 and a rank-k reader)";
+            err = path + ": glp.rank=" + std::to_string((long long) rank) + " is not implemented (rank 1 only; "
+                  "a rank-k file needs a rank-k reader - spec_version 2, or a v3 file carrying the v2 keys)";
             return false;
         }
         // ---- version-2 keys are refused under version 1 (a file that carries them is malformed).
         for (const char* key : {"glp.dir_scales", "glp.layer_scales"}) {
             if (g.get(key) != nullptr) {
-                err = path + ": " + key + " requires glp.spec_version 2 (this reader implements 1)";
+                err = path + ": " + key + " needs a reader that implements the alpha-scaling keys "
+                  "(this build is rank 1, one alpha for the whole file; spec_version 2 files and "
+                  "v3 files carrying the keys need a rank-k reader)";
                 return false;
             }
         }

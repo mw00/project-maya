@@ -948,9 +948,7 @@ bool load_control_vectors(const Options& o, const maya::core::ModelGeometry& g, 
     bool any_glp = false;
     for (const auto& [path, scale] : o.cvec_files) {
         try {
-            maya::GgufFile probe(path);
-            bool is_glp = false;
-            for (const auto& [k, v] : probe.metadata()) { (void) v; if (k.rfind("glp.", 0) == 0) { is_glp = true; break; } }
+            const bool is_glp = maya::core::glp::has_glp_metadata(path);
             if (!is_glp) continue;
             any_glp = true;
             if (o.cvec_files.size() > 1) {
@@ -1192,8 +1190,7 @@ static int glm_pack_generate(const Options& o) {
         // refused (the file names them); --ablate-scale's 0-means-file maps to glp.alpha_default.
         bool is_glp = false;
         try {
-            maya::GgufFile probe(o.ablate);
-            for (const auto& [k, v] : probe.metadata()) { (void) v; if (k.rfind("glp.", 0) == 0) { is_glp = true; break; } }
+            is_glp = maya::core::glp::has_glp_metadata(o.ablate);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "maya generate: --ablate: %s\n", e.what());
             return 1;
