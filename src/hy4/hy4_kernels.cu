@@ -6,6 +6,10 @@
 #include "maya/kernels/lane_xor.hpp"   // warp sums in registers on RDNA
 #include "maya/kernels/rdna_wmma.hpp"
 
+#if !defined(MAYA_USE_HIP)
+#include <mma.h>
+#endif
+
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -1326,6 +1330,162 @@ __global__ void __launch_bounds__(256 * G) HY4_WMMA_OCC attn_wmma_kernel(const f
     (void) out, (void) rb;
 #endif
 }
+#if !defined(MAYA_USE_HIP)
+// A token window's attention on NVIDIA's tensor cores (Volta on; HY4_ATTN_TC=0: attn2_kernel): grid (chunk, 16 heads,
+// token), 8 warps, a chunk of kKCmin = 32 keys - attn2_kernel's chunks, its ws and attn_combine_kernel's merge.  The
+// query split into an F16 high and a low part (two products each, ~22 bits of mantissa, as attn_wmma_kernel), the
+// chunk's 32 rows staged as F16 (Q8 rows dequantized to attn2_kernel's F16 values).  Scores: warp w over k-steps w,
+// w + 8, .. of the 36 (the latent's 32, the rotated part's 4), each warp's 16 x 16 partial per tile summed in warp
+// order; the chunk's softmax in one pass (its maximum known before the weighted sums: no rescaling); the weighted sums
+// with the probabilities split in two F16 parts as well, warp w over output dimensions w * 64 .. + 64.  ws gets the
+// chunk's maximum, sum and unnormalised sums, as attn2_kernel's.  attn2_kernel takes a key at a time a warp with a
+// warp's reduction each (a V100: ~88 us a layer's window, 4 ms a decode round of Hy4-flash); this, 16 heads x 16 keys
+// an MMA.  Not attn2_kernel's bits: its sums in another order, within F32 / ~22-bit rounding.
+constexpr int kTcLd = 584, kTcLdP = 40, kTcLdO = 516;   // (smem strides: F16 rows, F16 probabilities, F32 outputs)
+constexpr size_t kTcTileB = (size_t) 2 * 16 * kTcLd * 2;                   // (2 x 16 rows of F16: the Q staging alike)
+constexpr size_t kTcOutB = (size_t) 16 * kTcLdO * 4;
+constexpr size_t kTcUnionB = kTcTileB > kTcOutB ? kTcTileB : kTcOutB;
+constexpr size_t kTcSmem = kTcUnionB + (size_t) 8 * 2 * 256 * 4 + (size_t) 16 * 33 * 4 + (size_t) 2 * 16 * kTcLdP * 2;
+template <bool Q8>
+__global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
+                                                      int ring, const int* __restrict__ keys, int ldk,
+                                                      const int* __restrict__ lo, const int* __restrict__ nk, float scale,
+                                                      int nchunk, float* __restrict__ ws, int rb) {
+    namespace wm = nvcuda::wmma;
+    extern __shared__ __align__(128) uint8_t smem[];
+    __half* tile = (__half*) smem;                                    // [32][kTcLd] (first: Q hi [16][kTcLd], lo [16][kTcLd])
+    float* outst = (float*) smem;                                     // [16][kTcLdO] (last)
+    float* sp = (float*) (smem + kTcUnionB);                          // [8 warps][2 tiles][256]
+    float* S = sp + 8 * 2 * 256;                                      // [16][33]
+    __half* Ph = (__half*) (S + 16 * 33);                             // [16][kTcLdP]
+    __half* Pl = Ph + 16 * kTcLdP;
+    const int c = blockIdx.x, hb = blockIdx.y * 16, t = blockIdx.z, tid = threadIdx.x, wp = tid >> 5;
+    const int n = nk[t], k0 = c * kKCmin;
+    if (k0 >= n) return;   // (attn_combine_kernel reads the chunks with keys only)
+    const int nr = min(kKCmin, n - k0);
+    // the queries, split, through the staging room into each warp's fragments of its k-steps
+    for (int i = tid; i < 16 * 576; i += 256) {
+        const int h = i / 576, d = i % 576;
+        const float v = q[((size_t) t * H + hb + h) * 576 + d];
+        const __half hi = __float2half_rn(v);
+        tile[h * kTcLd + d] = hi;
+        tile[(16 + h) * kTcLd + d] = __float2half_rn(v - __half2float(hi));
+    }
+    __syncthreads();
+    const int nks = wp < 4 ? 5 : 4;   // (k-steps w, w + 8, w + 16, w + 24 of the latent; w < 4: 32 + w, the rotated part)
+    wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> qa[5], qb[5];
+#pragma unroll
+    for (int j = 0; j < 5; ++j)
+        if (j < nks) {
+            const int d0 = 16 * (j < 4 ? wp + 8 * j : 32 + wp);
+            wm::load_matrix_sync(qa[j], tile + d0, kTcLd);
+            wm::load_matrix_sync(qb[j], tile + 16 * kTcLd + d0, kTcLd);
+        }
+    __syncthreads();
+    // the chunk's 32 rows as F16 (rows past the keys: zero - their probabilities are 0, a NaN would not be)
+    for (int i = tid; i < kKCmin * 72; i += 256) {
+        const int r = i / 72, w = i % 72;
+        uint4 u = make_uint4(0u, 0u, 0u, 0u);
+        if (r < nr) {
+            const int p = keys ? keys[(size_t) t * ldk + k0 + r] : lo[t] + k0 + r, row = ring > 0 ? p % ring : p;
+            if (!Q8) {
+                u = ((const uint4*) cache_v)[(size_t) row * 72 + w];
+            } else {
+                const uint8_t* rp = (const uint8_t*) cache_v + (size_t) row * rb;
+                if (w < 64) {   // (8 int8 values times their block's scale, rounded to F16 as attn2_kernel's)
+                    const uint2 b = *(const uint2*) (rp + 8 * w);
+                    const float d = __half2float(__ushort_as_half(*(const uint16_t*) (rp + 512 + 2 * (w >> 2))));
+                    const uint32_t bw[2] = {b.x, b.y};
+                    __half2 o[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        o[j] = __floats2half2_rn(d * (float) (int8_t) ((bw[j >> 1] >> (16 * (j & 1))) & 0xff),
+                                                 d * (float) (int8_t) ((bw[j >> 1] >> (16 * (j & 1) + 8)) & 0xff));
+                    u = *(const uint4*) o;
+                } else {
+                    u = *(const uint4*) (rp + 544 + 16 * (w - 64));
+                }
+            }
+        }
+        *((uint4*) (tile + r * kTcLd) + w) = u;
+    }
+    __syncthreads();
+    // the scores: each warp's partial of its k-steps for the two tiles of 16 rows
+#pragma unroll
+    for (int tl = 0; tl < 2; ++tl) {
+        wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+        wm::fill_fragment(acc, 0.0f);
+#pragma unroll
+        for (int j = 0; j < 5; ++j)
+            if (j < nks) {
+                const int d0 = 16 * (j < 4 ? wp + 8 * j : 32 + wp);
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> kb;
+                wm::load_matrix_sync(kb, tile + 16 * tl * kTcLd + d0, kTcLd);
+                wm::mma_sync(acc, qa[j], kb, acc);
+                wm::mma_sync(acc, qb[j], kb, acc);
+            }
+        wm::store_matrix_sync(sp + (wp * 2 + tl) * 256, acc, 16, wm::mem_row_major);
+    }
+    __syncthreads();
+    // thread (head tid / 16, rows tid % 16 and + 16): the scores, the chunk's maximum and sum, the probabilities
+    {
+        const int h = tid >> 4, r = tid & 15;
+        float v[2];
+#pragma unroll
+        for (int tl = 0; tl < 2; ++tl) {
+            float a = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) a += sp[(w * 2 + tl) * 256 + h * 16 + r];
+            v[tl] = 16 * tl + r < nr ? a * scale : -INFINITY;
+        }
+        float mx = fmaxf(v[0], v[1]);
+#pragma unroll
+        for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+        float sum = 0.0f;
+#pragma unroll
+        for (int tl = 0; tl < 2; ++tl) {
+            const float p = 16 * tl + r < nr ? expf(v[tl] - mx) : 0.0f;
+            sum += p;
+            const __half ph = __float2half_rn(p);
+            Ph[h * kTcLdP + 16 * tl + r] = ph;
+            Pl[h * kTcLdP + 16 * tl + r] = __float2half_rn(p - __half2float(ph));
+        }
+#pragma unroll
+        for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+        if (r == 0) {
+            float* o = ws + (((size_t) t * H + hb + h) * nchunk + c) * (512 + 2);
+            o[0] = mx;
+            o[1] = sum;
+        }
+    }
+    __syncthreads();
+    // the weighted sums: warp w's 4 tiles of 16 output dimensions over the chunk's 32 rows
+    wm::fragment<wm::accumulator, 16, 16, 16, float> ov[4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) wm::fill_fragment(ov[nt], 0.0f);
+#pragma unroll
+    for (int kt = 0; kt < 2; ++kt) {
+        wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> pa, pb;
+        wm::load_matrix_sync(pa, Ph + 16 * kt, kTcLdP);
+        wm::load_matrix_sync(pb, Pl + 16 * kt, kTcLdP);
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::row_major> vb;
+            wm::load_matrix_sync(vb, tile + 16 * kt * kTcLd + wp * 64 + nt * 16, kTcLd);
+            wm::mma_sync(ov[nt], pa, vb, ov[nt]);
+            wm::mma_sync(ov[nt], pb, vb, ov[nt]);
+        }
+    }
+    __syncthreads();   // (the rows read: their room takes the outputs)
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) wm::store_matrix_sync(outst + wp * 64 + nt * 16, ov[nt], kTcLdO, wm::mem_row_major);
+    __syncthreads();
+    for (int i = tid; i < 16 * 512; i += 256) {
+        const int h = i >> 9, d = i & 511;
+        ws[(((size_t) t * H + hb + h) * nchunk + c) * (512 + 2) + 2 + d] = outst[h * kTcLdO + d];
+    }
+}
+#endif
 // a block a (t, head): the chunks merged with the sink, 512 threads (a value dim each)
 __global__ void attn_combine_kernel(int H, int nchunk, int kc, const int* __restrict__ nk,
                                     const float* __restrict__ sinks, const float* __restrict__ ws,
@@ -2672,6 +2832,32 @@ int attn_heads_a_block() {
     return 8;
 #endif
 }
+// attn_tc_kernel for the token windows: NVIDIA from Volta on (HY4_ATTN_TC=0: attn2_kernel); its shared memory past
+// the 48 KB a launch takes by default asked for once a device
+bool attn_tc_on() {
+#if defined(MAYA_USE_HIP)
+    return false;
+#else
+    static const bool off = std::getenv("HY4_ATTN_TC") != nullptr && std::atoi(std::getenv("HY4_ATTN_TC")) == 0;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int major = 0;
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        major >= 7 &&
+                        cudaFuncSetAttribute(attn_tc_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int) kTcSmem) == cudaSuccess &&
+                        cudaFuncSetAttribute(attn_tc_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int) kTcSmem) == cudaSuccess;
+        if (!ok) (void) cudaGetLastError();
+        v = ok ? 2 : 1;
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
+#endif
+}
 }  // namespace
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
@@ -2699,6 +2885,12 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     } else if (old) {
         if (q8) attn_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
         else attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+    } else if (kc == kKCmin && H % 16 == 0 && attn_tc_on()) {
+#if !defined(MAYA_USE_HIP)
+        const dim3 g16((unsigned) nchunk, (unsigned) (H / 16), (unsigned) T);
+        if (q8) attn_tc_kernel<true><<<g16, 256, kTcSmem, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, ws, rb);
+        else attn_tc_kernel<false><<<g16, 256, kTcSmem, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, ws, 0);
+#endif
     } else {
         if (q8) attn2_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
         else attn2_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
