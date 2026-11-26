@@ -7160,6 +7160,48 @@ struct Model::Impl {
             if (e == 0) h_valid[t] = dead ? 0.0f : 1.0f;
         }
     }
+    // A token window's Engram rows' pages asked for first, all of them (MADV_WILLNEED: the kernel starts their reads
+    // side by side and returns), then looked up: a row whose page is not in the page cache was one read from the disk
+    // after another - on an NVMe ~5 ms a window of 3 tokens once the table's pages had gone cold (a V100 + 62 GB box,
+    // Hy4-Flash: a decode round's largest wait).  The same rows: the same bits.  HY4_EG_WILLNEED=0: as before
+    void engram_willneed(int T, int64_t p0) {
+#if !defined(_WIN32)
+        static const bool off = std::getenv("HY4_EG_WILLNEED") && std::getenv("HY4_EG_WILLNEED")[0] == '0';
+        if (off || eg_table == nullptr) return;
+        const Engram& eg = pk.eg;
+        const int n = eg.ngram, hd = eg.head_dim;
+        auto cid = [&](int t) -> int64_t {
+            return t < 0 || t >= eg.vocab ? -1 : (int64_t) eg.token_map[(size_t) t];
+        };
+        for (int e = 0; e < eg.modules; ++e) {
+            const uint64_t* mult = eg.mult.data() + (size_t) e * n;
+            const uint64_t* primes = eg.primes.data() + (size_t) e * eg.cols();
+            const uint64_t* offs = eg.offsets.data() + (size_t) e * eg.cols();
+            for (int t = 0; t < T; ++t) {
+                const int64_t p = p0 + t;
+                uint64_t toks[8];
+                const int64_t c0 = cid(tokens[(size_t) p]);
+                toks[0] = (uint64_t) (c0 < 0 ? eg.pad : c0);
+                for (int sft = 1; sft < n; ++sft) {
+                    const int64_t c = p - sft < 0 ? -1 : cid(tokens[(size_t) (p - sft)]);
+                    toks[sft] = (uint64_t) (c < 0 ? eg.pad : c);
+                }
+                uint64_t rolling = toks[0] * mult[0];
+                for (int oo = 1; oo < n; ++oo) {
+                    rolling ^= toks[oo] * mult[oo];
+                    for (int h = 0; h < eg.heads; ++h) {
+                        const int col = (oo - 1) * eg.heads + h;
+                        const uint64_t row = rolling % primes[col] + offs[col];
+                        const uintptr_t a = (uintptr_t) (eg_table + row * (uint64_t) hd), b = a & ~(uintptr_t) 4095;
+                        (void) madvise((void*) b, (a - b) + (size_t) hd, MADV_WILLNEED);
+                    }
+                }
+            }
+        }
+#else
+        (void) T, (void) p0;
+#endif
+    }
     std::unique_ptr<Crew> eg_crew;   // (the Engram lookups' threads)
     // A token window's Engram rows with tensor parallel: looked up on a thread of their own while the members queue
     // their layers - a row is a random page of the table, a page fault at its first touch (the table is not mapped in
@@ -8148,6 +8190,7 @@ struct Model::Impl {
                 });
                 eg_crew->wait();
             } else {
+                if (T <= W) engram_willneed(T, p0);
                 for (int e = 0; e < pk.eg.modules; ++e) engram_gather(e, T, p0);
             }
             eg_last_s = now_s() - te;
@@ -8160,6 +8203,7 @@ struct Model::Impl {
             h_pos[2 * Tc + t] = (int) (p - h_pos[Tc + t] + 1);
         }
         if (tp > 1) return window_tp(ids, T, p0, want, logits_out, err);
+
         // (HY4_FETCH_PROF=1, one GPU's token windows: the host's time to queue the layers, the GPU's from the first
         //  layer to the head, the wall time - reported at the end)
         const bool wprof = fx.prof && T <= W && G.size() == 1;

@@ -1883,6 +1883,7 @@ int main(int argc, char** argv) {
         extra.n_more = n_more;
         extra.need = need;
         double t_draft = 0, t_verify = 0;
+        const double eg0 = m.stats().engram_ms;
         // (a row's top: the GPUs' where they found it - Model::row_top - else the walk over its logits)
         auto top_of = [&](const float* row, int r) {
             const int t = m.row_top(r);
@@ -1933,9 +1934,10 @@ int main(int argc, char** argv) {
             if (!m.save_profile(perr)) std::fprintf(stderr, "maya-hy4: the expert profile: %s\n", perr.c_str());
         }
         std::fprintf(stderr, "decode: %zu tokens in %.2f s (%.2f tok/s); %lld rounds, %s kept %lld of %lld drafts "
-                     "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms\n", out.size(), t2 - t1,
-                     out.size() / (t2 - t1), rounds, m.has_dfly2() ? "DFly2" : "MTP", acc, off, rounds ? (double) out.size() / rounds : 0.0,
-                     rounds ? 1e3 * t_draft / rounds : 0.0, rounds ? 1e3 * t_verify / rounds : 0.0);
+                     "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms (Engram lookups %.2f ms)\n",
+                     out.size(), t2 - t1, out.size() / (t2 - t1), rounds, m.has_dfly2() ? "DFly2" : "MTP", acc, off,
+                     rounds ? (double) out.size() / rounds : 0.0, rounds ? 1e3 * t_draft / rounds : 0.0,
+                     rounds ? 1e3 * t_verify / rounds : 0.0, rounds ? (m.stats().engram_ms - eg0) / rounds : 0.0);
         return 0;
     }
     for (int i = 0; i < gen; ++i) {
