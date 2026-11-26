@@ -4850,6 +4850,11 @@ struct Model::Impl {
     struct Deq {
         int64_t base = -1, hi = 0;
     };
+    // (attn_prompt / attn_sparse: the keys padded to a multiple of 8 - HY4_ATTN_PAD8=0: as before)
+    static bool pad8() {
+        static const bool on = !(std::getenv("HY4_ATTN_PAD8") && std::getenv("HY4_ATTN_PAD8")[0] == '0');
+        return on;
+    }
     bool attn_prompt(Layer& l, Gpu& gp, int t0, int ts, int64_t p0, bool all, float scale, Deq& dq) {
         const int H = l.H, KR = g.kv_row(), KL = g.kv_lora, maxk = g.ix_top_k + g.ix_kpool;
         const int64_t P0 = p0 + t0, k1 = P0 + ts;
@@ -4879,13 +4884,22 @@ struct Model::Impl {
             k::kv_gather(l.kv, l.ring, KR, (int) k0, nkr, gp.kbuf, gp.s);
             K = gp.kbuf;
         }
+        // (the keys padded to a multiple of 8 where they are kbuf's rows: cuBLAS's aligned tiles, not its align1 ones -
+        //  a V100's GEMMs of 575 keys ran at ~15 TFLOP/s.  The padding's rows zeroed, its columns of P zero: the same
+        //  sums)
+        const bool kb = K >= gp.kbuf && K < gp.kbuf + deq_rows() * KR;
+        const int nk8 = kb && (size_t) (K - gp.kbuf) / KR + (size_t) (nkr + 7) / 8 * 8 <= deq_rows() && pad8()
+                            ? (nkr + 7) / 8 * 8 : nkr;
+        if (nk8 > nkr &&
+            cudaMemsetAsync((uint16_t*) K + (size_t) nkr * KR, 0, sizeof(uint16_t) * (nk8 - nkr) * KR, gp.s) != cudaSuccess)
+            return false;
         k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
-        const int ldS = (nkr + 7) / 8 * 8;
+        const int ldS = (nk8 + 7) / 8 * 8;
         const float one = 1.0f, zero = 0.0f;
         const int Tp = W + 1;   // (the profile's names: a prompt step)
         part(gp, "attn: the keys and queries as FP16", Tp);
-        if (!(lt_on && lt::gemm_loose(gp.s, K, nkr, KR, gp.xh16, KR, ts * H, gp.sS, ldS)) &&
-            cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, nkr, ts * H, KR, &one, K, CUDA_R_16F, KR, gp.xh16,
+        if (!(lt_on && lt::gemm_loose(gp.s, K, nk8, KR, gp.xh16, KR, ts * H, gp.sS, ldS)) &&
+            cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, nk8, ts * H, KR, &one, K, CUDA_R_16F, KR, gp.xh16,
                          CUDA_R_16F, KR, &zero, gp.sS, CUDA_R_32F, ldS, CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             return false;
@@ -4893,12 +4907,12 @@ struct Model::Impl {
         if (!l.swa && !all)
             k::dsa_mask(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, (int) k0, nkr, gp.dmask, (size_t) dense_max,
                         gp.s);
-        k::attn_softmax(gp.sS, ldS, ts, H, nkr, (int) k0, gp.pos + t0, window, gp.dmask, (size_t) dense_max, scale, l.sinks,
-                        gp.sP, ldS, gp.s);
+        k::attn_softmax(gp.sS, ldS, ts, H, nk8, (int) k0, gp.pos + t0, window, gp.dmask, (size_t) dense_max, scale, l.sinks,
+                        gp.sP, ldS, gp.s, nkr);
         part(gp, "attn: mask and softmax", Tp);
         const bool ok =
-            (lt_on && lt::gemm_n(gp.s, K, KR, KL, nkr, gp.sP, ldS, ts * H, gp.o + (size_t) t0 * H * KL, KL, true)) ||
-            cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, nkr, &one, K, CUDA_R_16F, KR, gp.sP, CUDA_R_16F,
+            (lt_on && lt::gemm_n(gp.s, K, KR, KL, nk8, gp.sP, ldS, ts * H, gp.o + (size_t) t0 * H * KL, KL, true)) ||
+            cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, nk8, &one, K, CUDA_R_16F, KR, gp.sP, CUDA_R_16F,
                          ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
         part(gp, "attn: values GEMM", Tp);
@@ -4920,7 +4934,8 @@ struct Model::Impl {
         if (cudaMemcpyAsync(&np, dn, sizeof(int), cudaMemcpyDeviceToHost, gp.s) != cudaSuccess ||
             cudaStreamSynchronize(gp.s) != cudaSuccess)
             return false;
-        const int rows = np * KP, ldS = (rows + 7) / 8 * 8;
+        const int rows = np * KP, rows8 = pad8() && (size_t) (rows + 7) / 8 * 8 <= deq_rows() ? (rows + 7) / 8 * 8 : rows,
+                  ldS = (rows8 + 7) / 8 * 8;
         if (sparse_stat) {
             long long m = sp_st[3].load();
             while (rows > m && !sp_st[3].compare_exchange_weak(m, rows)) {}
@@ -4939,17 +4954,20 @@ struct Model::Impl {
         spill_need(l, gp, nullptr, 0, nullptr, 0, list, KP, (int) k1, 0, np);
         if (kv_q8) k::kv_deq(l.kv, l.res, KL, g.rope, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1, l.hs());
         else k::kv_gather(l.kv, l.res, KR, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1, l.hs());
+        if (rows8 > rows &&
+            cudaMemsetAsync(gp.kbuf + (size_t) rows * KR, 0, sizeof(uint16_t) * (rows8 - rows) * KR, gp.s) != cudaSuccess)
+            return false;
         k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
         const float one = 1.0f, zero = 0.0f;
-        if (cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, ts * H, KR, &one, gp.kbuf, CUDA_R_16F, KR, gp.xh16,
+        if (cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows8, ts * H, KR, &one, gp.kbuf, CUDA_R_16F, KR, gp.xh16,
                          CUDA_R_16F, KR, &zero, gp.sS, CUDA_R_32F, ldS, CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             return false;
         k::dsa_mask_list(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, col, KP, rows, gp.dmask, (size_t) dense_max,
                          gp.s);
-        k::attn_softmax(gp.sS, ldS, ts, H, rows, 0, gp.pos + t0, -1, gp.dmask, (size_t) dense_max, scale, l.sinks, gp.sP,
-                        ldS, gp.s);
-        return cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, rows, &one, gp.kbuf, CUDA_R_16F, KR, gp.sP,
+        k::attn_softmax(gp.sS, ldS, ts, H, rows8, 0, gp.pos + t0, -1, gp.dmask, (size_t) dense_max, scale, l.sinks, gp.sP,
+                        ldS, gp.s, rows);
+        return cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, rows8, &one, gp.kbuf, CUDA_R_16F, KR, gp.sP,
                             CUDA_R_16F, ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
     }

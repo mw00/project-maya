@@ -252,9 +252,10 @@ void ix_unpack(const uint16_t* wire, int ldw, int T, const int* pos, int kpool, 
 /// P (F16, ldP) = softmax(scale S, the head's sink) over the keys the token sees: window > 0 the last `window`
 /// positions up to its own, else mask[t][j] == 0 (the indexer's picks, dsa_mask); 0 elsewhere
 /// (window < 0: the mask alone - the keys a list, not the positions from k0: dsa_mask_list's)
+/// (nv >= 0: only the first nv columns are keys - the rest the callers' padding to a multiple of 8, P 0 there)
 void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, const int* pos, int window,
                   const float* mask, size_t ldm, float scale, const float* sinks, uint16_t* P, size_t ldP,
-                  cudaStream_t s);
+                  cudaStream_t s, int nv = -1);
 /// mask[t][j] = 0 for every key position k0 + j among keys[t][0 .. nk[t]), -inf for the others
 void dsa_mask(const int* keys, int ldk, const int* nk, int T, int k0, int nkr, float* mask, size_t ldm, cudaStream_t s);
 /// dst[j] = the latent cache row of position k0 + j (row p % ring), j < n: a ring's rows in position order
