@@ -1215,10 +1215,24 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     // a 64 x 64 staging of both (35 KB), so more blocks fit a CU to hide the loads (a Radeon 8065S, 32 experts x 128
     // rows: 7.7-11.4 -> 13.6-14.6 TFLOP/s; a 4K prompt +8%)
     static_assert(sizeof(Tiles) >= (size_t) (kThreads / 32) * 16 * 16 * sizeof(float), "the warps' output tiles");
-    __shared__ __align__(32) unsigned char smem[sizeof(Tiles)];
+#if defined(MAYA_USE_HIP)
+    constexpr int NB = 1;
+#else
+    // (NVIDIA: two tiles - k-step kb + 1 decoded and staged into one while the warps' MMAs read kb's from the other, a
+    //  barrier a step; a V100's tiles waited on each step's loads between its two barriers.  The same values into the
+    //  same MMAs in the same order: the same bits.  DS4_IQ_TC_DB=0 builds one tile, as before)
+#if defined(DS4_IQ_TC_DB) && DS4_IQ_TC_DB == 0
+    constexpr int NB = 1;
+#else
+    // (a static block's shared memory, the code table and the rows' sources with the tiles: RM 4's, and the big
+    //  tables' types, one tile)
+    constexpr int NB = 2 * sizeof(Tiles) + 4 * (Ty<T>::TAB > 0 ? Ty<T>::TAB : 1) + 4 * BR <= 48 * 1024 ? 2 : 1;
+#endif
+#endif
+    __shared__ __align__(32) unsigned char smem[NB * sizeof(Tiles)];
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     __shared__ int src[BR];
-    Tiles& Tl = *reinterpret_cast<Tiles*>(smem);
+    Tiles* TB = reinterpret_cast<Tiles*>(smem);
     const int e = blockIdx.z;
     const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
     const int r0 = lo + blockIdx.x * BR;
@@ -1243,7 +1257,7 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
             wm::fill_fragment(fu[q][j], 0.0f);
         }
     const int tr = tid >> 2, tq = tid & 3;
-    for (int kb = 0; kb < K / 32; ++kb) {
+    auto stage = [&](int kb, Tiles& Tl) {
         for (int m = 0; m < (TWO ? 2 : 1); ++m) {
             float w8[8];
             deq8<T>(blob + a.tr[GATE_UP ? (TWO ? m : kRole0<EPI>) : 2] + (size_t) (c0 + tr) * rb, kb, tq, tab, w8);
@@ -1273,7 +1287,8 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
                 }
             }
         }
-        __syncthreads();
+    };
+    auto mma = [&](Tiles& Tl) {
 #pragma unroll
         for (int kk = 0; kk < 32; kk += 16) {
             wm::fragment<wm::matrix_a, 16, 16, 16, wh, wm::row_major> fa[RM];
@@ -1295,7 +1310,22 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
                 }
             }
         }
+    };
+    if constexpr (NB == 1) {
+        for (int kb = 0; kb < K / 32; ++kb) {
+            stage(kb, TB[0]);
+            __syncthreads();
+            mma(TB[0]);
+            __syncthreads();
+        }
+    } else {
+        stage(0, TB[0]);
         __syncthreads();
+        for (int kb = 0; kb < K / 32; ++kb) {
+            if (kb + 1 < K / 32) stage(kb + 1, TB[(kb + 1) & 1]);   // (the other tile: read by step kb - 1, done)
+            mma(TB[kb & 1]);
+            __syncthreads();
+        }
     }
     float* ow = reinterpret_cast<float*>(smem) + (size_t) warp * 16 * 16;   // (the K loop's last barrier: tiles free)
     const int lane = tid & 31;
