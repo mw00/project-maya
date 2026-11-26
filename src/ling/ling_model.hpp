@@ -262,6 +262,9 @@ private:
         int router_type = 0;
         const float* rb_dev = nullptr;
         int etg = 0, etu = 0, etd = 0;
+        // gate and up experts of different types: the kernels' two passes (Args / SetArgs::tu), never the CPU lane
+        bool mixed_gu() const { return etu != etg; }
+        int tu_arg() const { return mixed_gu() ? etu : 0; }
         size_t eg_ld = 0, eu_ld = 0, ed_ld = 0;
         size_t tr[3] = {0, 0, 0};
         size_t blob = 0;

@@ -744,6 +744,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
 
     max_blob_ = 0;
     int quant_tg = -1, quant_td = -1;
+    std::string quant_mix;   // (the layers whose up's type is not the gate's, and that type: restore / calibration keys)
     for (int il = c.n_dense_lead; il < c.n_layers; ++il) {
         Layer& l = layers_[(size_t) il];
         const std::string b = "blk." + std::to_string(il) + ".";
@@ -753,10 +754,16 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         expect_shape(tg, {E, FE, c.n_expert});
         expect_shape(tu, {E, FE, c.n_expert});
         expect_shape(td, {FE, E, c.n_expert});
-        if (tg.type != tu.type)
-            throw std::runtime_error("GGUF: " + b + "gate and up expert types differ");
-        if (!iq::expert_supported((int) tg.type) || !iq::down_supported((int) td.type))
+        // (gate and up of different types - Maya-M / Maya-L give a few layers a larger up: the kernels' two passes,
+        //  the gate's sums then the up's; such a layer's experts never take the CPU lane, which has one type for both)
+        if (!iq::expert_supported((int) tg.type) || !iq::expert_supported((int) tu.type) ||
+            !iq::down_supported((int) td.type))
             throw std::runtime_error("GGUF: " + b + "expert type not supported");
+        if (tg.type != tu.type) {
+            if (FE > E)   // (the prompt sets keep the gate's F32 sums in their down output's rows: n_ff <= n_embd)
+                throw std::runtime_error("GGUF: " + b + "gate and up expert types differ (n_ff > n_embd)");
+            quant_mix += b + std::to_string((int) tu.type) + ";";
+        }
         l.etg = (int) tg.type;
         l.etu = (int) tu.type;
         l.etd = (int) td.type;
@@ -1066,6 +1073,11 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         const maya::TensorInfo& tg = at(mtp_prefix + "ffn_gate_exps.weight");
         const maya::TensorInfo& tu = at(mtp_prefix + "ffn_up_exps.weight");
         const maya::TensorInfo& td = at(mtp_prefix + "ffn_down_exps.weight");
+        if (tg.type != tu.type) {   // (as the trunk's layers: two passes on the GPU, never the CPU lane)
+            if (!iq::expert_supported((int) tg.type) || !iq::expert_supported((int) tu.type) || FE > E)
+                throw std::runtime_error("GGUF: " + mtp_prefix + "gate and up expert types differ (not supported)");
+            quant_mix += mtp_prefix + std::to_string((int) tu.type) + ";";
+        }
         mtp_.layer.etg = (int) tg.type;
         mtp_.layer.etu = (int) tu.type;
         mtp_.layer.etd = (int) td.type;
@@ -1331,7 +1343,9 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             if (l.n_res < c.n_expert) any_host_unpinned_ = true;
             continue;
         }
-        if (want_pin && (double) l.host_bytes <= pin_budget) {
+        // (a layer whose gate and up are of different types is pinned whatever the mode and the budget: its experts
+        //  outside VRAM run on the GPU from pinned RAM, never on the CPU lane - a few layers of a file)
+        if ((want_pin && (double) l.host_bytes <= pin_budget) || (l.mixed_gu() && l.n_res < c.n_expert)) {
             set_dev(gpus_[(size_t) l.dev_idx].dev);
             if (cudaHostRegister(l.host_blobs, l.host_bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
                 l.host_pinned = true;
@@ -1423,7 +1437,14 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         CK(cudaStreamSynchronize(gp.s));
         l.fl.hptr = d_hptr;
 
-        if (l.n_res < c.n_expert) {
+        if (l.n_res < c.n_expert && l.mixed_gu()) {
+            // (the CPU lane has one type for the gate and the up: this layer's other experts run on the GPU, fetched
+            //  from pinned RAM - never computed with the gate's type for the up)
+            if (l.host_blobs == nullptr || !l.host_pinned)
+                throw std::runtime_error("layer " + std::to_string(tk.il) +
+                                         ": its gate and up experts are of different types, and the experts that are "
+                                         "not in VRAM must be in pinned RAM for this (more VRAM or --pin-ram-gib helps)");
+        } else if (l.n_res < c.n_expert) {
             std::string err;
             if (!l.cex.init(l.etg, l.etd, E, FE, err))
                 throw std::runtime_error("cpu lane init failed on layer " + std::to_string(tk.il) + ": " + err);
@@ -1458,7 +1479,18 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
         }
         int drv = 0;
         cudaDriverGetVersion(&drv);
-        const std::string qtag = std::to_string(quant_tg) + "_" + std::to_string(quant_td);
+        // (a file whose layers' up types differ from their gate's: those layers and types in the keys, as a short
+        //  hash - the keys of every other file stay as they were, their restore points and measurements kept)
+        std::string mix_tag;
+        if (!quant_mix.empty()) {
+            uint64_t hsh = 1469598103934665603ull;
+            for (unsigned char ch : quant_mix) hsh = (hsh ^ ch) * 1099511628211ull;
+            char hx[24];
+            std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long) hsh);
+            mix_tag = std::string("mix") + hx;
+        }
+        const std::string qtag =
+            std::to_string(quant_tg) + "_" + std::to_string(quant_td) + (mix_tag.empty() ? "" : "_" + mix_tag);
         const std::string khash = "ling-v2-" + std::to_string(o_.kv_q8 ? 1 : 0);
         const std::string canon_name =
             std::filesystem::path(gf_paths.empty() ? path : gf_paths[0]).filename().string();
@@ -1472,7 +1504,8 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             }
             restore_expect_.key.model_id = canon_name;
             restore_expect_.key.quant_tag = "etg=" + std::to_string(quant_tg) + ",etd=" + std::to_string(quant_td) +
-                                            ",emb=" + std::to_string(emb_.type) + ",out=" + std::to_string(out_w_.type);
+                                            ",emb=" + std::to_string(emb_.type) + ",out=" + std::to_string(out_w_.type) +
+                                            (mix_tag.empty() ? "" : ",etu=" + mix_tag);
             restore_expect_.key.engine_version = sys::kRestoreEngineVersion;
             // (the files' sampled bytes, then the tensor table: names, types, offsets, sizes)
             restore_expect_.key.gguf_fingerprint =
@@ -1769,7 +1802,7 @@ void Model::calibrate_split_and_threads() {
     Layer* probe = nullptr;
     for (int il = c_.n_dense_lead; il < c_.n_layers; ++il) {
         if (layers_[(size_t) il].n_res < c_.n_expert && layers_[(size_t) il].host_blobs != nullptr &&
-            layers_[(size_t) il].host_pinned) {
+            layers_[(size_t) il].host_pinned && !layers_[(size_t) il].mixed_gu()) {   // (a layer with a CPU lane)
             probe = &layers_[(size_t) il];
             break;
         }
@@ -1878,6 +1911,8 @@ bool Model::read_expert_blob(const Layer& l, int e, uint8_t* dst) const {
 }
 
 void Model::run_cpu_entries(Layer& l, const std::vector<hy4::CpuEntry>& entries, const float* x, int T, float* out) {
+    if (l.mixed_gu())   // (its callers never send such a layer here: the lane would read the up with the gate's type)
+        throw std::runtime_error("cpu lane: a layer whose gate and up experts are of different types");
     if (entries.empty()) {
         std::fill(out, out + (size_t) T * c_.n_embd, 0.0f);
         return;
@@ -2147,7 +2182,7 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* ne
     const int E = c.n_embd, FE = c.n_ff_exp, FS = c.n_ff_shexp, NU = c.n_used;
     cudaStream_t s = gp.s;
 
-    const bool use_lane = (l.n_res < c.n_expert) &&
+    const bool use_lane = (l.n_res < c.n_expert) && !l.mixed_gu() &&   // (mixed gate / up: the GPU fetch, pinned RAM)
                           (active_offload_ == OffloadMode::kCpu || active_offload_ == OffloadMode::kMix || !l.host_pinned);
 
     auto run_shared = [&](cudaStream_t st) {
@@ -2175,6 +2210,11 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* ne
             k::add2(gp.x, gp.moe, gp.shout, E, s);
         }
     };
+
+    // Lane parity (--repeatable): re-quantise gp.cur to Q8_K into xq/xd BEFORE ev_norm. The shared expert below
+    // reads xq/xd on s_copy; doing this later on s (as before) raced with it, so the shared expert saw the norm's
+    // quants on some steps and Q8_K ones on others (#1224 repeatable). Every path now gives it the Q8_K quants.
+    if (o_.lane_parity) k::q8k_rows(gp.cur, 1, E, gp.xq, gp.xd, s);
 
     // In kCpu mode, start copying gp.cur (10 KB) to host on dedicated s_d2h IMMEDIATELY (overlaps router + fetch_resolve!)
     if (use_lane) {
@@ -2216,10 +2256,10 @@ void Model::ffn_moe_decode(Gpu& gp, Layer& l, int il, bool seam, const float* ne
     a.hd = gp.ehd;
     a.part = gp.part;
     a.tg = l.etg;
+    a.tu = l.tu_arg();   // (0: the gate's type; else gate and up in two passes)
     a.td = l.etd;
     a.act = iq::kActSwiglu;
     a.pexp = o_.lane_parity ? 1 : 0;
-    if (o_.lane_parity) k::q8k_rows(gp.cur, 1, E, gp.xq, gp.xd, s);
 
     if (l.n_res == c.n_expert) {
         hy::plan_experts(gp.d_ids, NU, l.fl.vram, l.blob, gp.d_plan, s);
@@ -2776,6 +2816,10 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
     const int ngpu = (int) gpus_.size();
     const int max_set_rows = P * NU;
     const int n_res_eff = (layer_borrowed || ((o_.repeatable || o_.lane_parity) && l.n_res < NE)) ? 0 : l.n_res;
+    // Repeatable / lane parity, all experts in VRAM: run them in the same sorted sets of <= kPfBatch experts a
+    // partly resident layer stages (weights read in place), so a token's expert outputs are added in the same groups
+    // and the answer does not depend on whether every expert fit in VRAM (#1224 repeatable)
+    const bool rep_sets = (o_.repeatable || o_.lane_parity) && !layer_borrowed && n_res_eff == NE;
     cudaStream_t s = gp.s;
     cudaStream_t sc = gp.s_copy;
 
@@ -2818,8 +2862,8 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
     std::vector<int> chunk_counts((size_t) NE, 0);
     int vram_hits = 0;
     int vram_max_rows = 0;
-    if (n_res_eff < NE) {
-        if (n_res_eff > 0) {
+    if (n_res_eff < NE || rep_sets) {
+        if (n_res_eff > 0 && !rep_sets) {
             CK(cudaMemcpyAsync(l.h_slot.data(), l.fl.slot, (size_t) NE * sizeof(int), cudaMemcpyDeviceToHost, s));
         }
         CK(cudaMemcpyAsync(gp.h_pf_ids, mb.ids, (size_t) B * NU * sizeof(int), cudaMemcpyDeviceToHost, s));
@@ -2833,7 +2877,7 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
             const int e = gp.h_pf_ids[i];
             l.pf_counts[(size_t) e]++;
             const int cnt = ++chunk_counts[(size_t) e];
-            if (n_res_eff > 0 && l.h_slot[(size_t) e] >= 0) {
+            if (n_res_eff > 0 && !rep_sets && l.h_slot[(size_t) e] >= 0) {
                 ++vram_hits;
                 if (cnt > vram_max_rows) vram_max_rows = cnt;
             } else if (cnt == 1) {
@@ -2935,6 +2979,10 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
         a.h = h16;
         a.ldo = FE;
         a.tg = l.etg;
+        a.tu = l.tu_arg();   // (0: the gate's type; else gate and up in two passes)
+        // (two passes: the gate's F32 sums [rows][n_ff] between them, in the down output's rows - [rows][n_embd],
+        //  n_ff <= n_embd, the load's check - which the down writes only after the up's pass has read them)
+        if (l.mixed_gu()) a.graw = y;
         a.td = l.etd;
         a.act = iq::kActSwiglu;
         if (!iq::set_gate_up(a, g.s)) throw std::runtime_error("moe prefill: set_gate_up failed");
@@ -2956,14 +3004,14 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
         long long rows = 0;
         for (int e : blist) rows += chunk_counts[(size_t) e];
         if (ling::moe_plan::one_pass(rows, max_set_rows)) {
-            run_set_on(g, gb, 0, B, g.pf_stage[buf], g.pf_pmap[buf], (int) blist.size(), bmax, accumulate);
+            run_set_on(g, gb, 0, B, rep_sets ? l.fl.vram : g.pf_stage[buf], g.pf_pmap[buf], rep_sets ? NE : (int) blist.size(), bmax, accumulate);
             return;
         }
         std::vector<int> in_set((size_t) NE, -1);
         for (size_t b = 0; b < blist.size(); ++b) in_set[(size_t) blist[b]] = (int) b;
         for (const auto& tl : ling::moe_plan::tiles(gp.h_pf_ids, B, NU, in_set, P)) {
             if (tl.max_rows > 0) {
-                run_set_on(g, gb, tl.t0, tl.T, g.pf_stage[buf], g.pf_pmap[buf], (int) blist.size(), tl.max_rows,
+                run_set_on(g, gb, tl.t0, tl.T, rep_sets ? l.fl.vram : g.pf_stage[buf], g.pf_pmap[buf], rep_sets ? NE : (int) blist.size(), tl.max_rows,
                            accumulate);
             } else if (!accumulate) {
                 CK(cudaMemsetAsync(gb.moe + (size_t) tl.t0 * E, 0, (size_t) tl.T * E * sizeof(float), g.s));
@@ -3004,10 +3052,12 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
         if (seq >= (uint64_t) kPfPmapRing) CK(cudaEventSynchronize(g.ev_pmap[ring]));
         int* pmap_h = g.h_pf_pmap[ring];
         std::fill(pmap_h, pmap_h + NE, -1);
-        for (int b = 0; b < Bn; ++b) pmap_h[blist[(size_t) b]] = b;
+        for (int b = 0; b < Bn; ++b) pmap_h[blist[(size_t) b]] = rep_sets ? blist[(size_t) b] : b;   // (VRAM slot e)
         CK(cudaMemcpyAsync(g.pf_pmap[buf], pmap_h, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, g.s_copy));
         CK(cudaEventRecord(g.ev_pmap[ring], g.s_copy));
-        if (l.host_pinned) {
+        if (rep_sets) {
+            // weights stay where they are in VRAM: nothing to stage
+        } else if (l.host_pinned) {
             for (int b = 0; b < Bn; ++b) {
                 const int e = blist[(size_t) b];
                 CK(cudaMemcpyAsync(g.pf_stage[buf] + (size_t) b * l.blob, l.host_blobs + (size_t) e * l.blob, l.blob,
@@ -3036,7 +3086,7 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
     };
 
     if (o_.repeatable || o_.lane_parity) std::sort(miss_list.begin(), miss_list.end());
-    const bool cpu_miss = !o_.repeatable && !o_.lane_parity && !miss_list.empty() && lane_ && B <= 48;
+    const bool cpu_miss = !o_.repeatable && !o_.lane_parity && !miss_list.empty() && lane_ && B <= 48 && !l.mixed_gu();
     const bool use_ep = !o_.repeatable && !o_.lane_parity && o_.ep_prefill && !cpu_miss && ngpu >= 2 && B >= 256 &&
                         (int) miss_list.size() >= 32 && l.host_pinned;
 
@@ -4010,7 +4060,7 @@ void Model::ffn_moe_decode_win(Gpu& gp, Layer& l, int il, int W, const float* ne
     const Config& c = c_;
     const int E = c.n_embd, FE = c.n_ff_exp, FS = c.n_ff_shexp, NU = c.n_used;
     cudaStream_t s = gp.s;
-    const bool use_lane = (l.n_res < c.n_expert) &&
+    const bool use_lane = (l.n_res < c.n_expert) && !l.mixed_gu() &&   // (mixed gate / up: the GPU fetch, pinned RAM)
                           (active_offload_ == OffloadMode::kCpu || active_offload_ == OffloadMode::kMix || !l.host_pinned);
 
     auto run_shared = [&](cudaStream_t st) {
@@ -4028,6 +4078,9 @@ void Model::ffn_moe_decode_win(Gpu& gp, Layer& l, int il, int W, const float* ne
         if (next_norm != nullptr) k::add2_rmsnorm_q8(gp.x, gp.moe, gp.shout, next_norm, W, E, c.eps, gp.cur, gp.xq, gp.xd, s);
         else k::add2(gp.x, gp.moe, gp.shout, (int64_t) W * E, s);
     };
+
+    // Lane parity: Q8_K quants into xq/xd before the shared expert starts on s_copy (see ffn_moe_decode).
+    if (o_.lane_parity) k::q8k_rows(gp.cur, W, E, gp.xq, gp.xd, s);
 
     if (use_lane) {
         CK(cudaEventRecord(gp.ev_norm, s));
@@ -4047,7 +4100,6 @@ void Model::ffn_moe_decode_win(Gpu& gp, Layer& l, int il, int W, const float* ne
     last_kernel_ = "router_grouped_win";
     k::router_grouped(gp.rlog, l.rb_dev, W, c.n_expert, NU, c.n_group, c.n_group_used, c.w_norm, c.w_scale, gp.d_ids, gp.d_w, s, gp.d_route_err);
 
-    if (o_.lane_parity) k::q8k_rows(gp.cur, W, E, gp.xq, gp.xd, s);
     hy::dup_rows_q8(gp.xq, gp.xd, W, E, gp.x2q, gp.x2d, s);
     iq::Args a;
     a.grp_ptr = gp.grp_ptr;
@@ -4067,6 +4119,7 @@ void Model::ffn_moe_decode_win(Gpu& gp, Layer& l, int il, int W, const float* ne
     a.hd = gp.ehd;
     a.part = gp.part;
     a.tg = l.etg;
+    a.tu = l.tu_arg();   // (0: the gate's type; else gate and up in two passes)
     a.td = l.etd;
     a.act = iq::kActSwiglu;
     a.pexp = o_.lane_parity ? 1 : 0;

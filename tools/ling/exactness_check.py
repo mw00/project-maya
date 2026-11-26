@@ -12,6 +12,8 @@ And checks:
   - INT8 KV (--kv q8) vs FP16 KV (--kv fp16)
   - speculative drafting spec=1 (3 runs) == spec=0 (3 runs)
   - repeatable mode (--repeatable): 2 cold starts + 2 warm requests give identical hash
+  - repeatable stress (--repeat-n N, default 16): N identical chat requests in ONE --repeatable --mtp process,
+    drafting off and on alternated, all give one hash (catches stream races that 2 requests miss)
   - lane-parity (--lane-parity): identical greedy hash across any VRAM vs CPU expert split on the same GPU set
     (same answers for 1 vs N GPUs hold with --repeatable only: a normal run can differ in the last digit)
   - --sampled-check: Pearson chi-square test of sampled spec=0 vs spec=1 draws
@@ -139,6 +141,8 @@ def main() -> int:
     ap.add_argument("--n-predict", type=int, default=32)
     ap.add_argument("--spec-runs", type=int, default=3)
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--repeat-n", type=int, default=16,
+                    help="identical requests in one --repeatable process (drafting off/on alternated); 0 skips")
     ap.add_argument("--sampled-check", action="store_true", help="Run sampled drafting chi-square check (spec=0 vs spec=1)")
     ap.add_argument("--sampled-draws", type=int, default=200)
     ap.add_argument("--no-promo-check", action="store_true", help="Verify --no-promo disables promotions and isolates profile lift")
@@ -224,6 +228,20 @@ def main() -> int:
         print(f"  chat      cold1={rh[:2]}  cold2={rh[2:]}  {'PASS' if ok_rep else 'FAIL'}", flush=True)
         if not ok_rep:
             failed = True
+
+        # 4b. Repeatable stress: many identical requests in one process, drafting off/on alternated
+        if a.repeat_n > 0:
+            print(f"=== 4b. Repeatable stress ({a.repeat_n} identical chat requests, one --repeatable --mtp process) ===", flush=True)
+            st_cmds = [fmt_gen(p_chat, "spec=1" if i % 2 else "spec=0") for i in range(a.repeat_n)]
+            st, _ = run_serve_cmds(a.bin, base_args + ["--kv", "fp16", "--mtp", "--repeatable"], st_cmds, 900.0)
+            groups: dict[str, list[int]] = {}
+            for i, r in enumerate(st):
+                groups.setdefault(r["hash"], []).append(i)
+            ok_st = len(st) == a.repeat_n and len(groups) == 1
+            desc = "; ".join(f"{h} x{len(v)} at {v[:6]}" for h, v in groups.items())
+            print(f"  chat      {len(groups)} distinct: {desc}  {'PASS' if ok_st else 'FAIL'}", flush=True)
+            if not ok_st:
+                failed = True
 
         # 5. Lane-parity placement invariance (0 GiB vs 10 GiB VRAM experts, same GPU set)
         if not a.quick:

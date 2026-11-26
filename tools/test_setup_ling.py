@@ -24,6 +24,12 @@ import maya_quants as Q  # noqa: E402
 S_NAME = "Ling-3.2-air-Maya-S-IQ2_XXS.gguf"
 S_BYTES = 36912008640
 S_SHA = "9fed99fc3beff053b96f8ef1cc40bb1b1cf926e201a121803d38f7927f60dd74"
+M_NAME = "Ling-3.2-air-Maya-M-IQ2_S.gguf"
+M_BYTES = 45971705280
+M_SHA = "1b43c9956d6ac3706744b0f043113a9b4d9269d51f77a56fb506d1332c9f4a88"
+V_NAME = "Ling-3.2-air-mmproj-BF16.gguf"
+V_BYTES = 869332480
+V_SHA = "4a6c6063070714617b62093baba9dfb040e4bee1f9019be6c81b6a16880117bb"
 
 
 def args(**kw):
@@ -35,12 +41,12 @@ def args(**kw):
     return SimpleNamespace(**base)
 
 
-def manifest(revision="", m_files=None):
-    """The table as it is, with another commit (a published one) or files for a size not made yet."""
+def manifest(revision="", l_files=None):
+    """The table as it is, with another commit (a published one) or files for a size not uploaded yet."""
     man = json.loads(maya.LING_MANIFEST.read_text(encoding="utf-8"))
     man["revision"] = revision
-    if m_files is not None:
-        man["quants"]["Ling-3.2-air-Maya-M"]["files"] = m_files
+    if l_files is not None:
+        man["quants"]["Ling-3.2-air-Maya-L"]["files"] = l_files
     return man
 
 
@@ -97,12 +103,14 @@ class Names(unittest.TestCase):
         a = args(model="ling-3.2-air-maya-s")
         self.assertIsNone(maya.model_option(a))
         self.assertEqual((a.model, a.ling_quant), (maya.LING, "maya-s"))
-        for size in ("ling-3.2-air-maya-m", "ling-3.2-air-maya-l"):   # (in the table, no files: said, not set up)
-            said = maya.model_option(args(model=size))
-            self.assertIn("is not available yet", said)
-            self.assertIn("ling-3.2-air-maya-s", said)
+        a = args(model="ling-3.2-air-maya-m")
+        self.assertIsNone(maya.model_option(a))
+        self.assertEqual((a.model, a.ling_quant), (maya.LING, "maya-m"))
+        said = maya.model_option(args(model="ling-3.2-air-maya-l"))   # (in the table, no files: said, not set up)
+        self.assertIn("is not available yet", said)
+        self.assertIn("ling-3.2-air-maya-s", said)
         self.assertIn("ling-3.2-air-maya-s", maya.named_quants())
-        self.assertNotIn("ling-3.2-air-maya-m", maya.named_quants())
+        self.assertIn("ling-3.2-air-maya-m", maya.named_quants())
         self.assertNotIn("ling-3.2-air-maya-l", maya.named_quants())
         # (the other models' ids: all of them, in their order)
         self.assertEqual([i for i in maya.named_quants() if not i.startswith("ling-")],
@@ -116,7 +124,9 @@ class Table(unittest.TestCase):
                          ("Ling-3.2-air", "MIT", "peasantsmith/Ling-3.2-air-Maya-GGUF"))
         self.assertEqual(list(m["quants"]), ["Ling-3.2-air-Maya-S", "Ling-3.2-air-Maya-M", "Ling-3.2-air-Maya-L"])
         self.assertEqual(m["quants"]["Ling-3.2-air-Maya-S"]["files"], {S_NAME: [S_BYTES, S_SHA]})
-        for q in ("Ling-3.2-air-Maya-M", "Ling-3.2-air-Maya-L"):   # (not made yet: no invented size or hash)
+        self.assertEqual(m["quants"]["Ling-3.2-air-Maya-M"], {"about": "IQ2_S", "files": {M_NAME: [M_BYTES, M_SHA]}})
+        self.assertRegex(m["revision"], r"^[0-9a-f]{40}$")   # (the Hub repo's commit that has S, M and vision/)
+        for q in ("Ling-3.2-air-Maya-L",):             # (not uploaded yet: no invented size or hash)
             self.assertEqual(m["quants"][q]["files"], {})
             self.assertNotIn("memory_gb", m["quants"][q])
         for q, spec in m["quants"].items():            # (a file's name carries the model, the size and its quant type)
@@ -124,7 +134,16 @@ class Table(unittest.TestCase):
                 self.assertRegex(name, r"^" + q + r"-[A-Z0-9_]+(-\d{5}-of-\d{5})?\.gguf$")
                 self.assertRegex(sha, r"^[0-9a-f]{64}$")
                 self.assertGreater(size, 1 << 30)
-        self.assertEqual(LINGF.listed(), ["Ling-3.2-air-Maya-S"])
+        self.assertEqual(LINGF.listed(), ["Ling-3.2-air-Maya-S", "Ling-3.2-air-Maya-M"])
+
+    def test_vision_pinned(self):
+        """The pictures: the mmproj from Maya's own repo (vision/ at the table's commit), by size and sha256."""
+        m = maya.ling_vision_model()
+        rev = LINGF.download_manifest()["revision"]
+        self.assertEqual((m["repo"], m["revision"], m["folder"]), ("peasantsmith/Ling-3.2-air-Maya-GGUF", rev, "vision"))
+        self.assertEqual((m["files"], m["sha256"], m["format"]), ({V_NAME: V_BYTES}, {V_NAME: V_SHA}, "mmproj"))
+        self.assertEqual(maya.file_url(m, V_NAME),
+                         f"https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF/resolve/{rev}/vision/{V_NAME}")
 
     def test_offered_only_once_pinned(self):
         """A size is downloadable once the table names the commit that has its files; until then it is set up from a
@@ -132,31 +151,34 @@ class Table(unittest.TestCase):
         if not LINGF.download_manifest().get("revision"):
             self.assertFalse(maya.ling_published("maya-s"))
         self.assertTrue(maya.ling_listed("maya-s"))
-        for k in ("maya-m", "maya-l", "maya-xs", None):
+        self.assertTrue(maya.ling_listed("maya-m"))
+        for k in ("maya-l", "maya-xs", None):
             self.assertFalse(maya.ling_listed(k))
             self.assertFalse(maya.ling_published(k))
         p1, p2 = with_manifest(manifest("0" * 40))
         with p1, p2:
             self.assertTrue(maya.ling_published("maya-s"))
-            self.assertFalse(maya.ling_published("maya-m"))
+            self.assertTrue(maya.ling_published("maya-m"))
+            self.assertFalse(maya.ling_published("maya-l"))
             e = maya.ling_entry("maya-s")
             self.assertEqual((e["repo"], e["revision"], e["files"], e["sha256"], e["gguf"]),
                              ("peasantsmith/Ling-3.2-air-Maya-GGUF", "0" * 40, {S_NAME: S_BYTES}, {S_NAME: S_SHA}, S_NAME))
             self.assertAlmostEqual(e["download_gb"], 36.91, places=2)
             self.assertEqual(maya.hf_url(e["repo"], e["revision"], e["folder"], S_NAME),
                              f"https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF/resolve/{'0' * 40}/{S_NAME}")
-            self.assertIn("Ling-3.2-air-Maya-S (37 GB)", maya.ling_about())
+            self.assertIn("Ling-3.2-air-Maya-S (37 GB), Ling-3.2-air-Maya-M (46 GB)", maya.ling_about())
 
     def test_sizes_from_the_files(self):
         """The planner sizes a listed size by its file, a GGUF of the user's own by the file on the disk; a size with
         no file has no figure of its own."""
         s = LINGF.quant_spec("Ling-3.2-air-Maya-S")
         self.assertAlmostEqual(s["experts_gib"], S_BYTES / LINGF.GIB - LINGF.DENSE_GIB, places=1)
-        self.assertEqual(LINGF.quant_spec("Ling-3.2-air-Maya-M"), LINGF.quant_spec(None))
+        m = LINGF.quant_spec("Ling-3.2-air-Maya-M")
+        self.assertAlmostEqual(m["experts_gib"], M_BYTES / LINGF.GIB - LINGF.DENSE_GIB, places=1)
+        self.assertEqual(LINGF.quant_spec("Ling-3.2-air-Maya-L"), LINGF.quant_spec(None))
         self.assertAlmostEqual(LINGF.quant_spec("local", gguf_gib=50.0)["experts_gib"], 50.0 - LINGF.DENSE_GIB, places=1)
         # (a hint never names a size that does not exist)
         hint = LINGF.smaller_quant_hint([8.0], 32.0, 32768, "f16", "local", gguf_gib=60.0)
-        self.assertNotIn("Maya-M", hint)
         self.assertNotIn("Maya-L", hint)
 
 
@@ -186,7 +208,8 @@ class Picker(unittest.TestCase):
             for part in ("inclusionAI's Ling-3.2-air", "Ling-3.2-air-Maya-S (37 GB)", "Linux only", "thinking on or off",
                          "one answer at a time"):
                 self.assertIn(part, got["about"]["Ling-3.2-air"])
-            self.assertNotIn("Maya-M", got["about"]["Ling-3.2-air"])
+            self.assertIn("Ling-3.2-air-Maya-M (46 GB)", got["about"]["Ling-3.2-air"])
+            self.assertNotIn("Maya-L", got["about"]["Ling-3.2-air"])
             got, fam = self.rows({"exe": "/b/maya-ling", "installer": {"family": "ling"}})
             self.assertEqual((got["rows"][got["default"]], fam), ("Ling-3.2-air", "ling"))
 
@@ -210,8 +233,11 @@ class Picker(unittest.TestCase):
         own = {"exe": "/b/maya-ling", "installer": {"family": "ling", "quant": "local", "model_dir": "/x"}}
         self.assertIsNone(maya.ling_choose_quant(args(), pc, own))
         p1, p2 = with_manifest(manifest("0" * 40))
-        with p1, p2, mock.patch.object(maya, "mem_gb", lambda: (128.0, 100.0)):
-            self.assertEqual(maya.ling_choose_quant(args(), pc, {}), "maya-s")
+        with p1, p2, mock.patch.object(maya, "mem_gb", lambda: (128.0, 100.0)):   # (the largest that fits: Maya-M)
+            self.assertEqual(maya.ling_choose_quant(args(), pc, {}), "maya-m")
+        small = {"gpus": [{"index": 0, "vram_gb": 8.0}]}
+        with p1, p2, mock.patch.object(maya, "mem_gb", lambda: (36.0, 30.0)):     # (room for Maya-S only: Maya-S)
+            self.assertEqual(maya.ling_choose_quant(args(), small, {}), "maya-s")
         p1, p2 = with_manifest(manifest(""))
         with p1, p2, self.assertRaises(SystemExit):    # (nothing downloadable and nothing named: said, with the way)
             maya.ling_choose_quant(args(), pc, {})
@@ -283,6 +309,81 @@ class Steps(unittest.TestCase):
         got = maya.ling_model_step(args(), d, None)
         self.assertEqual(got.name, "Ling-3.2-air-Q8_0-00001-of-00002.gguf")
         self.assertAlmostEqual(maya.ling_gguf_gib(got) * LINGF.GIB, 96.0)   # (both shards, not the vision file)
+
+    def small_vision(self):
+        """The table with a small file in the vision file's place: its real size and sha256."""
+        body = b"GGUF" + b"\3" * 124
+        man = manifest("0" * 40)
+        man["vision"]["files"] = {V_NAME: [len(body), hashlib.sha256(body).hexdigest()]}
+        return man, body
+
+    def test_vision_fresh_downloads_from_our_repo(self):
+        """Nothing on the disk: the vision file from Maya's repo, the pinned commit, folder vision/, beside the model;
+        sha256-checked; --mmproj names it.  A declined download: text only."""
+        d = self.root / "m"
+        d.mkdir()
+        (d / S_NAME).write_bytes(b"GGUF")
+        man, body = self.small_vision()
+        seen = []
+
+        def offer(a, label, folder, files, m):
+            seen.append((m["repo"], m["revision"], m["folder"], folder, [f.name for f in files]))
+            files[0].write_bytes(body)
+            return True
+        p1, p2 = with_manifest(man)
+        with p1, p2, mock.patch.object(maya, "offer_download", offer):
+            self.assertEqual(maya.ling_vision_step(args(), d), d / V_NAME)
+            self.assertEqual(seen, [("peasantsmith/Ling-3.2-air-Maya-GGUF", man["vision"]["revision"], "vision", d,
+                                     [V_NAME])])
+            self.assertEqual(maya.ling_vision_step(args(), d), d / V_NAME)   # (there now: not downloaded again)
+            self.assertEqual(len(seen), 1)
+        (d / V_NAME).unlink()
+        with p1, p2, mock.patch.object(maya, "offer_download", lambda *a: False):
+            self.assertIsNone(maya.ling_vision_step(args(), d))
+        self.assertTrue(any("not downloaded" in x for x in self.said))
+
+    def test_vision_off_with_no_vision(self):
+        d = self.root / "m"
+        d.mkdir()
+        (d / V_NAME).write_bytes(b"GGUF")
+        man, _ = self.small_vision()
+        p1, p2 = with_manifest(man)
+        with p1, p2, mock.patch.object(maya, "offer_download") as offer:
+            self.assertIsNone(maya.ling_vision_step(args(no_vision=True), d))
+            offer.assert_not_called()
+
+    def test_vision_file_already_beside_the_model_is_kept(self):
+        """An mmproj beside the model under another name (an earlier one, or the user's own): used as it is, nothing
+        downloaded.  The table naming no vision file: the one beside the model, else text only."""
+        d = self.root / "m"
+        d.mkdir()
+        (d / S_NAME).write_bytes(b"GGUF")
+        man, _ = self.small_vision()
+        p1, p2 = with_manifest(man)
+        with p1, p2, mock.patch.object(maya, "offer_download") as offer:
+            (d / "mmproj-BF16.gguf").write_bytes(b"GGUF mine")
+            self.assertEqual(maya.ling_vision_step(args(), d), d / "mmproj-BF16.gguf")
+            offer.assert_not_called()
+        none = manifest("0" * 40)
+        none["vision"]["files"] = {}
+        p1, p2 = with_manifest(none)
+        with p1, p2, mock.patch.object(maya, "offer_download") as offer:
+            self.assertEqual(maya.ling_vision_step(args(), d), d / "mmproj-BF16.gguf")
+            (d / "mmproj-BF16.gguf").unlink()
+            self.assertIsNone(maya.ling_vision_step(args(), d))
+            offer.assert_not_called()
+
+    def test_vision_sha256_checked(self):
+        """The table's file whole but with other bytes: removed, and the setup stops (the next run downloads it)."""
+        d = self.root / "m"
+        d.mkdir()
+        man, body = self.small_vision()
+        (d / V_NAME).write_bytes(b"GGUF" + b"\4" * 124)   # (the same size, other bytes)
+        p1, p2 = with_manifest(man)
+        with p1, p2, mock.patch.object(maya, "offer_download") as offer, self.assertRaises(SystemExit):
+            maya.ling_vision_step(args(), d)
+        offer.assert_not_called()
+        self.assertFalse((d / V_NAME).exists())
 
     def test_tokenizer_with_the_models_own_template(self):
         d = self.root / "m"
@@ -438,7 +539,8 @@ class Catalog(unittest.TestCase):
         after = self.catalog(manifest("0" * 40))
         ling = [r for r in after if r["family"] == "ling"]
         self.assertEqual([(r["id"], r["name"], r["group"], r["size_gb"]) for r in ling],
-                         [("ling-3.2-air-maya-s", "Ling-3.2-air · Maya-S", "maya", 36.9)])
+                         [("ling-3.2-air-maya-s", "Ling-3.2-air · Maya-S", "maya", 36.9),
+                          ("ling-3.2-air-maya-m", "Ling-3.2-air · Maya-M", "maya", 46.0)])
         self.assertEqual([r for r in after if r["family"] != "ling"], before)
         for platform, backend in (("win32", "cuda"), ("linux", "hip"), ("darwin", "metal")):
             rows = self.catalog(manifest("0" * 40), platform, backend)

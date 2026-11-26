@@ -12105,7 +12105,8 @@ def ling_about() -> str:
             "; NVIDIA from V100 / RTX 20 on, Linux only; one GPU or several (the layers split across "
             "them), the experts that do not fit in VRAM computed from RAM, the rest read from the SSD; tool calls, "
             "thinking on or off, up to a 256K context, MTP drafting where the file has the model's draft block "
-            "(measured once on this PC), pictures where its vision file is beside the model; one answer at a time.")
+            "(measured once on this PC), pictures (its vision file, 0.9 GB, downloaded with the model; not with "
+            "--no-vision); one answer at a time.")
 
 
 def ling_choose_quant(a, pc: dict, prev: dict) -> str | None:
@@ -12317,7 +12318,7 @@ def set_up_ling(a, prev: dict) -> Path | None:
     older than V100 / RTX 20 or under 8 GB, no AVX2), the size (--model's, the one before, else the largest that fits
     this PC), the context and the fit (tools/ling_fit.py, the planner the Models page reads too), the engine
     (build/maya-ling), the file (pinned and sha256-checked for a Maya size), the tokenizer with the model's own chat
-    template, the pictures (its vision file where it is beside the model), the config.  What is faster on a PC is the
+    template, the pictures (its vision file, downloaded beside the model), the config.  What is faster on a PC is the
     engine's own to measure at its first start and keep in its calibration file (--cal-file): the expert split over
     VRAM, CPU and SSD, and whether drafting pays (--drafting auto)."""
     if config_family(prev) != "ling":                  # (another model's config: nothing of it is Ling's)
@@ -12393,19 +12394,58 @@ def set_up_ling(a, prev: dict) -> Path | None:
     home = gguf.parent if gguf.parent.is_dir() else d
     tok = ling_tokenizer_step(a, home, gguf)           # 6
 
-    step(7, "images (the vision file)")                # 7
-    _, mmproj = ling_find_gguf_and_mmproj(home)
-    if getattr(a, "no_vision", False):
-        ok("skipped (--no-vision): the model reads text only")
-        mmproj = None
-    elif mmproj is not None:
-        ok(f"pictures: ON - {mmproj.name} ({mmproj.stat().st_size / 1e9:.1f} GB on the SSD); no VRAM kept for it, "
-           "the engine borrows room only while a picture is read")
-    else:
-        ok("pictures: off - no vision file (an mmproj .gguf of Ling-3.2-air) beside the model; the setup does not "
-           "download one yet. The model reads text only")
+    mmproj = ling_vision_step(a, home)                 # 7
     return write_config_ling(a, pc, meta, gguf, tok, ctx, kv, drafting, models_root, home, mmproj, quant_name, prev,
                              key)
+
+
+def ling_vision_model() -> dict | None:
+    """The model's vision file as offer_download's form (tools/ling/download.json's "vision": the mmproj of
+    Ling-3.2-air's tower from Maya's own repo, by size and sha256), or None when the table names none."""
+    man = read_json(LING_MANIFEST).get("vision") or {}
+    if not man.get("files") or not man.get("repo") or not man.get("revision"):
+        return None
+    return {"about": f"{LING}'s vision file (it lets the model read pictures): the mmproj of the model's own tower "
+                     "(BF16)", "format": "mmproj",
+            "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ling_vision_step(a, d: Path) -> Path | None:
+    """Step 7: the mmproj maya-ling reads (--mmproj), beside the model in d, or None (text only, said why).  The
+    table's file: downloaded when it is not there (a partly downloaded one is finished), then sha256-checked.  An
+    mmproj already beside the model under another name (an earlier one, or the user's own) is used as it is.  None
+    with --no-vision or a declined download.  No VRAM is kept for it: the engine borrows room only while a picture is
+    read."""
+    step(7, "images (the vision file)")
+    if getattr(a, "no_vision", False):
+        ok("skipped (--no-vision): the model reads text only")
+        return None
+    m = ling_vision_model()
+    files = [d / n for n in m["files"]] if m else []
+    _, here = ling_find_gguf_and_mmproj(d)
+    if here is not None and here not in files:         # (another mmproj beside the model: kept, not downloaded)
+        f = here
+    elif m is None:
+        if here is None:
+            ok("pictures: off - no vision file (an mmproj .gguf of Ling-3.2-air) beside the model, and "
+               f"{LING_MANIFEST.name} names none to download. The model reads text only")
+            return None
+        f = here
+    else:
+        fetch = [x for x in files if file_incomplete(m, x)]
+        if fetch and not offer_download(a, "the vision file", d, fetch, m):
+            warn(f"the vision file was not downloaded: the model reads text only ({ME} --setup asks again)")
+            return None
+        for x in files:                                # (offer_download checked the ones it fetched; these too)
+            if not sha256_checked(x, m["sha256"][x.name]):
+                x.unlink(missing_ok=True)              # else the next run finds it complete and fails here again
+                fail(f"{x}: the sha256 does not match the published one (the file was removed)", "run the setup again")
+        f = files[0]
+    ok(f"pictures: ON - {f.name} ({f.stat().st_size / 1e9:.1f} GB on the SSD); no VRAM kept for it, the engine "
+       "borrows room only while a picture is read")
+    return f
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:

@@ -32,10 +32,11 @@ alesha-pro contributed (PR #1224).
 | Size | Setup id | File |
 | --- | --- | --- |
 | Ling-3.2-air · Maya-S | `ling-3.2-air-maya-s` | `Ling-3.2-air-Maya-S-IQ2_XXS.gguf`, 36.9 GB |
+| Ling-3.2-air · Maya-M | `ling-3.2-air-maya-m` | `Ling-3.2-air-Maya-M-IQ2_S.gguf`, 46.0 GB |
 
 The file is pinned in `tools/ling/download.json` by size and sha256, and checked after the download and when a copy
-is already in the folder (`--model-dir <folder>` names a folder that has it). Larger sizes are listed there without
-files; the setup offers a size once its files are.
+is already in the folder (`--model-dir <folder>` names a folder that has it). A larger size is listed there without
+files until it is uploaded; the setup offers a size once its files are.
 
 Any other GGUF of the model (one file, or a split set by its first shard):
 
@@ -85,9 +86,10 @@ Nothing here is a fixed number for one machine: the setup reads the PC, and the 
 
 ## 6. Pictures
 
-With the model's vision file (an `mmproj` GGUF of Ling-3.2-air) beside the model, the setup turns pictures on. No
-VRAM is kept for it: the engine borrows room only while a picture is read. The setup does not download a vision file
-yet; `--no-vision` leaves pictures off.
+Pictures work: the setup downloads the model's vision file (`Ling-3.2-air-mmproj-BF16.gguf`, 0.9 GB, from Maya's
+repo, pinned by size and sha256) beside the model and turns pictures on. An `mmproj` GGUF of Ling-3.2-air already
+beside the model is used as it is. No VRAM is kept for it: the engine borrows room only while a picture is read.
+`--no-vision` leaves pictures off (nothing is downloaded).
 
 ## 7. Restore points on disk
 
@@ -99,7 +101,7 @@ Off by default. `--restore-dir <folder>` in the config's arguments turns them on
 - One answer at a time: no `--parallel`.
 - No tensor parallel.
 - Windows, AMD (Linux and Windows) and Mac.
-- A download for the vision file, and for sizes above Maya-S.
+- Maya-L (not uploaded yet).
 - The same answer on one GPU and on several holds with `--repeatable` only; a normal run can differ in the last
   digits between layouts.
 
