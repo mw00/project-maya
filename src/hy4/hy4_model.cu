@@ -463,6 +463,8 @@ struct Gpu {
     cublasHandle_t blas = nullptr;
     uint16_t *xh16 = nullptr, *wband = nullptr, *sh16 = nullptr;
     size_t wband_n = 0;   // (values)
+    // (HY4_ATTN_SUB: a layer's dense matrices decoded to F16 once for its sub-chunks - Impl::wc_get)
+    uint16_t* wcache = nullptr;
     int *bounds = nullptr, *stok = nullptr, *srow = nullptr;
     float* sy = nullptr;
     float* cpo = nullptr;   // (the CPU lane's sums, [Tc][n_lat])
@@ -1700,6 +1702,33 @@ struct Model::Impl {
     // indexed layer's up to dense_max (an 8-bit cache dequantized there; F16's read in place but where a ring wraps)
     size_t deq_rows() const { return dense_kbuf_rows((size_t) g.n_swa, (size_t) ta(), (size_t) dense_max, kSub); }
     static constexpr size_t kBand = 32u << 20;   // (values: a dense matrix decoded to F16 this much at a time)
+    // HY4_ATTN_SUB: a layer's attention matrices (Hy4-flash: ~70 M values a layer) decoded to F16 once for all its
+    // sub-chunks - the sub-chunks of a chunk run a layer at a time, so each sub-chunk's GEMMs would decode them again
+    // (a V100, a 16K prompt in sub-chunks of 1024: 0.9 s of f16_rows).  HY4_WCACHE=0: decoded a GEMM at a time
+    static constexpr size_t kWCache = 80u << 20;   // (values)
+    bool wc_on = false;
+    size_t wc_used = 0;
+    std::vector<std::pair<const uint8_t*, size_t>> wc_map;   // (a matrix's bytes -> its F16 rows' offset)
+    void wc_reset(bool on) {
+        static const bool off = std::getenv("HY4_WCACHE") && std::getenv("HY4_WCACHE")[0] == '0';
+        wc_on = on && !off;
+        wc_used = 0;
+        wc_map.clear();
+    }
+    // matrix w (rows of k values, n of them) as F16 rows in the cache - decoded at its first use while the cache is on;
+    // nullptr: off, or no room (the caller decodes it as before)
+    const uint16_t* wc_get(Gpu& gp, int type, const uint8_t* w, size_t ld, int k, int n) {
+        if (!wc_on || gp.wcache == nullptr) return nullptr;
+        for (const auto& [p, off] : wc_map)
+            if (p == w) return gp.wcache + off;
+        const size_t need = (size_t) k * n;
+        if (wc_used + need > kWCache) return nullptr;
+        (void) ld;
+        if (!iq::f16_rows(type, w, k, n, gp.wcache + wc_used, k, gp.s)) return nullptr;
+        wc_map.push_back({w, wc_used});
+        wc_used += (need + 127) / 128 * 128;
+        return gp.wcache + wc_map.back().second;
+    }
     // (H, ff: the most heads and the widest dense / shared FFN a layer gives the GPU - a tensor-parallel member's share)
     size_t scratch_floats(size_t& f16, size_t& ints, size_t H = 64, size_t ff = 0) const {
         if (ff == 0) ff = (size_t) g.n_ff;
@@ -1716,7 +1745,7 @@ struct Model::Impl {
         f += 16 * T * lat + W * E + (size_t) W * g.n_vocab;                                     // (the sets' y, head)
         f += W * E / 32;                                                                        // (the side stream's)
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
-        f16 = std::max(A * qk, T * std::max({E, lat, ffe})) + kBand + 16 * T * ffe;
+        f16 = std::max(A * qk, T * std::max({E, lat, ffe})) + kBand + 16 * T * ffe + (A < T ? kWCache : 0);
         ints = T * 16 + 3 * T + A * maxk + A + 2 * 16 * T + 1024 + 4 * 16 * W + W * qk / 4 + 2 * W * lat / 4 +
                16 * W * ffe / 4 + A * egc / 4 + W * E / 4;
         return f;
@@ -3668,7 +3697,7 @@ struct Model::Impl {
                (eg_scale == nullptr || take(gp.eg_sc, A * (size_t) std::max(1, pk.eg.cols()))) &&
                take(gp.eg_kvo, A * (hc + 1) * E) && take(gp.hcur, T * E) &&
                take(gp.xh16, std::max(A * qk, T * std::max({E, lat, ffe}))) && take(gp.wband, kBand) &&
-               take(gp.sh16, 16 * T * ffe) &&
+               take(gp.sh16, 16 * T * ffe) && (A >= T || take(gp.wcache, kWCache)) &&
                take(gp.sy, 16 * T * lat) && take(gp.cpo, T * lat) && take(gp.bounds, 1025) && take(gp.stok, 16 * T) &&
                take(gp.srow, 16 * T) && take(gp.sS, att) && take(gp.sP, att) &&
                take(gp.dmask, (size_t) kSub * dense_max) &&
@@ -4740,6 +4769,10 @@ struct Model::Impl {
         }
         if (M.type == kBF16 || M.type == kF16 || !iq::mv_supported(M.type)) return false;
         k::to_f16(x, ldx, T, M.k, gp.xh16, (size_t) M.k, gp.s);
+        if (const uint16_t* wc = wc_get(gp, M.type, M.w, M.ld, M.k, M.n))
+            return cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &alpha, wc, CUDA_R_16F, M.k, gp.xh16,
+                                CUDA_R_16F, M.k, &beta, y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
         const int band = (int) std::max<size_t>(1, gp.wband_n / (size_t) M.k);
         for (int r0 = 0; r0 < M.n; r0 += band) {
             const int nb = std::min(band, M.n - r0);
@@ -4758,17 +4791,19 @@ struct Model::Impl {
         if (T > W) {   // (one strided batched GEMM over the heads: every head's matrix decoded to F16 at once)
             const size_t per = (size_t) M.n * M.k;
             if (per * H > gp.wband_n) return false;
-            if (!iq::f16_rows(M.type, M.w, M.k, M.n * H, gp.wband, M.k, gp.s)) return false;
+            const uint16_t* wh = wc_get(gp, M.type, M.w, M.ld, M.k, M.n * H);
+            if (wh == nullptr && !iq::f16_rows(M.type, M.w, M.k, M.n * H, gp.wband, M.k, gp.s)) return false;
+            if (wh == nullptr) wh = gp.wband;
             k::to_f16(x, ldt, T, (int) (ldh * (H - 1) + M.k), gp.xh16, ldt, gp.s);
             const float one = 1.0f, zero = 0.0f;
             if (lt_on) {   // (AMD: a head a product - false at the first head: the BLAS's batched GEMM for them all)
                 int h = 0;
-                while (h < H && lt::gemm(gp.s, gp.wband + (size_t) h * per, M.n, M.k, gp.xh16 + (size_t) h * ldh, (int) ldt,
+                while (h < H && lt::gemm(gp.s, wh + (size_t) h * per, M.n, M.k, gp.xh16 + (size_t) h * ldh, (int) ldt,
                                          T, y + (size_t) h * ldyh, (int) ldyt))
                     ++h;
                 if (h == H) return true;
             }
-            return cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &one, gp.wband,
+            return cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &one, wh,
                                               CUDA_R_16F, M.k, (long long) per, gp.xh16, CUDA_R_16F, (int) ldt,
                                               (long long) ldh, &zero, y, CUDA_R_32F, (int) ldyt, (long long) ldyh, H,
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
@@ -8263,6 +8298,7 @@ struct Model::Impl {
             };
             const int A = T > W ? ta() : T;
             if (A < T) {   // (HY4_ATTN_SUB: the attention's rows a sub-chunk at a time - a view of the chunk's)
+                wc_reset(true);   // (the layer's matrices decoded once for its sub-chunks)
                 for (int r0 = 0; r0 < T; r0 += A) {
                     const int ts = std::min(A, T - r0);
                     Gpu gs = gp;
@@ -8274,6 +8310,7 @@ struct Model::Impl {
                     gp.eg_armed = gs.eg_armed;
                     gp.pf_early_il = gs.pf_early_il;
                 }
+                wc_reset(false);
                 lap(l.swa ? "attention, window" : "attention, indexed");
                 if (!l.dense && !ffn(l, gp, T, err)) return false;
                 lap(l.dense ? "ffn, dense" : "ffn, experts");
