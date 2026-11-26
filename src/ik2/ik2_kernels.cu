@@ -7400,8 +7400,14 @@ static void need_class(int cls, const char* what) {
     std::fprintf(stderr, "ik2::k::%s: not on this GPU (sm_%d class; the kernel needs sm_%d)\n", what, arch_class(), cls);
     std::abort();
 }
+static int g_attn_rdna = 0;   // IK2_ATTN_RDNA (AMD's RDNA 3 / 4): 0 attn_decode_mma_kernel (the default), 1 attn_decode_rdna_kernel
+void attn_decode_rdna_set(int mode) { g_attn_rdna = mode; }
+int attn_decode_rdna_mode() { return g_attn_rdna; }
 #ifdef MAYA_USE_HIP
 #include "ik2_rdna.inc"   // (AMD: the matrix-core kernels)
+bool attn_decode_rdna_available() { return rdna_wmma_gpu(); }
+#else
+bool attn_decode_rdna_available() { return false; }
 #endif
 
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
@@ -8631,6 +8637,10 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
                 q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
                 ml_part, blk0);
 #if defined(MAYA_USE_HIP)
+        else if (sizeof(KV) == 1 && attn_decode_rdna_on(H, Hkv))
+            attn_decode_rdna_launch(dim3((unsigned) Hkv, (unsigned) nblk), s, q16, (const uint8_t*) kc,
+                                    (const uint8_t*) vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4,
+                                    extent, window, n_split, o_part, ml_part, blk0, 0, 0, 0);
         else if (sizeof(KV) == 1 && g_mma_s8)
             attn_decode_mma_kernel<KV, sizeof(KV) == 1><<<dim3((unsigned) Hkv, (unsigned) nblk), kWaNW * 32, 0, s>>>(
                 q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
@@ -8643,13 +8653,18 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         check("attn_decode_mma");
     }
     if (phase == 1) return;
+#if defined(MAYA_USE_HIP)
+    const bool s8 = sizeof(KV) == 1 && (g_mma_s8 || attn_decode_rdna_on(H, Hkv));   // (the RDNA kernel: s8 always)
+#else
+    const bool s8 = sizeof(KV) == 1 && g_mma_s8;
+#endif
     if (arch_class() == 70)
         attn_decode_v70_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
             o_part, ml_part, n_split, H, sink, v_inv * (sizeof(KV) == 1 ? 256.0f : 1.0f), pos, qpos, window, gate, out,
             out16);   // (FP8: its V as FP16 times 2^-8)
     else
     attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
-        o_part, ml_part, n_split, H, sink, v_inv * (sizeof(KV) == 1 && g_mma_s8 ? 256.0f : 1.0f), pos, qpos, window,
+        o_part, ml_part, n_split, H, sink, v_inv * (s8 ? 256.0f : 1.0f), pos, qpos, window,
         gate, out, out16);   // (S8: its V as FP16 times 2^-8)
     check("attn_decode_mma (combine)");
 }
@@ -8687,6 +8702,18 @@ static bool attn_decode_mma_toks_impl(const uint16_t* q16, int q_ld, const float
     float* o_part = scratch;
     float2* ml_part = (float2*) (o_part + (size_t) n_split * kWaNW * H * kFaD);
     const bool rel4 = d_rel % 4 == 0 && (((uintptr_t) r | (uintptr_t) proj) & 15) == 0 && r_ld % 4 == 0;
+#if defined(MAYA_USE_HIP)
+    if (sizeof(KV) == 1 && attn_decode_rdna_on(H, Hkv)) {   // (the RDNA kernel: each token its one-token blocks)
+        attn_decode_rdna_launch(dim3((unsigned) Hkv, (unsigned) n_split, (unsigned) T), s, q16, (const uint8_t*) kc,
+                                (const uint8_t*) vc, kv_cap, H, Hkv, pos, 0, qk_scale, r, proj, d_rel, rel4, extent,
+                                window, n_split, o_part, ml_part, 0, q_ld, r_ld, part);
+        attn_decode_mma_combine_kernel<<<dim3((unsigned) H, 1, (unsigned) T), kFaD,
+                                         (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
+            o_part, ml_part, n_split, H, sink, v_inv * 256.0f, pos, 0, window, gate, out, out16, part, gate_ld);
+        check("attn_decode_rdna_toks (combine)");
+        return true;
+    }
+#endif
     // A layer without a sliding window: the tokens' queries on a key's rows read once, where their warps have the
     // same steps (decided on the device from the position: a replayed graph) - and the tokens' own blocks where not,
     // which do nothing otherwise.  IK2_ATTN_SHARE=0: the tokens' own blocks always.
