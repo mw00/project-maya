@@ -1342,6 +1342,76 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         }
 }
 
+// mv_kernel with R rows a warp (Q6_K, Q8_0): each lane takes sub-blocks kb = lane, lane + 32, ... of R rows at once,
+// so the activations of a sub-block (its 32 int8 values and scale, every column's) are loaded once for the R rows,
+// not once a row.  mv_kernel's GEMV of a few columns is bound by those loads, not by the weights' bytes: on a V100 its
+// time grows with the columns (Hy4's attn_gate, Q6_K 3072 -> 8192: 49 us for one, 99 us for four - 210 GB/s of
+// weights), and a token window of the drafts is 2-4 columns, a draft pass more.  Each row's sums - its lanes'
+// sub-blocks, decode (WIDE: decode_q8_wide), sub_dot and fmaf order, then warp_sum - are mv_kernel's: the same bits.
+// MAYA_IQ_MV_ROWS=1: mv_kernel, as before; 2 / 4: rows a warp (default: 2 for two columns or more where the rows give
+// every SM 8 warps, else mv_kernel)
+template <int T, int NC, int R, bool WIDE = false>
+__global__ void __launch_bounds__(kThreads) mv_rows_kernel(const Jobs J) {
+    pdl_wait();
+    pdl_trigger();
+    const MvJob& b = J.j[blockIdx.y];
+    const int row0 = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (row0 >= b.n) return;
+    const int nr = min(R, b.n - row0);
+    const int nsb = b.k / 32;
+    float acc[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        int4 xa[NC], xb[NC];
+        float xd[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                xa[c] = xp[0];
+                xb[c] = xp[1];
+                xd[c] = b.xd[(size_t) c * nsb + kb];
+            }
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            if (r < nr) {
+                Sub s;
+                const uint8_t* w = b.w + (size_t) (row0 + r) * b.ld;
+                if constexpr (WIDE) decode_q8_wide(w, kb, s);
+                else decode<T>(w, kb, nullptr, s);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < b.ncol) acc[r][c] = fmaf(xd[c], sub_dot<T, kMinMV>(s, xa[c], xb[c]), acc[r][c]);
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (r < nr && c < b.ncol) {
+                const float v = warp_sum(acc[r][c]);
+                if (lane == 0) b.y[c * b.ycs + row0 + r] = b.alpha * v + (b.bias != nullptr ? b.bias[row0 + r] : 0.0f);
+            }
+}
+static int rows_a_warp(int max_n, int max_c) {
+    static const int env = std::getenv("MAYA_IQ_MV_ROWS") ? std::atoi(std::getenv("MAYA_IQ_MV_ROWS")) : 0;
+    if (env == 1 || env == 2 || env == 4) return env;
+    static const int sms = [] {
+        int dev = 0, n = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return 0;
+        }
+        return n;
+    }();
+    // (a V100, Hy4's attn_gate / attn_output / attn_q_b: 2 rows a warp 1.4-1.8x faster at 2-4 columns, the same at one,
+    //  4 rows slower than 2 - fewer warps to hide the loads with)
+    return max_c >= 2 && sms > 0 && max_n / 2 >= 8 * sms ? 2 : 1;
+}
+
 // mv_kernel for H jobs alike but for their offsets (a 3D matrix's heads: grid y = the head): head h's job is b0 with w,
 // xq, xd and y moved h strides - one launch for every head where mv's take kMaxJobs a launch.  A row's arithmetic is
 // mv_kernel's, line for line: the same bits.
@@ -2218,6 +2288,31 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
             if (max_k > 2048 && max_k <= 3072 && mv_reg_launch<3>(J, nj, max_c, s)) return;
         }
 #endif
+    if constexpr (T == kQ6_K || T == kQ8_0) {   // (R rows a warp: mv_rows_kernel - mv_kernel's columns, sums and order)
+        const int R = rows_a_warp(max_n, max_c);
+        const bool wd = T == kQ8_0 && wide;
+#define MR_(NC)                                                                                                         \
+    {                                                                                                                   \
+        const dim3 g2((unsigned) ((max_n + kWarps * R - 1) / (kWarps * R)), (unsigned) nj);                             \
+        if (R == 4) {                                                                                                   \
+            if (wd) pdl_launch(mv_rows_kernel<T, NC, 4, true>, g2, kThreads, 0, s, J);                                 \
+            else pdl_launch(mv_rows_kernel<T, NC, 4>, g2, kThreads, 0, s, J);                                          \
+        } else {                                                                                                        \
+            if (wd) pdl_launch(mv_rows_kernel<T, NC, 2, true>, g2, kThreads, 0, s, J);                                 \
+            else pdl_launch(mv_rows_kernel<T, NC, 2>, g2, kThreads, 0, s, J);                                          \
+        }                                                                                                               \
+        return;                                                                                                         \
+    }
+        if (R > 1) {
+            if (max_c <= 1) MR_(1)
+            if (max_c <= 2) MR_(2)
+            if (max_c <= 3) MR_(3)
+            if (max_c <= 4) MR_(4)
+            if (max_c <= 6 && mv56()) MR_(6)
+            if (max_c <= 8 && mv8()) MR_(8)
+        }
+#undef MR_
+    }
     if constexpr (T == kQ8_0)
         if (wide && mv56() && mv8()) {   // (every job's blocks readable in aligned words: mv's check)
             if (max_c <= 1) pdl_launch(mv_kernel<T, 1, true>, grid, kThreads, 0, s, J);
