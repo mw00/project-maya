@@ -89,6 +89,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -106,6 +107,8 @@
 #include "hy4_lane.hpp"
 #include "hy4_model.hpp"
 #include "hy4_pack.hpp"
+#include "hy4_slot_dir.hpp"
+#include "hy4_slots.hpp"
 #include "mm3_os.hpp"
 #include "mm3_sample.hpp"
 
@@ -452,7 +455,31 @@ struct Lines {
         q.pop_front();
         return true;
     }
+    // (SLOTS v2: the folder's idle and end work) a line within ms: 1 a line, 0 none yet, -1 the input's end
+    int next_for(std::string& out, int ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        if (!cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return !q.empty() || eof; })) return 0;
+        if (q.empty()) return -1;
+        out = std::move(q.front());
+        q.pop_front();
+        return 1;
+    }
 };
+
+// (SLOTS v2) SIGTERM / SIGINT with the folder on: a flag and the request's stop, nothing else in the handler
+// (both are lock-free atomics or a sig_atomic_t); the serve loop ends at its next look and writes what it holds
+volatile std::sig_atomic_t g_slot_term = 0;
+std::atomic<bool>* g_slot_stop = nullptr;
+std::atomic<int64_t> g_slot_term_ns{0};   // (the first signal's CLOCK_MONOTONIC time, ns: the end's deadline counts from it)
+extern "C" void slot_on_term(int) {
+#if !defined(_WIN32)
+    timespec ts{};
+    if (g_slot_term == 0 && clock_gettime(CLOCK_MONOTONIC, &ts) == 0)   // (async-signal-safe)
+        g_slot_term_ns.store((int64_t) ts.tv_sec * 1000000000LL + ts.tv_nsec);
+#endif
+    g_slot_term = 1;
+    if (g_slot_stop != nullptr) g_slot_stop->store(true);
+}
 
 bool parse_gen(const std::string& line, Req& r) {
     const bool geni = line.rfind("GENI ", 0) == 0;
@@ -732,7 +759,8 @@ struct Extra {
     }
 };
 
-int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need) {
+int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need,
+          const std::string& pack = std::string()) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
     std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
@@ -753,6 +781,196 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 std::printf("INFO vision=off\n");
                 break;
             }
+    // (SLOTS: MAYA_HY4_SLOT_KEEP=1 - a request that does not continue the conversation in the model first
+    //  parks that one in RAM (Model::conv_save), then takes back a parked conversation it continues (conv_load) where
+    //  that reuses more than the model's own state: hy4_slots.hpp's table and rule, ds4's slot_put / slot_take without
+    //  the folder.  Saved on a switch, not at each answer's end: one client pays nothing.  Unset: none of it runs and
+    //  nothing is printed)
+    std::string slot_warn;
+    const hy4::slots::Knobs sk = hy4::slots::knobs_from_env(&slot_warn);
+    bool slots_on = sk.on();
+    hy4::slots::Table slots(sk);
+    const hy4::slots::Geometry slot_geo{m.ring_rows(), m.ring_back()};
+    const auto slot_note = [](const std::string& msg) {
+        std::fprintf(stderr, "hy4 slots: %s\n", msg.c_str());
+        std::printf("NOTE sessions: %s\n", msg.c_str());
+        std::fflush(stdout);
+    };
+    const auto slot_gb = [](uint64_t b) {
+        char s[32];
+        std::snprintf(s, sizeof s, "%.2f GB", (double) b / 1073741824.0);
+        return std::string(s);
+    };
+    if (sk.keep) {
+        std::string why;
+        if (!slot_warn.empty()) slot_note(slot_warn);
+        if (!sk.on()) {
+            slot_note("conversations are not kept: MAYA_HY4_SLOT_CAP is 0");
+        } else if (!m.conv_ok(why)) {
+            slots_on = false;
+            slot_note("conversations are not kept on this start (" + why + "): a switch reads the prompt again, as before");
+        } else {
+            char b[320];
+            std::snprintf(b, sizeof b, "conversations kept in RAM on a switch: up to %d, %s, from %zu tokens, the rings' "
+                          "%s positions (MAYA_HY4_SLOT_KEEP)%s", sk.cap,
+                          sk.ram_bytes > 0 ? slot_gb(sk.ram_bytes).c_str() : "any size",
+                          sk.min, sk.ring > 0 ? ("newest " + std::to_string(sk.ring)).c_str() : "held",
+                          sk.verify ? "; each take read back and compared (MAYA_HY4_SLOT_VERIFY)" : "");
+            slot_note(b);
+        }
+    }
+    // (SLOTS v2: the folder - MAYA_HY4_SLOT_DIR, <pack>/slots by default - so the kept conversations outlive
+    //  the engine: every park is written there by a background thread right after its RAM copy (the RAM copy stays
+    //  the fast path; the loop never waits on the drive but at the end), the conversation in the model after
+    //  MAYA_HY4_SLOT_IDLE_S idle seconds (given up when a request comes), and at QUIT, SIGTERM or the input's end
+    //  whatever is not there yet, within MAYA_HY4_SLOT_QUIT_S.  At the start the folder's .meta files are read into the
+    //  table (no .bin until a take); a file another engine, pack, cache or split made, an incomplete one, or one unused
+    //  for MAYA_HY4_SLOT_DAYS is removed.  MAYA_HY4_SLOT_GB caps the .bin files (the least recently used goes first,
+    //  never the one just written nor one being written).  hy4_slot_dir.hpp: the files and the writer)
+    namespace hsd = hy4::slots;
+    bool folder_on = false;
+    std::string slot_dir, slot_ident;
+    std::unique_ptr<hsd::Writer> writer;
+    uint64_t slot_seq = 0;
+    // (the rates the engine's end judges its last save by: a save's GPU copy, the writer's - each as measured, an
+    //  EMA; until then conservative guesses)
+    double slot_copy_gbs = 3.0, slot_write_gbs = 0.5;
+    const auto slot_mb = [](uint64_t b) {
+        char s[32];
+        std::snprintf(s, sizeof s, "%.0f MB", (double) b / 1048576.0);
+        return std::string(s);
+    };
+    const auto slot_name = [](const std::string& stem) { return std::filesystem::path(stem).filename().string(); };
+#if defined(_WIN32)
+    // (the folder's atomic writes lean on POSIX flock and fsync - no cross-process lock or crash durability on
+    //  Windows: it is refused there, the RAM slots of MAYA_HY4_SLOT_KEEP stay; v1 is portable)
+    if (slots_on)
+        slot_note("the folder is not kept on Windows (its atomic writes need POSIX locks and fsync): the kept "
+                  "conversations end with the engine; MAYA_HY4_SLOT_KEEP's RAM slots stay");
+#else
+    if (slots_on) {
+        namespace fs = std::filesystem;
+        slot_dir = sk.dir_set ? sk.dir : pack.empty() ? std::string() : pack + "/slots";
+        std::error_code ec;
+        if (slot_dir.empty() || sk.folder_bytes == 0) {
+            slot_note(std::string("no folder (") +
+                      (sk.folder_bytes == 0 ? "MAYA_HY4_SLOT_GB is 0" : "MAYA_HY4_SLOT_DIR is empty") +
+                      "): the kept conversations end with the engine");
+        } else if (fs::create_directories(slot_dir, ec), !fs::is_directory(slot_dir, ec)) {
+            slot_note("the folder " + slot_dir + " cannot be made: the kept conversations end with the engine");
+        } else {
+            {   // (writable: a probe written and removed - a slot-*.tmp, which a start removes anyway)
+                const std::string probe = slot_dir + "/slot-probe.tmp";
+                std::FILE* f = std::fopen(probe.c_str(), "wb");
+                folder_on = f != nullptr && std::fputc('x', f) != EOF;
+                if (f != nullptr) std::fclose(f);
+                fs::remove(probe, ec);
+            }
+            if (!folder_on)
+                slot_note("the folder " + slot_dir + " is not writable: the kept conversations end with the engine");
+            else if (hsd::lock_dir(slot_dir, sk.quit_s + 10) < 0) {   // (held while the engine runs; never closed)
+                folder_on = false;
+                slot_note("the folder " + slot_dir + " is held by another engine: the kept conversations end with this one");
+            }
+        }
+        if (folder_on) {
+            slot_ident = m.conv_identity();
+            struct Found {
+                std::string stem;
+                hsd::Meta meta;
+                fs::file_time_type t;
+            };
+            std::vector<Found> found;
+            std::vector<std::string> why_out;
+            size_t refused = 0;
+            const auto refuse = [&](const std::string& stem, const std::string& why) {
+                ++refused;
+                if (why_out.size() < 8) why_out.push_back(slot_name(stem) + ": " + why);
+                hsd::remove_files(stem);
+            };
+            // (the first field of the identity that differs: what made the file another start's)
+            const auto differs = [&](const std::string& a) {
+                std::istringstream x(a), y(slot_ident);
+                for (std::string p, q;;) {
+                    const bool gp = (bool) (x >> p), gq = (bool) (y >> q);
+                    if (!gp && !gq) return std::string("?");
+                    if (p != q) return (gp ? p.substr(0, p.find_first_of("=:")) : q.substr(0, q.find_first_of("=:")));
+                }
+            };
+            const auto now_t = fs::file_time_type::clock::now();
+            std::vector<fs::path> entries;   // (listed first: removing while the folder is walked is unspecified)
+            for (const auto& de : fs::directory_iterator(slot_dir, ec)) entries.push_back(de.path());
+            std::sort(entries.begin(), entries.end());
+            std::vector<std::string> bins;
+            for (const fs::path& ep : entries) {
+                const std::string fn = ep.filename().string(), p = ep.string();
+                const hsd::FileKind k = hsd::file_kind(fn);
+                if (k == hsd::kTmp) {   // (an interrupted write)
+                    fs::remove(ep, ec);
+                    continue;
+                }
+                if (k == hsd::kBin) bins.push_back(p);
+                if (k != hsd::kMeta) continue;
+                const std::string stem = p.substr(0, p.size() - 5);
+                std::vector<uint8_t> mb;
+                std::string why;
+                hsd::Meta meta;
+                const uint64_t ms = (uint64_t) fs::file_size(ep, ec);
+                if (ec || ms > ((uint64_t) 256 << 20) || !hsd::read_file(p, mb, ms, why) ||
+                    !hsd::meta_decode(mb.data(), mb.size(), meta, why)) {
+                    refuse(stem, why.empty() ? "its .meta cannot be read" : why);
+                    continue;
+                }
+                if (meta.identity != slot_ident) {
+                    refuse(stem, "made by another engine, pack, cache or split (" + differs(meta.identity) + ")");
+                    continue;
+                }
+                const uint64_t have = (uint64_t) fs::file_size(stem + ".bin", ec);
+                if (ec || have != meta.bin_bytes) {
+                    refuse(stem, "its .bin is missing or incomplete");
+                    continue;
+                }
+                const fs::file_time_type t = fs::last_write_time(ep, ec);
+                const double age = std::chrono::duration<double>(now_t - t).count() / 86400.0;
+                if (!ec && age > sk.days) {
+                    refuse(stem, "unused for " + std::to_string((int) age) + " days (MAYA_HY4_SLOT_DAYS)");
+                    continue;
+                }
+                found.push_back({stem, std::move(meta), t});
+            }
+            for (const std::string& b : bins)   // (a .bin without its .meta: a write that did not end)
+                if (!fs::exists(b.substr(0, b.size() - 4) + ".meta", ec)) fs::remove(b, ec);
+            std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t < b.t; });
+            for (Found& fd : found) {
+                hsd::Slot sl;
+                sl.tokens = std::move(fd.meta.tokens);
+                sl.pics = std::move(fd.meta.pics);
+                sl.lo = fd.meta.lo;
+                sl.file = fd.stem;
+                sl.disk = 2;
+                sl.file_bytes = fd.meta.bin_bytes;
+                sl.sum = fd.meta.checksum;
+                sl.id = ++slot_seq;
+                slots.add(std::move(sl));
+            }
+            size_t trimmed = 0;
+            for (const std::string& f : slots.trim_folder(sk.folder_bytes, 0)) {
+                hsd::remove_files(f);
+                ++trimmed;
+            }
+            std::string msg = "folder " + slot_dir + ": " + std::to_string(slots.size()) +
+                              " conversation(s) kept from earlier runs (" + slot_gb(slots.disk_bytes()) + " of " +
+                              slot_gb(sk.folder_bytes) + ")";
+            if (trimmed) msg += ", " + std::to_string(trimmed) + " least recently used removed (MAYA_HY4_SLOT_GB)";
+            if (refused) msg += ", " + std::to_string(refused) + " refused and removed";
+            slot_note(msg);
+            for (const std::string& w : why_out) slot_note("refused " + w);
+            if (refused > why_out.size()) slot_note("refused " + std::to_string(refused - why_out.size()) + " more");
+            writer = std::make_unique<hsd::Writer>();
+            writer->start([] { hy4::lower_this_thread(); });   // (below the engine's own threads)
+        }
+    }
+#endif
     // (#1026: a start that came out short of its VRAM reserve - the server starts the engine once more, which keeps
     //  what this one measured free beside it)
     if (const int short_mib = m.late_check(true); short_mib > 0) std::printf("INFO reserve_short=%d\n", short_mib);
@@ -767,12 +985,392 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
     //  is still being torn down - a Lines on this stack would be gone by then and its mutex with it)
     Lines& in = *new Lines;
     in.start();
+    if (folder_on) {   // (SLOTS v2: SIGTERM / SIGINT end the loop, which writes what it holds; unset: as before)
+        g_slot_stop = &in.stop;
+#if !defined(_WIN32)
+        struct sigaction sa{};
+        sa.sa_handler = slot_on_term;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGINT, &sa, nullptr);
+#else
+        std::signal(SIGTERM, slot_on_term);
+        std::signal(SIGINT, slot_on_term);
+#endif
+    }
     std::vector<int> state;   // the tokens in the caches, positions 0 ..
     struct Held {
         long long start;
         uint64_t hash;
     };
     std::vector<Held> held;   // the pictures in the caches (their first image token's position, their pixels' hash)
+    // (SLOTS v2) the folder's side of the table: a dropped slot's write stopped and files removed; the folder
+    // trimmed to MAYA_HY4_SLOT_GB; slot i queued for the writer; the writer's finished jobs taken in (NOTE lines from
+    // this thread alone); the live conversation parked (an idle or end-time park: no take after it)
+    const auto slot_gone = [&](const hsd::Slot& s) {
+        if (s.disk == 1 && writer) writer->abort(s.id);   // (the writer removes what it wrote of it)
+        else if (s.disk == 2) hsd::remove_files(s.file);
+    };
+    uint64_t slot_hold = 0;   // (a slot a switch is about to take back: no trim removes its file meanwhile)
+    const auto slot_trim = [&](uint64_t keep) {
+        if (!folder_on) return;
+        for (const std::string& f : slots.trim_folder(sk.folder_bytes, keep, slot_hold)) hsd::remove_files(f);
+    };
+    const auto slot_write = [&](size_t i, bool idle, bool front) {
+        hsd::Slot& s = slots.slot(i);
+        if (!folder_on || !s.data || s.disk != 0) return;
+        if (s.id == 0) s.id = ++slot_seq;
+        const long long stamp = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+        s.file = slot_dir + "/slot-" + std::to_string(stamp) + "-" + std::to_string(s.id);
+        s.disk = 1;
+        s.file_bytes = s.data->size();
+        hsd::Writer::Job j;
+        j.id = s.id;
+        j.stem = s.file;
+        j.data = s.data;
+        j.meta.identity = slot_ident;
+        j.meta.n = (int64_t) s.tokens.size();
+        j.meta.lo = s.lo;
+        j.meta.tokens = s.tokens;
+        j.meta.pics = s.pics;
+        j.idle = idle;
+        writer->submit(std::move(j), front);
+        slot_trim(s.id);
+    };
+    const auto slot_poll = [&]() {
+        if (!writer) return;
+        for (const hsd::Writer::Done& d : writer->poll()) {
+            const size_t i = slots.find_id(d.id);
+            if (i == hsd::Match::npos || slots[i].file != d.stem) {   // (its slot gone meanwhile: so are its files)
+                if (d.ok) hsd::remove_files(d.stem);
+                continue;
+            }
+            hsd::Slot& s = slots.slot(i);
+            if (d.ok) {
+                s.disk = 2;
+                s.file_bytes = d.bytes;
+                s.sum = d.sum;
+                if (d.ms > 0 && d.bytes > ((uint64_t) 64 << 20))
+                    slot_write_gbs = 0.7 * slot_write_gbs + 0.3 * ((double) d.bytes / (d.ms * 1e6));
+                char b[256];
+                std::snprintf(b, sizeof b, "wrote a %lld-token conversation to the folder (%s in %.0f ms)%s; %zu there, %s",
+                              (long long) d.n, slot_mb(d.bytes).c_str(), d.ms, d.idle ? " while idle" : "",
+                              [&] {
+                                  size_t k = 0;
+                                  for (size_t x = 0; x < slots.size(); ++x) k += slots[x].disk == 2;
+                                  return k;
+                              }(),
+                              slot_gb(slots.disk_bytes()).c_str());
+                slot_note(b);
+                slot_trim(d.id);
+                continue;
+            }
+            s.file.clear();
+            s.disk = 0;
+            s.file_bytes = 0;
+            const bool lost = !s.data;
+            if (d.aborted) std::fprintf(stderr, "hy4 slots: a %lld-token conversation's write given up (%s)\n",
+                                        (long long) d.n, d.err.c_str());
+            else slot_note("writing a " + std::to_string(d.n) + "-token conversation to the folder failed (" + d.err +
+                           (lost ? ") - it is lost" : ") - it stays in RAM only"));
+            if (lost) slots.drop(i);
+        }
+    };
+    const auto slot_park = [&](bool idle, const char* why) {
+        namespace hs = hy4::slots;
+        std::vector<hs::Pic> have;
+        for (const Held& q : held) have.push_back({q.start, q.hash});
+        const double ts = now();
+        auto buf = std::make_shared<std::vector<uint8_t>>();
+        std::string e;
+        int64_t lo = 0;
+        const uint64_t bytes = m.conv_save(*buf, (int64_t) state.size(), sk.ring, e, &lo, state.data());
+        if (bytes == 0) {
+            if (e != "it is already set aside")
+                slot_note(std::string("setting the conversation aside") + why + " failed (" + e + ")");
+            return;
+        }
+        if (const double dt = now() - ts; dt > 0 && bytes > ((uint64_t) 64 << 20))
+            slot_copy_gbs = 0.7 * slot_copy_gbs + 0.3 * ((double) bytes / (dt * 1e9));
+        hs::Slot sl;
+        sl.tokens = state;
+        sl.pics = have;
+        sl.lo = lo;
+        sl.data = std::move(buf);
+        sl.id = ++slot_seq;
+        const uint64_t id = sl.id;
+        hs::Put pr = slots.put(std::move(sl), nullptr);
+        for (const hs::Slot& g : pr.gone) slot_gone(g);
+        char b[400];
+        std::snprintf(b, sizeof b, "saved a %zu-token conversation%s (%s in RAM in %.2f s, its rings from token %lld); "
+                      "%zu kept, %s of %s", state.size(), why, slot_gb(bytes).c_str(), now() - ts, (long long) lo,
+                      slots.size(), slot_gb(slots.ram_bytes()).c_str(),
+                      sk.ram_bytes > 0 ? slot_gb(sk.ram_bytes).c_str() : "any size");
+        slot_note(b);
+        const size_t i = slots.find_id(id);
+        if (i != hs::Match::npos) slot_write(i, idle, !idle);
+    };
+    // (SLOTS v2) the folder's idle work: the conversation in the model, then any slot in RAM the folder lacks
+    // (a write that failed or was given up), the most recently used first - each an idle job, given up for a request
+    const auto slot_idle = [&]() {
+        if (!folder_on) return;
+        slot_poll();
+        if (state.size() >= sk.min) {
+            std::vector<hsd::Pic> have;
+            for (const Held& q : held) have.push_back({q.start, q.hash});
+            const size_t i = slots.live(state, have);
+            if (i != hsd::Match::npos) slot_write(i, true, false);
+            else if (!m.conv_held()) slot_park(true, " while idle");
+        }
+        std::vector<size_t> order;
+        for (size_t i = 0; i < slots.size(); ++i)
+            if (slots[i].data && slots[i].disk == 0) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return slots[a].used > slots[b].used; });
+        for (size_t i : order) slot_write(i, true, false);
+    };
+    // (SLOTS v2) the engine's end (QUIT, SIGTERM / SIGINT, the input's end): the writes in flight finished,
+    // the conversation in the model and every slot in RAM the folder lacks written, all within MAYA_HY4_SLOT_QUIT_S -
+    // past it the write running stops and removes its file
+    const auto slot_end = [&]() {
+        if (!folder_on) return;
+        const double t0 = hsd::steady_s();
+        double dl = t0 + sk.quit_s;
+#if !defined(_WIN32)
+        if (const int64_t tn = g_slot_term_ns.load(); tn > 0) {   // (a SIGTERM: a swap's kill counts from it - the end's
+            timespec ts{};                                        //  time too, whatever the answer or prompt took after)
+            if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+                const double since = (double) ((int64_t) ts.tv_sec * 1000000000LL + ts.tv_nsec - tn) * 1e-9;
+                dl = std::min(dl, t0 + std::max(0.5, sk.quit_s - since));
+            }
+        }
+#endif
+        writer->set_deadline(dl);
+        slot_poll();
+        if (state.size() >= sk.min) {
+            std::vector<hsd::Pic> have;
+            for (const Held& q : held) have.push_back({q.start, q.hash});
+            const size_t i = slots.live(state, have);
+            if (i != hsd::Match::npos) slot_write(i, false, true);
+            else if (!m.conv_held()) {
+                // (the save's GPU copy cannot stop part way: begun with too little left of _QUIT_S, a swap's kill
+                //  would end it and the writes queued behind it - so it is skipped where the copy and the writes
+                //  already queued and its own would not end in time, by the rates measured so far)
+                uint64_t queued = 0;
+                for (size_t k = 0; k < slots.size(); ++k)
+                    if (slots[k].disk == 1) queued += slots[k].file_bytes;
+                const uint64_t need = m.conv_bytes((int64_t) state.size(), sk.ring);
+                const double est = (double) need / (slot_copy_gbs * 1e9) + (double) (queued + need) / (slot_write_gbs * 1e9);
+                const double left = dl - hsd::steady_s();
+                if (need > 0 && est * 1.25 + 0.25 > left) {
+                    char b[300];
+                    std::snprintf(b, sizeof b, "the %zu-token conversation in the model is left out at the engine's "
+                                  "end: %.1f s of MAYA_HY4_SLOT_QUIT_S left, ~%.1f s needed (%s at %.1f GB/s copied, "
+                                  "%.1f GB/s written)", state.size(), left, est, slot_gb(need).c_str(), slot_copy_gbs,
+                                  slot_write_gbs);
+                    slot_note(b);
+                } else {
+                    slot_park(false, " as the engine ended");
+                }
+            }
+        }
+        for (size_t i = 0; i < slots.size(); ++i)
+            if (slots[i].data && slots[i].disk == 0) slot_write(i, false, false);
+        if (!writer->wait_idle(dl + 0.25)) {
+            writer->abort_all();
+            writer->wait_idle(hsd::steady_s() + 2.0);
+        }
+        slot_poll();
+        size_t there = 0, lost = 0;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            there += slots[i].disk == 2;
+            lost += slots[i].disk != 2;
+        }
+        char b[256];
+        std::snprintf(b, sizeof b, "the engine's end: %zu conversation(s) in the folder (%s) after %.1f s%s", there,
+                      slot_gb(slots.disk_bytes()).c_str(), hsd::steady_s() - t0,
+                      lost ? (", " + std::to_string(lost) + " not written in time (MAYA_HY4_SLOT_QUIT_S)").c_str() : "");
+        slot_note(b);
+    };
+    // (SLOTS v2) the next line with the folder on: the writer's jobs taken in meanwhile, the idle work once
+    // MAYA_HY4_SLOT_IDLE_S passed since the last request, a request's line giving up the idle jobs (not QUIT's: the
+    // end writes them); false at the input's end or a SIGTERM / SIGINT
+    const auto slot_next = [&](std::string& out) -> bool {
+        const double t_idle = now();
+        bool idle_done = sk.idle_s <= 0;
+        for (;;) {
+            if (g_slot_term) return false;
+            slot_poll();
+            int wait_ms = 200;
+            if (!idle_done) {
+                const double left = t_idle + sk.idle_s - now();
+                if (left <= 0) {
+                    slot_idle();
+                    idle_done = true;
+                    continue;
+                }
+                wait_ms = std::max(1, std::min(wait_ms, (int) (left * 1000) + 1));
+            }
+            const int r = in.next_for(out, wait_ms);
+            if (r < 0) return false;
+            if (r == 0) continue;
+            if (out != "QUIT") writer->abort_idle();
+            return g_slot_term == 0 || out == "QUIT";
+        }
+    };
+    // (SLOTS) a take whose restored state MAYA_HY4_SLOT_VERIFY found not to be its slot's (or could not read
+    // back): not served - the model reset (a read from token 0), the loop's state with it, the slot and its files gone
+    const auto slot_refuse_loaded = [&](size_t i, const std::string& why) {
+        m.conv_reset();
+        state.clear();
+        held.clear();
+        slot_gone(slots[i]);
+        slots.drop(i);
+        slot_note("taking a conversation back failed (" + why + ") - its state is not used: the engine reset, the slot "
+                  "dropped, the prompt read from token 0");
+    };
+    // (SLOTS) before a request's reuse is computed: the conversation in the model parked and / or a parked one
+    // taken back (hy4_slots.hpp's decide); the loop's own reuse then runs on whatever the model holds, unchanged
+    const auto slot_switch = [&](const std::vector<int>& ids, const std::vector<Pic>& pics) {
+        namespace hs = hy4::slots;
+        slot_poll();   // (v2: the writer's finished jobs first)
+        std::vector<hs::Pic> want, have;
+        for (const Pic& x : pics) want.push_back({x.start, x.hash});
+        for (const Held& q : held) have.push_back({q.start, q.hash});
+        size_t from_cur = hs::shared_start(state, have, ids, want);   // (the loop's own reuse, below)
+        if (from_cur > 0 && !m.resumable((int64_t) from_cur)) from_cur = 0;
+        hs::Match best = slots.best(ids, want, slot_geo);
+        const hs::Plan plan = hs::decide(state.size(), from_cur, m.conv_held(), best, sk);
+        struct Hold {   // (v2: the slot to take kept from the folder's trim while the park's write is queued)
+            uint64_t& h;
+            ~Hold() { h = 0; }
+        } hold{slot_hold};
+        slot_hold = plan.take ? slots[best.index].id : 0;
+        if (plan.park) {
+            const double ts = now();
+            auto buf = std::make_shared<std::vector<uint8_t>>();
+            std::string e;
+            int64_t lo = 0;
+            const uint64_t bytes = m.conv_save(*buf, (int64_t) state.size(), sk.ring, e, &lo, state.data());
+            if (bytes == 0) {
+                if (e != "it is already set aside")
+                    slot_note("setting the conversation aside failed (" + e + ") - it is read from token 0 when it "
+                              "comes back");
+            } else {
+                hs::Slot sl;
+                sl.tokens = state;
+                sl.pics = have;
+                sl.lo = lo;
+                sl.data = std::move(buf);
+                sl.id = ++slot_seq;
+                const uint64_t sid = sl.id;
+                if (const double dt = now() - ts; dt > 0 && bytes > ((uint64_t) 64 << 20))
+                    slot_copy_gbs = 0.7 * slot_copy_gbs + 0.3 * ((double) bytes / (dt * 1e9));
+                const hs::Put pr = slots.put(std::move(sl), plan.take ? slots[best.index].data.get() : nullptr);
+                for (const hs::Slot& g : pr.gone) slot_gone(g);   // (v2: their files)
+                if (const size_t k = slots.find_id(sid); k != hs::Match::npos) slot_write(k, false, false);
+                char b[400];
+                std::snprintf(b, sizeof b, "saved a %zu-token conversation (%s in RAM in %.2f s, its rings from token "
+                              "%lld); %zu kept, %s of %s%s%s", state.size(), slot_gb(bytes).c_str(), now() - ts,
+                              (long long) lo, slots.size(), slot_gb(slots.ram_bytes()).c_str(),
+                              sk.ram_bytes > 0 ? slot_gb(sk.ram_bytes).c_str() : "any size",
+                              pr.superseded ? (" - " + std::to_string(pr.superseded) + " earlier state(s) of it dropped").c_str() : "",
+                              pr.evicted ? (" - " + std::to_string(pr.evicted) + " least recently used dropped").c_str() : "");
+                slot_note(b);
+            }
+            if (plan.take) best = slots.best(ids, want, slot_geo);   // (the table changed: put may have dropped some)
+        }
+        if (!plan.take || !hs::take_pays(from_cur, best, sk)) return;
+        if (!slots[best.index].data && slots[best.index].disk == 2) {   // (v2: the folder's alone - its .bin read)
+            const hs::Slot s = slots[best.index];
+            const double t0 = now();
+            std::vector<uint8_t> buf;
+            std::string e;
+            bool ok = hsd::read_file(s.file + ".bin", buf, s.file_bytes, e);
+            const double t1 = now();
+            if (ok && hsd::checksum(buf.data(), buf.size()) != s.sum) {
+                e = "its checksum is not its .meta's (the .bin changed after it was written)";
+                ok = false;
+            }
+            if (ok && (buf.size() < 128 + s.tokens.size() * 4 ||
+                       std::memcmp(buf.data() + 128, s.tokens.data(), s.tokens.size() * 4) != 0)) {
+                e = "its .bin is not its .meta's conversation";
+                ok = false;
+            }
+            const double t2 = now();
+            std::vector<int> toks;
+            if (ok && !m.conv_load(buf.data(), buf.size(), &toks, e)) ok = false;
+            const double t3 = now();
+            std::string vm;
+            if (ok && sk.verify && !m.conv_verify(buf.data(), buf.size(), vm)) {   // (MAYA_HY4_SLOT_VERIFY: fails closed)
+                slot_refuse_loaded(best.index, vm);
+                return;
+            }
+            if (!ok) {
+                slot_note("refused " + slot_name(s.file) + ": " + e + " - removed; reading its prompt again");
+                hsd::remove_files(s.file);
+                slots.drop(best.index);
+                if (m.end() == 0) {   // (a load that failed after its first write reset the model)
+                    state.clear();
+                    held.clear();
+                }
+                return;
+            }
+            state = std::move(toks);
+            held.clear();
+            for (const hs::Pic& q : s.pics) held.push_back({q.start, q.hash});
+            slots.touch(best.index);
+            std::error_code ec;   // (its age, for MAYA_HY4_SLOT_DAYS and the next start's order: from this use)
+            std::filesystem::last_write_time(s.file + ".meta", std::filesystem::file_time_type::clock::now(), ec);
+            char b[320];
+            std::string part;
+            if (best.len < s.tokens.size())
+                part = " at token " + std::to_string(best.len) + " of " + std::to_string(s.tokens.size());
+            std::snprintf(b, sizeof b, "took back a %zu-token conversation%s from the folder (%s, read %.0f ms, checked "
+                          "%.0f ms, loaded %.0f ms); %zu new tokens to read", best.len, part.c_str(),
+                          slot_mb(buf.size()).c_str(), (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3,
+                          ids.size() - best.len);
+            slot_note(b);
+            if (sk.verify) slot_note(vm);
+            return;
+        }
+        const double tt = now();
+        const std::shared_ptr<std::vector<uint8_t>> data = slots[best.index].data;
+        const size_t whole = slots[best.index].tokens.size();
+        std::string e;
+        std::vector<int> toks;
+        if (!data || !m.conv_load(data->data(), data->size(), &toks, e)) {
+            slot_note("taking a conversation back failed (" + (e.empty() ? std::string("no bytes") : e) +
+                      ") - reading its prompt again");
+            slot_gone(slots[best.index]);   // (v2: its file too)
+            slots.drop(best.index);
+            if (m.end() == 0) {   // (a load that failed after its first write reset the model)
+                state.clear();
+                held.clear();
+            }
+            return;
+        }
+        const double t_load = now() - tt;
+        // (MAYA_HY4_SLOT_VERIFY, tests: the restored state read back and compared with the slot - a mismatch or a failed
+        //  read-back fails closed: the state is not served)
+        std::string vm;
+        if (sk.verify && !m.conv_verify(data->data(), data->size(), vm)) {
+            slot_refuse_loaded(best.index, vm);
+            return;
+        }
+        state = std::move(toks);
+        held.clear();
+        for (const hs::Pic& q : slots[best.index].pics) held.push_back({q.start, q.hash});
+        slots.touch(best.index);
+        char b[320];
+        std::string part;
+        if (best.len < whole) part = " at token " + std::to_string(best.len) + " of " + std::to_string(whole);
+        std::snprintf(b, sizeof b, "took back a %zu-token conversation%s from RAM (%.2f s); %zu new tokens to read",
+                      best.len, part.c_str(), t_load, ids.size() - best.len);
+        slot_note(b);
+        if (sk.verify) slot_note(vm);
+    };
     struct Unpin {   // (a pinned buffer unpinned before its vector frees it)
         void* p;
         bool on;
@@ -788,7 +1386,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", n_ids);
         std::fflush(stdout);
     };
-    while (in.next(line)) {
+    while (folder_on ? slot_next(line) : in.next(line)) {   // (SLOTS v2: slot_next with the folder)
         if (line == "QUIT") break;
         if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
             std::printf("ERR unsupported command '%s' (GEN, GENI, STOP, WRAP and QUIT)\n",
@@ -799,6 +1397,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         (void) m.late_check(false);   // (#1026: what the requests before allocated, against the reserve)
         in.stop.store(false);
         in.wrap.store(false);
+        if (folder_on && g_slot_term) in.stop.store(true);   // (SLOTS v2: a SIGTERM just now: no answer)
         Req r;
         if (!parse_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
             std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> (GENI: the pictures' file before the ids)\n");
@@ -818,6 +1417,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             continue;
         }
         const double t0 = now() * 1e3;
+        if (slots_on) slot_switch(r.ids, pics);   // (SLOTS: MAYA_HY4_SLOT_KEEP=1)
         // the state's shared start (the prompt's last token is always read again: its logits are the first token's)
         size_t from = 0;
         while (from < state.size() && from + 1 < r.ids.size() && state[from] == r.ids[from]) ++from;
@@ -837,7 +1437,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             std::vector<hy4::Model::Image> rows;
             const int itok = m.vision() ? m.vision()->image_token : -1;
             const bool any = !pics.empty() || (itok >= 0 && std::find(r.ids.begin(), r.ids.end(), itok) != r.ids.end());
-            if (any && !picture_rows(m, pics, r.ids, from, rows, err)) {
+            // (SLOTS: a picture before `from` whose rows the MTP block has not made yet - mtp_rows() short of
+            //  its end, a conversation read without drafts, or taken back so - is encoded again too, so the MTP
+            //  catch-up past it reads its rows, not the image token's embedding.  The same before a park as after a
+            //  take: a taken-back state goes on as the one in the model would.  Unset: as before)
+            const size_t img_from = slots_on ? std::min<size_t>(from, (size_t) std::max<int64_t>(0, m.mtp_rows())) : from;
+            if (any && !picture_rows(m, pics, r.ids, img_from, rows, err)) {
                 std::printf("ERR %s\n", err.c_str());
                 done_cancel(r.ids.size());
                 state.clear();   // (the caches' pictures are no longer known)
@@ -1071,6 +1676,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                      t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0);
     }
+    slot_end();   // (SLOTS v2: the folder's writes at the engine's end; none without it)
     return 0;
 }
 
@@ -1832,7 +2438,7 @@ int main(int argc, char** argv) {
     // (--draft-more: the MTP block's drafts - the DFly2 drafter's round is one pass of its own count; a step's window,
     //  the token and its drafts, is kMaxWin positions at most: the added drafts within it)
     n_more = m.has_dfly2() ? 0 : std::min(n_more, std::max(0, hy4::k::kMaxWin - 1 - n_draft));
-    if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need);
+    if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need, o.pack);
     if (kld.rfind("topk:", 0) == 0) return run_kld_topk(m, kld.substr(5), chunks, kld_save);
     if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);
