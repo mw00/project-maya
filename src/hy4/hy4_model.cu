@@ -471,6 +471,11 @@ struct Gpu {
     int heads_one = -1;         // (a token window's head-by-head GEMVs in one launch: 1, 8 heads a launch: 0, -1 not
                                 //  timed yet - mm_heads)
     int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's)
+    // (experts_streamed's two halves in flight: the second half's map, the copies' own stream, each half's copy done
+    //  and sets done - made at its first use)
+    int* pmap2 = nullptr;
+    cudaStream_t cs = nullptr;
+    cudaEvent_t ev_in[2] = {nullptr, nullptr}, ev_used[2] = {nullptr, nullptr};
     // (the GPU fetch: its scratch and staging slots, the copies' stream and its two events - the resolve done, the
     //  copies done)
     k::FetchScratch fxs, fxa[2];   // (fxa: the look-ahead's copies - a later layer's guessed misses; a pair by the
@@ -650,6 +655,7 @@ struct Model::Impl {
     size_t stage_blob = 0;              // (h_stage's blob size)
     double copy_gbs = 15.0;       // ... the copies into the bounce, GB/s (measured, EMA)
     int* h_pmap = nullptr;
+    int* h_pmap2 = nullptr;     // (experts_streamed's second half's map)
     int* h_who = nullptr;         // (pinned: the GPU fetch's entries of the CPU lane, a token window's)
     std::vector<CpuEntry> lane_entries;
     // tensor parallel (Options::tp > 1, hy4_tp.hpp): the members (indexes into G), each one's layer slices; the pinned
@@ -1028,6 +1034,7 @@ struct Model::Impl {
         if (h_cpu) cudaFreeHost(h_cpu);
         if (h_stage) cudaFreeHost(h_stage);
         if (h_pmap) cudaFreeHost(h_pmap);
+        if (h_pmap2) cudaFreeHost(h_pmap2);
         for (uint16_t* p : kv_host)
             if (p) cudaFreeHost(p);
         for (int* p : sp_host)
@@ -6792,6 +6799,7 @@ struct Model::Impl {
         }
         const CpuExperts& cx = l.cex;
         const size_t gb = cx.g_stride, db = cx.d_stride;
+        if (!share && stream_pipe() && u.size() > (size_t) kStage / 2) return streamed_pipe(l, gp, T, u, err);
         for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) kStage) {
             const int np = (int) std::min(u.size() - p0, (size_t) kStage);
             const double tc = now_s();
@@ -6824,6 +6832,78 @@ struct Model::Impl {
             CK(cudaStreamSynchronize(s));   // (the bounce and the map are the next pass's)
             if (!own_ids) st.streamed += np;
         }
+        return true;
+    }
+
+    // experts_streamed in two halves of kStage / 2 slots, in flight together (HY4_STREAM_PIPE=0: one pass at a time,
+    // as before): the lane's threads copy pass i + 1 from the model's file into its half of the pinned bounce while
+    // pass i crosses the bus on the copies' own stream, and its sets run on the layer's stream while pass i + 1
+    // crosses.  A half's bounce is filled again once its copy is done (ev_in), its staging slots once its sets are
+    // (ev_used).  The same passes' sets, the same sums (each expert's rows in one pass either way: its slot is all
+    // that differs).  One pass at a time a V100 streamed at ~4 GB/s, the copies, the bus and the sets one after another.
+    bool stream_pipe() const {
+        static const bool on = !(std::getenv("HY4_STREAM_PIPE") && std::getenv("HY4_STREAM_PIPE")[0] == '0');
+        return on;
+    }
+    bool streamed_pipe(Layer& l, Gpu& gp, int T, const std::vector<int>& u, std::string& err) {
+        const int ne = g.n_expert, half = kStage / 2;
+        cudaStream_t s = gp.s;
+        if (gp.cs == nullptr) {
+            CK(cudaStreamCreateWithFlags(&gp.cs, cudaStreamNonBlocking));
+            for (int b = 0; b < 2; ++b) {
+                CK(cudaEventCreateWithFlags(&gp.ev_in[b], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&gp.ev_used[b], cudaEventDisableTiming));
+                CK(cudaEventRecord(gp.ev_in[b], gp.cs));
+                CK(cudaEventRecord(gp.ev_used[b], s));
+            }
+            if (!gp.alloc(gp.pmap2, (size_t) ne, err)) return false;
+        }
+        if (h_pmap2 == nullptr) CK(cudaMallocHost(&h_pmap2, sizeof(int) * ne));
+        const CpuExperts& cx = l.cex;
+        const size_t gb = cx.g_stride, db = cx.d_stride;
+        const int npass = (int) ((u.size() + half - 1) / half);
+        auto fill = [&](int p) {   // (pass p's experts into its half of the bounce, on the lane's threads)
+            const int b = p & 1;
+            const size_t p0 = (size_t) p * half;
+            const int np = (int) std::min(u.size() - p0, (size_t) half);
+            uint8_t* bounce = h_stage + (size_t) b * half * l.blob;
+            const double tc = now_s();
+            lane->parallel_for(np * 3, [&](int it) {
+                const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
+                uint8_t* dst = bounce + (size_t) i * l.blob + l.tr[role];
+                const uint8_t* src = role == 0 ? cx.G((size_t) e) : role == 1 ? cx.U((size_t) e) : cx.D((size_t) e);
+                std::memcpy(dst, src, role == 2 ? db : gb);
+            });
+            st.stream_ms += (now_s() - tc) * 1e3;
+            CK(cudaStreamWaitEvent(gp.cs, gp.ev_used[b], 0));   // (its slots: the sets two passes back done)
+            CK(cudaMemcpyAsync(gp.stage + (size_t) b * half * l.blob, bounce, (size_t) np * l.blob,
+                               cudaMemcpyHostToDevice, gp.cs));
+            CK(cudaEventRecord(gp.ev_in[b], gp.cs));
+        };
+        CK(cudaEventSynchronize(gp.ev_in[0]));
+        fill(0);
+        for (int p = 0; p < npass; ++p) {
+            const int b = p & 1;
+            const size_t p0 = (size_t) p * half;
+            const int np = (int) std::min(u.size() - p0, (size_t) half);
+            if (p + 1 < npass) {
+                CK(cudaEventSynchronize(gp.ev_in[b ^ 1]));   // (that half's bounce: its last copy done)
+                fill(p + 1);
+            }
+            int* ph = b ? h_pmap2 : h_pmap;
+            int* pd = b ? gp.pmap2 : gp.pmap;
+            for (int e = 0; e < ne; ++e) ph[e] = -1;
+            for (int i = 0; i < np; ++i) ph[u[p0 + (size_t) i]] = i;
+            CK(cudaStreamWaitEvent(s, gp.ev_in[b], 0));
+            CK(cudaMemcpyAsync(pd, ph, sizeof(int) * ne, cudaMemcpyHostToDevice, s));
+            if (!experts_sets(l, gp, T, err, pd, gp.stage + (size_t) b * half * l.blob, np, true)) return false;
+            CK(cudaEventRecord(gp.ev_used[b], s));
+            st.streamed += np;
+        }
+        // (the bounce's halves and the host maps are the next call's: their copies done)
+        CK(cudaEventSynchronize(gp.ev_in[0]));
+        CK(cudaEventSynchronize(gp.ev_in[1]));
+        CK(cudaStreamSynchronize(s));
         return true;
     }
 
