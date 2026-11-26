@@ -311,7 +311,8 @@ bool GlmExpertHelper::reserve(int keys, size_t requested_bytes, std::string& err
         if (!link_post(err) || !link_wait(err)) return false;
         slots_.assign((size_t) keys, {});
         owned_.assign((size_t) keys, 0);
-        capacity_ = requested_bytes;
+        // (a discrete helper holds its experts in its own VRAM: what it could reserve, not what was asked)
+        capacity_ = integrated_ ? requested_bytes : std::min(requested_bytes, (size_t) std::max<int64_t>(0, ctl_->b));
         return true;
     }
     DeviceScope scope(device_);
@@ -1119,8 +1120,17 @@ bool GlmExpertHelper::open_link(int n_embd, int n_ff, const std::vector<std::pai
         close();
         return false;
     }
+    // A DISCRETE helper GPU (a Radeon card beside the lead, not an APU's graphics): it cannot read the shared RAM tier
+    // in place, it keeps its experts in its own VRAM (kReserve answers how much) and the lead keeps its RAM copies as
+    // its own - the in-process second card's ownership rules.  The prompt exchange needs the in-place reads: off.
+    if (ctl_->d == 0) {
+        integrated_ = false;
+        if (pf_ != nullptr) std::fprintf(stderr, "glm helper link: a discrete helper GPU - its experts go to its VRAM, prompts "
+                                                 "stream as before\n");
+        pf_cap_ = 0;
+    }
     // the exchange as this GPU reads it (out is added into the FFN in place; x and the plan are copied down into it)
-    if (pf_ != nullptr) {
+    if (pf_ != nullptr && pf_cap_ > 0) {
         void* dp = nullptr;
         if (cudaHostRegister(pf_, pf_bytes_, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess &&
             cudaHostGetDevicePointer(&dp, pf_, 0) == cudaSuccess) {

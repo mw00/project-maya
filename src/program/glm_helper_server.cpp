@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
         madvise(p, r.bytes, MADV_HUGEPAGE);
         bool imported = false;
 #ifdef MAYA_HELPER_DMABUF
+        if (prop.integrated)
         {
             uint8_t* g = nullptr;
             size_t np = 0;
@@ -264,12 +265,25 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        if (!imported && !register_pieces(p, r.bytes) &&
+        // A discrete card only uploads its experts from these pages (copies into its own VRAM): nothing registered.
+        // Registered in pieces, an upload that crosses two pieces is refused ("cache upload: invalid argument");
+        // registered whole, one page the kernel moves stops this program's queues until the driver has re-validated
+        // the whole block (a 62 GB block on an R9700: about 10 s a time, four times in one answer, measured).
+        // MAYA_GLM_HELPER_REG_DISCRETE=1: the block registered whole, as a faster upload path (A/B).
+        static const bool reg_discrete = [] {
+            const char* v = std::getenv("MAYA_GLM_HELPER_REG_DISCRETE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const bool want_reg = prop.integrated || reg_discrete;
+        if (want_reg && !imported && !(prop.integrated && register_pieces(p, r.bytes)) &&
             cudaHostRegister(p, r.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
             std::fprintf(stderr, "maya-glm-helper: GPU %d could not register a RAM-tier block (%.2f GB): %s\n", dev,
                          r.bytes / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
             return 6;
         }
+        if (!want_reg)
+            std::fprintf(stderr, "maya-glm-helper: a %.2f GB RAM-tier block mapped, not registered (a discrete GPU: it "
+                                 "uploads its experts)\n", r.bytes / 1073741824.0);
         r.mine = (uint8_t*) p;
         regions.push_back({p, r.bytes});
         gb += r.bytes / 1073741824.0;
@@ -322,6 +336,7 @@ int main(int argc, char** argv) {
             ok = h.open(dev, (int) c->a, (int) c->b, regions, err, c->x3_on != 0);
             n_embd = (int) c->a;
             c->caps = ok && h.win_ready() ? hl::kCapWin : 0u;   // (the window call: kComputeWin)
+            c->d = ok && h.integrated() ? 1 : 0;   // (0: a discrete card - the lead keeps the RAM tier, see open_link)
             if (ok && xchg != nullptr && !h.pf_attach(xchg, (size_t) xbytes, xcap, err)) {
                 std::fprintf(stderr, "maya-glm-helper: %s (prompt calls will fail)\n", err.c_str());
                 err.clear();
@@ -375,6 +390,7 @@ int main(int argc, char** argv) {
         }
         case hl::kReserve:
             ok = h.reserve((int) c->a, (size_t) c->b, err);
+            if (ok) c->b = (int64_t) (h.available() + h.used());   // (what this GPU holds: a discrete card's VRAM budget)
             break;
         case hl::kInsert: {
             const uint8_t* p = mine(c->host, (size_t) c->b);
