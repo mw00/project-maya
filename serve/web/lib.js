@@ -129,6 +129,7 @@ export function relTime(t) {
 // the model family's logo (web/logo-*.svg: lobe-icons' marks, MIT) and its name as people write it:
 // "glm-5.3-flash" -> "GLM 5.3 Flash", "deepseek-v4.1-flash" -> "DeepSeek V4.1 Flash", "qwen3.8-flash-next" -> "Qwen3.8 Flash Next"
 // (CYBER-FROST-3.8-PS, a Qwen3.8-Flash-Next fine-tune: Qwen's mark, its own name as its card writes it)
+// (Ling-3.2-air: its name as inclusionAI writes it; no mark in lobe-icons' set here, so none)
 const MODEL_LOGOS = [[/glm/i, "glm", true], [/deepseek/i, "deepseek"], [/minimax/i, "minimax"], [/qwen|cyber-frost/i, "qwen"],
                      [/hy4/i, "hy4"]];
 export function modelLogo(name) {
@@ -141,6 +142,8 @@ const NAME_WORDS = {glm: "GLM", deepseek: "DeepSeek", minimax: "MiniMax", qwen: 
 export function modelName(id, short) {
   const cf = String(id || "").match(/^cyber-frost-([\d.]+)/i);
   if (cf) return `Qwen-${cf[1]}-Flash-Next${short ? "" : " (CYBER-FROST)"}`;
+  const ling = String(id || "").match(/^ling-([\d.]+)-air$/i);   // (Ling-3.2-air: as inclusionAI writes it)
+  if (ling) return `Ling-${ling[1]}-air`;
   return String(id || "").split(/[-_\s]+/).filter(Boolean).map((w) => {
     const lw = w.toLowerCase(), m = lw.match(/^([a-z]+)(\d.*)$/);
     if (NAME_WORDS[lw]) return NAME_WORDS[lw];

@@ -2945,6 +2945,10 @@ def speculation_modes(info: dict, dspark=None, lookup=None) -> list:
             return float(v) > 0
         except (TypeError, ValueError):
             return False
+    if info.get("engine_kind") == "ling" and "spec" in info:
+        # (maya-ling's INFO spec=: what its start decided - mtp+lookup, mtp, lookup or off; its mtp= says only that the
+        #  draft block is loaded, also where the measurement then kept drafting off)
+        return [{"mtp": "MTP", "lookup": "Lookup"}[p] for p in str(info["spec"]).split("+") if p in ("mtp", "lookup")]
     modes = []
     ds = dspark if dspark is not None else info.get("dspark")
     if on(ds):

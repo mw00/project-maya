@@ -46,7 +46,12 @@ const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`se
 
 // the engines by their INFO engine_kind
 const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)",
-                 hy4: "Hy4-Flash (maya-hy4)", ik2: "Inkling 2 (maya-ik2)"};
+                 hy4: "Hy4-Flash (maya-hy4)", ik2: "Inkling 2 (maya-ik2)", ling: "Ling-3.2-air (maya-ling)"};
+// maya-ling's INFO spec=: what its start decided (the measurement where --drafting is auto)
+const LING_SPEC = {"mtp+lookup": "MTP and the prompt lookup: the model's draft block and text copied from the chat propose tokens, the full model checks them",
+                   mtp: "MTP: the model's draft block proposes the next tokens, the full model checks them",
+                   lookup: "The prompt lookup: text copied from the chat proposes tokens, the full model checks them",
+                   off: "off (the config's --drafting off, or faster without it on this PC, or no draft block in this model file)"};
 
 // ------------------------------------------------------------------ General
 function General() {
@@ -428,7 +433,7 @@ function gpuNames(name, count) {
   }
   return count > 1 ? `${count} × ${name}` : name;
 }
-function facts() {
+export function facts() {   // (exported for serve/test_dashboard.py)
   const m = S.metrics || {}, eng = m.engine || {}, hw = m.hardware || {}, st = m.hardware_static || {}, storage = m.storage;
   const ver = eng.maya_version || S.health.version;
   const kvPerTok = eng.kv_gb && eng.kv_ctx ? (eng.kv_gb * 1073741824) / eng.kv_ctx : null;
@@ -440,6 +445,8 @@ function facts() {
       : `${k} attention cache, in VRAM${kvPerTok ? ` (about ${fmt(kvPerTok / 1024)} KB a token, ${fmt(eng.kv_gb, 1)} GB at this size)` : ""}`;
   } else if (eng.engine_kind === "ik2") {   // (maya-ik2's INFO: kv=fp8|f16 - the full layers' cache, all in VRAM)
     kv = `${eng.kv === "fp8" ? "8-bit (FP8)" : "16-bit"}, all in VRAM (the layers without a window; the others keep 1,024 positions)`;
+  } else if (eng.engine_kind === "ling") {   // (maya-ling's INFO: kv=q8|f16 - the 7 attention layers' cache; the other 35 keep a fixed-size state)
+    kv = `${eng.kv === "q8" ? "8-bit" : "16-bit (F16)"}, all in VRAM (7 attention layers; the other 35 keep a fixed-size state)`;
   } else {
     const k = (eng.engine_kind === "mm3"   // (MiniMax's: maya-mm3's KV formats)
       ? {bf16: "16-bit (BF16)", int8: "8-bit (INT8)", fp8: "8-bit (FP8)", fp4: "4-bit (FP4)", nvfp4: "4-bit (NVFP4)",
@@ -469,7 +476,8 @@ function facts() {
                 : eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
                  `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}` +
                  `${+eng.expert_slots + (+eng.ram_slots || 0) >= +eng.experts ? "" : ", the rest read from the SSD"}` : null],
-    ["Speculation", eng.engine_kind === "hy4" && !+eng.dspark && !+eng.mtp ? "off: drafting is not available for Hy4-Flash's files yet"
+    ["Speculation", eng.engine_kind === "ling" ? LING_SPEC[eng.spec] || null
+                  : eng.engine_kind === "hy4" && !+eng.dspark && !+eng.mtp ? "off: drafting is not available for Hy4-Flash's files yet"
                   : eng.dspark != null && !(eng.engine_kind === "hy4" && +eng.mtp)
                   ? (+eng.dspark ? "DSpark: its drafter proposes a few tokens at a time, the full model checks them" +
                                   (m.tiers && m.tiers.now && m.tiers.now.drafts != null ? ` (${fmt(100 * m.tiers.now.drafts)}% of them kept in the last answer)` : "")

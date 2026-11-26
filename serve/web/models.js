@@ -373,6 +373,7 @@ function fieldsOf(m, d) {
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
   if (m.family === "hy4") return hy4Fields(m, d, s, ch, images, gpus);
   if (m.family === "ik2") return ik2Fields(m, d, ch);
+  if (m.family === "ling") return lingFields(m, d, s, ch, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -594,6 +595,45 @@ function ik2Fields(m, d, ch) {
         hint="FP8, the default: half the bytes of F16 and the faster one deep in a long context. F16: twice the VRAM a token, a little closer to the model's own numbers.">
         <${Seg} label="KV cache" value=${d.kv} options=${[{id: "fp8", label: "FP8"}, {id: "f16", label: "F16"}]}
           onChange=${(v) => setDraft({kv: v})}/><//>`]},
+  ];
+}
+
+// Ling-3.2-air's (maya-ling: it stops at a flag it does not know, so only its own are offered - the server's LING_KEYS;
+// text only for now, one answer at a time).  Its cache's VRAM a context token: the 7 attention layers' rows by its format
+// (m.ling_kv_bytes, tools/ling_fit.py's figures); m.ling_fit: the planner's split for the config's GPUs at each context.
+// Drafting: auto (--drafting auto: measured once on this PC) or off; "mtp" (--drafting mtp, a config written so) the
+// engine reads as auto, so it is shown only where a config has it
+export function lingFitNote(fit) {
+  if (!fit) return null;
+  if (fit.fits_trunk === false) return "At this size the model's layers and their cache do not fit on these GPUs: a smaller context, the 8-bit cache or another GPU.";
+  if (fit.resident === false) return `At this size about ${fmt(fit.vram_pct, 0)}% of the experts fit in VRAM; the others are taken from RAM${fit.ssd_gib > 0 ? " and the SSD" : ""} - slower answers.`;
+  return null;
+}
+export const lingDraftOptions = (now, was) => [{id: "auto", label: "Auto"},
+  ...(now === "mtp" || was === "mtp" ? [{id: "mtp", label: "On"}] : []), {id: "none", label: "Off"}];
+function lingFields(m, d, s, ch, gpus) {
+  const kvb = (m.ling_kv_bytes || {})[d.kv] || 8064;
+  const fit = same(d.gpus, s.gpus) ? ((m.ling_fit || {})[d.kv] || {})[String(d.context)] : null;   // (worked out for the config's GPUs)
+  return [
+    {label: "Model", rows: [
+      contextRow(m, d, ch, {vram: kvb}, ["kv"], lingFitNote(fit)),
+      html`<${Row} label="Drafting" flag=${"--drafting " + ({auto: "auto", mtp: "mtp"}[d.draft] || "off")} changed=${ch("draft")}
+        hint=${"The model's own draft block (MTP) and the prompt lookup propose tokens, and the model checks every one. Auto measures once on this PC whether drafting is faster and keeps the faster. A model file without the draft block runs without it." +
+          (d.draft === "mtp" ? " On (this config's --drafting mtp): maya-ling measures it the same way as Auto." : "")}>
+        <${Seg} label="Drafting" value=${d.draft} options=${lingDraftOptions(d.draft, s.draft)} onChange=${(v) => setDraft({draft: v})}/><//>`]},
+    {label: "GPUs and memory", rows: [gpus,
+      html`<${Row} label="KV cache" flag="--kv" changed=${ch("kv")}
+        hint=${`F16, the default: ${fmt((m.ling_kv_bytes || {}).f16 || 8064)} bytes a context token. 8-bit: ${fmt((m.ling_kv_bytes || {}).q8 || 4704)} bytes a token, more VRAM left to the experts; the engine has no measured choice between the two yet.`}>
+        <${Seg} label="KV cache" value=${d.kv} options=${[{id: "f16", label: "F16"}, {id: "q8", label: "8-bit"}]}
+          onChange=${(v) => setDraft({kv: v})}/><//>`]},
+    {label: "Speed", rows: [
+      html`<${Row} label="Prompt chunk" flag="--prefill-chunk" changed=${ch("prefill_chunk")}
+        hint="The prompt tokens one pass reads at most, from 64 to 8,192: larger reads long prompts faster and takes more VRAM. Empty: the engine's own, 2,048 or less where the VRAM is short."
+        warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
+      html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The threads that compute the experts VRAM does not hold. Empty: the engine picks (the physical cores less two)."
+        warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
   ];
 }
 
@@ -1083,7 +1123,7 @@ function Card({m}) {
   const stopping = m.running && r && r.why === "switch", restarting = m.running && r && r.why === "settings";
   const loading = r && r.why === "switch" && r.file === m.file;
   const chips = [["Context", ctxfmt(s.context)], ["Draft", DRAFTS[s.draft] || s.draft], ["GPUs", s.gpus.join(", ") || "–"],
-                 ["Images", s.images ? "on" : m.choices.text_only ? "text only" : "off"], ...(s.parallel > 1 ? [["At once", String(s.parallel)]] : [])];
+                 ["Images", s.images ? "on" : m.choices.text_only || m.family === "ling" ? "text only" : "off"], ...(s.parallel > 1 ? [["At once", String(s.parallel)]] : [])];
   const about = [m.backend === "hip" ? "HIP" : "CUDA", size(m.size), setUpOn(m.written)].filter(Boolean).join(" · ");
   const why = deleteBlock(m);
   return html`<section class=${`card mdl-card${m.running ? " is-running" : ""}${loading ? " is-loading" : ""}`} aria-label=${titleOf(m)}>

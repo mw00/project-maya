@@ -781,7 +781,9 @@ def apply(cfg: dict, settings: dict) -> dict:
         args = set_flag(args, "--kv", "fp16" if kv in ("fp16", "f16") else "q8")
         if s.get("draft") in ("auto", "mtp", "none"):
             args = set_flag(args, "--drafting", s["draft"])
-        if "images" in settings:
+        # (written where it changes: the Models page sends every setting back, and offers no pictures for Ling - a
+        #  config without its vision file keeps a command without --vision)
+        if "images" in settings and bool(settings["images"]) != bool(settings_of(cfg).get("images")):
             args = set_flag(args, "--vision", "on" if s.get("images") else "off")
         pc = _num(s, "prefill_chunk", 64, 8192, "Prefill chunk")
         args = set_flag(args, "--prefill-chunk", pc) if pc else args
