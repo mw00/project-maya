@@ -746,6 +746,7 @@ struct Chunk {
     cudaEvent_t pc_ev = nullptr;
     bool pc_ev_set = false;
     long long pc_experts = 0, pc_rows = 0, pc_layers = 0;
+    long long pc_run_experts = 0;   // (the last run's CPU share, kept past pcpu_report for pick_path's pm_learn)
     double pc_ms = 0.0, pc_wait_ms = 0.0;
     double pc_link = 0.0;   // (DS4_PREFILL_CPU: this device's host-to-device link, bytes a second; 0: not measured)
     // the CPU lane's experts streamed in: ring_n VRAM slots of ring_stride bytes in kParts parts, a batch a part,
@@ -7010,6 +7011,7 @@ struct Model::Impl {
                                  "lane_busy=%lld\n",
                          gpu, c.pc_layers, c.pc_experts, c.pc_rows, c.pc_ms, c.pc_wait_ms,
                          pcpu_busy.load(std::memory_order_relaxed));
+        c.pc_run_experts = c.pc_experts;
         c.pc_layers = c.pc_experts = c.pc_rows = 0;
         c.pc_ms = c.pc_wait_ms = 0.0;
     }
@@ -19668,6 +19670,7 @@ struct Model::Impl {
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = c.it_helper = c.chk_n = 0;
+            c.pc_run_experts = 0;
             c.lc_il = -1;
             c.lc_used = 0;
             c.lc_first = c.lc_chk = 0;
@@ -21893,7 +21896,8 @@ struct Model::Impl {
             double picked = 0;
             for (const auto& cp : chunks)
                 if (cp != nullptr && cp->flow)
-                    picked += (double) (cp->it_file + cp->it_ram + cp->it_helper) - (double) cp->it_spec_unused;
+                    picked += (double) (cp->it_file + cp->it_ram + cp->it_helper) + (double) cp->pc_run_experts -
+                              (double) cp->it_spec_unused;   // (DS4_PREFILL_CPU: the CPU share's picks too, not streamed)
             if (!tp) pm_learn(n, picked);
         }
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
