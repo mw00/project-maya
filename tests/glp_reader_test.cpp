@@ -39,6 +39,23 @@ int main() {
         check(!bad3, "fewer model layers refuses");
         std::fprintf(stderr, "   refusal: %s\n", e3.c_str());
     }
+
+    // --ablate path: the same reader feeds the GLM engine's per-layer projection.  The reader
+    // contract is identical; the test above covers it.  What the GLM path adds is the routing:
+    // a GLP file refuses --ablate-layer (the file names its layers) - checked at the flag level,
+    // so only the reader behavior is testable here: alpha 0 (the file's default) and the full
+    // layer list survive the LoadOptions mapping.
+    {
+        maya::core::glp::Vector v; std::string e; std::vector<std::string> w;
+        maya::core::glp::LoadOptions lo;
+        lo.alpha = 0.0f;  // --ablate-scale 0 = the file's default: LoadOptions < 0 does that
+        lo.alpha = -1.0f;
+        check(maya::core::glp::load("/tmp/glp-inkling2mini.gguf", 2304, 48, lo, v, e, w), "ablate-path loads");
+        check(v.alpha == 0.25f, "ablate-path alpha 0 keeps glp.alpha_default");
+        check(v.s[(size_t) 1] == 0.25f && v.s[(size_t) 48] == 0.25f, "s table carries the dose per steered layer");
+        check(v.s[(size_t) 0] == 0.0f, "layer 0 unsteered");
+    }
+
     std::fprintf(stderr, fails ? "FAILURES: %d\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;
 }

@@ -1188,7 +1188,27 @@ static int glm_pack_generate(const Options& o) {
     // --ablate: the direction on every part (src/core/glm_ablate.hpp), each conversation by --ablate-default until a
     // request says otherwise
     if (!o.ablate.empty()) {
-        if (!model.ablate_load(o.ablate, o.ablate_layer, o.ablate_scale, o.ablate_default, err)) {
+        // A GLP file (glp.* metadata) carries its own layers and dose: --ablate-layer is
+        // refused (the file names them); --ablate-scale's 0-means-file maps to glp.alpha_default.
+        bool is_glp = false;
+        try {
+            maya::GgufFile probe(o.ablate);
+            for (const auto& [k, v] : probe.metadata()) { (void) v; if (k.rfind("glp.", 0) == 0) { is_glp = true; break; } }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "maya generate: --ablate: %s\n", e.what());
+            return 1;
+        }
+        if (is_glp) {
+            if (o.ablate_layer != 0) {
+                std::fprintf(stderr, "maya generate: --ablate-layer overrides the GLP file's own layer list; "
+                                    "a GLP vector names its layers\n");
+                return 1;
+            }
+            if (!model.ablate_load_glp(o.ablate, o.ablate_scale, o.ablate_default, err)) {
+                std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+                return 1;
+            }
+        } else if (!model.ablate_load(o.ablate, o.ablate_layer, o.ablate_scale, o.ablate_default, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }

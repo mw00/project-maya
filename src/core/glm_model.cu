@@ -640,6 +640,7 @@ Glm5Model::~Glm5Model() {
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
     if (abl_r_ != nullptr) cudaFree(abl_r_);   // (--ablate: this part's copy of the direction)
+    if (abl_glp_r_ != nullptr) cudaFree(abl_glp_r_);   // (--ablate GLP: the per-layer direction table)
     mtp_carry_forget();   // glm-dsa B15.3: this part's NextN carrier rows
     if (!seq_.empty()) {   // MAYA_GLM_SEQS: sequence 0 goes back to the members (freed below), the others here
         seq_bind(0);
@@ -2502,7 +2503,8 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
         }
 
         // ---- hc write (ping-pong), then the FFN half
-        ablate(A + sc_mixer, 1, nullptr);   // (--ablate: the mixer's write loses the direction)
+        if (abl_glp_r_ != nullptr) ablate_layer(A + sc_mixer, il, 1, nullptr);   // (--ablate GLP: the mixer's write loses the layer's direction)
+        else ablate(A + sc_mixer, 1, nullptr);   // (--ablate: the mixer's write loses the direction)
         maya::kernels::glm_hc_post(A + sc_mixer, R, A + sc_post, A + sc_comb, hcs, S + g.hc * g.n_embd, nullptr);
         R = S + g.hc * g.n_embd;
         cb_dump("hc_attn_post-" + L, R, g.hc * g.n_embd);
@@ -2578,7 +2580,8 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
         }
         cb_dump("ffn_out-" + L, A + sc_ffn, g.n_embd);
 
-        ablate(A + sc_ffn, 1, nullptr);   // (... and the FFN's)
+        if (abl_glp_r_ != nullptr) ablate_layer(A + sc_ffn, il, 1, nullptr);   // (... the FFN's, the layer's own)
+        else ablate(A + sc_ffn, 1, nullptr);   // (... and the FFN's)
         maya::kernels::glm_hc_post(A + sc_ffn, R, A + sc_post, A + sc_comb, hcs, S, nullptr);
         R = S;
         cb_dump("l_out-" + L, R, g.hc * g.n_embd);
