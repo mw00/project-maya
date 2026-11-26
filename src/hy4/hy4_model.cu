@@ -1811,6 +1811,14 @@ struct Model::Impl {
     // the buffers a GPU allocates for a forward (scratch()): the chunk's activations (Tc rows), the token path's int8
     // inputs and experts (W rows), the attention / indexer sub-batches' (kSub rows) and the GEMMs' weight band
     static constexpr int kSub = 64;
+    // A prompt chunk's attention (and Engram, and the dense FFN of the lead layer) in sub-chunks of ta() rows, its
+    // routed experts over the whole chunk (HY4_ATTN_SUB=N; 0: the chunk's): the attention's buffers - ~0.9 MB a row,
+    // the heads' queries and outputs in the latent space - sized for the sub-chunk, the FFN's (~0.3 MB a row) for the
+    // chunk, so a larger chunk fits the same VRAM, and the experts get several times the rows a call: an expert's
+    // weights decoded and streamed once a chunk, its GEMMs over more rows (the busy ones on cuBLAS, HY4_FAT_ROWS).
+    // The rows' sums are the same kernels' in the same order: only the experts' sets see more rows at once.
+    int attn_sub = 0;
+    int ta() const { return attn_sub > 0 && attn_sub < Tc ? attn_sub : Tc; }
     // --chunk auto: the chunks tried above kChunkBase, largest first (hy4_plan.hpp's chunk_pick)
     static constexpr int kChunkBase = 1024;
     static constexpr int kChunks[2] = {4096, 2048};
@@ -1879,26 +1887,27 @@ struct Model::Impl {
     int ixw_ld = 0;
     // the prompt path's F16 rows of the cache a layer's dense sub-batches read (kbuf): a window's and a chunk's, or an
     // indexed layer's up to dense_max (an 8-bit cache dequantized there; F16's read in place but where a ring wraps)
-    size_t deq_rows() const { return dense_kbuf_rows((size_t) g.n_swa, (size_t) Tc, (size_t) dense_max, kSub); }
+    size_t deq_rows() const { return dense_kbuf_rows((size_t) g.n_swa, (size_t) ta(), (size_t) dense_max, kSub); }
     static constexpr size_t kBand = 32u << 20;   // (values: a dense matrix decoded to F16 this much at a time)
     // (H, ff: the most heads and the widest dense / shared FFN a layer gives the GPU - a tensor-parallel member's share)
     size_t scratch_floats(size_t& f16, size_t& ints, size_t H = 64, size_t ff = 0) const {
         if (ff == 0) ff = (size_t) g.n_ff;
         const size_t E = g.n_embd, hc = g.hc, maxk = (size_t) g.ix_top_k + g.ix_kpool, T = (size_t) Tc;
+        const size_t A = (size_t) ta();   // (the attention's rows: HY4_ATTN_SUB's sub-chunk)
         const size_t lat = g.n_lat, ffe = g.n_ff_exp, npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
         const size_t egc = (size_t) std::max(1, pk.eg.cols()) * std::max(1, pk.eg.head_dim);
-        size_t f = T * hc * E + 6 * T * E + T * hc + 2 * T * g.q_lora + T * H * g.k_mla + T * H * g.kv_row() +
-                   T * g.kv_row() + T * H * g.kv_lora + 2 * T * H * g.v_mla + 3 * T * ff + T * g.n_expert + T * 16 +
-                   2 * T * lat;
+        size_t f = T * hc * E + 2 * T * E + 4 * A * E + T * hc + 2 * A * g.q_lora + A * H * g.k_mla + A * H * g.kv_row() +
+                   A * g.kv_row() + A * H * g.kv_lora + 2 * A * H * g.v_mla + std::max(3 * A * ff, 3 * T * ffe) +
+                   T * g.n_expert + T * 16 + 2 * T * lat;
         f += W * lat * 2 / 32 + 16 * W * ffe + 16 * W * ffe / 32 + 16 * W * lat;               // (the token path)
         f += k::attn_ws_floats(kSub, (int) H, g.kv_lora, (int) maxk) + kSub * npool;           // (the sub-batches)
-        f += T * (g.ix_heads * g.ix_dim + 3 * g.ix_dim + g.ix_heads) + T + T * egc + T * (hc + 1) * E;
+        f += A * (g.ix_heads * g.ix_dim + 3 * g.ix_dim + g.ix_heads) + A + A * egc + A * (hc + 1) * E + T * E;
         f += 16 * T * lat + W * E + (size_t) W * g.n_vocab;                                     // (the sets' y, head)
         f += W * E / 32;                                                                        // (the side stream's)
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
-        f16 = T * qk + kBand + 16 * T * ffe + (lat16_on ? T * lat : 0);
-        ints = T * 16 + 3 * T + T * maxk + T + 2 * 16 * T + 1024 + 4 * 16 * W + W * qk / 4 + 2 * W * lat / 4 +
-               16 * W * ffe / 4 + T * egc / 4 + W * E / 4;
+        f16 = std::max(A * qk, T * std::max({E, lat, ffe})) + kBand + 16 * T * ffe + (lat16_on ? T * lat : 0);
+        ints = T * 16 + 3 * T + A * maxk + A + 2 * 16 * T + 1024 + 4 * 16 * W + W * qk / 4 + 2 * W * lat / 4 +
+               16 * W * ffe / 4 + A * egc / 4 + W * E / 4;
         return f;
     }
     size_t scratch_bytes(size_t H = 64, size_t ff = 0) const {
@@ -3797,6 +3806,7 @@ struct Model::Impl {
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
         const size_t npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
         const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
+        const size_t A = (size_t) ta();   // (the attention's, the Engram's and the lead layer's dense FFN's rows)
         if (!only_bytes && (cublasCreate(&gp.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(gp.blas, gp.s) != CUBLAS_STATUS_SUCCESS)) {
             err = "GPU " + std::to_string(gp.dev) + ": cuBLAS did not start";
             return false;
@@ -3832,12 +3842,12 @@ struct Model::Impl {
         };
         auto all = [&]() {
             return take(gp.x, T * hc * E) && take(gp.cur, T * E) && take(gp.post, T * hc) &&
-               take(gp.xa, T * E) && take(gp.qa, T * g.q_lora) && take(gp.qr, T * g.q_lora) &&
-               take(gp.q, T * H * g.k_mla) && take(gp.qcat, T * H * g.kv_row()) &&
-               take(gp.kvr, T * g.kv_row()) && take(gp.o, T * H * g.kv_lora) &&
-               take(gp.ob, T * H * g.v_mla) && take(gp.g, T * H * g.v_mla) &&
-               take(gp.y, T * E) && take(gp.xf, T * E) && take(gp.gu, T * ff * 2) &&
-               take(gp.hd, T * ff) && take(gp.rl, T * g.n_expert) && take(gp.rw, T * 16) &&
+               take(gp.xa, A * E) && take(gp.qa, A * g.q_lora) && take(gp.qr, A * g.q_lora) &&
+               take(gp.q, A * H * g.k_mla) && take(gp.qcat, A * H * g.kv_row()) &&
+               take(gp.kvr, A * g.kv_row()) && take(gp.o, A * H * g.kv_lora) &&
+               take(gp.ob, A * H * g.v_mla) && take(gp.g, A * H * g.v_mla) &&
+               take(gp.y, T * E) && take(gp.xf, T * E) && take(gp.gu, std::max(A * ff, T * ffe) * 2) &&
+               take(gp.hd, std::max(A * ff, T * ffe)) && take(gp.rl, T * g.n_expert) && take(gp.rw, T * 16) &&
                take(gp.ids, T * 16) && take(gp.lat, T * lat) && take(gp.latout, T * (lat + (gp.sFF ? E : 0))) &&
                take(gp.xq, W * qk) && take(gp.xd, W * qk / 32) &&
                take(gp.xq4, W * E) && take(gp.xd4, W * E / 32) &&
@@ -3848,14 +3858,15 @@ struct Model::Impl {
                take(gp.grp_start, 16 * W + 2) && take(gp.grp_ent, 16 * W) &&
                take(gp.n_groups, 1) &&
                take(gp.ws, k::attn_ws_floats(kSub, (int) H, g.kv_lora, (int) maxk)) &&
-               take(gp.pos, 3 * T) && take(gp.keys, T * maxk) && take(gp.knk, T) &&
-               take(gp.iq, T * g.ix_heads * g.ix_dim) && take(gp.ik, T * g.ix_dim) &&
-               take(gp.ivt, T * 2 * g.ix_dim) && take(gp.wt, T * g.ix_heads) &&
-               take(gp.score, (size_t) kSub * npool) && take(gp.eg_rows, T * egc) &&
-               take(gp.eg_valid, T) && take(gp.eg_r, T * egc) &&
-               (eg_scale == nullptr || take(gp.eg_sc, T * (size_t) std::max(1, pk.eg.cols()))) &&
-               take(gp.eg_kvo, T * (hc + 1) * E) && take(gp.hcur, T * E) &&
-               take(gp.xh16, T * qk) && take(gp.wband, kBand) && take(gp.sh16, 16 * T * ffe) &&
+               take(gp.pos, 3 * T) && take(gp.keys, A * maxk) && take(gp.knk, A) &&
+               take(gp.iq, A * g.ix_heads * g.ix_dim) && take(gp.ik, A * g.ix_dim) &&
+               take(gp.ivt, A * 2 * g.ix_dim) && take(gp.wt, A * g.ix_heads) &&
+               take(gp.score, (size_t) kSub * npool) && take(gp.eg_rows, A * egc) &&
+               take(gp.eg_valid, A) && take(gp.eg_r, A * egc) &&
+               (eg_scale == nullptr || take(gp.eg_sc, A * (size_t) std::max(1, pk.eg.cols()))) &&
+               take(gp.eg_kvo, A * (hc + 1) * E) && take(gp.hcur, T * E) &&
+               take(gp.xh16, std::max(A * qk, T * std::max({E, lat, ffe}))) && take(gp.wband, kBand) &&
+               take(gp.sh16, 16 * T * ffe) &&
                take(gp.sy, 16 * T * lat) && take(gp.cpo, T * lat) && take(gp.bounds, 1025) && take(gp.stok, 16 * T) &&
                take(gp.srow, 16 * T) && take(gp.sS, att) && take(gp.sP, att) &&
                take(gp.dmask, (size_t) kSub * dense_max) &&
@@ -7348,11 +7359,33 @@ struct Model::Impl {
         a.tg = l.tg;
         a.td = l.td;
         a.act = iq::kActSwiglu;
-        if (!iq::set_gate_up(a, s)) {
+        // the busy experts (HY4_FAT_ROWS=N: of N rows or more, default 256; 0 off; NVIDIA): decoded to FP16 once
+        // and multiplied by cuBLAS - the tiles run at ~27 TFLOP/s whatever an expert's rows, the library's GEMM at
+        // ~48 with 512 rows (a V100, Hy4's 1536 x 1536 experts: 32 experts of 512 rows 8.4 -> 5.8 ms, the same at 256,
+        // slower below).  Their rows are left out of the tiles (skip_ge); the sums in another order
+        std::vector<int> fat;
+#if !defined(MAYA_USE_HIP)
+        if (T > W && fat_rows() > 0 && (size_t) 3 * l.ffe * lat + (size_t) max_rows * (lat + 2 * l.ffe) <= gp.wband_n) {
+            int rest = 0;
+            for (int e = 0; e < ne; ++e) {
+                const int r = b[(size_t) e + 1] - b[(size_t) e];
+                if (r >= fat_rows()) fat.push_back(e);
+                else rest = std::max(rest, r);
+            }
+            if (!fat.empty()) {
+                a.skip_ge = fat_rows();
+                a.max_rows = rest;
+            }
+        }
+#endif
+        if (a.max_rows > 0 && !iq::set_gate_up(a, s)) {
             err = "layer " + std::to_string(l.il) + ": the experts' gate / up sets did not run";
             return false;
         }
         part(gp, "experts: gate / up sets", T);
+        for (const int e : fat)
+            if (!expert_fat(l, gp, a, e, b[(size_t) e], b[(size_t) e + 1] - b[(size_t) e], err)) return false;
+        part(gp, "experts: busy ones as FP16 GEMMs", T);
         iq::SetArgs d = a;
         d.xf = nullptr;
         d.idx = nullptr;
@@ -7361,13 +7394,49 @@ struct Model::Impl {
         d.h = nullptr;
         d.y = gp.sy;
         d.ldo = lat;
-        if (!iq::set_down(d, s)) {
+        if (d.max_rows > 0 && !iq::set_down(d, s)) {
             err = "layer " + std::to_string(l.il) + ": the experts' down sets did not run";
             return false;
         }
         part(gp, "experts: down sets", T);
         k::moe_combine(gp.sy, gp.srow, gp.rw, T, nu, lat, gp.latout, s, accumulate);
         part(gp, "experts: combine", T);
+        return true;
+    }
+
+    static int fat_rows() {
+        static const int n = std::getenv("HY4_FAT_ROWS") ? std::max(0, std::atoi(std::getenv("HY4_FAT_ROWS"))) : 256;
+        return n;
+    }
+    // one busy expert of a set (slot e: its rows r0 .. r0 + n of the sorted ones) as FP16 GEMMs in the weight band:
+    // its gate, up and down decoded (f16_rows: the tiles' values), its rows gathered as F16, gate | up in one GEMM
+    // (F16 out, F32 sums), the SwiGLU into a.h's rows, the down into gp.sy's
+    bool expert_fat(Layer& l, Gpu& gp, const iq::SetArgs& a, int e, int r0, int n, std::string& err) {
+        const int lat = a.n_embd, ff = a.n_ff;
+        cudaStream_t s = gp.s;
+        const uint8_t* w = a.wbase + (size_t) e * a.stride;
+        uint16_t* wf = (uint16_t*) gp.wband;
+        uint16_t* wd = wf + (size_t) 2 * ff * lat;
+        uint16_t* xh = wd + (size_t) lat * ff;
+        uint16_t* gu = xh + (size_t) n * lat;
+        if (!iq::f16_rows(l.tg, w + a.tr[0], lat, ff, wf, lat, s) ||
+            !iq::f16_rows(l.tg, w + a.tr[1], lat, ff, wf + (size_t) ff * lat, lat, s) ||
+            !iq::f16_rows(l.td, w + a.tr[2], ff, lat, wd, ff, s)) {
+            err = "layer " + std::to_string(l.il) + ": a busy expert's weights did not decode";
+            return false;
+        }
+        k::gather_f16(a.xf, (size_t) a.ldx, a.idx + r0, n, lat, xh, s);
+        const float one = 1.0f, zero = 0.0f;
+        bool ok = cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * ff, n, lat, &one, wf, CUDA_R_16F, lat, xh,
+                               CUDA_R_16F, lat, &zero, gu, CUDA_R_16F, 2 * ff, CUBLAS_COMPUTE_32F,
+                               CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+        if (ok) k::swiglu_gu16(gu, n, ff, a.limit, a.h + (size_t) r0 * a.ldo, (size_t) a.ldo, s);
+        if (!ok || cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, lat, n, ff, &one, wd, CUDA_R_16F, ff,
+                         a.h + (size_t) r0 * a.ldo, CUDA_R_16F, a.ldo, &zero, gp.sy + (size_t) r0 * lat, CUDA_R_32F,
+                         lat, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+            err = "layer " + std::to_string(l.il) + ": a busy expert's GEMMs did not run";
+            return false;
+        }
         return true;
     }
 
@@ -9002,6 +9071,24 @@ struct Model::Impl {
                 prof_acc[std::string(what) + (T > W ? " (prompt)" : " (token)")] += t - tp;
                 tp = t;
             };
+            const int A = T > W ? ta() : T;
+            if (A < T) {   // (HY4_ATTN_SUB: the attention's rows a sub-chunk at a time - a view of the chunk's)
+                for (int r0 = 0; r0 < T; r0 += A) {
+                    const int ts = std::min(A, T - r0);
+                    Gpu gs = gp;
+                    gs.x = gp.x + (size_t) r0 * hc * E;
+                    gs.pos = gp.pos + r0;   // (its three arrays Tc apart: the sub-chunk's rows of each)
+                    if (l.eg >= 0 && !engram(l, gs, ts, err, r0)) return false;
+                    if (!attention(l, gs, ts, p0 + r0, err)) return false;
+                    if (l.dense && !ffn(l, gs, ts, err)) return false;
+                    gp.eg_armed = gs.eg_armed;
+                    gp.pf_early_il = gs.pf_early_il;
+                }
+                lap(l.swa ? "attention, window" : "attention, indexed");
+                if (!l.dense && !ffn(l, gp, T, err)) return false;
+                lap(l.dense ? "ffn, dense" : "ffn, experts");
+                continue;
+            }
             if (l.eg >= 0 && !engram(l, gp, T, err)) return false;
             if (l.eg >= 0) lap("engram");
             if (inject && l.eg >= 0) ref_cmp("engram_out", l.il, gp, gp.x, nx, T);
@@ -10330,6 +10417,9 @@ Model::~Model() {
 // launch), cuBLAS's start and the buffers made at their first use; then the state as loaded - position 0, no tokens,
 // the MTP cache empty, the counts as they were
 bool Model::load(const Options& o, std::string& err) {
+    // (HY4_ATTN_SUB: one GPU, no MTP block - its pass reads a whole chunk's rows in the attention's buffers)
+    if (const char* as = std::getenv("HY4_ATTN_SUB"))
+        m->attn_sub = !o.mtp && o.gpus.size() <= 1 && o.tp <= 1 ? std::max(0, std::atoi(as)) : 0;
     if (!m->load(o, err)) return false;
     if (o.trial) return true;   // (a drafting trial: its own short warm-up, hy4_main.cpp)
     // the GPU fetch's auto (Impl::Fetch): the lane, gpu and mix timed on the same short decode, the fastest kept (the

@@ -3826,11 +3826,39 @@ void kv_hidx(const int* set, int n_set, const int* drop, int n_drop, int* hidx, 
     check("kv_hidx");
 }
 namespace {
+__global__ void gather_f16_kernel(const float* __restrict__ x, size_t ldx, const int* __restrict__ idx, int k,
+                                  __half* __restrict__ dst) {
+    const int j = blockIdx.x;
+    const float* r = x + (size_t) idx[j] * ldx;
+    for (int c = threadIdx.x; c < k; c += blockDim.x) dst[(size_t) j * k + c] = __float2half_rn(r[c]);
+}
+__global__ void swiglu_gu16_kernel(const __half* __restrict__ gu, int ff, float limit, __half* __restrict__ h,
+                                   size_t ldh) {
+    const int j = blockIdx.x;
+    for (int c = threadIdx.x; c < ff; c += blockDim.x) {
+        float gv = __half2float(gu[(size_t) j * 2 * ff + c]), uv = __half2float(gu[(size_t) j * 2 * ff + ff + c]);
+        if (limit > 0.0f) {
+            gv = fminf(gv, limit);
+            uv = fminf(fmaxf(uv, -limit), limit);
+        }
+        h[(size_t) j * ldh + c] = __float2half_rn(__fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv))), uv));
+    }
+}
 __global__ void bf16_f32_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, size_t n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = bf16f(src[i]);
 }
 }  // namespace
+void gather_f16(const float* x, size_t ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s) {
+    if (n <= 0) return;
+    gather_f16_kernel<<<n, 256, 0, s>>>(x, ldx, idx, k, (__half*) dst);
+    check("gather_f16");
+}
+void swiglu_gu16(const uint16_t* gu, int n, int ff, float limit, uint16_t* h, size_t ldh, cudaStream_t s) {
+    if (n <= 0) return;
+    swiglu_gu16_kernel<<<n, 256, 0, s>>>((const __half*) gu, ff, limit, (__half*) h, ldh);
+    check("swiglu_gu16");
+}
 void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s) {
     if (n == 0) return;
     bf16_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(src, dst, n);
