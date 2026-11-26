@@ -399,6 +399,14 @@ int attn_decode_mma_blocks(int Hkv);
 /// operations (AMD only, on by default; IK2_ATTN_S8=0 in maya-ik2 turns it off; NVIDIA keeps e4m3x4_h4).
 void attn_decode_mma_set_s8(bool on);
 bool attn_decode_mma_s8();
+/// AMD's RDNA 3 / 4 (wave32): the FP8 cache's one-token attention (attn_decode_mma_fp8 and the window's
+/// attn_decode_mma_toks_fp8) on attn_decode_rdna_kernel - v_dot2 and DPP for the emulated m16n8k16, the same blocks,
+/// partials and combine, always the e4m3x4_h4_s8 dequant.  0: off (the default); 1: on.
+/// Not attn_decode_mma_kernel's bits (its sums in another order).  Elsewhere, or a K / V head's R over 8: off whatever
+/// the mode.
+void attn_decode_rdna_set(int mode);
+int attn_decode_rdna_mode();
+bool attn_decode_rdna_available();   // (this GPU takes it: RDNA 3 / 4, wave32)
 size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,

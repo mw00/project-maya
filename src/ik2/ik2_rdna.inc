@@ -467,3 +467,270 @@ void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T,
     moe_rows_combine_kernel<<<T, 256, 0, s>>>(y32, inv, wtr, K, C, out);
     check("moe_rows_combine");
 }
+
+// ---- One token's attention on RDNA 3 / 3.5 / 4 without the emulated mma16816 (IK2_ATTN_RDNA): attn_decode_mma_kernel's
+// job for an FP8 cache - its grid, its warps' steps of 16 keys and its partials, so attn_decode_mma_combine_kernel
+// merges them (v_inv times 256: K and V come through e4m3x4_h4_s8 as FP16 times 2^-8).  On AMD the CUDA kernel's
+// m16n8k16 is 24 shuffles and 32 FMAs a lane a call, 16 calls a step; here a step is plain v_dot2_f32_f16 and DPP:
+//   a warp is two rows of 16 lanes; a row takes 8 keys of the step (row 0 the first 8), a lane 8 of the 128 dims - 8
+//   bytes of each key's K and V, the 16 lanes a 128-byte line;
+//   Q K^T  v_dot2 over the lane's 8 dims, R heads a key; then the row's 16 sums by a transposing reduction (xor 8,
+//          4 and 2 halve the keys a lane keeps, xor 1 adds the pair): a lane ends with one key's logits (its pair
+//          lane the same), 8 R moves for 8 keys;
+//   softmax  online in log2 units as the CUDA kernel's, the max of a head over the warp's 16 keys;
+//   P V    P in FP16 by key pairs (the CUDA kernel's P), from the pair's lane by row_share; v_dot2 over a pair a dim.
+// Every sum in a fixed order, so a GPU's answers repeat; they are not attn_decode_mma_kernel's bits (another order).
+// A window's tokens (grid z) each take the blocks of their one-token launch: the window is the token path's to the bit.
+template <int M>
+__device__ __forceinline__ float rd_xor(float v) {
+#if defined(MAYA_RDNA_WMMA) && !defined(MAYA_HIP_WAVE64)
+    const int x = __builtin_bit_cast(int, v);
+    int r;
+    if constexpr (M == 1) r = __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, false);         // quad_perm [1,0,3,2]
+    else if constexpr (M == 2) r = __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, false);    // quad_perm [2,3,0,1]
+    else if constexpr (M == 4) r = __builtin_amdgcn_update_dpp(0, x, 0x164, 0xF, 0xF, false);   // row_xmask:4
+    else if constexpr (M == 8) r = __builtin_amdgcn_update_dpp(0, x, 0x168, 0xF, 0xF, false);   // row_xmask:8
+    else {
+        static_assert(M == 16, "rd_xor: 1, 2, 4, 8 or 16");
+        r = (int) __builtin_amdgcn_permlanex16((unsigned) x, (unsigned) x, 0x76543210u, 0xFEDCBA98u, false, false);
+    }
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, M);
+#endif
+}
+// lane N of this lane's row of 16 (row_share)
+template <int N>
+__device__ __forceinline__ uint32_t rd_row_lane(uint32_t x) {
+#if defined(MAYA_RDNA_WMMA) && !defined(MAYA_HIP_WAVE64)
+    return (uint32_t) __builtin_amdgcn_update_dpp(0, (int) x, 0x150 + N, 0xF, 0xF, false);
+#else
+    return __shfl_sync(0xffffffffu, x, (int) (threadIdx.x & 16u) + N);
+#endif
+}
+__device__ __forceinline__ float rd_dot2(uint32_t a, uint32_t b, float c) {
+#if defined(MAYA_RDNA_WMMA)
+    typedef _Float16 rd_h2 __attribute__((ext_vector_type(2)));
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(rd_h2, a), __builtin_bit_cast(rd_h2, b), c, false);
+#else
+    const float2 x = u32_to_f2(a), y = u32_to_f2(b);
+    return fmaf(x.y, y.y, fmaf(x.x, y.x, c));
+#endif
+}
+
+template <int R>
+__global__ void __launch_bounds__(kWaNW * 32)
+attn_decode_rdna_kernel(const uint16_t* __restrict__ q16_0, const uint8_t* __restrict__ kc,
+                        const uint8_t* __restrict__ vc, int kv_cap, int H, int Hkv, const int* pos_d, int qpos,
+                        float qk_scale, const float* __restrict__ r_0, const float* __restrict__ proj, int d_rel,
+                        bool rel4, int extent, int window, int n_split, float* __restrict__ o_part_0,
+                        float2* __restrict__ ml_part_0, int blk0, int tok_q, int tok_r, size_t tok_part) {
+#if defined(MAYA_RDNA_WMMA) && !defined(MAYA_HIP_WAVE64)
+    const int tz = blockIdx.z;
+    const uint16_t* __restrict__ q16 = q16_0 + (size_t) tz * tok_q;
+    const float* __restrict__ r = r_0 + (size_t) tz * tok_r;
+    float* __restrict__ o_part = o_part_0 + (size_t) tz * tok_part;
+    float2* __restrict__ ml_part = (float2*) ((float*) ml_part_0 + (size_t) tz * tok_part);
+    if (pos_d) qpos = pos_d[tz];
+    const int lane = threadIdx.x & 31, row = lane >> 4, li = lane & 15;
+    const int g = blockIdx.x, KD = Hkv * kFaD;
+    const int w = (blockIdx.y + blk0) * kWaNW + (threadIdx.x >> 5);   // (attn_decode_mma_kernel's warps and steps)
+    int k_lo, n_steps;
+    const int n_act = wa_active(qpos, window, n_split * kWaNW, k_lo, n_steps);
+    if (w >= n_act) return;
+    const int per = (n_steps + n_act - 1) / n_act;
+    const int st0 = min(n_steps, w * per), st1 = min(n_steps, st0 + per);
+    uint32_t qf[R][4];   // the lane's 8 dims of each head's q, FP16 pairs
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        const uint4 v = __ldg((const uint4*) (q16 + (size_t) (g * R + h) * kFaD + 8 * li));
+        qf[h][0] = v.x, qf[h][1] = v.y, qf[h][2] = v.z, qf[h][3] = v.w;
+    }
+    float o[R][8], m[R], l[R];
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        m[h] = -INFINITY, l[h] = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) o[h][d] = 0.0f;
+    }
+    const float sc = qk_scale * kLog2e * 256.0f;   // (K as FP16 times 2^-8)
+    const int kj = ((li >> 3) & 1) * 4 + ((li >> 2) & 1) * 2 + ((li >> 1) & 1);   // the key whose logits the lane ends with
+    const bool u8 = li & 8, u4 = li & 4, u2 = li & 2;
+    const uint8_t* kg = kc + (size_t) g * kFaD + 8 * li;
+    const uint8_t* vg = vc + (size_t) g * kFaD + 8 * li;
+    auto load = [&](int st, uint2* kb, uint2* vb) {
+        const int kt = k_lo + st * 16, kmax = qpos - kt;
+        const int row0 = kv_cap > 0 ? kt % kv_cap : kt;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {   // (a key past the token's: the token's row, its logits masked)
+            int rw = row0 + min(8 * row + j, kmax);
+            if (kv_cap > 0 && rw >= kv_cap) rw -= kv_cap;
+            kb[j] = __ldg((const uint2*) (kg + (size_t) rw * KD));
+            vb[j] = __ldg((const uint2*) (vg + (size_t) rw * KD));
+        }
+    };
+    uint2 kb[8], vb[8];
+    if (st0 < st1) load(st0, kb, vb);
+    for (int st = st0; st < st1; ++st) {
+        const int kt = k_lo + st * 16;
+        // Q K^T: the lane's part of its row's 8 keys, R heads each
+        float s[8][R];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint32_t k01, k23, k45, k67;
+            e4m3x4_h4_s8(kb[j].x, k01, k23);
+            e4m3x4_h4_s8(kb[j].y, k45, k67);
+#pragma unroll
+            for (int h = 0; h < R; ++h)
+                s[j][h] = rd_dot2(k67, qf[h][3], rd_dot2(k45, qf[h][2], rd_dot2(k23, qf[h][1], rd_dot2(k01, qf[h][0], 0.0f))));
+        }
+        // the row's sums: 8 keys to 4, 2, 1 a lane (the halves kept by the lane's bits 3, 2, 1), then the pair's
+        float c[R];
+        {
+            float t4[4][R], t2[2][R];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int h = 0; h < R; ++h) {
+                    const float keep = u8 ? s[j + 4][h] : s[j][h], give = u8 ? s[j][h] : s[j + 4][h];
+                    t4[j][h] = keep + rd_xor<8>(give);
+                }
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+#pragma unroll
+                for (int h = 0; h < R; ++h) {
+                    const float keep = u4 ? t4[j + 2][h] : t4[j][h], give = u4 ? t4[j][h] : t4[j + 2][h];
+                    t2[j][h] = keep + rd_xor<4>(give);
+                }
+#pragma unroll
+            for (int h = 0; h < R; ++h) {
+                const float keep = u2 ? t2[1][h] : t2[0][h], give = u2 ? t2[0][h] : t2[1][h];
+                const float t1 = keep + rd_xor<2>(give);
+                c[h] = (t1 + rd_xor<1>(t1)) * sc;
+            }
+        }
+        // the logits (log2 units): bias within the extent, mask past the token
+        const int key = kt + 8 * row + kj;
+        if (qpos - (kt + 15) < extent) {
+            const int dd = qpos - key;
+            if (dd >= 0 && dd < extent) {
+                const float* pj = proj + (size_t) dd * d_rel;
+#pragma unroll
+                for (int h = 0; h < R; ++h) {
+                    const float* rh = r + (size_t) (g * R + h) * d_rel;
+                    float b = 0.0f;
+                    if (rel4) {
+                        for (int e = 0; e < d_rel; e += 4) {
+                            const float4 x = __ldg((const float4*) (pj + e)), y = __ldg((const float4*) (rh + e));
+                            b = fmaf(x.w, y.w, fmaf(x.z, y.z, fmaf(x.y, y.y, fmaf(x.x, y.x, b))));
+                        }
+                    } else {
+                        for (int e = 0; e < d_rel; ++e) b = fmaf(__ldg(pj + e), __ldg(rh + e), b);
+                    }
+                    c[h] = fmaf(b, kLog2e, c[h]);
+                }
+            }
+        }
+        float p[R];
+#pragma unroll
+        for (int h = 0; h < R; ++h) {
+            if (key > qpos) c[h] = -INFINITY;
+            float mx = fmaxf(c[h], rd_xor<2>(c[h]));   // (over the warp's 16 keys: lanes 2 apart hold the next key)
+            mx = fmaxf(mx, rd_xor<4>(mx));
+            mx = fmaxf(mx, rd_xor<8>(mx));
+            mx = fmaxf(mx, rd_xor<16>(mx));
+            if (mx > m[h]) {   // (the warp's: every lane has the same mx and m)
+                const float f = exp2f(m[h] - mx);   // (m = -inf: 0, with o and l still 0)
+                m[h] = mx;
+                l[h] *= f;
+#pragma unroll
+                for (int d = 0; d < 8; ++d) o[h][d] *= f;
+            }
+            p[h] = exp2f(c[h] - (m[h] == -INFINITY ? 0.0f : m[h]));
+            if (!(li & 1)) l[h] += p[h];   // (a key's two lanes: the even one counts it)
+        }
+        // P by key pairs (2 i, 2 i + 1): the pair's lanes are 2 apart; lane 4 i of the row holds pair i
+        uint32_t pk[R];
+#pragma unroll
+        for (int h = 0; h < R; ++h) {
+            const float other = rd_xor<2>(p[h]);
+            pk[h] = u2 ? f2_to_u32(other, p[h]) : f2_to_u32(p[h], other);
+        }
+        // P V: o[h][d] += P (keys 2 i, 2 i + 1) . V (the same keys, dim d), pair after pair
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint32_t pp[R];
+#pragma unroll
+            for (int h = 0; h < R; ++h) {
+                if (i == 0) pp[h] = rd_row_lane<0>(pk[h]);
+                else if (i == 1) pp[h] = rd_row_lane<4>(pk[h]);
+                else if (i == 2) pp[h] = rd_row_lane<8>(pk[h]);
+                else pp[h] = rd_row_lane<12>(pk[h]);
+            }
+            const uint2 a = vb[2 * i], b = vb[2 * i + 1];
+            uint32_t v2[8];   // dim d of the two keys, FP16 times 2^-8
+            e4m3x4_h4_s8(__byte_perm(a.x, b.x, 0x5140u), v2[0], v2[1]);
+            e4m3x4_h4_s8(__byte_perm(a.x, b.x, 0x7362u), v2[2], v2[3]);
+            e4m3x4_h4_s8(__byte_perm(a.y, b.y, 0x5140u), v2[4], v2[5]);
+            e4m3x4_h4_s8(__byte_perm(a.y, b.y, 0x7362u), v2[6], v2[7]);
+#pragma unroll
+            for (int h = 0; h < R; ++h)
+#pragma unroll
+                for (int d = 0; d < 8; ++d) o[h][d] = rd_dot2(v2[d], pp[h], o[h][d]);
+        }
+        if (st + 1 < st1) load(st + 1, kb, vb);
+    }
+    // the two rows' sums (the same max), the lanes' l; row 0 writes the warp's partials
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+#pragma unroll
+        for (int d = 0; d < 8; ++d) o[h][d] += rd_xor<16>(o[h][d]);
+        float lt = l[h];
+        lt += rd_xor<1>(lt);
+        lt += rd_xor<2>(lt);
+        lt += rd_xor<4>(lt);
+        lt += rd_xor<8>(lt);
+        lt += rd_xor<16>(lt);
+        l[h] = lt;
+    }
+    if (row == 0) {
+#pragma unroll
+        for (int h = 0; h < R; ++h) {
+            float* op = o_part + ((size_t) w * H + g * R + h) * kFaD + 8 * li;
+            *(float4*) op = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+            *(float4*) (op + 4) = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+            if (li == 0) ml_part[(size_t) w * H + g * R + h] = make_float2(m[h], l[h]);
+        }
+    }
+#else
+    __trap();   // (never launched: attn_decode_rdna_on() is false off RDNA 3 / 4 wave32)
+#endif
+}
+
+// the RDNA kernel takes this layer's one-token FP8 attention (a K / V head's R up to 8)
+static bool attn_decode_rdna_on(int H, int Hkv) {
+    static const bool gpu = rdna_wmma_gpu();
+    return g_attn_rdna > 0 && gpu && Hkv > 0 && H % Hkv == 0 && H / Hkv >= 1 && H / Hkv <= 8;
+}
+static void attn_decode_rdna_launch(dim3 grid, cudaStream_t s, const uint16_t* q16, const uint8_t* kc,
+                                    const uint8_t* vc, int kv_cap, int H, int Hkv, const int* pos, int qpos,
+                                    float qk_scale, const float* r, const float* proj, int d_rel, bool rel4,
+                                    int extent, int window, int n_split, float* o_part, float2* ml_part, int blk0, int tok_q,
+                                    int tok_r, size_t tok_part) {
+#define IK2_RDNA_LAUNCH(RR)                                                                                            \
+    attn_decode_rdna_kernel<RR><<<grid, kWaNW * 32, 0, s>>>(q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj,  \
+                                                            d_rel, rel4, extent, window, n_split, o_part, ml_part, blk0,  \
+                                                            tok_q, tok_r, tok_part)
+    switch (H / Hkv) {
+        case 1: IK2_RDNA_LAUNCH(1); break;
+        case 2: IK2_RDNA_LAUNCH(2); break;
+        case 3: IK2_RDNA_LAUNCH(3); break;
+        case 4: IK2_RDNA_LAUNCH(4); break;
+        case 5: IK2_RDNA_LAUNCH(5); break;
+        case 6: IK2_RDNA_LAUNCH(6); break;
+        case 7: IK2_RDNA_LAUNCH(7); break;
+        default: IK2_RDNA_LAUNCH(8); break;
+    }
+#undef IK2_RDNA_LAUNCH
+    check("attn_decode_rdna");
+}

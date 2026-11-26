@@ -6636,6 +6636,10 @@ int main(int argc, char** argv) {
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     if (getenv("IK2_ATTN_S8")) k::attn_decode_mma_set_s8(std::atoi(getenv("IK2_ATTN_S8")) != 0);   // (AMD: 0 = h4)
+    if (getenv("IK2_ATTN_RDNA")) k::attn_decode_rdna_set(std::atoi(getenv("IK2_ATTN_RDNA")));   // (AMD RDNA 3 / 4: 1 = on)
+    std::fprintf(stderr, "maya-ik2: one-token attention %d blocks a K/V head, FP8 dequant %s, RDNA kernel %d\n",
+                 g_mma_split, k::attn_decode_mma_s8() ? "s8" : "h4",
+                 k::attn_decode_rdna_mode() && k::attn_decode_rdna_available() ? 1 : 0);
     // Older NVIDIA (docs/INKLING2.md 8): Volta (sm_70) and Turing (sm_75) take their own attention and expert kernels
     // (k::arch_class); a prompt's attention goes through cuBLAS there (the fused kernel is Ampere's: cp.async, and more
     // shared memory than a Turing SM has).  Drafting needs a verify window with the token path's own arithmetic: the
