@@ -53,7 +53,7 @@ _ds4 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ds4)
 
 # ggml type -> (name, values a block, bytes a block): the types a Hy4-flash GGUF holds and the engine reads
-TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 30: ("BF16", 1, 2), 8: ("Q8_0", 32, 34), 43: ("F8_E4M3", 1, 1),
+TYPES = {6: ("Q5_0", 32, 22), 7: ("Q5_1", 32, 24), 0: ("F32", 1, 4), 1: ("F16", 1, 2), 30: ("BF16", 1, 2), 8: ("Q8_0", 32, 34), 43: ("F8_E4M3", 1, 1),
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
          19: ("IQ1_S", 256, 50), 20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82),
@@ -237,8 +237,8 @@ def engram_bytes(kv: dict, tensors: dict, vocab: int) -> tuple:
     if "per_layer_token_embd.weight" not in tensors:
         raise SystemExit("engram: the GGUF names Engram layers but has no per_layer_token_embd table")
     typ, dims = tensors["per_layer_token_embd.weight"][:2]
-    if TYPES[typ][0] != "F8_E4M3" or dims[0] != hd:
-        raise SystemExit("engram: the table is %s %s, maya-hy4 reads F8_E4M3 rows of %d" % (TYPES[typ][0], dims, hd))
+    if TYPES[typ][0] not in ("F8_E4M3", "Q5_0", "Q5_1") or dims[0] != hd or (typ in (6, 7) and hd % 32 != 0):
+        raise SystemExit("engram: the table is %s %s, maya-hy4 reads F8_E4M3, Q5_0 or Q5_1 rows of %d" % (TYPES[typ][0], dims, hd))
     rows = dims[1]
     for c in range(nm * cols):
         if primes[c] < 2 or offs[c] + primes[c] > rows:

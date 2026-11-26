@@ -1059,6 +1059,16 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
         target_link_libraries(hy4_kernels_test PRIVATE ${_maya_gpu_runtime_target})
         add_test(NAME hy4_kernels_test COMMAND hy4_kernels_test)
         set_tests_properties(hy4_experts_test PROPERTIES TIMEOUT 300)
+        # Mixed-role GGUF experts and Q5 Engram: self-contained ggml-reference parity.
+        add_executable(hy4_mixed_quant_test tests/hy4_mixed_quant_test.cu
+                       src/hy4/hy4_kernels.cu src/ds4/ds4_iq.cu)
+        target_include_directories(hy4_mixed_quant_test PRIVATE ${_maya_gpu_include_directories}
+                                   include src/hy4 third_party/ggml)
+        target_link_libraries(hy4_mixed_quant_test PRIVATE maya_kernels_cpu ${_maya_gpu_runtime_target})
+        target_compile_definitions(hy4_mixed_quant_test PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
+        add_test(NAME hy4_mixed_quant_test COMMAND hy4_mixed_quant_test)
+        set_tests_properties(hy4_mixed_quant_test PROPERTIES TIMEOUT 300)
+
       endif()
     endif()
     if(MAYA_BUILD_TESTS)

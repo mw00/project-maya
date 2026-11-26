@@ -13,6 +13,7 @@
 //   x = hc_post(x, rms(that) w, post)
 // and logits = rms(hc_head(x)) w . Wout.
 #include "hy4_model.hpp"
+#include "hy4_legacy_q5.hpp"
 
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
@@ -329,6 +330,7 @@ struct Layer {
     int n_res = 0;               // (the plan) experts in VRAM; the others on the CPU lane
     std::vector<int> slot_of;    // each expert's slot (-1: the CPU lane's), and on the device
     int* slot_d = nullptr;
+    int mixed_types[3] = {8, 8, 8};
     CpuExperts cex;              // the CPU lane's view of the layer's experts (the file's tensors)
     // the GPU fetch (Impl::Fetch): its experts' blobs in pinned RAM as the layer's GPU addresses them, each VRAM slot's
     // expert, the experts' scores (and the start's slots and scores, put back after a trial)
@@ -833,6 +835,9 @@ struct Model::Impl {
     size_t tok_ld = 0;
     const uint8_t* eg_table = nullptr;   // (host: the Engram table's F8 rows)
     size_t eg_bytes = 0;
+    bool eg_q5_1 = false;
+    bool eg_q5_0 = false;
+    size_t eg_row_bytes = 0;
     std::thread eg_populator;            // (its pages mapped in the background)
     int ring = 0;
     int Tc = W;                          // a forward's chunk at most (the prompt path's; W: the token path's alone)
@@ -1094,9 +1099,41 @@ struct Model::Impl {
         return hc_el() ? f32_by_col(gp, n, p, err, rows, g.hc * g.n_embd)
                        : f32(gp, n, p, err, (int64_t) rows * g.hc * g.n_embd);
     }
+    bool mat_q51_part(Gpu& gp, const Tensor& t, Mat& m, std::string& err, int k, int n, int batch, int r0, int r1,
+                      int c0, int c1, int b0, int b1) {
+        if (k % 32 || t.n(0) != k || t.n(1) != n || t.n(2) != batch || t.bytes != (size_t)k / 32 * 24 * n * batch) {
+            err = "Q5_1 matrix has invalid geometry";
+            return false;
+        }
+        const int width = c1 - c0;
+        const size_t rows = (size_t)(r1 - r0) * (b1 - b0);
+        std::vector<float> h(rows * (size_t)width);
+        const uint8_t* src = pk.data(t);
+        const size_t ld = (size_t)k / 32 * 24;
+        for (int b = b0; b < b1; ++b)
+            for (int r = r0; r < r1; ++r)
+                for (int c = c0; c < c1; ++c)
+                    h[((size_t)(b - b0) * (r1 - r0) + (r - r0)) * width + c - c0] =
+                        hy4::compat::q5_value(src + ((size_t)b * n + r) * ld + (c / 32) * 24, 7, c % 32);
+        float* dst = nullptr;
+        if (!gp.alloc(dst, h.size(), err))
+            return false;
+        CK(cudaMemcpy(dst, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice));
+        m.type = kF32;
+        m.k = width;
+        m.n = r1 - r0;
+        m.batch = b1 - b0;
+        m.ld = (size_t)width * 4;
+        m.w = (const uint8_t*)dst;
+        return true;
+    }
     bool mat(Gpu& gp, const std::string& n, Mat& m, std::string& err, int k = -1, int nout = -1, int batch = 1) {
         const Tensor* t = need(n, err);
         if (!t) return false;
+        if (t->type == "Q5_1") {
+            const int ki = k < 0 ? (int)t->n(0) : k, ni = nout < 0 ? (int)t->n(1) : nout;
+            return mat_q51_part(gp, *t, m, err, ki, ni, batch, 0, ni, 0, ki, 0, batch);
+        }
         m.type = type_id(t->type);
         m.k = (int) t->n(0);
         m.n = (int) t->n(1);
@@ -1203,6 +1240,8 @@ struct Model::Impl {
         if (r0 == 0 && r1 == nout && c0 == 0 && c1 == k && b0 == 0 && b1 == batch) return mat(gp, n, m, err, k, nout, batch);
         const Tensor* t = need(n, err);
         if (!t) return false;
+        if (t->type == "Q5_1")
+            return mat_q51_part(gp, *t, m, err, k, nout, batch, r0, r1, c0, c1, b0, b1);
         const int type = type_id(t->type);
         const size_t ld = row_bytes(type, k);
         if (ld == 0 || t->n(0) != k || t->n(1) != nout || t->n(2) != batch || ld * (size_t) nout * batch != t->bytes) {
@@ -1600,14 +1639,32 @@ struct Model::Impl {
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
             if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") == std::string::npos)
-                b += t.bytes + 256 + (il < g.n_layer && t.type == "BF16" ? t.bytes : 0);   // (BF16: F32 in VRAM, mat())
+                b += (t.type == "Q5_1" ? t.bytes / 24 * 32 * 4 : t.bytes) + 256 +
+                     (il < g.n_layer && t.type == "BF16" ? t.bytes : 0);
         if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
         else
             b += ix_rows_bytes() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
                  (size_t) ring * 2 * g.ix_dim * pool_b();
         return b;
     }
+    bool cpu_only_experts(int il) const {
+        const std::string pre = "blk." + std::to_string(il) + ".";
+        const Tensor* gate = pk.get(pre + "ffn_gate_exps.weight");
+        const Tensor* up = pk.get(pre + "ffn_up_exps.weight");
+        const Tensor* down = pk.get(pre + "ffn_down_exps.weight");
+        auto gpu_type = [](const Tensor* t) {
+            return t && (t->type == "Q8_0" || t->type == "BF16" || t->type == "IQ3_S" || t->type == "IQ4_XS" ||
+                         t->type == "Q5_K" || t->type == "Q6_K");
+        };
+        const bool gpu_ok = gpu_type(gate) && gpu_type(up) && gpu_type(down);
+        return il < g.n_layer && gate && up && (gate->type != up->type || gate->type == "BF16" || up->type == "BF16") &&
+               (!gpu_ok ||
+                !(std::getenv("MAYA_GLM_HY4_MIXED_GPU") && std::atoi(std::getenv("MAYA_GLM_HY4_MIXED_GPU")) != 0));
+    }
     size_t expert_bytes(int il) const {
+        if (cpu_only_experts(il))
+            return (2 * iq::row_bytes(8, g.n_lat) * (size_t)g.n_ff_exp +
+                    iq::row_bytes(8, g.n_ff_exp) * (size_t)g.n_lat + 768);
         size_t b = 0;
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
@@ -1622,6 +1679,8 @@ struct Model::Impl {
                 b += t.bytes + 256;
                 // (a trunk layer's BF16 matrices sit in VRAM as F32 - mat(); the MTP block's are rounded to Q8_0)
                 if (il < g.n_layer && t.type == "BF16" && n.find("_exps.") == std::string::npos) b += t.bytes;
+                if (t.type == "Q5_1")
+                    b += t.bytes / 24 * 32 * 4 - t.bytes;
             }
         // caches
         if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
@@ -2221,7 +2280,8 @@ struct Model::Impl {
             double left = free_b[0];
             for (int il = 0; il < g.n_layer; ++il) {
                 const bool dense = il < g.n_dense_lead;
-                const int n = dense ? 0 : std::min(g.n_expert, (int) std::floor(rho * g.n_expert));
+                const int n =
+                    dense || cpu_only_experts(il) ? 0 : std::min(g.n_expert, (int)std::floor(rho * g.n_expert));
                 const double b = (double) dense_bytes(il) + (double) n * (double) expert_bytes(il);
                 const double need = b;
                 if (!o.layer_split.empty()) {
@@ -3266,8 +3326,8 @@ struct Model::Impl {
             !mat_part(gp, p + "attn_gate.weight", l.gate, err, E, Hall * vm, 1, h0 * vm, h1 * vm, 0, E, 0, 1))
             return false;
         for (const Mat* m : {&l.q_a, &l.q_b, &l.kv_a, &l.k_b, &l.v_b, &l.wo, &l.gate})
-            if (m->type == kF32 || m->type == kBF16 || m->type == kF16 || m->type == kF8) {
-                err = p + ": an attention matrix in F32 / BF16 / F16 (maya-hy4 runs ggml's block types there)";
+            if (m->type == kF16 || m->type == kF8) {
+                err = p + ": an attention matrix type not supported after upload";
                 return false;
             }
         if (l.mtp && (!f32(gp, p + "nextn.enorm.weight", l.enorm, err, E) ||
@@ -3334,6 +3394,67 @@ struct Model::Impl {
             const Tensor *tg = need(p + "ffn_gate_exps.weight", err), *tu = tg ? need(p + "ffn_up_exps.weight", err) : nullptr,
                          *td = tu ? need(p + "ffn_down_exps.weight", err) : nullptr;
             if (!td) return false;
+            if (!l.mtp && (tg->type != tu->type || tg->type == "BF16" || tu->type == "BF16")) {
+                if (N != 1 || tg->n(0) != lat || tu->n(0) != lat || tg->n(1) != ff || tu->n(1) != ff ||
+                    tg->n(2) != g.n_expert || tu->n(2) != g.n_expert || td->n(0) != ff || td->n(1) != lat ||
+                    td->n(2) != g.n_expert) {
+                    err = p + "mixed experts require an unsplit, matching geometry";
+                    return false;
+                }
+                if (!l.cex.init_mixed(type_id(tg->type), type_id(tu->type), type_id(td->type), lat, ff, err))
+                    return false;
+                l.cex.gate = pk.data(*tg);
+                l.cex.up = pk.data(*tu);
+                l.cex.down = pk.data(*td);
+                l.cex.limit = g.limit[(size_t)il];
+                l.mixed_types[0] = type_id(tg->type);
+                l.mixed_types[1] = type_id(tu->type);
+                l.mixed_types[2] = type_id(td->type);
+                bool mixed_gpu_types = true;
+                for (int ty : l.mixed_types)
+                    if (ty != 8 && ty != kBF16 && ty != 13 && ty != 14 && ty != 21 && ty != 23)
+                        mixed_gpu_types = false;
+                l.tg = l.td = 8;
+                l.ffe = ff;
+                const bool mixed_gpu =
+                    std::getenv("MAYA_GLM_HY4_MIXED_GPU") && std::atoi(std::getenv("MAYA_GLM_HY4_MIXED_GPU")) != 0;
+                if (!mixed_gpu || !mixed_gpu_types)
+                    l.n_res = 0;
+                l.n_res = std::max(0, std::min(l.n_res, g.n_expert));
+                l.slot_of.assign((size_t)g.n_expert, -1);
+                const size_t gb = l.cex.g_stride, ub = l.cex.u_stride, db = l.cex.d_stride;
+                auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+                l.tr[0] = 0;
+                l.tr[1] = al(gb);
+                l.tr[2] = l.tr[1] + al(ub);
+                l.blob = al(l.tr[2] + db);
+                std::vector<int> order((size_t)g.n_expert);
+                for (int e = 0; e < g.n_expert; ++e)
+                    order[e] = e;
+                if (hot.loaded && (size_t)(il + 1) * g.n_expert <= hot.score.size()) {
+                    const float* sc = hot.score.data() + (size_t)il * g.n_expert;
+                    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return sc[a] > sc[b]; });
+                }
+                order.resize((size_t)l.n_res);
+                std::sort(order.begin(), order.end());
+                if (!gp.alloc(l.experts, l.blob * (size_t)std::max(1, l.n_res), err) ||
+                    !gp.alloc(l.slot_d, (size_t)g.n_expert, err))
+                    return false;
+                std::vector<uint8_t> host(l.blob);
+                for (int slot = 0; slot < l.n_res; ++slot) {
+                    const int e = order[slot];
+                    l.slot_of[e] = slot;
+                    std::memcpy(host.data(), l.cex.G(e), gb);
+                    std::memcpy(host.data() + l.tr[1], l.cex.U(e), ub);
+                    std::memcpy(host.data() + l.tr[2], l.cex.D(e), db);
+                    CK(cudaMemcpy(l.experts + (size_t)slot * l.blob, host.data(), l.blob, cudaMemcpyHostToDevice));
+                }
+                CK(cudaMemcpy(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice));
+                info.push_back("INFO layer " + std::to_string(il) + " mixed " + tg->type + "/" + tu->type + "/" +
+                               td->type + " experts: " + std::to_string(l.n_res) +
+                               " original-weight GPU slots, remaining on CPU");
+                return caches(l, gp, err);
+            }
             l.tg = type_id(tg->type);
             l.td = type_id(td->type);
             const bool round = t_round_bf16 && l.tg == kBF16 && l.td == kBF16 && type_id(tu->type) == kBF16;
@@ -4129,12 +4250,24 @@ struct Model::Impl {
         if (pk.eg.modules > 0) {
             const Tensor* tt = need("per_layer_token_embd.weight", err);
             if (!tt) return false;
-            if (tt->type != "F8_E4M3" || tt->n(0) != pk.eg.head_dim || tt->n(1) < pk.eg.rows) {
-                err = "per_layer_token_embd: " + tt->type + " (F8_E4M3 rows of the Engram head dim expected)";
+            eg_q5_1 = tt->type == "Q5_1";
+            eg_q5_0 = tt->type == "Q5_0";
+            if ((!eg_q5_1 && !eg_q5_0 && tt->type != "F8_E4M3") || tt->n(0) != pk.eg.head_dim ||
+                tt->n(1) < pk.eg.rows || ((eg_q5_1 || eg_q5_0) && tt->n(0) % 32 != 0)) {
+                err = "per_layer_token_embd: " + tt->type +
+                      " (F8_E4M3, Q5_0 or Q5_1 rows of the Engram head dim expected)";
                 return false;
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+            eg_row_bytes = eg_q5_1   ? (size_t)pk.eg.head_dim / 32 * 24
+                           : eg_q5_0 ? (size_t)pk.eg.head_dim / 32 * 22
+                                     : (size_t)pk.eg.head_dim;
+            if (eg_row_bytes * (size_t)tt->n(1) != eg_bytes) {
+                err = "Engram table byte size mismatch";
+                return false;
+            }
+            info.push_back(std::string("INFO Engram encoding: ") + tt->type);
             if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
             if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
             if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
@@ -4744,6 +4877,18 @@ struct Model::Impl {
     // a 3D matrix head by head: y head h = M[h] x head h; x [T][H][..] (ldt, ldh), y + h ldyh, columns ldyt apart
     bool mm_heads(Gpu& gp, const Mat& M, const float* x, size_t ldt, size_t ldh, int T, int H, float* y, size_t ldyt,
                   size_t ldyh, bool pre = false) {
+        // BF16 weights are expanded exactly to F32 by mat()/mat_part().
+        // Preserve the head and token strides for both GEMV and prompt GEMM.
+        if (M.type == kF32) {
+            Mat head = M;
+            head.batch = 1;
+            for (int h = 0; h < H; ++h) {
+                head.w = M.w + (size_t)h * M.n * M.ld;
+                if (!mm(gp, head, x + (size_t)h * ldh, ldt, T, y + (size_t)h * ldyh, ldyt))
+                    return false;
+            }
+            return true;
+        }
         if (T > W) {   // (one strided batched GEMM over the heads: every head's matrix decoded to F16 at once)
             const size_t per = (size_t) M.n * M.k;
             if (per * H > gp.wband_n) return false;
@@ -5401,6 +5546,12 @@ struct Model::Impl {
                       const int* who = nullptr, bool* out_pre = nullptr, bool lat_made = false) {
         const int lat = g.n_lat, ffe = l.ffe, nu = g.n_used;
         cudaStream_t s = gp.s;
+        if (l.cex.mixed && (l.mixed_types[0] == kBF16 || l.mixed_types[1] == kBF16 || l.mixed_types[2] == kBF16)) {
+            k::mixed_experts(gp.lat, gp.ids, gp.rw, l.slot_d, l.experts, l.blob, l.tr[1], l.tr[2], l.mixed_types[0],
+                             l.mixed_types[1], l.mixed_types[2], lat, ffe, T, nu, g.limit[(size_t)l.il], gp.eh, false,
+                             gp.part, out, s);
+            return true;
+        }
         bool ok = true;
         const bool f8 = q8f(T);
         if (!lat_made && (T == 1 || !f8)) k::q8_rows(gp.lat, lat, T, lat, gp.xq, gp.xd, s);
@@ -5413,8 +5564,9 @@ struct Model::Impl {
         a.limit = g.limit[(size_t) l.il];
         a.h = gp.eh;
         a.part = gp.part;
-        a.tg = l.tg;
-        a.td = l.td;
+        a.tg = l.cex.mixed ? l.mixed_types[0] : l.tg;
+        a.tu = l.cex.mixed ? l.mixed_types[1] : 0;
+        a.td = l.cex.mixed ? l.mixed_types[2] : l.td;
         a.act = iq::kActSwiglu;
         int groups, ne_max;
         if (T == 1) {
@@ -6102,6 +6254,13 @@ struct Model::Impl {
             return false;
         }
         if (fx.want == 0 || fx.want == 4 || !lane) return true;
+        for (const Layer& l : lane_layers())
+            if (l.cex.mixed) {
+                info.push_back(
+                    "INFO GPU fetch off: mixed experts require their original-weight CPU lane for cache misses");
+                fx.want = 0;
+                return true;
+            }
         char buf[400];
         if (tp > 1) {
             info.push_back("INFO GPU fetch: not with tensor parallel - the CPU lane as before");
@@ -6626,7 +6785,10 @@ struct Model::Impl {
                         uint8_t* dst = h_stage + i * stage_blob + l.tr[role];
                         const size_t e = (size_t) s.in;
                         const uint8_t* src = role == 0 ? l.cex.G(e) : role == 1 ? l.cex.U(e) : l.cex.D(e);
-                        std::memcpy(dst, src, role == 2 ? l.cex.d_stride : l.cex.g_stride);
+                        std::memcpy(dst, src,
+                                    role == 2                     ? l.cex.d_stride
+                                    : role == 1 && l.cex.u_stride ? l.cex.u_stride
+                                                                  : l.cex.g_stride);
                     };
                     if (lane && nb >= 2) lane->parallel_for((int) (nb * 3), gather);
                     else
@@ -6701,6 +6863,16 @@ struct Model::Impl {
                       int n_slots = -1, bool accumulate = false) {
         const int lat = g.n_lat, nu = g.n_used, ne = slot ? (n_slots >= 0 ? n_slots : l.n_res) : g.n_expert;
         cudaStream_t s = gp.s;
+        if (l.cex.mixed) {
+            if (wbase || accumulate) {
+                err = "mixed expert streaming is not enabled";
+                return false;
+            }
+            k::mixed_experts(gp.lat, gp.ids, gp.rw, l.slot_d, l.experts, l.blob, l.tr[1], l.tr[2], l.mixed_types[0],
+                             l.mixed_types[1], l.mixed_types[2], lat, l.ffe, T, nu, g.limit[(size_t)l.il], gp.sh16,
+                             true, gp.sy, gp.latout, s);
+            return true;
+        }
         part0(gp);
         k::moe_sort(gp.ids, T, nu, g.n_expert, gp.bounds, gp.stok, gp.srow, s, slot, nullptr, ne);
         if (ne == 0) {   // (no expert of the set here: the zeros, or nothing to add)
@@ -6990,7 +7162,7 @@ struct Model::Impl {
                 if (share) {   // (tensor parallel with the CPU lane: every member its share, to its own GPU)
                     ok = ok && experts_streamed(l, gp, T, err, true);
                     streamed = true;
-                } else if (lane_on && route.any) {
+                } else if (lane_on && !l.cex.mixed && route.any) {
                     int n_ent = 0;
                     std::vector<char> used((size_t) g.n_expert, 0);
                     for (int i = 0; i < T * nu; ++i)
@@ -7014,7 +7186,7 @@ struct Model::Impl {
                         stream = side == 1;
                         if (timed && n_ent > 0) route_side = side, route_amount = side ? mb : (double) n_ent;
                     }
-                    if (stream) {
+                    if (!l.cex.mixed && stream) {
                         if (route_side == 1) CK(cudaStreamSynchronize(s));   // (timed alone: the GPU's queue done)
                         const double ts = now_s();
                         ok = ok && experts_streamed(l, gp, T, err);
@@ -7131,7 +7303,7 @@ struct Model::Impl {
                 for (int h = 0; h < eg.heads; ++h) {
                     const int col = (oo - 1) * eg.heads + h;
                     const uint64_t row = rolling % primes[col] + offs[col];
-                    std::memcpy(dst + ((size_t) t * cols + col) * hd, eg_table + row * (uint64_t) hd, (size_t) hd);
+                    std::memcpy(dst + ((size_t)t * cols + col) * hd, eg_table + row * eg_row_bytes, eg_row_bytes);
                     float sc = 1.0f;
                     if (eg_scale != nullptr) {
                         uint16_t sb;
@@ -7144,7 +7316,7 @@ struct Model::Impl {
                         const int64_t rec[4] = {e, p, col, (int64_t) row};
                         std::fwrite(rec, 8, 4, eg_dump);
                         std::fwrite(&sc, 4, 1, eg_dump);
-                        std::fwrite(eg_table + row * (uint64_t) hd, 1, (size_t) hd, eg_dump);
+                        std::fwrite(eg_table + row * eg_row_bytes, 1, eg_row_bytes, eg_dump);
                     }
                 }
             }
@@ -7199,7 +7371,11 @@ struct Model::Impl {
         if (eg_scale != nullptr)
             CK(cudaMemcpyAsync(gp.eg_sc, h_egs + ((size_t) l.eg * Tc + (size_t) r0) * cols, sizeof(float) * T * cols,
                                cudaMemcpyHostToDevice, se));
-        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, se, eg_scale ? gp.eg_sc : nullptr);
+        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, se,
+                       eg_scale ? gp.eg_sc : nullptr,
+                       eg_q5_1   ? 1
+                       : eg_q5_0 ? 2
+                                 : 0);
         dbg("engram_rows_normed", l.il, gp, gp.eg_r, T, (size_t) cols * hd);
         if (!mm(ge, l.eg_kv, gp.eg_r, (size_t) cols * hd, T, gp.eg_kvo, (size_t) (g.hc + 1) * E)) {
             err = "engram_kv: a GEMV the kernels do not take";

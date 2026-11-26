@@ -206,11 +206,16 @@ bool moe_sum(const float* part, int T, int n_used, int n, const float* w, float*
 /// rows, two a token: entry e reads row e >> 3)
 void dup_rows_q8(const int8_t* q, const float* d, int rows, int k, int8_t* q2, float* d2, cudaStream_t s);
 
+// Original Q8_0/BF16/IQ3_S/IQ4_XS/Q5_K/Q6_K mixed experts. Missing slots contribute zero; the CPU lane supplies them.
+void mixed_experts(const float* x, const int* ids, const float* weights, const int* slot, const uint8_t* base,
+                   size_t stride, size_t up, size_t down, int tg, int tu, int td, int E, int F, int T, int used,
+                   float limit, void* hidden, bool half_hidden, float* partial, float* out, cudaStream_t stream);
+
 /// Engram.  rows: the window's looked-up rows, F8 E4M3 [T][cols][dim]; valid[t] 0 / 1 -> r [T][cols dim] = each row
 /// RMS-normed (eps) times lookup_norm [cols][dim], times valid.  scale [T][cols] (or none): each row's own scale, its
 /// values the codes times it (a table of per-row scaled codes with its scales beside it)
 void engram_rows(const uint8_t* rows, const float* valid, int T, int cols, int dim, const float* lookup_norm, float eps,
-                 float* r, cudaStream_t s, const float* scale = nullptr);
+                 float* r, cudaStream_t s, const float* scale = nullptr, int q5_type = 0);
 /// kv [T][(hc + 1) E] (the fused key / value projection, without its bias kv_b [(hc + 1) E]) -> x[t][s] += delta, for
 /// the tokens with valid[t]: delta[s][d] = rms(value + b)[d] gamma[d] (gate[s] + hc_scale[s][d]),
 /// gate[s] = sigmoid(sign(dot) sqrt(max(|dot|, 1e-6))), dot = sum_d rms(x[s])[d] rms(key[s])[d] egate[s][d] / sqrt(E)

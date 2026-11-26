@@ -26,7 +26,7 @@ MTP = HERE / "hy4" / "mtp_gguf.py"
 ARCH = "hy_v4_flash"
 
 # ggml type -> (values a block, bytes a block)
-BLOCK = {0: (1, 4), 8: (32, 34), 12: (256, 144), 30: (1, 2), 43: (1, 1)}
+BLOCK = {6: (32, 22), 7: (32, 24), 0: (1, 4), 8: (32, 34), 12: (256, 144), 30: (1, 2), 43: (1, 1)}
 TAG = ":6124c78e"
 D, NL, ROWS, HD = 256, 3, 64, 32
 SPECIAL = ["<｜hy_start%s｜>" % TAG, "<｜hy_end%s｜>" % TAG, "<think%s>" % TAG, "</think%s>" % TAG,
@@ -170,6 +170,20 @@ class PackTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_q5_engram(self):
+        for typ, name, block_bytes in ((6, "Q5_0", 22), (7, "Q5_1", 24)):
+            with self.subTest(type=name):
+                gguf(self.root / "Hy4-flash-Q4_K_M-00002-of-00002.gguf", {"split.count": (2, 2)},
+                     [("blk.2.attn_q_a.weight", 12, [D, 128]),
+                      ("per_layer_token_embd.weight", typ, [HD, ROWS])])
+                r = pack(self.root)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                lines = (self.root / "maya-hy4" / "tensors.txt").read_text().splitlines()
+                row = next(x.split() for x in lines if x.startswith("t per_layer_token_embd.weight "))
+                self.assertEqual(row[2], name)
+                self.assertEqual(int(row[5]), HD // 32 * block_bytes * ROWS)
+                self.assertTrue((self.root / "maya-hy4" / "engram.bin").is_file())
 
     def test_other_files_in_the_folder(self):
         # a vision projector and a drafter beside the set: the pack is the set's alone

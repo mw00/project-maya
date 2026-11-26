@@ -104,12 +104,16 @@ struct Q4xSet {
 struct CpuExperts {
     maya::ds4::gguf::IqCpu f;
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
+    bool mixed = false;
+    maya::ds4::gguf::IqCpu mix_g, mix_u;
+    size_t u_stride = 0;
+    bool init_mixed(int tg, int tu, int td, int n_embd, int n_ff, std::string& err);
     size_t g_stride = 0, d_stride = 0;   // bytes an expert in the gate / up tensors, in the down tensor
     // (0: g_stride / d_stride) the step from one expert's matrix to the next's - the GPU fetch's RAM store, where an
     // expert's three matrices lie side by side in one blob (gate, up, down at its offsets): the blob's bytes
     size_t step = 0;
     const uint8_t* G(size_t e) const { return gate + e * (step ? step : g_stride); }
-    const uint8_t* U(size_t e) const { return up + e * (step ? step : g_stride); }
+    const uint8_t* U(size_t e) const { return up + e * (step ? step : u_stride ? u_stride : g_stride); }
     const uint8_t* D(size_t e) const { return down + e * (step ? step : d_stride); }
     float limit = 0.0f;
     std::shared_ptr<Q4xSet> q4x;         // (null: no copies for this layer)
