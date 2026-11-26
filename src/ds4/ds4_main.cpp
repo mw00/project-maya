@@ -1702,6 +1702,13 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         P.done = from;
         P.next_pp = from + 64;
         P.continued = continued;
+        // the read's first PP line, before a token of it is read: what the state already held (`from`) of the prompt's
+        // `total` - a client knows at once how much there is to read, not only after the first chunk (#1273).  None
+        // when nothing is left to read (the PP line at its end says it)
+        if (from < r.ids.size()) {
+            std::printf("PP%s %zu %zu 0.0 0.0 %zu\n", tag.c_str(), from, r.ids.size(), from);
+            std::fflush(stdout);
+        }
         // the restore points the request asks for (marks= / shared=; ds4_marks.hpp picks the ones this read reaches):
         // the read stops at each and keeps the state there.  The stretch up to each is read as runs of its own (a
         // piece ends at a point, and tells the model only of the prompt up to the next one: Model::feed's `after`),
