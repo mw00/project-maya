@@ -839,6 +839,26 @@ class RequestChecks(unittest.TestCase):
             svc.check_request({"ignore_eos": True, "max_tokens": 8})
 
 
+class SamplerEnds(unittest.TestCase):
+    def test_a_closed_server_stops_its_sampler(self):
+        """server_close(): the hardware sampler behind /metrics ends with the server. Every test server's sampler
+        used to read the sensors each second for the rest of the suite (50 of them by the stop tests, v1.1.82's CI)."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        tel = svc.telemetry
+        self.assertFalse(tel._stopped.is_set())
+        httpd.shutdown()
+        self.assertIs(svc.telemetry, tel)               # (main()'s stop: the stall watchdog still reads it)
+        httpd.server_close()
+        self.assertTrue(tel._stopped.is_set())
+        self.assertIsNone(svc.telemetry)
+        again = serve(svc, port=0)                      # (the same service served again: a sampler of its own)
+        self.addCleanup(lambda: (again.shutdown(), again.server_close()))
+        self.assertIsNotNone(svc.telemetry)
+        self.assertIsNot(svc.telemetry, tel)
+
+
 class PrometheusMetrics(unittest.TestCase):
     """GET /metrics/prometheus: llama-server's metric names in Prometheus' text format, behind the API key."""
 

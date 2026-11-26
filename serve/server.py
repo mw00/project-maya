@@ -7678,6 +7678,14 @@ class Server(ThreadingHTTPServer):
         try:
             if service is not None:
                 service.response_jobs.close()
+                # the hardware sampler behind /metrics ends with its server's socket: each server closed with its
+                # sampler left reading the sensors every second - every test server of the suite - kept a thread for
+                # ever. (main()'s stop does not close the socket: the stall watchdog reads the sampler while the
+                # request in progress wraps up.)
+                tel = getattr(service, "telemetry", None)
+                if tel is not None and callable(getattr(tel, "stop", None)):
+                    tel.stop()
+                    service.telemetry = None            # (a later serve() of the same service starts a new one)
         finally:
             super().server_close()
 
