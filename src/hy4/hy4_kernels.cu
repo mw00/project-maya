@@ -1733,7 +1733,7 @@ __global__ void __launch_bounds__(256) attn_softmax_kernel(const float* __restri
                                                            int k0, const int* __restrict__ pos, int window,
                                                            const float* __restrict__ mask, size_t ldm, float scale,
                                                            const float* __restrict__ sinks, __half* __restrict__ P,
-                                                           size_t ldP) {
+                                                           size_t ldP, int nv) {
     __shared__ float sh[32];
     const int r = blockIdx.x, t = r / H, h = r % H;
     const int p = pos[t];
@@ -1741,6 +1741,7 @@ __global__ void __launch_bounds__(256) attn_softmax_kernel(const float* __restri
     __half* pr = P + (size_t) r * ldP;
     const int lo = window > 0 ? max(0, p - window + 1) : 0;
     auto seen = [&](int j) {
+        if (j >= nv) return false;   // (the padding)
         if (window < 0) return mask[(size_t) t * ldm + j] == 0.0f;   // (the columns a list of keys: the mask alone)
         const int q = k0 + j;
         if (q > p || q < lo) return false;
@@ -1767,6 +1768,53 @@ __global__ void __launch_bounds__(256) attn_softmax_kernel(const float* __restri
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     for (int j = threadIdx.x; j < nkr; j += blockDim.x)
         pr[j] = __float2half_rn(seen(j) ? expf(sr[j] * scale - m) * inv : 0.0f);
+}
+// the same a warp a row, for rows of at most 32 N keys: the row read once into registers, the maximum and the sum
+// warp reductions (8 rows a block).  A window layer's row is ~575 keys: a block of 256 threads a row spent its time in
+// three passes' barriers (a V100: ~97 us for 4096 rows of 575)
+template <int N>
+__global__ void __launch_bounds__(256) attn_softmax_warp_kernel(const float* __restrict__ S, size_t ldS, int R, int H,
+                                                                int nkr, int k0, const int* __restrict__ pos, int window,
+                                                                const float* __restrict__ mask, size_t ldm, float scale,
+                                                                const float* __restrict__ sinks, __half* __restrict__ P,
+                                                                size_t ldP, int nv) {
+    const int r = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= R) return;
+    const int t = r / H, h = r % H;
+    const int p = pos[t];
+    const float* sr = S + (size_t) r * ldS;
+    __half* pr = P + (size_t) r * ldP;
+    const int lo = window > 0 ? max(0, p - window + 1) : 0;
+    float v[N];
+    float m = sinks ? sinks[h] : -INFINITY;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const int j = lane + 32 * i;
+        bool ok = j < nv;
+        if (ok) {
+            if (window < 0) ok = mask[(size_t) t * ldm + j] == 0.0f;
+            else {
+                const int q = k0 + j;
+                ok = q <= p && q >= lo && (window > 0 || mask[(size_t) t * ldm + j] == 0.0f);
+            }
+        }
+        v[i] = ok ? sr[j] * scale : -INFINITY;
+        m = fmaxf(m, v[i]);
+    }
+    m = warp_max(m);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        v[i] = v[i] == -INFINITY ? 0.0f : expf(v[i] - m);
+        sum += v[i];
+    }
+    sum = warp_sum(sum) + (sinks ? expf(sinks[h] - m) : 0.0f);
+    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const int j = lane + 32 * i;
+        if (j < nkr) pr[j] = __float2half_rn(v[i] * inv);
+    }
 }
 __global__ void dsa_mask_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ nk, int k0, int nkr,
                                 float* __restrict__ mask, size_t ldm) {
@@ -3184,10 +3232,21 @@ void dfly_expand_keys(const int* snap, const int* snap_nk, int n_layers, int W, 
 }
 void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, const int* pos, int window,
                   const float* mask, size_t ldm, float scale, const float* sinks, uint16_t* P, size_t ldP,
-                  cudaStream_t s) {
+                  cudaStream_t s, int nv) {
     if (T <= 0) return;
-    attn_softmax_kernel<<<T * H, 256, 0, s>>>(S, ldS, H, nkr, k0, pos, window, mask, ldm, scale, sinks, (__half*) P,
-                                             ldP);
+    if (nv < 0) nv = nkr;
+    static const bool warp_off = std::getenv("HY4_SOFTMAX_WARP") && std::getenv("HY4_SOFTMAX_WARP")[0] == '0';
+    const int R = T * H;
+    const dim3 gw((unsigned) ((R + 7) / 8));
+#define SW_(N) attn_softmax_warp_kernel<N><<<gw, 256, 0, s>>>(S, ldS, R, H, nkr, k0, pos, window, mask, ldm, scale, sinks, \
+                                                             (__half*) P, ldP, nv)
+    if (!warp_off && nkr <= 32 * 8) SW_(8);
+    else if (!warp_off && nkr <= 32 * 20) SW_(20);
+    else if (!warp_off && nkr <= 32 * 32) SW_(32);
+    else
+        attn_softmax_kernel<<<R, 256, 0, s>>>(S, ldS, H, nkr, k0, pos, window, mask, ldm, scale, sinks, (__half*) P,
+                                             ldP, nv);
+#undef SW_
     check("attn_softmax");
 }
 void dsa_mask(const int* keys, int ldk, const int* nk, int T, int k0, int nkr, float* mask, size_t ldm, cudaStream_t s) {
