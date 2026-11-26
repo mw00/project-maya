@@ -4732,8 +4732,15 @@ struct Model::Impl {
             quant = quant && o.m->k == k;
         }
         if (!quant || outs.size() > 64) {
+            // (a prompt's GEMMs over the same x: its F16 rows made once - gemm's x16_same - for every matrix of its width)
+            x16_multi = T > W;
+            x16_made = nullptr;
             for (const Out& o : outs)   // (pre: the int8 rows are the first matrix's width of x)
-                if (!mm(gp, *o.m, x, ldx, T, o.y, o.ldy, 1.0f, pre && o.m->k == k)) return false;
+                if (!mm(gp, *o.m, x, ldx, T, o.y, o.ldy, 1.0f, pre && o.m->k == k)) {
+                    x16_multi = false;
+                    return false;
+                }
+            x16_multi = false;
             return true;
         }
         if (!pre) k::q8_rows(x, ldx, T, k, gp.xq, gp.xd, gp.s);
@@ -4754,6 +4761,11 @@ struct Model::Impl {
         }
         return iq::mv(jobs.data(), (int) jobs.size(), gp.s);
     }
+    // (mm_multi's prompt GEMMs over one x: the F16 rows gemm made last - kept only within one mm_multi call)
+    bool x16_multi = false;
+    const float* x16_made = nullptr;
+    size_t x16_ld = 0;
+    int x16_T = 0, x16_k = 0;
     bool gemm(Gpu& gp, const Mat& M, const float* x, size_t ldx, int T, float* y, size_t ldy, float alpha) {
         const float beta = 0.0f;
         if (M.type == kF32) {
@@ -4768,7 +4780,13 @@ struct Model::Impl {
                                (int) ldx, &beta, y, (int) ldy) == CUBLAS_STATUS_SUCCESS;
         }
         if (M.type == kBF16 || M.type == kF16 || !iq::mv_supported(M.type)) return false;
-        k::to_f16(x, ldx, T, M.k, gp.xh16, (size_t) M.k, gp.s);
+        if (!(x16_multi && x16_made == x && x16_ld == ldx && x16_T == T && x16_k == M.k)) {
+            k::to_f16(x, ldx, T, M.k, gp.xh16, (size_t) M.k, gp.s);
+            x16_made = x16_multi ? x : nullptr;
+            x16_ld = ldx;
+            x16_T = T;
+            x16_k = M.k;
+        }
         if (const uint16_t* wc = wc_get(gp, M.type, M.w, M.ld, M.k, M.n))
             return cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &alpha, wc, CUDA_R_16F, M.k, gp.xh16,
                                 CUDA_R_16F, M.k, &beta, y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F,
