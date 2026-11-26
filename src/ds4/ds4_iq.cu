@@ -2094,7 +2094,7 @@ void dn_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     else if (ne <= 8) launch_dn<T, 8>(a, grid, s);
     else launch_dn<T, 16>(a, grid, s);
 }
-static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_RM, else 4 on gfx11, else 1)
+static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_RM, else 4 on gfx11, 2 on Volta, else 1)
     static const int env = [] {
         const char* v = std::getenv("DS4_IQ_TC_RM");
         if (v == nullptr) return 0;
@@ -2114,7 +2114,21 @@ static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_
     }
     return k;
 #else
-    return 1;
+    // (Volta, compute capability 7.0: 2 - a V100, Hy4-Flash Maya-S's prompt experts, a 22K prompt 496 -> 508 tok/s;
+    //  4 was slower there, 467.  Others: 1, not measured)
+    static std::atomic<int> known[64];   // 0: not asked yet, else the answer
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 1;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+        int major = 0, minor = 0;
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+        if (!ok) (void) cudaGetLastError();
+        k = ok && major == 7 && minor == 0 ? 2 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k;
 #endif
 }
 template <int T, bool GU, int EPI = 0>
