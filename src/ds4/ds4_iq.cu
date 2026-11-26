@@ -400,10 +400,31 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         const uint8_t* ql = b + 64 * hf + 32 * (qt & 1);
         const uint8_t* qh = b + 128 + 32 * hf;
         const int8_t* sc = (const int8_t*) (b + 192 + 8 * hf + 2 * qt);
+#if !defined(DS4_IQ_Q6_LD2)
+        // (ql's and qh's 32 bytes each from 9 aligned words, shifted into place: a block is 2-byte aligned, and ld2's
+        //  two 16-bit loads a word made 32 loads a sub-block - a Q6_K GEMV of one column is bound by them on a V100.
+        //  The words read: ql's from 2 bytes before it at most - inside the block, or the 2 bytes before a block that
+        //  starts 2 bytes past a word, inside the matrix's allocation as mv's check of its start - to 2 bytes past its
+        //  end (qh's start); qh's to the scales.  The same bytes: the same bits)
+        const uint32_t sh = 8u * (uint32_t) ((uintptr_t) ql & 3u);   // (ql and qh: both the block's alignment)
+        const uint32_t* la = (const uint32_t*) ((uintptr_t) ql & ~(uintptr_t) 3);
+        const uint32_t* ha = (const uint32_t*) ((uintptr_t) qh & ~(uintptr_t) 3);
+        uint32_t lw[9], hw[9];
+#pragma unroll
+        for (int t = 0; t < 9; ++t) {
+            lw[t] = la[t];
+            hw[t] = ha[t];
+        }
+#endif
 #pragma unroll
         for (int t = 0; t < 8; ++t) {
+#if !defined(DS4_IQ_Q6_LD2)
+            const uint32_t v = ((__funnelshift_r(lw[t], lw[t + 1], sh) >> (4 * (qt >> 1))) & 0x0f0f0f0fu) |
+                               (((__funnelshift_r(hw[t], hw[t + 1], sh) >> (2 * qt)) & 0x03030303u) << 4);
+#else
             const uint32_t v = ((ld2(ql + 4 * t) >> (4 * (qt >> 1))) & 0x0f0f0f0fu) |
                                (((ld2(qh + 4 * t) >> (2 * qt)) & 0x03030303u) << 4);
+#endif
             // (each byte v - 32 for v in 0..63, no carry between them: v ^ 32, the top two bits set where v < 32)
             const uint32_t lo = (~v) & 0x20202020u;
             s.q[t] = (int) ((v ^ 0x20202020u) | (lo << 1) | (lo << 2));
