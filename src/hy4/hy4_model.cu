@@ -4135,6 +4135,15 @@ struct Model::Impl {
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+#if !defined(_WIN32)
+            // a lookup reads one 96-byte row of tens of GB: without this, each page fault reads the kernel's read-around
+            // (128 KB by default) into the page cache - ~30x the pages the rows need, pushing the CPU lane's experts out
+            // of the RAM (read from the disk again at their next use).  HY4_EG_RANDOM=0: the kernel's default
+            if (const char* er = std::getenv("HY4_EG_RANDOM"); er == nullptr || std::atoi(er) != 0) {
+                const uintptr_t a = (uintptr_t) eg_table, b = a & ~(uintptr_t) 4095;
+                (void) madvise((void*) b, eg_bytes + (a - b), MADV_RANDOM);
+            }
+#endif
             if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
             if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
             if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
