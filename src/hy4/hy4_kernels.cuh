@@ -275,6 +275,11 @@ void dsa_mask_list(const int* keys, int ldk, const int* nk, int T, const int* co
                    size_t ldm, cudaStream_t s);
 /// The prompt path.  dst[r][i] = F16(src[r * lds + i]), i < n
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s);
+/// (the busy experts' FP16 GEMMs, hy4_model.cu's experts_fat) dst[j][0 .. k) = F16 of x[idx[j]][0 .. k), n rows
+void gather_f16(const float* x, size_t ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s);
+/// ... h[j * ldh + c] = F16 of silu(min(g, limit)) clamp(u, -limit, limit) (limit 0: none), g = gu[j][c] and u =
+/// gu[j][ff + c] (F16, the gate | up GEMM's rows) - ds4_iq's swiglu on those values
+void swiglu_gu16(const uint16_t* gu, int n, int ff, float limit, uint16_t* h, size_t ldh, cudaStream_t s);
 /// dst[i] = the F32 of BF16 src[i] (exact), n values
 void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s);
 /// A chunk's expert entries sorted by expert for ds4_iq's sets: entry e = t n_used + j of ids; bounds[x .. x + 1] the
