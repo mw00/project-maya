@@ -12102,7 +12102,7 @@ def ling_about() -> str:
     sizes = [f"{LING_QUANTS[k]} ({ling_entry(k)['download_gb']:.0f} GB)" for k in LING_QUANTS if ling_published(k)]
     return ("inclusionAI's Ling-3.2-air (512 experts a layer, 8 a token) on its own engine"
             + (", in Maya's own GGUF quants: " + ", ".join(sizes) if sizes else "") +
-            "; NVIDIA from V100 / RTX 20 on with 8 GB or more, Linux only; one GPU or several (the layers split across "
+            "; NVIDIA from V100 / RTX 20 on, Linux only; one GPU or several (the layers split across "
             "them), the experts that do not fit in VRAM computed from RAM, the rest read from the SSD; tool calls, "
             "thinking on or off, up to a 256K context, MTP drafting where the file has the model's draft block "
             "(measured once on this PC), pictures where its vision file is beside the model; one answer at a time.")

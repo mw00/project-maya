@@ -6948,7 +6948,7 @@ def make_handler(svc: Service):
                         svc.default_effort) or svc.default_effort
                     if getattr(svc.template, "forced_thinking", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
-                    if getattr(svc.template, "hy4", False):   # (Hy4-flash: the level it runs at, none / high)
+                    if getattr(svc.template, "hy4", False) or getattr(svc.template, "ling", False):   # (none / high)
                         rec["reasoning_effort"] = svc.template.effort_shown(svc.default_effort) or \
                             rec["reasoning_effort"]
                 # Hy4-flash alone: its two levels (the page offers these and no others)
@@ -8370,7 +8370,7 @@ def main() -> int:
                                                      else "none")
         if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
             level = QWEN_EFFORT.get(level, level)
-        if getattr(svc.template, "hy4", False):               # (Hy4-flash: the level it runs at, none / high)
+        if getattr(svc.template, "hy4", False) or getattr(svc.template, "ling", False):   # (Hy4-flash, Ling: none / high)
             level = svc.template.effort_shown(svc.default_effort) or level
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",

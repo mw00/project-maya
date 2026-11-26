@@ -19,7 +19,7 @@ alesha-pro contributed (PR #1224).
 
 | | |
 | --- | --- |
-| NVIDIA, Linux | V100 / RTX 20 and newer (compute capability 7.0 on), 8 GB of VRAM or more, one GPU or several |
+| NVIDIA, Linux | V100 / RTX 20 and newer (compute capability 7.0 on), one GPU or several |
 | CPU | AVX2 (the experts that are not in VRAM are computed on the CPU) |
 | Windows, AMD, Mac | not yet: the setup says so in one line and stops |
 
@@ -65,7 +65,9 @@ Nothing here is a fixed number for one machine: the setup reads the PC, and the 
   `./maya.sh --calibrate` clears it, and the next start measures again.
 - **Drafting**: `--drafting auto` by default. Where the file has the model's draft block, the engine measures once
   whether drafting makes answers faster on this PC and keeps the faster. `--drafting off` turns it off;
-  `--drafting on` turns it on without measuring. A file without the draft block runs without it.
+  `--drafting on` turns it on without measuring. A file without the draft block runs without it. The Models page
+  offers On and Off (they write `--drafting on` / `--drafting off`); a setup's `auto` shows there as On and stays
+  `auto` until one of them is picked.
 - **The cache format**: FP16 rows by default. `--kv q8` in the config's arguments halves the cache (8-bit rows); the
   engine has no measured choice between the two yet.
 

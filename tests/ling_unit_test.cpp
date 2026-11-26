@@ -8,6 +8,8 @@
 //   7. GGUF fingerprint: same size + same first 64 KiB but different quant bytes / tensor table never collide
 //   8. Full-precision (F32 / F16 / BF16) dense matrices -> Q8_0 at load (ling_dense.hpp)
 #include "ling_dense.hpp"
+#include "ling_drafting.hpp"
+#include "ling_moe_plan.hpp"
 #include "ling_restore.hpp"
 #include "ling_sys.hpp"
 
@@ -639,6 +641,63 @@ static void test_dense_to_q8_0() {
     std::printf("PASS test_dense_to_q8_0\n");
 }
 
+// A staged expert set of a long prompt block: one hot expert can have more rows than the set scratch holds
+// (P x n_used); the tiles must cover every token once and never hold more than that (5000-token prompt crash)
+static void test_moe_tiles_bound_rows() {
+    namespace M = ling::moe_plan;
+    constexpr int NU = 8, NE = 256;
+    for (int P : {64, 256}) {
+        const int max_set_rows = P * NU;
+        for (int B : {P, 3 * P + 17, 4096, 8192}) {
+            std::vector<int> ids((size_t) B * NU);
+            for (int t = 0; t < B; ++t)
+                for (int j = 0; j < NU; ++j) ids[(size_t) t * NU + j] = j == 0 ? 7 : 8 + (t * 31 + j * 13) % (NE - 8);   // 7: every token, once
+            std::vector<int> in_set((size_t) NE, -1);
+            in_set[7] = 0;   // the set: expert 7 alone (B rows)
+            in_set[200] = 1;
+            long long rows = 0, seen_tokens = 0;
+            int next_t0 = 0;
+            for (const auto& tl : M::tiles(ids.data(), B, NU, in_set, P)) {
+                EXPECT(tl.t0 == next_t0 && tl.T > 0 && tl.T <= P, "P=%d B=%d: tiles cover the block in order", P, B);
+                EXPECT(tl.rows <= max_set_rows && tl.max_rows <= tl.rows, "P=%d B=%d: a tile's rows fit the scratch", P, B);
+                EXPECT(tl.max_rows == tl.T, "P=%d B=%d: expert 7's rows in the tile = its tokens", P, B);
+                next_t0 = tl.t0 + tl.T;
+                rows += tl.rows;
+                seen_tokens += tl.T;
+            }
+            long long want = 0;
+            for (int v : ids) want += (v == 7 || v == 200) ? 1 : 0;
+            EXPECT(seen_tokens == B && rows == want, "P=%d B=%d: every row once (%lld of %lld)", P, B, rows, want);
+            if (B > max_set_rows) EXPECT(!M::one_pass(want, max_set_rows), "P=%d B=%d: expert 7 alone needs tiles", P, B);
+        }
+    }
+    // the sizes that broke: one expert with more rows than P x n_used needs tiles
+    EXPECT(!M::one_pass(4096, 256 * 8) && !M::one_pass(1024, 64 * 8) && M::one_pass(2048, 256 * 8),
+           "B=4096 at P=256 and B=1024 at P=64 do not fit one pass; 2048 at 256 does");
+    std::vector<int> none((size_t) NE, -1);
+    std::vector<int> ids((size_t) 100 * NU, 3);
+    for (const auto& tl : M::tiles(ids.data(), 100, NU, none, 64))
+        EXPECT(tl.rows == 0 && tl.max_rows == 0, "a tile with no row of the set says so (the caller zeroes it)");
+    std::printf("PASS test_moe_tiles_bound_rows\n");
+}
+
+// --drafting: auto measures at the first start; on (the setup writes mtp) drafts without measuring; off does not draft
+static void test_drafting_values() {
+    namespace D = ling::drafting;
+    for (const char* v : {"on", "mtp", "1"}) {
+        const D::Choice c = D::parse(v);
+        EXPECT(c.known && c.spec_k == -1 && c.load_mtp && !c.measure, "--drafting %s: drafting on, no measurement", v);
+    }
+    const D::Choice a = D::parse("auto");
+    EXPECT(a.known && a.spec_k == -1 && a.load_mtp && a.measure, "--drafting auto: measured once, the faster kept");
+    for (const char* v : {"off", "none", "0"}) {
+        const D::Choice c = D::parse(v);
+        EXPECT(c.known && c.spec_k == 0 && !c.load_mtp && !c.measure, "--drafting %s: no drafting", v);
+    }
+    EXPECT(!D::parse("sometimes").known, "an unknown value changes nothing");
+    std::printf("PASS test_drafting_values\n");
+}
+
 int main() {
     test_expert_slot_order_regression();
     test_restore_validation_and_model_keys();
@@ -646,6 +705,8 @@ int main() {
     test_split_gguf_fingerprint();
     test_gguf_fingerprint_depth();
     test_dense_to_q8_0();
+    test_moe_tiles_bound_rows();
+    test_drafting_values();
     test_numa_helpers();
     test_direct_reader();
     if (g_fail != 0) {

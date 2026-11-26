@@ -1082,18 +1082,17 @@ console.log(JSON.stringify(out));""".replace("HEALTH", json.dumps(health)))
         self.assertTrue(got["ik2"][1].startswith("off (the config's --dspark"))
 
     def test_ling_models_page_offers_only_what_maya_ling_takes(self):
-        # Ling-3.2-air's engine settings: context, drafting (Auto / Off, and On only where a config has --drafting mtp -
-        # maya-ling reads it as auto), GPUs, KV cache (F16 / 8-bit), prompt chunk and CPU threads; no answers at once,
+        # Ling-3.2-air's engine settings: context, drafting (On / Off; a setup's auto shows as On), GPUs, KV cache (F16 / 8-bit), prompt chunk and CPU threads; no answers at once,
         # no tensor parallel, no pictures; the planner's note where a context leaves experts outside VRAM
         got = self.node("""
 const md = await import(web + "/models.js");
-const out = {opts: [["auto", "auto"], ["none", "auto"], ["mtp", "mtp"], ["auto", "mtp"]].map(([a, b]) => md.lingDraftOptions(a, b).map((o) => o.id)),
+const out = {opts: [md.lingDraftOptions().map((o) => o.id + ":" + o.label)],
   fit: md.lingFitNote({fits_trunk: true, resident: true, vram_pct: 100, ssd_gib: 0}),
   part: md.lingFitNote({fits_trunk: true, resident: false, vram_pct: 58.4, ssd_gib: 0}),
   ssd: md.lingFitNote({fits_trunk: true, resident: false, vram_pct: 20, ssd_gib: 3.2}),
   none: md.lingFitNote({fits_trunk: false, resident: false, vram_pct: 0, ssd_gib: 0}), empty: md.lingFitNote(undefined)};
 console.log(JSON.stringify(out));""")
-        self.assertEqual(got["opts"], [["auto", "none"], ["auto", "none"], ["auto", "mtp", "none"], ["auto", "mtp", "none"]])
+        self.assertEqual(got["opts"], [["on:On", "none:Off"]])
         self.assertIsNone(got["fit"])
         self.assertIsNone(got["empty"])
         self.assertIn("about 58% of the experts fit in VRAM", got["part"])

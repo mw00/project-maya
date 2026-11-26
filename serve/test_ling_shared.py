@@ -149,6 +149,22 @@ class LingAsEveryModel(unittest.TestCase):
         self.assertTrue(t.ling)
         self.assertEqual(t.thinking_levels(), ["none", "high"])
 
+    def test_not_taken_for_a_forced_thinking_template(self):
+        # Ling's template sets enable_thinking = true only when none is given; it was taken for CYBER-FROST's (thinking
+        # always on), so the start line said "medium (the config says high)" and the web app's default was Qwen's word
+        from serve.frontend import ChatTemplate
+        tpl = Path(__file__).resolve().parents[1] / "tools" / "ling" / "chat_template.jinja"
+        t = ChatTemplate(tpl)
+        self.assertFalse(t.forced_thinking)
+        self.assertFalse(t.qwen)
+        self.assertEqual(t.effort_shown("high"), "high")
+        self.assertEqual(t.effort_shown("medium"), "high")
+        self.assertEqual(t.effort_shown("none"), "none")
+        m = [{"role": "user", "content": "hi"}]
+        self.assertTrue(t.render(m, add_generation_prompt=True).endswith("<role>ASSISTANT</role>\n<think>"))
+        self.assertTrue(t.render(m, add_generation_prompt=True, enable_thinking=False).endswith("\n<think></think>"))
+        # (CYBER-FROST's template keeps its flag: tools/test_setup_qwen.py test_thinking_always_on_and_off_form)
+
     def test_one_answer_at_a_time_is_said(self):
         from serve import models as M
         self.assertIn("parallel", M.LING_NOT_YET)

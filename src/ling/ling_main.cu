@@ -10,6 +10,7 @@
 #include <fstream>
 #include <cstring>
 // src/ling/ling_main.cu - maya-ling CLI for Ling-3.2-air (bailingmoe3).
+#include "ling_drafting.hpp"
 #include "ling_model.hpp"
 #include "ling_parity.hpp"
 #include "ling_sys.hpp"
@@ -831,7 +832,7 @@ static int draw_from_dist(const std::vector<std::pair<int, double>>& dist, std::
 }
 
 static int serve_loop(ling::Model& model, int default_spec_k, float default_floor, float default_cum,
-                      int default_lookup, bool recalibrate_draft) {
+                      int default_lookup, bool recalibrate_draft, bool draft_measure) {
     const ling::Config& c = model.cfg();
     const bool has_mtp = model.has_mtp();
 
@@ -872,8 +873,13 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
 
     // PC-measured auto-drafting decision when default_spec_k < 0
     DraftDecision cal_dec;
-    if (has_mtp && default_spec_k < 0) {
+    if (has_mtp && default_spec_k < 0 && draft_measure) {
         cal_dec = calibrate_drafting(model, recalibrate_draft);
+    } else if (has_mtp && default_spec_k < 0) {   // --drafting on: drafts by the auto rule's window, nothing measured
+        cal_dec.use_mtp = true;
+        cal_dec.use_lookup = false;
+        std::fprintf(stderr, "ling draft-cal: not measured (--drafting on) mtp=1 base_k=%d max_k=%d\n", cal_dec.base_k,
+                     cal_dec.max_k);
     } else {
         cal_dec.use_mtp = has_mtp && (default_spec_k > 0);
         cal_dec.use_lookup = (default_lookup != 0);
@@ -1484,6 +1490,7 @@ int main(int argc, char** argv) {
     unsigned seed = 42;
     bool print_text = false, no_stop = false, mtp_check = false, serve_mode = false;
     int spec_k = 0;           // 0=off, 1..3=fixed max drafts, -1=auto
+    bool draft_measure = true;   // spec_k -1: measured at the first start (--drafting auto), or used as is (on)
     int lookup_mode = -1;     // -1=auto (on where wins), 0=off, 1=on
     float draft_floor = 0.50f;
     float draft_cum = 0.25f;
@@ -1554,11 +1561,11 @@ int main(int argc, char** argv) {
         } else if (a == "--serve") {
             serve_mode = true;
         } else if (a == "--drafting") {
-            const std::string v = val("--drafting");
-            if (v == "none" || v == "off" || v == "0") spec_k = 0;
-            else if (v == "auto" || v == "mtp" || v == "on" || v == "1") {
-                spec_k = -1;
-                opt.load_mtp = true;
+            const ling::drafting::Choice d = ling::drafting::parse(val("--drafting"));
+            if (d.known) {
+                spec_k = d.spec_k;
+                if (d.load_mtp) opt.load_mtp = true;
+                draft_measure = d.measure;
             }
         } else if (a == "--vision") {
             const std::string v = val("--vision");
@@ -1624,7 +1631,8 @@ int main(int argc, char** argv) {
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
         std::fprintf(stderr, "%s\nload: %.2f s\n", model.info().c_str(), load_s);
         print_mem(opt.gpus);
-        if (serve_mode) return serve_loop(model, spec_k, draft_floor, draft_cum, lookup_mode, opt.recalibrate);
+        if (serve_mode)
+            return serve_loop(model, spec_k, draft_floor, draft_cum, lookup_mode, opt.recalibrate, draft_measure);
 
         if (!vision_dump_emb.empty()) {
             const ling::VisionGeo* vg = model.vision();

@@ -356,6 +356,19 @@ def hy4_draft_of(args: list) -> str:
     return "dfly2" if "--dfly2" in args or how == "dfly2" else "none"
 
 
+def ling_draft_of(args: list) -> str:
+    """A Ling-3.2-air config's drafting as the Models page shows it: "on" (--drafting on; also the setup's --drafting
+    auto - maya-ling measures once on this PC and keeps the faster - and the older --mtp / --spec-k forms) or "none"
+    (--drafting off / none, or no drafting flag: maya-ling's own default is off)."""
+    args = [str(a) for a in args]
+    how = flag(args, "--drafting")
+    if how is None:
+        k = flag(args, "--spec-k")
+        on = "--mtp" in args or k == "auto" or (_int(k) or 0) > 0
+        return "on" if on else "none"
+    return "none" if how in ("none", "off", "0") else "on"
+
+
 def hy4_has_vision(cfg: dict) -> bool:
     """Hy4-flash's pack has the vision tower (hy4.txt's vision.* keys: tools/hy4/pack_gguf.py with the mmproj file)."""
     pack = pack_of(cfg)
@@ -453,7 +466,7 @@ def _choices(cfg: dict) -> dict:
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
     if family(cfg) == "ling":
         args = cfg.get("args") or []
-        return {"draft": ["auto", "mtp", "none"], "images": bool(flag(args, "--mmproj")), "kv": ["f16", "q8"]}
+        return {"draft": ["on", "none"], "images": bool(flag(args, "--mmproj")), "kv": ["f16", "q8"]}
     if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off)
         # (drafting: auto - measured once on this PC; the drafter by hand where the setup downloaded it; none)
         ctx = int(flag(cfg.get("args") or [], "--max-context") or 0)
@@ -507,7 +520,7 @@ def settings_of(cfg: dict) -> dict:
                    kv=flag(args, "--kv", "auto"))     # (the latent cache's rows: auto, the engine's default)
         return out
     if family(cfg) == "ling":                          # (maya-ling's own defaults where the config names none)
-        dr = flag(args, "--drafting") or ("auto" if flag(args, "--spec-k") == "auto" else "mtp" if "--mtp" in args else "none")
+        dr = ling_draft_of(args)
         kv_raw = flag(args, "--kv", LINGF.DEFAULT_KV)
         kv_norm = LINGF.normalize_kv(kv_raw)
         out.update(images=bool(flag(args, "--mmproj")) and flag(args, "--vision") != "off",
@@ -779,8 +792,12 @@ def apply(cfg: dict, settings: dict) -> dict:
         if kv not in ("q8", "fp16", "f16", "int8"):
             raise ValueError("KV cache: f16 or q8")
         args = set_flag(args, "--kv", "fp16" if kv in ("fp16", "f16") else "q8")
-        if s.get("draft") in ("auto", "mtp", "none"):
-            args = set_flag(args, "--drafting", s["draft"])
+        # (drafting On or Off, written only where it changes: a setup's --drafting auto - measured once on this PC, the
+        #  faster kept - shows as On and stays auto until Off or On is picked)
+        if "draft" in settings and settings["draft"] != ling_draft_of(args):
+            if settings["draft"] not in ("on", "none"):
+                raise ValueError("Drafting: on or off")
+            args = set_flag(args, "--drafting", "on" if settings["draft"] == "on" else "off")
         # (written where it changes: the Models page sends every setting back, and offers no pictures for Ling - a
         #  config without its vision file keeps a command without --vision)
         if "images" in settings and bool(settings["images"]) != bool(settings_of(cfg).get("images")):

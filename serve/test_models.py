@@ -454,7 +454,7 @@ class Settings(unittest.TestCase):
         return p
 
     def test_ling_read_and_written_with_its_own_flags(self):
-        """Ling-3.2-air on the Models page: context, drafting (auto / off), KV cache (F16 / 8-bit), GPUs, prompt chunk
+        """Ling-3.2-air on the Models page: context, drafting (on / off; the setup's auto shows as on), KV cache (F16 / 8-bit), GPUs, prompt chunk
         and CPU threads - maya-ling's own flags; a save from the page (every setting sent back) changes nothing it did
         not change, and writes no --vision (the page offers no pictures for it); one answer at a time."""
         cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0},
@@ -465,20 +465,28 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family(cfg), "ling")
         s = M.settings_of(cfg)
         self.assertEqual(s, {"context": 65536, "gpus": [0], "env": {}, "ablate": False, "images": False, "kv": "f16",
-                             "draft": "auto", "parallel": 1, "prefill_chunk": None, "cpu_threads": None})
+                             "draft": "on", "parallel": 1, "prefill_chunk": None, "cpu_threads": None})
+        self.assertEqual(M.choices(cfg)["draft"], ["on", "none"])
+        self.assertEqual(M.flag(M.apply(cfg, {"draft": "on"})["args"], "--drafting"), "auto")   # (On: auto stays)
         self.assertEqual(M.choices(cfg)["kv"], ["f16", "q8"])
         self.assertFalse(M.choices(cfg)["images"])                  # (no vision file: tools/ling/download.json has none)
         self.assertEqual(M.apply(cfg, {}), cfg)
         self.assertEqual(M.apply(cfg, s), cfg)                       # (the page's save: every setting, none changed)
         new = M.apply(cfg, {**s, "context": 131072, "kv": "q8", "draft": "none", "prefill_chunk": 1024, "cpu_threads": 12})
-        for f, v in (("--max-context", "131072"), ("--kv", "q8"), ("--drafting", "none"), ("--prefill-chunk", "1024"),
+        for f, v in (("--max-context", "131072"), ("--kv", "q8"), ("--drafting", "off"), ("--prefill-chunk", "1024"),
                      ("--cpu-threads", "12")):
             self.assertEqual(M.flag(new["args"], f), v, f)
         self.assertNotIn("--vision", new["args"])
         self.assertEqual({M.settings_of(new)[k] for k in ("kv", "draft")}, {"q8", "none"})
+        back = M.apply(new, {"draft": "on"})                         # (On again: --drafting on, no measuring)
+        self.assertEqual((M.flag(back["args"], "--drafting"), M.settings_of(back)["draft"]), ("on", "on"))
+        self.assertEqual(M.apply(back, M.settings_of(back)), back)
+        for args, want in ((["--drafting", "mtp"], "on"), (["--drafting", "none"], "none"), (["--mtp"], "on"),
+                           (["--spec-k", "2"], "on"), (["--spec-k", "0"], "none"), ([], "none")):
+            self.assertEqual(M.ling_draft_of(args), want, args)
         two = M.apply(cfg, {**s, "gpus": [0, 1]})
         self.assertEqual((two["gpu"], M.flag(two["args"], "--gpus")), ([0, 1], "0,1"))
-        for bad, why in (({"parallel": 2}, "one request at a time"), ({"kv": "fp8"}, "f16 or q8"),
+        for bad, why in (({"parallel": 2}, "one request at a time"), ({"kv": "fp8"}, "f16 or q8"), ({"draft": "auto"}, "on or off"),
                          ({"prefill_chunk": 32}, "Prefill chunk"), ({"tp": 2}, "not a setting"),
                          ({"reserve_gb": 1.0}, "not a setting")):
             with self.assertRaises(ValueError, msg=str(bad)) as e:

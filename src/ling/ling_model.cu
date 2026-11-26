@@ -4,6 +4,7 @@
 
 #include "ling_dense.hpp"
 #include "ling_kernels.cuh"
+#include "ling_moe_plan.hpp"
 #include "ling_parity.hpp"
 #include "ling_sys.hpp"
 #include "ds4_iq.cuh"
@@ -2949,7 +2950,29 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
         hy::moe_combine(y, gb.row_of, w_p, T_sub, NU, E, moe_p, g.s, accumulate);
     };
 
-    // Pack an expert list into row-bounded batches (each <= kPfBatch experts AND <= max_set_rows total rows)
+    // A staged set over the block: one pass when its rows fit the set scratch (max_set_rows), else P tokens a tile
+    // (one expert alone can have up to B rows - ling_moe_plan.hpp)
+    auto run_staged = [&](Gpu& g, const MacroBufs& gb, int buf, const std::vector<int>& blist, int bmax, bool accumulate) {
+        long long rows = 0;
+        for (int e : blist) rows += chunk_counts[(size_t) e];
+        if (ling::moe_plan::one_pass(rows, max_set_rows)) {
+            run_set_on(g, gb, 0, B, g.pf_stage[buf], g.pf_pmap[buf], (int) blist.size(), bmax, accumulate);
+            return;
+        }
+        std::vector<int> in_set((size_t) NE, -1);
+        for (size_t b = 0; b < blist.size(); ++b) in_set[(size_t) blist[b]] = (int) b;
+        for (const auto& tl : ling::moe_plan::tiles(gp.h_pf_ids, B, NU, in_set, P)) {
+            if (tl.max_rows > 0) {
+                run_set_on(g, gb, tl.t0, tl.T, g.pf_stage[buf], g.pf_pmap[buf], (int) blist.size(), tl.max_rows,
+                           accumulate);
+            } else if (!accumulate) {
+                CK(cudaMemsetAsync(gb.moe + (size_t) tl.t0 * E, 0, (size_t) tl.T * E * sizeof(float), g.s));
+            }
+        }
+    };
+
+    // Pack an expert list into row-bounded batches (each <= kPfBatch experts AND <= max_set_rows total rows; an
+    // expert with more rows than that is a batch of its own, run in tiles by run_staged)
     auto make_batches = [&](const std::vector<int>& elist) {
         std::vector<std::vector<int>> out;
         std::vector<int> cur;
@@ -3079,7 +3102,7 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
             int bmax = 0;
             for (int e : blist) bmax = std::max(bmax, chunk_counts[(size_t) e]);
             CK(cudaStreamWaitEvent(hg.s, hg.ev_copy[buf], 0));
-            run_set_on(hg, hb, 0, B, hg.pf_stage[buf], hg.pf_pmap[buf], (int) blist.size(), bmax, bi > 0);
+            run_staged(hg, hb, buf, blist, bmax, bi > 0);
             CK(cudaEventRecord(hg.ev_comp[buf], hg.s));
             if (bi + 1 < hbatches.size()) stage_batch_on(hg, hbatches, bi + 1);
         }
@@ -3171,7 +3194,7 @@ void Model::ffn_moe_prefill_macro(int gi, Layer& l, int il, int B, bool is_last_
             int bmax = 0;
             for (int e : blist) bmax = std::max(bmax, chunk_counts[(size_t) e]);
             CK(cudaStreamWaitEvent(s, gp.ev_copy[buf], 0));
-            run_set_on(gp, mb, 0, B, gp.pf_stage[buf], gp.pf_pmap[buf], (int) blist.size(), bmax, accum);
+            run_staged(gp, mb, buf, blist, bmax, accum);
             if (do_warm_commit) {
                 for (size_t b = 0; b < blist.size(); ++b) {
                     const int e = blist[b];

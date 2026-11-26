@@ -118,7 +118,7 @@ class LingModelsConfig(unittest.TestCase):
             self.assertEqual(M.family(cfg), "ling")
             self.assertEqual(M.trained_context_of(cfg), 262144)
             cur = M.settings_of(cfg)
-            self.assertEqual((cur["context"], cur["kv"], cur["draft"]), (32768, "q8", "auto"))
+            self.assertEqual((cur["context"], cur["kv"], cur["draft"]), (32768, "q8", "on"))   # (auto shows as On)
             can = M.choices(cfg)
             self.assertEqual(can["kv"], ["f16", "q8"])
 
@@ -131,7 +131,7 @@ class LingModelsConfig(unittest.TestCase):
                     "installer": {"family": fam_name},
                 }
                 self.assertIsNone(M.trained_context_of(other_cfg), f"{fam_name} must not read Ling GGUF context_length")
-            self.assertIn("auto", can["draft"])
+            self.assertEqual(can["draft"], ["on", "none"])
             desc = M.describe(cfg_p, None)
             self.assertIn(262144, desc["contexts"])
             self.assertEqual(desc["context_range"]["max"], 262144)

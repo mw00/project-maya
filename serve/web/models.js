@@ -601,26 +601,24 @@ function ik2Fields(m, d, ch) {
 // Ling-3.2-air's (maya-ling: it stops at a flag it does not know, so only its own are offered - the server's LING_KEYS;
 // text only for now, one answer at a time).  Its cache's VRAM a context token: the 7 attention layers' rows by its format
 // (m.ling_kv_bytes, tools/ling_fit.py's figures); m.ling_fit: the planner's split for the config's GPUs at each context.
-// Drafting: auto (--drafting auto: measured once on this PC) or off; "mtp" (--drafting mtp, a config written so) the
-// engine reads as auto, so it is shown only where a config has it
+// Drafting: On (--drafting on; a setup's --drafting auto - measured once on this PC, the faster kept - shows as On and
+// stays auto until one is picked) or Off (--drafting off): the server's ling_draft_of
 export function lingFitNote(fit) {
   if (!fit) return null;
   if (fit.fits_trunk === false) return "At this size the model's layers and their cache do not fit on these GPUs: a smaller context, the 8-bit cache or another GPU.";
   if (fit.resident === false) return `At this size about ${fmt(fit.vram_pct, 0)}% of the experts fit in VRAM; the others are taken from RAM${fit.ssd_gib > 0 ? " and the SSD" : ""} - slower answers.`;
   return null;
 }
-export const lingDraftOptions = (now, was) => [{id: "auto", label: "Auto"},
-  ...(now === "mtp" || was === "mtp" ? [{id: "mtp", label: "On"}] : []), {id: "none", label: "Off"}];
+export const lingDraftOptions = () => [{id: "on", label: "On"}, {id: "none", label: "Off"}];
 function lingFields(m, d, s, ch, gpus) {
   const kvb = (m.ling_kv_bytes || {})[d.kv] || 8064;
   const fit = same(d.gpus, s.gpus) ? ((m.ling_fit || {})[d.kv] || {})[String(d.context)] : null;   // (worked out for the config's GPUs)
   return [
     {label: "Model", rows: [
       contextRow(m, d, ch, {vram: kvb}, ["kv"], lingFitNote(fit)),
-      html`<${Row} label="Drafting" flag=${"--drafting " + ({auto: "auto", mtp: "mtp"}[d.draft] || "off")} changed=${ch("draft")}
-        hint=${"The model's own draft block (MTP) and the prompt lookup propose tokens, and the model checks every one. Auto measures once on this PC whether drafting is faster and keeps the faster. A model file without the draft block runs without it." +
-          (d.draft === "mtp" ? " On (this config's --drafting mtp): maya-ling measures it the same way as Auto." : "")}>
-        <${Seg} label="Drafting" value=${d.draft} options=${lingDraftOptions(d.draft, s.draft)} onChange=${(v) => setDraft({draft: v})}/><//>`]},
+      html`<${Row} label="Drafting" flag=${"--drafting " + (d.draft === "on" ? "on" : "off")} changed=${ch("draft")}
+        hint="The model's own draft block (MTP) and the prompt lookup propose tokens, and the model checks every one: the same answers, on or off. A new setup's drafting (auto: measured once on this PC, the faster kept) shows as On. A model file without the draft block runs without it.">
+        <${Seg} label="Drafting" value=${d.draft} options=${lingDraftOptions()} onChange=${(v) => setDraft({draft: v})}/><//>`]},
     {label: "GPUs and memory", rows: [gpus,
       html`<${Row} label="KV cache" flag="--kv" changed=${ch("kv")}
         hint=${`F16, the default: ${fmt((m.ling_kv_bytes || {}).f16 || 8064)} bytes a context token. 8-bit: ${fmt((m.ling_kv_bytes || {}).q8 || 4704)} bytes a token, more VRAM left to the experts; the engine has no measured choice between the two yet.`}>

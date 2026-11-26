@@ -93,6 +93,8 @@ class ChatTemplate:
         # (none .. max, its effort_map) or a number; tool call arguments must be objects
         self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
         self.ling = "<|role_end|>" in self.source and "detailed thinking on" in self.source
+        if self.ling:   # (Ling's sets enable_thinking = true only as its default when none is given: not CYBER-FROST's)
+            self.forced_thinking = False
 
     def effort_shown(self, value) -> str | None:
         """Hy4-flash / Ling-3.2-air: a thinking level as given (a config's, a client's) -> the level this model really
