@@ -20,6 +20,7 @@
 #include "hy4_pack.hpp"
 #include "hy4_plan.hpp"
 #include "hy4_ring.hpp"
+#include "hy4_slots.hpp"
 #include "hy4_spill.hpp"
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
@@ -31,6 +32,7 @@
 #if defined(__linux__)
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #endif
 #include <cuda_runtime.h>
 
@@ -43,8 +45,10 @@
 #include <cstring>
 #include <ctime>
 #include <array>
+#include <filesystem>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <numeric>
 #include <mutex>
 #include <thread>
@@ -844,6 +848,496 @@ struct Model::Impl {
     // the lowest position the sliding-window rings (and hring) may still hold: a rewind moves `end` back, but the
     // slots of the positions below the old end - ring were overwritten when the sequence was read (#1091)
     int64_t ring_lo = 0;
+    // (SLOTS: a conversation parked in RAM and taken back - Model::conv_save / conv_load, hy4_model.hpp; the
+    //  serve loop's table in hy4_slots.hpp.  Nothing here runs unless the serve loop calls it: MAYA_HY4_SLOT_KEEP=1.
+    //  A slot: a header of kConvHdr words, the tokens (int32), the runs conv_runs lists in their order, the magic again.
+    //  conv_held: the model unchanged since a save or a load - Model::forward clears it)
+    bool conv_held = false;
+    static constexpr uint64_t kConvMagic = 0x31564e4f43345948ull;   // "HY4CONV1" (little endian)
+    static constexpr uint64_t kConvVersion = 2;   // (2: v2's identity with the pack's contents; 1 refused)
+    static constexpr int kConvHdr = 16;
+    struct ConvRun {
+        int gi = 0;               // its GPU (an index into G)
+        uint8_t* dev = nullptr;   // its bytes there
+        size_t bytes = 0, off = 0;   // ... how many; where in the payload
+        int il = 0;               // its layer (g.n_layer: the MTP block; -1: hring)
+        const char* what = "";
+    };
+    // the runs of a slot of positions [0, n) whose rings hold [lo, n) (n - lo <= ring): each trunk layer in order -
+    // a window layer its ring's rows; an indexed one its latent rows [0, n), its pooled keys [0, n / kpool + 1) (the
+    // partial group's row with them) and its value | gate ring's rows - then the MTP block's the same way and the trunk's
+    // states it reads (hring's rows, on the head's GPU).  A ring's rows of [lo, n) are one run, or two where they wrap
+    std::vector<ConvRun> conv_runs(int64_t n, int64_t lo) const {
+        std::vector<ConvRun> r;
+        size_t off = 0;
+        const auto add = [&](int gi, void* p, size_t b, int il, const char* what) {
+            if (b == 0) return;
+            r.push_back({gi, (uint8_t*) p, b, off, il, what});
+            off += b;
+        };
+        const auto ring_part = [&](int gi, void* base, size_t rb, int il, const char* what) {
+            if (n <= lo) return;
+            const int64_t s = lo % ring, c = n - lo, first = std::min<int64_t>(c, ring - s);
+            add(gi, (uint8_t*) base + (size_t) s * rb, (size_t) first * rb, il, what);
+            if (c > first) add(gi, base, (size_t) (c - first) * rb, il, what);
+        };
+        const auto layer = [&](const Layer& l) {
+            if (l.swa) {
+                ring_part(l.gpu, l.kv, kv_rb(), l.il, "window rows");
+                return;
+            }
+            add(l.gpu, l.kv, (size_t) n * kv_rb(), l.il, "latent rows");
+            const int64_t groups = std::min<int64_t>(n / g.ix_kpool + 1, o.max_ctx / g.ix_kpool + 1);
+            add(l.gpu, l.pooled, (size_t) groups * g.ix_dim * pool_b(), l.il, "pooled keys");
+            ring_part(l.gpu, l.ivg, (size_t) 2 * g.ix_dim * pool_b(), l.il, "value | gate rows");
+        };
+        for (const Layer& l : L) layer(l);
+        if (M.mtp) {
+            layer(M);
+            ring_part(head_gpu, hring, sizeof(float) * (size_t) g.n_embd, -1, "trunk states (hring)");
+        }
+        return r;
+    }
+    bool conv_ok(std::string& why) const {
+        why.clear();
+        if (tp > 1) why = "tensor parallel";
+        else if (kv_res() > 0 || spill()) why = "KV streaming (the indexed layers' rows in host memory)";
+        else if (df.on) why = "the DFly2 drafter (its picks of the last window)";
+        else if (inject) why = "HY4_INJECT (a layer's inputs from a reference dump: not the model's own state)";
+        else if (ring <= 0 || L.empty()) why = "no caches";
+        else
+            for (const Layer& l : L)
+                if (l.kv == nullptr || l.res > 0 || (l.swa ? l.ring != ring : (l.pooled == nullptr || l.ivg == nullptr)) ||
+                    l.gpu < 0 || l.gpu >= (int) G.size()) {
+                    why = "layer " + std::to_string(l.il) + "'s caches are not this build's layout";
+                    break;
+                }
+        if (why.empty() && M.mtp && (M.kv == nullptr || hring == nullptr)) why = "the MTP block's caches";
+        return why.empty();
+    }
+    // every GPU's queued work done - the queued MTP pass (mtp_settle; HY4_DRAFT_EARLY's on the head's stream), HY4_HOT's
+    // copies, a refill's
+    bool conv_quiet(std::string& err) {
+        mtp_settle();
+        for (const Gpu& gp : G) {
+            cudaError_t e = cudaSetDevice(gp.dev);
+            if (e == cudaSuccess) e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) {
+                err = "GPU " + std::to_string(gp.dev) + ": " + cudaGetErrorString(e);
+                (void) cudaGetLastError();
+                return false;
+            }
+        }
+        return true;
+    }
+    // the runs copied, a thread a GPU (each its own GPU's runs one after another; pageable host memory, so cudaMemcpy
+    // returns once its bytes are staged - a load's thread waits for its GPU after them).  host: the payload's start;
+    // to_dev: host -> GPU.  false: err names the first run that failed
+    bool conv_copy(const std::vector<ConvRun>& runs, uint8_t* host, bool to_dev, std::string& err) {
+        std::vector<int> gis;
+        for (const ConvRun& r : runs)
+            if (std::find(gis.begin(), gis.end(), r.gi) == gis.end()) gis.push_back(r.gi);
+        std::vector<std::string> errs(gis.size());
+        const auto work = [&](size_t k) {
+            const int gi = gis[k];
+            cudaError_t e = cudaSetDevice(G[(size_t) gi].dev);
+            for (const ConvRun& r : runs) {
+                if (r.gi != gi) continue;
+                if (e == cudaSuccess)
+                    e = to_dev ? cudaMemcpy(r.dev, host + r.off, r.bytes, cudaMemcpyHostToDevice)
+                               : cudaMemcpy(host + r.off, r.dev, r.bytes, cudaMemcpyDeviceToHost);
+                if (e != cudaSuccess) {
+                    errs[k] = (r.il < 0 ? std::string("the MTP block's ") : "layer " + std::to_string(r.il) + "'s ") +
+                              r.what + " on GPU " + std::to_string(G[(size_t) gi].dev) + ": " + cudaGetErrorString(e);
+                    (void) cudaGetLastError();
+                    return;
+                }
+            }
+            if (to_dev && (e = cudaDeviceSynchronize()) != cudaSuccess) {
+                errs[k] = "GPU " + std::to_string(G[(size_t) gi].dev) + ": " + cudaGetErrorString(e);
+                (void) cudaGetLastError();
+            }
+        };
+        std::vector<std::thread> th;
+        for (size_t k = 1; k < gis.size(); ++k) th.emplace_back(work, k);
+        if (!gis.empty()) work(0);
+        for (std::thread& t : th) t.join();
+        for (const std::string& e : errs)
+            if (!e.empty()) {
+                err = e;
+                return false;
+            }
+        return true;
+    }
+    // a slot's header read and checked against this start's caches -> n, lo, the MTP rows made, its runs; tokens and
+    // payload: where they start in d
+    bool conv_parse(const uint8_t* d, size_t b, int64_t& n, int64_t& lo, int64_t& md, std::vector<ConvRun>& runs,
+                    size_t& tok_off, size_t& pay_off, std::string& err) const {
+        uint64_t h[kConvHdr];
+        if (d == nullptr || b < sizeof h + 8) {
+            err = "the slot is cut short";
+            return false;
+        }
+        std::memcpy(h, d, sizeof h);
+        if (h[0] != kConvMagic || h[1] != kConvVersion) {
+            err = "not a slot of this engine's";
+            return false;
+        }
+        const uint64_t want[] = {(uint64_t) ring, (uint64_t) o.max_ctx, (uint64_t) kv_rb(), (uint64_t) pool_b(),
+                                 (uint64_t) g.ix_dim, (uint64_t) g.ix_kpool, (uint64_t) g.n_embd, (uint64_t) g.n_layer,
+                                 (uint64_t) (M.mtp ? 1 : 0)};
+        for (size_t i = 0; i < sizeof want / sizeof want[0]; ++i)
+            if (h[5 + i] != want[i]) {
+                err = "the slot's caches are not this start's (word " + std::to_string(5 + i) + ")";
+                return false;
+            }
+        n = (int64_t) h[2];
+        lo = (int64_t) h[3];
+        md = (int64_t) h[4];
+        if (n <= 0 || n > o.max_ctx || lo < 0 || lo > n || n - lo > ring || md < 0 || md > n) {
+            err = "the slot's positions are not valid";
+            return false;
+        }
+        runs = conv_runs(n, lo);
+        uint64_t pay = 0;
+        for (const ConvRun& r : runs) pay += r.bytes;
+        tok_off = sizeof h;
+        pay_off = tok_off + (size_t) n * 4;
+        if (h[14] != runs.size() || h[15] != pay || b != pay_off + pay + 8) {
+            err = "the slot's size does not add up";
+            return false;
+        }
+        uint64_t tail = 0;
+        std::memcpy(&tail, d + b - 8, 8);
+        if (tail != kConvMagic) {
+            err = "the slot's end is not there";
+            return false;
+        }
+        return true;
+    }
+    // (SLOTS v2) what a slot's file must have been saved with to be read on this start - one line the .meta
+    // keeps, compared whole:
+    //  - the slot layout's version (kConvVersion; 2 refuses v2's first files, whose identity said less);
+    //  - this engine binary: size, mtime (ns), device and inode (a rebuild may compute or store rows another way);
+    //  - the pack: its canonical folder, hy4.txt's and tensors.txt's size and content checksum (small: read whole),
+    //    the canonical model_dir hy4.txt names, and each model file's canonical path, size, mtime (ns), device, inode
+    //    and a sparse content checksum - 16 reads of 64 KiB at fixed offsets (the first and the last block among
+    //    them), 1 MiB a file: same-name, same-size weights put in place (a copy, an edit, another download) differ
+    //    in their time or inode, and different weights in their bytes;
+    //  - the cache's rows (q8 / f16, kv_rb, pool_b) and geometry (context, ring, n_swa, kpool, ix_dim, n_embd, the
+    //    layers' kinds); the MTP block loaded or not;
+    //  - the layer split (each layer's GPU, the head's) with each GPU's name, compute capability and PCI place - the
+    //    bytes' order does not depend on it (conv_runs walks the layers in order), but the rows' values were computed
+    //    by the GPUs that held them;
+    //  - the Engram norms' effective eps (hy4.txt's engram_eps or HY4_ENGRAM_EPS, its float's bits) and its row scales
+    //    (HY4_ENGRAM_SCALES=0 or none: "none"; else the scales file hy4.txt names, outside the tensors: its canonical
+    //    path, size, mtime, device, inode and checksum - whole up to 64 MiB, else the 16 samples) - the model's
+    //    function itself, as the weights are.
+    // Not in it, by decision: the experts' placement (HY4_HOT and its file, the VRAM experts / CPU lane split, the
+    // profile, HY4_Q4X's copies, HY4_FETCH, the helper GPU) and the prompt's plan (the chunk, HY4_DENSE_MAX,
+    // HY4_IX_GEMM, HY4_SPARSE, HY4_ROUTE, HY4_STREAM) or a kernel's form (HY4_GEMV_OLD .., HY4_LT,
+    // HY4_VISION_F32): they move a sum's rounding, not the function, and the engine already goes on with a
+    // conversation in place across hot-set moves and other chunkings - a slot taken back under another placement or
+    // plan is no less exact than that.  Nor a full hash of the model files: the size, mtime, inode and 16 samples are
+    // the bar; an in-place edit outside the samples that keeps the size and puts the mtime and inode back is not
+    // seen (a known limit).  HY4_INJECT (a layer's inputs from a reference dump: not the model's state) is refused
+    // by conv_ok instead.
+    // (upstream ds4's slot_identity: the engine version, the geometry and the pack files' sizes alone)
+    std::string conv_identity() const {
+        namespace fs = std::filesystem;
+        const auto canon = [](const std::string& f) {
+            std::error_code ec;
+            const fs::path c = fs::weakly_canonical(f, ec);
+            return ec ? f : c.string();
+        };
+        // size, mtime ns, device, inode ("-" where the file cannot be looked at)
+        const auto stat_of = [](const std::string& f) {
+            std::ostringstream s;
+#if defined(__linux__)
+            struct stat st{};
+            if (::stat(f.c_str(), &st) != 0) return std::string("-");
+            s << (long long) st.st_size << ":" << (long long) st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec << ":"
+              << (unsigned long long) st.st_dev << ":" << (unsigned long long) st.st_ino;
+#else
+            std::error_code ec;
+            const auto z = fs::file_size(f, ec);
+            if (ec) return std::string("-");
+            const auto t = fs::last_write_time(f, ec);
+            s << (long long) z << ":" << (ec ? 0LL : (long long) t.time_since_epoch().count());
+#endif
+            return s.str();
+        };
+        // a file's checksum: whole (sparse false) or 16 pieces of 64 KiB at offsets k (size - 64 KiB) / 15
+        const auto sum_of = [](const std::string& f, bool sparse) {
+            std::ifstream in(f, std::ios::binary);
+            if (!in) return std::string("-");
+            in.seekg(0, std::ios::end);
+            const long long size = (long long) in.tellg();
+            uint64_t h = 0;
+            std::vector<uint8_t> buf;
+            const auto piece = [&](long long off, long long n) {
+                buf.resize((size_t) n);
+                in.clear();
+                in.seekg(off);
+                if (n > 0 && !in.read((char*) buf.data(), n)) return false;
+                h = hy4::slots::checksum(buf.data(), buf.size(), h ^ (uint64_t) off);
+                return true;
+            };
+            bool ok = true;
+            if (!sparse) ok = piece(0, size);
+            else {
+                const long long kP = 64 << 10, n = std::min(kP, size);
+                for (int k = 0; ok && k < 16; ++k) ok = piece(size > kP ? (size - kP) * k / 15 : 0, n);
+            }
+            if (!ok) return std::string("-");
+            char b[24];
+            std::snprintf(b, sizeof b, "%016llx", (unsigned long long) h);
+            return std::string(b);
+        };
+        std::ostringstream id;
+        id << "maya-hy4-conv " << kConvVersion;
+#if defined(__linux__)
+        {
+            std::error_code ec;
+            const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+            if (!ec) id << " engine=" << stat_of(exe.string());
+        }
+#endif
+        id << " pack=" << canon(pk.dir) << " hy4.txt=" << sum_of(pk.dir + "/hy4.txt", false)
+           << " tensors.txt=" << sum_of(pk.dir + "/tensors.txt", false)
+           << " model_dir=" << canon(pk.model_dir);
+        for (size_t i = 0; i < pk.files.size(); ++i) {
+            const std::string& f = pk.files[i];
+            const std::string p = canon(!f.empty() && f[0] == '/' ? f : pk.model_dir + "/" + f);
+            id << " file=" << p << ":" << stat_of(p) << ":" << sum_of(p, true);
+        }
+        {   // (the Engram norms: eps as its float's bits, the row scales' file or none)
+            uint32_t eb = 0;
+            std::memcpy(&eb, &eg_eps, 4);
+            char b[16];
+            std::snprintf(b, sizeof b, "%08x", (unsigned) eb);
+            id << " engram_eps=" << b << " engram_scales=";
+            if (eg_scale == nullptr || eg_scale_path.empty()) {
+                id << "none";
+            } else {
+                const std::string p = canon(eg_scale_path);
+                std::error_code ec;
+                const auto z = fs::file_size(p, ec);
+                id << p << ":" << stat_of(p) << ":" << sum_of(p, ec || z > ((uintmax_t) 64 << 20));
+            }
+        }
+        id << " kv=" << (kv_q8 ? "q8" : "f16") << " kv_rb=" << kv_rb() << " pool_b=" << pool_b() << " ctx=" << o.max_ctx
+           << " ring=" << ring << " n_swa=" << g.n_swa << " kpool=" << g.ix_kpool << " ix_dim=" << g.ix_dim
+           << " n_embd=" << g.n_embd << " n_layer=" << g.n_layer << " swa=";
+        for (int il = 0; il < g.n_layer; ++il) id << (g.swa[(size_t) il] ? '1' : '0');
+        id << " mtp=" << (M.mtp ? 1 : 0) << " split=";
+        for (const Layer& l : L) id << l.gpu << ",";
+        id << " head=" << head_gpu << " gpus=";
+        for (const Gpu& gp : G) {
+            cudaDeviceProp pr{};
+            if (cudaGetDeviceProperties(&pr, gp.dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                id << "?;";
+                continue;
+            }
+            id << pr.name << " " << pr.major << "." << pr.minor << " " << pr.pciDomainID << ":" << pr.pciBusID << ":"
+               << pr.pciDeviceID << ";";
+        }
+        return id.str();
+    }
+    void conv_reset() {
+        tokens.clear();
+        end = 0;
+        ring_lo = 0;
+        mtp_done = 0;
+        mtp_apos = -1;
+        mtp_atok = -1;
+        df.snap_p0 = -1;
+        conv_held = false;
+    }
+    // (the rings' lowest position held once a forward continues at n: rejected drafts past n wrote over the slots of
+    //  the positions below end - ring, so not n - ring - hy4_ring.hpp; keep_ring > 0 raises it, at least ring_back)
+    int64_t conv_lo(int64_t n, int64_t keep_ring) const {
+        int64_t lo = std::min<int64_t>(ring_lo_at(n, ring_lo, end, ring), n);
+        if (keep_ring > 0)
+            lo = std::max<int64_t>(lo, n - std::max<int64_t>(keep_ring, (int64_t) std::max(g.n_swa, g.ix_kpool) - 1));
+        return lo;
+    }
+    // a conv_save of n positions' bytes, without saving (0: none possible)
+    uint64_t conv_bytes(int64_t n, int64_t keep_ring) const {
+        if (n <= 0 || n > end || (int64_t) tokens.size() < n) return 0;
+        uint64_t pay = 0;
+        for (const ConvRun& r : conv_runs(n, conv_lo(n, keep_ring))) pay += r.bytes;
+        return sizeof(uint64_t) * kConvHdr + (uint64_t) n * 4 + pay + 8;
+    }
+    uint64_t conv_save(std::vector<uint8_t>& out, int64_t n, int64_t keep_ring, std::string& err, int64_t* lo_out,
+                       const int* expect) {
+        if (conv_held) {
+            err = "it is already set aside";
+            return 0;
+        }
+        if (!conv_ok(err)) return 0;
+        if (n <= 0 || n > end || (int64_t) tokens.size() < n) {
+            err = "the model holds " + std::to_string(end) + " positions, not " + std::to_string(n);
+            return 0;
+        }
+        if (expect != nullptr && std::memcmp(expect, tokens.data(), sizeof(int) * (size_t) n) != 0) {
+            err = "the model's tokens are not the conversation's";
+            return 0;
+        }
+        const int64_t lo = conv_lo(n, keep_ring);
+        const int64_t md = std::min<int64_t>(mtp_done, n);
+        const std::vector<ConvRun> runs = conv_runs(n, lo);
+        uint64_t pay = 0;
+        for (const ConvRun& r : runs) pay += r.bytes;
+        const size_t tok_off = sizeof(uint64_t) * kConvHdr, pay_off = tok_off + (size_t) n * 4,
+                     total = pay_off + (size_t) pay + 8;
+        try {
+            out.resize(total);
+        } catch (const std::bad_alloc&) {
+            char m[160];
+            std::snprintf(m, sizeof m, "no %.2f GB of RAM for it", (double) total / 1e9);
+            err = m;
+            out.clear();
+            out.shrink_to_fit();
+            return 0;
+        }
+        const uint64_t h[kConvHdr] = {kConvMagic, kConvVersion, (uint64_t) n, (uint64_t) lo, (uint64_t) md,
+                                      (uint64_t) ring, (uint64_t) o.max_ctx, (uint64_t) kv_rb(), (uint64_t) pool_b(),
+                                      (uint64_t) g.ix_dim, (uint64_t) g.ix_kpool, (uint64_t) g.n_embd,
+                                      (uint64_t) g.n_layer, (uint64_t) (M.mtp ? 1 : 0), (uint64_t) runs.size(), pay};
+        std::memcpy(out.data(), h, sizeof h);
+        std::memcpy(out.data() + tok_off, tokens.data(), (size_t) n * 4);
+        std::memcpy(out.data() + total - 8, &kConvMagic, 8);
+        int cur = -1;
+        if (cudaGetDevice(&cur) != cudaSuccess) cur = -1;
+        bool ok = conv_quiet(err) && conv_copy(runs, out.data() + pay_off, false, err);
+        if (cur >= 0) (void) cudaSetDevice(cur);
+        if (!ok) {
+            out.clear();
+            return 0;
+        }
+        conv_held = true;
+        if (lo_out) *lo_out = lo;
+        return (uint64_t) total;
+    }
+    bool conv_load(const uint8_t* d, size_t b, std::vector<int>* toks, std::string& err) {
+        bool wrote = false, ok = false;
+        // (a load that stops after some of the slot went into the caches leaves a state no rewind repairs: the model is
+        //  reset - the prompt read from token 0 - never served from the mix; ds4's slot_load)
+        struct FailClosed {
+            Impl& p;
+            const bool& wrote;
+            const bool& ok;
+            ~FailClosed() {
+                if (!ok && wrote) p.conv_reset();
+            }
+        } guard{*this, wrote, ok};
+        if (!conv_ok(err)) return false;
+        int64_t n = 0, lo = 0, md = 0;
+        std::vector<ConvRun> runs;
+        size_t tok_off = 0, pay_off = 0;
+        if (!conv_parse(d, b, n, lo, md, runs, tok_off, pay_off, err)) return false;
+        std::vector<int> t((size_t) n);
+        std::memcpy(t.data(), d + tok_off, (size_t) n * 4);
+        int cur = -1;
+        if (cudaGetDevice(&cur) != cudaSuccess) cur = -1;
+        bool good = conv_quiet(err);
+        if (good) {
+            wrote = true;
+            good = conv_copy(runs, const_cast<uint8_t*>(d) + pay_off, true, err);
+        }
+        if (cur >= 0) (void) cudaSetDevice(cur);
+        static const bool fault = [] {
+            const char* v = std::getenv("MAYA_HY4_SLOT_FAULT");
+            return v && *v && std::atoi(v) != 0;
+        }();
+        if (good && fault) {
+            err = "MAYA_HY4_SLOT_FAULT: the load failed after its copies (a test)";
+            good = false;
+        }
+        if (!good) return false;
+        tokens = std::move(t);
+        end = n;
+        ring_lo = lo;
+        mtp_done = md;
+        mtp_apos = -1;
+        mtp_atok = -1;
+        df.snap_p0 = -1;
+        conv_held = true;
+        if (toks) *toks = tokens;
+        ok = true;
+        return true;
+    }
+    bool conv_verify(const uint8_t* d, size_t b, std::string& msg) {
+        int64_t n = 0, lo = 0, md = 0;
+        std::vector<ConvRun> runs;
+        size_t tok_off = 0, pay_off = 0;
+        std::string err;
+        if (!conv_parse(d, b, n, lo, md, runs, tok_off, pay_off, err)) {
+            msg = "verify: the slot: " + err;
+            return false;
+        }
+        char buf[320];
+        if (end != n || ring_lo != lo || mtp_done != md || (int64_t) tokens.size() != n ||
+            std::memcmp(tokens.data(), d + tok_off, (size_t) n * 4) != 0) {
+            std::snprintf(buf, sizeof buf, "verify: MISMATCH in the host's state (end %lld / %lld, ring_lo %lld / %lld, "
+                          "MTP rows %lld / %lld, tokens %s)", (long long) end, (long long) n, (long long) ring_lo,
+                          (long long) lo, (long long) mtp_done, (long long) md,
+                          (int64_t) tokens.size() == n && std::memcmp(tokens.data(), d + tok_off, (size_t) n * 4) == 0
+                              ? "the same" : "differ");
+            msg = buf;
+            return false;
+        }
+        size_t most = 0;
+        uint64_t pay = 0;
+        for (const ConvRun& r : runs) {
+            most = std::max(most, r.bytes);
+            pay += r.bytes;
+        }
+        std::vector<uint8_t> back(most);
+        int cur = -1;
+        if (cudaGetDevice(&cur) != cudaSuccess) cur = -1;
+        bool ok = conv_quiet(err);
+        size_t bad = runs.size(), at = 0;
+        for (size_t i = 0; ok && i < runs.size(); ++i) {
+            const ConvRun& r = runs[i];
+            const cudaError_t e = cudaSetDevice(G[(size_t) r.gi].dev) == cudaSuccess
+                                      ? cudaMemcpy(back.data(), r.dev, r.bytes, cudaMemcpyDeviceToHost)
+                                      : cudaGetLastError();
+            if (e != cudaSuccess) {
+                err = cudaGetErrorString(e);
+                (void) cudaGetLastError();
+                ok = false;
+                break;
+            }
+            const uint8_t* s = d + pay_off + r.off;
+            if (std::memcmp(back.data(), s, r.bytes) != 0) {
+                bad = i;
+                while (at < r.bytes && back[at] == s[at]) ++at;
+                break;
+            }
+        }
+        if (cur >= 0) (void) cudaSetDevice(cur);
+        if (!ok) {
+            msg = "verify: reading the state back failed (" + err + ")";
+            return false;
+        }
+        if (bad < runs.size()) {
+            const ConvRun& r = runs[bad];
+            const std::string who = r.il < 0 ? std::string("the MTP block's") : "layer " + std::to_string(r.il) + "'s";
+            std::snprintf(buf, sizeof buf, "verify: MISMATCH - %s %s on GPU %d differ from the slot at byte %zu of %zu "
+                          "(run %zu of %zu)", who.c_str(), r.what, G[(size_t) r.gi].dev, at, r.bytes, bad + 1,
+                          runs.size());
+            msg = buf;
+            return false;
+        }
+        std::snprintf(buf, sizeof buf, "verify: the restored state is the slot's byte for byte - %zu runs, %.1f MB on the "
+                      "GPUs, %lld tokens, rings from %lld, %lld MTP rows", runs.size(), (double) pay / 1e6,
+                      (long long) n, (long long) lo, (long long) md);
+        msg = buf;
+        return true;
+    }
     std::unique_ptr<Vision> vis;         // the vision tower (Options::vision)
     VisionGeo vgeo;
     double vis_room = 0;                 // its room for the largest picture this start reads
@@ -946,6 +1440,7 @@ struct Model::Impl {
     // BF16 s a row in a file beside it (hy4.txt's engram_scales); the rows' values are then the release's own.  Read
     // from the disk a looked-up row at a time, as the table
     const uint8_t* eg_scale = nullptr;
+    std::string eg_scale_path;           // (its file: conv_identity's)
     float* h_egs = nullptr;              // pinned [modules][Tc][cols]
     std::FILE* eg_dump = nullptr;        // (HY4_EG_DUMP=<file>, tests: every looked-up row - see engram_row)
     std::mutex eg_dump_mu;
@@ -4147,6 +4642,7 @@ struct Model::Impl {
                 const std::string sp = !sp0.empty() && sp0[0] == '/' ? sp0 : pk.model_dir + "/" + sp0;
                 size_t sz = 0;
                 eg_scale = mm3::os::map_file(sp, sz);
+                eg_scale_path = sp;
                 if (eg_scale == nullptr || sz < (size_t) tt->n(1) * 2) {
                     err = sp + ": not the Engram table's row scales (BF16, one a row)";
                     return false;
@@ -9443,6 +9939,23 @@ bool Model::resumable(int64_t pos) const {
     return ring_holds(pos, m->end, m->ring_lo, m->ring, (int64_t) std::max(m->g.n_swa, m->g.ix_kpool) - 1);
 }
 int64_t Model::end() const { return m->end; }
+// (SLOTS) hy4_model.hpp; Impl::conv_runs and the ones beside it
+bool Model::conv_ok(std::string& why) const { return m->conv_ok(why); }
+uint64_t Model::conv_save(std::vector<uint8_t>& out, int64_t n, int64_t keep_ring, std::string& err, int64_t* lo,
+                          const int* expect) {
+    return m->conv_save(out, n, keep_ring, err, lo, expect);
+}
+bool Model::conv_load(const uint8_t* d, size_t b, std::vector<int>* toks, std::string& err) {
+    return m->conv_load(d, b, toks, err);
+}
+bool Model::conv_verify(const uint8_t* d, size_t b, std::string& msg) { return m->conv_verify(d, b, msg); }
+void Model::conv_reset() { m->conv_reset(); }
+bool Model::conv_held() const { return m->conv_held; }
+std::string Model::conv_identity() const { return m->conv_identity(); }
+uint64_t Model::conv_bytes(int64_t n, int64_t keep_ring) const { return m->conv_bytes(n, keep_ring); }
+int64_t Model::mtp_rows() const { return m->M.mtp ? std::min(m->mtp_done, m->end) : m->end; }
+int64_t Model::ring_rows() const { return m->ring; }
+int64_t Model::ring_back() const { return (int64_t) std::max(m->g.n_swa, m->g.ix_kpool) - 1; }
 
 bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err) {
     if (n <= 0) {
@@ -9476,6 +9989,7 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         }
     }
     m->ring_lo = ring_lo_at(pos0, m->ring_lo, m->end, m->ring);   // (#1091)
+    m->conv_held = false;   // (SLOTS: the state moves on from what a slot holds)
     m->tokens.resize((size_t) pos0);
     // (the MTP cache's rows from pos0 on are the drafts' own - but the row at pos0 when this is the token the last
     //  drafts started from, there: that one is the model's)
@@ -9523,6 +10037,7 @@ int Model::chunk() const { return m->Tc; }
 int Model::tensor_parallel() const { return std::max(1, m->tp); }
 bool Model::draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& c,
                   std::string& err, int base, float sure) {
+    m->conv_held = false;   // (SLOTS: a draft writes the MTP block's rows)
     return m->df.on ? m->dfly_draft(tok, pos, n, floor, d, c, err) : m->draft(tok, pos, n, floor, d, c, err, base, sure);
 }
 bool Model::has_mtp() const { return m->M.mtp; }

@@ -152,6 +152,44 @@ public:
     /// The positions processed so far (the next forward's pos0 when continuing)
     int64_t end() const;
 
+    /// A conversation parked in RAM and taken back (MAYA_HY4_SLOT_KEEP; hy4_main's serve loop, the
+    /// table in hy4_slots.hpp).  A slot is the state a forward continuing at n reads: every indexed layer's latent rows
+    /// [0, n) and pooled keys [0, n / kpool + 1), the rings' rows of the positions [lo, n) - the sliding-window layers'
+    /// latent rows, the indexed layers' value | gate rows and, with the MTP block, its own caches and the trunk's states
+    /// it reads (hring) - and the host's tokens, n, lo and the MTP rows made (min(mtp_done, n)).  lo is the rings'
+    /// lowest position still held (hy4_ring.hpp's ring_lo_at(n, ...): rejected drafts past n overwrote the slots below
+    /// it), raised to n - keep_ring with keep_ring > 0 (at least ring_back()).  Every GPU's work is waited for first
+    /// (the queued MTP pass); the GPUs' layers copied by a thread each, between the caches and pageable RAM - no VRAM,
+    /// no pinned memory.
+    /// conv_ok: this start can (no KV streaming or spill, no tensor parallel, no DFly2 drafter); why: the reason not.
+    /// conv_save: the state of positions [0, n) into out (n <= end(); expect: the caller's n tokens, compared with the
+    /// model's) -> its bytes, and *lo; 0 on a failure (err; "it is already set aside": conv_held, the model unchanged
+    /// since its last save or load).  conv_load: a slot back (toks: its tokens) - end() n, resumable as when it was
+    /// saved; a load that fails after its first write resets the model (conv_reset: a read from token 0), never
+    /// serves a mix of two conversations; MAYA_HY4_SLOT_FAULT=1 (tests) fails every load after its writes.
+    /// conv_verify: the GPUs' state and the host's read back and compared with a slot (after its conv_load) -> msg,
+    /// one line.  conv_reset: no conversation (tokens, end, ring_lo, the MTP rows made).  conv_held: the model unchanged
+    /// since a conv_save or conv_load (a forward clears it).  ring_rows / ring_back: the rings' rows, the positions a
+    /// forward reads before its start (hy4_ring.hpp's ring_holds)
+    bool conv_ok(std::string& why) const;
+    uint64_t conv_save(std::vector<uint8_t>& out, int64_t n, int64_t keep_ring, std::string& err, int64_t* lo = nullptr,
+                       const int* expect = nullptr);
+    bool conv_load(const uint8_t* d, size_t b, std::vector<int>* toks, std::string& err);
+    bool conv_verify(const uint8_t* d, size_t b, std::string& msg);
+    void conv_reset();
+    bool conv_held() const;
+    /// What a slot's file must match to be read on this start (its .meta keeps it): the slot
+    /// layout's version, this engine binary, the pack's files, the cache's rows and geometry, the MTP block, the layer
+    /// split and its GPUs - one line of text
+    std::string conv_identity() const;
+    /// The bytes conv_save(n, keep_ring) would take, nothing copied (0: no such save)
+    uint64_t conv_bytes(int64_t n, int64_t keep_ring) const;
+    /// The MTP block's cache rows made: positions [0, mtp_rows()) - the next MTP catch-up reads the
+    /// embeddings of the positions from there (a picture's rows among them); no MTP block: end()
+    int64_t mtp_rows() const;
+    int64_t ring_rows() const;
+    int64_t ring_back() const;
+
     int vocab() const;
     /// Row r of the last forward's logits: its largest value's index (of equals the lowest - the host's argmax), found
     /// by the GPUs that computed the row's parts (tensor parallel with the head over the members); -1: not known, the
