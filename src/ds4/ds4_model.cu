@@ -8153,7 +8153,16 @@ struct Model::Impl {
                                          "%d statics, %d recent)\n",
                                  l.il, l.n_slots, l.n_vram, l.rc_n, l.spare_vram >= 0 ? 1 : 0, d.slots, d.statics, d.recent);
             }
-            for (int i = 0; i < l.n_vram; ++i) l.slot[(size_t) order[(size_t) i]] = i;
+            {   // (DS4_RHELPER_SKIP_FILE, the helper engine: its VRAM takes the experts after the lead's own first ones
+                //  of the layer, by the same profile order - the two GPUs' experts apart; the lead writes that file,
+                //  DS4_RHELPER_SKIP_OUT)
+                const int sk = std::max(0, std::min(rh_skip(l.il), l.n_exp - l.n_vram));
+                for (int i = 0; i < l.n_vram; ++i) l.slot[(size_t) order[(size_t) (sk + i)]] = i;
+                if (const char* f = std::getenv("DS4_RHELPER_SKIP_OUT"); f != nullptr && *f && !rh_serve && !l.mtp) {
+                    static std::FILE* out = std::fopen(f, "w");
+                    if (out != nullptr) std::fprintf(out, "%d %d\n", l.il, l.n_slots), std::fflush(out);
+                }
+            }
             // (the last n_tail slots - the coldest of them, and the cache's spare - in the device's tail region)
             l.n_main = l.n_slots - std::min(l.n_slots, n_tail[(size_t) (&l - &L[0])]);
             l.pv_n = l.n_slots;
@@ -12356,6 +12365,10 @@ struct Model::Impl {
                     Layer& x = member(l, m);
                     upd[(size_t) x.dev].push_back((unsigned long long) (x.vram_tab + e));
                     upd[(size_t) x.dev].push_back(i < 0 ? 0ull : l.rc_pin[(size_t) i * nm + m]);
+                    if (rh_follows(x, e)) {   // (MAYA_MIXED_HELPER's lead: its decode table follows)
+                        upd[(size_t) x.dev].push_back((unsigned long long) (x.rh_tab + e));
+                        upd[(size_t) x.dev].push_back(i < 0 ? 0ull : l.rc_pin[(size_t) i * nm + m]);
+                    }
                 }
             };
             for (int i = 0; i < l.rc_n; ++i) {   // the window's landings (rc_land): the slot's old expert out, the new in
@@ -12516,7 +12529,10 @@ struct Model::Impl {
             const std::vector<unsigned long long>& u = tick_upd[di];
             if (u.empty() && jobs.empty()) continue;
             cudaSetDevice(devs[di].id);
-            const int n = (int) std::min<size_t>(u.size() / 2, (size_t) kRcUpd);
+            // (every pair, kRcUpd a launch: MAYA_MIXED_HELPER's lead writes each change into its decode table too, so a
+            //  tick can hold more pairs than one launch takes - the rest were dropped, the tables left stale)
+            for (size_t done = 0; done < u.size() / 2; done += (size_t) kRcUpd) {
+            const int n = (int) std::min<size_t>(u.size() / 2 - done, (size_t) kRcUpd);
             if (n > 0) {
                 // tab_set reads its host-mapped input only when it eventually executes. The head GPU's: before every
                 // overwrite, all earlier work on its stream finished (in particular back-to-back cache_drain /
@@ -12529,10 +12545,9 @@ struct Model::Impl {
                                      cudaGetErrorString(update_sync));
                         std::abort();
                     }
-                    std::memcpy(rc_upd[di], u.data(), (size_t) n * 16);
+                    std::memcpy(rc_upd[di], u.data() + done * 2, (size_t) n * 16);
                     tab_set(rc_upd[di], n, devs[di].st);
-                    cudaEventRecord(rc_go[di], devs[di].st);
-                    continue;
+                    continue;   // (rc_go: recorded once after every launch, below)
                 }
                 // another GPU of a layer split, whose stream the window's end never waits for: no wait for the whole
                 // stream - on two AMD GPUs that sync hung with nothing left to run (#1086, #1027; --no-expert-cache
@@ -12553,7 +12568,7 @@ struct Model::Impl {
                     std::abort();
                 }
                 unsigned long long* in = rc_upd[di] + (size_t) k * 2 * kRcUpd;
-                std::memcpy(in, u.data(), (size_t) n * 16);
+                std::memcpy(in, u.data() + done * 2, (size_t) n * 16);
                 tab_set(in, n, devs[di].st);
                 te = cudaEventRecord(ev[k], devs[di].st);
                 if (te != cudaSuccess) {
@@ -12561,6 +12576,7 @@ struct Model::Impl {
                                  cudaGetErrorString(te));
                     std::abort();
                 }
+            }
             }
             cudaEventRecord(rc_go[di], devs[di].st);
         }
@@ -12829,6 +12845,14 @@ struct Model::Impl {
                 u.push_back((unsigned long long) sat(l, x, l.slot[(size_t) sw.in], unit(x)));
                 u.push_back((unsigned long long) (x.vram_tab + sw.out));
                 u.push_back(0ull);
+                if (rh_follows(x, sw.in)) {   // (MAYA_MIXED_HELPER's lead: its decode table follows)
+                    u.push_back((unsigned long long) (x.rh_tab + sw.in));
+                    u.push_back((unsigned long long) sat(l, x, l.slot[(size_t) sw.in], unit(x)));
+                }
+                if (rh_follows(x, sw.out)) {
+                    u.push_back((unsigned long long) (x.rh_tab + sw.out));
+                    u.push_back(0ull);
+                }
             }
             l.swap_pending = false;
             l.sw_in = -1;
@@ -15402,10 +15426,15 @@ struct Model::Impl {
     void helper_answer(const Layer& l, const Req& r, Resp& rp, unsigned seq, int T,
                        const std::vector<std::pair<int, int>>& hp, std::vector<Ent>& ents) {
         const int slot = (int) (seq % kRing);
+        // (a cold lead, DS4_RHELPER_COLD: a request with none of the helper's experts needs nothing from it - its take
+        //  of the request is not waited for; it sees a later request in the slot and leaves this one)
+        if (rh_cold && rh_lead && hp.empty()) return;
         const volatile unsigned* f = helper_flags + (hp.empty() ? 0 : kRing) + slot;
         const double t0 = now_ms();
         bool ok = true;
-        for (unsigned n = 0; *f != seq; ++n) {
+        // (a helper in another engine: its flags only rise, and the lead's GPU reads its sums itself (rh_direct) without
+        //  waiting for this thread - so the flag may already be past seq when this thread gets here: answered, not lost)
+        for (unsigned n = 0; rh_lead ? (int) (*f - seq) < 0 : *f != seq; ++n) {
             if (helper_dead.load(std::memory_order_relaxed) || ((n & 1023) == 0 && now_ms() - t0 > kHelperWaitMs)) {
                 ok = false;
                 break;
@@ -15878,6 +15907,13 @@ struct Model::Impl {
         while (!quit.load(std::memory_order_relaxed)) {
             if (deep) gate_seen = gate.epoch();   // (before the look at the ring: a poke after it ends the sleep at once)
             Req& r = reqs[next % kRing];
+            if (rh_lead) {
+                // (a helper in another engine, rh_direct: no GPU waits for this thread, so after a sleep the ring can be a
+                //  whole turn ahead - request `next` is gone from its slot, which holds a later one; a request a GPU does
+                //  wait for is never passed (its GPU publishes nothing after it), so the slot's own request is the next)
+                const unsigned cur = *(volatile unsigned*) &r.seq;
+                if ((int) (cur - next) > 0 && (cur - next) % (unsigned) kRing == 0u) next = cur;
+            }
             if (*(volatile unsigned*) &r.seq != next) {
                 const auto quiet = std::chrono::steady_clock::now() - last;
                 if (kIdleMs > 0 && quiet > std::chrono::milliseconds(kIdleMs)) {
@@ -20420,6 +20456,7 @@ struct Model::Impl {
             const unsigned long long v = sl >= 0 ? (unsigned long long) sat(l, x, sl, unit(x)) : 0ull;
             ok = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess &&
                  cudaMemcpy(x.vram_tab + e, &v, 8, cudaMemcpyHostToDevice) == cudaSuccess;
+            if (ok && rh_follows(x, e)) ok = cudaMemcpy(x.rh_tab + e, &v, 8, cudaMemcpyHostToDevice) == cudaSuccess;
         }
         return ok;
     }
@@ -20781,7 +20818,8 @@ struct Model::Impl {
             for (int m = 0; m < l.nm; ++m) {   // (a group's: every member's table - DS4_TP_BORROW)
                 const Layer& x = member(l, m);
                 if (cudaSetDevice(devs[(size_t) x.dev].id) != cudaSuccess ||
-                    cudaMemcpy(x.vram_tab + e, &zero, 8, cudaMemcpyHostToDevice) != cudaSuccess)
+                    cudaMemcpy(x.vram_tab + e, &zero, 8, cudaMemcpyHostToDevice) != cudaSuccess ||
+                    (rh_follows(x, e) && cudaMemcpy(x.rh_tab + e, &zero, 8, cudaMemcpyHostToDevice) != cudaSuccess))
                     broken = true;   // (the device's table may still name the slot)
             }
         }
@@ -22778,7 +22816,7 @@ struct Model::Impl {
             const int m1 = nx1 != nullptr ? std::max(1, std::min(kAhead1, nx1->k_exp + ahead_extra)) : 0;
             // (MAYA_MIXED_HELPER's lead: the request into this GPU's mirror, then copied out by DMA - a GPU's own
             //  stores into host memory crawl over a USB4 link)
-            Req* const preq = rh_lead && lead ? rh_dreq : reqs + slot;
+            Req* const preq = rh_mir() && lead ? rh_dreq : reqs + slot;
             RoutePair rp;
             if (nx1 != nullptr) {
                 rp.logits = d.glog;
@@ -22830,7 +22868,7 @@ struct Model::Impl {
                               na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any,
                               lane_done, mi == 0 && sq == 0 && host_free(l) ? dev_count(d, l.il) : nullptr);
             }
-            if (rh_lead && lead && !rh_req_out(slot, T, s, err)) return false;
+            if (rh_mir() && lead && !rh_req_out(slot, T, s, err)) return false;
             {
                 x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)};
                 if (!mv_n(d, js, 2, err, ffn_q8)) return false;
@@ -22844,7 +22882,7 @@ struct Model::Impl {
             // (DS4_RHELPER_LATE: a single token's layer the helper answers goes the window's way too - its combine
             //  waits for the helper's sums after this GPU's own experts, not before them; the same sums, WinArgs'
             //  contract)
-            const bool rh_late_tok = rh_lead && lead && rh_late_on() && rh_direct_on(l);
+            const bool rh_late_tok = rh_mir() && lead && rh_late_on() && rh_direct_on(l);
             if (T == 1 && moe_token_path && !rh_late_tok) {
                 const int lc = lead && nm == 1 && lay.fmt == gg::kFmtMXFP4 ? lane_class(l.il) : -1;
                 const bool zc_nowait = lc >= 0 && ln_zc_nowait && zc_layer_full(l);
@@ -22882,9 +22920,9 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
-                const bool rhd = rh_lead && lead && rh_direct_on(l);
+                const bool rhd = rh_mir() && lead && rh_direct_on(l);
                 if ((lead || lane_m) && !zc_nowait && !rhd) wait_seq(&resps[slot].seq, sq, s);
-                if (rh_lead && lead) {   // (MAYA_MIXED_HELPER's lead: the answer in by DMA, read from this GPU)
+                if (rh_mir() && lead) {   // (MAYA_MIXED_HELPER's lead: the answer in by DMA, read from this GPU)
                     if (!(rhd ? rh_help_in(slot, sq, T, s, err) : rh_resp_in(slot, T, s, err))) return false;
                     ma.cpu_part = rh_dresp->part[0];
                     ma.cpu_flag = rhd ? rh_ones : &rh_dresp->cpu[0];
@@ -22927,7 +22965,7 @@ struct Model::Impl {
                 }
                 wa.wait_ptr = lead || lane_m ? &resps[slot].seq : nullptr;
                 wa.wait_val = sq;
-                if (rh_lead && lead) {   // (MAYA_MIXED_HELPER's lead: the answer waited for, in by DMA, read here)
+                if (rh_mir() && lead) {   // (MAYA_MIXED_HELPER's lead: the answer waited for, in by DMA, read here)
                     const bool rhd = rh_direct_on(l);
                     if (rhd && rh_late_on()) {   // (DS4_RHELPER_LATE: its sums read in place, waited for after this GPU's own)
                         wa.wait_ptr = helper_flags + kRing + slot;
