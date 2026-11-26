@@ -2,6 +2,7 @@
 //
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--drafting auto|on|off|mtp|dfly2 | --mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F]
+//            [--lookup on|off [--lookup-max N] [--lookup-match N] [--lookup-hot N]]
 //            [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
 //            [--kv-streaming on|off|auto] [--kv-resident N] [--kv-spill on|off|auto] [--kv-spill-dir D]
@@ -1168,13 +1169,13 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             state.clear();
             held.clear();
         }
-        if (d_off > 0) {
-            std::fprintf(stderr, "maya hy4 serve: kept %lld of %lld drafts", d_acc, d_off);
-            if (lk.rounds > 0)
-                std::fprintf(stderr, " (the copy's: %lld of %lld in %lld windows; the %s: %lld of %lld)", lk.acc, lk.off,
-                             lk.rounds, m.has_dfly2() ? "DFly2 drafter's" : "MTP block's", d_acc - lk.acc, d_off - lk.off);
-            std::fprintf(stderr, "\n");
-        }
+        // (the drafter's own drafts as before; the copy's beside them)
+        if (spec && d_off - lk.off > 0)
+            std::fprintf(stderr, "maya hy4 serve: %s kept %lld of %lld drafts\n", m.has_dfly2() ? "DFly2" : "MTP",
+                         d_acc - lk.acc, d_off - lk.off);
+        if (lk.rounds > 0)
+            std::fprintf(stderr, "maya hy4 serve: the copy kept %lld of %lld drafts in %lld windows\n", lk.acc, lk.off,
+                         lk.rounds);
         stat_line();
         const double t2 = now() * 1e3;
         // (its last two: the routed experts the answer ran in VRAM, of all it ran - the web app's VRAM hit)
