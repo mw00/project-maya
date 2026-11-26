@@ -32,6 +32,7 @@ namespace maya::core::glp {
 /// (llama.cpp's `build_cvec()` site).  The hc fold site (`hc_fold_pre_engram`, spec_version 3) is a different
 /// tensor and is refused; so are the two writer sites (`*_out_pre_residual`).
 inline constexpr const char* kHookResidualPostLayer = "residual_stream_post_layer";
+inline constexpr const char* kHookFoldPreEngram = "hc_fold_pre_engram";   // spec_version 3: the fold + companion writer pair
 
 struct Vector {
     int64_t n_embd = 0;
@@ -42,6 +43,7 @@ struct Vector {
     std::vector<float> s;        ///< n_layers: alpha (0 = unsteered)
     std::vector<int> layers;     ///< the layer ids the file carries, ascending
     std::string mode, hook, derived_at, spec_version;
+    int spec = 1;   ///< 1: residual_stream_post_layer; 3: hc_fold_pre_engram (the fold + writer pair)
     std::string base_model, base_revision, content_sha256;
     bool loaded() const { return !dir.empty(); }
 };
@@ -204,30 +206,38 @@ inline bool load(const std::string& path, int64_t n_embd, int64_t n_layers, cons
                       "'add' files use --control-vector)";
             return false;
         }
-        // ---- glp.spec_version: required; 1 only.
+        // ---- glp.spec_version: required; 1 (residual_stream_post_layer) or 3 (hc_fold_pre_engram).
+        // Version 3 files apply at the hc fold site: the projection at the fold consuming the layer's
+        // FFN write AND the companion attention output writer (the same stack, the same alpha) - a
+        // reader that arms only the fold under-doses and must refuse the file (GLP.md, "The
+        // companion writer is part of the site"). This reader returns the tables for BOTH halves;
+        // the engine applies them at its two writes.  Version 2 (rank-k) remains refused.
         if (g.get("glp.spec_version") == nullptr) {
-            err = path + ": missing glp.spec_version (required; this reader implements 1)";
+            err = path + ": missing glp.spec_version (required; this reader implements 1 and 3)";
             return false;
         }
         double spec = 0.0;
         if (!detail::meta_num(g, path, "glp.spec_version", spec, err)) return false;
-        if (spec != 1.0) {
+        if (spec != 1.0 && spec != 3.0) {
             err = path + ": glp.spec_version=" + std::to_string((long long) spec) + " is not implemented (this "
-                  "reader implements 1" +
-                  (spec == 2.0 ? "; rank-k and the alpha-scaling keys need a rank-k reader"
-                               : spec == 3.0 ? "; hc fold sites need a fold-site reader" : "") + ")";
+                  "reader implements 1 and 3" +
+                  (spec == 2.0 ? "; rank-k and the alpha-scaling keys need a rank-k reader" : "") + ")";
             return false;
         }
-        // ---- glp.hook_point: absent = residual_stream_post_layer (the canonical site).
+        // ---- glp.hook_point: absent = residual_stream_post_layer (v1's canonical site).  A v3 file
+        // must name hc_fold_pre_engram; a v1 file must not.
         std::string hook = kHookResidualPostLayer;
         if (!detail::meta_str(g, path, "glp.hook_point", hook, err)) return false;
-        if (hook != kHookResidualPostLayer) {
-            err = path + ": glp.hook_point='" + hook + "' is not applied here (this reader applies at '" +
-                  kHookResidualPostLayer + "')";
+        if (spec == 1.0 && hook != kHookResidualPostLayer) {
+            err = path + ": glp.hook_point='" + hook + "' with glp.spec_version=1: this reader applies v1 files at '" +
+                  kHookResidualPostLayer + "' only";
             if (hook == "hc_fold_pre_engram")
                 err += "; the hc fold site needs glp.spec_version 3 and the fold + companion writer pair";
-            else if (hook == "ffn_out_pre_residual" || hook == "attn_out_pre_residual")
-                err += "; the writer sites are maya-ds4's --ablate, not this residual-stream path";
+            return false;
+        }
+        if (spec == 3.0 && hook != kHookFoldPreEngram) {
+            err = path + ": glp.hook_point='" + hook + "' with glp.spec_version=3: a v3 file must name '" +
+                  kHookFoldPreEngram + "'";
             return false;
         }
         // ---- glp.rank: 1 only.
@@ -362,8 +372,9 @@ inline bool load(const std::string& path, int64_t n_embd, int64_t n_layers, cons
         out.rank = 1;
         out.mode = mode;
         out.hook = hook;
+        out.spec = (int) spec;
         out.derived_at = derived_at;
-        out.spec_version = "1";
+        out.spec_version = std::to_string((long long) spec);
         out.layers = sorted;
         // One row past n_layers: direction.N == n_layers is valid (the container's index space),
         // so the dense tables carry a (n_layers + 1)-th row the cvec kernel indexes by layer id.
