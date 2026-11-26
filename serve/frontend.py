@@ -32,6 +32,11 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from serve.response_schema import json_instruction, with_system_note
 from serve.glm_dsa_template import effort_dialect
 
+# What the chat template refuses a request with (its `raise_exception` global, ChatTemplate below).  jinja2's exception
+# is no ValueError, so an uncaught one escapes the server's except clauses and the connection is dropped with no answer:
+# the handler catches it and answers a 400 with its message.
+TemplateError = jinja2.exceptions.TemplateError
+
 
 # ------------------------------------------------------------------------------------------------ template
 class ChatTemplate:
@@ -684,15 +689,28 @@ _JSON_KINDS = {str: "a string", bool: "a boolean", int: "a number", float: "a nu
                type(None): "null"}
 
 
-def check_messages(req: dict, key: str = "messages") -> None:
+def check_messages(req: dict, key: str = "messages", nonempty: bool = False) -> None:
     """A request's list of messages (`messages`; the Responses API's `input`, which may also be one string) has the
-    right shape: a list of objects.  Else a ValueError with plain words - the server answers 400 with them, where
-    reading the list would stop at the first item with an AttributeError."""
+    right shape: a list of objects, and with `nonempty` at least one of them.  Else a ValueError with plain words -
+    the server answers 400 with them, where reading the list would stop at the first item with an AttributeError.
+
+    `nonempty` is for the routes that always answer with a completion (OpenAI's Chat Completions, Anthropic's
+    messages): an absent or empty list reaches the chat template, which refuses it with a
+    TemplateError ('No messages provided.') that no except clause covered, so the connection simply closed - a client
+    probing the route (M3 Code asks every protocol path `POST {}` and reads only the status code) took the missing
+    400 for "this server does not serve Chat Completions".  /api/chat leaves it off: there an empty list is Ollama's
+    preload/unload, a call of its own that answers 200."""
     msgs = req.get(key)
-    if msgs is None or (key == "input" and isinstance(msgs, str)):
+    if key == "input" and isinstance(msgs, str):
+        return
+    if msgs is None:
+        if nonempty:
+            raise ValueError(f"`{key}` must be a nonempty array of messages")
         return
     if not isinstance(msgs, list):
         raise ValueError(f"`{key}` must be a list of messages, not {_JSON_KINDS.get(type(msgs), 'an object')}")
+    if nonempty and not msgs:
+        raise ValueError(f"`{key}` must be a nonempty array of messages")
     for i, m in enumerate(msgs):
         if not isinstance(m, dict):
             raise ValueError(f"`{key}[{i}]` must be an object (a message with its role and content), not "
