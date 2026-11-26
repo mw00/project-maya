@@ -1466,6 +1466,22 @@ void test_attn_decode_mma() {
                 k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv, dp,
                                        d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
                 CU(cudaDeviceSynchronize());
+                {   // the other FP8 dequant (e4m3x4_h4 / e4m3x4_h4_s8): the same output to the bit, the FP16 copy too
+                    const auto o1 = host(dout, (size_t) H * D);
+                    const auto h1 = host(dout16, (size_t) H * D);
+                    const bool s8 = k::attn_decode_mma_s8();
+                    k::attn_decode_mma_set_s8(!s8);
+                    k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv,
+                                           dp, d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
+                    CU(cudaDeviceSynchronize());
+                    k::attn_decode_mma_set_s8(s8);
+                    const auto o2 = host(dout, (size_t) H * D);
+                    const auto h2 = host(dout16, (size_t) H * D);
+                    char lb[112];
+                    std::snprintf(lb, sizeof lb, "mma fp8 %s: s8 and h4 dequant the same to the bit", c.name);
+                    expect_true(lb, !std::memcmp(o1.data(), o2.data(), o1.size() * sizeof(o1[0])) &&
+                                        !std::memcmp(h1.data(), h2.data(), h1.size() * sizeof(h1[0])));
+                }
                 cudaFree(dk), cudaFree(dv);
             } else {
                 uint16_t *dk = dev(k16), *dv = dev(v16);

@@ -395,6 +395,10 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 /// once, a window of w keys needs no more than w / 64.  scratch: attn_decode_mma_scratch(H, n_split) floats.
 /// gate [H][128] (or null): the output times its sigmoid (gate_mul's); out16 (or null): an FP16 copy of the output.
 int attn_decode_mma_blocks(int Hkv);
+/// The one-token FP8 path's dequant (attn_decode_mma_fp8, not the window's): e4m3x4_h4_s8, the same bits in fewer
+/// operations (AMD only, on by default; IK2_ATTN_S8=0 in maya-ik2 turns it off; NVIDIA keeps e4m3x4_h4).
+void attn_decode_mma_set_s8(bool on);
+bool attn_decode_mma_s8();
 size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,

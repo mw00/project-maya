@@ -1582,7 +1582,20 @@ __device__ __forceinline__ bool wa_shared(int pos0, int T, int nw) {
     return wa_per0(pos0, nw) == wa_per0(pos0 + T - 1, nw);
 }
 
-template <class KVT>
+// four E4M3 values as FP16 times 2^-8, lo the first two, hi the other two: a byte's bits are the FP16's (the sign at
+// bit 15, the rest from bit 7), and that FP16 times 2^8 is the E4M3 value, a subnormal too (4 operations for two
+// values, against e4m3x4_h4's dozen - on Volta the attention's FP8 cache waits on these); 0x7F comes out finite
+__device__ __forceinline__ void e4m3x4_h4_s8(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    const uint32_t t0 = __byte_perm(w, 0u, 0x1404u), t1 = __byte_perm(w, 0u, 0x3424u);   // (a byte its half's high one)
+    lo = (t0 & 0x80008000u) | ((t0 >> 1) & 0x3F803F80u);
+    hi = (t1 & 0x80008000u) | ((t1 >> 1) & 0x3F803F80u);
+}
+
+// S8 (an FP8 cache): its K and V as FP16 times 2^-8 (e4m3x4_h4_s8, 4 operations for two values against e4m3x4_h4's
+// dozen), the 2^8 back in the logit scale and in the combine's v_inv.  Every product of the emulated or real MMA is
+// exact in FP32 and a power of two moves through the sums and the rescales unrounded, so the output is S8 = false's
+// to the bit (ik2_kernels_test checks it); only the FP8 decode's own work changes.
+template <class KVT, bool S8 = false>
 __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                        int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
@@ -1625,7 +1638,8 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict
 #pragma unroll
     for (int j = 0; j < kFaD / 16; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
     float ma = -INFINITY, mb = -INFINITY, la = 0.0f, lb = 0.0f;
-    const float sc = qk_scale * kLog2e;
+    float sc = qk_scale * kLog2e;
+    if constexpr (F8 && S8) sc *= 256.0f;   // (K as FP16 times 2^-8; the same rounding of qk_scale kLog2e as without)
     const KVT* kg = kc + (size_t) g * kFaD + tq * 4;    // the lane's values of a K row (+ 16 kk) ...
     const KVT* vg = vc + (size_t) g * kFaD + gr * 16;   // ... and of a V row
     const float* ra = r + (size_t) (g * R + (a_ok ? qa : 0)) * d_rel;   // (the bias: the heads' r)
@@ -1657,8 +1671,13 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict
                 }
 #pragma unroll
                 for (int kk = 0; kk < kFaD / 16; ++kk) {
-                    e4m3x4_h4(w0[kk], ka[kk][0], ka[kk][2]);
-                    e4m3x4_h4(w1[kk], ka[kk][1], ka[kk][3]);
+                    if constexpr (S8) {
+                        e4m3x4_h4_s8(w0[kk], ka[kk][0], ka[kk][2]);
+                        e4m3x4_h4_s8(w1[kk], ka[kk][1], ka[kk][3]);
+                    } else {
+                        e4m3x4_h4(w0[kk], ka[kk][0], ka[kk][2]);
+                        e4m3x4_h4(w1[kk], ka[kk][1], ka[kk][3]);
+                    }
                 }
             } else {
 #pragma unroll
@@ -1738,11 +1757,21 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {   // (four bytes: two dims of two keys)
                     uint32_t a[4];
-                    e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
-                    e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
+                    if constexpr (S8) {
+                        e4m3x4_h4_s8(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
+                        e4m3x4_h4_s8(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
+                    } else {
+                        e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
+                        e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
+                    }
                     mma16816(o[2 * i], a, pb0, pb1);
-                    e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
-                    e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
+                    if constexpr (S8) {
+                        e4m3x4_h4_s8(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
+                        e4m3x4_h4_s8(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
+                    } else {
+                        e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
+                        e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
+                    }
                     mma16816(o[2 * i + 1], a, pb0, pb1);
                 }
             } else {
@@ -1823,14 +1852,6 @@ __global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part_
     if (out16) out16[(size_t) h * kFaD + d] = f2h(res);
 }
 
-// four E4M3 values as FP16 times 2^-8, lo the first two, hi the other two: a byte's bits are the FP16's (the sign at
-// bit 15, the rest from bit 7), and that FP16 times 2^8 is the E4M3 value, a subnormal too (4 operations for two
-// values, against e4m3x4_h4's dozen - on Volta the attention's FP8 cache waits on these); 0x7F comes out finite
-__device__ __forceinline__ void e4m3x4_h4_s8(uint32_t w, uint32_t& lo, uint32_t& hi) {
-    const uint32_t t0 = __byte_perm(w, 0u, 0x1404u), t1 = __byte_perm(w, 0u, 0x3424u);   // (a byte its half's high one)
-    lo = (t0 & 0x80008000u) | ((t0 >> 1) & 0x3F803F80u);
-    hi = (t1 & 0x80008000u) | ((t1 >> 1) & 0x3F803F80u);
-}
 
 // ---- Volta (sm_70): one token's attention on mma.m8n8k4 - attn_decode_mma_kernel's job, its partials and its combine.
 // A warp takes 32 keys a step, a quad pair (mma884) 8 of them:
@@ -7954,6 +7975,14 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
     check("attn_decode_fp8_at (combine)");
 }
 
+#if defined(MAYA_USE_HIP)
+static bool g_mma_s8 = true;    // (AMD: the FP8 cache's K and V through e4m3x4_h4_s8 - the same bits, fewer operations)
+void attn_decode_mma_set_s8(bool on) { g_mma_s8 = on; }
+#else
+static const bool g_mma_s8 = false;   // (NVIDIA: e4m3x4_h4 as before - the switch does nothing there)
+void attn_decode_mma_set_s8(bool) {}
+#endif
+bool attn_decode_mma_s8() { return g_mma_s8; }
 int attn_decode_mma_blocks(int Hkv) {
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
@@ -7985,6 +8014,12 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
             attn_decode_v70_kernel<KV><<<dim3((unsigned) Hkv, (unsigned) nblk), kWaNW * 32, 0, s>>>(
                 q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
                 ml_part, blk0);
+#if defined(MAYA_USE_HIP)
+        else if (sizeof(KV) == 1 && g_mma_s8)
+            attn_decode_mma_kernel<KV, sizeof(KV) == 1><<<dim3((unsigned) Hkv, (unsigned) nblk), kWaNW * 32, 0, s>>>(
+                q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
+                ml_part, blk0);
+#endif
         else
             attn_decode_mma_kernel<KV><<<dim3((unsigned) Hkv, (unsigned) nblk), kWaNW * 32, 0, s>>>(
                 q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
@@ -7998,7 +8033,8 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
             out16);   // (FP8: its V as FP16 times 2^-8)
     else
     attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
-        o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16);
+        o_part, ml_part, n_split, H, sink, v_inv * (sizeof(KV) == 1 && g_mma_s8 ? 256.0f : 1.0f), pos, qpos, window,
+        gate, out, out16);   // (S8: its V as FP16 times 2^-8)
     check("attn_decode_mma (combine)");
 }
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
