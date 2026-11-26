@@ -6836,9 +6836,11 @@ struct Model::Impl {
     }
     // the CPU lane's time a row, ms, measured once at the load (DS4_PREFILL_CPU_ROW_MS unset): the first layer with 64
     // experts on the lane (no VRAM slot; copied into RAM where the lane copies), those 64 for one and two rows in turn
-    // (the share's experts: the fewest rows first), four passes, the first a warm-up, the middle of the other three, in
-    // steps of 0.01 ms; 0: not measured, the default (0.49 on two Ivy Bridge Xeons is about four times what a
-    // Threadripper 5975WX's lane takes, #959). (plan_streams' host_list is made before each prompt, not yet here)
+    // (the share's experts: the fewest rows first), six passes, the first a warm-up, the fastest of the other five, in
+    // steps of 0.01 ms - whatever else runs meanwhile only slows a pass, and the middle of three once read 0.67 ms on a
+    // load where the others read 0.15-0.17 (i9-10980XE), which shrank that run's share (#959); 0: not measured, the
+    // default (0.49 on two Ivy Bridge Xeons is about four times what a Threadripper 5975WX's lane takes, #959).
+    // (plan_streams' host_list is made before each prompt, not yet here)
     double pc_row_ms = 0.0;
     void pcpu_measure_rows() {
         const PcpuCfg& cf = pcpu_cfg();
@@ -6876,16 +6878,16 @@ struct Model::Impl {
             ents.push_back(en);
         }
         std::vector<double> t;
-        for (int rep = 0; rep < 4; ++rep) {
+        for (int rep = 0; rep < 6; ++rep) {
             const double t0 = now_ms();
             cpu_experts(*lp, x.data(), ents, (size_t) D);
             if (rep > 0) t.push_back(now_ms() - t0);
         }
         std::sort(t.begin(), t.end());
-        pc_row_ms = std::max(0.01, std::round(t[1] / rows / 0.01) * 0.01);
+        pc_row_ms = std::max(0.01, std::round(t[0] / rows / 0.01) * 0.01);
         std::fprintf(stderr, "ds4: DS4_PREFILL_CPU: the CPU lane %.2f ms a row (%zu experts, %d rows of layer %d, "
-                             "measured; DS4_PREFILL_CPU_ROW_MS sets it)\n",
-                     pc_row_ms, ents.size(), rows, lp->il);
+                             "measured: the fastest of 5 passes, the slowest %.2f ms; DS4_PREFILL_CPU_ROW_MS sets it)\n",
+                     pc_row_ms, ents.size(), rows, lp->il, t[t.size() - 1] / rows);
     }
     // (the lane's scratch, c_xh / c_yd / the pools: one caller at a time - the devices run chunks side by side, and a
     // prompt's CPU share holds it from its first call to its last outputs read; cpu_experts takes it too)
