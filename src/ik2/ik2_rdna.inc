@@ -5,8 +5,8 @@
 // not the CUDA kernels' bits (another order of the same sums).
 //
 // The prompt's routed experts: a layer's experts over a chunk in three launches, straight from their blocks (NVFP4 or
-// Q8_0, made FP16 in shared memory - exact: a code times its scale is an FP16), instead of a decode to FP16 and two
-// BLAS products an expert.  The rows (a token's pick each) lie grouped by expert, in expert order; a tile is up to 32
+// Q8_0, made FP16 in shared memory - exact: a code times its scale is an FP16; or IQ2_XXS / IQ2_XS / IQ1_S / IQ1_M,
+// made the FP16 values decode_f16 gives), instead of a decode to FP16 and two BLAS products an expert.  The rows (a token's pick each) lie grouped by expert, in expert order; a tile is up to 32
 // rows of one expert.  gate / up: a block 64 rows of gate and the same 64 of up against a tile's rows, SwiGLU in the
 // registers (a lane holds a row's gate and up); down: 128 rows of down.  Then each token's picks summed in expert
 // order (the order the CUDA path adds them in).
@@ -16,21 +16,77 @@ namespace {
 
 constexpr int kRmBM = 32, kRmBN = 128, kRmBK = 64, kRmLd = kRmBK + 8;   // (row pad: the lanes' rows on other banks)
 
-// a block's W tile row: 64 values of one row (k-step ks) from its blocks into FP16 in shared memory
+// (the tests' reference: rows that are FP16 already - decode_f16's - through the same products)
+constexpr int kRmF16 = kRdnaF16Rows;
 template <int TY>
-__device__ __forceinline__ void rm_load_w(const uint8_t* row, int ks, uint32_t (&w)[17]) {
+constexpr int rm_nw = TY == kRmF16 ? 32 : 17;   // (the words a thread holds for its row's next 64 values)
+constexpr bool rm_iq(int ty) { return ty == kIQ2_XXS || ty == kIQ2_XS || ty == kIQ1_S || ty == kIQ1_M; }
+
+// three FP16 in a word: value i at bit 16 i
+__device__ __forceinline__ uint64_t rm_lut3(float a, float b, float c) {
+    return (uint64_t) f2h(a) | ((uint64_t) f2h(b) << 16) | ((uint64_t) f2h(c) << 32);
+}
+// IQ2_XXS / IQ2_XS: a grid entry's 8 values (8, 25 or 43 each: byte >> 4 = 0, 1, 2) times the sub-block's scale, as
+// FP16 pairs with their signs - lut: the three products rounded as decode_f16 rounds them (a sign flips one bit)
+__device__ __forceinline__ void rm_iq2_group(uint64_t g, uint32_t sg, uint64_t lut, uint32_t* o) {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const uint32_t b0 = (uint32_t) (g >> (16 * p)) & 0x30u, b1 = (uint32_t) (g >> (16 * p + 8)) & 0x30u;
+        const uint32_t h0 = ((uint32_t) (lut >> b0) & 0xFFFFu) ^ (((sg >> (2 * p)) & 1u) << 15);
+        const uint32_t h1 = ((uint32_t) (lut >> b1) & 0xFFFFu) ^ (((sg >> (2 * p + 1)) & 1u) << 15);
+        o[p] = h0 | (h1 << 16);
+    }
+}
+// IQ1_S / IQ1_M: a grid entry's 8 values (n: the nibbles g + 1 = 0, 1, 2 - values 0..3 the low nibbles of its bytes,
+// 4..7 the high ones), lut: dl (g + delta) for the three g
+__device__ __forceinline__ void rm_iq1_group(uint32_t n, uint64_t lut, uint32_t* o) {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int s0 = 16 * (p & 1) + 4 * (p >> 1);
+        const uint32_t n0 = (n >> s0) & 3u, n1 = (n >> (s0 + 8)) & 3u;
+        o[p] = ((uint32_t) (lut >> (16 * n0)) & 0xFFFFu) | (((uint32_t) (lut >> (16 * n1)) & 0xFFFFu) << 16);
+    }
+}
+
+// a block's W tile row: 64 values of one row (k-step ks) from its blocks into FP16 in shared memory
+template <int TY, int N>
+__device__ __forceinline__ void rm_load_w(const uint8_t* row, int ks, uint32_t (&w)[N]) {
     if constexpr (TY == kNVFP4) {   // a 64-value block: 4 scales, 32 bytes of codes
         const uint32_t* p = (const uint32_t*) (row + (size_t) ks * 36);
 #pragma unroll
         for (int i = 0; i < 9; ++i) w[i] = __ldg(p + i);
-    } else {   // Q8_0: two 32-value blocks (34 bytes each)
+    } else if constexpr (TY == kQ8_0) {   // Q8_0: two 32-value blocks (34 bytes each)
         const uint32_t* p = (const uint32_t*) (row + (size_t) ks * 68);
 #pragma unroll
         for (int i = 0; i < 17; ++i) w[i] = __ldg(p + i);
+    } else if constexpr (TY == kRmF16) {
+        const uint32_t* p = (const uint32_t*) (row + (size_t) ks * 128);
+#pragma unroll
+        for (int i = 0; i < 32; ++i) w[i] = __ldg(p + i);
+    } else if constexpr (TY == kIQ2_XXS) {   // a quarter of a 66-byte block: d, 2 x (4 grid bytes, signs + scale)
+        const uint8_t* b = row + (size_t) (ks >> 2) * 66;
+        w[0] = ld2u(b);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) w[1 + i] = ld4u(b + 2 + 16 * (ks & 3) + 4 * i);
+    } else if constexpr (TY == kIQ2_XS) {   // of a 74-byte block: d, 2 x 4 16-bit entries, their 2 scale bytes
+        const uint8_t* b = row + (size_t) (ks >> 2) * 74;
+        w[0] = ld2u(b) | (ld2u(b + 66 + 2 * (ks & 3)) << 16);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) w[1 + i] = ld4u(b + 2 + 16 * (ks & 3) + 4 * i);
+    } else if constexpr (TY == kIQ1_S) {   // of a 50-byte block: d, 2 x 4 grid bytes, their 2 x 16 qh bits
+        const uint8_t* b = row + (size_t) (ks >> 2) * 50;
+        w[0] = ld2u(b);
+        w[1] = ld4u(b + 2 + 8 * (ks & 3)), w[2] = ld4u(b + 6 + 8 * (ks & 3));
+        w[3] = ld4u(b + 34 + 4 * (ks & 3));
+    } else {   // IQ1_M, of a 56-byte block: 2 x 4 grid bytes, their 2 x 16 qh bits, the block's 8 scale bytes
+        const uint8_t* b = row + (size_t) (ks >> 2) * 56;
+        w[0] = ld4u(b + 8 * (ks & 3)), w[1] = ld4u(b + 4 + 8 * (ks & 3));
+        w[2] = ld4u(b + 32 + 4 * (ks & 3));
+        w[3] = ld4u(b + 48), w[4] = ld4u(b + 52);
     }
 }
-template <int TY>
-__device__ __forceinline__ void rm_store_w(const uint32_t (&w)[17], uint16_t* dst) {
+template <int TY, int N>
+__device__ __forceinline__ void rm_store_w(const uint32_t (&w)[N], int ks, uint16_t* dst) {
     uint32_t h[32];
     if constexpr (TY == kNVFP4) {
 #pragma unroll
@@ -42,6 +98,69 @@ __device__ __forceinline__ void rm_store_w(const uint32_t (&w)[17], uint16_t* ds
             o[2] = nv_pair_h2(w1, sc), o[3] = nv_pair_h2(w1 >> 16, sc);
             o[4] = nv_pair_h2(w0 >> 4, sc), o[5] = nv_pair_h2(w0 >> 20, sc);
             o[6] = nv_pair_h2(w1 >> 4, sc), o[7] = nv_pair_h2(w1 >> 20, sc);
+        }
+    } else if constexpr (TY == kRmF16) {
+#pragma unroll
+        for (int i = 0; i < 32; ++i) h[i] = w[i];
+    } else if constexpr (TY == kIQ2_XXS) {   // (the values decode_f16 gives: db * grid value * sign, rounded to FP16)
+        const float d = half_bits_to_float((uint16_t) w[0]);
+#pragma unroll
+        for (int sb = 0; sb < 2; ++sb) {
+            const uint32_t qw = w[1 + 2 * sb], aux = w[2 + 2 * sb];
+            const float db = d * (0.5f + (float) (aux >> 28)) * 0.25f;
+            const uint64_t lut = rm_lut3(db * 8.0f, db * 25.0f, db * 43.0f);
+#pragma unroll
+            for (int l = 0; l < 4; ++l)
+                rm_iq2_group(iq2xxs_grid_at((int) ((qw >> (8 * l)) & 0xFFu)), iq_signs8((aux >> (7 * l)) & 127u), lut,
+                             h + 16 * sb + 4 * l);
+        }
+    } else if constexpr (TY == kIQ2_XS) {
+        const float d = half_bits_to_float((uint16_t) w[0]);
+#pragma unroll
+        for (int sb = 0; sb < 2; ++sb) {
+            const uint32_t sc = (w[0] >> (16 + 8 * sb)) & 0xFFu;
+#pragma unroll
+            for (int hf = 0; hf < 2; ++hf) {   // (a 4-bit scale a half of the sub-block)
+                const float db = d * (0.5f + (float) ((sc >> (4 * hf)) & 15u)) * 0.25f;
+                const uint64_t lut = rm_lut3(db * 8.0f, db * 25.0f, db * 43.0f);
+                const uint32_t qq = w[1 + 2 * sb + hf];
+#pragma unroll
+                for (int m = 0; m < 2; ++m) {
+                    const uint32_t q16 = (qq >> (16 * m)) & 0xFFFFu;
+                    rm_iq2_group(iq2xs_grid_at((int) (q16 & 511u)), iq_signs8(q16 >> 9), lut,
+                                 h + 16 * sb + 8 * hf + 4 * m);
+                }
+            }
+        }
+    } else if constexpr (TY == kIQ1_S) {   // (dl (g + delta): three values a sub-block)
+        const float d = half_bits_to_float((uint16_t) w[0]);
+#pragma unroll
+        for (int sb = 0; sb < 2; ++sb) {
+            const uint32_t q = w[1 + sb], hh = (w[3] >> (16 * sb)) & 0xFFFFu;
+            const float dl = d * (float) (2 * (int) ((hh >> 12) & 7u) + 1);
+            const float d8 = (hh & 0x8000u) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const uint64_t lut = rm_lut3(dl * (-1.0f + d8), dl * (0.0f + d8), dl * (1.0f + d8));
+#pragma unroll
+            for (int l = 0; l < 4; ++l)
+                rm_iq1_group(__ldg(ik2_iq::dev::iq1s_grid_gpu + (((q >> (8 * l)) & 0xFFu) | (((hh >> (3 * l)) & 7u) << 8))),
+                             lut, h + 16 * sb + 4 * l);
+        }
+    } else if constexpr (TY == kIQ1_M) {   // (a scale a half of the sub-block, the delta's sign a group)
+        const float d = half_bits_to_float((uint16_t) (((w[3] >> 12) & 0xFu) | ((w[3] >> 24) & 0xF0u) |
+                                                       ((w[4] >> 4) & 0xF00u) | ((w[4] >> 16) & 0xF000u)));
+        const uint32_t sw2 = ((ks & 2) ? w[4] : w[3]) >> (16 * (ks & 1));   // (this pair of sub-blocks' 12 scale bits)
+#pragma unroll
+        for (int sb = 0; sb < 2; ++sb) {
+            const uint32_t q = w[sb], hh = (w[2] >> (16 * sb)) & 0xFFFFu, sw = (sw2 & 0xFFFFu) >> (6 * sb);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const float dl = d * (float) (2 * (int) ((sw >> (3 * (l >> 1))) & 7u) + 1);
+                const uint32_t hn = (hh >> (4 * l)) & 0xFu;
+                const float d8 = (hn & 8u) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const uint64_t lut = rm_lut3(dl * (-1.0f + d8), dl * (0.0f + d8), dl * (1.0f + d8));
+                rm_iq1_group(__ldg(ik2_iq::dev::iq1s_grid_gpu + (((q >> (8 * l)) & 0xFFu) | ((hn & 7u) << 8))), lut,
+                             h + 16 * sb + 4 * l);
+            }
         }
     } else {
 #pragma unroll
@@ -102,7 +221,7 @@ __global__ void __launch_bounds__(128) experts_rdna_kernel(const uint8_t* const*
     const bool xok = xr < nrows;
     const uint4* xsrc = (const uint4*) (x16 + (size_t) (row0 + (xok ? xr : 0)) * K + xc);
     const int nk = K / kRmBK;
-    uint32_t w[17];
+    uint32_t w[rm_nw<TY>];
     uint4 xa, xb;
     rm_load_w<TY>(wrow, 0, w);
     xa = xok ? xsrc[0] : make_uint4(0u, 0u, 0u, 0u);
@@ -114,7 +233,7 @@ __global__ void __launch_bounds__(128) experts_rdna_kernel(const uint8_t* const*
         __syncthreads();   // (the previous step's reads of the tiles are done)
         *(uint4*) (Xs + xr * kRmLd + xc) = xa;
         *(uint4*) (Xs + xr * kRmLd + xc + 8) = xb;
-        rm_store_w<TY>(w, Ws + tid * kRmLd);
+        rm_store_w<TY>(w, ks, Ws + tid * kRmLd);
         __syncthreads();
         if (ks + 1 < nk) {   // (the next step's bytes in flight under this one's products)
             rm_load_w<TY>(wrow, ks + 1, w);
@@ -369,7 +488,8 @@ void attn_flash_rdna(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc
 
 // y [T][ldy] = x [T][K] . W [N][K]^T in BF16 for a few tokens (TT >= T): a warp R rows, a lane 8 values a step (16
 // bytes of each row and of each token's x), every token's sum in its own register, then the warp's sum.
-template <int WARPS, int R, int TT>
+// (H16: the values are FP16, not BF16 - a head kept as other blocks, in the drafter's FP16 copy)
+template <int WARPS, int R, int TT, bool H16 = false>
 __global__ void __launch_bounds__(WARPS * 32)
 gemm_bf16_cols_kernel(const uint16_t* __restrict__ W, int N, int K, const uint16_t* __restrict__ x, int T,
                       float* __restrict__ y, int ldy) {
@@ -383,8 +503,12 @@ gemm_bf16_cols_kernel(const uint16_t* __restrict__ W, int N, int K, const uint16
     for (int i = 0; i < R; ++i)
 #pragma unroll
         for (int t = 0; t < TT; ++t) acc[i][t] = 0.0f;
-    auto lo = [](uint32_t v) { return __uint_as_float(v << 16); };
-    auto hi = [](uint32_t v) { return __uint_as_float(v & 0xFFFF0000u); };
+    auto lo = [](uint32_t v) {
+        return H16 ? __half2float(__ushort_as_half((unsigned short) (v & 0xFFFFu))) : __uint_as_float(v << 16);
+    };
+    auto hi = [](uint32_t v) {
+        return H16 ? __half2float(__ushort_as_half((unsigned short) (v >> 16))) : __uint_as_float(v & 0xFFFF0000u);
+    };
     for (int c = lane; c < (K >> 3); c += 32) {
         float wf[R][8];
 #pragma unroll
@@ -424,6 +548,15 @@ bool gemm_bf16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, f
     check("gemm_bf16_cols");
     return true;
 }
+bool gemm_f16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s) {
+    if (N <= 0 || T <= 0 || T > 8 || K % 8 || ((uintptr_t) W & 15) || ((uintptr_t) x & 15)) return false;
+    constexpr int WARPS = 4, R = 4;
+    const unsigned g = (unsigned) ((N + WARPS * R - 1) / (WARPS * R));
+    if (T <= 4) gemm_bf16_cols_kernel<WARPS, R, 4, true><<<g, WARPS * 32, 0, s>>>(W, N, K, x, T, y, ldy);
+    else gemm_bf16_cols_kernel<WARPS, R, 8, true><<<g, WARPS * 32, 0, s>>>(W, N, K, x, T, y, ldy);
+    check("gemm_f16_cols");
+    return true;
+}
 
 
 bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F) {
@@ -431,34 +564,47 @@ bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F) {
         if (std::getenv("IK2_RDNA_MOE") && !std::atoi(std::getenv("IK2_RDNA_MOE"))) return 0;
         return rdna_wmma_gpu() ? 1 : 0;
     }();
-    const bool fmt = (ty_gate == kNVFP4 || ty_gate == kQ8_0) && ty_up == ty_gate && ty_down == ty_gate;
+    // (IK2_RDNA_IQ=0: the IQ block types back on the decode-to-FP16 path)
+    static const bool iq_on = !(std::getenv("IK2_RDNA_IQ") && !std::atoi(std::getenv("IK2_RDNA_IQ")));
+    auto dense = [](int t) { return t == kNVFP4 || t == kQ8_0; };
+    bool fmt = dense(ty_gate) && ty_up == ty_gate && ty_down == ty_gate;
+    // gate and up of one type, down of its own, when an IQ type is among them (a 256-value block: 4 steps of 64)
+    if (!fmt && iq_on && ty_up == ty_gate && (rm_iq(ty_gate) || rm_iq(ty_down)) &&
+        (dense(ty_gate) || rm_iq(ty_gate)) && (dense(ty_down) || rm_iq(ty_down)))
+        fmt = C % 256 == 0 && F % 256 == 0;
     return on && fmt && C % kRmBN == 0 && F % kRmBN == 0 && C % kRmBK == 0 && F % kRmBK == 0;
 }
+namespace {
+size_t rm_row_bytes(int ty, int K) { return ty == kRmF16 ? (size_t) K * 2 : mv_row_bytes(ty, K); }
+template <bool GU, class... A>
+void rm_launch(int ty, dim3 g, cudaStream_t s, A... a) {
+    switch (ty) {
+    case kNVFP4: experts_rdna_kernel<kNVFP4, GU><<<g, 128, 0, s>>>(a...); break;
+    case kQ8_0: experts_rdna_kernel<kQ8_0, GU><<<g, 128, 0, s>>>(a...); break;
+    case kIQ2_XXS: experts_rdna_kernel<kIQ2_XXS, GU><<<g, 128, 0, s>>>(a...); break;
+    case kIQ2_XS: experts_rdna_kernel<kIQ2_XS, GU><<<g, 128, 0, s>>>(a...); break;
+    case kIQ1_S: experts_rdna_kernel<kIQ1_S, GU><<<g, 128, 0, s>>>(a...); break;
+    case kIQ1_M: experts_rdna_kernel<kIQ1_M, GU><<<g, 128, 0, s>>>(a...); break;
+    case kRmF16: experts_rdna_kernel<kRmF16, GU><<<g, 128, 0, s>>>(a...); break;
+    default: std::fprintf(stderr, "ik2: experts_rdna: block type %d\n", ty), std::abort();
+    }
+}
+}  // namespace
 void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_up,
                      const uint16_t* x16, int C, int F, const float* sg, const float* su, float gcap, float ucap,
                      uint16_t* h16, cudaStream_t s) {
     if (n_tiles <= 0) return;
     const dim3 g((unsigned) (F / 64), (unsigned) n_tiles);
-    const size_t rb = mv_row_bytes(ty, C);
-    if (ty == kNVFP4)
-        experts_rdna_kernel<kNVFP4, true><<<g, 128, 0, s>>>(eptr, (const int4*) tiles, off_up, rb, x16, C, F, C, sg,
-                                                            su, gcap, ucap, h16, nullptr);
-    else
-        experts_rdna_kernel<kQ8_0, true><<<g, 128, 0, s>>>(eptr, (const int4*) tiles, off_up, rb, x16, C, F, C, sg,
-                                                           su, gcap, ucap, h16, nullptr);
+    rm_launch<true>(ty, g, s, eptr, (const int4*) tiles, off_up, rm_row_bytes(ty, C), x16, C, F, C, sg, su, gcap, ucap,
+                    h16, (float*) nullptr);
     check("experts_rdna_gu");
 }
 void experts_rdna_down(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_down,
                        const uint16_t* h16, int C, int F, float* y32, cudaStream_t s) {
     if (n_tiles <= 0) return;
     const dim3 g((unsigned) (C / 128), (unsigned) n_tiles);
-    const size_t rb = mv_row_bytes(ty, F);
-    if (ty == kNVFP4)
-        experts_rdna_kernel<kNVFP4, false><<<g, 128, 0, s>>>(eptr, (const int4*) tiles, off_down, rb, h16, F, F, C,
-                                                             nullptr, nullptr, 0.0f, 0.0f, nullptr, y32);
-    else
-        experts_rdna_kernel<kQ8_0, false><<<g, 128, 0, s>>>(eptr, (const int4*) tiles, off_down, rb, h16, F, F, C,
-                                                            nullptr, nullptr, 0.0f, 0.0f, nullptr, y32);
+    rm_launch<false>(ty, g, s, eptr, (const int4*) tiles, off_down, rm_row_bytes(ty, F), h16, F, F, C,
+                     (const float*) nullptr, (const float*) nullptr, 0.0f, 0.0f, (uint16_t*) nullptr, y32);
     check("experts_rdna_down");
 }
 void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,

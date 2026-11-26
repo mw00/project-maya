@@ -2847,6 +2847,21 @@ __host__ __device__ __forceinline__ uint32_t iq3s_grid_at(int i) {
     return ik2_iq::host::iq3s_grid[i];
 #endif
 }
+// IQ1_S / IQ1_M's grid (ggml's, 2048 entries of 8 values g in {-1, 0, 1}): value j of entry i.  The device reads
+// iq1s_grid_gpu (a uint32: the nibbles g + 1, values 0..3 in the low nibbles of its 4 bytes, 4..7 in the high ones),
+// the host iq1s_grid (a uint64: 8 int8) - ggml-common.h gives each side its own, and the tests hold them together.
+__host__ __device__ __forceinline__ int iq1_g(int i, int j) {
+#ifdef __CUDA_ARCH__
+    return (int) ((__ldg(ik2_iq::dev::iq1s_grid_gpu + i) >> (8 * (j & 3) + 4 * (j >> 2))) & 0xFu) - 1;
+#else
+    return (int) (int8_t) (ik2_iq::host::iq1s_grid[i] >> (8 * j));
+#endif
+}
+// IQ1_M's F16 block scale: the top nibbles of its 4 scale words (sc: the block's scales [8])
+__host__ __device__ __forceinline__ float iq1m_d(const uint8_t* sc) {
+    return half_bits_to_float((uint16_t) ((uint32_t) (sc[1] >> 4) | (uint32_t) (sc[3] & 0xF0u) |
+                                          ((uint32_t) (sc[5] & 0xF0u) << 4) | ((uint32_t) (sc[7] & 0xF0u) << 8)));
+}
 // ggml's ksigns_iq2xs[s]: the 7 sign bits plus an 8th that makes the count of set bits even
 __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
 #ifdef __CUDA_ARCH__
@@ -2996,6 +3011,28 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const uint8_t q = b[2 + j];
         return d * (float) iq4nl_at(i < 16 ? (int) (q & 0xF) : (int) (q >> 4));
     }
+    if (type == kIQ1_S) {   // d, qs [32] (a grid byte a group of 8), qh [8] (16 bits a sub-block: 4 x 3 top index
+                            // bits, a 3-bit scale, the sign of the delta)
+        const uint8_t* b = blocks + (v / 256) * 50;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const uint32_t h = (uint32_t) b[34 + 2 * ib] | ((uint32_t) b[35 + 2 * ib] << 8);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float dl = d * (float) (2 * (int) ((h >> 12) & 7u) + 1);
+        const float delta = (h & 0x8000u) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const int g = iq1_g((int) b[2 + 4 * ib + l] | (int) (((h >> (3 * l)) & 7u) << 8), j);
+        return dl * ((float) g + delta);
+    }
+    if (type == kIQ1_M) {   // qs [32], qh [16] (a nibble a group of 8: 3 top index bits and the sign of the delta),
+                            // scales [8] (4 x 16 bits: 4 x 3-bit scales, a 16-value half each; d's F16 in the top nibbles)
+        const uint8_t* b = blocks + (v / 256) * 56;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const uint32_t hn = ((uint32_t) b[32 + 2 * ib + (l >> 1)] >> (4 * (l & 1))) & 0xFu;
+        const uint32_t sw = (uint32_t) b[48 + 2 * (ib >> 1)] | ((uint32_t) b[49 + 2 * (ib >> 1)] << 8);
+        const float dl = iq1m_d(b + 48) * (float) (2 * (int) ((sw >> (6 * (ib & 1) + 3 * (l >> 1))) & 7u) + 1);
+        const float delta = (hn & 8u) ? -IQ1S_DELTA : IQ1S_DELTA;   // (ggml's dequantize_row_iq1_m: IQ1S_DELTA)
+        const int g = iq1_g((int) b[4 * ib + l] | (int) ((hn & 7u) << 8), j);
+        return dl * ((float) g + delta);
+    }
     return 0.0f;
 }
 
@@ -3121,9 +3158,23 @@ __device__ __forceinline__ void load_xv8(const float* x, float4 (&xv)[8]) {
 
 // four bytes as a uint32 from any address (the odd block sizes, 18 / 66 / 74 / 82 / 110, put rows at any alignment)
 __device__ __forceinline__ uint32_t ld4u(const uint8_t* p) {
+#ifdef MAYA_USE_HIP   // (AMD: one load at any address - gfx10 on read a word wherever it lies; the same bytes)
+    uint32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+#endif
     if (((uintptr_t) p & 3) == 0) return __ldg((const uint32_t*) p);
     return (uint32_t) __ldg(p) | ((uint32_t) __ldg(p + 1) << 8) | ((uint32_t) __ldg(p + 2) << 16) |
            ((uint32_t) __ldg(p + 3) << 24);
+}
+// two bytes as a uint32 (a block's FP16 scale, a 16-bit field)
+__device__ __forceinline__ uint32_t ld2u(const uint8_t* p) {
+#ifdef MAYA_USE_HIP
+    uint16_t v;
+    __builtin_memcpy(&v, p, 2);
+    return v;
+#endif
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8);
 }
 __device__ __forceinline__ float sum_f4x8(const float4 (&xv)[8]) {
     float s = 0.0f;
@@ -3134,23 +3185,71 @@ __device__ __forceinline__ float sum_f4x8(const float4 (&xv)[8]) {
 // the types whose 32-value sub-blocks the two helpers below read (an IQ4_NL block: one of them)
 __device__ __host__ __forceinline__ bool sub32_type(int type) {
     return type == kIQ2_XXS || type == kIQ2_XS || type == kIQ2_S || type == kIQ3_S || type == kIQ4_NL ||
-           type == kQ4_K;
+           type == kQ4_K || type == kIQ1_S || type == kIQ1_M;
+}
+// IQ1_S / IQ1_M: 4 grid values (the nibbles g + 1 in the bytes of n, the delta d8 = +-1/8 added) against 4 inputs
+__device__ __forceinline__ float iq1_dot4(uint32_t n, float d8, float4 x) {
+    return ((float) ((int) (n & 15u) - 1) + d8) * x.x + ((float) ((int) ((n >> 8) & 15u) - 1) + d8) * x.y +
+           ((float) ((int) ((n >> 16) & 15u) - 1) + d8) * x.z + ((float) ((int) ((n >> 24) & 15u) - 1) + d8) * x.w;
+}
+// an IQ1_S (s1) / IQ1_M sub-block ib of block b: its 4 qs bytes, its 16 qh bits, the two 16-value halves' scales
+struct Iq1Sub {
+    uint32_t q;   // (the 4 qs bytes)
+    uint32_t h;
+    float dl0, dl1;
+};
+__device__ __forceinline__ Iq1Sub iq1_sub(bool s1, const uint8_t* b, int ib) {
+    Iq1Sub r;
+    if (s1) {
+        r.q = ld4u(b + 2 + 4 * ib);
+        r.h = ld2u(b + 34 + 2 * ib);
+        r.dl0 = r.dl1 = half_bits_to_float((uint16_t) ld2u(b)) * (float) (2 * (int) ((r.h >> 12) & 7u) + 1);
+    } else {
+        r.q = ld4u(b + 4 * ib);
+        r.h = ld2u(b + 32 + 2 * ib);
+        const uint32_t sw = ld2u(b + 48 + 2 * (ib >> 1)) >> (6 * (ib & 1));
+        const float d = iq1m_d(b + 48);
+        r.dl0 = d * (float) (2 * (int) (sw & 7u) + 1);
+        r.dl1 = d * (float) (2 * (int) ((sw >> 3) & 7u) + 1);
+    }
+    return r;
+}
+// ... its group l (0..3): the grid entry's nibbles and the delta
+__device__ __forceinline__ uint32_t iq1_group(bool s1, const Iq1Sub& r, int l, float& d8) {
+    uint32_t top, neg;
+    if (s1) top = (r.h >> (3 * l)) & 7u, neg = r.h & 0x8000u;
+    else top = (r.h >> (4 * l)) & 7u, neg = (r.h >> (4 * l)) & 8u;
+    d8 = neg ? -IQ1S_DELTA : IQ1S_DELTA;
+    return __ldg(ik2_iq::dev::iq1s_grid_gpu + (((r.q >> (8 * l)) & 0xFFu) | (top << 8)));
 }
 // sub-block sb of a row of `type` from w against those 32 inputs: the sum of the products.  Block layouts (ggml's):
 // IQ2_XXS, 66 bytes: d, 8 x (4 grid bytes, 3 sign bytes, a 4-bit scale in the top nibble); IQ2_XS, 74: d, 8 x 4
 // 16-bit grid indices with 7 sign bits, scales [8] (a nibble a half); IQ2_S, 82: d, grid bytes [32], sign bytes [32],
 // qh [8], scales [8]; IQ3_S, 110: d, qs [64], qh [8], signs [32], scales [4]; IQ4_NL, 18: d, qs [16]; Q4_K, 144: d,
-// dmin, scales [12], qs [128].
+// dmin, scales [12], qs [128]; IQ1_S, 50: d, qs [32], qh [8] (16 bits); IQ1_M, 56: qs [32], qh [16], scales [8].
 __device__ __forceinline__ float sub32_dot(int type, const uint8_t* w, int sb, const float4 (&xv)[8]) {
+    if (type == kIQ1_S || type == kIQ1_M) {   // a value: dl (g + delta), g in {-1, 0, 1}, delta +-1/8
+        const bool s1 = type == kIQ1_S;
+        const Iq1Sub r = iq1_sub(s1, w + (size_t) (sb >> 3) * (s1 ? 50 : 56), sb & 7);
+        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            float d8;
+            const uint32_t n = iq1_group(s1, r, l, d8);
+            const float v = iq1_dot4(n, d8, xv[2 * l]) + iq1_dot4(n >> 4, d8, xv[2 * l + 1]);
+            (l < 2 ? a0 : a1) += v;
+        }
+        return r.dl0 * a0 + r.dl1 * a1;
+    }
     if (type == kIQ2_XXS) {
         const uint8_t* b = w + (size_t) (sb >> 3) * 66;
         const uint8_t* q = b + 2 + 8 * (sb & 7);
-        const uint32_t aux = ld4u(q + 4);
-        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const uint32_t qw = ld4u(q), aux = ld4u(q + 4);
+        const float d = half_bits_to_float((uint16_t) ld2u(b));
         float a = 0.0f;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint64_t g = iq2xxs_grid_at(q[l]);
+            const uint64_t g = iq2xxs_grid_at((int) ((qw >> (8 * l)) & 0xFFu));
             const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
             a += sdot4_u8((uint32_t) g, sg, xv[2 * l]) + sdot4_u8((uint32_t) (g >> 32), sg >> 4, xv[2 * l + 1]);
         }
@@ -3226,7 +3325,19 @@ __device__ __forceinline__ float sub32_dot(int type, const uint8_t* w, int sb, c
 }
 // ... and the same sub-block's 32 values in y (the FP16 decode)
 __device__ __forceinline__ void sub32_values(int type, const uint8_t* w, int sb, float* y) {
-    if (type == kIQ2_XXS) {
+    if (type == kIQ1_S || type == kIQ1_M) {
+        const bool s1 = type == kIQ1_S;
+        const Iq1Sub r = iq1_sub(s1, w + (size_t) (sb >> 3) * (s1 ? 50 : 56), sb & 7);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            float d8;
+            const uint32_t n = iq1_group(s1, r, l, d8);
+            const float dl = l < 2 ? r.dl0 : r.dl1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                y[8 * l + j] = dl * ((float) ((int) ((n >> (8 * (j & 3) + 4 * (j >> 2))) & 15u) - 1) + d8);
+        }
+    } else if (type == kIQ2_XXS) {
         const uint8_t* b = w + (size_t) (sb >> 3) * 66;
         const uint8_t* q = b + 2 + 8 * (sb & 7);
         const uint32_t aux = ld4u(q + 4);
@@ -4631,6 +4742,27 @@ __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_
         if (row >= N) break;
         const float v = row_dot(type, W + (size_t) row * rb, xs, K);
         if ((threadIdx.x & 31) == 0) y[row] = v;
+    }
+}
+
+// mv_blocks_kernel for a verify window's T tokens: a block's rows for each token in turn (its x in shared memory, the
+// rows' blocks read again from the cache, not from the memory), with the one-token kernel's row dots - every token's
+// y the same to the bit, the matrix read from the memory once for the window
+template <int WARPS, int ROWS>
+__global__ void mv_blocks_rows_kernel(int type, const uint8_t* W, int N, int K, size_t rb, const float* x, int x_ld,
+                                      int T, float* y, int y_ld) {
+    extern __shared__ float xs[];
+    const int warp = threadIdx.x >> 5;
+    for (int t = 0; t < T; ++t) {
+        if (t) __syncthreads();
+        load_xs_f32(x + (size_t) t * x_ld, K, xs);
+        __syncthreads();
+        for (int j = 0; j < ROWS; ++j) {
+            const int row = (blockIdx.x * WARPS + warp) * ROWS + j;
+            if (row >= N) break;
+            const float v = row_dot(type, W + (size_t) row * rb, xs, K);
+            if ((threadIdx.x & 31) == 0) y[(size_t) t * y_ld + row] = v;
+        }
     }
 }
 
@@ -7906,14 +8038,16 @@ void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base,
 int block_values(int type) {
     return type == kNVFP4 ? 64 : type == kQ8_0 || type == kIQ4_NL ? 32
          : type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_XXS || type == kIQ2_XS ||
-                  type == kIQ3_XXS || type == kIQ3_S || type == kIQ2_S || type == kIQ4_XS
+                  type == kIQ3_XXS || type == kIQ3_S || type == kIQ2_S || type == kIQ4_XS || type == kIQ1_S ||
+                  type == kIQ1_M
              ? 256
              : 0;
 }
 size_t block_bytes(int type) {
     return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kIQ4_NL ? 18 : type == kQ4_K ? 144
          : type == kQ5_K ? 176 : type == kQ6_K ? 210 : type == kIQ2_XXS ? 66 : type == kIQ2_XS ? 74
-         : type == kIQ3_XXS ? 98 : type == kIQ3_S ? 110 : type == kIQ2_S ? 82 : type == kIQ4_XS ? 136 : 0;
+         : type == kIQ3_XXS ? 98 : type == kIQ3_S ? 110 : type == kIQ2_S ? 82 : type == kIQ4_XS ? 136
+         : type == kIQ1_S ? 50 : type == kIQ1_M ? 56 : 0;
 }
 
 template <int WARPS, int ROWS>
@@ -8117,16 +8251,169 @@ void launch_mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, 
                                     xp_floats(K) * 4, s>>>(type, W, N, K, mv_row_bytes(type, K), x, y);
 }
 
+static bool q6k_cols_fits(int type, int K, const float* x, int T);
+static void q6k_cols(const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                     cudaStream_t s);
+void mv_blocks_ref(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
+    if (N <= 0) return;
+    if (K > 8192 || !block_values(type) || K % block_values(type)) {
+        std::fprintf(stderr, "ik2::k::mv_blocks_ref: type %d, K %d\n", type, K);
+        std::abort();
+    }
+    launch_mv_blocks<4, 2>(type, W, N, K, x, y, s);
+    check("mv_blocks_ref");
+}
 void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
     if (N <= 0) return;
     if (K > 8192 || !block_values(type) || K % block_values(type)) {
         std::fprintf(stderr, "ik2::k::mv_blocks: type %d, K %d\n", type, K);
         std::abort();
     }
+#ifdef MAYA_USE_HIP   // (AMD, Q6_K: a lane's 8 values of a block in two loads of the input - twice the row dots' speed)
+    if (q6k_cols_fits(type, K, x, 1)) {
+        q6k_cols(W, N, K, x, K, 1, y, N, s);
+        return;
+    }
+#endif
     if (N <= 512) launch_mv_blocks<2, 1>(type, W, N, K, x, y, s);
     else if (N <= 2048) launch_mv_blocks<4, 1>(type, W, N, K, x, y, s);
     else launch_mv_blocks<4, 2>(type, W, N, K, x, y, s);
     check("mv_blocks");
+}
+
+// A window's products over a Q6_K matrix, its blocks decoded once for the window's tokens: a lane holds the 8 values
+// of a block mv_blocks' row dot gives it (scale x level, exact in F32), then each token's sum over them in that row
+// dot's order - every token's y the same to the bit.  xq: the tokens' inputs laid out a lane's 8 together
+// (q6k_cols_x_kernel), so a token costs a lane two loads a block.  R rows a warp share those loads.
+__global__ void q6k_cols_x_kernel(const float* __restrict__ x, int x_ld, int K, float* __restrict__ xq) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (j >= K) return;
+    const int bi = j >> 8, r = j & 255, lane = r >> 3, n = (r >> 2) & 1, k = r & 3;
+    xq[(size_t) t * K + j] = x[(size_t) t * x_ld + bi * 256 + n * 128 + k * 32 + lane];
+}
+template <int WARPS, int R, int TT>
+__global__ void __launch_bounds__(WARPS * 32)
+mv_q6k_cols_kernel(const uint8_t* __restrict__ W, int N, int K, const float* __restrict__ xq, int T,
+                   float* __restrict__ y, int y_ld) {
+    const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (row0 >= N) return;
+    const int nb = K >> 8;
+    const size_t rb = (size_t) nb * 210;
+    float acc[R][TT];
+#pragma unroll
+    for (int i = 0; i < R; ++i)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) acc[i][t] = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+        float p[R][8], dv[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const int row = min(row0 + i, N - 1);   // (past the last row: the last again, not written)
+            const uint8_t* b = W + (size_t) row * rb + (size_t) bi * 210;
+            dv[i] = half_bits_to_float((uint16_t) (__ldg(b + 208) | (__ldg(b + 209) << 8)));
+            const int8_t* sc = (const int8_t*) (b + 192);
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                const uint8_t* ql = b + n * 64;
+                const uint8_t qh = __ldg(b + 128 + n * 32 + lane);
+                const uint8_t l0 = __ldg(ql + lane), l1 = __ldg(ql + lane + 32);
+                const int is = n * 8 + (lane >> 4);
+                p[i][n * 4 + 0] = (float) __ldg(sc + is + 0) * (float) ((int) ((l0 & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
+                p[i][n * 4 + 1] = (float) __ldg(sc + is + 2) * (float) ((int) ((l1 & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+                p[i][n * 4 + 2] = (float) __ldg(sc + is + 4) * (float) ((int) ((l0 >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+                p[i][n * 4 + 3] = (float) __ldg(sc + is + 6) * (float) ((int) ((l1 >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= T) break;
+            const float4* x4 = (const float4*) (xq + (size_t) t * K + bi * 256 + lane * 8);
+            const float4 xa = __ldg(x4), xb = __ldg(x4 + 1);
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                float a = 0.0f;
+                a += p[i][0] * xa.x;
+                a += p[i][1] * xa.y;
+                a += p[i][2] * xa.z;
+                a += p[i][3] * xa.w;
+                a += p[i][4] * xb.x;
+                a += p[i][5] * xb.y;
+                a += p[i][6] * xb.z;
+                a += p[i][7] * xb.w;
+                acc[i][t] += dv[i] * a;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= T) break;
+            float v = acc[i][t];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && row0 + i < N) y[(size_t) t * y_ld + row0 + i] = v;
+        }
+}
+// (the tokens' inputs in the lanes' order: 16 buffers a GPU, kept and taken in turn - a product reads its own, written
+//  just before it on the same stream)
+static float* q6k_cols_scratch() {
+    static float* buf[16] = {};
+    static unsigned turn[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) {
+        std::fprintf(stderr, "ik2::k::mv_q6k_cols: GPU %d\n", dev);
+        std::abort();
+    }
+    const size_t one = (size_t) 8 * 8192;
+    if (!buf[dev] && cudaMalloc(&buf[dev], 16 * one * sizeof(float)) != cudaSuccess) {
+        std::fprintf(stderr, "ik2::k::mv_q6k_cols: no memory for a window's inputs\n");
+        std::abort();
+    }
+    return buf[dev] + (size_t) (turn[dev]++ & 15u) * one;
+}
+// IK2_Q6_COLS=0: Q6_K through the row dots (mv_blocks_kernel / mv_blocks_rows_kernel)
+static bool q6k_cols_fits(int type, int K, const float* x, int T) {
+    static const bool q6 = !(getenv("IK2_Q6_COLS") && !atoi(getenv("IK2_Q6_COLS")));
+    return q6 && type == kQ6_K && T >= 1 && T <= 8 && K <= 8192 && (K & 255) == 0 && ((uintptr_t) x & 3) == 0;
+}
+static void q6k_cols(const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                     cudaStream_t s) {
+    float* xq = q6k_cols_scratch();
+    q6k_cols_x_kernel<<<dim3((unsigned) ((K + 255) / 256), (unsigned) T), 256, 0, s>>>(x, x_ld, K, xq);
+    constexpr int WW = 4, RR = 2;
+    const unsigned g = (unsigned) ((N + WW * RR - 1) / (WW * RR));
+    if (T == 1) mv_q6k_cols_kernel<WW, RR, 1><<<g, WW * 32, 0, s>>>(W, N, K, xq, T, y, y_ld);
+    else if (T <= 2) mv_q6k_cols_kernel<WW, RR, 2><<<g, WW * 32, 0, s>>>(W, N, K, xq, T, y, y_ld);
+    else if (T <= 4) mv_q6k_cols_kernel<WW, RR, 4><<<g, WW * 32, 0, s>>>(W, N, K, xq, T, y, y_ld);
+    else if (T <= 6) mv_q6k_cols_kernel<WW, RR, 6><<<g, WW * 32, 0, s>>>(W, N, K, xq, T, y, y_ld);
+    else mv_q6k_cols_kernel<WW, RR, 8><<<g, WW * 32, 0, s>>>(W, N, K, xq, T, y, y_ld);
+    check("mv_q6k_cols");
+}
+
+void mv_blocks_rows(int type, const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                    cudaStream_t s) {
+    if (N <= 0 || T <= 0) return;
+    if (K > 8192 || !block_values(type) || K % block_values(type)) {
+        std::fprintf(stderr, "ik2::k::mv_blocks_rows: type %d, K %d\n", type, K);
+        std::abort();
+    }
+    // (Q6_K - Inkling 2 Small's attention outputs and head: a block decoded once for the window's tokens)
+    if (q6k_cols_fits(type, K, x, T)) {
+        q6k_cols(W, N, K, x, x_ld, T, y, y_ld, s);
+        return;
+    }
+    // (a block's rows are read once from the memory and T - 1 times from the cache: two rows a block at most)
+    static const int rr = getenv("IK2_ROWS_R") ? atoi(getenv("IK2_ROWS_R")) : 1;
+#define IK2_ROWS(WW, RR)     mv_blocks_rows_kernel<WW, RR><<<(unsigned) ((N + WW * RR - 1) / (WW * RR)), WW * 32, xp_floats(K) * 4, s>>>(         type, W, N, K, mv_row_bytes(type, K), x, x_ld, T, y, y_ld)
+    if (rr == 2) IK2_ROWS(4, 2);
+    else if (rr == 4) IK2_ROWS(4, 4);
+    else if (rr == 11) IK2_ROWS(1, 1);
+    else if (rr == 21) IK2_ROWS(2, 1);
+    else IK2_ROWS(4, 1);
+#undef IK2_ROWS
+    check("mv_blocks_rows");
 }
 
 template <class KV>

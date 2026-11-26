@@ -120,7 +120,11 @@ bool attn_flash_available();
 /// AMD, RDNA 3 / 3.5 / 4 (ik2_rdna.inc): the prompt's routed experts of a layer in three launches from their blocks.
 /// Rows: a token's pick each, grouped by expert in expert order; tiles: int4 {expert, first row, rows <= 32, 0} over
 /// them; eptr [E]: an expert's blocks (gate, then up at off_up / down at off_down, as a cache slot holds them).
-/// Can the current GPU take it for these expert types (all NVFP4 or all Q8_0) and widths (IK2_RDNA_MOE=0: no)?
+/// Can the current GPU take it for these expert types (all NVFP4 or all Q8_0; or gate and up of one type and down of
+/// its own among those and IQ2_XXS / IQ2_XS / IQ1_S / IQ1_M with one of the IQ types there - IK2_RDNA_IQ=0: not
+/// these) and widths (IK2_RDNA_MOE=0: no)?
+/// (kRdnaF16Rows as experts_rdna_gu / _down's type: rows that are FP16 already - the tests' reference)
+constexpr int kRdnaF16Rows = -16;
 bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F);
 /// h16 [rows][F] = SwiGLU(x16 . gate^T * sg[row], x16 . up^T * su[row]) (softcaps gcap / ucap), x16 [rows][C]
 void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_up,
@@ -135,6 +139,8 @@ void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T,
 /// AMD: y [T][ldy] = x [T][K] . W [N][K]^T, BF16 in, F32 sums, T <= 8 (the drafter's block): the weights read once,
 /// a warp's rows sharing each x load.  False (nothing launched): not this shape (K % 8, alignment, T) - the BLAS then.
 bool gemm_bf16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
+/// ... FP16 in (the drafter's base logits through an FP16 copy of the head: the BLAS has no FP16-in F32-out product)
+bool gemm_f16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
 #endif
 
 /// o *= sigmoid(g), n values.
@@ -242,6 +248,13 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
 /// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
 /// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
 void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+/// ... through the row dots whatever the GPU and the type (mv_blocks may take another kernel with the same sums: the
+/// tests hold the two together bit for bit).
+void mv_blocks_ref(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+/// ... for T tokens, x [T] rows x_ld apart, y [T] rows y_ld apart: each token's y is mv_blocks' to the bit, the matrix
+/// read from the memory once (a verify window's products over a matrix kept as blocks).
+void mv_blocks_rows(int type, const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                    cudaStream_t s);
 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.
@@ -513,7 +526,7 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 
 /// ggml type ids of the blocks these decode.
 constexpr int kQ4_K = 12, kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18,
-               kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kNVFP4 = 40;
+               kIQ1_S = 19, kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29, kNVFP4 = 40;
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);
 size_t block_bytes(int type);

@@ -2467,6 +2467,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // embedding and its logits: no routing round trip a layer, no table upload.  The position is read on the device too
 // (W.pos), so a token's launches do not change from one token to the next and are replayed as one CUDA graph.  The
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
+uint16_t* g_draft_head16 = nullptr;   // (the drafter's FP16 copy of a head kept as blocks other than Q8_0; else null)
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
@@ -3555,7 +3556,13 @@ void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, fl
         k::mv_q8p_cols(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x, x_ld, T, y, ldy, g_s);
         return;
     }
-    const Mat part = mat_rows(m, r0, n);   // (not planar Q8_0: mv1 a token at a time)
+    const Mat part = mat_rows(m, r0, n);   // (not planar Q8_0: mv1's row dots for each token, its blocks read once;
+                                           //  IK2_BLOCK_ROWS=0: mv1 a token at a time)
+    static const bool rows = !(getenv("IK2_BLOCK_ROWS") && !std::atoi(getenv("IK2_BLOCK_ROWS")));
+    if (rows && T > 1) {
+        k::mv_blocks_rows(part.type, part.raw, part.N, part.K, x, x_ld, T, y, ldy, g_s);
+        return;
+    }
     for (int t = 0; t < T; ++t) mv1(part, x + (size_t) t * x_ld, y + (size_t) t * ldy);
 }
 
@@ -4830,7 +4837,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         //  IK2_DRAFT_COUPLE_T, so that its draws stay on the model's token there - any draft leaves the model's draw exact)
         static const double couple_t = getenv("IK2_DRAFT_COUPLE_T") ? std::atof(getenv("IK2_DRAFT_COUPLE_T")) : 1.0;
         nz.salt = sc.salt, nz.inv_temp = sc.temp > 0 ? (float) (1.0 / (sc.temp * couple_t)) : 0.0f, nz.cap = c.logit_cap;
-        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1,
+        ik2::draft::propose(drafter, anchor, anchor_h, P, g_draft_head16, c.n_rows, c.n_vocab, dr, B - 1,
                             sc.temp > 0 && g_draft_couple ? &nz : nullptr);
         if (t_draft) *t_draft += now() - t0;
         g_sp_draft += now() - t0;
@@ -6210,6 +6217,7 @@ int main(int argc, char** argv) {
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
     double cache_gb = 60;
+    bool cache_set = false;
     int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -6230,7 +6238,7 @@ int main(int argc, char** argv) {
         else if (a == "--gen") gen = std::atoi(next().c_str());
         else if (a == "--chunk") chunk = std::atoi(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
-        else if (a == "--cache-gb") cache_gb = std::atof(next().c_str());
+        else if (a == "--cache-gb") cache_gb = std::atof(next().c_str()), cache_set = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
         else if (a == "--draft") draft_path = next();
@@ -6696,7 +6704,11 @@ int main(int argc, char** argv) {
         }
 #endif
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
-        bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        // (an APU: the host copy of the cache path is the same RAM again, so where every expert fits they all stay
+        //  whatever their size - --cache-gb given: its cap as everywhere)
+        bool fits = exp_b + dense_b + kv_b + reserve <= fr0 &&
+                    (exp_b <= (size_t) (cache_gb * 1073741824.0) || (g_apu && !cache_set));
+        if (fits && g_apu && !cache_set) cache_gb = std::max(cache_gb, exp_b / 1073741824.0 * 1.02 + 1.0);
         // KV streaming (g_kv_stream): auto takes it only where the cache alone does not fit beside the dense weights
         // and a half-GiB tier of experts (the offload layout, below), and only where the RAM holds the rows beside its
         // experts; where the offload path does not run, where the cache does not fit beside every expert.  The rows
@@ -6874,8 +6886,12 @@ int main(int argc, char** argv) {
             const auto* head = S.info("output.weight");
             const int head_rows = head ? (int) (head->elements() / c.C) : 201024;
             // (the fold reads an FP16 head or a planar Q8_0 one: on the layout that keeps the dense weights as their blocks,
-            //  a head of another type - UD-IQ3_XXS's is Q5_K - has no rows for it, and the drafter is left out)
-            if (model_drafter && g_dense_q8 && !(head && (int) head->type == k::kQ8_0 && c.C % 128 == 0)) {
+            //  a head of another type - UD-IQ3_XXS's is Q5_K, a 150 GB Inkling-2-Small's Q6_K - gets an FP16 copy for
+            //  the drafter where every expert stays in VRAM and it has the room (head_f16_b, counted below); the
+            //  model's own logits still come from the blocks, so its answers are the same with the drafter and without)
+            const bool head_q8 = head && (int) head->type == k::kQ8_0 && c.C % 128 == 0;
+            const size_t head_f16_b = model_drafter && g_dense_q8 && !head_q8 ? (size_t) head_rows * c.C * 2 : 0;
+            if (head_f16_b && !(head && g_fast_want && k::block_values((int) head->type))) {
                 std::printf("NOTE maya-ik2: the drafter left out: the output head is %s, and the fold reads an FP16 or a "
                             "planar Q8_0 one\n",
                             head ? head->type_name() : "missing");
@@ -6885,7 +6901,7 @@ int main(int argc, char** argv) {
             // (the drafter: its context rows in FP16, else in FP8 - IK2_DRAFT_KV takes one; the load below measures)
             const char* kv_env = getenv("IK2_DRAFT_KV");
             const bool only16 = kv_env && std::string(kv_env) == "f16", only8 = kv_env && std::string(kv_env) == "fp8";
-            size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8);
+            size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8) + head_f16_b;
             std::string why;
             if (off_layout && model_drafter && off_why.empty()) {
                 std::vector<std::pair<int, bool>> tries;   // (rows, FP8)
@@ -6908,7 +6924,7 @@ int main(int argc, char** argv) {
                 if (!ok) ik2::draft::plan_context_rows(0);
             } else if (model_drafter && !only8 && !only16 && !room_ok(need, why)) {
                 why.clear();
-                need = draft_room(draft_path, ctx, chunk, c, head_rows, true);
+                need = draft_room(draft_path, ctx, chunk, c, head_rows, true) + head_f16_b;
             }
             why.clear();
             if (room_ok(need, why)) {
@@ -7249,6 +7265,7 @@ int main(int argc, char** argv) {
     // mapped, then the rest read and pinned (below the warm) - an 8 GB card's tier is RAM a 16 GB PC does not need.
     // Linux, where the GPU reads a registered range at its own address; IK2_PIN_ALL=1: every expert pinned here.
     bool pin_later = false;
+    bool res_stage = false;   // (the resident path's experts read a layer at a time, not from the files' mapping)
 #ifndef _WIN32
     if (!host_mmap && g_off_want && !(getenv("IK2_PIN_ALL") && std::atoi(getenv("IK2_PIN_ALL"))) &&
         !(getenv("IK2_TIER_MIN") && std::atoi(getenv("IK2_TIER_MIN"))) &&
@@ -7269,16 +7286,34 @@ int main(int argc, char** argv) {
     if (host_mmap) {
         if (g_pool) die("IK2_HOST=mmap with the CPU lane");
         if (g_off_want) die("IK2_HOST=mmap with the offload path (it reads pinned host memory: IK2_OFF=0)");
+#ifdef __linux__
+        // (the files and the experts' VRAM do not fit the RAM together - a 150 GB model on an APU, whose VRAM is the
+        //  RAM: reading the whole files ahead fills the RAM the slots need, and the load crawls at a page fault at a
+        //  time.  There the resident path reads a layer at a time into a pinned block, with the reads' threads.)
+        if (g_fast_want)
+            if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+                char line[256];
+                unsigned long long av_kb = 0;
+                while (std::fgets(line, sizeof line, mi)) std::sscanf(line, "MemAvailable: %llu kB", &av_kb);
+                std::fclose(mi);
+                cudaDeviceProp dp{};
+                CU(cudaGetDeviceProperties(&dp, 0));
+                // (an integrated GPU's slots come out of the same RAM as the page cache)
+                const size_t need = host_total + (dp.integrated ? host_total : 0);
+                res_stage = av_kb && (size_t) av_kb * 1024 < need + ((size_t) 4 << 30);
+            }
+#endif
         for (const auto& J : exp_jobs) {
             Layer& Ly = M.L[J.l];
             const uint8_t* p = S.data(J.name);
             for (size_t i = 0; i < J.roles.size(); ++i) Ly.host[J.roles[i]] = p + i * Ly.eb[J.roles[i]];
-            {   // (read ahead: a cold file otherwise comes in a page fault at a time)
+            if (!res_stage) {   // (read ahead: a cold file otherwise comes in a page fault at a time)
                 const size_t pg = 4096, a0 = (size_t) p & ~(pg - 1);
                 ::madvise((void*) a0, (size_t) p - a0 + tensor_bytes(*S.info(J.name)), MADV_WILLNEED);
             }
         }
-        std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
+        std::printf(res_stage ? "experts: read a layer at a time into VRAM (the RAM does not hold the files beside them)\n"
+                              : "experts: read where the files are mapped (IK2_HOST=mmap)\n");
         std::fflush(stdout);
     } else if (pin_later) {
         pin.blocks.resize(c.n_layer);
@@ -7477,6 +7512,14 @@ int main(int argc, char** argv) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
         // (a Q8_0 head: the fold reads its blocks a chunk at a time and the base logits are products with them - no
         //  FP16 copy of it, 0.9 GiB for Inkling 2's, which at a long context's start had no room beside the cache)
+        if (!draft_head && !M.out_w.q8 && M.out_w.raw && k::block_values(M.out_w.type)) {
+            // (a head kept as other blocks - Q6_K, Q5_K: an FP16 copy of it for the drafter's fold and base logits)
+            draft_head = g_draft_head16 = dalloc<uint16_t>((size_t) c.n_rows * c.C);
+            k::decode_f16(M.out_w.type, M.out_w.raw, (size_t) c.n_rows * c.C, draft_head, g_s);
+            CU(cudaStreamSynchronize(g_s));
+            std::printf("drafter: an FP16 copy of the %.2f GiB output head for it (the model's own logits: from its "
+                        "blocks, as without the drafter)\n", (size_t) c.n_rows * c.C * 2 / 1073741824.0);
+        }
         if (!draft_head && !M.out_w.q8) die("--draft: the output head is neither FP16 nor planar Q8_0");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
@@ -8037,10 +8080,52 @@ int main(int argc, char** argv) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
             int n = 0;
-            for (int l = 0; l < c.n_layer; ++l)
+            uint8_t* stage = nullptr;   // (res_stage: a layer's experts, slot by slot, pinned)
+            if (res_stage) {
+                size_t mx = 0;
+                for (const auto& Ly : M.L) mx = std::max(mx, (size_t) c.E * (Ly.eb[0] + Ly.eb[1] + Ly.eb[2]));
+                CU(cudaHostAlloc((void**) &stage, mx, cudaHostAllocPortable));
+            }
+            for (int l = 0; l < c.n_layer; ++l) {
+                Layer& Ly = M.L[l];
+                const bool keep_contig = Ly.host_contig;
+                const size_t keep_slot = Ly.slot_bytes, keep_stride[3] = {Ly.stride[0], Ly.stride[1], Ly.stride[2]};
+                const uint8_t* keep_host[3] = {Ly.host[0], Ly.host[1], Ly.host[2]};
+                if (stage) {
+                    const size_t sb = Ly.eb[0] + Ly.eb[1] + Ly.eb[2];
+                    std::vector<std::thread> th;
+                    const int per_job = std::max(1, threads / 3);
+                    for (const auto& J : exp_jobs) {
+                        if (J.l != l) continue;
+                        // (a tensor's parts of an expert, one after the other in the slot from its first role on)
+                        const size_t role_off = J.roles[0] == 0 ? 0 : (J.roles[0] == 1 ? Ly.eb[0] : Ly.eb[0] + Ly.eb[1]);
+                        const size_t exp_bytes = tensor_bytes(*S.info(J.name)) / c.E;
+                        const ExpJob* Jp = &J;
+                        for (int t = 0; t < per_job; ++t) {
+                            const int e0 = (int) ((long long) c.E * t / per_job), e1 = (int) ((long long) c.E * (t + 1) / per_job);
+                            if (e1 > e0)
+                                th.emplace_back([&S, Jp, stage, e0, e1, role_off, exp_bytes, sb]() {
+                                    read_into_strided(S.paths[S.file_of(Jp->name)],
+                                                      S.file_offset(Jp->name) + (uint64_t) e0 * exp_bytes, e1 - e0,
+                                                      exp_bytes, sb, stage + (size_t) e0 * sb + role_off);
+                                });
+                        }
+                    }
+                    for (auto& t : th) t.join();
+                    Ly.host_contig = true, Ly.slot_bytes = sb;
+                    Ly.host[0] = stage, Ly.host[1] = stage + Ly.eb[0], Ly.host[2] = stage + Ly.eb[0] + Ly.eb[1];
+                    Ly.stride[0] = Ly.stride[1] = Ly.stride[2] = sb;
+                }
                 for (int e = 0; e < c.E; ++e)
-                    if (!EC.has(l, e)) EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true), ++n;
+                    if (!EC.has(l, e)) EC.get(Ly, l, e, EC.tick, g_cs, nullptr, true, true), ++n;
+                if (stage) {   // (the block is the next layer's: this one's copies done first)
+                    CU(cudaStreamSynchronize(g_cs));
+                    Ly.host_contig = keep_contig, Ly.slot_bytes = keep_slot;
+                    for (int r = 0; r < 3; ++r) Ly.host[r] = keep_host[r], Ly.stride[r] = keep_stride[r];
+                }
+            }
             CU(cudaStreamSynchronize(g_cs));
+            if (stage) CU(cudaFreeHost(stage));
             ++EC.tick;
             for (int l = 0; l < c.n_layer; ++l) {
                 Layer& Ly = M.L[l];

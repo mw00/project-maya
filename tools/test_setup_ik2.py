@@ -92,6 +92,9 @@ class Names(unittest.TestCase):
         small = {"exe": "build/maya-ik2", "model_name": "inkling-2-small",
                  "args": ["--model", "Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf"]}
         self.assertEqual((Q.model_key(small), Q.model_defaults(small)[1]), ("ik2", "auto"))
+        # (thinkingmachines/Inkling-2-Small names no sampling: plain, and its own entry - not Inkling-2-Mini's)
+        self.assertEqual(Q.model_defaults(small)[0], {"temperature": 1.0, "top_p": 1.0})
+        self.assertIsNot(Q.MODEL_DEFAULTS["ik2"], Q.MODEL_DEFAULTS["ik2-mini"])
 
     def test_label(self):
         cfg = {"exe": "/b/maya-ik2", "installer": {"family": "ik2", "ik2_quant": Q.IK2_QUANT}}

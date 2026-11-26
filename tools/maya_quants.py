@@ -47,8 +47,9 @@ MODEL_DEFAULTS = {
     # Hy4-flash: tencent/Hy4-flash generation_config.json and card ("Recommended sampling parameters") - temperature
     # 0.9, top_p 1.0, no top-k (its -1); reasoning_effort high its template's default (no_think: direct answers)
     "hy4": ({"temperature": 0.9, "top_p": 1.0}, "high"),
-    # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (no
-    # generation_config.json), so plain sampling - temperature 1.0, top_p 1.0; "auto" its template's own effort (0.9)
+    # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (its
+    # generation_config.json, 885d78b: the end and pad tokens only), so plain sampling - temperature 1.0, top_p 1.0;
+    # "auto" its template's own effort (0.9; the template is Inkling-2-Mini's, the same file)
     "ik2": ({"temperature": 1.0, "top_p": 1.0}, "auto"),
     # Inkling-2-Mini (the setup's Inkling 2; model_key "ik2-mini"), its author's values (PR
     # #1095): thinkingmachines/Inkling-2-Mini's generation_config.json - temperature 1.0, top_p 1.0, no top-k, no
