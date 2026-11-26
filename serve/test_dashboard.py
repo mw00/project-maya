@@ -176,6 +176,18 @@ class Dashboard(unittest.TestCase):
         now = json.loads(self.req("GET", "/metrics")[2])["tiers"]["now"]
         self.assertEqual((now["draft_acc"], now["draft_off"], now["disk_gb"]), (124.0, 200.0, 31.4))
 
+    def test_stat_lines_carry_the_prefill_expert_totals(self):
+        # the DeepSeek engine's STAT pf_picks / pf_hits (prompt-path expert rows routed, of them in VRAM, since the
+        # engine started): they reach the Monitor's tiers.now, where the Prefill VRAM hit tile divides them
+        class Stub:
+            pass
+        eng = Stub()
+        StrataEngine._parse_stat(eng, "STAT tok_s=31.20 vram_hit=0.9100 pf_picks=983040 pf_hits=419503")
+        self.assertEqual((eng.stat["pf_picks"], eng.stat["pf_hits"]), (983040.0, 419503.0))
+        self.engine.stat = dict(eng.stat)
+        now = json.loads(self.req("GET", "/metrics")[2])["tiers"]["now"]
+        self.assertEqual((now["pf_picks"], now["pf_hits"]), (983040.0, 419503.0))
+
     def test_requests_carry_the_drafts_offered_and_kept(self):
         # the page's last-answer acceptance: the engine's DONE counts reach the request row, None when it reported none
         self.engine.last = None

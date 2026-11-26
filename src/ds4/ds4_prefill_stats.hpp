@@ -9,6 +9,13 @@ struct PrefillCounts {
     uint64_t picks = 0, vram_picks = 0;
     uint64_t unique_uses = 0, vram_unique_uses = 0;
 
+    void merge(const PrefillCounts& other) {
+        picks += other.picks;
+        vram_picks += other.vram_picks;
+        unique_uses += other.unique_uses;
+        vram_unique_uses += other.vram_unique_uses;
+    }
+
     bool add_bounds(const int* bounds, size_t slots, size_t resident_slots) {
         if (!bounds || resident_slots > slots || bounds[0] < 0) return false;
         for (size_t v = 0; v < slots; ++v)
@@ -24,5 +31,13 @@ struct PrefillCounts {
         }
         return true;
     }
+};
+
+// One device worker owns destination. Preserve its completed routing even on an early return; the owner thread
+// merges these destinations only after the existing worker-completion synchronization.
+struct PrefillCountsCapture {
+    PrefillCounts& destination;
+    const PrefillCounts& source;
+    ~PrefillCountsCapture() { destination.merge(source); }
 };
 }

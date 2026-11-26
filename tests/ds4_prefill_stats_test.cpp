@@ -1,6 +1,8 @@
 #include "../src/ds4/ds4_prefill_stats.hpp"
 #include <climits>
 #include <cstdio>
+#include <array>
+#include <thread>
 
 using maya::ds4::PrefillCounts;
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
@@ -48,5 +50,55 @@ int main() {
     const int maximum[] = {0, INT_MAX};
     CHECK(large.add_bounds(maximum, 1, 1) && large.add_bounds(maximum, 1, 1));
     CHECK(large.picks == uint64_t(INT_MAX) * 2 && large.vram_picks == large.picks);
-    std::puts("prefill statistics: weighted hits, repeated uses, lent slots, invalid bounds and 64-bit totals passed");
+
+    // Each device writes only its own completed count. The owner merges after the existing completion boundary.
+    // One device does no routing (a helper-only worker); another returns early (cancelled/failed partial work).
+    constexpr int devices = 8, rounds = 32768;
+    std::array<PrefillCounts, devices> per_device{};
+    std::array<int, devices> errors{};
+    std::array<std::thread, devices> workers;
+    for (int i = 0; i < devices; ++i)
+        workers[i] = std::thread([&, i] {
+            PrefillCounts local;
+            strata::ds4::PrefillCountsCapture capture{per_device[i], local};
+            const int count = i == 0 ? 0 : i == devices - 1 ? rounds / 4 : rounds;
+            const int bounds[] = {0, 2, 5, 10};
+            for (int j = 0; j < rounds; ++j) {
+                if (j == count) return;
+                if (!local.add_bounds(bounds, 3, 1 + i % 3)) {
+                    errors[i] = 1;
+                    return;
+                }
+            }
+        });
+    for (auto& worker : workers) worker.join();
+    PrefillCounts total;
+    uint64_t expected_picks = 0, expected_hits = 0, expected_uses = 0, expected_vram_uses = 0;
+    for (int i = 0; i < devices; ++i) {
+        CHECK(errors[i] == 0);
+        const uint64_t n = i == 0 ? 0 : i == devices - 1 ? rounds / 4 : rounds;
+        const uint64_t hits[] = {0, 2, 5, 10};
+        expected_picks += 10 * n;
+        expected_hits += hits[1 + i % 3] * n;
+        expected_uses += 3 * n;
+        expected_vram_uses += (1 + i % 3) * n;
+        total.merge(per_device[i]);
+    }
+    CHECK(total.picks == expected_picks && total.vram_picks == expected_hits);
+    CHECK(total.unique_uses == expected_uses && total.vram_unique_uses == expected_vram_uses);
+    // Later runs add to lifetime totals; a layer-major delegate must not be overwritten by its empty outer scope.
+    PrefillCounts cumulative = total;
+    for (const auto& count : per_device) cumulative.merge(count);
+    CHECK(cumulative.picks == 2 * expected_picks && cumulative.vram_picks == 2 * expected_hits);
+    PrefillCounts delegated, outer;
+    {
+        strata::ds4::PrefillCountsCapture outer_capture{delegated, outer};
+        PrefillCounts inner;
+        strata::ds4::PrefillCountsCapture inner_capture{delegated, inner};
+        CHECK(inner.add_bounds(a, 3, 2));
+    }
+    CHECK(delegated.picks == 101 && delegated.vram_picks == 100);
+    large.merge(large);
+    CHECK(large.picks == uint64_t(INT_MAX) * 4 && large.vram_picks == large.picks);
+    std::puts("prefill statistics: bounds, 64-bit totals, worker-local merging, partial runs and delegation passed");
 }
