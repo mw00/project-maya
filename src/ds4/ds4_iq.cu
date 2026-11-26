@@ -748,6 +748,7 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 #endif
 }
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only: a negative limit = the post-SiLU clamp; every other engine takes the #else)
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's; < 0: post-SiLU clamp)
     if (limit > 0.0f) {
         gv = fminf(gv, limit);
@@ -761,6 +762,15 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // 
     }
     return fmul_no_fma(act, uv);
 }
+#else
+__device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
+    if (limit > 0.0f) {
+        gv = fminf(gv, limit);
+        uv = fminf(fmaxf(uv, -limit), limit);
+    }
+    return fmul_no_fma(__fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv))), uv);
+}
+#endif
 // MiniMax-M3.1's swigluoai (mm3_exl3.cu's: the same operations)
 __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
     if (limit > 0.0f) {
@@ -2596,6 +2606,7 @@ __global__ void mmq_epilogue(const float* __restrict__ g, uint16_t* __restrict__
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * nff) return;
     const int r = i / nff, c = i - r * nff;
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only)
     const float g0 = g[(size_t) r * 2 * nff + c];
     const float u0 = g[(size_t) r * 2 * nff + nff + c];
     float v;
@@ -2609,6 +2620,11 @@ __global__ void mmq_epilogue(const float* __restrict__ g, uint16_t* __restrict__
     } else {
         v = g0 / (1.0f + __expf(-g0)) * u0;
     }
+#else
+    const float gv = fminf(g[(size_t) r * 2 * nff + c], limit);
+    const float uv = fminf(fmaxf(g[(size_t) r * 2 * nff + nff + c], -limit), limit);
+    const float v = gv / (1.0f + __expf(-gv)) * uv;
+#endif
     h[(size_t) r * ldo + c] = __half_as_ushort(__float2half_rn(v));
 }
 

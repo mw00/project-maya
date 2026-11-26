@@ -110,7 +110,7 @@ public:
     const std::vector<maya::TensorInfo>& tensors() const { return all_; }
     const uint8_t* tensor_data(const maya::TensorInfo& t) const { return files_[(size_t) file_of(t)]->tensor_data(t); }
     uint64_t tensor_file_offset(const maya::TensorInfo& t) const {
-        return files_[(size_t) file_of(t)]->tensor_file_offset(t);
+        return files_[(size_t) file_of(t)]->data_start() + t.offset;
     }
     int file_of(const maya::TensorInfo& t) const {
         const auto it = index_.find(t.name);
