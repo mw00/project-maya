@@ -713,13 +713,15 @@ inline bool plain_sampling(const mm3::sample::Req& r) {
 // where the match is `need` tokens long.  Verified token by token like the drafter's, so the tokens are the model's
 // either way.
 struct Lookup {
-    maya::spec::SuffixDrafter sd{3, 64, (size_t) 1 << 19};
+    static constexpr int kMaxMatch = 64;
+    maya::spec::SuffixDrafter sd{3, kMaxMatch, (size_t) 1 << 19};
     bool on = false;
     // (a run of 7 drafts - a window of 8 tokens: 18 ms on eight RTX 5060 Ti, where the drafter's 5 are 13.6 - and, once
     //  such a window was kept whole, of up to cap_max: 16 tokens are 31 ms, every token past the 8th 1.5 to 1.7 ms;
     //  back to 7 after a window that was not kept whole)
     int cap_max = hy4::k::kMaxWin - 1, cap0 = 7, cap = 7, need = 12, hot_need = 4, match_need = 6;
     int hot = 0;      // (the tokens in a row the runs foretold, up to now)
+    int prev_n = 0, prev_match = 0, since = 0;   // (the run before: its length and match, the tokens made since)
     long long off = 0, acc = 0, rounds = 0;
     int32_t buf[hy4::k::kMaxWin];
     void start(const int* ids, size_t n) {
@@ -728,14 +730,27 @@ struct Lookup {
         sd.append(ids, n);
         hot = 0;
         cap = std::min(cap0, cap_max);
+        prev_n = prev_match = since = 0;
     }
     void add(int t) {
-        if (on) sd.append(t);
+        if (!on) return;
+        sd.append(t);
+        ++since;
     }
     // the run after the text's last tokens -> buf (0: none)
+    // (a run that goes on where the one before it stood has its match longer by the tokens made since: one whose match
+    //  is shorter is another place in the text - what the runs before it foretold says nothing of it - and a run past
+    //  7 drafts is taken from a match of 16 and more)
     int propose(long long room) {
         if (!on || room <= 0 || cap_max <= 0) return 0;
-        return sd.propose((int) std::min<long long>(room, cap), buf);
+        int n = sd.propose((int) std::min<long long>(room, cap), buf);
+        const int m = n > 0 ? sd.last_match() : 0;
+        if (n <= 0 || prev_n <= 0 || m < std::min(kMaxMatch, prev_match + since)) hot = 0;
+        if (n > cap0 && m < 16) n = cap0;
+        prev_n = n;
+        prev_match = m;
+        since = 0;
+        return n;
     }
     int match() const { return sd.last_match(); }
     bool sure() const { return hot >= hot_need && match() >= match_need; }
@@ -1012,6 +1027,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         lk.need = la.need;
         lk.hot_need = la.hot_need;
         lk.start(state.data(), state.size());
+        static const bool lk_log = std::getenv("HY4_LOOKUP_LOG") != nullptr;   // (debugging: a line a step)
         const int win_rows = std::max(spec ? n_draft + n_more + 1 : 0, lk.on ? lk.cap_max + 1 : 0);
         std::vector<float> lgw((size_t) win_rows * m.vocab());
         Unpin lgw_unpin{lgw.data(), hy4::Model::pin(lgw.data(), lgw.size() * sizeof(float))};
@@ -1069,6 +1085,9 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 } else {
                     tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state, m.row_top(0)), rng);
                 }
+                if (lk_log)
+                    std::fprintf(stderr, "LK one pos %lld nl %d match %d hot %d drafted %zu conf %.2f\n", (long long) pos, nl,
+                                 nl > 0 ? lk.match() : 0, lk.hot, drafts.size(), confs.empty() ? -1.0f : confs[0]);
                 lk.judge(nl, nullptr, 0, tok);
                 continue;
             }
@@ -1134,6 +1153,9 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             }
             if (lk_round) lk.seen(k, (int) (d_acc - acc0));
             else extra.seen(k, (int) (d_acc - acc0), n_draft);
+            if (lk_log)
+                std::fprintf(stderr, "LK %s pos %lld nl %d match %d hot %d k %d kept %d\n", lk_round ? "copy" : "mtp",
+                             (long long) pos, nl, nl > 0 ? lk.match() : 0, lk.hot, k, (int) (d_acc - acc0));
             lk.judge(nl, drafts.data(), (int) (d_acc - acc0), more ? next : -1);
             if (!more) break;
             tok = next;
