@@ -70,6 +70,8 @@ def meta_tokens(path: str) -> list[int] | None:
 
 
 ENGINE_ARGS: list[str] = []   # (--tp N: the layout under test - tensor parallel writes every member's copy)
+ENGINE_ENV: dict[str, str] = {}
+EXPECT: list[str] = []        # (lines the start must print: the layout under test was taken)
 
 
 def run(exe, gpus, pack, ctx, slots, keep, steps, max_new, slot_gb=None, extra_env=None):
@@ -77,6 +79,7 @@ def run(exe, gpus, pack, ctx, slots, keep, steps, max_new, slot_gb=None, extra_e
            "HY4_ROUTE": "lane"}   # (the route pinned: a start does not measure its own)
     if slot_gb is not None:
         env["MAYA_HY4_SLOT_GB"] = str(slot_gb)
+    env.update(ENGINE_ENV)
     env.update(extra_env or {})
     args = [*(("--gpus", ",".join(str(g) for g in gpus)) if gpus else ()), "--pack", pack, "--max-context", str(ctx),
             "--mtp", *ENGINE_ARGS, "--serve"]
@@ -96,6 +99,10 @@ def run(exe, gpus, pack, ctx, slots, keep, steps, max_new, slot_gb=None, extra_e
         if eng.proc is not None:
             eng.quit()
         err = eng.stderr_lines()
+    said = "\n".join([*err, *eng.notes])
+    for want in EXPECT:
+        if want not in said:
+            raise RuntimeError(f"the engine did not take the layout under test (no '{want}' at its start)")
     for line in err:   # (a slot that failed to be set aside, taken back or written: this test's failure)
         if line.startswith("hy4 slots:") and ("did not load" in line or "could not be written" in line
                                              or "not saved" in line):
@@ -116,9 +123,22 @@ def main() -> int:
     ap.add_argument("--max-new", type=int, default=24)
     ap.add_argument("--cut", type=int, default=8, help="B's cut-back turn: B's answer's first CUT tokens, then a turn")
     ap.add_argument("--tp", type=int, default=0, help="--tp N: tensor parallel over N GPUs (0: the engine's own layout)")
+    ap.add_argument("--kv-resident", type=int, default=0,
+                    help="KV streaming on with N positions of the indexed layers in VRAM (0: the start's own choice)")
+    ap.add_argument("--kv-spill-res", type=int, default=0,
+                    help="with --kv-resident: KV spill on, N positions in RAM (HY4_KV_SPILL_RES), the rest on a drive")
     a_ = ap.parse_args()
     if a_.tp > 1:
         ENGINE_ARGS.extend(["--tp", str(a_.tp)])
+    spill_dir = None
+    if a_.kv_resident > 0:
+        ENGINE_ARGS.extend(["--kv-streaming", "on", "--kv-resident", str(a_.kv_resident)])
+        EXPECT.append("kv_streaming=on")
+        if a_.kv_spill_res > 0:
+            spill_dir = tempfile.mkdtemp(prefix="hy4-spill-")
+            ENGINE_ARGS.extend(["--kv-spill", "on", "--kv-spill-dir", spill_dir])
+            ENGINE_ENV["HY4_KV_SPILL_RES"] = str(a_.kv_spill_res)
+            EXPECT.append("KV spill: the indexed layers' rows")
     if not os.path.exists(a_.exe):
         print(f"{a_.exe}: no engine - build it first", flush=True)
         return 2
@@ -152,7 +172,13 @@ def main() -> int:
 
         print("in place: A, A's next turn, B, B's cut-back turn (MAYA_HY4_SLOT_KEEP=0: each turn continues its own "
               "conversation, no switch - the reference)", flush=True)
-        r0, _, load0 = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-1"), False, in_place(), a_.max_new)
+        r0, notes0, load0 = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-1"), False, in_place(), a_.max_new)
+        plan0 = [n for n in notes0 if n.startswith("INFO CPU lane:")]
+
+        def plan(name, notes):   # (a start that placed the experts otherwise: its answers can move in the last bits)
+            p = [n for n in notes if n.startswith("INFO CPU lane:")]
+            if p != plan0:
+                print(f"        {name}: this start's plan is not the reference's: {p} against {plan0}", flush=True)
         ref_a, ref_b = r0["A"]["tokens"], r0["B"]["tokens"]
         print(f"        load {load0:.0f} s; A {len(a)} tok in {r0['A']['s']:.0f} s; A's next turn in "
               f"{r0['A-turn']['s']:.1f} s (reused {r0['A-turn']['reused']}); B's cut-back turn in {r0['B-cut']['s']:.1f} s "
@@ -162,14 +188,18 @@ def main() -> int:
               r0["A-turn"]["reused"] == len(a) + len(ref_a) - 1 and r0["B-cut"]["reused"] == len(b) + a_.cut)
 
         print("in place: the same, a second process (the engine's run-to-run determinism, the route pinned)", flush=True)
-        r0b, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-2"), False, in_place(ref_a, ref_b),
-                        a_.max_new)
+        r0b, notes0b, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-2"), False, in_place(ref_a, ref_b),
+                              a_.max_new)
+        plan("in place, second process", notes0b)
         det = all(r0b[k]["tokens"] == r0[k]["tokens"] for k in r0)
         n_same = sum(r0b[k]["tokens"] == r0[k]["tokens"] for k in r0)
-        if det or a_.tp <= 1:
+        moved = [n for n in notes0b if n.startswith("INFO CPU lane:")] != plan0
+        if det or (a_.tp <= 1 and not moved):
             check(f"in place: two processes give the same answers ({n_same} of {len(r0)})", det)
-        else:   # (tensor parallel: a start's plan - its VRAM reserve measured anew - can move the last bits)
-            print(f"        tensor parallel: two processes differ ({n_same} of {len(r0)} the same) - the checks across "
+        else:   # (a start's plan - its VRAM measured anew: tensor parallel's reserve, the experts the CPU lane leaves in
+            #  VRAM - can move the last bits)
+            why = "tensor parallel" if a_.tp > 1 else "the second start placed its experts otherwise"
+            print(f"        {why}: two processes differ ({n_same} of {len(r0)} the same) - the checks across "
                   "processes below are reported, not claimed; the repeat run is the exactness check", flush=True)
 
         def diff(x, y):
@@ -189,6 +219,7 @@ def main() -> int:
                                 [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn),
                                  ("B-cut", lambda _: b + ref_b[:a_.cut] + turn2)], a_.max_new)
         t, cb = r1["A-turn"], r1["B-cut"]
+        plan("switched", notes1)
         print(f"        load {load1:.0f} s; A's next turn {t['len']} tok in {t['s']:.1f} s (reused {t['reused']}); B's "
               f"cut-back turn in {cb['s']:.1f} s (reused {cb['reused']})", flush=True)
         for k in ("A", "B", "A-turn", "B-cut"):
@@ -220,7 +251,10 @@ def main() -> int:
 
         print("kept: A, B, then QUIT (both written to the folder)", flush=True)
         dir_kept = os.path.join(tmp, "kept")
-        run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True, [("A", lambda _: a), ("B", lambda _: b)], a_.max_new)
+        rk, notesk, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True, [("A", lambda _: a), ("B", lambda _: b)],
+                            a_.max_new)
+        plan("kept", notesk)
+        same("kept", rk, "A")   # (the restart below continues this process's A: the reference's only if this is)
         bins = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".bin")]
         metas = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".meta")]
         check(f"kept: the folder holds A and B ({len(bins)} .bin, {len(metas)} .meta)", len(bins) == 2 and len(metas) == 2)
@@ -236,10 +270,15 @@ def main() -> int:
         r3, notes3, load3 = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
                                 [("A-turn", lambda _: a + ref_a + turn)], a_.max_new)
         t3 = r3["A-turn"]
+        plan("restart", notes3)
         print(f"        load {load3:.0f} s; A's next turn in {t3['s']:.1f} s (reused {t3['reused']})", flush=True)
         check(f"restart: A's conversation back from the folder as far as the prompt continues it ({t3['reused']} of "
               f"{want3})", t3["reused"] == want3)
-        same("restart", r3, "A-turn")
+        if rk["A"]["tokens"] == ref_a:
+            same("restart", r3, "A-turn")
+        else:
+            print("        (not comparable) restart: the kept A is not the reference's, so its next turn is read from "
+                  "another point", flush=True)
 
         print("evict: A, B, C into a folder capped at A+B's bytes", flush=True)
         dir_ev = os.path.join(tmp, "evict")
@@ -256,6 +295,8 @@ def main() -> int:
         return 2
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        if spill_dir:
+            shutil.rmtree(spill_dir, ignore_errors=True)
     print("PASS" if ok else "FAIL", flush=True)
     return 0 if ok else 1
 

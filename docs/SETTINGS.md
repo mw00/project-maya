@@ -2832,8 +2832,13 @@ checks it (greedy, with `HY4_HOT=0` and `HY4_ROUTE=lane`): A, B, A's next turn a
 same turns with no switch; a turn sent again after a switch, its conversation back from a slot, against its first
 answer in the same process (the layer split and tensor parallel, `--tp 2`: a tensor-parallel start's plan can move the
 last bits between processes, so there the check within one process is the one claimed); a restart from the folder,
-and the folder's cap. Not with KV streaming or KV spill yet (their rows partly in RAM or on the drive):
-there the engine says so at the start and keeps no conversations.
+and the folder's cap. With KV streaming and KV spill too (`--kv-streaming on --kv-resident 4096`, and
+`--kv-spill on` with `HY4_KV_SPILL_RES=65536` at a 128K context and an 80K-token conversation): a slot's rows are by
+position, so a save reads them from pinned memory and the drive and a load writes them back to both - the VRAM ring
+gets the newest, the RAM tier the newest it holds, the drive the rest - and a slot saved under one layout loads under
+another. An 80K-token conversation with spill: 1.58 GB, set aside in 1.1-1.8 s, back from RAM in 0.16 s. With
+streaming the experts a start leaves in VRAM can differ by a few between starts (the VRAM it finds free), which moves
+the last bits of every answer, slots on or off: the test says so and claims the check within one process then.
 
 | Setting | Default | |
 | --- | --- | --- |
