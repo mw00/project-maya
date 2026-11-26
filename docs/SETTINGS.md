@@ -1778,6 +1778,7 @@ for fallback, and CPU versus GPU floating-point arithmetic can change model outp
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_HELPER_EXL3` | off | `1`: allow uniform EXL3 experts in the helper pool |
+| `MAYA_DS4_SETTLE_IDLE_MS` | off | `<ms>` (the server, with the helper): after that many ms without a request, each layer's hottest expert in the helper's pool (by the expert cache's heat: every decode pick counts, the helper's too) changes places with its coldest VRAM expert, one exchange a layer at a time, the bytes moved between the pool and VRAM (no model file read). A request stops new exchanges at once; those under way finish first (a few ms). The placement the load took from the profile does not follow the work; this does, while idle. Placement only: an expert's sums differ in the last bits by where it runs. The profile, and so the next load's placement, is unchanged. `DS4_CHECK_SWAPS`: the moved bytes compared with the model file |
 | `MAYA_DS4_HELPER_SHARED` | off | `1`: let the helper also host DSpark blocks; currently requires EXL3, `--tp 2`, loaded DSpark blocks and zero target layers on that GPU |
 
 With shared mode, select the helper in `--gpus`, place DSpark there with `MAYA_DS4_DRAFT_GPU`, and use
