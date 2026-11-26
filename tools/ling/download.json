@@ -1,8 +1,8 @@
 {
- "_": "Ling-3.2-air (inclusionAI/Ling-3.2-air, bailingmoe3) on maya-ling. Official quant names, sizes, and hashes will be added here by maintainers when published; pass --model-dir <folder with local .gguf> today.",
+ "_": "Ling-3.2-air (inclusionAI/Ling-3.2-air, bailingmoe3) on maya-ling. \"quants\": Project Maya's quants of it (GGUF), named as every Maya quant (tools/maya_quants.py): one repo for the model. This table is the one switch: a size is offered by the setup and the Models page once \"revision\" names the repo's commit and the size has \"files\" with their sizes and sha256 (until then: --model ling-3.2-air-maya-s --model-dir <folder with the file>, checked against the size and sha256 here). A size with empty \"files\" is not offered and cannot be set up by its name: to switch one on, fill its \"files\" and \"about\" and move \"revision\" to the commit that has them. A file's name carries its quant type (IQ2_XXS, IQ2_S, IQ3_S): Hugging Face reads a repo's sizes from the names. Any other GGUF of the model: --model ling-3.2-air --model-dir <folder with the .gguf>.",
  "name": "Ling-3.2-air",
- "repo": "",
- "revision": "",
+ "repo": "peasantsmith/Ling-3.2-air-Maya-GGUF",
+ "revision": "1ffb809239878aeca133b79f1a0a174be5027f0b",
  "license": "MIT",
  "default_kv": "f16",
  "sampling": {
@@ -14,7 +14,32 @@
  "vision": {
   "_": "Ling-3.2-air vision projector (mmproj-BF16, built with tools/ling/convert_mmproj.py; 0 permanent VRAM, lent from the expert pool tail while encoding).",
   "files": {},
-  "legacy_names": ["Ling-3.2-air-mmproj-BF16.gguf", "mmproj-BF16.gguf", "mmproj-Ling-3.2-air-BF16.gguf"]
+  "legacy_names": [
+   "Ling-3.2-air-mmproj-BF16.gguf",
+   "mmproj-BF16.gguf",
+   "mmproj-Ling-3.2-air-BF16.gguf"
+  ]
  },
- "quants": {}
+ "quants": {
+  "Ling-3.2-air-Maya-S": {
+   "about": "IQ2_XXS",
+   "files": {
+    "Ling-3.2-air-Maya-S-IQ2_XXS.gguf": [
+     36912008640,
+     "9fed99fc3beff053b96f8ef1cc40bb1b1cf926e201a121803d38f7927f60dd74"
+    ]
+   }
+  },
+  "Ling-3.2-air-Maya-M": {
+   "_": "IQ2_S: not made yet",
+   "about": "",
+   "files": {}
+  },
+  "Ling-3.2-air-Maya-L": {
+   "_": "IQ3_S: not made yet",
+   "about": "",
+   "files": {}
+  }
+ },
+ "folder": ""
 }

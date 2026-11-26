@@ -24,7 +24,7 @@ MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minima
          "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini", "ling": "Ling-3.2-air"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
          "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
-         "ik2": "Inkling 2 Mini"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "ik2": "Inkling 2 Mini", "ling": "Ling-3.2-air"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -60,7 +60,10 @@ MODEL_DEFAULTS = {
     # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
     # (QUANT_SAMPLING / QUANT_THINK_BUDGET are keyed by this key, not by the family both share)
     "glm53": ({"temperature": 1.0, "top_p": 0.95}, "max"),
-    # Ling-3.2-air (maya-ling): generation_config.json - temperature 1.0, top_p 0.95, top_k 20; thinking on by default
+    # Ling-3.2-air (maya-ling): inclusionAI/Ling-3.2-air's generation_config.json - do_sample, temperature 1.0,
+    # top_p 0.95, top_k 20 (no min-p, no penalties); its chat template has one switch, enable_thinking, on unless a
+    # request turns it off ("detailed thinking on" / "off" in the system turn) - "high" by name, the page offers
+    # Off and High (serve/frontend.py thinking_levels)
     "ling": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "high"),
 }
 GLM53 = "glm53"
@@ -216,6 +219,11 @@ QUANTS = (
     ("hy4", "maya-s", "Maya-S", "hy4-flash-maya-s"),
     ("hy4", "maya-m", "Maya-M", "hy4-flash-maya-m"),
     ("hy4", "maya-l", "Maya-L", "hy4-flash-maya-l"),
+    # Ling-3.2-air (maya-ling): a size is offered once tools/ling/download.json lists its files (tools/ling_fit.py's
+    # listed / published) - until then its row is here and nowhere on screen
+    ("ling", "maya-s", "Maya-S", "ling-3.2-air-maya-s"),
+    ("ling", "maya-m", "Maya-M", "ling-3.2-air-maya-m"),
+    ("ling", "maya-l", "Maya-L", "ling-3.2-air-maya-l"),
 )
 # the other files the setup offers, as shown after the model's name (a GLM download not listed: its own name); also
 # the ones an install can still have though the list no longer offers them (DeepSeek's UD-Q4_K_XL: maya.DS4_BY_HAND)
@@ -284,8 +292,8 @@ def config_stem(family: str, key: str | None) -> str | None:
         return "maya-hy4-flash"
     if family == "ik2":                                # (Inkling-2-Mini: its one file set)
         return "maya-inkling-2-mini"
-    if family == "ling":
-        return "maya-ling-3.2-air"
+    if family == "ling":                               # (a Maya size: its own config; any other GGUF of the model: one)
+        return f"maya-{setup_id(family, key)}" if setup_id(family, key) else "maya-ling-3.2-air"
     return f"maya-{setup_id(family, key)}" if family in ("minimax", "hy4") and setup_id(family, key) else None
 
 
@@ -362,6 +370,8 @@ def config_key(cfg: dict) -> str | None:
         return str(inst.get("hy4_quant") or "q4_k_m").lower()
     if fam == "ik2":
         return str(inst.get("ik2_quant") or IK2_QUANT).lower()
+    if fam == "ling":                                  # (a Maya size's key, "maya-s"; a GGUF of the user's own: none)
+        return str(inst["ling_quant"]).lower() if inst.get("ling_quant") else None
     return inst.get("quant")
 
 

@@ -895,6 +895,12 @@ LING = "Ling-3.2-air"
 LING_MODEL_NAME = "ling-3.2-air"
 LING_DIR = "maya-ling"
 LING_PROFILE = ROOT / "data" / "expert-profile-ling32.bin"
+LING_SHOWN = Q.SHOWN["ling"]
+LING_TEMPLATE = ROOT / "tools" / "ling" / "chat_template.jinja"
+LING_TOKENIZER_TOOLS = ("tools/strata_tokenizer.py", "tools/ling/chat_template.jinja")
+LING_MANIFEST = ROOT / "tools" / "ling" / "download.json"
+LING_QUANTS = {k: Q.full_name("ling", k) for f, k, _, _ in Q.QUANTS if f == "ling"}   # "maya-s": "Ling-3.2-air-Maya-S" ...
+LING_LOCAL = LINGF.DEFAULT_QUANT                   # a GGUF of the user's own (--model-dir): no table entry
 FAMILIES =("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
@@ -2180,8 +2186,13 @@ def choose_family(a, prev: dict) -> str:
                       "and newer, Linux." if q4 else "")))
     else:
         keys = tuple(k for k in keys if k != "hy4")
+    # Ling-3.2-air: its row once a size's files can be downloaded (ling_published), or where it was set up before
+    if default == "ling" or any(map(ling_published, LING_QUANTS)):
+        rows.append((LING_SHOWN, None, ling_about()))
+        keys += ("ling",)
     # Inkling-2-Mini, after it (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 12 GB
     rows.append((f"{IK2_SHOWN}", None, ik2_about()))
+    keys = tuple(k for k in keys if k != "ik2") + ("ik2",)   # (its row is the last)
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
     if pick in ("glm", "glm53"):
@@ -12015,6 +12026,108 @@ def set_up_ik2(a, prev: dict) -> Path | None:
 
 
 
+# ------------------------------------------------------------------------------------------------ Ling-3.2-air
+def ling_table(key: str | None) -> str | None:
+    """A Maya size's name in tools/ling/download.json ("maya-s" -> "Ling-3.2-air-Maya-S"); None for any other files."""
+    return LING_QUANTS.get(str(key or "").lower())
+
+
+def ling_listed(key: str | None) -> bool:
+    """Whether the table lists a size's files (their sizes and sha256): it can be set up from a folder that has them."""
+    return bool(ling_table(key)) and bool(LINGF.quant_files(ling_table(key)))
+
+
+def ling_published(key: str | None) -> bool:
+    """Whether the setup downloads a size: its files are listed and the table names the repo's commit that has them."""
+    return bool(ling_table(key)) and LINGF.published(ling_table(key))
+
+
+def named_quants() -> list:
+    """Maya's quants by their setup ids, as --model's help and its error list them: Ling-3.2-air's only once their
+    files are listed (the sizes not made yet are in the table, not on screen)."""
+    return [i for f, k, _, i in Q.QUANTS if f != "ling" or ling_listed(k)]
+
+
+def ling_entry(key: str) -> dict:
+    """A Maya size of Ling-3.2-air as offer_download's form (tools/ling/download.json: its files pinned by the repo's
+    commit, their sizes and sha256)."""
+    man, name = read_json(LING_MANIFEST), ling_table(key)
+    files = LINGF.quant_files(name, man)
+    if not name or not files:
+        fail(f"{LING_MANIFEST} lists no files for {Q.shown('ling', key)}",
+             "that size is not made yet - set up one that is, or a GGUF of your own with --model ling-3.2-air "
+             "--model-dir <folder>")
+    return {"about": f"{Q.shown('ling', key)}: inclusionAI's Ling-3.2-air in Project Maya's GGUF quant "
+                     f"({(man['quants'][name].get('about') or 'GGUF')}); {man.get('license', 'MIT')}",
+            "format": "ling-gguf", "repo": man.get("repo", ""), "revision": man.get("revision", ""),
+            "folder": man.get("folder", ""),
+            "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+            "gguf": next(iter(files)), "download_gb": sum(v[0] for v in files.values()) / 1e9,
+            "memory_gb": LINGF.quant_spec(name)["memory_gb"]}
+
+
+def ling_about() -> str:
+    """The setup's model row for Ling-3.2-air: what runs today, the sizes that can be downloaded."""
+    sizes = [f"{LING_QUANTS[k]} ({ling_entry(k)['download_gb']:.0f} GB)" for k in LING_QUANTS if ling_published(k)]
+    return ("inclusionAI's Ling-3.2-air (512 experts a layer, 8 a token) on its own engine"
+            + (", in Maya's own GGUF quants: " + ", ".join(sizes) if sizes else "") +
+            "; NVIDIA from V100 / RTX 20 on with 8 GB or more, Linux only; one GPU or several (the layers split across "
+            "them), the experts that do not fit in VRAM computed from RAM, the rest read from the SSD; tool calls, "
+            "thinking on or off, up to a 256K context, MTP drafting where the file has the model's draft block "
+            "(measured once on this PC), pictures where its vision file is beside the model; one answer at a time.")
+
+
+def ling_choose_quant(a, pc: dict, prev: dict) -> str | None:
+    """The size to set up, by its key ("maya-s"), or None for a GGUF of the user's own (--model-dir without a size
+    named, or the config before's): --model's, else the one set up before, else - nothing named - the largest
+    downloadable size that fits this PC's VRAM and RAM without reading experts from the SSD (fit_recommendation)."""
+    key = getattr(a, "ling_quant", None)
+    inst = prev.get("installer") or {}
+    if not key and not getattr(a, "model_dir", None) and config_family(prev) == "ling":
+        key = inst.get("ling_quant")
+        if not key and inst.get("model_dir"):          # (a GGUF of the user's own, set up before: the same again)
+            return None
+    if key:
+        return str(key).lower()
+    if getattr(a, "model_dir", None):
+        return None
+    offered = {k: ling_entry(k)["memory_gb"] for k in LING_QUANTS if ling_published(k)}
+    if not offered:
+        fail("no size of Ling-3.2-air can be downloaded by the setup yet",
+             f"with a GGUF of it in a folder: {ME} --setup --model ling-3.2-air --model-dir <folder>")
+    return fit_recommendation(offered, pc.get("gpus") or [], mem_gb()[0])
+
+
+def ling_model_step(a, d: Path, key: str | None) -> Path | None:
+    """Step 5, the model's GGUF in d.  A Maya size: downloaded when it is not there (once the table names the repo's
+    commit; before that only a copy already in the folder), then checked against its published sha256.  A GGUF of the
+    user's own (key None): the one in the folder, as it is.  None when a download was declined."""
+    step(5, f"the model ({Q.shown('ling', key)})")
+    if key is None:
+        gguf, _ = ling_find_gguf_and_mmproj(d)
+        if gguf is None:
+            fail(f"no Ling-3.2-air .gguf found in {d}", "pass --model-dir <the folder with the model's .gguf>")
+    else:
+        m = ling_entry(key)
+        files = [d / n for n in m["files"]]
+        missing = [f for f in files if file_incomplete(m, f)]
+        if missing and not ling_published(key):
+            fail(f"{Q.shown('ling', key)}: {missing[0].name} is not in {d}, and the setup cannot download it yet",
+                 f"with the file in a folder: {ME} --setup --model {Q.setup_id('ling', key)} --model-dir <folder>")
+        if missing and not offer_download(a, Q.shown("ling", key, m["download_gb"]), d, files, m):
+            return None
+        for f in files:                                # (a file that was already there: checked once, then remembered)
+            if not sha256_checked(f, m["sha256"][f.name]):
+                fail(f"{f.name}: the sha256 does not match the published one - still being downloaded, or damaged",
+                     f"let the download finish, or delete the file and run {ME} --setup --download-model")
+        gguf = files[0]
+    ok(f"{Q.shown('ling', key)}: {gguf.name}, {gguf.stat().st_size / 1e9:.1f} GB in {gguf.parent}")
+    if rotational(gguf.parent):
+        warn(f"{gguf.parent} is on a spinning hard disk: the experts that do not fit in memory are read from it at "
+             "every token - an NVMe SSD is far faster (--models-dir)")
+    return gguf
+
+
 def ling_avx2_available() -> bool:
     """Check whether the host CPU supports AVX2 (required for maya-ling CPU expert lane)."""
     if WIN:
@@ -12043,88 +12156,108 @@ def ling_find_gguf_and_mmproj(folder: Path) -> tuple[Path | None, Path | None]:
 
 
 def ling_tokenizer_step(a, d: Path, gguf: Path) -> Path:
-    """Ensure tokenizer folder exists beside the model with Ling's verbatim chat_template.jinja."""
+    """The tokenizer from the GGUF with inclusionAI's own chat template (tools/ling/chat_template.jinja: the official
+    file's text under a licence line) in <model folder>/maya-ling/tokenizer, round-trip checked
+    (tools/strata_tokenizer.py --check); built again when its tools or the GGUF changed.  A chat_template.jinja the
+    user put beside the model wins (the model's own folder first, as for every model)."""
     step(6, "the tokenizer and the chat template")
-    out = d / LING_DIR / "tokenizer"
+    out = d / LING_DIR
+    own = d / "chat_template.jinja"
+    template = own if own.is_file() else LING_TEMPLATE
+    tools = S.source_hash(LING_TOKENIZER_TOOLS)
+    rec = read_json(out / PACK_SOURCES)
+    vocab = out / "tokenizer" / "vocab.json"
+    sig = {"name": gguf.name, "size": gguf.stat().st_size}
+    import hashlib
+    tpl = hashlib.sha256(template.read_bytes()).hexdigest()
+    same = rec.get("tools") == tools and rec.get("gguf") == sig and rec.get("template") == tpl
+    if not getattr(a, "repack", False) and same and vocab.exists() and (out / "tokenizer" / "chat_template.jinja").exists():
+        ok(f"tokenizer already exported: {vocab.parent}")
+        return out / "tokenizer"
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the tokenizer is written next to the GGUF file", "pass --model-dir with a writable folder")
+    r = run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(out),
+             "--chat-template", str(template), "--check"], check=False)
+    if r.returncode != 0 or not vocab.exists():
+        fail(f"the tokenizer could not be exported from {gguf.name}", "the reason is in the messages above")
     out.mkdir(parents=True, exist_ok=True)
-    # Copy tokenizer.json if present alongside the GGUF or extract from GGUF via strata_tokenizer.py
-    src_tok = next((p for p in (gguf.parent / "tokenizer.json", d / "tokenizer.json") if p.is_file()), None)
-    if src_tok is not None and not (out / "tokenizer.json").exists():
-        shutil.copy2(src_tok, out / "tokenizer.json")
-    elif not (out / "tokenizer.json").exists() and not (out / "vocab.json").exists():
-        # Try tools/strata_tokenizer.py extraction from GGUF
-        st_py = ROOT / "tools" / "strata_tokenizer.py"
-        if st_py.exists():
-            run([sys.executable, str(st_py), "--gguf", str(gguf), "--out", str(d / LING_DIR)], check=False)
-    tpl_src = ROOT / "tools" / "ling" / "chat_template.jinja"
-    if tpl_src.exists():
-        shutil.copy2(tpl_src, out / "chat_template.jinja")
-    ok(f"tokenizer & verbatim chat template: {out}")
-    return out
+    (out / PACK_SOURCES).write_text(json.dumps({"tools": tools, "gguf": sig, "template": tpl, "files": [sig]},
+                                               indent=1), encoding="utf-8")
+    ok(f"tokenizer: {vocab.parent} (" + ("the chat template beside the model" if template == own else
+                                         "inclusionAI's chat template") + ")")
+    return out / "tokenizer"
+
+
+# (the engine flags a user sets by hand in the config: a setup again keeps them - each takes one value)
+LING_KEPT_FLAGS = ("--cpu-threads", "--reserve-gb", "--ram-cap-gib", "--prefill-chunk", "--prefill-block",
+                   "--expert-vram-gib", "--pin-ram-gib", "--offload", "--mix-k-gpu", "--lookup", "--lookahead",
+                   "--restore-dir", "--restore-dir-max-mb")
+
+
+def ling_drafting(a, prev_args: list) -> str:
+    """The engine's --drafting from the setup's: off by hand; mtp by hand (on, not measured); else auto - measured
+    once on this PC at the engine's first start and kept in its calibration file (another model's dfly2 / measure,
+    --yes: the same as auto).  Nothing given: what the config before says."""
+    how = getattr(a, "drafting", None)
+    if how is None and "--drafting" in prev_args[:-1]:
+        how = prev_args[prev_args.index("--drafting") + 1]
+    how = str(how or "auto").lower()
+    return "off" if how in ("off", "none", "0") else "mtp" if how in ("mtp", "on", "1") else "auto"
+
+
+def ling_gguf_gib(gguf: Path) -> float:
+    """The model's size on the disk, GiB: the file, or every shard of its set (<name>-0000N-of-0000M.gguf)."""
+    m = SHARD_RE.search(gguf.name)
+    files = [gguf] if not m else sorted(gguf.parent.glob(gguf.name[:m.start()] + "-*-of-" + m.group(2) + ".gguf"))
+    return sum(f.stat().st_size for f in files if f.is_file()) / LINGF.GIB
 
 
 def write_config_ling(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, kv: str, drafting: str,
-                      models_root: Path, d: Path, mmproj: Path | None, quant_name: str, prev: dict) -> Path:
-    """Write maya-ling-3.2-air.json preserving prior user settings, backing up `.bak-*` and reporting changes."""
-    step(8, "the config")
-    cfg_path = ROOT / "maya-ling-3.2-air.json"
+                      models_root: Path, d: Path, mmproj: Path | None, quant_name: str, prev: dict,
+                      key: str | None = None) -> Path:
+    """A Ling-3.2-air config and its start script: maya-ling-3.2-air-maya-s.json for a Maya size (key), one config a
+    size, maya-ling-3.2-air.json for a GGUF of the user's own.  A setup again keeps what the config before says that
+    this one does not ask (the engine flags set by hand: LING_KEPT_FLAGS, where the server listens, its key, its
+    variables) with a .bak beside it; the model's own sampling and thinking level every setup (its
+    generation_config.json: tools/maya_quants.py).  Disk restore points stay off unless the config before named a
+    --restore-dir."""
+    step(8, "the configuration and the start script")
+    cfg_path = ROOT / f"{Q.config_stem('ling', key)}.json"
     before = {str(cfg_path): cfg_path.read_text(encoding="utf-8-sig")} if cfg_path.exists() else {}
-    inst = dict(prev.get("installer") or {})
+    old = read_json(cfg_path) if cfg_path.exists() else {}
     gpus = [int(g["index"]) for g in pc["gpus"]]
-    args = [
-        "--serve",
-        "--gguf", str(gguf),
-        "--max-context", str(ctx),
-        "--kv", "fp16" if LINGF.normalize_kv(kv) == "f16" else "q8",
-    ]
-    if len(gpus) > 1:
+    args = ["--serve", "--gguf", str(gguf), "--max-context", str(ctx),
+            "--kv", "fp16" if LINGF.normalize_kv(kv) == "f16" else "q8"]
+    if len(gpus) > 1:                                  # (the config's GPUs as the engine counts them: 0..N-1)
         args += ["--gpus", ",".join(str(i) for i in range(len(gpus)))]
-    if drafting == "auto":
-        args += ["--drafting", "auto"]
-    elif drafting == "mtp":
-        args += ["--drafting", "mtp"]
-    else:
-        args += ["--drafting", "off"]
+    args += ["--drafting", drafting if drafting in ("auto", "mtp") else "off"]
     if mmproj is not None and not getattr(a, "no_vision", False):
         args += ["--mmproj", str(mmproj)]
     cal_file = d / LING_DIR / "ling-calibration.txt"
     args += ["--cal-file", str(cal_file)]
-    # Disk restore points stay OFF by default (opt-in via --restore-dir).
     if LING_PROFILE.is_file():
         args += ["--profile", str(LING_PROFILE)]
-
-    sampling, effort = Q.MODEL_DEFAULTS["ling"]
-    cfg = {
-        "exe": str(LING_EXE),
-        "backend": pc.get("backend", "cuda"),
-        "gpu": gpus,
-        "args": args,
-        "tokenizer": str(tok),
-        "chat_template": str(tok / "chat_template.jinja"),
-        "model_name": prev.get("model_name") or LING_MODEL_NAME,
-        "port": int(getattr(a, "port", None) or prev.get("port") or 8080),
-        "sampling": dict(prev.get("sampling") or sampling),
-        "reasoning_effort": prev.get("reasoning_effort") or effort,
-        "log": str(cfg_path.with_suffix(".log")),
-    }
-    env = dict(prev.get("env") or {})
-    if getattr(a, "env", None):
-        env.update(parse_env(a.env))
+    kept = keep_args([str(x) for x in old.get("args") or []], args, LING_KEPT_FLAGS)
+    inst = {"family": "ling", "quant": quant_name, **({"ling_quant": key} if key else {}), "drafting": drafting}
+    sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
+    cfg = {"exe": str(LING_EXE), "backend": pc.get("backend", "cuda"), "gpu": gpus, "args": args, "cwd": str(ROOT),
+           "tokenizer": str(tok), "chat_template": str(tok / "chat_template.jinja"),
+           "model_name": old.get("model_name") or LING_MODEL_NAME, "port": getattr(a, "port", None) or 8080,
+           "sampling": sampling, "reasoning_effort": effort,
+           "lib_dirs": (meta or {}).get("lib_dirs") or old.get("lib_dirs") or [],
+           "log": str(cfg_path.with_suffix(".log"))}
+    kept += keep_server_settings(cfg, old, a)
+    env = dict(old.get("env") or {})
+    env.update(parse_env(getattr(a, "env", None) or []))
     if env:
         cfg["env"] = env
     for k in ("host", "api_key"):
-        v = getattr(a, k, None) or prev.get(k)
-        if v:
-            cfg[k] = v
-    cfg["installer"] = {
-        **inst,
-        "family": "ling",
-        "quant": quant_name,
-        "models_dir": str(models_root),
-        "model_dir": str(d),
-        "cal_file": str(cal_file),
-        "written": time.strftime("%Y-%m-%d %H:%M"),
-    }
+        if getattr(a, k, None):
+            cfg[k] = getattr(a, k)
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+    cfg["installer"] = {**inst, "models_dir": str(models_root), "model_dir": str(d), "cal_file": str(cal_file),
+                        "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     if before:
         keep_config_backups(before)
@@ -12149,13 +12282,19 @@ def reset_ling_calibration(cfg: dict) -> bool:
 
 
 def set_up_ling(a, prev: dict) -> Path | None:
-    """Ling-3.2-air setup (steps 1-8): PC check, quant/fit/context/KV/drafting choices, tools,
-    build maya-ling (CUDA archs from chosen cards, never native), model & vision files, tokenizer, config."""
+    """Ling-3.2-air's steps 1-8: the PC (refused in one line where maya-ling does not run: Windows, a Mac, AMD, a card
+    older than V100 / RTX 20 or under 8 GB, no AVX2), the size (--model's, the one before, else the largest that fits
+    this PC), the context and the fit (tools/ling_fit.py, the planner the Models page reads too), the engine
+    (build/maya-ling), the file (pinned and sha256-checked for a Maya size), the tokenizer with the model's own chat
+    template, the pictures (its vision file where it is beside the model), the config.  What is faster on a PC is the
+    engine's own to measure at its first start and keep in its calibration file (--cal-file): the expert split over
+    VRAM, CPU and SSD, and whether drafting pays (--drafting auto)."""
+    if config_family(prev) != "ling":                  # (another model's config: nothing of it is Ling's)
+        prev = {}
     inst = prev.get("installer") or {}
     prev_args = [str(x) for x in (prev.get("args") or [])]
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     prev_kv = prev_args[prev_args.index("--kv") + 1] if "--kv" in prev_args[:-1] else LINGF.DEFAULT_KV
-    prev_draft = prev_args[prev_args.index("--drafting") + 1] if "--drafting" in prev_args[:-1] else "auto"
     a.gpus_before = prev.get("gpu")
 
     pc = check_pc(a)                                   # 1
@@ -12165,71 +12304,77 @@ def set_up_ling(a, prev: dict) -> Path | None:
         fail(why)
 
     step(2, "your choices")                            # 2
-    manifest = LINGF.download_manifest()
-    quants = manifest.get("quants") or {}
-    quant_name = getattr(a, "ling_quant", None) or inst.get("quant") or (next(iter(quants)) if quants else LINGF.DEFAULT_QUANT)
+    key = ling_choose_quant(a, pc, prev)
+    quant_name = ling_table(key) or LING_LOCAL
+    models_root = (Path(a.models_dir).expanduser().resolve() if getattr(a, "models_dir", None) else
+                   Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    same = (inst.get("ling_quant") or None) == key
+    if getattr(a, "model_dir", None):
+        d = Path(a.model_dir).expanduser().resolve()
+    elif inst.get("model_dir") and same:
+        d = Path(inst["model_dir"])
+    else:
+        d = models_root / LING
+    gguf_gib = None
+    if key is None:                                    # (a GGUF of the user's own: its size is the file's)
+        own, _ = ling_find_gguf_and_mmproj(d)
+        if own is None:
+            fail(f"no Ling-3.2-air .gguf found in {d}", "pass --model-dir <the folder with the model's .gguf>")
+        gguf_gib = ling_gguf_gib(own)
+        ok(f"model: {LING_SHOWN} - {own.name} ({gguf_gib * LINGF.GIB / 1e9:.1f} GB), your own file")
+    else:
+        m = ling_entry(key)
+        ok(f"model: {Q.shown('ling', key, m['download_gb'])} - inclusionAI's Ling-3.2-air in Project Maya's GGUF "
+           "quant (MIT)")
     vrams = [float(g.get("vram_gb") or 0) for g in pc["gpus"]]
     kv = LINGF.normalize_kv(getattr(a, "kv", None) or prev_kv)
     rec_ctx = LINGF.recommended_context(vrams, kv, quant_name)
     ctx = choose_context(a, prev_ctx, LINGF.CONTEXTS, rec_ctx)
-
-    # Unified planner fit verdict & hints
-    word, line = LINGF.verdict(vrams, ram_gb, ctx, kv, quant_name)
+    label = Q.shown("ling", key)
+    word, line = LINGF.verdict(vrams, ram_gb, ctx, kv, quant_name, gguf_gib=gguf_gib)
     if word == "does not fit":
         if getattr(a, "force_fit", False):
-            warn(f"{quant_name} at {ctx}: {line} - continuing (--force-fit)")
+            warn(f"{label} at {context_label(ctx)}: {line} - continuing (--force-fit)")
         else:
-            fail(f"{quant_name} does not fit at {ctx}: {line}", "pass --force-fit to try anyway, or pick a shorter --context / --kv q8")
+            fail(f"{label} does not fit at {context_label(ctx)}: {line}",
+                 "pass --force-fit to try anyway, or pick a shorter --context")
     elif word == "runs slowly":
-        warn(f"{quant_name} at {ctx} will run slowly: {line}")
+        warn(f"{label} at {context_label(ctx)} will run slowly: {line}")
     else:
-        ok(f"fit plan ({quant_name}, {ctx} ctx, {kv.upper()} KV): {line}")
-
-    drafting = getattr(a, "drafting", None) or prev_draft or "auto"
-    if drafting in ("off", "none", "0"):
-        drafting = "none"
-    elif drafting in ("mtp", "on", "1"):
-        drafting = "mtp"
-    else:
-        drafting = "auto"
-
-    models_root = (Path(a.models_dir).expanduser().resolve() if getattr(a, "models_dir", None) else
-                   Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    if getattr(a, "model_dir", None):
-        d = Path(a.model_dir).expanduser().resolve()
-    elif inst.get("model_dir"):
-        d = Path(inst["model_dir"])
-    else:
-        d = models_root / quant_name
+        ok(f"fit ({label}, {context_label(ctx)}, {kv.upper()} cache): {line}")
+    drafting = ling_drafting(a, prev_args)
+    ok("drafting: " + {"off": "off - every token from a full model step",
+                       "mtp": "on (the model's draft block), not measured",
+                       "auto": "auto - where the file has the model's draft block, the engine measures once at its "
+                               "first start on this PC whether drafting makes answers faster, and keeps the result"
+                       }[drafting])
     ok(f"model folder: {d}")
 
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama, "maya-ling")       # 4
     if not LING_EXE.exists():
-        fail(f"maya-ling was not built ({LING_EXE})", "check the build log above (maya-ling requires CUDA sm_70+ on Linux)")
+        fail(f"the engine was not built ({LING_EXE})",
+             "the reason is in the build's messages above (maya-ling needs a V100 / RTX 20 or newer card, on Linux)")
 
-    step(5, "the model files")                         # 5
-    gguf, mmproj = ling_find_gguf_and_mmproj(d)
+    gguf = ling_model_step(a, d, key)                  # 5
     if gguf is None:
-        fail(f"no Ling-3.2-air .gguf found in {d}",
-             f"pass --model-dir <folder with Ling-3.2-air .gguf> (direct downloads turn on once tools/ling/download.json names a published revision)")
-    ok(f"model GGUF: {gguf} ({gguf.stat().st_size / 1e9:.2f} GB)")
-    if rotational(gguf.parent):
-        warn(f"{gguf.parent} is on a spinning hard disk (HDD): expert reads will be slow; prefer an NVMe SSD")
+        return None
+    home = gguf.parent if gguf.parent.is_dir() else d
+    tok = ling_tokenizer_step(a, home, gguf)           # 6
 
-    tok = ling_tokenizer_step(a, gguf.parent if gguf.parent.is_dir() else d, gguf)  # 6
-
-    step(7, "vision projector")                        # 7
-    if mmproj is not None and not getattr(a, "no_vision", False):
-        ok(f"vision mmproj: {mmproj} ({mmproj.stat().st_size / 1e6:.1f} MB; 0 permanent VRAM, lent while encoding)")
-    elif getattr(a, "no_vision", False):
-        ok("vision disabled (--no-vision)")
+    step(7, "images (the vision file)")                # 7
+    _, mmproj = ling_find_gguf_and_mmproj(home)
+    if getattr(a, "no_vision", False):
+        ok("skipped (--no-vision): the model reads text only")
         mmproj = None
+    elif mmproj is not None:
+        ok(f"pictures: ON - {mmproj.name} ({mmproj.stat().st_size / 1e9:.1f} GB on the SSD); no VRAM kept for it, "
+           "the engine borrows room only while a picture is read")
     else:
-        ok("no mmproj GGUF found beside model (text-only start; place Ling-3.2-air-mmproj-BF16.gguf beside model to enable pictures)")
-
-    return write_config_ling(a, pc, meta, gguf, tok, ctx, kv, drafting, models_root,
-                             gguf.parent if gguf.parent.is_dir() else d, mmproj, quant_name, prev)
+        ok("pictures: off - no vision file (an mmproj .gguf of Ling-3.2-air) beside the model; the setup does not "
+           "download one yet. The model reads text only")
+    return write_config_ling(a, pc, meta, gguf, tok, ctx, kv, drafting, models_root, home, mmproj, quant_name, prev,
+                             key)
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:
@@ -12259,7 +12404,7 @@ def model_option(a) -> str | None:
         return None
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
-        return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
+        return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(named_quants()) +
                 f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
@@ -12277,6 +12422,10 @@ def model_option(a) -> str | None:
         a.model = IK2
         return None
     if family == "ling":
+        if key is not None and not ling_listed(key):   # (a size in the table without files: not made yet)
+            return (f"--model {a.model}: {Q.shown(family, key)} is not available yet - one of "
+                    + ", ".join(i for i in named_quants() if i.startswith("ling-")) +
+                    ", or a GGUF of your own with --model ling-3.2-air --model-dir <folder>")
         a.model = LING
         if key is not None:
             a.ling_quant = key
@@ -12320,7 +12469,7 @@ def main() -> int:
                     help="download the model without asking (the commands and the size are still printed)")
     ap.add_argument("--model", metavar="MODEL",
                     help="which model and files (default: asked): a Maya quant - "
-                         + ", ".join(i for _, _, _, i in Q.QUANTS) +
+                         + ", ".join(named_quants()) +
                          f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
                          f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN},"
                          " or a GLM-5.3-Flash "

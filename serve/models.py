@@ -169,7 +169,9 @@ def gpus_of(cfg: dict) -> list:
 def pack_of(cfg: dict) -> Path | None:
     args = cfg.get("args") or []
     p = flag(args, "--glm-pack") or flag(args, "--pack")
-    if not p and family(cfg) in ("ik2", "ling") and (flag(args, "--model") or flag(args, "--gguf") or flag(args, "-m")) and cfg.get("tokenizer"):
+    # (Inkling 2 reads --model only, as before; maya-ling also reads its GGUF from --gguf or -m)
+    own_gguf = flag(args, "--model") or (family(cfg) == "ling" and (flag(args, "--gguf") or flag(args, "-m")))
+    if not p and family(cfg) in ("ik2", "ling") and own_gguf and cfg.get("tokenizer"):
         # (maya-ik2 reads its GGUF in place: the setup's folder beside it - the tokenizer and its sources.json - stands
         #  for the pack, in the model's folder)
         return Path(str(cfg["tokenizer"])).parent
@@ -480,7 +482,9 @@ def _choices(cfg: dict) -> dict:
 def settings_of(cfg: dict) -> dict:
     args = cfg.get("args") or []
     env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
-    out = {"context": _int(flag(args, "--max-context") or flag(args, "--ctx"), 32768), "gpus": gpus_of(cfg), "env": env,
+    # (maya-ling's config may name its context --ctx; every other model reads --max-context only, as before)
+    ctx_flag = flag(args, "--max-context") or (flag(args, "--ctx") if family(cfg) == "ling" else None)
+    out = {"context": _int(ctx_flag, 32768), "gpus": gpus_of(cfg), "env": env,
            # (refusal ablation: the default for requests that leave `ablate` out - ablate_default)
            "ablate": ablate_default(cfg)}
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)

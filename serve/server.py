@@ -253,7 +253,7 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 CONTEXT_MIN, CONTEXT_FALLBACK_MAX = models.CONTEXT_MIN, models.CONTEXT_FALLBACK_MAX
 CONTEXT_TESTED, CONTEXT_TESTED_DEFAULT = models.CONTEXT_TESTED, models.CONTEXT_TESTED_DEFAULT
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|maya-ling:|ling (?:prompt|stat|split|vram|cal|numa|profile|env|draft)|ERR|error|"
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|^maya-ling:|^ling (?:prompt|stat|split|vram|cal|numa|profile|env|draft)|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -1245,7 +1245,7 @@ class StrataEngine:
         args = list(args)
         if "--max-context" in args[:-1]:
             args[args.index("--max-context") + 1] = str(int(n))
-        elif "--ctx" in args[:-1]:
+        elif "--ctx" in args[:-1] and Path(str(exe)).name.startswith("maya-ling"):   # (maya-ling's own name for it)
             args[args.index("--ctx") + 1] = str(int(n))
         else:
             args += ["--max-context", str(int(n))]
@@ -3458,7 +3458,7 @@ class Service:
             args = list(cfg.get("args") or [])
             if "--max-context" in args[:-1]:
                 args[args.index("--max-context") + 1] = str(int(n))
-            elif "--ctx" in args[:-1]:
+            elif "--ctx" in args[:-1] and models.family(cfg) == "ling":   # (maya-ling's own name for it)
                 args[args.index("--ctx") + 1] = str(int(n))
             else:
                 args += ["--max-context", str(int(n))]

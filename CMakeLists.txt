@@ -1198,7 +1198,10 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
                                                  src/ds4 src/mm3 src/kernels/cuda third_party/ggml)
     target_link_libraries(maya-ling PRIVATE maya_kernels maya_kernels_cpu ${_maya_gpu_runtime_target}
                                             ${_maya_gpu_blas_target} Threads::Threads)
-    target_compile_definitions(maya-ling PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
+    # MAYA_LING_SWIGLU: the post-SiLU clamp (a negative limit) in the shared kernel sources (ds4_iq.cu, ds4_iq_cpu.cpp,
+    # ds4_lane_parity.cpp, ds4_par_exp.h) - defined for this target ONLY, so every other engine compiles exactly the
+    # sources it had before Ling
+    target_compile_definitions(maya-ling PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS MAYA_LING_SWIGLU)
     if(_ling_filter)
       set_target_properties(maya-ling PROPERTIES CUDA_ARCHITECTURES "${_ling_archs}")
     endif()
@@ -1814,6 +1817,13 @@ if(MAYA_NATIVE_EXPERTS)
       set_tests_properties(ds4_iq1_rows_nopdep PROPERTIES ENVIRONMENT DS4_IQ1_PDEP=0)
       add_test(NAME ds4_iq1_rows_measured COMMAND ds4_iq1_rows_test)
       set_tests_properties(ds4_iq1_rows_measured PROPERTIES ENVIRONMENT DS4_IQ1_PDEP=1)
+      # maya-ling's CPU lane (the post-SiLU clamp: iq_cpu_gate_up / iq_cpu_q4x_gate_up with a negative limit, built with
+      # MAYA_LING_SWIGLU as maya-ling builds that file) against ggml-cpu's dot, bit for bit.  No GPU.
+      add_executable(ling_gu_clamp_test tests/ling_gu_clamp_test.cpp src/ds4/ds4_iq_cpu.cpp)
+      target_include_directories(ling_gu_clamp_test PRIVATE third_party/ggml)
+      target_compile_definitions(ling_gu_clamp_test PRIVATE MAYA_LING_SWIGLU)
+      target_link_libraries(ling_gu_clamp_test PRIVATE maya_kernels_cpu)
+      add_test(NAME ling_gu_clamp_test COMMAND ling_gu_clamp_test)
       # the same rows' time an expert, 1 / 2 / 4 tokens, one thread and a pool (a bench, not a test: it includes the
       # source to reach the row forms)
       add_executable(ds4_iq1_bench tests/ds4_iq1_bench.cpp)

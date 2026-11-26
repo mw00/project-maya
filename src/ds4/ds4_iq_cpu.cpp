@@ -1571,6 +1571,39 @@ void iq_cpu_quant(int act, const float* x, int k, void* dst) {
     kc::native_quant_act(n, x, dst);
 }
 
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only: a negative limit = the post-SiLU clamp; no other engine builds this)
+// native_gu_rows_split has no post-SiLU clamp (and the shared kernel file stays as every other engine has it), so the
+// gate rows and the up rows are taken as plain dot products - native_down_rows_split on a copy of the format whose
+// "down" type, row bytes and length are the gate/up ones: the same exact rows (or ggml-cpu's dot) the split gate/up
+// reads - and the clamped epilogue runs here on the same values.
+static void gu_rows_post_clamp(const kc::NativeFmt& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                        float* const* ff, int r0, int r1, float limit) {
+    if (r1 <= r0) return;
+    kc::NativeFmt d = f;
+    d.d_type = f.gu_type;
+    d.d_row = f.gu_row;
+    d.n_ff = f.n_embd;
+    const int nr = r1 - r0;
+    thread_local std::vector<float> buf;
+    thread_local std::vector<float*> go, uo;
+    buf.resize((size_t) 2 * nt * nr);
+    go.resize((size_t) nt);
+    uo.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        go[(size_t) t] = buf.data() + (size_t) t * nr;
+        uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
+    }
+    kc::native_down_rows_split(d, gate + (size_t) r0 * f.gu_row, act, nt, go.data(), 0, nr);
+    kc::native_down_rows_split(d, up + (size_t) r0 * f.gu_row, act, nt, uo.data(), 0, nr);
+    const float L = -limit;
+    for (int t = 0; t < nt; ++t)
+        for (int r = 0; r < nr; ++r) {
+            const float g = go[(size_t) t][r], u = uo[(size_t) t][r];
+            ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
+        }
+}
+#endif
+
 void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
                     float* const* ff, int r0, int r1, float limit) {
     if (r1 > r0 && own_nt(f.tg, nt)) {   // (native_gu_rows_split's epilogue, on the same values)
@@ -1589,21 +1622,29 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
         for (int t = 0; t < nt; ++t)
             for (int r = 0; r < nr; ++r) {
                 float g = go[(size_t) t][r], u = uo[(size_t) t][r];
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only: the post-SiLU clamp)
+                if (limit < 0.0f) {
+                    const float L = -limit;
+                    ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
+                    continue;
+                }
+#endif
                 if (limit > 0.0f) {
                     g = std::fmin(g, limit);
                     u = std::fmin(std::fmax(u, -limit), limit);
-                    ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
-                } else if (limit < 0.0f) {
-                    const float L = -limit;
-                    ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
-                } else {
-                    ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
                 }
+                ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
             }
         return;
     }
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only)
+    if (limit < 0.0f) {
+        gu_rows_post_clamp(native(f), gate, up, act, nt, ff, r0, r1, limit);
+        return;
+    }
+#endif
     kc::native_gu_rows_split(native(f), gate, up, act, nt, ff, r0, r1,
-                             limit != 0.0f ? limit : std::numeric_limits<float>::infinity());
+                             limit > 0.0f ? limit : std::numeric_limits<float>::infinity());
 }
 
 void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
@@ -1682,16 +1723,18 @@ void iq_cpu_q4x_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, 
     for (int t = 0; t < nt; ++t)   // (iq_cpu_gate_up's epilogue, on the same values)
         for (int r = 0; r < nr; ++r) {
             float g = go[(size_t) t][r], u = uo[(size_t) t][r];
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only: the post-SiLU clamp)
+            if (limit < 0.0f) {
+                const float L = -limit;
+                ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
+                continue;
+            }
+#endif
             if (limit > 0.0f) {
                 g = std::fmin(g, limit);
                 u = std::fmin(std::fmax(u, -limit), limit);
-                ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
-            } else if (limit < 0.0f) {
-                const float L = -limit;
-                ff[t][r0 + r] = std::fmin(g / (1.f + std::exp(-g)), L) * std::fmin(std::fmax(u, -L), L);
-            } else {
-                ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
             }
+            ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
         }
 #else
     (void) f, (void) gate, (void) up, (void) act, (void) nt, (void) ff, (void) r0, (void) r1, (void) limit;

@@ -12,7 +12,8 @@ And checks:
   - INT8 KV (--kv q8) vs FP16 KV (--kv fp16)
   - speculative drafting spec=1 (3 runs) == spec=0 (3 runs)
   - repeatable mode (--repeatable): 2 cold starts + 2 warm requests give identical hash
-  - lane-parity (--lane-parity): identical greedy hash across any VRAM vs CPU expert split
+  - lane-parity (--lane-parity): identical greedy hash across any VRAM vs CPU expert split on the same GPU set
+    (same answers for 1 vs N GPUs hold with --repeatable only: a normal run can differ in the last digit)
   - --sampled-check: Pearson chi-square test of sampled spec=0 vs spec=1 draws
   - --no-promo-check: verifies --no-promo disables promotions (promo=0.00) and isolates cold profile hit lift
 

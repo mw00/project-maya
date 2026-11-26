@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +52,11 @@ class TestLingFit(unittest.TestCase):
         word_ssd, line_ssd = LINGF.verdict(24.0, 32.0, 32768, "f16", gguf_gib=55.6)
         self.assertEqual(word_ssd, "runs slowly")
         self.assertIn("NVMe SSD", line_ssd)
-        self.assertIn("smaller quant", line_ssd)
+        # (the hint names the smaller size that exists - the table's - with what it changes)
+        self.assertIn("try Ling-3.2-air-Maya-S", line_ssd)
+        self.assertIn("SSD", line_ssd.split("try ", 1)[1])
+        with mock.patch.object(LINGF, "download_manifest", lambda: {"quants": {}}):   # (no size listed: the plain hint)
+            self.assertIn("smaller quant", LINGF.verdict(24.0, 32.0, 32768, "f16", gguf_gib=55.6)[1])
 
         # Card too small -> "does not fit"
         word_no, _ = LINGF.verdict(4.0, 64.0, 32768, "f16", gguf_gib=55.6)

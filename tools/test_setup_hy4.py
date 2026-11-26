@@ -389,13 +389,13 @@ class Picker(unittest.TestCase):
     def test_not_listed_until_published(self):
         got = self.rows()
         self.assertNotIn("Hy4-Flash", got["rows"])
-        self.assertEqual(got["rows"][-2:], ["Qwen-3.8-Flash-Next", "Inkling 2 Mini"])   # (as before;
+        self.assertEqual(got["rows"][-3:], ["Qwen-3.8-Flash-Next", "Ling-3.2-air", "Inkling 2 Mini"])   # (as before;
         #  Inkling-2-Mini's preview the last row)
         self.assertEqual(got["family"], "glm")
 
     def test_listed_once_published(self):
         got = self.rows(man=manifest())
-        self.assertEqual(got["rows"][-2:], ["Hy4-Flash", "Inkling 2 Mini"])
+        self.assertEqual(got["rows"][-3:], ["Hy4-Flash", "Ling-3.2-air", "Inkling 2 Mini"])
         about = got["about"]["Hy4-Flash"]
         for part in ("Tencent's Hy4-flash", "Hy4-Flash-Maya-XS (108 GB)", "NVIDIA from V100 on", "Linux or Windows",
                      "pictures (its vision tower", "thinking High or Off", "tool calls", "Tencent's own Q4_K_M (AngelSlim",
@@ -413,7 +413,7 @@ class Picker(unittest.TestCase):
     def test_the_setup_before(self):
         prev = {"exe": "/b/maya-hy4", "args": ["--pack", "/p"], "installer": {"family": "hy4"}}
         got = self.rows(prev=prev)                                    # (set up from a folder before the upload)
-        self.assertEqual((got["rows"][-2], got["family"]), ("Hy4-Flash", "hy4"))
+        self.assertEqual((got["rows"][-3], got["family"]), ("Hy4-Flash", "hy4"))
 
     def test_named(self):
         self.assertEqual(maya.choose_family(args(model=maya.HY4), {}), "hy4")
@@ -2221,12 +2221,12 @@ class Names(unittest.TestCase):
 
         def pick(title, intro, opts, default, yes, *x):
             rows.extend(opts)
-            return len(opts) - 2
+            return len(opts) - 3                       # (Hy4-flash's row: before Ling-3.2-air's and Inkling-2-Mini's)
         a = type("A", (), {"model": None, "gguf_dir": None, "draft": None, "model_dir": None, "yes": True})()
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             self.assertEqual(maya.choose_family(a, {}), "hy4")
-        self.assertEqual(len(rows), len(maya.FAMILIES) + 1)   # (GLM-5.3 (744B): a row of the "glm" family)
-        label, note, about = rows[-2]
+        self.assertEqual(len(rows), len(maya.FAMILIES) + 2)   # (GLM-5.3 (744B): a row of the "glm" family; Ling-3.2-air's row, there once a size can be downloaded)
+        label, note, about = rows[-3]
         self.assertEqual(label, "Hy4-Flash")
         self.assertIn("Q4_K_M", about)
         self.assertIn("pictures", about)

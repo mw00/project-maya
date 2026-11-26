@@ -5,11 +5,15 @@
 //   4. .lingrp folder size cap eviction & default-off check
 //   5. Linux NUMA topology / cpuset builder helper
 //   6. DirectGgufReader O_DIRECT + buffered + deterministic fallback + /dev/shm tmpfs
+//   7. GGUF fingerprint: same size + same first 64 KiB but different quant bytes / tensor table never collide
+//   8. Full-precision (F32 / F16 / BF16) dense matrices -> Q8_0 at load (ling_dense.hpp)
+#include "ling_dense.hpp"
 #include "ling_restore.hpp"
 #include "ling_sys.hpp"
 
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -223,6 +227,33 @@ static void test_restore_validation_and_model_keys() {
         auto ex_fp = ex;
         ex_fp.key.gguf_fingerprint ^= 1ULL;
         EXPECT(!ling::sys::load_restore_file(saved_p, ex_fp, loaded, reason), "reject GGUF fingerprint mismatch");
+        EXPECT(reason.find("fingerprint") != std::string::npos, "fingerprint mismatch says so (got '%s')", reason.c_str());
+    }
+    {   // a restore file written under the old fingerprint (size + first 64 KiB) carries a value the deeper one never
+        // equals for the same model, so it is skipped with the usual one line
+        namespace fsx = std::filesystem;
+        const fsx::path probe = td / "old_fp_probe.bin";
+        {
+            std::ofstream pf(probe, std::ios::binary);
+            const std::string blob(3u << 20, 'a');
+            pf << blob;
+        }
+        uint64_t old_style = 1469598103934665603ULL;   // FNV-1a of (1 file, its size, its first 64 KiB): the old formula
+        auto mix_old = [&](const void* p, size_t n) {
+            const auto* bp = (const uint8_t*) p;
+            for (size_t i = 0; i < n; ++i) old_style = (old_style ^ bp[i]) * 1099511628211ULL;
+        };
+        const uint64_t one = 1, sz = 3u << 20;
+        mix_old(&one, 8);
+        mix_old(&sz, 8);
+        const std::string head(65536, 'a');
+        mix_old(head.data(), head.size());
+        EXPECT(old_style != ling::sys::compute_gguf_fingerprint(probe.string()), "the deeper fingerprint is not the old one");
+        auto ex_old = ex;
+        ex_old.key.gguf_fingerprint = old_style;
+        EXPECT(!ling::sys::load_restore_file(saved_p, ex_old, loaded, reason), "reject a file with the old-style fingerprint");
+        std::error_code ec_old;
+        fsx::remove(probe, ec_old);
     }
     {
         auto ex_ver = ex;
@@ -242,7 +273,7 @@ static void test_restore_validation_and_model_keys() {
     EXPECT(skipped.size() == 8, "load_restore_dir reports 8 skipped damaged files (got %zu)", skipped.size());
 
     fs::remove_all(td, ec);
-    std::printf("PASS test_restore_validation_and_model_keys (8 corruption cases + 6 key mismatches)\n");
+    std::printf("PASS test_restore_validation_and_model_keys (8 corruption cases + 7 key mismatches)\n");
 }
 
 static void test_restore_dir_cap_eviction() {
@@ -439,11 +470,182 @@ static void test_split_gguf_fingerprint() {
     std::printf("PASS test_split_gguf_fingerprint\n");
 }
 
+// Two different quants of one model have the same size and often the same first 64 KiB: the fingerprint must tell
+// them apart from bytes elsewhere in the file and from the tensor table.
+static void test_gguf_fingerprint_depth() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("ling_fp_depth_" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const size_t N = 6u << 20;
+    std::vector<uint8_t> a(N);
+    for (size_t i = 0; i < N; ++i) a[i] = (uint8_t) ((i * 2654435761u) >> 24);
+    auto write = [&](const char* name, const std::vector<uint8_t>& b) {
+        const fs::path p = dir / name;
+        std::ofstream f(p, std::ios::binary);
+        f.write((const char*) b.data(), (std::streamsize) b.size());
+        return p.string();
+    };
+    const std::string pa = write("a.gguf", a);
+    const std::string pa2 = write("a_copy.gguf", a);
+    EXPECT(ling::sys::compute_gguf_fingerprint(pa) == ling::sys::compute_gguf_fingerprint(pa2), "equal files, equal fingerprint");
+
+    // "another quant": same size, same first 64 KiB, every later byte different
+    std::vector<uint8_t> q = a;
+    for (size_t i = 65536; i < N; ++i) q[i] = (uint8_t) (q[i] ^ 0x5Au);
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("q.gguf", q)) != ling::sys::compute_gguf_fingerprint(pa),
+           "same size + same first 64 KiB, other bytes after: other fingerprint");
+
+    // the end of the file alone differs
+    std::vector<uint8_t> t = a;
+    t[N - 100] ^= 1;
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("t.gguf", t)) != ling::sys::compute_gguf_fingerprint(pa),
+           "a change in the last 64 KiB: other fingerprint");
+
+    // one sampled window changes (the middle of the file)
+    std::vector<uint8_t> m = a;
+    const uint64_t step = (N - ling::sys::kFpSample) / (ling::sys::kFpSamples - 1);
+    m[(size_t) (step * 64 + 10)] ^= 0x80;
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("m.gguf", m)) != ling::sys::compute_gguf_fingerprint(pa),
+           "a change inside a sampled window: other fingerprint");
+
+    // a small file is read whole
+    std::vector<uint8_t> s1(300000, 7), s2 = s1;
+    s2[299999] = 8;
+    EXPECT(ling::sys::compute_gguf_fingerprint(write("s1.gguf", s1)) != ling::sys::compute_gguf_fingerprint(write("s2.gguf", s2)),
+           "a small file's last byte counts");
+
+    // the tensor table
+    using FT = ling::sys::FingerprintTensor;
+    const uint64_t base = ling::sys::compute_gguf_fingerprint(pa);
+    const std::vector<FT> tab{{"blk.0.attn_q.weight", 8, 0, 4096, 0}, {"output.weight", 14, 4096, 8192, 0},
+                              {"token_embd.weight", 30, 9000, 100, 1}};
+    const uint64_t f0 = ling::sys::mix_tensor_table(base, tab);
+    EXPECT(f0 == ling::sys::mix_tensor_table(base, tab), "tensor-table fingerprint is deterministic");
+    EXPECT(f0 != base, "the tensor table changes the fingerprint");
+    auto shuffled = tab;
+    std::swap(shuffled[0], shuffled[2]);
+    EXPECT(f0 == ling::sys::mix_tensor_table(base, shuffled), "the order the tensors were read in does not matter");
+    auto other_type = tab;
+    other_type[1].type = 8;   // (the output head Q6_K -> Q8_0 at the same place)
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_type), "another tensor type: other fingerprint");
+    auto other_off = tab;
+    other_off[2].offset += 32;
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_off), "another tensor offset: other fingerprint");
+    auto other_size = tab;
+    other_size[0].elements += 32;
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_size), "another tensor size: other fingerprint");
+    auto other_name = tab;
+    other_name[0].name = "blk.0.attn_k.weight";
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_name), "another tensor name: other fingerprint");
+    auto other_shard = tab;
+    other_shard[2].shard = 0;
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, other_shard), "another shard: other fingerprint");
+    auto fewer = tab;
+    fewer.pop_back();
+    EXPECT(f0 != ling::sys::mix_tensor_table(base, fewer), "a tensor fewer: other fingerprint");
+
+    fs::remove_all(dir, ec);
+    std::printf("PASS test_gguf_fingerprint_depth\n");
+}
+
+// F32 / F16 / BF16 dense matrices become Q8_0 rows (ggml's quantize_row_q8_0_ref) while the model loads.
+static void test_dense_to_q8_0() {
+    namespace D = ling::dense;
+    bool half_ok = true;
+    for (uint32_t h = 0; h < 65536; ++h) {
+        if ((h & 0x7c00u) == 0x7c00u && (h & 0x3ffu) != 0) continue;   // NaN
+        if (D::f32_to_f16(D::f16_to_f32((uint16_t) h)) != (uint16_t) h) { half_ok = false; break; }
+    }
+    EXPECT(half_ok, "every F16 value survives F16 -> F32 -> F16");
+    EXPECT(D::f16_to_f32(0x3c00) == 1.0f && D::f16_to_f32(0xc000) == -2.0f && D::f16_to_f32(0x0001) == std::ldexp(1.0f, -24),
+           "F16 one, minus two, smallest subnormal");
+    EXPECT(D::f32_to_f16(65519.0f) == 0x7bff && D::f32_to_f16(65520.0f) == 0x7c00, "F16 rounding at the top of the range");
+    EXPECT(D::f32_to_f16(1.0f + std::ldexp(1.0f, -11)) == 0x3c00, "F16 ties go to even");
+    EXPECT(D::bf16_to_f32(0x3f80) == 1.0f && D::bf16_to_f32(0xc040) == -3.0f, "BF16 one and minus three");
+
+    // two rows of 64 values (2 blocks a row); small integers are exact in all three types
+    const uint64_t rows = 2, k = 64;
+    std::vector<float> v((size_t) (rows * k));
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (float) ((int) (i % 37) - 18);
+    for (size_t i = 32; i < 64; ++i) v[i] = 0.0f;   // an all-zero block
+    std::vector<uint8_t> f32b(v.size() * 4), f16b(v.size() * 2), bf16b(v.size() * 2);
+    for (size_t i = 0; i < v.size(); ++i) {
+        std::memcpy(&f32b[i * 4], &v[i], 4);
+        const uint16_t h = D::f32_to_f16(v[i]);
+        std::memcpy(&f16b[i * 2], &h, 2);
+        uint32_t bits;
+        std::memcpy(&bits, &v[i], 4);
+        const uint16_t b = (uint16_t) (bits >> 16);
+        std::memcpy(&bf16b[i * 2], &b, 2);
+    }
+    const std::vector<uint8_t> q32 = D::to_q8_0(D::kF32, f32b.data(), rows * k, k, "t");
+    const std::vector<uint8_t> q16 = D::to_q8_0(D::kF16, f16b.data(), rows * k, k, "t");
+    const std::vector<uint8_t> qbf = D::to_q8_0(D::kBF16, bf16b.data(), rows * k, k, "t");
+    EXPECT(q32.size() == D::q8_0_bytes(rows, k) && q32.size() == 2 * 2 * 34, "Q8_0 size: 2 rows x 2 blocks x 34 bytes");
+    EXPECT(q32 == q16 && q32 == qbf, "F32, F16 and BF16 of the same values give the same Q8_0 bytes");
+
+    bool layout_ok = true;
+    for (size_t b = 0; b < 4; ++b) {                 // block b = row b / 2, block b % 2
+        const uint8_t* blk = &q32[b * 34];
+        uint16_t dh;
+        std::memcpy(&dh, blk, 2);
+        float amax = 0;
+        for (size_t j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(v[b * 32 + j]));
+        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        if (dh != D::f32_to_f16(d)) layout_ok = false;
+        for (size_t j = 0; j < 32; ++j)
+            if ((int8_t) blk[2 + j] != (int8_t) std::lround(v[b * 32 + j] * id)) layout_ok = false;
+    }
+    EXPECT(layout_ok, "scale (F16) and int8 values as ggml's quantize_row_q8_0_ref");
+    const std::vector<uint8_t> zero34(34, 0);
+    EXPECT(std::memcmp(&q32[34], zero34.data(), 34) == 0, "an all-zero block is all zero bytes");
+    EXPECT((int8_t) q32[2 + 0] == (int8_t) std::lround(v[0] / (18.0f / 127.0f)), "the first value, quantised as expected");
+
+    {   // dequantised values within half a step of the originals (plus the F16 scale's rounding: 127 x 2^-11 steps)
+        std::vector<float> w(32 * 4);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = std::sin((float) i * 0.37f) * (1.0f + (float) (i / 32));
+        std::vector<uint8_t> wb(w.size() * 4);
+        std::memcpy(wb.data(), w.data(), wb.size());
+        const auto q = D::to_q8_0(D::kF32, wb.data(), w.size(), 64, "w");
+        bool close = true;
+        for (size_t i = 0; i < w.size(); ++i) {
+            const uint8_t* blk = &q[(i / 32) * 34];
+            uint16_t dh;
+            std::memcpy(&dh, blk, 2);
+            const float d = D::f16_to_f32(dh);
+            if (std::fabs(d * (float) (int8_t) blk[2 + i % 32] - w[i]) > 0.57f * d + 1e-6f) close = false;   // half a step + 127 x the F16 scale's rounding
+        }
+        EXPECT(close, "dequantised values within half a quantisation step (plus the F16 scale's rounding)");
+    }
+
+    auto throws = [&](auto&& fn) {
+        try { fn(); } catch (const std::exception&) { return true; }
+        return false;
+    };
+    EXPECT(throws([&] { D::to_q8_0(D::kF32, f32b.data(), 40, 40, "bad_k"); }), "rows that are not a multiple of 32 values are refused");
+    EXPECT(throws([&] { D::to_q8_0(8, f32b.data(), 64, 64, "not_float"); }), "a block type is not a full-precision one");
+    {
+        std::vector<float> bad(32, 1.0f);
+        bad[5] = std::numeric_limits<float>::infinity();
+        std::vector<uint8_t> bb(32 * 4);
+        std::memcpy(bb.data(), bad.data(), bb.size());
+        EXPECT(throws([&] { D::to_q8_0(D::kF32, bb.data(), 32, 32, "inf"); }), "a value that is not finite is refused");
+    }
+    EXPECT(D::to_f32(D::kF16, f16b.data(), rows * k) == v, "F16 -> F32 (the router's weights) is exact");
+    EXPECT(D::is_float_type(0) && D::is_float_type(1) && D::is_float_type(30) && !D::is_float_type(8) && !D::is_float_type(14),
+           "which types count as full precision");
+    std::printf("PASS test_dense_to_q8_0\n");
+}
+
 int main() {
     test_expert_slot_order_regression();
     test_restore_validation_and_model_keys();
     test_restore_dir_cap_eviction();
     test_split_gguf_fingerprint();
+    test_gguf_fingerprint_depth();
+    test_dense_to_q8_0();
     test_numa_helpers();
     test_direct_reader();
     if (g_fail != 0) {

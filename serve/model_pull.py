@@ -115,8 +115,17 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
     ccs = _nvidia_ccs(backend) if ccs is None else ccs
     # Hy4-Flash (maya-hy4): the sizes that are uploaded, on NVIDIA from V100 on only (no AMD or Mac engine yet)
     hy4 = _hy4_downloads() if backend not in ("hip", "metal") and (not ccs or max(ccs) >= HY4_MIN_CC) else {}
+    # Ling-3.2-air (maya-ling): the sizes the setup can download, on NVIDIA from V100 on under Linux only
+    ling = _ling_downloads() if backend == "cuda" and sys.platform.startswith("linux") and \
+        (not ccs or max(ccs) >= LING_MIN_CC) else {}
     out = []
     for fam, key, _tier, ident in Q.QUANTS:
+        if fam == "ling":                              # (a size not uploaded, or not made yet: no row)
+            if key in ling:
+                out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya",
+                            "note": "Linux, NVIDIA; one answer at a time", "installed": (fam, key) in have,
+                            "size_gb": round(float(ling[key]["download_gb"]), 1)})
+            continue
         if fam == "hy4":
             if key in hy4:
                 out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya",
@@ -170,6 +179,20 @@ def _hy4_downloads() -> dict:
         sys.path.insert(0, str(ROOT))
         import maya                                    # (the setup's own table; nothing runs on import)
         return {k: maya.hy4_entry(k) for k in maya.HY4_QUANTS if maya.hy4_published(k)}
+    except (Exception, SystemExit):  # noqa: BLE001 - a manifest not readable: not offered
+        return {}
+
+
+LING_MIN_CC = 70                                     # (tools/ling_fit.py MIN_CC: maya-ling's kernels, V100 / RTX 20 on)
+
+
+def _ling_downloads() -> dict:
+    """Ling-3.2-air's downloads, by the setup's key ("maya-s"): the sizes whose files are uploaded
+    (maya.ling_published), each as maya.ling_entry says it - listed the day the setup's table names them."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import maya                                    # (the setup's own table; nothing runs on import)
+        return {k: maya.ling_entry(k) for k in maya.LING_QUANTS if maya.ling_published(k)}
     except (Exception, SystemExit):  # noqa: BLE001 - a manifest not readable: not offered
         return {}
 

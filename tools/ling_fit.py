@@ -72,17 +72,39 @@ def download_manifest() -> dict:
     return {"name": "Ling-3.2-air", "default_kv": DEFAULT_KV, "quants": {}}
 
 
+def quant_files(quant: str | None, manifest: dict | None = None) -> dict:
+    """A size's files as the table lists them ({name: [bytes, sha256]}); {} for a size not made yet or not listed."""
+    q = ((manifest or download_manifest()).get("quants") or {}).get(quant or "") or {}
+    return dict(q.get("files") or {})
+
+
+def listed(manifest: dict | None = None) -> list:
+    """The sizes whose files the table lists (their sizes and sha256 known), in the table's order."""
+    m = manifest or download_manifest()
+    return [q for q in (m.get("quants") or {}) if quant_files(q, m)]
+
+
+def published(quant: str | None, manifest: dict | None = None) -> bool:
+    """Whether the setup may download a size: its files are listed and the table names the repo and its commit."""
+    m = manifest or download_manifest()
+    return bool(quant_files(quant, m) and m.get("repo") and m.get("revision"))
+
+
 def quant_spec(quant: str | None = None, gguf_gib: float | None = None,
                experts_gib: float | None = None) -> dict:
+    """What a size takes: the table's own figures where it gives them, else from its files' bytes (a listed size) or
+    the GGUF on the disk (gguf_gib); a size with no file yet has no figure of its own (the neutral fallback)."""
     manifest = download_manifest()
-    quants = manifest.get("quants") or {}
-    if quant and quant in quants:
-        q = quants[quant]
+    q = (manifest.get("quants") or {}).get(quant or "") or {}
+    if q.get("experts_gib"):
         return {
             "dense_gib": float(q.get("dense_gib", DENSE_GIB)),
-            "experts_gib": float(q.get("experts_gib", DEFAULT_EXPERTS_GIB)),
-            "memory_gb": float(q.get("memory_gb", DENSE_GIB + DEFAULT_EXPERTS_GIB)),
+            "experts_gib": float(q["experts_gib"]),
+            "memory_gb": float(q.get("memory_gb", DENSE_GIB + float(q["experts_gib"]) + 4.0)),
         }
+    files = quant_files(quant, manifest)
+    if files and not (gguf_gib and gguf_gib > 0) and not (experts_gib and experts_gib > 0):
+        gguf_gib = sum(int(v[0]) for v in files.values()) / GIB
     if experts_gib is not None and experts_gib > 0:
         eg = float(experts_gib)
     elif gguf_gib is not None and gguf_gib > 0:
@@ -294,16 +316,16 @@ def unsupported(backend: str, win: bool, gpus: list[dict], ram_gb: float = 0.0, 
 def smaller_quant_hint(vram_gbs: list[float] | float, ram_gb: float, ctx: int, kv: str,
                        current_quant: str | None = None, gguf_gib: float | None = None) -> str:
     """Suggest a smaller published quant (when download.json lists any), shorter context, or --kv q8."""
-    quants = download_manifest().get("quants") or {}
-    if quants:
+    sizes = {q: quant_spec(q)["memory_gb"] for q in listed()}   # (only the sizes that exist)
+    if sizes:
         cur_p = plan(vram_gbs, ctx, kv, current_quant, ram_gb=ram_gb, gguf_gib=gguf_gib)
         cur_mem = quant_spec(current_quant, gguf_gib=gguf_gib)["memory_gb"]
-        for q, qspec in sorted(quants.items(), key=lambda kvp: float(kvp[1].get("memory_gb", 999))):
-            if float(qspec.get("memory_gb", 999)) < cur_mem:
+        for q, mem in sorted(sizes.items(), key=lambda kvp: kvp[1]):
+            if mem < cur_mem:
                 p = plan(vram_gbs, ctx, kv, q, ram_gb=ram_gb)
                 if p["fits_trunk"] and (p["ssd_slots"] == 0 or p["ssd_slots"] < cur_p["ssd_slots"]):
                     note = "fits RAM without SSD streaming" if p["ssd_slots"] == 0 else f"cuts SSD spill to {p['ssd_gib']:.1f} GiB"
-                    return f"try {q} (~{qspec['memory_gb']} GB total, {note})"
+                    return f"try {q} (~{mem:.0f} GB total, {note})"
     if ctx > 16384:
         return "try a smaller quant, a shorter context (--context 16384 or 32768), or --kv q8"
     return "try a smaller quant or use --force-fit to proceed anyway"

@@ -26,7 +26,8 @@ struct RestoreKey {
     std::string model_id;           // GGUF basename / model identifier
     std::string quant_tag;          // tensor quant signature (e.g. "etg=12,etd=12,emb=8,out=8")
     std::string engine_version;     // engine/format compatibility tag
-    uint64_t gguf_fingerprint = 0;  // FNV-1a of GGUF file byte size + header prefix
+    uint64_t gguf_fingerprint = 0;  // FNV-1a of every shard's size + first/last 64 KiB + 128 spaced 4 KiB samples, then
+                                    // the tensor table (names, types, offsets, sizes - mix_tensor_table)
     uint32_t ctx = 0;               // configured max context length
     uint32_t kv_q8 = 0;             // 0 = fp16 KV, 1 = q8 KV
 };
@@ -65,6 +66,12 @@ inline bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t& out) {
     return true;
 }
 
+// What a shard's fingerprint reads: its size, the first and last 64 KiB, and kFpSamples windows of kFpSample bytes
+// spread evenly over the file (two quants of one model with the same size and the same first 64 KiB differ in
+// the tensors' bytes).  A file of at most kFpWhole bytes is read whole.  About 1 MiB a shard, 130 reads.
+static constexpr size_t kFpEdge = 65536, kFpSample = 4096, kFpSamples = 128;
+static constexpr uint64_t kFpWhole = 1ULL << 20;
+
 inline uint64_t compute_gguf_set_fingerprint(const std::vector<std::string>& paths) {
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const void* p, size_t n) {
@@ -73,17 +80,66 @@ inline uint64_t compute_gguf_set_fingerprint(const std::vector<std::string>& pat
     };
     const uint64_t nfiles = (uint64_t) paths.size();
     mix(&nfiles, sizeof nfiles);
-    std::vector<uint8_t> buf(65536);
+    std::vector<uint8_t> buf(kFpEdge);
     for (const std::string& path : paths) {
         std::error_code ec;
         const uint64_t fsz = std::filesystem::file_size(path, ec);
         if (!ec) mix(&fsz, sizeof fsz);
         std::ifstream f(path, std::ios::binary);
-        if (f) {
-            f.read((char*) buf.data(), (std::streamsize) buf.size());
+        if (!f) continue;
+        auto window = [&](uint64_t off, size_t n) {   // (the offset is mixed in too: a window moved is another file)
+            f.clear();
+            f.seekg((std::streamoff) off);
+            if (!f) return;
+            f.read((char*) buf.data(), (std::streamsize) n);
             const auto got = (size_t) std::max<std::streamsize>(0, f.gcount());
+            mix(&off, sizeof off);
             if (got > 0) mix(buf.data(), got);
+        };
+        if (ec || fsz <= kFpWhole) {                  // (small, or of unknown size: from the start, as before)
+            window(0, kFpEdge);
+            if (!ec)
+                for (uint64_t off = kFpEdge; off < fsz; off += kFpEdge) window(off, kFpEdge);
+            continue;
         }
+        window(0, kFpEdge);
+        window(fsz - kFpEdge, kFpEdge);
+        const uint64_t step = (fsz - kFpSample) / (kFpSamples - 1);
+        for (size_t i = 0; i < kFpSamples; ++i) window(step * i, kFpSample);
+    }
+    return h;
+}
+
+// One tensor of a GGUF set as the fingerprint reads it.
+struct FingerprintTensor {
+    std::string name;
+    uint32_t type = 0;
+    uint64_t offset = 0;      // in its shard's data section
+    uint64_t elements = 0;
+    uint32_t shard = 0;
+};
+
+/// The file fingerprint mixed with the tensor table (names, types, offsets, element counts, shards): two files that
+/// differ in a tensor's quant, or in where it sits, never share a fingerprint.  Sorted by name, so the order the
+/// shards were read in does not matter.
+inline uint64_t mix_tensor_table(uint64_t fp, std::vector<FingerprintTensor> tensors) {
+    std::sort(tensors.begin(), tensors.end(),
+              [](const FingerprintTensor& a, const FingerprintTensor& b) { return a.name < b.name; });
+    uint64_t h = fp ^ 0x9e3779b97f4a7c15ULL;
+    auto mix = [&](const void* p, size_t n) {
+        const auto* b = (const uint8_t*) p;
+        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ULL;
+    };
+    const uint64_t n = (uint64_t) tensors.size();
+    mix(&n, sizeof n);
+    for (const FingerprintTensor& t : tensors) {
+        const uint64_t len = (uint64_t) t.name.size();
+        mix(&len, sizeof len);
+        mix(t.name.data(), t.name.size());
+        mix(&t.type, sizeof t.type);
+        mix(&t.offset, sizeof t.offset);
+        mix(&t.elements, sizeof t.elements);
+        mix(&t.shard, sizeof t.shard);
     }
     return h;
 }
