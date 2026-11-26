@@ -1807,6 +1807,19 @@ model's files (each read again, so those prompts are not timed); a difference fa
 | `MAYA_DS4_HELPER_RECENT_WIN` | 8 | the decode steps a layer's uses are counted over (1-64) |
 | `MAYA_DS4_HELPER_RECENT_FILLS` | 2 | new recent slots a layer a step at most (1-16) |
 
+For batched EXL3 prompt prefill, `MAYA_DS4_HELPER_PREFILL=1` runs router-selected experts on the integrated helper
+where their weights are already resident. It sends activations and routing metadata directly between GPUs and adds
+the helper's result once on the lead, before reduction. The router's choices and weights are unchanged. The change
+in floating-point accumulation order can change answers. Decode uses its existing path.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HELPER_PREFILL` | off | `1`: run resident EXL3 experts on the helper during chunked prefill |
+
+This requires one trunk group with uniform-layout EXL3 layers, a separate helper with bidirectional peer access
+to the lead, and extra VRAM for scratch on both GPUs. Scratch grows with the configured chunk size. The helper can
+still host DSpark blocks.
+
 ## DeepSeek: where the measured hipBLASLt picks are kept (AMD)
 
 On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
