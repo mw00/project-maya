@@ -6524,7 +6524,16 @@ struct Model::Impl {
         // of 921 likely ones unpicked, 7 GB of 84 read for nothing; Radeon 8065S, 128 and 512 tokens - 44 of 945 and
         // 21 of 1568, the early reads 9-12% faster there)
         static const double waste = std::getenv("DS4_SPEC_WASTE") ? std::atof(std::getenv("DS4_SPEC_WASTE")) : 0.2;
-        const bool early = c.it_spec < 2u * (uint64_t) c.ring_n || (double) c.it_spec_unused <= waste * (double) c.it_spec;
+        // (DS4_PREFILL_CPU: none on a layer the CPU share takes - the likely ones read early are the stream's, so the
+        // lane could take none of them, and as the cache's counts follow the decode they drift to experts the prompt
+        // picks for a row or two: 3x RX 7900 XTX on PCIe 3, 550-token agent turns, three rounds with a decode between -
+        // early reads queued 5K -> 27K a round and the share shrank, rounds 16.8 / 27.4 / 28.4 s against 16.3 / 20.8 /
+        // 21.1 s without them; two Xeon E5-2697 v2 + 2x RTX 3090, the same rounds: ~1,070-token turns on an 8K start
+        // 5.38-5.53 -> 4.91-5.04 s, fresh 700 / 1,650 tokens -9-14 / -5-7 %, the 8K start itself -1 % - its layers before
+        // the cut keep theirs, where all of them off, DS4_SPEC_Q=2, was +2-4 %; #959. DS4_PREFILL_CPU_EARLY=1 keeps them)
+        const bool lane = !pcpu_cfg().early && pcpu_takes(c, l, mi, T);
+        const bool early = !lane && (c.it_spec < 2u * (uint64_t) c.ring_n ||
+                                     (double) c.it_spec_unused <= waste * (double) c.it_spec);
         for (int e : l.host_list) {
             if (!early) break;
             const double p = sum > 0 ? pr[e] / sum : 0.0;
@@ -6794,6 +6803,7 @@ struct Model::Impl {
         double exp_ms = 0.9;   // (where a device's link was not measured: the best there through the staging)
         bool row_set = false;  // (DS4_PREFILL_CPU_ROW_MS given: that, not the load's measurement)
         bool exp_set = false;  // (DS4_PREFILL_CPU_EXPERT_MS given: that for every device, not its link's)
+        bool early = false;    // (DS4_PREFILL_CPU_EARLY=1: early reads on the layers the share takes too, pcpu_takes)
     };
     static const PcpuCfg& pcpu_cfg() {
         static const PcpuCfg c = [] {
@@ -6809,6 +6819,7 @@ struct Model::Impl {
                 p.exp_ms = std::max(1e-4, std::atof(e));
                 p.exp_set = true;
             }
+            if (const char* q = ds4_env("DS4_PREFILL_CPU_EARLY")) p.early = std::atoi(q) != 0;
             return p;
         }();
         return c;
@@ -6894,6 +6905,13 @@ struct Model::Impl {
         ptr = static_cast<P*>(q);
         have = want;
         return true;
+    }
+    // (chunk c's layer L0 of T rows, member mi) one the CPU share runs on (pcpu_plan; rhp: a helper engine's prompt
+    // share takes it instead, rh_p_ok - the lead's member 0, as flow_layer's caller decides)
+    bool pcpu_takes(const Chunk& c, const Layer& L0, int mi, int T) const {
+        const PcpuCfg& cf = pcpu_cfg();
+        return cf.on && T <= cf.max_t && L0.nm == 1 && !member(L0, mi).packed_host && !flow_helper &&
+               !L0.host_list.empty() && !(mi == 0 && rh_p_ok(L0, c, T));
     }
     // after the layer's routing (bounds b by virtual slot, read back): choose the CPU share, sort again, read back the
     // inputs and start the lane on them; b2 the new bounds (empty: no share, b as it was)

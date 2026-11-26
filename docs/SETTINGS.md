@@ -986,8 +986,8 @@ below that prompts run in windows of 16. The log says which.
 
 A short prompt (an agent's turn of a few hundred to a few thousand tokens) routes to nearly every expert in RAM, most of
 them for one to three of its tokens, and the chunked pass streams each of them whole over PCIe - on PCIe 3.0 about
-1 ms an expert. With `MAYA_DS4_PREFILL_CPU=1`, after each layer's routing the experts not already copied early are
-taken fewest tokens first for the CPU lane while its estimated time stays under the stream's for the rest (a row's
+1 ms an expert. With `MAYA_DS4_PREFILL_CPU=1`, on the layers that get a share no likely experts are copied early, and
+after each layer's routing its RAM experts are taken fewest tokens first for the CPU lane while its estimated time stays under the stream's for the rest (a row's
 CPU time measured at the load, an expert's stream time by that GPU's own link, so a slower link gives the CPU more);
 the CPU computes them while the GPU streams and computes the others, and their outputs are added after the layer's
 streamed and VRAM experts (as `MAYA_GLM_PREFILL_CPU` does for GLM). Those experts' sums are then the CPU's, not the
@@ -1012,6 +1012,7 @@ from the prompts' own `DS4_PREFILL_CPU` lines before (six runs: agent turns 47.4
 | `MAYA_DS4_PREFILL_CPU` | off (0) | `1`: a prompt chunk's least-picked RAM experts on the CPU lane while the GPU streams the rest (the last bits can move) |
 | `MAYA_DS4_PREFILL_CPU_MAX_T` | 4096 | the largest chunk, in tokens, that gets a CPU share |
 | `MAYA_DS4_PREFILL_CPU_ROW_MS` | measured at the load | the CPU lane's time for one token of one expert it plans with, ms: lower gives the CPU more. Unset: the lane computes 64 of a layer's experts for one and two tokens once at the load, in steps of 0.01 ms (the log's `DS4_PREFILL_CPU: the CPU lane` line; 0.49 where nothing was measured, the box above). A value sets it |
+| `MAYA_DS4_PREFILL_CPU_EARLY` | off (0) | `1`: the likely experts are copied early (`DS4_SPEC_Q`) on the layers the share takes too, as before. Off, those layers' experts all wait for the routing, so the lane can take any of them; the layers without a share (longer chunks) still copy early. On the box above, three rounds of the same prompts with a decode between them and one frozen expert profile: agent turns of ~1,070 new tokens on an 8K start 5.38-5.53 -> 4.91-5.04 s, fresh 700 / 1,650 tokens 3.90-4.33 / 6.35-6.37 -> 3.50-3.73 / 5.91-6.04 s, the 8K start 12.44-12.71 -> 12.33-12.60 s (every early read off, `DS4_SPEC_Q=2`: 12.75-12.99 s), decode the same. 3x RX 7900 XTX on PCIe 3.0 (#959): rounds of 550-token agent turns 27-28 s with them against 21 s without after the first round, where the early reads queued grew from 5K to 27K a round and the share shrank |
 | `MAYA_DS4_PREFILL_CPU_EXPERT_MS` | each GPU's link | the stream's time for one expert it plans with, ms: higher gives the CPU more. Unset: each GPU's own, the layer's expert bytes over the link the load measures, in steps of 0.05 ms (the log's `DS4_PREFILL_CPU: a streamed expert` line; 0.9 where a link was not measured). A value sets it for every GPU (on the box above 0.9 measured best through the staging, 1.2 with `DS4_FLOW_COPY_DMA=1`; 0.3 / 0.5 / 1.5 / 2.0 slower) |
 
 ## DeepSeek: long prompts on a layer split (`DS4_SPLIT`, several GPUs)
