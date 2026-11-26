@@ -63,10 +63,11 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · até 1M de contexto · lê imagens · NVIDIA, AMD no Linux</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44,8 GB<br>53,0 GB<br>68,4 GB<br>89,5 GB<br>cada um + uma tabela n-gram de 63,4 GB em comum | PCs com cerca de 56-64 GB (Maya-XS; placas a partir de 8 GB), 68-80 GB (Maya-S), 80-96 GB (Maya-M) ou 104-128 GB (Maya-L) de RAM + VRAM; Maya-S, Maya-M e Maya-L em placas a partir de 12 GB; a tabela n-gram fica no SSD |
 | **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · até 1M de contexto · lê imagens · NVIDIA, AMD no Linux</sub> | GGUF [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) · `inkling-2-mini` | 17.6 GB | placas a partir de 8 GB: os especialistas que não cabem ficam na RAM; o modelo inteiro na VRAM a partir de 24 GB |
+| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 512 especialistas por camada, 8 por token · até 262.144 de contexto · lê imagens · NVIDIA no Linux</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | PCs cuja VRAM + RAM comportam o arquivo (a instalação escolhe o maior que cabe; o que a VRAM não guarda é calculado na CPU); raciocínio ligado ou desligado, chamadas de ferramentas, drafting MTP com o bloco do próprio modelo |
 
 **Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
-Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)); o Hy4-Flash roda em NVIDIA (Linux e Windows) e em AMD no Linux (Strix Halo / Gorgon Halo, placas Radeon) e lê imagens em toda placa que o roda (placas de 8 GB incluídas). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
+Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)); o Hy4-Flash roda em NVIDIA (Linux e Windows) e em AMD no Linux (Strix Halo / Gorgon Halo, placas Radeon) e lê imagens em toda placa que o roda (placas de 8 GB incluídas). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). O Ling-3.2-air roda só em NVIDIA a partir da V100 / RTX 20, no Linux (`./maya.sh --setup --model ling-3.2-air-maya-s`; [docs/LING.md](docs/LING.md)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
 
 ## <a name="quality"></a>Qualidade
 
@@ -77,6 +78,7 @@ As quantizações do Maya são feitas a partir dos pesos divulgados de cada mode
 - **MiniMax M3.1 · Maya-S** em 87,6% das vezes (a média das suas categorias).
 - **Hy4-Flash · quantizações Maya** em 88,5% (Maya-XS) a 96,6% (Maya-L) das vezes, com divergência KL de 0,16 até
   0,012 - gráficos contra os GGUFs da própria Tencent no [cartão do modelo](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
+- **Ling-3.2-air · quantizações Maya** em 88,1% (Maya-S), 91,1% (Maya-M) e 93,8% (Maya-L) das vezes.
 
 Mais na página de cada modelo no [Hugging Face](https://huggingface.co/peasantsmith).
 
@@ -247,6 +249,20 @@ Cada linha indica em qual versão do Maya foi medida.
 | Máquina | Modelo | Decodificação (escrevendo a resposta) | Prefill (lendo o seu prompt) | Versão | Por |
 | --- | --- | ---: | ---: | --- | --- |
 | **RX 7900 XTX 24 GB** (gfx1100), Ryzen 7 7800X3D, 32 GB RAM | unsloth UD-Q4_K_XL, 128K context | 109.1 tokens/s | 2267 tokens/s | v1.1.74 | @lazm0 (#1116) |
+
+</details>
+
+<details><summary><b>Benchmarks de velocidade do Ling-3.2-air</b></summary>
+
+| Máquina | Modelo | Decodificação (escrevendo a resposta) | Prefill (lendo o seu prompt) | Versão | Por |
+| --- | --- | ---: | ---: | --- | --- |
+| **Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 107.8 tokens/s | 1823 tokens/s (1875 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 124.7 tokens/s | 3561 tokens/s (1908 at 2K) | v1.1.82 | maintainer |
+| **2x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 125.5 tokens/s | 2834 tokens/s (1888 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 124.1 tokens/s | 3498 tokens/s (1893 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-L, MTP drafting, FP16 cache | 127.8 tokens/s | 3383 tokens/s (1810 at 2K) | v1.1.82 | maintainer |
+
+Em uma placa, parte dos especialistas do Maya-S roda a partir da RAM.
 
 </details>
 

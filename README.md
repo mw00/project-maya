@@ -74,6 +74,7 @@ recommends one for your PC; to pick one yourself, give its setup id: `./setup.sh
 | | Maya-S · `minimax-maya-s` | 122 GB | closer to the original |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · up to 1M context · reads pictures · NVIDIA, AMD on Linux</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>each + one 63.4 GB n-gram table | PCs with about 56-64 GB (Maya-XS; cards from 8 GB), 68-80 GB (Maya-S), 80-96 GB (Maya-M) or 104-128 GB (Maya-L) of RAM + VRAM; Maya-S, Maya-M and Maya-L on cards from 12 GB; the n-gram table stays on the SSD |
 | **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · up to 1M context · reads pictures · NVIDIA, AMD on Linux</sub> | [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) GGUF · `inkling-2-mini` | 17.6 GB | cards from 8 GB: the experts that don't fit stay in RAM; the whole model in VRAM from 24 GB |
+| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 512 experts a layer, 8 a token · up to 262,144 context · reads pictures · NVIDIA on Linux</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | PCs whose VRAM + RAM hold the file (the setup picks the largest that fits; what VRAM doesn't hold is computed on the CPU); thinking on or off, tool calls, MTP drafting with the model's own block |
 
 **Which model fits your PC?** See [docs/MEMORY.md](docs/MEMORY.md) for each model's recommended memory (VRAM + RAM together).
 
@@ -87,7 +88,7 @@ with MTP drafting (run on NVIDIA RTX 30 / A100 and newer, Linux; with pictures: 
 [its settings](docs/SETTINGS.md#hy4-flash)), and Inkling 2 Mini (26 B) on its own engine:
 unsloth's UD-Q4_K_XL GGUF on NVIDIA V100 / RTX 20 and newer from 8 GB, Linux and Windows (the experts that don't fit
 stay in RAM; one or two GPUs; up to 1M context), or AMD Radeon from 12 GB and Halo on Linux, with pictures
-(`./maya.sh --setup --model inkling-2-mini`; [docs/INKLING2.md](docs/INKLING2.md)). **Each model's files, drafters, pictures and options:
+(`./maya.sh --setup --model inkling-2-mini`; [docs/INKLING2.md](docs/INKLING2.md)). Ling-3.2-air runs on NVIDIA from the V100 / RTX 20 on, on Linux only (`./maya.sh --setup --model ling-3.2-air-maya-s`; [docs/LING.md](docs/LING.md)). **Each model's files, drafters, pictures and options:
 [docs/MODELS.md](docs/MODELS.md).**
 
 ## Quality
@@ -101,6 +102,7 @@ Maya's quants are made from each model's released weights and measured against t
 - **MiniMax M3.1 · Maya-S** picks it 87.6% of the time (the average over its categories).
 - **Hy4-Flash · Maya quants** pick it 88.5% (Maya-XS) to 96.6% (Maya-L) of the time, with a KL divergence of 0.16
   down to 0.012 - charts against Tencent's own GGUFs on the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
+- **Ling-3.2-air · Maya quants** pick it 88.1% (Maya-S), 91.1% (Maya-M) and 93.8% (Maya-L) of the time.
 
 More on each model's card on [Hugging Face](https://huggingface.co/peasantsmith).
 
@@ -275,6 +277,20 @@ Every row says which Maya release it was measured on.
 | Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | Release | By |
 | --- | --- | ---: | ---: | --- | --- |
 | **RX 7900 XTX 24 GB** (gfx1100), Ryzen 7 7800X3D, 32 GB RAM | unsloth UD-Q4_K_XL, 128K context | 109.1 tokens/s | 2267 tokens/s | v1.1.74 | @lazm0 (#1116) |
+
+</details>
+
+<details><summary><b>Ling-3.2-air speed benchmarks</b></summary>
+
+| Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | Release | By |
+| --- | --- | ---: | ---: | --- | --- |
+| **Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 107.8 tokens/s | 1823 tokens/s (1875 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 124.7 tokens/s | 3561 tokens/s (1908 at 2K) | v1.1.82 | maintainer |
+| **2x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 125.5 tokens/s | 2834 tokens/s (1888 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 124.1 tokens/s | 3498 tokens/s (1893 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-L, MTP drafting, FP16 cache | 127.8 tokens/s | 3383 tokens/s (1810 at 2K) | v1.1.82 | maintainer |
+
+On one card part of Maya-S's experts run from RAM.
 
 </details>
 

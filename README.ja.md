@@ -65,10 +65,11 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>それぞれ + 共通の n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB (Maya-XS、8 GB 以上のカード)、68-80 GB (Maya-S)、80-96 GB (Maya-M)、104-128 GB (Maya-L) の PC。Maya-S、Maya-M、Maya-L は 12 GB 以上のカード。n-gram テーブルは SSD に置いたまま |
 | **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、Linux 上の AMD</sub> | [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) GGUF · `inkling-2-mini` | 17.6 GB | 8 GB 以上のカード: 収まらないエキスパートは RAM に置かれます。24 GB 以上ではモデル全体が VRAM に収まります |
+| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 1 層 512 エキスパート、1 トークン 8 個 · 最大 262,144 コンテキスト · 画像対応 · Linux 上の NVIDIA</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | VRAM + RAM にファイルが収まる PC (セットアップは収まる最大のサイズを選びます。VRAM に収まらない分は CPU で計算); 思考のオン/オフ、ツール呼び出し、モデル自身の MTP ブロックによるドラフト |
 
 **どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 
-いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は NVIDIA (Linux と Windows) と Linux 上の AMD (Strix Halo / Gorgon Halo、Radeon カード) で動き、動くすべてのカードで画像も読めます (8 GB のカードを含む)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
+いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は NVIDIA (Linux と Windows) と Linux 上の AMD (Strix Halo / Gorgon Halo、Radeon カード) で動き、動くすべてのカードで画像も読めます (8 GB のカードを含む)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。Ling-3.2-air は Linux 上の NVIDIA (V100 / RTX 20 以降) でのみ動きます (`./maya.sh --setup --model ling-3.2-air-maya-s`、[docs/LING.md](docs/LING.md))。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>品質
 
@@ -78,6 +79,7 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 - **DeepSeek V4.1 · Maya-S** は元のモデルと同じ次トークンを 92.6% の確率で選びます。
 - **MiniMax M3.1 · Maya-S** は 87.6% です (カテゴリ平均)。
 - **Hy4-Flash · Maya 量子化** は 88.5% (Maya-XS) から 96.6% (Maya-L)、KL ダイバージェンスは 0.16 から 0.012 です。Tencent 自身の GGUF との比較グラフは[モデルカード](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)にあります。
+- **Ling-3.2-air · Maya 量子化** は 88.1% (Maya-S)、91.1% (Maya-M)、93.8% (Maya-L) です。
 
 各モデルの詳細は [Hugging Face](https://huggingface.co/peasantsmith) のモデルカードにあります。
 
@@ -248,6 +250,20 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 | マシン | モデル | デコード (回答の書き出し) | プリフィル (プロンプトの読み込み) | リリース | 報告者 |
 | --- | --- | ---: | ---: | --- | --- |
 | **RX 7900 XTX 24 GB** (gfx1100), Ryzen 7 7800X3D, 32 GB RAM | unsloth UD-Q4_K_XL, 128K context | 109.1 tokens/s | 2267 tokens/s | v1.1.74 | @lazm0 (#1116) |
+
+</details>
+
+<details><summary><b>Ling-3.2-air の速度ベンチマーク</b></summary>
+
+| マシン | モデル | デコード (回答の書き出し) | プリフィル (プロンプトの読み込み) | リリース | 報告者 |
+| --- | --- | ---: | ---: | --- | --- |
+| **Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 107.8 tokens/s | 1823 tokens/s (1875 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 124.7 tokens/s | 3561 tokens/s (1908 at 2K) | v1.1.82 | maintainer |
+| **2x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 125.5 tokens/s | 2834 tokens/s (1888 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 124.1 tokens/s | 3498 tokens/s (1893 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-L, MTP drafting, FP16 cache | 127.8 tokens/s | 3383 tokens/s (1810 at 2K) | v1.1.82 | maintainer |
+
+1 枚のカードでは、Maya-S のエキスパートの一部が RAM から実行されます。
 
 </details>
 
