@@ -57,6 +57,16 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(pc["gpus"], [self.gpus[1]])
         self.assertEqual(maya.EXE, self.root / "build-hip/maya")
 
+    def test_rx_9060_xt_is_a_supported_discrete_card(self):
+        """gfx1200 (RX 9050 / 9060 XT): RDNA4 like the gfx1201 R9700, no hipBLASLt table yet (plain hipBLAS)."""
+        card = {"index": 0, "arch": "gfx1200", "vendor": "amd", "name": "AMD Radeon RX 9060 XT", "vram_gb": 16}
+        with patch.object(maya.S, "amd_gpus", return_value=[card]):
+            self.a.gpu = None
+            pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [card])
+        self.assertEqual(pc["backend"], "hip")
+        self.assertFalse(maya.hip_unified_memory(card))
+
     def test_versioned_llvm_slot_is_found(self) -> None:
         """Gentoo's versioned LLVM slots count as ROCm's compiler."""
         # Gentoo keeps each LLVM version in its own slot: <root>/lib/llvm/22/bin/clang++
@@ -139,6 +149,24 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["env"]["MAYA_HIPBLASLT_TUNING"],
                          f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
 
+    def test_gfx1200_card_takes_both_of_its_shipped_tables(self):
+        """An RX 9060 XT ships tables for hipBLASLt 100202 and 100401: setup offers both, in version order, so the
+        engine takes the one its installed hipBLASLt accepts (100401 is the one tuned on the card)."""
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        for version in ("100202", "100401"):
+            (tables / f"gfx1200-glm-hipblaslt-{version}.txt").write_text(
+                f"MAYA_HIPBLASLT_TUNING_V1 gfx1200 {version}\n")
+        card = {"index": 0, "arch": "gfx1200", "vendor": "amd", "name": "AMD Radeon RX 9060 XT", "vram_gb": 16}
+        with patch.object(maya.S, "amd_gpus", return_value=[card]):
+            self.a.gpu = None
+            pc = maya.check_pc(self.a)
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                              self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"].split(os.pathsep),
+                         [str(tables / "gfx1200-glm-hipblaslt-100202.txt"),
+                          str(tables / "gfx1200-glm-hipblaslt-100401.txt")])
+
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
         self.a.env = ["MAYA_GLM_RESERVE_MB=4096"]
@@ -196,6 +224,16 @@ class HipSetupTests(unittest.TestCase):
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"], "/selected/table.txt")
+
+    def test_shipped_glm_tuning_tables_name_their_architecture(self):
+        """The tables shipped in tools/hip (gfx1200's tuned on a RX 9060 XT): the engine accepts a table only for
+        its own arch and hipBLASLt version, so a header that does not match the file name's arch would silently
+        leave that card's prompts on plain hipBLAS."""
+        for table in sorted((Path(__file__).resolve().parents[1] / "tools" / "hip").glob("*-glm-hipblaslt-*.txt")):
+            magic = next((l for l in table.read_text(errors="replace").splitlines()
+                          if l.startswith("MAYA_HIPBLASLT_TUNING_V1")), None)
+            self.assertIsNotNone(magic, table.name)
+            self.assertEqual(magic.split()[1], table.name.split("-")[0], table.name)
 
     def test_glm53_tuning_table_only_on_a_glm_dsa_pack(self):
         # GLM-5.3 (glm-dsa) prompt shapes have their own rows (<arch>-glm53-hipblaslt-<version>.txt), after the GLM
@@ -839,8 +877,10 @@ class WindowsDetectionTests(unittest.TestCase):
         self.assertAlmostEqual(g["vram_gb"], 96.0)
         rows = json.dumps([{"DriverDesc": "AMD Radeon(TM) 8065S Graphics", "MatchingDeviceId": "pci\\ven_1002&dev_9999"},
                            {"DriverDesc": "AMD Radeon RX 9070 XT", "MatchingDeviceId": "pci\\ven_1002&dev_7550"},
+                           {"DriverDesc": "AMD Radeon RX 9060 XT", "MatchingDeviceId": "pci\\ven_1002&dev_7590"},
                            {"DriverDesc": "AMD Radeon(TM) Graphics", "MatchingDeviceId": "pci\\ven_1002&dev_164e"}])
-        self.assertEqual([g["arch"] for g in maya.S.parse_display_adapters(rows)], ["gfx1151", "gfx1201", "unknown"])
+        self.assertEqual([g["arch"] for g in maya.S.parse_display_adapters(rows)],
+                         ["gfx1151", "gfx1201", "gfx1200", "unknown"])
         self.assertEqual(maya.S.parse_display_adapters(""), [])
         self.assertEqual(maya.S.parse_display_adapters("not json"), [])
 

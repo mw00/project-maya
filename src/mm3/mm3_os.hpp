@@ -163,4 +163,19 @@ inline size_t populate_mapped(const void* p, size_t n, const std::atomic<bool>& 
     return c > (const uint8_t*) p ? (size_t) (c - (const uint8_t*) p) : 0;
 }
 
+/// A looked-up row is 1-2 KB at a hashed offset of a mapping (an Engram table): readahead off, so a fault pulls the
+/// page asked for and no window beside it (MADV_RANDOM on Linux; a hint, a failure changes nothing).
+inline void random_mapped(const void* p, size_t n) {
+#if defined(__linux__)
+    const uintptr_t pg = 4096;
+    if (p == nullptr || n < pg) return;
+    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) (pg - 1);
+    const uintptr_t b = (uintptr_t) p + n;
+    (void) ::madvise((void*) a, (size_t) (b - a), MADV_RANDOM);
+#else
+    (void) p;
+    (void) n;
+#endif
+}
+
 }  // namespace mm3::os

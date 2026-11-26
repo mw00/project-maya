@@ -16,6 +16,8 @@
 
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
+#include "hy4_handoff.hpp"
+#include "hy4_engram.hpp"
 #include "hy4_tp.hpp"
 #include "hy4_pack.hpp"
 #include "hy4_plan.hpp"
@@ -518,11 +520,14 @@ struct Model::Impl {
     std::vector<Layer> L;
     std::vector<Gpu> G;
     int head_gpu = 0;
-    // the layer split's hand-offs from G[a] to G[b]: xfer[a * G.size() + b] (peer_setup) - kXPeer a peer copy (peer
-    // access on, a test copy arrived right), kXDriver the same call without peer access (the driver's own route, its
-    // test copy right), kXHost through pinned host memory (hand_off)
-    static constexpr uint8_t kXPeer = 0, kXDriver = 1, kXHost = 2;
+    // the layer split's hand-offs from G[a] to G[b]: xfer[a * G.size() + b] (peer_setup) - kXPeer a peer copy on
+    // b's stream (peer access on, a test copy arrived right), kXDriver the same without peer access (the driver's
+    // own route, its test copy right), kXSrc / kXSync the peer ways probed when the destination's stream does not
+    // land (HY4_HANDOFF), kXHost through pinned host memory (hand_off)
+    static constexpr uint8_t kXPeer = 0, kXDriver = 1, kXHost = 2, kXSrc = 3, kXSync = 4;
     std::vector<uint8_t> xfer;
+    bool handoff_log = false;   // HY4_HANDOFF_LOG: one line per real copy
+    int handoff_check = 0;      // HY4_HANDOFF_CHECK: sample the first n real copies
     int n_bad_drafts = 0;   // (drafts stopped at a step with no top token: its logits not finite - #1084)
     Mat out;
     float *out_norm = nullptr, *hh_fn = nullptr, *hh_base = nullptr, *hh_scale = nullptr;
@@ -4135,6 +4140,9 @@ struct Model::Impl {
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+            // a looked-up row is 1-2 KB at a hashed offset: the kernel's readahead pulls windows of pages no one
+            // asked for (the DS4 Engram reader's MAYA_DS4_EG_RANDOM, here on by default; HY4_EG_RANDOM=0 keeps it)
+            if (engram::random_enabled(std::getenv("HY4_EG_RANDOM"))) mm3::os::random_mapped(eg_table, eg_bytes);
             if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
             if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
             if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
@@ -7914,12 +7922,62 @@ struct Model::Impl {
               "; CUDA reports a kernel's fault at a later launch - CUDA_LAUNCH_BLOCKING=1 names the kernel that faulted)"
               " - then: " + err;
     }
+    // Does a peer copy from pa.x to pb.x land, queued `how`?  pat/back are the reused pattern and readback (idle
+    // until the first forward).  On a recoverable failure reason says why and err stays empty; a fatal CUDA error
+    // goes into err, as CK does elsewhere.
+    bool peer_test_copy(Gpu& pa, Gpu& pb, size_t nb, uint8_t how, const std::vector<uint32_t>& pat,
+                        std::vector<uint32_t>& back, std::string& reason, std::string& err) {
+        const cudaStream_t q = how == kXSrc ? pa.s : pb.s;   // (CUDA's rule is b's stream; ROCm's pairs can need a's)
+        CK(cudaSetDevice(pa.dev));
+        CK(cudaMemcpy(pa.x, pat.data(), nb, cudaMemcpyHostToDevice));
+        CK(cudaSetDevice(pb.dev));
+        CK(cudaMemsetAsync(pb.x, 0, nb, pb.s));
+        CK(cudaStreamSynchronize(pb.s));
+        CK(cudaSetDevice(how == kXSrc ? pa.dev : pb.dev));
+        const cudaError_t ce = how == kXSync ? cudaMemcpyPeer(pb.x, pb.dev, pa.x, pa.dev, nb)
+                                             : cudaMemcpyPeerAsync(pb.x, pb.dev, pa.x, pa.dev, nb, q);
+        cudaError_t se = cudaSuccess;
+        if (ce == cudaSuccess && how != kXSync) {
+            const double t0 = now_s();
+            while ((se = cudaStreamQuery(q)) == cudaErrorNotReady && now_s() - t0 < 20.0) std::this_thread::yield();
+        }
+        (void) cudaGetLastError();
+        size_t wrong = pat.size();
+        if (ce == cudaSuccess && se == cudaSuccess) {
+            CK(cudaSetDevice(pb.dev));
+            if (cudaMemcpy(back.data(), pb.x, nb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                wrong = 0;
+                for (size_t i = 0; i < pat.size(); ++i) wrong += back[i] != pat[i];
+            }
+        }
+        (void) cudaGetLastError();
+        CK(cudaSetDevice(pb.dev));
+        if (se == cudaErrorNotReady) {
+            err = "a test copy from GPU " + std::to_string(pa.dev) + " to GPU " + std::to_string(pb.dev) +
+                  " did not finish in 20 s (peer copies hang on this PC: HY4_HOST_STAGE=1 hands over "
+                  "through host memory)";
+            return false;
+        }
+        if (ce != cudaSuccess || se != cudaSuccess) {
+            reason = std::string("a test copy failed: ") + cudaGetErrorString(ce != cudaSuccess ? ce : se);
+            return false;
+        }
+        if (wrong != 0) {
+            char m[160];
+            std::snprintf(m, sizeof m, "a test copy arrived wrong: %zu of %zu words", wrong, pat.size());
+            reason = m;
+            return false;
+        }
+        return true;
+    }
     // The layer split's hand-offs between GPUs (a layer's GPU to the next layer's, the last to the head's): a peer copy
     // only where the driver offers peer access, the IOMMU translates neither GPU's DMA (iommu_translates - #1100) and a
     // test copy over the very call arrives right (a PHB pair took peer copies and delivered 99.6% of the bytes wrong);
     // else through pinned host memory (hand_off), the same bytes.  HY4_HOST_STAGE=1: host memory for every hand-off;
-    // HY4_PEER=1: peer copies tried (and tested) where the IOMMU translates too.  Tensor parallel hands nothing over
-    // between GPUs (the host sums): no peer access there.
+    // HY4_PEER=1: peer copies tried (and tested) where the IOMMU translates too.  HY4_HANDOFF: 0 / off keeps exactly
+    // that, auto (the default) probes the source's stream and a blocking copy when the destination's does not land,
+    // src / sync / peer force one way, host forces staging; HY4_HANDOFF_LOG and _CHECK watch the real copies.
+    // Tensor parallel hands nothing over between GPUs (the host sums): no peer access there.
     bool peer_setup(std::string& err) {
         const size_t n = G.size();
         xfer.assign(n * n, kXDriver);
@@ -7934,7 +7992,10 @@ struct Model::Impl {
         if (cur >= 0 && cur != head_gpu) used[(size_t) cur * n + (size_t) head_gpu] = 1;
         const char* hs = std::getenv("HY4_HOST_STAGE");
         const char* hp = std::getenv("HY4_PEER");
-        const bool force_host = hs && std::atoi(hs) != 0, force_peer = hp && std::atoi(hp) != 0;
+        const handoff::Mode mode = handoff::mode_from(std::getenv("HY4_HANDOFF"));
+        const bool force_host = handoff::host_forced(hs, mode), force_peer = handoff::peer_forced(hp);
+        handoff_log = handoff::log_enabled(std::getenv("HY4_HANDOFF_LOG"));
+        handoff_check = handoff::check_count(std::getenv("HY4_HANDOFF_CHECK"));
         std::vector<char> smmu(n, 0);
         for (size_t i = 0; i < n; ++i) smmu[i] = !force_host && !force_peer && iommu_translates(G[i].dev);
         std::vector<std::string> why(n * n);   // (a hand-off through host memory: why)
@@ -7962,6 +8023,7 @@ struct Model::Impl {
         const size_t full = sizeof(float) * (size_t) Tc * (size_t) g.hc * (size_t) g.n_embd;
         const size_t nb = std::min<size_t>((size_t) 4 << 20, full) & ~(size_t) 3;
         std::vector<uint32_t> pat(nb / 4), back(nb / 4);
+        std::vector<uint8_t> alt(n * n, 0);   // (a peer way other than the destination's stream that landed)
         for (size_t a = 0; a < n; ++a)
             for (size_t b = 0; b < n; ++b) {
                 if (!used[a * n + b] || !why[a * n + b].empty()) continue;
@@ -7972,39 +8034,24 @@ struct Model::Impl {
                     continue;
                 }
                 for (size_t i = 0; i < pat.size(); ++i) pat[i] = (uint32_t) (i * 2654435761u) ^ (0x9e3779b9u + (uint32_t) (a * 64 + b));
-                CK(cudaSetDevice(pa.dev));
-                CK(cudaMemcpy(pa.x, pat.data(), nb, cudaMemcpyHostToDevice));
-                CK(cudaSetDevice(pb.dev));
-                CK(cudaMemsetAsync(pb.x, 0, nb, pb.s));
-                CK(cudaStreamSynchronize(pb.s));
-                const cudaError_t ce = cudaMemcpyPeerAsync(pb.x, pb.dev, pa.x, pa.dev, nb, pb.s);
-                cudaError_t se = cudaSuccess;
-                if (ce == cudaSuccess) {
-                    const double t0 = now_s();
-                    while ((se = cudaStreamQuery(pb.s)) == cudaErrorNotReady && now_s() - t0 < 20.0) std::this_thread::yield();
-                    if (se == cudaErrorNotReady) {
-                        err = "a test copy from GPU " + std::to_string(pa.dev) + " to GPU " + std::to_string(pb.dev) +
-                              " did not finish in 20 s (peer copies hang on this PC: HY4_HOST_STAGE=1 hands over "
-                              "through host memory)";
-                        return false;
+                std::string reason;
+                if (!handoff::only_alternative(mode) &&
+                    peer_test_copy(pa, pb, nb, kXPeer, pat, back, reason, err)) continue;
+                if (!err.empty()) return false;
+                if (handoff::probes_alternatives(mode)) {
+                    for (uint8_t how : {kXSrc, kXSync}) {
+                        reason.clear();
+                        if (peer_test_copy(pa, pb, nb, how, pat, back, reason, err)) {
+                            alt[a * n + b] = how;
+                            break;
+                        }
+                        if (!err.empty()) return false;
                     }
                 }
-                (void) cudaGetLastError();
-                size_t wrong = pat.size();
-                if (ce == cudaSuccess && se == cudaSuccess &&
-                    cudaMemcpy(back.data(), pb.x, nb, cudaMemcpyDeviceToHost) == cudaSuccess) {
-                    wrong = 0;
-                    for (size_t i = 0; i < pat.size(); ++i) wrong += back[i] != pat[i];
-                }
-                (void) cudaGetLastError();
-                if (wrong == 0) continue;
-                char m[160];
-                if (ce != cudaSuccess || se != cudaSuccess)
-                    std::snprintf(m, sizeof m, "a test copy failed: %s", cudaGetErrorString(ce != cudaSuccess ? ce : se));
-                else
-                    std::snprintf(m, sizeof m, "a test copy arrived wrong: %zu of %zu words", wrong, pat.size());
-                why[a * n + b] = m;
-                if (peer[a * n + b]) {   // (peer access off between the two: neither way peer copies then)
+                if (alt[a * n + b] != 0) continue;   // (a working peer way: still no host staging)
+                why[a * n + b] = reason.empty() ? "a test copy arrived wrong" : reason;
+                if (mode == handoff::Mode::kOff || mode == handoff::Mode::kPeer) {
+                    // (as before: peer access off between the two, neither way peer copies then)
                     const size_t lo = std::min(a, b), hi = std::max(a, b);
                     CK(cudaSetDevice(G[hi].dev));
                     (void) cudaDeviceDisablePeerAccess(G[lo].dev);
@@ -8030,10 +8077,14 @@ struct Model::Impl {
             for (size_t b = 0; b < n; ++b) {
                 if (!used[a * n + b]) continue;
                 const bool host = !why[a * n + b].empty();
-                xfer[a * n + b] = host ? kXHost : peer[a * n + b] ? kXPeer : kXDriver;
+                const uint8_t route = host ? kXHost : alt[a * n + b] ? alt[a * n + b] :
+                                      peer[a * n + b] ? kXPeer : kXDriver;
+                xfer[a * n + b] = route;
                 say += (say.empty() ? "" : ", ") + std::string("CUDA") + std::to_string(G[a].dev) + " -> CUDA" +
                        std::to_string(G[b].dev) + (host ? " through host memory (" + why[a * n + b] + ")" :
-                                                   peer[a * n + b] ? " peer copy (tested)" : " driver copy (tested)");
+                                                   route == kXSrc ? " peer copy on the source's stream (tested)" :
+                                                   route == kXSync ? " blocking peer copy (tested)" :
+                                                   route == kXPeer ? " peer copy (tested)" : " driver copy (tested)");
                 if (!host) continue;
                 Gpu& pa = G[a];
                 Gpu& pb = G[b];
@@ -8054,38 +8105,85 @@ struct Model::Impl {
                     pb.ho_b = piece;
                 }
             }
+        if (handoff::probes_alternatives(mode)) {
+            // (with alternatives a failing direction must not drop peer access the other direction still uses)
+            for (size_t i = 0; i + 1 < n; ++i) {
+                const size_t f = i * n + i + 1, r = (i + 1) * n + i;
+                if (!peer[f] || xfer[f] != kXHost || (used[r] && xfer[r] != kXHost)) continue;
+                CK(cudaSetDevice(G[i + 1].dev));
+                (void) cudaDeviceDisablePeerAccess(G[i].dev);
+                (void) cudaGetLastError();
+                peer[f] = peer[r] = 0;
+            }
+        }
         if (!say.empty()) info.push_back("INFO hand-offs between GPUs: " + say);
         return true;
     }
     // One of the layer split's hand-offs, G[a]'s rows to G[b] (b's device current after it): a's queued work waited for
-    // on the host, as it always was, then a peer copy on b's stream - or through host memory (xfer kXHost) in pieces of
-    // a pinned half each, a's stream copying a piece out once that half's last piece is in, b's copying it in once it is
-    // out (a's next piece out beside b's copy in)
+    // on the host, as it always was, then the peer way probed in peer_setup - a copy on b's stream, one on a's stream
+    // (ROCm pairs that need it), a blocking copy, or pinned host memory (xfer kXHost) in pieces of a pinned half each,
+    // a's stream copying a piece out once that half's last piece is in, b's copying it in once it is out
     bool hand_off(int a, int b, float* dst, const float* src, size_t bytes, std::string& err) {
         Gpu& pa = G[(size_t) a];
         Gpu& pb = G[(size_t) b];
+        const uint8_t way = xfer.empty() ? kXDriver : xfer[(size_t) a * G.size() + (size_t) b];
         CK(cudaStreamSynchronize(pa.s));
-        if (xfer.empty() || xfer[(size_t) a * G.size() + (size_t) b] != kXHost) {
-            CK(cudaMemcpyPeerAsync(dst, pb.dev, src, pa.dev, bytes, pb.s));
-            return true;
-        }
-        const char* s8 = (const char*) src;
-        char* d8 = (char*) dst;
-        size_t piece = 0;
-        for (size_t off = 0; off < bytes; off += pb.ho_b, ++piece) {
-            const size_t nb = std::min(pb.ho_b, bytes - off);
-            const int h = (int) (piece & 1);
+        if (way == kXSrc) {
+            CK(cudaStreamSynchronize(pb.s));   // (b's earlier work is done before its rows are overwritten)
             CK(cudaSetDevice(pa.dev));
-            CK(cudaStreamWaitEvent(pa.s, pb.ho_in[h], 0));
-            CK(cudaMemcpyAsync(pb.ho_buf[h], s8 + off, nb, cudaMemcpyDeviceToHost, pa.s));
-            CK(cudaEventRecord(pa.ho_out, pa.s));
-            k::submit(pa.s);
+            CK(cudaMemcpyPeerAsync(dst, pb.dev, src, pa.dev, bytes, pa.s));
+            CK(cudaStreamSynchronize(pa.s));   // (the rows are there before b's first kernel is queued)
             CK(cudaSetDevice(pb.dev));
-            CK(cudaStreamWaitEvent(pb.s, pa.ho_out, 0));
-            CK(cudaMemcpyAsync(d8 + off, pb.ho_buf[h], nb, cudaMemcpyHostToDevice, pb.s));
-            CK(cudaEventRecord(pb.ho_in[h], pb.s));
+        } else if (way == kXSync) {
+            CK(cudaStreamSynchronize(pb.s));
+            CK(cudaSetDevice(pb.dev));
+            CK(cudaMemcpyPeer(dst, pb.dev, src, pa.dev, bytes));
+        } else if (way != kXHost) {
+            CK(cudaMemcpyPeerAsync(dst, pb.dev, src, pa.dev, bytes, pb.s));
+        } else {
+            const char* s8 = (const char*) src;
+            char* d8 = (char*) dst;
+            size_t piece = 0;
+            for (size_t off = 0; off < bytes; off += pb.ho_b, ++piece) {
+                const size_t nb = std::min(pb.ho_b, bytes - off);
+                const int h = (int) (piece & 1);
+                CK(cudaSetDevice(pa.dev));
+                CK(cudaStreamWaitEvent(pa.s, pb.ho_in[h], 0));
+                CK(cudaMemcpyAsync(pb.ho_buf[h], s8 + off, nb, cudaMemcpyDeviceToHost, pa.s));
+                CK(cudaEventRecord(pa.ho_out, pa.s));
+                k::submit(pa.s);
+                CK(cudaSetDevice(pb.dev));
+                CK(cudaStreamWaitEvent(pb.s, pa.ho_out, 0));
+                CK(cudaMemcpyAsync(d8 + off, pb.ho_buf[h], nb, cudaMemcpyHostToDevice, pb.s));
+                CK(cudaEventRecord(pb.ho_in[h], pb.s));
+            }
+            CK(cudaSetDevice(pb.dev));
         }
-        CK(cudaSetDevice(pb.dev));
+        if (handoff_log) {
+            static const char* kNames[] = {"the destination's stream", "the driver's route", "host memory",
+                                           "the source's stream", "a blocking copy"};
+            std::fprintf(stderr, "HANDOFF CUDA%d <- CUDA%d: %zu bytes, %s\n", pa.dev, pb.dev, bytes, kNames[way]);
+        }
+        if (handoff_check > 0) {
+            --handoff_check;
+            CK(cudaStreamSynchronize(pa.s));
+            CK(cudaStreamSynchronize(pb.s));
+            const size_t nn = std::min<size_t>(bytes / sizeof(float), (size_t) (1 << 20));
+            std::vector<float> a(nn), b(nn);
+            CK(cudaSetDevice(pa.dev));
+            CK(cudaMemcpy(a.data(), src, nn * sizeof(float), cudaMemcpyDeviceToHost));
+            CK(cudaSetDevice(pb.dev));
+            CK(cudaMemcpy(b.data(), dst, nn * sizeof(float), cudaMemcpyDeviceToHost));
+            size_t bad = 0, first = nn;
+            for (size_t i = 0; i < nn; ++i)
+                if (a[i] != b[i]) {
+                    if (bad++ == 0) first = i;
+                }
+            std::fprintf(stderr, "HANDOFF CUDA%d <- CUDA%d, %zu bytes: %zu of %zu sampled differ",
+                         pa.dev, pb.dev, bytes, bad, nn);
+            if (bad) std::fprintf(stderr, ", first %zu: %.6f vs %.6f", first, a[first], b[first]);
+            std::fprintf(stderr, "\n");
+        }
         return true;
     }
 
@@ -8132,7 +8230,8 @@ struct Model::Impl {
         //  or, with tensor parallel, beside the members' launches: window_tp)
         if (!eg_wait) {
             if (n_look >= 8 && T > W && !std::getenv("HY4_EG_SERIAL")) {
-                if (!eg_crew) eg_crew = std::make_unique<Crew>(8);
+                static const int eg_threads = engram::threads(std::getenv("HY4_EG_THREADS"));
+                if (!eg_crew) eg_crew = std::make_unique<Crew>(eg_threads);
                 const int nt = eg_crew->size();
                 eg_crew->start([&](int w) {
                     for (int i = w; i < n_look; i += nt) engram_row(i / T, i % T, p0);
