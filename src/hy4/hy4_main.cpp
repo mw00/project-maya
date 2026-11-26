@@ -49,11 +49,11 @@
 // The VRAM plan counts the room of the drafter the start loads, none without one (every byte to the routed experts):
 // within a start the drafts on and off (a request's spec) give the same answers; a start with another drafter, or
 // none, plans otherwise and may word an answer differently.  A drafter whose room would change more than where
-// experts sit (the cache's rows, the dense prompt span, KV streaming, the GPUs' layout) is not loaded (said); an auto
-// prompt chunk is the one beside its room.  --drafting auto (the server's): no drafting, the MTP block or the DFly2
-// drafter - whichever this PC decodes fastest, each loaded once with its own plan and timed at the first start (before
-// READY), remembered per PC, GPUs, model and options (HY4_DRAFT_FILE; pick_drafting); on: the faster drafter of the
-// two; off / mtp / dfly2 (--mtp, --dfly2): by hand, not measured.
+// experts sit (the cache's rows, KV streaming, the GPUs' layout) is not loaded (said); an auto prompt chunk and the
+// prompts' dense span are the ones beside its room.  --drafting auto (the server's): no drafting, the MTP block or the
+// DFly2 drafter - whichever this PC decodes fastest, each loaded once with its own plan and timed at the first start
+// (before READY), remembered per PC, GPUs, model and options (HY4_DRAFT_FILE; pick_drafting); on: the faster drafter of
+// the two; off / mtp / dfly2 (--mtp, --dfly2): by hand, not measured.
 //
 // --serve speaks what serve/server.py's StrataEngine expects (maya-mm3's protocol, one conversation): INFO lines, then
 // `READY <context> stop`; per request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms>
