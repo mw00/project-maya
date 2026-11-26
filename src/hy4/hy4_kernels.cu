@@ -1486,6 +1486,195 @@ __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ 
     }
 }
 #endif
+#if !defined(MAYA_USE_HIP)
+// A prompt's attention in one pass on NVIDIA's tensor cores (Volta on; HY4_ATTN_FLASH=0: the two GEMMs and the softmax
+// between them, attn_prompt): grid (32 heads, token), 8 warps.  A block holds one token's 32 heads' queries (F16) and
+// walks that token's keys - its window's positions (keys null: lo .. p, lo = p - window + 1) or its list (keys[t]
+// .. + nk[t]: the indexer's picks) - 32 rows at a time staged as F16 (Q8 rows dequantized to attn_prompt's values):
+// the 32 x 32 scores (WMMA, the 36 k-steps split over two warps a tile, summed in a fixed order), the online softmax
+// (the head's sink the running maximum's start, its term the sum's), the probabilities F16 and the value sums
+// (WMMA, each warp 4 of the 32 output tiles of 16 dimensions for both groups of 16 heads, rescaled a row at a time by
+// way of a fragment of row numbers - the accumulators' layout, whatever the architecture's).  The precision of
+// attn_prompt's (F16 queries and probabilities, F32 sums); the scores never leave shared memory, and a token of an
+// indexed layer reads its picks alone where attn_prompt multiplies every key of the span and masks.
+constexpr int kFlLd = 584, kFlLdP = 40;
+constexpr size_t kFlSmem = (size_t) 2 * 32 * kFlLd * 2 + (size_t) 8 * 256 * 4 + (size_t) 32 * kFlLdP * 2 +
+                           (size_t) 3 * 32 * 4 + (size_t) 256 * 4;
+template <bool Q8>
+__global__ void __launch_bounds__(256) attn_flash_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
+                                                         int ring, int rb, const int* __restrict__ keys, int ldk,
+                                                         const int* __restrict__ nk, const int* __restrict__ pos,
+                                                         int window, float scale, const float* __restrict__ sinks,
+                                                         float* __restrict__ out) {
+    namespace wm = nvcuda::wmma;
+    extern __shared__ __align__(128) uint8_t smem[];
+    __half* Qs = (__half*) smem;                     // [32][kFlLd]
+    __half* Ks = Qs + 32 * kFlLd;                    // [32][kFlLd]
+    float* Sp = (float*) (Ks + 32 * kFlLd);          // [2 halves of K][4 tiles][256]
+    __half* Ps = (__half*) (Sp + 8 * 256);           // [32][kFlLdP]
+    float* mrow = (float*) (Ps + 32 * kFlLdP);
+    float* lrow = mrow + 32;
+    float* arow = lrow + 32;
+    float* rmap = arow + 32;                         // [16][16]: each element its row
+    const int hb = blockIdx.x * 32, t = blockIdx.y, tid = threadIdx.x, wp = tid >> 5;
+    int n, lo = 0;
+    const int* kl = nullptr;
+    if (keys) {
+        n = nk[t];
+        kl = keys + (size_t) t * ldk;
+    } else {
+        const int p = pos[t];
+        lo = window > 0 ? max(0, p - window + 1) : 0;
+        n = p - lo + 1;
+    }
+    for (int i = tid; i < 32 * 576; i += 256) {
+        const int r = i / 576, d = i % 576;
+        Qs[r * kFlLd + d] = __float2half_rn(q[((size_t) t * H + hb + r) * 576 + d]);
+    }
+    if (tid < 32) {
+        mrow[tid] = sinks ? sinks[hb + tid] : -INFINITY;
+        lrow[tid] = sinks ? 1.0f : 0.0f;   // (the sink's term: exp(sink - sink))
+    }
+    rmap[tid] = (float) (tid >> 4);
+    __syncthreads();
+    wm::fragment<wm::accumulator, 16, 16, 16, float> frow;
+    wm::load_matrix_sync(frow, rmap, 16, wm::mem_row_major);
+    wm::fragment<wm::accumulator, 16, 16, 16, float> ov[2][4];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int nj = 0; nj < 4; ++nj) wm::fill_fragment(ov[mi][nj], 0.0f);
+    const int ti = wp & 3, kh = wp >> 2, smi = ti >> 1, sni = ti & 1;
+    // (the next 32 rows' bytes fetched into registers while this tile's sums run: 9 words a thread, a Q8 word its 8
+    //  int8 values and their block's scale, dequantized as it is stored)
+    uint4 pre[9];
+    auto fetch = [&](int kf) {
+        const int ntf = min(32, n - kf);
+#pragma unroll
+        for (int j = 0; j < 9; ++j) {
+            const int i = tid + 256 * j, r = i / 72, w = i % 72;
+            uint4 u = make_uint4(0u, 0u, 0u, 0u);
+            if (r < ntf) {
+                const int p = kl ? kl[kf + r] : lo + kf + r, row = ring > 0 ? p % ring : p;
+                if (!Q8) {
+                    u = ((const uint4*) cache_v)[(size_t) row * 72 + w];
+                } else {
+                    const uint8_t* rp = (const uint8_t*) cache_v + (size_t) row * rb;
+                    if (w < 64) {
+                        const uint2 b = *(const uint2*) (rp + 8 * w);
+                        u.x = b.x;
+                        u.y = b.y;
+                        u.z = *(const uint16_t*) (rp + 512 + 2 * (w >> 2));
+                    } else {
+                        u = *(const uint4*) (rp + 544 + 16 * (w - 64));
+                    }
+                }
+            }
+            pre[j] = u;
+        }
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (int j = 0; j < 9; ++j) {
+            const int i = tid + 256 * j, r = i / 72, w = i % 72;
+            uint4 u = pre[j];
+            if (Q8 && w < 64) {
+                const float d = __half2float(__ushort_as_half((uint16_t) u.z));
+                const uint32_t bw[2] = {u.x, u.y};
+                __half2 o[4];
+#pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    o[c] = __floats2half2_rn(d * (float) (int8_t) ((bw[c >> 1] >> (16 * (c & 1))) & 0xff),
+                                             d * (float) (int8_t) ((bw[c >> 1] >> (16 * (c & 1) + 8)) & 0xff));
+                u = *(const uint4*) o;
+            }
+            *((uint4*) (Ks + r * kFlLd) + w) = u;
+        }
+    };
+    fetch(0);
+    for (int k0 = 0; k0 < n; k0 += 32) {
+        const int nt = min(32, n - k0);
+        store();
+        __syncthreads();
+        if (k0 + 32 < n) fetch(k0 + 32);
+        {   // the scores: warp (tile ti, half kh of the 36 k-steps)
+            wm::fragment<wm::accumulator, 16, 16, 16, float> sc;
+            wm::fill_fragment(sc, 0.0f);
+#pragma unroll 6
+            for (int j = 0; j < 18; ++j) {
+                const int d0 = 16 * (kh * 18 + j);
+                wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> fa;
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> fb;
+                wm::load_matrix_sync(fa, Qs + smi * 16 * kFlLd + d0, kFlLd);
+                wm::load_matrix_sync(fb, Ks + sni * 16 * kFlLd + d0, kFlLd);
+                wm::mma_sync(sc, fa, fb, sc);
+            }
+            wm::store_matrix_sync(Sp + (kh * 4 + ti) * 256, sc, 16, wm::mem_row_major);
+        }
+        __syncthreads();
+        {   // thread (row tid / 8, keys 4 (tid % 8) .. + 4): the online softmax
+            const int r = tid >> 3, c0 = (tid & 7) * 4, mi = r >> 4, rr = r & 15;
+            float v[4], mx = -INFINITY;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int key = c0 + c, tt = mi * 2 + (key >> 4), at = rr * 16 + (key & 15);
+                const float sv = (Sp[tt * 256 + at] + Sp[(4 + tt) * 256 + at]) * scale;
+                v[c] = key < nt ? sv : -INFINITY;
+                mx = fmaxf(mx, v[c]);
+            }
+#pragma unroll
+            for (int o = 4; o >= 1; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = mrow[r], m_new = fmaxf(m_old, mx);
+            const float alpha = m_old == m_new ? 1.0f : expf(m_old - m_new);
+            float sum = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float pv = v[c] == -INFINITY ? 0.0f : expf(v[c] - m_new);
+                sum += pv;
+                Ps[r * kFlLdP + c0 + c] = __float2half_rn(pv);
+            }
+#pragma unroll
+            for (int o = 4; o >= 1; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                mrow[r] = m_new;
+                lrow[r] = lrow[r] * alpha + sum;
+                arow[r] = alpha;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+            for (int nj = 0; nj < 4; ++nj)
+                for (int i = 0; i < ov[mi][nj].num_elements; ++i) ov[mi][nj].x[i] *= arow[mi * 16 + (int) frow.x[i]];
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> pa;
+                wm::load_matrix_sync(pa, Ps + mi * 16 * kFlLdP + kk * 16, kFlLdP);
+#pragma unroll
+                for (int nj = 0; nj < 4; ++nj) {
+                    wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::row_major> vb;
+                    wm::load_matrix_sync(vb, Ks + kk * 16 * kFlLd + (wp * 4 + nj) * 16, kFlLd);
+                    wm::mma_sync(ov[mi][nj], pa, vb, ov[mi][nj]);
+                }
+            }
+        }
+        __syncthreads();   // (Ks, Ps: the next keys')
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int nj = 0; nj < 4; ++nj) {
+            for (int i = 0; i < ov[mi][nj].num_elements; ++i) {
+                const float l = lrow[mi * 16 + (int) frow.x[i]];
+                ov[mi][nj].x[i] = l > 0.0f ? ov[mi][nj].x[i] / l : 0.0f;
+            }
+            wm::store_matrix_sync(out + ((size_t) t * H + hb + mi * 16) * 512 + (wp * 4 + nj) * 16, ov[mi][nj], 512,
+                                  wm::mem_row_major);
+        }
+}
+#endif
 // a block a (t, head): the chunks merged with the sink, 512 threads (a value dim each)
 __global__ void attn_combine_kernel(int H, int nchunk, int kc, const int* __restrict__ nk,
                                     const float* __restrict__ sinks, const float* __restrict__ ws,
@@ -2946,6 +3135,41 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     check("attention");
     attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out, q8o);
     check("attn_combine");
+}
+bool attn_flash(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
+                int ldk, const int* nk, const int* pos, int window, float scale, const float* sinks, float* out,
+                cudaStream_t s, bool q8) {
+#if defined(MAYA_USE_HIP)
+    (void) q, (void) T, (void) H, (void) kv_lora, (void) n_rot, (void) cache, (void) ring, (void) keys, (void) ldk;
+    (void) nk, (void) pos, (void) window, (void) scale, (void) sinks, (void) out, (void) s, (void) q8;
+    return false;
+#else
+    static const bool off = std::getenv("HY4_ATTN_FLASH") && std::getenv("HY4_ATTN_FLASH")[0] == '0';
+    if (off || T <= 0 || kv_lora != 512 || n_rot != 64 || H % 32 != 0) return false;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int major = 0;
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        major >= 7 &&
+                        cudaFuncSetAttribute(attn_flash_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int) kFlSmem) == cudaSuccess &&
+                        cudaFuncSetAttribute(attn_flash_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int) kFlSmem) == cudaSuccess;
+        if (!ok) (void) cudaGetLastError();
+        v = ok ? 2 : 1;
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    if (v != 2) return false;
+    const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
+    const dim3 grid((unsigned) (H / 32), (unsigned) T);
+    if (q8) attn_flash_kernel<true><<<grid, 256, kFlSmem, s>>>(q, H, cache, ring, rb, keys, ldk, nk, pos, window, scale, sinks, out);
+    else attn_flash_kernel<false><<<grid, 256, kFlSmem, s>>>(q, H, cache, ring, rb, keys, ldk, nk, pos, window, scale, sinks, out);
+    check("attn_flash");
+    return true;
+#endif
 }
 bool attn_wmma_on() {
 #if defined(MAYA_USE_HIP)

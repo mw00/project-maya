@@ -130,6 +130,13 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys);
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
                float* out, cudaStream_t s, bool q8 = false, Q8Out q8o = {});
+/// A prompt's attention in one pass on NVIDIA's tensor cores (attn_flash_kernel): out[t][h] (512 values) for T tokens
+/// at positions pos[t], each over its window (keys null: the `window` positions up to its own; window 0: every one
+/// from 0) or its list keys[t][0 .. nk[t]) (positions); the cache's rows `ring` (0: a row a position), Q8 or F16; the
+/// heads' sinks.  false: not taken here (AMD, HY4_ATTN_FLASH=0, a shape it does not take) - the caller's path instead
+bool attn_flash(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
+                int ldk, const int* nk, const int* pos, int window, float scale, const float* sinks, float* out,
+                cudaStream_t s, bool q8);
 /// The same over keys[t][0 .. nk[t]) on an RDNA GPU's matrix cores (gfx11; HY4_ATTN_WMMA=0 off, =1 also gfx12): a
 /// prompt's tokens past the dense span - within rounding of attention's sums (F16 products of a split query and
 /// split probabilities, in another order), so never a token window's.  false: not taken (another GPU, H not a

@@ -4850,6 +4850,15 @@ struct Model::Impl {
     struct Deq {
         int64_t base = -1, hi = 0;
     };
+    // (attn_flash on the prompt path: NVIDIA, HY4_ATTN_FLASH=0 off)
+    static bool flash_on() {
+#if defined(MAYA_USE_HIP)
+        return false;
+#else
+        static const bool on = !(std::getenv("HY4_ATTN_FLASH") && std::getenv("HY4_ATTN_FLASH")[0] == '0');
+        return on;
+#endif
+    }
     // (attn_prompt / attn_sparse: the keys padded to a multiple of 8 - HY4_ATTN_PAD8=0: as before)
     static bool pad8() {
         static const bool on = !(std::getenv("HY4_ATTN_PAD8") && std::getenv("HY4_ATTN_PAD8")[0] == '0');
@@ -5206,6 +5215,20 @@ struct Model::Impl {
                 k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
                              gp.knk + t0, si);
             };
+            // (NVIDIA, the prompt path: the sub-batches [fl_a, fl_b) waiting for one attn_flash launch - attend; a
+            //  sub-batch's 64 tokens are 64 blocks, too few for the GPU)
+            const bool fl_on = T > W && !l.wrapped() && flash_on();
+            int fl_a = 0, fl_b = 0;
+            auto flush_flash = [&] {
+                if (fl_b > fl_a &&
+                    !k::attn_flash(gp.qcat + (size_t) fl_a * H * KR, fl_b - fl_a, H, KL, R, l.kv, 0,
+                                   gp.keys + (size_t) fl_a * maxk, maxk, gp.knk + fl_a, gp.pos + fl_a, 0, scale, l.sinks,
+                                   gp.o + (size_t) fl_a * H * KL, s, kv_q8)) {
+                    err = "layer " + std::to_string(l.il) + ": attn_flash did not take the prompt's picks";
+                    ok = false;
+                }
+                fl_a = fl_b = 0;
+            };
             // (the matrix cores' attention, AMD: the sub-batches [wm_a, wm_b) waiting for one launch - attend)
             const bool wm_on = T > W && k::attn_wmma_on();
             int wm_a = 0, wm_b = 0;
@@ -5227,6 +5250,12 @@ struct Model::Impl {
                 const int dsl = df.on && (T <= W || t0 + ts == T) ? df.slot(l.il) : -1;
                 if (dsl >= 0) ok = ok && dfly_snap(dsl, gp, T, p0, err);
                 const int64_t span = p0 + t0 + ts;
+                if (fl_on) {   // (every token over its own picks: one launch for the sub-batches in a row)
+                    if (fl_b != t0) flush_flash();
+                    if (fl_b == fl_a) fl_a = t0;
+                    fl_b = t0 + ts;
+                    return;
+                }
                 if (T > W && sparse_attn && sparse_frac > 0 && span > kDenseBase && span <= dense_max &&
                     attn_sparse(l, gp, t0, ts, p0, scale, dq, (int) (span * sparse_frac / 100)))
                     return;
@@ -5341,6 +5370,7 @@ struct Model::Impl {
                 }
                 part(gp, "attn: the indexer's scores and picks", T);
                 for (int t0 = 0; t0 < T; t0 += kSub) attend(t0, std::min(kSub, T - t0));
+                flush_flash();
                 flush_wmma();
                 part(gp, "attn: gathering kernel", T);
             } else {
@@ -5348,7 +5378,11 @@ struct Model::Impl {
                     const int ts = std::min(kSub, T - t0);
                     // the picks are every pool the tokens see until a token sees more than `top` of them
                     const bool all = (p0 + t0 + ts - 1) / KP <= top;
-                    if (T > W && all && attn_prompt(l, gp, t0, ts, p0, true, scale, dq)) {
+                    if (T > W && all &&
+                        ((fl_on && k::attn_flash(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, 0, nullptr, 0,
+                                                 nullptr, gp.pos + t0, 0, scale, l.sinks, gp.o + (size_t) t0 * H * KL, s,
+                                                 kv_q8)) ||
+                         attn_prompt(l, gp, t0, ts, p0, true, scale, dq))) {
                         // (made there too where the DFly2 drafter needs this layer's picks: see attend)
                         const int dsl = df.on && t0 + ts == T ? df.slot(l.il) : -1;
                         if (dsl >= 0) {
@@ -5367,6 +5401,7 @@ struct Model::Impl {
                     attend(t0, ts);
                     part(gp, "attn: gathering kernel", T);
                 }
+                flush_flash();
                 flush_wmma();
                 part(gp, "attn: gathering kernel", T);
             }
@@ -5384,7 +5419,12 @@ struct Model::Impl {
                          df.ws ? df.ws : gp.ws, gp.o, s, kv_q8);
         } else {
             if (afork) CK(cudaStreamWaitEvent(s, gp.evj, 0));   // (the cache's rows and the gate: before the attention)
-            for (int t0 = 0; t0 < T; t0 += kSub) {
+            // (NVIDIA, the prompt path: the whole chunk's window attention in one attn_flash launch)
+            const bool fl = T > W && !l.wrapped() && flash_on() &&
+                            k::attn_flash(gp.qcat, T, H, KL, R, l.kv, l.ring, nullptr, 0, nullptr, gp.pos, g.n_swa, scale,
+                                          l.sinks, gp.o, s, kv_q8);
+            if (fl) part(gp, "attn: one pass (flash)", T);
+            for (int t0 = 0; !fl && t0 < T; t0 += kSub) {
                 const int ts = std::min(kSub, T - t0);
                 if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
                 const bool vo = vb8 && t0 == 0 && ts == T;
