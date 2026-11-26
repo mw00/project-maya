@@ -1373,6 +1373,28 @@ log says `ds4: CPU lane iq2_xs rows: AVX-512` when they apply.
 | --- | --- | --- |
 | `DS4_IQ512` | by CPU (above) | `1`: these rows for every call of the three types wherever the CPU runs them (tests: `ds4_iq512_rows_test` checks them against ggml-cpu); `0`: never |
 
+## DeepSeek: the CPU lane's MXFP4 rows on arm64 (NEON + dot product)
+
+A GGUF pack's MXFP4 experts (UD-Q8_K_XL's are all MXFP4) on the CPU lane run one of several tiers of rows: scalar,
+AVX2, AVX-VNNI, AVX-512 and AVX-512 VNNI on x86, and on arm64 `neondot` - NEON with the dot product (SDOT, FEAT_DotProd,
+which arm64 server and desktop CPUs from the Neoverse-N1 / Ampere Altra on have, and every Apple chip). A block's 16 code bytes become its 32 int8 values with two table lookups and are
+summed against the activation with two SDOTs; the partial sums are added in the scalar rows' order, so the answers are
+the same bits as the scalar tier's. Only that function is compiled for `armv8.2-a+dotprod`, and it runs only where
+the kernel reports the dot product (Linux: `HWCAP_ASIMDDP`), so the build's own `-march` does not matter for it.
+
+Where a CPU runs more than one vector tier, a start times each on the same small job (64 rows of a 5120-wide matrix,
+1, 2 and 4 tokens, in L2) and keeps the fastest; with one vector tier (arm64) that one is used. The log says which
+(`ds4: CPU lane: 64 threads, MXFP4 rows neondot (...)`, with `--verbose`). The choice never changes an answer.
+
+A Neoverse-N1 (Ampere Altra Max, 128 cores) with 2x RTX PRO 6000 Max-Q, DeepSeek-V4.1-Flash UD-Q8_K_XL (`--tp 2`,
+`--cpu-threads 64`), `--bench`, scalar against neondot: decode 27.4 -> 62.5 tokens/s (2.3x); prefill unchanged (a
+prompt's experts run on the GPUs). `build/ds4_mx_bench`, one thread, GB/s of weights: 0.27 -> 5.45 at 1 token
+(ggml-cpu's NEON dot: 5.27), 2.60 at 4 tokens (ggml-cpu 1.37); 82 GB/s on 16 threads (ggml-cpu 79.2).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_MX_TIER` | measured (above) | `scalar`, `avx2`, `avxvnni`, `avx512`, `avx512vnni` or `neondot`: that tier, if this CPU runs it (otherwise the default); nothing is measured. The same answers each way |
+
 ## DeepSeek: a GEMV call's int8 inputs rounded in one launch
 
 A GGUF pack's Q8_0 (and low-bit dense) GEMVs round their activations to int8 first. This used to take one small launch

@@ -30,6 +30,18 @@
 #define MX_TARGET(s)
 #endif
 #define MX_AVX2 MX_TARGET("avx2,fma")
+
+// arm64 (GCC / Clang): NEON with the dot product (FEAT_DotProd, SDOT), for the int8 path's one arm tier.  The file is
+// built for the baseline armv8-a; the tier's function alone is compiled for armv8.2-a+dotprod, and it runs only where
+// the kernel says the CPU has the dot product (Linux: HWCAP_ASIMDDP; Apple silicon has it on every chip).
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#define MX_ARM 1
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#define MX_NEONDOT __attribute__((target("arch=armv8.2-a+dotprod")))
+#endif
 // AVX-VNNI's intrinsics: GCC 11, Clang 12, MSVC 2022
 // (MAYA_NO_AVXVNNI: the toolchain's assembler has no AVX-VNNI - Rocky / RHEL 9's binutils 2.35 with any GCC, #535's
 //  "unsupported instruction `vpdpbusd'" - so the tier is left out and the AVX2 one runs; CMake checks it)
@@ -211,12 +223,80 @@ void rows_q_scalar(const uint8_t* w, size_t rb, int k, int r0, int r1, const voi
     }
 }
 
+#if defined(MX_ARM)
+// ---- the int8 path's arm64 tier: NEON + SDOT, rows_q_scalar's arithmetic in its order (the same bits).  A block: the
+// 16 code bytes -> 32 int8 values through one table lookup each half (low nibbles: values 0..15, high: 16..31, as the
+// activation's two 16-value halves), two SDOTs against the activation's halves -> the block's exact integer sum in 4
+// partials.  A group of 8 blocks: the even blocks' 4 sums (pairwise adds) are lanes 0..3 of rows_q_scalar's 8
+// accumulators, the odd blocks' lanes 4..7 (act_lane: block j of a group -> lane (j & 1) * 4 + (j >> 1)); each lane
+// takes fma(float(sum), weight scale x activation scale, acc) - the scale product rounded first, as the scalar tier's.
+// The row's sum is the scalar tier's ((A0 + A4) + (A2 + A6)) + ((A1 + A5) + (A3 + A7)).  k % 256 == 0 (whole groups).
+MX_NEONDOT void rows_neondot(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
+                             float* const* y, const float* tb, int pf) {
+    static const int8_t kLut[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const int8x16_t lut = vld1q_s8(kLut);
+    const uint8x16_t m4 = vdupq_n_u8(0x0f);
+    const int ng = k / kBlock / 8;
+    const size_t qb = act_qbytes(k);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* p = w + (size_t) r * rb;
+        float32x4_t ae[kMxCpuMaxN], ao[kMxCpuMaxN];   // lanes 0..3 (the even blocks), 4..7 (the odd ones)
+        for (int i = 0; i < n; ++i) ae[i] = ao[i] = vdupq_n_f32(0.0f);
+        for (int g = 0; g < ng; ++g, p += 8 * kBytes) {
+            if (pf > 0) __builtin_prefetch(p + pf);
+            int8x16_t wl[8], wh[8];
+            float sw[8];
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t* pb = p + j * kBytes;
+                sw[j] = tb[pb[0]];
+                const uint8x16_t q = vld1q_u8(pb + 1);
+                wl[j] = vqtbl1q_s8(lut, vandq_u8(q, m4));
+                wh[j] = vqtbl1q_s8(lut, vshrq_n_u8(q, 4));
+            }
+            const float swe_[4] = {sw[0], sw[2], sw[4], sw[6]}, swo_[4] = {sw[1], sw[3], sw[5], sw[7]};
+            const float32x4_t swe = vld1q_f32(swe_), swo = vld1q_f32(swo_);
+            for (int i = 0; i < n; ++i) {
+                const int8_t* a = (const int8_t*) act[i];
+                int32x4_t d[8];
+                for (int j = 0; j < 8; ++j) {
+                    const int b = 8 * g + j;
+                    const int8_t* lo = a + (b >> 2) * 128 + 16 * (b & 3);
+                    int32x4_t s = vdotq_s32(vdupq_n_s32(0), wl[j], vld1q_s8(lo));
+                    d[j] = vdotq_s32(s, wh[j], vld1q_s8(lo + 64));
+                }
+                const int32x4_t se = vpaddq_s32(vpaddq_s32(d[0], d[2]), vpaddq_s32(d[4], d[6]));
+                const int32x4_t so = vpaddq_s32(vpaddq_s32(d[1], d[3]), vpaddq_s32(d[5], d[7]));
+                const float* da = (const float*) (a + qb) + 8 * g;   // the group's activation scales, in lane order
+                ae[i] = vfmaq_f32(ae[i], vcvtq_f32_s32(se), vmulq_f32(swe, vld1q_f32(da)));
+                ao[i] = vfmaq_f32(ao[i], vcvtq_f32_s32(so), vmulq_f32(swo, vld1q_f32(da + 4)));
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            const float32x4_t v = vaddq_f32(ae[i], ao[i]);   // A0 + A4, A1 + A5, A2 + A6, A3 + A7
+            y[i][r - r0] = (vgetq_lane_f32(v, 0) + vgetq_lane_f32(v, 2)) + (vgetq_lane_f32(v, 1) + vgetq_lane_f32(v, 3));
+        }
+    }
+}
+bool arm_dotprod() {
+#if defined(__APPLE__)
+    return true;   // (every Apple silicon chip has FEAT_DotProd)
+#elif defined(__linux__) && defined(HWCAP_ASIMDDP)
+    return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#else
+    return false;
+#endif
+}
+#endif
+
 // ---- which tiers this CPU runs
 struct Cpu {
-    bool avx2 = false, vnni256 = false, avx512 = false, vnni512 = false, vbmi = false, bmi2 = false;
+    bool avx2 = false, vnni256 = false, avx512 = false, vnni512 = false, vbmi = false, bmi2 = false, neondot = false;
 };
 Cpu detect() {
     Cpu c;
+#if defined(MX_ARM)
+    c.neondot = arm_dotprod();
+#endif
 #if defined(MX_X86)
     unsigned r[4] = {0, 0, 0, 0};
     auto cpuid = [&](unsigned leaf, unsigned sub) {
@@ -357,6 +437,9 @@ bool mx_tier_ok(int t) {
 #endif
         case kMxAvx512: return cpu().avx512;
         case kMxAvx512Vnni: return cpu().vnni512;
+#if defined(MX_ARM)
+        case kMxNeonDot: return cpu().neondot;
+#endif
         default: return false;
     }
 }
@@ -367,6 +450,7 @@ const char* mx_tier_name(int t) {
         case kMxAvxVnni: return "avxvnni";
         case kMxAvx512: return "avx512";
         case kMxAvx512Vnni: return "avx512vnni";
+        case kMxNeonDot: return "neondot";
         default: return "?";
     }
 }
@@ -404,6 +488,13 @@ void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, con
         case kMxAvx512: return mx_avx512::rows(w, rb, k, r0, r1, act, n, y, tb, pf);
         case kMxAvx512Vnni: return mx_avx512vnni::rows(w, rb, k, r0, r1, act, n, y, tb, pf);
         default: break;
+    }
+#endif
+#if defined(MX_ARM)
+    if (t == kMxNeonDot) {
+        for (int i0 = 0; i0 < n; i0 += kMxCpuMaxN)
+            rows_neondot(w, rb, k, r0, r1, act + i0, std::min(kMxCpuMaxN, n - i0), y + i0, tb, pf);
+        return;
     }
 #endif
     (void) tb, (void) pf;
