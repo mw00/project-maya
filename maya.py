@@ -870,8 +870,8 @@ HY4_CHUNK_UP_GIB = 0.95
 # kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); the experts the card does not hold
 # stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 from 12 GB (the same
 # offload path under 24 GB) or a Halo / APU with 24 GB.
-# Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
-# by size and sha256; its drafter from Maya's own repo (download.json's "drafter", ik2_drafter_step).  Pictures: the
+# Its file: Maya's Inkling-2-Mini-Maya-L-NVFP4 (the looped layout the engine reads; an install of unsloth's UD-Q4_K_XL,
+# the file before, keeps it: ik2_quant_pick) - tools/ik2/download.json, pinned by revision, size and sha256; its drafter from Maya's own repo (download.json's "drafter", ik2_drafter_step).  Pictures: the
 # model's vision tower as the mmproj-Inkling-2-Mini-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
 # read by maya-vision (tools/vision/inkling2v_patch.py) only while a request's pictures are encoded - on the GPU where
 # its free VRAM holds the encoder, else on the CPU; never kept in VRAM, and the context's fit is the same.  What fits on
@@ -11613,21 +11613,48 @@ def set_up_qwen(a, prev: dict) -> Path | None:
 
 
 # ------------------------------------------------------------------------------------------------ Inkling-2-Mini
-def ik2_entry() -> dict:
-    """Inkling-2-Mini's download (tools/ik2/download.json: unsloth's UD-Q4_K_XL) as a MODELS entry (offer_download's
-    form)."""
+def ik2_entry(key: str | None = None) -> dict:
+    """Inkling-2-Mini's download as a MODELS entry (offer_download's form): tools/ik2/download.json's file set `key`
+    (maya_quants.IK2_QUANT, Maya's Maya-L, the table's top - the default; maya_quants.IK2_UNSLOTH, unsloth's
+    UD-Q4_K_XL, under its "earlier")."""
     man = read_json(IK2_MANIFEST)
+    key = key or Q.IK2_QUANT
+    if key != man.get("quant", Q.IK2_QUANT):
+        man = (man.get("earlier") or {}).get(key) or {}
     if not man.get("files") or not man.get("revision") or man.get("gguf") not in (man.get("files") or {}):
         fail(f"{IK2_MANIFEST} is missing or damaged", "restore it (git checkout tools/ik2/download.json)")
     src = man.get("sources") or {}
-    return {"about": f"{IK2_SHOWN} in unsloth's GGUF ({man.get('about', 'UD-Q4_K_XL')}); "
-                     f"{man.get('license', 'Apache 2.0')}",
+    whose = "Maya's GGUF" if key == Q.IK2_QUANT else "unsloth's GGUF"
+    return {"about": f"{IK2_SHOWN} in {whose} ({man.get('about', key)}); {man.get('license', 'Apache 2.0')}",
             "format": "ik2-gguf", "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
             "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
             "sources": {k: (v["repo"], v["revision"]) for k, v in src.items()},
             "source_folders": {k: v.get("folder", "") for k, v in src.items()},
-            "gguf": man["gguf"],
+            "gguf": man["gguf"], "quant": key, "whose": whose,
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ik2_quant_pick(a, d: Path, prev: dict) -> str:
+    """The file set the setup uses: the one --model names (inkling-2-mini-maya-l / inkling-2-mini-ud-q4_k_xl); else
+    the one the config before ran (a setup again keeps unsloth's UD-Q4_K_XL where it was set up so - nothing
+    downloaded again); else unsloth's GGUF where its whole file is already in the model's folder and Maya's is not;
+    else Maya's Maya-L (Q.IK2_QUANT)."""
+    asked = getattr(a, "ik2_quant", None)
+    if asked:
+        return asked
+    if config_family(prev) == "ik2" and (prev.get("installer") or {}).get("ik2_quant"):
+        was = Q.config_key(prev)
+        if was in (Q.IK2_QUANT, Q.IK2_UNSLOTH):
+            return was
+    if ik2_whole(ik2_entry(), d):
+        return Q.IK2_QUANT
+    return Q.IK2_UNSLOTH if ik2_whole(ik2_entry(Q.IK2_UNSLOTH), d) else Q.IK2_QUANT
+
+
+def ik2_whole(m: dict, d: Path) -> bool:
+    """Whether the file set m's GGUF is whole in d (its published size)."""
+    f = d / m["gguf"]
+    return f.is_file() and file_incomplete(m, f) is None
 
 
 def ik2_about() -> str:
@@ -11635,7 +11662,7 @@ def ik2_about() -> str:
     files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
     gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
     return ("thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
-            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA V100 / "
+            f"on its own engine, in Maya's GGUF, Maya-L ({gb}); NVIDIA V100 / "
             "RTX 20 and newer with 8 GB or more (experts that do not fit in VRAM stay in RAM: about 13 GB of RAM with an 8 GB card), or "
             "AMD RDNA 3 / 3.5 / 4 with 12 GB or more (the same: experts that do not fit stay in RAM) or a Halo / APU "
             "with 24 GB (every expert in memory); Linux only; tool calls, "
@@ -11657,17 +11684,18 @@ def ik2_dir(a, models: Path, prev: dict) -> Path:
 def ik2_model_step(a, d: Path, models: Path) -> Path | None:
     """The model's GGUF in d, downloaded when it is not there, then checked against its published sha256; None when
     it was not downloaded."""
-    step(5, f"the model ({Q.shown('ik2', Q.IK2_QUANT)})")
-    m = ik2_entry()
+    key = getattr(a, "ik2_quant", None) or Q.IK2_QUANT   # (ik2_quant_pick's)
+    step(5, f"the model ({Q.shown('ik2', key)})")
+    m = ik2_entry(key)
     files = [d / m["gguf"]]
     missing = [f for f in files if file_incomplete(m, f)]
-    if missing and not offer_download(a, Q.shown("ik2", Q.IK2_QUANT, m["download_gb"]), d, files, m):
+    if missing and not offer_download(a, Q.shown("ik2", key, m["download_gb"]), d, files, m):
         return None
     for f in files:                                    # (a file that was already there: checked once, then remembered)
         if not sha256_checked(f, m["sha256"][f.name]):
             fail(f"{f.name}: the sha256 does not match the published one - still being downloaded, or damaged",
                  f"let the download finish, or delete the file and run {ME} --download-model")
-    ok(f"{Q.shown('ik2', Q.IK2_QUANT)}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    ok(f"{Q.shown('ik2', key)}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: every start copies the whole model from it into VRAM - an NVMe SSD "
              "starts it in seconds (--models-dir)")
@@ -11857,7 +11885,8 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     how = ik2_drafting(a)
     args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
-    inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}
+    key = getattr(a, "ik2_quant", None) or Q.IK2_QUANT   # (ik2_quant_pick's)
+    inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", key)], "ik2_quant": key, "drafting": how}
     if pc["gpus"][0].get("ik2_vram_gb"):              # (Windows: the card as CUDA gets it, measured - the Models page)
         inst["ik2_vram_gb"] = pc["gpus"][0]["ik2_vram_gb"]
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
@@ -11965,9 +11994,14 @@ def set_up_ik2(a, prev: dict) -> Path | None:
          f"{IK2_SHOWN} on AMD is run by Maya's team on a Radeon 8065S (Gorgon Halo, "
          "Linux, also set as a 12 and a 16 GB card), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes "
          "in an issue")
-    m = ik2_entry()
-    ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
-       "(Apache 2.0)")
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    d = ik2_dir(a, models, prev)
+    a.ik2_quant = ik2_quant_pick(a, d, prev)          # (Maya's Maya-L; an install of unsloth's keeps it)
+    m = ik2_entry(a.ik2_quant)
+    ok(f"model: {Q.shown('ik2', a.ik2_quant, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in {m['whose']} "
+       "(Apache 2.0)" + (f"; Maya's own, {Q.shown('ik2', Q.IK2_QUANT)}, with --model {Q.IK2_IDS[3]}"
+                         if a.ik2_quant != Q.IK2_QUANT else ""))
     kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
     rec = IK2F.recommended_context(vram, kv)
     ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
@@ -11996,9 +12030,6 @@ def set_up_ik2(a, prev: dict) -> Path | None:
                 if IK2F.plan(vram, rec, kv, apu)["resident"] else "")
         warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: "
              f"{line}{keep}" + (" - it may not start" if word == "tight" else ""))
-    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
-              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = ik2_dir(a, models, prev)
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama, "maya-ik2")        # 4
@@ -12418,8 +12449,10 @@ def model_option(a) -> str | None:
         if key is not None:
             a.qwen_quant = key
         return None
-    if family == "ik2":                                  # (Inkling-2-Mini: its one file set, unsloth's UD-Q4_K_XL)
+    if family == "ik2":                                  # (Inkling-2-Mini; a file set by its id: ik2_quant_pick)
         a.model = IK2
+        if key is not None:
+            a.ik2_quant = key
         return None
     if family == "ling":
         if key is not None and not ling_listed(key):   # (a size in the table without files: not made yet)
@@ -12471,7 +12504,8 @@ def main() -> int:
                     help="which model and files (default: asked): a Maya quant - "
                          + ", ".join(named_quants()) +
                          f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
-                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN},"
+                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (Maya-L; an install of unsloth's "
+                         f"UD-Q4_K_XL keeps it: {Q.IK2_IDS[3]} / {Q.IK2_IDS[4]} name one),"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
     ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4} or {QWEN_SHOWN}: their "

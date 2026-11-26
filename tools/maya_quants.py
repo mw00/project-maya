@@ -241,7 +241,8 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
           ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
           ("hy4", "q4_k_m"): "Q4_K_M",                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
-          ("ik2", "ud-q4_k_xl"): "unsloth UD-Q4_K_XL"}  # (unsloth's GGUF of Inkling-2-Mini: maya.IK2)
+          ("ik2", "maya-l"): "Maya-L",                  # (Maya's GGUF of Inkling-2-Mini, the setup's since v1.1.82)
+          ("ik2", "ud-q4_k_xl"): "unsloth UD-Q4_K_XL"}  # (unsloth's GGUF of Inkling-2-Mini: the setup's before)
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
 SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next"}
 # CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
@@ -251,10 +252,14 @@ QWEN_UD_IDS = ("qwen-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2_xs", "qwen3.8-ud-iq2
 # Hy4-flash: AngelSlim's Q4_K_M GGUF (two shards) - the setup ids it is asked for by (the first: the Models page's).
 # "hy4-flash" and "hy4" alone are the model: its files are then asked (Maya's quants and this one), or --hy4-quant
 HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
-# Inkling-2-Mini (maya-ik2): unsloth's UD-Q4_K_XL, its one file set - the setup ids it is asked
-# for by (the first: the Models page's)
-IK2_IDS = ("inkling-2-mini", "inkling-2-mini-ud-q4_k_xl", "inkling2-mini", "ik2-mini")
-IK2_QUANT = "ud-q4_k_xl"
+# Inkling-2-Mini (maya-ik2): two file sets, Maya's Inkling-2-Mini-Maya-L-NVFP4 (IK2_QUANT: a new setup's) and
+# unsloth's UD-Q4_K_XL (IK2_UNSLOTH: the setup's before v1.1.82 - an install of it keeps it, nothing downloaded
+# again).  The setup ids it is asked for by: the model (the files then: those already here, else Maya's) or one file
+# set by its own id (IK2_FILE_IDS)
+IK2_QUANT = "maya-l"
+IK2_UNSLOTH = "ud-q4_k_xl"
+IK2_FILE_IDS = {"inkling-2-mini-maya-l": IK2_QUANT, "inkling-2-mini-ud-q4_k_xl": IK2_UNSLOTH}
+IK2_IDS = ("inkling-2-mini", "inkling2-mini", "ik2-mini", *IK2_FILE_IDS)
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -291,7 +296,7 @@ def config_stem(family: str, key: str | None) -> str | None:
         return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
     if family == "hy4" and key == "q4_k_m":            # (AngelSlim's Q4_K_M: the config's name since its first setup)
         return "maya-hy4-flash"
-    if family == "ik2":                                # (Inkling-2-Mini: its one file set)
+    if family == "ik2":                                # (Inkling-2-Mini: one config, whichever file set it runs)
         return "maya-inkling-2-mini"
     if family == "ling":                               # (a Maya size: its own config; any other GGUF of the model: one)
         return f"maya-{setup_id(family, key)}" if setup_id(family, key) else "maya-ling-3.2-air"
@@ -319,8 +324,8 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "hy4", "q4_k_m"
     if low == "hy4":                                   # (the model by its short name: its files then asked)
         return "hy4", None
-    if low in IK2_IDS:                                 # (Inkling-2-Mini: one file set, unsloth's UD-Q4_K_XL)
-        return "ik2", IK2_QUANT
+    if low in IK2_IDS:                                 # (Inkling-2-Mini: the model, or one of its file sets)
+        return "ik2", IK2_FILE_IDS.get(low)
     if low in ("ling", "ling-3.2-air", "ling32", "ling32-air"):
         return "ling", None
     for f in ("deepseek", "minimax", "qwen", "hy4"):
@@ -370,7 +375,7 @@ def config_key(cfg: dict) -> str | None:
     if fam == "hy4":
         return str(inst.get("hy4_quant") or "q4_k_m").lower()
     if fam == "ik2":
-        return str(inst.get("ik2_quant") or IK2_QUANT).lower()
+        return str(inst.get("ik2_quant") or IK2_UNSLOTH).lower()   # (a record without one: before Maya's file)
     if fam == "ling":                                  # (a Maya size's key, "maya-s"; a GGUF of the user's own: none)
         return str(inst["ling_quant"]).lower() if inst.get("ling_quant") else None
     return inst.get("quant")

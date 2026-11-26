@@ -240,7 +240,8 @@ histories are a visit's. `ref/inkling2.py` and `maya-ik2` keep a list of visits;
 **The file.** unsloth's Mini GGUFs are in the layout llama.cpp master reads (other tensor and key names, the convs
 not folded, gate and up merged into `ffn_gate_up_exps`); the reference and the engine read both layouts.
 UD-Q4_K_XL (17.6 GB) holds the experts of layers 0-19 in NVFP4 - their original bits - and those of layers 20-23
-and the dense weights in Q8_0. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
+and the dense weights in Q8_0. Maya's Maya-L (17.6 GB, the setup's file from v1.1.82) has the same layout and types,
+written from the original model's files. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
 UD-IQ3_XXS (11.7 GB) holds gate and up in IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS, down in NVFP4 (IQ4_NL in layers 20-23),
 its embedding and three `attn_q` in Q4_K: read since the IQ2 / IQ3_S / IQ4_NL / Q4_K blocks joined the decoded ones
 (their 32-value sub-blocks against the inputs, as IQ3_XXS's and IQ4_XS's). On an RTX 5080 (16 GB, Windows, FP8 cache,
@@ -530,11 +531,12 @@ Cost, Radeon 8065S (gfx1151), plain decoding, the engine's own CLI, 192 tokens, 
 with the direction loaded and a request not asking, 38.4 with it projecting (about 3%: 96 small launches a token);
 `--bench` with the direction loaded and off: the same as without one (decode +0.0%, prompts +0.2% / +0.0%, exact).
 
-**Files** (Apache 2.0, the model and unsloth's GGUF alike):
+**Files** (Apache 2.0, the model, Maya's GGUF and unsloth's alike):
 
 | File | Repository | sha256 |
 |---|---|---|
-| `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
+| `Inkling-2-Mini-Maya-L-NVFP4.gguf` (17.6 GB, the model: what the setup fetches) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`Maya-L/`) | `1945d7b212601f429ef9dc4f6b8208062f3b9f22a1ebbdc1665373f412ebf54a` |
+| `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB, the setup's file before v1.1.82: an install of it is kept) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
 | `mmproj-Inkling-2-Mini-BF16.gguf` (0.6 GB, pictures; unsloth's `mmproj-BF16.gguf` byte for byte, an existing copy is kept) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`vision/`) | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
 | `dspark-Inkling-2-Mini-Q8_0.gguf` (0.4 GB, the drafter as a GGUF, Q8_0: the setup fetches it, on NVIDIA and on AMD, not with `--drafting off`; unsloth's file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773` |
 | `mtp.safetensors` (0.6 GB, the same drafter as published, BF16: what earlier setups fetched, still read where it is; thinkingmachines' file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |

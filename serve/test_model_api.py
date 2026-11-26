@@ -426,37 +426,60 @@ class OtherQuantsTest(unittest.TestCase):
             model_pull.Puller(self.root, lambda i, c: []).start("deepseek-gguf-q4", None)
 
     def test_inkling_2_mini_note(self):
-        """Inkling-2-Mini (maya-ik2): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
-        said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux or Windows (never AMD or
-        a Mac); its setup id on the command line; the size the setup's manifest says."""
+        """Inkling-2-Mini (maya-ik2): Maya's Maya-L among Maya's, unsloth's UD-Q4_K_XL (the setup's file before
+        v1.1.82) under "Other quants" by unsloth; each offered only where the setup runs it - NVIDIA V100 / RTX 20 on,
+        Linux or Windows (never AMD or a Mac); its setup id on the command line; the size the setup's manifest says."""
+        mine, old = "inkling-2-mini-maya-l", "inkling-2-mini-ud-q4_k_xl"
         with mock.patch.object(model_pull.sys, "platform", "linux"):
             c = {m["id"]: m for m in self.cat()}
-            ik = c["inkling-2-mini"]
+            self.assertNotIn("inkling-2-mini", c)                              # (the model's id: no row of its own)
+            ik = c[mine]
+            self.assertEqual((ik["family"], ik["group"], ik["by"]), ("ik2", "maya", "Maya"))
+            self.assertEqual(ik["name"], "Inkling 2 Mini · Maya-L")
+            ik = c[old]
             self.assertEqual((ik["family"], ik["group"], ik["by"]), ("ik2", "other", "unsloth"))
             self.assertEqual(ik["name"], "Inkling 2 Mini · unsloth UD-Q4_K_XL")
-            self.assertIn("an NVIDIA GPU of 8 GB or more", ik["note"])
-            self.assertIn("8 GB or more", ik["note"])
-            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70, 89))})
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=())})       # (not read: the setup says)
-            for backend in ("hip", "metal"):
-                self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(backend, ())})
+            for ident in (mine, old):
+                self.assertIn("an NVIDIA GPU of 8 GB or more", c[ident]["note"])
+                self.assertNotIn(ident, {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
+                self.assertIn(ident, {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
+                self.assertIn(ident, {m["id"] for m in self.cat(ccs=(70, 89))})
+                self.assertIn(ident, {m["id"] for m in self.cat(ccs=())})       # (not read: the setup says)
+                for backend in ("hip", "metal"):
+                    self.assertNotIn(ident, {m["id"] for m in self.cat(backend, ())})
         with mock.patch.object(model_pull.sys, "platform", "win32"):   # (Windows + NVIDIA: as on Linux)
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat()})
-            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat("hip", ())})
+            self.assertTrue({mine, old} <= {m["id"] for m in self.cat()})
+            self.assertFalse({mine, old} & {m["id"] for m in self.cat("hip", ())})
         with mock.patch.object(model_pull.sys, "platform", "darwin"):
-            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat()})
-        cmd = model_pull.setup_command("inkling-2-mini", {"installer": {"models_dir": "/m"}})
-        self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "inkling-2-mini"])
+            self.assertFalse({mine, old} & {m["id"] for m in self.cat()})
+        for ident in (mine, old):
+            cmd = model_pull.setup_command(ident, {"installer": {"models_dir": "/m"}})
+            self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", ident])
         sys.path.insert(0, str(model_pull.ROOT))
         import maya
         self.assertEqual(model_pull.IK2_MIN_CC, maya.IK2_MIN_CC)
         model_pull._other_gb.clear()
         try:
-            self.assertAlmostEqual(model_pull._other_sizes()["inkling-2-mini"], 18.7, places=1)   # (the GGUF + mmproj + drafter)
+            sizes = model_pull._other_sizes()
+            self.assertAlmostEqual(sizes[mine], 18.7, places=1)                 # (the GGUF + mmproj + drafter)
+            self.assertAlmostEqual(sizes[old], 18.7, places=1)
         finally:
             model_pull._other_gb.clear()
+
+    def test_inkling_2_mini_installed(self):
+        """An install of unsloth's file shows as installed on its own row (not Maya's); one of Maya's on Maya's."""
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(model_pull.sys, "platform", "linux"):
+            root = Path(t)
+            cfg = {"exe": "/b/maya-ik2", "args": [], "installer": {"family": "ik2", "ik2_quant": "ud-q4_k_xl"}}
+            (root / "maya-inkling-2-mini.json").write_text(json.dumps(cfg), encoding="utf-8")
+            c = {m["id"]: m for m in model_pull.catalog(root, glm_sizes={}, ccs=(80,), other_sizes={})}
+            self.assertEqual((c["inkling-2-mini-ud-q4_k_xl"]["installed"], c["inkling-2-mini-maya-l"]["installed"]),
+                             (True, False))
+            cfg["installer"]["ik2_quant"] = "maya-l"
+            (root / "maya-inkling-2-mini.json").write_text(json.dumps(cfg), encoding="utf-8")
+            c = {m["id"]: m for m in model_pull.catalog(root, glm_sizes={}, ccs=(80,), other_sizes={})}
+            self.assertEqual((c["inkling-2-mini-ud-q4_k_xl"]["installed"], c["inkling-2-mini-maya-l"]["installed"]),
+                             (False, True))
 
     def test_qwen_unsloth_ud_iq2_xs(self):
         """unsloth's Qwen3.8-Flash-Next GGUFs: UD-IQ2_XS only, under "Other quants" by unsloth (CYBER-FROST stays

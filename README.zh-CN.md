@@ -62,7 +62,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>腾讯 · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最长 1M 上下文 · 支持图片 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>各加一个共用的 63.4 GB n-gram 表 | 内存与显存合计约 56-64 GB (Maya-XS，8 GB 及以上的显卡)、68-80 GB (Maya-S)、80-96 GB (Maya-M) 或 104-128 GB (Maya-L) 的电脑；Maya-S、Maya-M 和 Maya-L 需要 12 GB 及以上的显卡；n-gram 表留在固态硬盘上 |
-| **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · 最高 1M 上下文 · 可读图片 · NVIDIA、Linux 上的 AMD</sub> | unsloth 的 UD-Q4_K_XL GGUF · `inkling-2-mini` | 17.6 GB | 8 GB 及以上的显卡：放不下的专家留在内存中；24 GB 及以上时整个模型都在显存中 |
+| **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · 最高 1M 上下文 · 可读图片 · NVIDIA、Linux 上的 AMD</sub> | [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) GGUF · `inkling-2-mini` | 17.6 GB | 8 GB 及以上的显卡：放不下的专家留在内存中；24 GB 及以上时整个模型都在显存中 |
 
 **哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 

@@ -64,7 +64,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>それぞれ + 共通の n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB (Maya-XS、8 GB 以上のカード)、68-80 GB (Maya-S)、80-96 GB (Maya-M)、104-128 GB (Maya-L) の PC。Maya-S、Maya-M、Maya-L は 12 GB 以上のカード。n-gram テーブルは SSD に置いたまま |
-| **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、Linux 上の AMD</sub> | unsloth の UD-Q4_K_XL GGUF · `inkling-2-mini` | 17.6 GB | 8 GB 以上のカード: 収まらないエキスパートは RAM に置かれます。24 GB 以上ではモデル全体が VRAM に収まります |
+| **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、Linux 上の AMD</sub> | [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) GGUF · `inkling-2-mini` | 17.6 GB | 8 GB 以上のカード: 収まらないエキスパートは RAM に置かれます。24 GB 以上ではモデル全体が VRAM に収まります |
 
 **どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 
