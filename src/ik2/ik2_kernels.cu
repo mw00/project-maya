@@ -3415,7 +3415,10 @@ __device__ __forceinline__ void sub32_values(int type, const uint8_t* w, int sb,
     }
 }
 
-// a warp's dot of one row of K values (blocks of `type` from w) with xs (shared, padded: xp), every lane gets it
+// a warp's dot of one row of K values (blocks of `type` from w) with xs (shared, padded: xp), every lane gets it.
+// SUB32 false: the sub32_type() blocks left out of the code - a kernel built so keeps the registers (and the speed) it
+// had before those types, and the host launches it only for the other types (sub32_kern below).
+template <bool SUB32 = true>
 __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
     const int lane = threadIdx.x & 31;
     float acc = 0.0f;
@@ -3535,7 +3538,7 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
             acc += iq3 ? iq3xxs_sub_dot(w + (size_t) (sb >> 3) * 98, sb & 7, xv)
                        : iq4xs_sub_dot(w + (size_t) (sb >> 3) * 136, sb & 7, xv);
         }
-    } else if (sub32_type(type)) {
+    } else if (SUB32 && sub32_type(type)) {
         for (int sb = lane; sb < K / 32; sb += 32) {
             float4 xv[8];
             load_xv8(xs + sb * 36, xv);
@@ -3550,6 +3553,7 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
 }
 
 // Single-pass dot of two weight rows (w0, w1) of the same quant type against xs (reading xs once for both rows).
+template <bool SUB32 = true>   // (SUB32: as row_dot's)
 __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const float* xs, int K, float& og, float& ou) {
     const int lane = threadIdx.x & 31;
     float ag = 0.0f, au = 0.0f;
@@ -3716,7 +3720,7 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
             ag += iq3 ? iq3xxs_sub_dot(wg + off, sb & 7, xv) : iq4xs_sub_dot(wg + off, sb & 7, xv);
             au += iq3 ? iq3xxs_sub_dot(wu + off, sb & 7, xv) : iq4xs_sub_dot(wu + off, sb & 7, xv);
         }
-    } else if (sub32_type(type)) {
+    } else if (SUB32 && sub32_type(type)) {
         for (int sb = lane; sb < K / 32; sb += 32) {
             float4 xv[8];
             load_xv8(xs + sb * 36, xv);
@@ -3738,9 +3742,10 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
     og = ag;
     ou = au;
 }
+template <bool SUB32 = true>
 __device__ __forceinline__ void row_dot_pair(int type, const uint8_t* wg, const uint8_t* wu, const float* xs, int K,
                                              float& og, float& ou) {
-    row_dot_2(type, wg, wu, xs, K, og, ou);
+    row_dot_2<SUB32>(type, wg, wu, xs, K, og, ou);
 }
 
 __device__ __forceinline__ void load_xs_f32(const float* x, int K, float* xs) {
@@ -3969,7 +3974,10 @@ experts_v70_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
     }
 }
 
-template <int WARPS, int ROWS>
+// a launch's kernel for these types: the SUB32 one only where a type needs it (see row_dot)
+__host__ __forceinline__ bool sub32_kern(int a, int b = -1) { return sub32_type(a) || (b >= 0 && sub32_type(b)); }
+
+template <int WARPS, int ROWS, bool SUB32 = true>
 __global__ void experts_gate_up_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up, size_t eb0,
                                        const float* x, int C, int F, size_t rb_gate, size_t rb_up, float* gu) {
     extern __shared__ float xs[];
@@ -3983,12 +3991,12 @@ __global__ void experts_gate_up_kernel(const uint8_t* const* blob, const int* to
         if (row >= 2 * F) break;
         const bool up = row >= F;
         const int r = up ? row - F : row;
-        const float v = row_dot(up ? ty_up : ty_gate, bl + (up ? eb0 + r * rb_up : r * rb_gate), xs, C);
+        const float v = row_dot<SUB32>(up ? ty_up : ty_gate, bl + (up ? eb0 + r * rb_up : r * rb_gate), xs, C);
         if ((threadIdx.x & 31) == 0) gu[(size_t) s * 2 * F + row] = v;
     }
 }
 
-template <int WARPS, int ROWS>
+template <int WARPS, int ROWS, bool SUB32 = true>
 __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up,
                                               size_t eb0, const float* x, int C, int F, size_t rb_gate, size_t rb_up,
                                               const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
@@ -4007,10 +4015,10 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
         if (r >= F) break;
         float vg, vu;
         if (ty_gate == ty_up) {
-            row_dot_pair(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
+            row_dot_pair<SUB32>(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
         } else {
-            vg = row_dot(ty_gate, bl + (size_t) r * rb_gate, xs, C);
-            vu = row_dot(ty_up, bl + eb0 + (size_t) r * rb_up, xs, C);
+            vg = row_dot<SUB32>(ty_gate, bl + (size_t) r * rb_gate, xs, C);
+            vu = row_dot<SUB32>(ty_up, bl + eb0 + (size_t) r * rb_up, xs, C);
         }
         if ((threadIdx.x & 31) == 0) {
             const float g = vg * sgs, u = vu * sus;
@@ -4020,7 +4028,7 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
     }
 }
 
-template <int WARPS, int ROWS>
+template <int WARPS, int ROWS, bool SUB32 = true>
 __global__ void experts_down_kernel(const uint8_t* const* blob, int ty_down, size_t off_down, const uint16_t* h,
                                     int C, int F, size_t rb_down, float* y) {
     extern __shared__ float xs[];
@@ -4035,14 +4043,14 @@ __global__ void experts_down_kernel(const uint8_t* const* blob, int ty_down, siz
         if (row >= C) break;
         if (j + 1 < ROWS && row + 1 < C) {
             float v0, v1;
-            row_dot_2(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
+            row_dot_2<SUB32>(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
             if ((threadIdx.x & 31) == 0) {
                 y[(size_t) s * C + row] = v0;
                 y[(size_t) s * C + row + 1] = v1;
             }
             j += 2;
         } else {
-            const float v = row_dot(ty_down, w + (size_t) row * rb_down, xs, F);
+            const float v = row_dot<SUB32>(ty_down, w + (size_t) row * rb_down, xs, F);
             if ((threadIdx.x & 31) == 0) y[(size_t) s * C + row] = v;
             j += 1;
         }
@@ -4731,7 +4739,7 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
     out[((size_t) qi * H + h) * 128 + tid] = (o / den) * v_inv_scale;
 }
 
-template <int WARPS, int ROWS>
+template <int WARPS, int ROWS, bool SUB32 = true>
 __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_t rb, const float* x, float* y) {
     extern __shared__ float xs[];
     load_xs_f32(x, K, xs);
@@ -4740,7 +4748,7 @@ __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_
     for (int j = 0; j < ROWS; ++j) {
         const int row = (blockIdx.x * WARPS + warp) * ROWS + j;
         if (row >= N) break;
-        const float v = row_dot(type, W + (size_t) row * rb, xs, K);
+        const float v = row_dot<SUB32>(type, W + (size_t) row * rb, xs, K);
         if ((threadIdx.x & 31) == 0) y[row] = v;
     }
 }
@@ -7102,7 +7110,7 @@ mv_q8p_colsx_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d
 
 // experts_gate_up_swiglu_kernel for group_route's groups: a block's rows for each member in turn (its x in shared
 // memory, the rows' weights read again from the cache), with the one-token kernel's row dots - the same h to the bit
-template <int WARPS, int ROWS>
+template <int WARPS, int ROWS, bool SUB32 = true>
 __global__ void experts_gate_up_swiglu_mem_kernel(const uint8_t* const* blob, const int* n_g, const int* tok_g,
                                                   const int* row_g, int ty_gate, int ty_up, size_t eb0, const float* x,
                                                   int C, int F, size_t rb_gate, size_t rb_up, const float* sg,
@@ -7124,10 +7132,10 @@ __global__ void experts_gate_up_swiglu_mem_kernel(const uint8_t* const* blob, co
             if (r >= F) break;
             float vg, vu;
             if (ty_gate == ty_up) {
-                row_dot_pair(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
+                row_dot_pair<SUB32>(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
             } else {
-                vg = row_dot(ty_gate, bl + (size_t) r * rb_gate, xs, C);
-                vu = row_dot(ty_up, bl + eb0 + (size_t) r * rb_up, xs, C);
+                vg = row_dot<SUB32>(ty_gate, bl + (size_t) r * rb_gate, xs, C);
+                vu = row_dot<SUB32>(ty_up, bl + eb0 + (size_t) r * rb_up, xs, C);
             }
             if ((threadIdx.x & 31) == 0) {
                 const float g = vg * sgs, u = vu * sus;
@@ -7137,7 +7145,7 @@ __global__ void experts_gate_up_swiglu_mem_kernel(const uint8_t* const* blob, co
     }
 }
 // ... experts_down_kernel's (its rows in pairs through row_dot_2: ROWS even)
-template <int WARPS, int ROWS>
+template <int WARPS, int ROWS, bool SUB32 = true>
 __global__ void experts_down_mem_kernel(const uint8_t* const* blob, const int* n_g, const int* row_g, int ty_down,
                                         size_t off_down, const uint16_t* h, int C, int F, size_t rb_down, float* y) {
     extern __shared__ float xs[];
@@ -7155,14 +7163,14 @@ __global__ void experts_down_mem_kernel(const uint8_t* const* blob, const int* n
             if (row >= C) break;
             if (j + 1 < ROWS && row + 1 < C) {
                 float v0, v1;
-                row_dot_2(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
+                row_dot_2<SUB32>(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
                 if ((threadIdx.x & 31) == 0) {
                     y[(size_t) slot * C + row] = v0;
                     y[(size_t) slot * C + row + 1] = v1;
                 }
                 j += 2;
             } else {
-                const float v = row_dot(ty_down, w + (size_t) row * rb_down, xs, F);
+                const float v = row_dot<SUB32>(ty_down, w + (size_t) row * rb_down, xs, F);
                 if ((threadIdx.x & 31) == 0) y[(size_t) slot * C + row] = v;
                 j += 1;
             }
@@ -8054,14 +8062,16 @@ template <int WARPS, int ROWS>
 void launch_experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, float* gu, cudaStream_t s) {
     const dim3 g((unsigned) ((2 * F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
-    experts_gate_up_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
+    (sub32_kern(ty_gate, ty_up) ? experts_gate_up_kernel<WARPS, ROWS, true> : experts_gate_up_kernel<WARPS, ROWS, false>)
+        <<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
         blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), gu);
 }
 template <int WARPS, int ROWS>
 void launch_experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C,
                          int F, float* y, cudaStream_t s) {
     const dim3 g((unsigned) ((C + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
-    experts_down_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
+    (sub32_kern(ty_down) ? experts_down_kernel<WARPS, ROWS, true> : experts_down_kernel<WARPS, ROWS, false>)
+        <<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
         blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
 }
 
@@ -8149,7 +8159,9 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
                                    float gcap, float ucap, uint16_t* h, cudaStream_t s, const int* orow = nullptr,
                                    int h_ld = 0) {
     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
-    experts_gate_up_swiglu_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
+    (sub32_kern(ty_gate, ty_up) ? experts_gate_up_swiglu_kernel<WARPS, ROWS, true>
+                                : experts_gate_up_swiglu_kernel<WARPS, ROWS, false>)
+        <<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
         blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su, gcap,
         ucap, h, orow, h_ld > 0 ? h_ld : F);
 }
@@ -8247,8 +8259,9 @@ void attn_multi_fp8(const float* q, const float* r, const float* sink, const uin
 
 template <int WARPS, int ROWS>
 void launch_mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
-    mv_blocks_kernel<WARPS, ROWS><<<(unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS)), WARPS * 32,
-                                    xp_floats(K) * 4, s>>>(type, W, N, K, mv_row_bytes(type, K), x, y);
+    (sub32_kern(type) ? mv_blocks_kernel<WARPS, ROWS, true> : mv_blocks_kernel<WARPS, ROWS, false>)
+        <<<(unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS)), WARPS * 32, xp_floats(K) * 4, s>>>(
+        type, W, N, K, mv_row_bytes(type, K), x, y);
 }
 
 static bool q6k_cols_fits(int type, int K, const float* x, int T);
@@ -9028,7 +9041,9 @@ void experts_gate_up_swiglu_mem(const uint8_t* const* blob, const int* n, const 
     if (G <= 0) return;
     constexpr int WARPS = 4, ROWS = 2;
     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) G);
-    experts_gate_up_swiglu_mem_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
+    (sub32_kern(ty_gate, ty_up) ? experts_gate_up_swiglu_mem_kernel<WARPS, ROWS, true>
+                                : experts_gate_up_swiglu_mem_kernel<WARPS, ROWS, false>)
+        <<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
         blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su,
         gcap, ucap, h);
     check("experts_gate_up_swiglu_mem");
@@ -9038,8 +9053,8 @@ void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, 
     if (G <= 0) return;
     constexpr int WARPS = 4, ROWS = 2;
     const dim3 g((unsigned) ((C + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) G);
-    experts_down_mem_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(blob, n, row, ty_down, off_down, h, C,
-                                                                                F, mv_row_bytes(ty_down, F), y);
+    (sub32_kern(ty_down) ? experts_down_mem_kernel<WARPS, ROWS, true> : experts_down_mem_kernel<WARPS, ROWS, false>)
+        <<<g, WARPS * 32, xp_floats(F) * 4, s>>>(blob, n, row, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
     check("experts_down_mem");
 }
 bool experts_block_exact() { return experts_mma_split(true) == 8 && experts_mma_split(false) == 4; }
