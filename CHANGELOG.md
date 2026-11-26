@@ -4,6 +4,25 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.82 - 2026-11-26
+
+Ling-3.2-air arrives on Maya: inclusionAI's model on its own engine, `maya-ling`, with Maya's own quants from 36.9 GB, thinking on or off, tool calls and drafting with the model's own MTP block, on NVIDIA cards under Linux.
+
+- **Ling-3.2-air, a new model (#1224).** inclusionAI's Ling-3.2-air (MIT licence) runs on its own engine, `maya-ling`. Set it up with `./maya.sh --setup --model ling-3.2-air-maya-s` or from the Models page. It runs on NVIDIA cards under Linux, from the V100 and RTX 20 series on, on one GPU or several; the experts that do not fit in VRAM are computed on the CPU. The context goes up to 262,144 tokens.
+- **Maya's own quants of it,** in [peasantsmith/Ling-3.2-air-Maya-GGUF](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF). Quality is how often the next token matches the original model's: Maya-S (IQ2_XXS, 36.9 GB) 88.1%, Maya-M (IQ2_S, 46.0 GB) 91.1%, Maya-L (IQ3_S, 59.2 GB) 93.8%.
+- **Speed,** measured with `./maya.sh --bench` on Tesla V100-PCIE-32GB cards (2x Xeon Gold 6138, PCIe 3.0), drafting on, median of 3 runs, decode and prompt reading at 2K / 8K: Maya-S on 1 GPU 107.8 tok/s, 1,875 / 1,823 tok/s (part of the experts run from RAM); Maya-S on 3 GPUs 124.7 tok/s, 1,908 / 3,561 tok/s; Maya-M on 2 GPUs 125.5 tok/s, 1,888 / 2,834 tok/s; Maya-M on 3 GPUs 124.1 tok/s, 1,893 / 3,498 tok/s; Maya-L on 3 GPUs 127.8 tok/s, 1,810 / 3,383 tok/s.
+- **Everything you use with the other models.** The OpenAI and Anthropic APIs and Maya's model API, streaming, tool calls, stop and the loop guard. Thinking is on (High) by default and can be turned off per chat or per request; the model keeps its own sampling defaults.
+- **Pictures.** The setup downloads the model's vision file (0.9 GB) with it, and Ling-3.2-air reads pictures in chat and through the APIs.
+- **Drafting with its own MTP block.** Ling-3.2-air drafts its next tokens with the model's own MTP block. The setup measures once on your PC whether drafting is faster and keeps the faster choice; the Models page switches it On or Off.
+- **The setup picks the faster options for each PC:** the context is recommended from your cards' VRAM and drafting is kept only where it is faster. The Models page shows Ling's own card (context, drafting, KV cache, prompt chunk, CPU threads) and the dashboard shows its figures.
+- **Inkling 2 Mini: new setups download Maya's own file.** A new Inkling 2 Mini setup now downloads Maya's own `Inkling-2-Mini-Maya-L-NVFP4` (17.6 GB). An existing install of unsloth's `UD-Q4_K_XL` keeps its file and downloads nothing again; both are on the Models page.
+- **Inkling 2 Mini: tool calls stream while the model writes them (#1134).** Coding agents see a call's name and arguments as they are written instead of waiting for the whole call.
+- **Inkling 2 Mini: more GGUF block types load (#1219):** IQ2_XXS, IQ2_XS, IQ2_S, IQ3_S, IQ4_NL and Q4_K experts, so files such as unsloth's `UD-IQ3_XXS` load. Answers with the default file are unchanged.
+- **Inkling 2 Mini: "minimal" effort now means a little thinking (#1129).** A request with `reasoning_effort: "minimal"` now reaches the model as a thinking level of 0.1, as its template defines it, instead of thinking off. **This changes answers for clients that send "minimal"**; requests with no level or any other level are unchanged.
+- **Fix: Inkling 2 Mini after very short prompts with experts in RAM (#1263, fixes #1262).** With part of the experts kept in RAM, a turn that added 8 tokens or fewer - for example right after a tool call that returned nothing, such as an empty grep in a coding agent - could crash the engine (Windows) or give wrong tokens (Linux), and the agent stopped. Both are fixed; other setups give the same tokens as before.
+- **Inkling 2 Small:** engine support for Inkling 2 Small GGUFs, including IQ1_S and IQ1_M expert blocks.
+- **Credits.** @alesha-pro contributed the base engine for Ling-3.2-air, `maya-ling` (#1224), with split GGUF loading and the CUDA 13 build fix by @Ajay9o9; the setup, the web page and the quants are by @mw00 (peasantsmith). Inkling 2 Mini: @cobra91 (#1263, #1219, with decoders from @TokenTinkererAI's #1133), @HermesVC (#1134) and @mrexodia (#1129).
+
 ## v1.1.81 - 2026-11-25
 
 Three fixes: the Hy4-flash settings can be saved again, the loop guard catches long loops, and the Windows setup avoids a compiler crash.
