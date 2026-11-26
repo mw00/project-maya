@@ -14,6 +14,7 @@
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/inkling.svg" alt="Inkling 2 Mini Maya downloads"></a>
 </p>
 
 <p align="center">作成・主導: <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>)、共同メンテナー: <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
@@ -53,7 +54,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**<br><sub>zai-org · MIT · 321 B、アクティブ 18 B · 最大 1M コンテキスト</sub> | **Maya-S** (デフォルト) · `glm-maya-s` | 96.5 GB | メモリ (RAM と VRAM の合計) が小さめの PC |
 | | Maya-S24 · `glm-maya-s24` | 94.7 GB | 24 GB 以下のカード: カードの約 1.5 GB 分をエキスパートに多く回せ、デコード +14% |
 | | Maya-XS · `glm-maya-xs` | 73.4 GB | RAM 64 GB と 24 GB のカードの PC、128K コンテキスト |
-| | Maya-M · `glm-maya-m` | 116 GB | より大きなメモリ; ツール呼び出しとフロントエンドのコード向けにキャリブレーション |
+| | Maya-M · `glm-maya-m` | 116 GB | より大きなメモリ; ツール呼び出しとフロントエンドのコード向け |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | [Blackfrost_AI](https://x.com/Blackfrost_AI) による重み編集で、一律の拒否を減らした Maya-M; 実験的 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大クラスのメモリ; 元のモデルに最も近い |
 | **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [独自ライセンス](https://huggingface.co/zai-org/GLM-5.3) · 744 B、アクティブ 40 B · 最大 1M コンテキスト · テキストのみ</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170.0 GB | 192 GB のメモリ (VRAM と RAM の合計) にモデル全体が収まる; NVIDIA (V100 以降) と AMD ([詳細](docs/GLM53.md)) |
@@ -313,6 +314,11 @@ Project Maya は無料のオープンソースです。すべてのリリース�
 <p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="40"></a>
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <b>Maya は誰でも無料で使えるオープンなプロジェクトです。スポンサーになっていただくと、それを続ける力になり、各リリースをテストするハードウェアの費用になります。ありがとうございます!</b></p>
+<p align="center">
+<img src="https://cdn.simpleicons.org/dash/008DE4" alt="Dash" title="Dash" height="20" align="top"> <code>Xqp3JtJhCoRvGt8TXpyvS9qvukFGp5EPqd</code><br>
+<img src="https://cdn.simpleicons.org/bitcoin/F7931A" alt="Bitcoin" title="Bitcoin" height="20" align="top"> <code>3BCPYKcCSm4VdjUiRPbxGatqCP9h3bo61f</code><br>
+<img src="https://cdn.simpleicons.org/ethereum/627EEA" alt="Ethereum" title="Ethereum" height="20" align="top"> <code>0xE083E8e8eAb2E899F84c4488A0B6a8e522841Cc2</code>
+</p>
 
 速度レポート、バグ報告、プルリクエストを歓迎します。何が最も助けになるかは [CONTRIBUTING.md](CONTRIBUTING.md) をご覧ください。
 

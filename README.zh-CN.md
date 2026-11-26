@@ -14,6 +14,7 @@
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/inkling.svg" alt="Inkling 2 Mini Maya downloads"></a>
 </p>
 
 <p align="center">由 <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>) 创建并主导，与 <b><a href="https://github.com/needmorevram">@needmorevram</a></b> 共同维护</p>
@@ -51,7 +52,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**<br><sub>zai-org · MIT · 321 B，激活 18 B · 最高 1M 上下文</sub> | **Maya-S** (默认) · `glm-maya-s` | 96.5 GB | 内存池 (内存与显存之和) 较小的电脑 |
 | | Maya-S24 · `glm-maya-s24` | 94.7 GB | 24 GB 及以下的显卡：显卡多出约 1.5 GB 用于专家，解码 +14% |
 | | Maya-XS · `glm-maya-xs` | 73.4 GB | 64 GB 内存加 24 GB 显卡的电脑，128K 上下文 |
-| | Maya-M · `glm-maya-m` | 116 GB | 更大的内存池；针对工具调用和前端代码做了校准 |
+| | Maya-M · `glm-maya-m` | 116 GB | 更大的内存池；面向工具调用和前端代码 |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | 经 [Blackfrost_AI](https://x.com/Blackfrost_AI) 修改权重、减少一刀切拒绝的 Maya-M；实验性 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大的内存池；最接近原版 |
 | **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [自有许可证](https://huggingface.co/zai-org/GLM-5.3) · 744 B，激活 40 B · 最高 1M 上下文 · 仅文本</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170.0 GB | 192 GB 内存池 (VRAM 与 RAM 合计) 即可容纳整个模型；NVIDIA (V100 及更新) 和 AMD ([详情](docs/GLM53.md)) |
@@ -311,6 +312,11 @@ Project Maya 免费且开源。每个版本在发布前都会在我们自己的 
 <p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="40"></a>
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <b>Maya 对所有人免费开放。成为赞助者能帮助它一直走下去，也用于购买每个版本测试所用的硬件。谢谢！</b></p>
+<p align="center">
+<img src="https://cdn.simpleicons.org/dash/008DE4" alt="Dash" title="Dash" height="20" align="top"> <code>Xqp3JtJhCoRvGt8TXpyvS9qvukFGp5EPqd</code><br>
+<img src="https://cdn.simpleicons.org/bitcoin/F7931A" alt="Bitcoin" title="Bitcoin" height="20" align="top"> <code>3BCPYKcCSm4VdjUiRPbxGatqCP9h3bo61f</code><br>
+<img src="https://cdn.simpleicons.org/ethereum/627EEA" alt="Ethereum" title="Ethereum" height="20" align="top"> <code>0xE083E8e8eAb2E899F84c4488A0B6a8e522841Cc2</code>
+</p>
 
 欢迎提交速度报告、错误报告和 pull request：[CONTRIBUTING.md](CONTRIBUTING.md) 说明了最有帮助的方式。
 

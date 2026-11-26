@@ -152,6 +152,7 @@ kld() {
 loop() {
     need --pack "$PACK"
     local py=${MAYA_PYTHON3:-$HOME/project-maya/.venv/bin/python3}
+    if [ ! -f "$ROOT/tools/maya_quant/loop_test.py" ]; then echo "SKIP loop: tools/maya_quant/loop_test.py is not in this checkout"; return 0; fi
     (cd "$ROOT" && "$py" tools/maya_quant/loop_test.py --exe "$PORT/maya" --pack "$PACK" ${TOK:+--tok "$TOK"} --max-new "$MAXNEW" \
         --runs "$RUNS" > "$OUT/loop.log" 2>&1) && pass "loop: $(tail -1 "$OUT/loop.log")" || fail "loop (see $OUT/loop.log)"
 }

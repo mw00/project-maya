@@ -14,6 +14,7 @@ privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, 
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/inkling.svg" alt="Inkling 2 Mini Maya downloads"></a>
 </p>
 
 <p align="center">Criado e liderado por <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>), com a manutenção compartilhada de <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
@@ -51,7 +52,7 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**<br><sub>zai-org · MIT · 321 B, 18 B ativos · até 1M de contexto</sub> | **Maya-S** (padrão) · `glm-maya-s` | 96,5 GB | PCs com um pool de memória (RAM e VRAM juntas) menor |
 | | Maya-S24 · `glm-maya-s24` | 94,7 GB | placas de 24 GB ou menos: ~1,5 GB a mais da placa para especialistas, decodificação +14% |
 | | Maya-XS · `glm-maya-xs` | 73,4 GB | PCs com 64 GB de RAM e uma placa de 24 GB, com contexto de 128K |
-| | Maya-M · `glm-maya-m` | 116 GB | um pool de memória maior; calibrado para chamadas de ferramentas e código de front-end |
+| | Maya-M · `glm-maya-m` | 116 GB | um pool de memória maior; voltado a chamadas de ferramentas e código de front-end |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | Maya-M com uma edição de pesos de [Blackfrost_AI](https://x.com/Blackfrost_AI) que reduz as recusas generalizadas; experimental |
 | | Maya-L · `glm-maya-l` | 156,3 GB | os maiores pools de memória; o mais próximo do original |
 | **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [licença própria](https://huggingface.co/zai-org/GLM-5.3) · 744 B, 40 B ativos · até 1M de contexto · só texto</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170,0 GB | o modelo inteiro num pool de memória de 192 GB (VRAM e RAM juntas); NVIDIA a partir da V100 e AMD ([detalhes](docs/GLM53.md)) |
@@ -312,6 +313,11 @@ O Project Maya é gratuito e de código aberto. Cada versão é testada em nossa
 <p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="40"></a>
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <b>O Maya é gratuito e aberto para todos. Tornar-se patrocinador ajuda a mantê-lo assim e paga o hardware em que cada versão é testada. Obrigado!</b></p>
+<p align="center">
+<img src="https://cdn.simpleicons.org/dash/008DE4" alt="Dash" title="Dash" height="20" align="top"> <code>Xqp3JtJhCoRvGt8TXpyvS9qvukFGp5EPqd</code><br>
+<img src="https://cdn.simpleicons.org/bitcoin/F7931A" alt="Bitcoin" title="Bitcoin" height="20" align="top"> <code>3BCPYKcCSm4VdjUiRPbxGatqCP9h3bo61f</code><br>
+<img src="https://cdn.simpleicons.org/ethereum/627EEA" alt="Ethereum" title="Ethereum" height="20" align="top"> <code>0xE083E8e8eAb2E899F84c4488A0B6a8e522841Cc2</code>
+</p>
 
 Relatos de velocidade, relatos de bugs e pull requests são bem-vindos: o [CONTRIBUTING.md](CONTRIBUTING.md) diz o que mais ajuda.
 

@@ -4104,7 +4104,7 @@ static int glm_pack_generate(const Options& o) {
         // before: mean NLL, perplexity, top-1 hits.  MAYA_GLM_SCORE_DUMP=<file> writes each scored position's
         // log-softmax (n_vocab floats); MAYA_GLM_SCORE_REF=<file> reads such a dump and reports KL(ref || this) and
         // how often both pick the same top token - the quality yardstick for engine changes and for quants.
-        // MAYA_GLM_SCORE_TOPK=<file> is the compact reference (the FP8 model's, tools/maya_quant): an int32 k, then
+        // MAYA_GLM_SCORE_TOPK=<file> is the compact reference (the FP8 model's): an int32 k, then
         // per scored position k int32 token ids (best first) and their k float log-probs.  KL over those k tokens plus
         // one bucket for the rest of the vocabulary.
         if (const char* sc = getenv("MAYA_GLM_SCORE")) {
@@ -4369,8 +4369,7 @@ static int glm_pack_generate(const Options& o) {
             }
         } busy_scope;
         // LOGP <n_ctx> <id,id,...>: the summed log-probability of the tokens from n_ctx on given those before
-        // ("LP <sum> <n> <1 if every one was the most likely>") - the multiple-choice scoring of the zero-shot suite
-        // (tools/maya_quant/zs_tasks.py).  A context identical to the previous request's is restored, not read again
+        // ("LP <sum> <n> <1 if every one was the most likely>") - the multiple-choice scoring of the zero-shot suite.  A context identical to the previous request's is restored, not read again
         // (the choices of one question share it).
         // VLEND / VRECLAIM (between requests): the on-demand vision encoder is about to start on the first GPU - the
         // expert pool's tail is emptied and freed for it ("VLENT <bytes>") - and has ended ("VRECLAIMED"; an ERR while

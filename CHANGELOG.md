@@ -4,6 +4,15 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.81 - 2026-11-25
+
+Three fixes: the Hy4-flash settings can be saved again, the loop guard catches long loops, and the Windows setup avoids a compiler crash.
+
+- **Fix: Hy4-flash settings could not be saved on the Models page (#1249).** "Save" stayed disabled for every Hy4-flash config whose tensor parallel was left on auto, which is the default. It works again.
+- **Loop guard: loops of more than 12 different tool calls (#1220).** A model that ran the same round of 13 to 100 tool calls again and again, with the same results, was never stopped. The guard now sees a whole round repeated: a note to the model after 3 rounds, the calls blocked after 5. Shorter loops are handled as before, and a round with any different call or result does not count.
+- **Windows setup: a compiler crash with CUDA 13.3 and the newest Visual Studio toolset (#992).** With CUDA 13.3 or newer and MSVC toolset 14.52 or newer the build stopped in `cudafe++`. The setup now builds with the newest older toolset that is installed and says so; if only the newest one is installed, it names the component to add (MSVC v143, toolset 14.44). This follows two users' reports and was not compiled on Windows by us; if a build already failed, delete the `build` folder once.
+- **Docs:** the quant-making tools and recipes are no longer part of this repository.
+
 ## v1.1.80 - 2026-11-25
 
 Inkling 2 Mini's thinking budget is now an option, not a default.

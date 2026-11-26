@@ -756,6 +756,54 @@ class ScriptEngine:
             yield t
 
 
+class LongCycle(unittest.TestCase):
+    """#1220: a loop of more than TOOL_WINDOW different calls (a round of 13 or 30, the same results every time)."""
+
+    @staticmethod
+    def rounds(n, times, tail=0):
+        one = [(f"cat part{i}.txt", f"contents of part {i}") for i in range(n)]
+        return one * times + one[:tail]
+
+    def messages(self, rounds):
+        return ToolRepeat().messages(agent(*rounds))
+
+    def test_a_13_call_round_is_a_loop(self):
+        self.assertIsNone(LG.tool_repeat(self.messages(self.rounds(13, 2, tail=12))))      # twice: not yet
+        self.assertEqual(LG.tool_repeat(self.messages(self.rounds(13, 3))), LG.ToolRepeat("bash", 3))
+        # (stops anywhere in the round it is in: the last call is the one that counts as made again)
+        self.assertEqual(LG.tool_repeat(self.messages(self.rounds(13, 3, tail=5))), LG.ToolRepeat("bash", 3))
+        self.assertEqual(LG.tool_blocked(self.messages(self.rounds(13, 4))), {})
+        got = LG.tool_blocked(self.messages(self.rounds(13, LG.TOOL_BLOCK)))
+        self.assertEqual(len(got), 13)
+        self.assertTrue(all(v.times == LG.TOOL_BLOCK for v in got.values()))
+
+    def test_a_30_call_round_is_a_loop(self):
+        self.assertIsNone(LG.tool_repeat(self.messages(self.rounds(30, 2, tail=29))))
+        self.assertEqual(LG.tool_repeat(self.messages(self.rounds(30, 3))), LG.ToolRepeat("bash", 3))
+        self.assertEqual(len(LG.tool_blocked(self.messages(self.rounds(30, LG.TOOL_BLOCK)))), 30)
+
+    def test_the_user_speaking_starts_the_count_over(self):
+        req = agent(*self.rounds(13, 3))
+        req["messages"].append({"role": "user", "content": "try something else"})
+        self.assertEqual(LG.tool_blocked(ToolRepeat().messages(req)), {})
+
+    def test_no_loop_where_calls_or_results_differ(self):
+        long = [(f"cat file{i}.txt", f"contents {i}") for i in range(60)]           # 60 different calls
+        self.assertIsNone(LG.tool_repeat(self.messages(long)))
+        self.assertEqual(LG.tool_blocked(self.messages(long)), {})
+        # the same 13 commands three times, but the results change (the work is going on): not a loop
+        moving = [(f"make t{i}", f"{k} failed") for k in (9, 6, 3) for i in range(13)]
+        self.assertIsNone(LG.tool_repeat(self.messages(moving)))
+        self.assertEqual(LG.tool_blocked(self.messages(moving)), {})
+        # two whole rounds and a long run of other calls in between: only two rounds
+        mixed = self.rounds(13, 2) + long[:20] + self.rounds(13, 1)
+        self.assertIsNone(LG.tool_repeat(self.messages(mixed)))
+        # a round broken in the middle (one call different) is not a whole round repeated
+        broken = self.rounds(13, 3)
+        broken[20] = ("cat other.txt", "something else")
+        self.assertIsNone(LG.tool_repeat(self.messages(broken)))
+
+
 class ToolBlock(unittest.TestCase):
     """After TOOL_NUDGES notes the model wrote the same call again (GLM-5.3: "the loop guard is right, act
     differently" - and the same grep, ten more times): that call is blocked - it never reaches the client, the server

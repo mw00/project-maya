@@ -509,6 +509,22 @@ class Settings(unittest.TestCase):
         self.assertEqual((row["family"], row["quant"], row["contexts"]), ("hy4", "Maya-XS", [4096, 8192, 16384, 32768]))
         self.assertEqual(row["context_range"], {"min": 4096, "max": 32768, "trained": 1048576, "tested": 32768})
 
+    def test_hy4_tensor_parallel_auto_round_trip(self):
+        """#1249: Hy4-Flash shows tp "auto"; saving it (or going back to it) writes no --tp, a number writes one."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": i, "name": "V100", "vram_gb": 16.0}
+                                                                   for i in range(4)])
+        cards.start()
+        self.addCleanup(cards.stop)
+        cfg = M.read(hy4_cfg(self.d))
+        self.assertEqual(M.settings_of(cfg)["tp"], "auto")
+        self.assertNotIn("--tp", M.apply(cfg, {"tp": "auto"})["args"])
+        two = M.apply(cfg, {"tp": 2})
+        self.assertEqual((M.flag(two["args"], "--tp"), M.settings_of(two)["tp"]), ("2", 2))
+        back = M.apply(two, {"tp": "auto"})
+        self.assertNotIn("--tp", back["args"])
+        self.assertEqual(M.settings_of(back)["tp"], "auto")
+        self.assertEqual(M.apply(cfg, {"tp": ""})["args"], M.apply(cfg, {"tp": "auto"})["args"])
+
     def test_hy4_a_new_context_gets_the_setups_chunk_again(self):
         """A small-card layout's prompt chunk is the setup's choice for one context (maya.py's hy4_fit: a picture's
         room first, the larger chunk only beside the largest picture's).  A context changed on the Models page gets
@@ -987,6 +1003,32 @@ class Settings(unittest.TestCase):
                "installer": {"family": "qwen", "quant": "CYBER-FROST-3.8-PS", "qwen_quant": "q5_k_m"}}
         self.assertEqual(M.quant_label(cfg, Path("maya-cyber-frost.json")), "Q5_K_M")
         self.assertEqual(M.maya_quants.config_label(cfg), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
+
+
+class PageValidity(unittest.TestCase):
+    """The Models page's own check of a draft (serve/web/models.js badField), run with node where it is installed."""
+
+    def test_tp_auto_is_a_valid_value(self):       # #1249: "Save and restart" stayed disabled for Hy4-Flash
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        import re
+        src = (ROOT / "serve/web/models.js").read_text(encoding="utf-8")
+        parts = [re.search(pat, src, re.S).group(0) for pat in (
+            r"const NUMS = \[.*?\];", r"const DECS = \[.*?\];", r"const whole = [^\n]*;",
+            r"const decimal = [^\n]*;", r"function badField\(k, v\) \{.*?\n\}")]
+        script = "\n".join(parts) + """
+const r = {auto: badField("tp", "auto"), two: badField("tp", "2"), empty: badField("tp", ""), zero: badField("tp", 0),
+  word: badField("tp", "fast"), ctxAuto: badField("context", "auto"), other: badField("prefill_chunk", "x"),
+  dec: badField("reserve_gb", "1.5"), decBad: badField("reserve_gb", "a")};
+console.log(JSON.stringify(r));"""
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"auto": False, "two": False, "empty": False, "zero": False,
+                                                  "word": True, "ctxAuto": True, "other": True,
+                                                  "dec": False, "decBad": True})
 
 
 class Served(unittest.TestCase):

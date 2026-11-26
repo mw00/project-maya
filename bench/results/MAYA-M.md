@@ -1,17 +1,7 @@
 # Maya-M - results
 
 Maya-M (116 GB, `Maya-M/` on [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF)) is Project
-Maya's larger quant of GLM-5.3-Flash, made from Z.ai's FP8 release with statistics from the FP8 model itself:
-
-| Tensors | Type |
-| --- | --- |
-| routed experts' gate/up | IQ2_S, error-feedback (GPTQ-style) rounding with the FP8 model's activation statistics |
-| routed experts' down | IQ3_XXS; IQ3_S in the most sensitive MoE layers (the first and last four) |
-| attention, shared experts, dense layers | Q6_K (the KDA gates and the indexer Q8_0, the router F32) |
-| the NextN (MTP) draft block | Q3_K / Q4_K experts |
-
-The calibration text is weighted toward tool calls and front-end code (HTML/CSS/JS, three.js, canvas), the work
-Maya-M is meant for. Recipe: `tools/maya_quant/recipes/maya-m.json`.
+Maya's larger quant of GLM-5.3-Flash, made from Z.ai's FP8 release.
 
 ## Against the FP8 model, token by token
 
@@ -40,12 +30,5 @@ token by token (above) Maya-M is clearly closer to the FP8 model.
 
 The same 400 questions per task for every model, scored the way lm-evaluation-harness scores them (the answer with
 the highest log-likelihood; length-normalized where the choices differ in length) - the FP8 model run layer by layer
-in PyTorch, Maya-M through Project Maya's engine (`tools/maya_quant/zs_*.py`). Maya-S on the same questions:
+in PyTorch, Maya-M through Project Maya's engine (Maya's scoring tools). Maya-S on the same questions:
 [MAYA-S.md](MAYA-S.md).
-
-## Tried and not kept
-
-An ISTA-DASLab-style refinement on top (each routed expert's group scales refitted to match the FP8 layer's output,
-codes held fixed, by least squares on calibration activations) lowered the layers' reconstruction error by 5-38% and
-the KL a little (0.323), but predicted held-out text slightly worse (4 of 8 texts better, 4 worse). The released
-Maya-M is the quant without it.
