@@ -164,8 +164,7 @@ public:
     /// size loads it).  slot_load puts it back in place of the caches' conversation: a forward from any position the
     /// slot holds a window for (the last one, or back to n - keep + 512) then gives what it would have without the
     /// switch.  A load that fails after writing any row leaves the model empty (end 0).  0 / false: err says why.
-    /// slot_supported: false (why) where the caches are not all in VRAM (KV streaming, KV spill: not kept yet)
-    bool slot_supported(std::string& why) const;
+    /// (KV streaming and KV spill: the rows by position as well - from pinned memory and the drive, back into both)
     uint64_t slot_save(const std::vector<int>& toks, int64_t keep, std::vector<uint8_t>& out, std::string& err);
     bool slot_load(const uint8_t* data, size_t bytes, std::vector<int>& toks, int64_t& keep, std::string& err);
     /// The engine and the model a slot is for: the version, the geometry, the rows' format, the MTP block, the pack's

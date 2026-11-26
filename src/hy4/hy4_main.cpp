@@ -922,12 +922,6 @@ struct Slots {
             on = false;
             return;
         }
-        std::string why;
-        if (!m.slot_supported(why)) {
-            on = false;
-            note(why);
-            return;
-        }
         min_tokens = (size_t) env_num("MAYA_HY4_SLOT_MIN", 1024);
         ring_keep = (int64_t) env_num("MAYA_HY4_SLOT_RING", 4096);
         ram_gb = env_num("MAYA_HY4_SLOT_RAM_GB", 8);
