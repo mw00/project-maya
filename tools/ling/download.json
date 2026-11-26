@@ -47,9 +47,17 @@
    }
   },
   "Ling-3.2-air-Maya-L": {
-   "_": "IQ3_S: not made yet",
-   "about": "",
-   "files": {}
+   "about": "IQ3_S",
+   "files": {
+    "Ling-3.2-air-Maya-L-IQ3_S-00001-of-00002.gguf": [
+     49602151040,
+     "aeed7796e48c713c6b1d5efd8c0db8c231fb8a0908542be881da6f0cea330def"
+    ],
+    "Ling-3.2-air-Maya-L-IQ3_S-00002-of-00002.gguf": [
+     9581612064,
+     "799e308aa227dc1faaa52a414d67c87b0d9adccd387c1c265b8eeb2b7a4842c8"
+    ]
+   }
   }
  },
  "folder": ""

@@ -33,10 +33,10 @@ alesha-pro contributed (PR #1224).
 | --- | --- | --- |
 | Ling-3.2-air · Maya-S | `ling-3.2-air-maya-s` | `Ling-3.2-air-Maya-S-IQ2_XXS.gguf`, 36.9 GB |
 | Ling-3.2-air · Maya-M | `ling-3.2-air-maya-m` | `Ling-3.2-air-Maya-M-IQ2_S.gguf`, 46.0 GB |
+| Ling-3.2-air · Maya-L | `ling-3.2-air-maya-l` | `Ling-3.2-air-Maya-L-IQ3_S-00001-of-00002.gguf` and `-00002-of-00002`, 59.2 GB |
 
 The file is pinned in `tools/ling/download.json` by size and sha256, and checked after the download and when a copy
-is already in the folder (`--model-dir <folder>` names a folder that has it). A larger size is listed there without
-files until it is uploaded; the setup offers a size once its files are.
+is already in the folder (`--model-dir <folder>` names a folder that has it).
 
 Any other GGUF of the model (one file, or a split set by its first shard):
 
@@ -101,7 +101,6 @@ Off by default. `--restore-dir <folder>` in the config's arguments turns them on
 - One answer at a time: no `--parallel`.
 - No tensor parallel.
 - Windows, AMD (Linux and Windows) and Mac.
-- Maya-L (not uploaded yet).
 - The same answer on one GPU and on several holds with `--repeatable` only; a normal run can differ in the last
   digits between layouts.
 

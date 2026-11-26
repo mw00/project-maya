@@ -27,6 +27,8 @@ S_SHA = "9fed99fc3beff053b96f8ef1cc40bb1b1cf926e201a121803d38f7927f60dd74"
 M_NAME = "Ling-3.2-air-Maya-M-IQ2_S.gguf"
 M_BYTES = 45971705280
 M_SHA = "1b43c9956d6ac3706744b0f043113a9b4d9269d51f77a56fb506d1332c9f4a88"
+L_FILES = {"Ling-3.2-air-Maya-L-IQ3_S-00001-of-00002.gguf": [49602151040, "aeed7796e48c713c6b1d5efd8c0db8c231fb8a0908542be881da6f0cea330def"],
+           "Ling-3.2-air-Maya-L-IQ3_S-00002-of-00002.gguf": [9581612064, "799e308aa227dc1faaa52a414d67c87b0d9adccd387c1c265b8eeb2b7a4842c8"]}
 V_NAME = "Ling-3.2-air-mmproj-BF16.gguf"
 V_BYTES = 869332480
 V_SHA = "4a6c6063070714617b62093baba9dfb040e4bee1f9019be6c81b6a16880117bb"
@@ -106,12 +108,11 @@ class Names(unittest.TestCase):
         a = args(model="ling-3.2-air-maya-m")
         self.assertIsNone(maya.model_option(a))
         self.assertEqual((a.model, a.ling_quant), (maya.LING, "maya-m"))
-        said = maya.model_option(args(model="ling-3.2-air-maya-l"))   # (in the table, no files: said, not set up)
-        self.assertIn("is not available yet", said)
-        self.assertIn("ling-3.2-air-maya-s", said)
-        self.assertIn("ling-3.2-air-maya-s", maya.named_quants())
-        self.assertIn("ling-3.2-air-maya-m", maya.named_quants())
-        self.assertNotIn("ling-3.2-air-maya-l", maya.named_quants())
+        a = args(model="ling-3.2-air-maya-l")
+        self.assertIsNone(maya.model_option(a))
+        self.assertEqual((a.model, a.ling_quant), (maya.LING, "maya-l"))
+        for i in ("ling-3.2-air-maya-s", "ling-3.2-air-maya-m", "ling-3.2-air-maya-l"):
+            self.assertIn(i, maya.named_quants())
         # (the other models' ids: all of them, in their order)
         self.assertEqual([i for i in maya.named_quants() if not i.startswith("ling-")],
                          [i for f, _, _, i in Q.QUANTS if f != "ling"])
@@ -126,15 +127,14 @@ class Table(unittest.TestCase):
         self.assertEqual(m["quants"]["Ling-3.2-air-Maya-S"]["files"], {S_NAME: [S_BYTES, S_SHA]})
         self.assertEqual(m["quants"]["Ling-3.2-air-Maya-M"], {"about": "IQ2_S", "files": {M_NAME: [M_BYTES, M_SHA]}})
         self.assertRegex(m["revision"], r"^[0-9a-f]{40}$")   # (the Hub repo's commit that has S, M and vision/)
-        for q in ("Ling-3.2-air-Maya-L",):             # (not uploaded yet: no invented size or hash)
-            self.assertEqual(m["quants"][q]["files"], {})
-            self.assertNotIn("memory_gb", m["quants"][q])
+        self.assertEqual(m["quants"]["Ling-3.2-air-Maya-L"], {"about": "IQ3_S", "files": L_FILES})
+        self.assertEqual(m["vision"]["revision"], m["revision"])
         for q, spec in m["quants"].items():            # (a file's name carries the model, the size and its quant type)
             for name, (size, sha) in spec["files"].items():
                 self.assertRegex(name, r"^" + q + r"-[A-Z0-9_]+(-\d{5}-of-\d{5})?\.gguf$")
                 self.assertRegex(sha, r"^[0-9a-f]{64}$")
                 self.assertGreater(size, 1 << 30)
-        self.assertEqual(LINGF.listed(), ["Ling-3.2-air-Maya-S", "Ling-3.2-air-Maya-M"])
+        self.assertEqual(LINGF.listed(), ["Ling-3.2-air-Maya-S", "Ling-3.2-air-Maya-M", "Ling-3.2-air-Maya-L"])
 
     def test_vision_pinned(self):
         """The pictures: the mmproj from Maya's own repo (vision/ at the table's commit), by size and sha256."""
@@ -151,22 +151,24 @@ class Table(unittest.TestCase):
         if not LINGF.download_manifest().get("revision"):
             self.assertFalse(maya.ling_published("maya-s"))
         self.assertTrue(maya.ling_listed("maya-s"))
-        self.assertTrue(maya.ling_listed("maya-m"))
-        for k in ("maya-l", "maya-xs", None):
+        self.assertTrue(maya.ling_listed("maya-m") and maya.ling_listed("maya-l"))
+        for k in ("maya-xs", None):
             self.assertFalse(maya.ling_listed(k))
             self.assertFalse(maya.ling_published(k))
         p1, p2 = with_manifest(manifest("0" * 40))
         with p1, p2:
             self.assertTrue(maya.ling_published("maya-s"))
             self.assertTrue(maya.ling_published("maya-m"))
-            self.assertFalse(maya.ling_published("maya-l"))
+            self.assertTrue(maya.ling_published("maya-l"))
+            e = maya.ling_entry("maya-l")   # (two files: the first shard is the one the engine opens)
+            self.assertEqual((list(e["files"]), e["gguf"]), (["Ling-3.2-air-Maya-L-IQ3_S-00001-of-00002.gguf", "Ling-3.2-air-Maya-L-IQ3_S-00002-of-00002.gguf"], "Ling-3.2-air-Maya-L-IQ3_S-00001-of-00002.gguf"))
             e = maya.ling_entry("maya-s")
             self.assertEqual((e["repo"], e["revision"], e["files"], e["sha256"], e["gguf"]),
                              ("peasantsmith/Ling-3.2-air-Maya-GGUF", "0" * 40, {S_NAME: S_BYTES}, {S_NAME: S_SHA}, S_NAME))
             self.assertAlmostEqual(e["download_gb"], 36.91, places=2)
             self.assertEqual(maya.hf_url(e["repo"], e["revision"], e["folder"], S_NAME),
                              f"https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF/resolve/{'0' * 40}/{S_NAME}")
-            self.assertIn("Ling-3.2-air-Maya-S (37 GB), Ling-3.2-air-Maya-M (46 GB)", maya.ling_about())
+            self.assertIn("Ling-3.2-air-Maya-S (37 GB), Ling-3.2-air-Maya-M (46 GB), Ling-3.2-air-Maya-L (59 GB)", maya.ling_about())
 
     def test_sizes_from_the_files(self):
         """The planner sizes a listed size by its file, a GGUF of the user's own by the file on the disk; a size with
@@ -175,7 +177,9 @@ class Table(unittest.TestCase):
         self.assertAlmostEqual(s["experts_gib"], S_BYTES / LINGF.GIB - LINGF.DENSE_GIB, places=1)
         m = LINGF.quant_spec("Ling-3.2-air-Maya-M")
         self.assertAlmostEqual(m["experts_gib"], M_BYTES / LINGF.GIB - LINGF.DENSE_GIB, places=1)
-        self.assertEqual(LINGF.quant_spec("Ling-3.2-air-Maya-L"), LINGF.quant_spec(None))
+        self.assertAlmostEqual(LINGF.quant_spec("Ling-3.2-air-Maya-L")["experts_gib"],
+                               (49602151040 + 9581612064) / LINGF.GIB - LINGF.DENSE_GIB, places=1)
+        self.assertEqual(LINGF.quant_spec("Ling-3.2-air-Maya-XS"), LINGF.quant_spec(None))
         self.assertAlmostEqual(LINGF.quant_spec("local", gguf_gib=50.0)["experts_gib"], 50.0 - LINGF.DENSE_GIB, places=1)
         # (a hint never names a size that does not exist)
         hint = LINGF.smaller_quant_hint([8.0], 32.0, 32768, "f16", "local", gguf_gib=60.0)
@@ -209,7 +213,7 @@ class Picker(unittest.TestCase):
                          "one answer at a time"):
                 self.assertIn(part, got["about"]["Ling-3.2-air"])
             self.assertIn("Ling-3.2-air-Maya-M (46 GB)", got["about"]["Ling-3.2-air"])
-            self.assertNotIn("Maya-L", got["about"]["Ling-3.2-air"])
+            self.assertIn("Ling-3.2-air-Maya-L (59 GB)", got["about"]["Ling-3.2-air"])
             got, fam = self.rows({"exe": "/b/maya-ling", "installer": {"family": "ling"}})
             self.assertEqual((got["rows"][got["default"]], fam), ("Ling-3.2-air", "ling"))
 
@@ -233,7 +237,9 @@ class Picker(unittest.TestCase):
         own = {"exe": "/b/maya-ling", "installer": {"family": "ling", "quant": "local", "model_dir": "/x"}}
         self.assertIsNone(maya.ling_choose_quant(args(), pc, own))
         p1, p2 = with_manifest(manifest("0" * 40))
-        with p1, p2, mock.patch.object(maya, "mem_gb", lambda: (128.0, 100.0)):   # (the largest that fits: Maya-M)
+        with p1, p2, mock.patch.object(maya, "mem_gb", lambda: (128.0, 100.0)):   # (the largest that fits: Maya-L)
+            self.assertEqual(maya.ling_choose_quant(args(), pc, {}), "maya-l")
+        with p1, p2, mock.patch.object(maya, "mem_gb", lambda: (24.0, 20.0)):     # (Maya-M's room, not Maya-L's)
             self.assertEqual(maya.ling_choose_quant(args(), pc, {}), "maya-m")
         small = {"gpus": [{"index": 0, "vram_gb": 8.0}]}
         with p1, p2, mock.patch.object(maya, "mem_gb", lambda: (36.0, 30.0)):     # (room for Maya-S only: Maya-S)
@@ -540,7 +546,8 @@ class Catalog(unittest.TestCase):
         ling = [r for r in after if r["family"] == "ling"]
         self.assertEqual([(r["id"], r["name"], r["group"], r["size_gb"]) for r in ling],
                          [("ling-3.2-air-maya-s", "Ling-3.2-air · Maya-S", "maya", 36.9),
-                          ("ling-3.2-air-maya-m", "Ling-3.2-air · Maya-M", "maya", 46.0)])
+                          ("ling-3.2-air-maya-m", "Ling-3.2-air · Maya-M", "maya", 46.0),
+                          ("ling-3.2-air-maya-l", "Ling-3.2-air · Maya-L", "maya", 59.2)])
         self.assertEqual([r for r in after if r["family"] != "ling"], before)
         for platform, backend in (("win32", "cuda"), ("linux", "hip"), ("darwin", "metal")):
             rows = self.catalog(manifest("0" * 40), platform, backend)
