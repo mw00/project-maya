@@ -163,7 +163,7 @@ from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Even
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
-                            unmark_literals, LiteralMemo)
+                            unmark_literals, LiteralMemo, TemplateError)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -7196,8 +7196,11 @@ def make_handler(svc: Service):
                     self.wfile.write(body)
                     return
                 if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
-                    # (a list of messages of the wrong shape: a 400 in plain words before anything reads it)
-                    check_messages(req, "input" if path == "/v1/responses" else "messages")
+                    # (a list of messages of the wrong shape, or no message at all: a 400 in plain words before
+                    # anything reads it.  Only Chat Completions and Anthropic's messages need a message to answer
+                    # with; /v1/responses checks its own `input` (serve/responses.py, whose message stays as is))
+                    check_messages(req, "input" if path == "/v1/responses" else "messages",
+                                   nonempty=path != "/v1/responses")
                     # file parts (OpenAI file / Responses input_file / Anthropic document): their text, or a
                     # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
                     attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
@@ -7228,6 +7231,13 @@ def make_handler(svc: Service):
                     self._json(ENGINE_ERROR_STATUS, engine_error_body(e, anthropic=path == "/v1/messages"))
             except EngineDied as e:
                 self._fail(503, "server_error", died_text(e))
+            except TemplateError as e:
+                # the chat template refusing the request it was handed (a message with an unknown role, or no role:
+                # serve/chat_template.jinja's raise_exception).  jinja2's exception is no ValueError, so it escaped
+                # every clause above and socketserver closed the socket with no answer at all - and a client that gets
+                # nothing cannot tell a bad request from a route the server does not serve
+                traceback.print_exc()
+                self._fail(400, "invalid_request_error", f"malformed request ({e})")
             except (KeyError, TypeError, AttributeError, IndexError) as e:
                 # a field of the wrong shape (Strata: a 400 with the traceback in the log, not a dropped connection)
                 traceback.print_exc()
