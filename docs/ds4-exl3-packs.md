@@ -3,6 +3,23 @@
 `tools/ds4/pack.py` packs another maker's EXL3 folder (`--model-dir` in the setup). Two layouts stop it; neither
 needs the weights re-quantized.
 
+## 3-bit DSpark routed experts
+
+The EXL3 pack builder can use a separate Safetensors file containing the 3-bit routed DSpark experts from the
+same checkpoint. Supply every `mtp.*.ffn.experts.*` matrix as EXL3 mul1, with each expert's pieces contiguous
+and in the same order across the layer. Keep the donor outside the base model folder's top level.
+
+```sh
+python tools/ds4/pack.py --model ./base-model \
+  --drafter-experts ./dspark-3bit-experts.safetensors \
+  --out ./maya-ds4-dspark-3bit
+```
+
+Point the native engine's `--pack` argument at `./maya-ds4-dspark-3bit` and enable drafting with `--dspark on`.
+The pack references the base shards and the donor in place, so keep those files at their original paths.
+The target and the rest of the drafter come from the base model. Packing without `--drafter-experts` uses
+the base model's bundled drafter.
+
 ## Type-ordered shards
 
 The engine reads a layer's experts as one region an expert: `expert_layout` (`src/ds4/ds4_model.cu`) takes expert 0's

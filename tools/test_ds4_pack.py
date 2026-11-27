@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "ds4"))
 import pack  # noqa: E402
@@ -194,6 +195,78 @@ def write_st(path: pathlib.Path, tensors: dict[str, tuple[str, list[int], bytes]
         off += len(b)
     hb = json.dumps(h).encode()
     path.write_bytes(len(hb).to_bytes(8, "little") + hb + b"".join(b for _, _, b in tensors.values()))
+
+
+class DrafterExperts(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.model = pathlib.Path(tmp.name) / "base"
+        self.model.mkdir()
+        self.donor = self.model.parent / "drafter.safetensors"
+        self.config = {"compress_ratios": [0, 0], "num_hidden_layers": 1,
+                       "dspark_block_size": 4, "dspark_n_routed_experts": 2}
+        self.weights = {}
+        base = {"layers.0.ffn.experts.0.w1.trellis": ("base.safetensors", "I16", (1, 2, 48), 0, 192),
+                "mtp.0.ffn.shared_experts.w1.trellis": ("base.safetensors", "I16", (1, 2, 96), 192, 384)}
+        for e in range(2):
+            for w in ("w1", "w2", "w3"):
+                prefix = f"mtp.0.ffn.experts.{e}.{w}"
+                for part, dtype, shape, data in (
+                    ("trellis", "I16", (1, 2, 48), bytes(192)),
+                    ("suh", "F16", (16,), bytes(32)),
+                    ("svh", "F16", (32,), bytes(64)),
+                    ("mul1", "I32", (), pack.MUL1.to_bytes(4, "little")),
+                ):
+                    name = f"{prefix}.{part}"
+                    self.weights[name] = (dtype, shape, data)
+                    base_shape = (1, 2, 64) if part == "trellis" else shape
+                    base[name] = ("base.safetensors", dtype, base_shape, 0, 256 if part == "trellis" else len(data))
+        self.st = FakeSt(base)
+        self.st.files = ["base.safetensors"]
+
+    def test_only_routed_drafter_experts_change(self):
+        write_st(self.donor, self.weights)
+        before = self.st.t.copy()
+        self.assertEqual(pack.use_drafter_experts(self.st, self.model, self.donor, self.config), 24)
+        self.assertEqual(self.st.files, ["base.safetensors", "../drafter.safetensors"])
+        self.assertEqual(self.st.t.keys(), before.keys())
+        for name, original in before.items():
+            if name in self.weights:
+                dtype, shape, data = self.weights[name]
+                ref, new_dtype, new_shape, off, nb = self.st.t[name]
+                self.assertEqual((ref, new_dtype, new_shape, nb), ("../drafter.safetensors", dtype, shape, len(data)))
+                self.assertEqual(self.donor.read_bytes()[off:off + nb], data)
+            else:
+                self.assertEqual(self.st.t[name], original)
+
+    def test_incompatible_donors_fail_before_mutating_the_index(self):
+        trellis = "mtp.0.ffn.experts.0.w1.trellis"
+        mul1 = "mtp.0.ffn.experts.0.w1.mul1"
+        before = self.st.t.copy()
+        for weights, msg in (
+            ({n: v for n, v in self.weights.items() if n != trellis}, "missing donor tensor"),
+            ({**self.weights, "embed.weight": ("F16", (1,), bytes(2))}, "unexpected donor tensor"),
+            ({**self.weights, trellis: ("I16", (1, 2, 64), bytes(256))}, "incompatible dtype, shape or byte range"),
+            ({**self.weights, mul1: ("I32", (), bytes(4))}, "expected the EXL3 mul1 codebook"),
+            (dict(sorted(self.weights.items(), key=lambda pair: pair[0].rsplit(".", 1)[1])),
+             "repack the donor"),
+        ):
+            with self.subTest(msg=msg):
+                write_st(self.donor, weights)
+                with self.assertRaisesRegex(ValueError, msg):
+                    pack.use_drafter_experts(self.st, self.model, self.donor, self.config)
+                self.assertEqual(self.st.t, before)
+                self.assertEqual(self.st.files, ["base.safetensors"])
+
+    def test_cli_requires_nondefault_output_for_donor(self):
+        args = ["pack.py", "--model", str(self.model), "--drafter-experts", str(self.donor)]
+        for extra in ([], ["--out", str(self.model / "maya-ds4")]):
+            with patch.object(sys, "argv", args + extra), patch.object(sys.stderr, "write") as err:
+                with self.assertRaises(SystemExit) as failure:
+                    pack.main()
+                self.assertEqual(failure.exception.code, 2)
+                self.assertIn("--drafter-experts requires --out separate", err.call_args.args[0])
 
 
 class MarkovNames(unittest.TestCase):
