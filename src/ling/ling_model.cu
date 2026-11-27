@@ -1220,7 +1220,15 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
 
     const uint64_t avail_ram = hy4::ram_available();
     const uint64_t total_ram = hy4::ram_total();
-    const uint64_t ram_spare = 8ULL << 30;
+    uint64_t ram_spare = 8ULL << 30;   // RAM left to the OS; MAYA_LING_RAM_HEADROOM_GB (GiB) overrides it
+    bool ram_spare_set = false;
+    if (const char* hs = std::getenv("MAYA_LING_RAM_HEADROOM_GB")) {
+        const double hg = std::atof(hs);
+        if (hg >= 0.0) {
+            ram_spare = (uint64_t) (hg * (double) (1ULL << 30));
+            ram_spare_set = true;
+        }
+    }
     uint64_t ram_budget_bytes = (avail_ram > ram_spare) ? (avail_ram - ram_spare) : 0ULL;
     if (o_.ram_cap_gib >= 0.0) {
         const uint64_t cap_b = (uint64_t) (o_.ram_cap_gib * (double) (1ULL << 30));
@@ -1320,8 +1328,11 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
     const double est_vram_frac =
         total_experts > 0 ? (double) total_vram_experts / (double) total_experts : 1.0;
     const uint64_t ram_headroom = std::max<uint64_t>(8ULL << 30, total_ram / 10);
+    // (the host tier is already allocated: pinning it takes no more RAM - with MAYA_LING_RAM_HEADROOM_GB set, the
+    //  whole tier may be pinned so --offload mix/gpu and auto's calibration can use it instead of the CPU lane only)
     const uint64_t host_pin_cap =
-        (avail_ram > ram_headroom)
+        ram_spare_set ? (avail_ram > ram_spare ? avail_ram - ram_spare : 0ULL)
+        : (avail_ram > ram_headroom)
             ? std::min<uint64_t>(avail_ram - ram_headroom, (uint64_t) (0.75 * (double) avail_ram))
             : 0ULL;
     const bool mode_uses_pin = !any_ssd && (o_.offload == OffloadMode::kGpu || o_.offload == OffloadMode::kMix ||
