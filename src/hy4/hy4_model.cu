@@ -24,7 +24,8 @@
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
 #include "../ds4/ds4_pcie.hpp"
-#include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
+#include "../core/vram_late.hpp"
+#include "maya/platform/memory.hpp"   // (--pin-experts/--pin-engram: lock_resident, the engines' own resident lock)   // (#1026: the reserve held for the whole run)
 
 #include <atomic>
 #include <cublas_v2.h>
@@ -171,6 +172,48 @@ void tok_row(int type, const uint8_t* row, int k, float* dst) {
         }
     }
 }
+
+// (the process's locked bytes (Linux /proc/self/status VmLck): what the pins hold, reported with them)
+static double vmlck_gib() {
+#if defined(__linux__)
+    std::ifstream f("/proc/self/status");
+    for (std::string line; std::getline(f, line);)
+        if (line.rfind("VmLck:", 0) == 0) return std::atof(line.c_str() + 6) / 1048576.0;
+#endif
+    return 0.0;
+}
+// (--pin-experts / --pin-engram: the engines' own resident lock, maya::platform::lock_resident - Linux mlock, Windows
+//  the working-set minimum + VirtualLock - a gigabyte at a time with progress (as ds4's Engram RAM mode prints), so the
+//  CPU lane's and the Engram table's reads never fault the pages out again.  HY4_PIN_REQUIRE=1: a range that stays
+//  pageable fails the start (ds4's ram-only rule) instead of being reported.)
+static size_t pin_range_chunked(const char* what, void* p, size_t n, std::string& why) {
+    const bool require = [] {
+        const char* e = std::getenv("HY4_PIN_REQUIRE");
+        return e && *e && std::atoi(e) != 0;
+    }();
+    const size_t pg = 4096, chunk = 1ull << 30;
+    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) (pg - 1);
+    const uintptr_t b = ((uintptr_t) p + n + pg - 1) & ~(uintptr_t) (pg - 1);
+    const size_t total = b > a ? (size_t) (b - a) : 0;
+    size_t done = 0;
+    for (size_t off = 0; off < total; off += chunk) {
+        const size_t m = std::min(chunk, total - off);
+        const maya::platform::LockResult r = maya::platform::lock_resident((uint8_t*) a + off, m);
+        if (!r.ok) {
+            why = std::string(what) + ": " + r.note + " (at " + std::to_string((unsigned long long) (off >> 20)) +
+                  " MiB of " + std::to_string((unsigned long long) (total >> 20)) + ")";
+            std::fprintf(stderr, "maya-hy4: %s\n", why.c_str());
+            if (require) return done;
+            break;
+        }
+        done += m;
+        if ((off / chunk) % 8 == 0)
+            std::fprintf(stderr, "maya-hy4: %s: %.1f / %.1f GB in RAM\n", what, (double) done / 1e9,
+                         (double) total / 1e9);
+    }
+    return done;
+}
+
 
 // BF16 values as F32 (exact: a BF16 is an F32's upper half)
 void bf16_to_f32(const uint16_t* src, size_t n, float* dst) {
@@ -4159,8 +4202,42 @@ struct Model::Impl {
             // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
             // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
             // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
+            // (--pin-experts / HY4_PIN_EXPERTS: the routed experts' mapped pages locked in RAM - the CPU lane reads a
+            //  token's experts from them, and a page evicted under pressure is a disk read in the middle of an answer)
+            if (const char* e = std::getenv("HY4_PIN_EXPERTS"); e && *e && std::atoi(e) != 0) o.pin_experts = true;
+            if (o.pin_experts) {
+                const double tp0 = now_s();
+                size_t got = 0, want = 0, ranges = 0;
+                std::string why;
+                for (const auto& tn : pk.t) {
+                    const Tensor& x = tn.second;
+                    if (tn.first.find("_exps.weight") == std::string::npos) continue;
+                    ++ranges;
+                    want += x.bytes;
+                    got += pin_range_chunked("pinned: the routed experts", (void*) pk.data(x), x.bytes, why);
+                }
+                char buf[240];
+                std::snprintf(buf, sizeof buf,
+                              "INFO pinned: the routed experts' pages %.1f GB of %.1f in RAM (%zu ranges, %.1f s; "
+                              "VmLck %.1f GiB)%s",
+                              (double) got / 1e9, (double) want / 1e9, ranges, now_s() - tp0, vmlck_gib(),
+                              why.empty() ? "" : (": " + why).c_str());
+                info.push_back(buf);
+            }
+            if (const char* e = std::getenv("HY4_PIN_ENGRAM"); e && *e && std::atoi(e) != 0) o.pin_engram = true;
+            if (o.pin_engram) {
+                const double tp0 = now_s();
+                std::string why;
+                const size_t eg_got = pin_range_chunked("pinned: the Engram table", (void*) eg_table, eg_bytes, why);
+                char buf[240];
+                std::snprintf(buf, sizeof buf, "INFO pinned: the Engram table %.1f GB of %.1f in RAM (%.1f s; "
+                              "VmLck %.1f GiB)%s",
+                              (double) eg_got / 1e9, (double) eg_bytes / 1e9, now_s() - tp0, vmlck_gib(),
+                              why.empty() ? "" : (": " + why).c_str());
+                info.push_back(buf);
+            }
             const char* ep = std::getenv("HY4_EG_POPULATE");
-            const bool eg_populate = ep && std::atoi(ep) != 0;
+            const bool eg_populate = (ep && std::atoi(ep) != 0) && !o.pin_engram;   // (pinned: mlock read it in)
             {
                 char buf[240];
                 std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, %s; norm eps %.9g; row scales %s",
