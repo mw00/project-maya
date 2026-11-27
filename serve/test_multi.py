@@ -77,6 +77,36 @@ class Engine(unittest.TestCase):
         for k, (n, got) in out.items():
             self.assertEqual(got, n, k)
 
+    def test_each_request_reads_its_own_progress(self):
+        """A request waiting for the engine behind another's prompt read gets heartbeats (None) while it waits, and the
+        server's prompt_progress for it is own_progress() at each: it carried the engine's latest PP line, the other
+        request's read (a 17K prompt showed a 600K read as its own, and its own count once that one was cancelled)."""
+        import serve.server as srv
+        os.environ["FAKE_MULTI_INTERLEAVE"] = "20"        # one prompt read at a time, 20 ids a PP line
+        quiet0, srv.REQUEST_QUIET_S = srv.REQUEST_QUIET_S, 10.0   # a heartbeat after 5 s of quiet (not 10)
+        engine = StrataEngine(script_exe(FAKE), ["2"])
+        try:
+            seen: dict[str, list] = {}
+
+            def one(name, n, delay):
+                time.sleep(delay)
+                got = seen.setdefault(name, [])
+                for t in engine.generate(list(range(n)), 3, {}, threading.Event()):
+                    if t is None:
+                        got.append(engine.own_progress())
+
+            ths = [threading.Thread(target=one, args=("long", 34000, 0.0)),
+                   threading.Thread(target=one, args=("short", 800, 0.3))]
+            [t.start() for t in ths]
+            [t.join(60) for t in ths]
+        finally:
+            engine.close()
+            srv.REQUEST_QUIET_S = quiet0
+            del os.environ["FAKE_MULTI_INTERLEAVE"]
+        self.assertEqual({p[1] for p in seen["long"] if p}, {34000})
+        self.assertEqual({p[1] for p in seen["short"] if p}, {800})
+        self.assertIsNone(seen["short"][0])               # its wait's heartbeat: no read of its own yet
+
     def test_a_restart_does_not_hand_out_a_number_a_request_already_has(self):
         """restart() rebuilt the rid counter (from 1) and the routing table while the old engine's requests were still
         unwinding: a request that came in then took an old rid, the engine's lines for it went into THAT request's

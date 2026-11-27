@@ -7754,6 +7754,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    tail->dump_logits(tail->sc_ + tail->sc_logits, 1, FT->cs);
     gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     cudaEventRecord(FT->ev_done, FT->cs);
@@ -8666,6 +8667,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             m->pick_tokens(m->sc_ + m->sc_logits, 1, *m->mtp_sample_, nullptr, 0, m->d_tok_, FL->cs);
             cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         } else {
+            m->dump_logits(m->sc_ + m->sc_logits, 1, FL->cs);
             gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
             cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         }
@@ -8847,6 +8849,7 @@ bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
         err = "glm spec: output head";
         return false;
     }
+    m->dump_logits(m->sc_ + m->sc_logits, 1, FL->cs);
     gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
     cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
     cudaEventRecord(FL->ev_done, FL->cs);

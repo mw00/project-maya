@@ -106,6 +106,12 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
    PC); then the settings [tuned for this PC](SETTINGS.md) earlier, or it offers the tuning (about 10-15 minutes;
    `./maya.sh --calibrate` any time) - and starts the dashboard.
 
+When you rerun setup for GLM-5.3-Flash on CUDA with the same native pack and GPUs in the same order, it keeps your
+layer split, expert RAM-resident flag and RAM headroom. It also keeps `--spec` and `--spec-min-p` when you use the same
+drafter (including MTP). If you explicitly pinned the expert CPU pool, the old lane count is reused with the same CPU
+mask. A saved calibration or a new `--env MAYA_GLM_CPU_LANE=...` takes priority. A normal restart reads the existing
+configuration directly.
+
 > **The start takes a few minutes**: the engine pins most of the free RAM (all but about 6 GB) for its expert tier
 > and warms its caches. Other programs get little RAM while Maya runs.
 

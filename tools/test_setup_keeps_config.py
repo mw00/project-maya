@@ -244,11 +244,11 @@ class GlmEnvKept(unittest.TestCase):
             ctx.start()
             self.addCleanup(ctx.stop)
 
-    def write(self, env=()):
+    def write(self, env=(), gpus=(0,), dflash=None):
         a = SimpleNamespace(env=list(env), port=None, host=None, api_key=None, gguf_dir=None)
-        pc = {"gpus": [{"index": 0, "name": "GPU", "vram_gb": 24}]}
+        pc = {"gpus": [{"index": i, "name": "GPU", "vram_gb": 24} for i in gpus]}
         return maya.write_config(a, pc, {}, self.model / "pack", "test", 32768, self.root / "models", None,
-                                 ("local", self.first))
+                                 ("local", self.first), dflash)
 
     def test_own_variables_stay_and_the_setups_are_worked_out_again(self):
         p = self.write()
@@ -260,6 +260,122 @@ class GlmEnvKept(unittest.TestCase):
         self.assertEqual(env.get("OTHER"), "y")                          # (an --env given now wins)
         self.assertNotIn("MAYA_GLM_PCIE_SHARE", env)                     # (the tuning's: none saved for this PC)
         self.assertNotIn("MAYA_GLM_MTP_DECODE", env)                     # (the setup's / speed check's own)
+
+    def test_cuda_flash_manual_layout_residency_and_mtp_spec_stay(self):
+        p = self.write(gpus=(0, 1, 2, 3))
+        c = maya.read_json(p)
+        c["layer_split"] = "12,24,36"                                  # server-level form, not an engine argv flag
+        c["args"] += ["--glm-ram-resident", "--spec", "6", "--spec-min-p", "0.73"]
+        p.write_text(json.dumps(c))
+
+        again = maya.read_json(self.write(gpus=(0, 1, 2, 3)))
+        self.assertEqual(again.get("layer_split"), "12,24,36")
+        self.assertIn("--glm-ram-resident", again["args"])
+        self.assertEqual(maya.flag_value(again["args"], "--spec"), "6")
+        self.assertEqual(maya.flag_value(again["args"], "--spec-min-p"), "0.73")
+        rerun = maya.read_json(self.write(gpus=(0, 1, 2, 3)))
+        self.assertEqual(rerun.get("layer_split"), "12,24,36")
+        self.assertEqual(rerun["args"], again["args"])                  # installer.written is deliberately ignored
+
+        changed_gpus = maya.read_json(self.write(gpus=(1, 0, 2, 3)))
+        self.assertNotIn("layer_split", changed_gpus)
+        self.assertNotIn("--glm-ram-resident", changed_gpus["args"])
+
+        drafter = self.root / "models" / "draft.gguf"
+        dflash = maya.read_json(self.write(gpus=(0, 1, 2, 3), dflash=drafter))
+        self.assertNotIn("--spec", dflash["args"])
+        self.assertNotIn("--spec-min-p", dflash["args"])
+
+    def test_cuda_flash_argv_layout_wins_and_invalid_layout_does_not(self):
+        p = self.write(gpus=(0, 1, 2, 3))
+        c = maya.read_json(p)
+        c.update(layer_split="12,24,36")
+        c["env"] = {"MAYA_GLM_DEVS": "0,2,1"}                           # GLM's part device order
+        c["args"] += ["--layer-split", "1,22"]
+        p.write_text(json.dumps(c))
+        again = maya.read_json(self.write(gpus=(0, 1, 2, 3)))
+        self.assertEqual(maya.flag_value(again["args"], "--layer-split"), "1,22")
+        self.assertEqual(again["env"].get("MAYA_GLM_DEVS"), "0,2,1")
+        self.assertNotIn("layer_split", again)
+
+        again["args"] = [a for a in again["args"] if a not in ("--layer-split", "1,22")]
+        again["layer_split"] = "12,12,36"                               # not strictly increasing
+        p.write_text(json.dumps(again))
+        invalid = maya.read_json(self.write(gpus=(0, 1, 2, 3)))
+        self.assertNotIn("layer_split", invalid)
+
+    def test_cuda_flash_dflash_spec_needs_the_same_actual_pack_and_drafter(self):
+        drafter = self.root / "models" / "draft.gguf"
+        p = self.write(gpus=(0, 1), dflash=drafter)
+        c = maya.read_json(p)
+        c.pop("installer")                                                # old hand-written JSON has no installer record
+        c["args"] += ["--spec", "5", "--spec-min-p", "0.72"]
+        p.write_text(json.dumps(c))
+        same = maya.read_json(self.write(gpus=(0, 1), dflash=drafter))
+        self.assertEqual(maya.flag_value(same["args"], "--spec"), "5")
+
+        c = maya.read_json(p)
+        c["args"][c["args"].index("--glm-pack") + 1] = str(self.root / "other-pack")
+        p.write_text(json.dumps(c))
+        changed_pack = maya.read_json(self.write(gpus=(0, 1), dflash=drafter))
+        self.assertNotIn("--spec", changed_pack["args"])
+
+        c = dict(same, args=list(same["args"]))
+        p.write_text(json.dumps(c))
+        changed_drafter = maya.read_json(self.write(gpus=(0, 1), dflash=self.root / "models" / "other.gguf"))
+        self.assertNotIn("--spec", changed_drafter["args"])
+
+    def test_cuda_flash_malformed_old_gpu_selection_is_not_reused(self):
+        p = self.write(gpus=(0, 1))
+        c = maya.read_json(p)
+        c["gpu"] = "0,not-a-gpu"
+        c["args"] += ["--glm-ram-resident"]
+        p.write_text(json.dumps(c))
+        again = maya.read_json(self.write(gpus=(0, 1)))
+        self.assertNotIn("--glm-ram-resident", again["args"])
+
+    def test_cuda_environment_split_and_explicit_residency_override(self):
+        p = self.write(gpus=(0, 1))
+        c = maya.read_json(p)
+        c["env"] = {"MAYA_GLM_SPLIT": "1"}
+        c["args"] += ["--glm-ram-resident"]
+        p.write_text(json.dumps(c))
+        again = maya.read_json(self.write(["MAYA_GLM_RAM_RESIDENT=0"], gpus=(0, 1)))
+        self.assertEqual(again["env"].get("MAYA_GLM_SPLIT"), "1")
+        self.assertNotIn("--glm-ram-resident", again["args"])
+        self.assertEqual(again["env"].get("MAYA_GLM_RAM_RESIDENT"), "0")
+        override = maya.read_json(self.write(["MAYA_GLM_SPLIT=0"], gpus=(0, 1)))
+        self.assertEqual(override["env"].get("MAYA_GLM_SPLIT"), "0")
+        self.assertNotIn("MAYA_GLM_SPLIT", maya.read_json(self.write(gpus=(1, 0))).get("env", {}))
+
+    def test_cuda_drafter_selected_in_the_environment(self):
+        p = self.write()
+        c = maya.read_json(p)
+        c["env"] = {"MAYA_GLM_DFLASH": "first.gguf"}
+        c["args"] += ["--spec", "5"]
+        p.write_text(json.dumps(c))
+        self.assertEqual(maya.flag_value(maya.read_json(self.write())["args"], "--spec"), "5")
+        changed = maya.read_json(self.write(["MAYA_GLM_DFLASH=second.gguf"]))
+        self.assertNotIn("--spec", changed["args"])
+
+    def test_cuda_hand_set_headroom_and_pinned_cpu_lane_survive_without_calibration(self):
+        p = self.write()
+        c = maya.read_json(p)
+        c["env"] = {"STRATA_GLM_RAM_HEADROOM_GB": "9", "STRATA_GLM_POOL_CPUS": "0,2,4,6",
+                    "STRATA_GLM_CPU_LANE": "4"}                       # legacy aliases normalize on read
+        p.write_text(json.dumps(c))
+
+        again = maya.read_json(self.write())
+        self.assertEqual(again["env"].get("MAYA_GLM_RAM_HEADROOM_GB"), "9")
+        self.assertEqual(again["env"].get("MAYA_GLM_CPU_LANE"), "4")
+        self.assertNotIn("MAYA_GLM_CPU_LANE", maya.read_json(self.write(["MAYA_GLM_POOL_CPUS=1,3,5,7"]))["env"])
+        self.assertEqual(maya.read_json(self.write(["MAYA_GLM_CPU_LANE=2"]))["env"].get("MAYA_GLM_CPU_LANE"), "2")
+
+        c = maya.read_json(p)
+        c["env"]["MAYA_GLM_CPU_LANE"] = "4"
+        p.write_text(json.dumps(c))
+        maya.CAL_STORE.write_text(json.dumps({maya.hardware_key(c): {"settings": {"MAYA_GLM_CPU_LANE": "3"}}}))
+        self.assertEqual(maya.read_json(self.write())["env"].get("MAYA_GLM_CPU_LANE"), "3")
 
 
 if __name__ == "__main__":

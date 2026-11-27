@@ -151,6 +151,8 @@ struct Stats {
     double store_wait_ms = 0.0;
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
+    double prof_dev_ms[2][6] = {};   // (the same by CUDA0 / CUDA1 apart) and the profiled steps' rows in all
+    int64_t prof_rows = 0;
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
     // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
     // read from the files, of them prefetched early; experts prefetched early
