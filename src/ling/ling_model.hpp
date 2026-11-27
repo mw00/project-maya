@@ -239,6 +239,8 @@ private:
     struct Layer {
         int dev_idx = 0;
         bool kda = false;
+        int kvr_slot = -1;      // this layer's place in its GPU's kept K/V tiles (prompt only; -1 = none)
+        int kvr_filled = 0;     // kept tiles written so far in this prompt
         const float* attn_norm = nullptr;
         const float* ffn_norm = nullptr;
         // KDA
@@ -376,6 +378,9 @@ private:
         uint16_t *pf_x16 = nullptr, *pf_w16 = nullptr;
         float *pf_tmp = nullptr;
         size_t pf_tmp_bytes = 0;
+        uint8_t* kvr_buf = nullptr;   // a long prompt's kept expanded MLA K/V tiles (ling_kv_reuse.hpp)
+        size_t kvr_bytes = 0;
+        int kvr_tiles = 0;            // tiles kept a layer
         int *pf_ids = nullptr, *pf_bounds = nullptr, *pf_tok = nullptr, *pf_row_of = nullptr;
         int *pf_pmap[2] = {nullptr, nullptr};
         float *pf_w = nullptr;
@@ -478,6 +483,8 @@ private:
     std::string last_kernel_;
 
     void* dev_alloc(Gpu& g, size_t bytes);
+    void kv_reuse_begin(int pos0, int n);   // a prompt's kept K/V tiles: sized from free VRAM (or none)
+    void kv_reuse_release();
     void* host_alloc(Gpu& g, size_t bytes);
     void set_dev(int dev);
     void check_token_id(int tok, const char* where) const;
