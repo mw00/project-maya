@@ -3325,7 +3325,28 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
                  // a draft's head rows (GlmDflash::split_head)
                  al((uint64_t) kWinMax * g_.n_embd * 4) + al((uint64_t) kWinMax * nc * 4) + al(kHdCandBytes) + al(4);
     }
-    { cudaError_t e_ = cudaMalloc(&w_arena_, bytes); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    {
+        cudaError_t e_ = cudaMalloc(&w_arena_, bytes);
+        if (e_ != cudaSuccess) {
+            // (#1169: say plainly that this GPU's memory is what ran out - the model's dense weights, which always go to
+            // VRAM - and by how much, not only the CUDA error)
+            w_arena_ = nullptr;
+            (void) cudaGetLastError();
+            size_t fr = 0, tot = 0;
+            const bool have = cudaMemGetInfo(&fr, &tot) == cudaSuccess;
+            char b[320];
+            if (e_ == cudaErrorMemoryAllocation && have)
+                std::snprintf(b, sizeof b, "pack: out of memory: CUDA%d cannot hold this model's dense weights (%.2f GB "
+                              "needed, %.2f GB of its %.2f GB free) - they always go to the GPU, so this model needs a "
+                              "GPU with more memory free, or more GPUs", dev_, (double) bytes / 1073741824.0,
+                              (double) fr / 1073741824.0, (double) tot / 1073741824.0);
+            else
+                std::snprintf(b, sizeof b, "pack: %s (CUDA%d, the model's dense weights: %.2f GB)", cudaGetErrorString(e_),
+                              dev_, (double) bytes / 1073741824.0);
+            err = b;
+            return false;
+        }
+    }
     w_arena_bytes_ = bytes;
     std::ifstream dense(pack_dir + "/dense.bin", std::ios::binary);
     if (!dense) {

@@ -2637,6 +2637,33 @@ def g53_contexts(pc: dict, parallel: int = 1, kv_bytes: int | None = None, reser
     return fit or CONTEXTS[:1]
 
 
+def g53_fit_gate(a, pc: dict, quant: str | None, reserve_mib: int | None = None) -> bool:
+    """The check before the tools, the build and the download (#1169): a GLM-5.3 (744B) quant whose dense weights - they
+    always go to VRAM - with each GPU's working memory and the VRAM the engine leaves free do not fit in these GPUs'
+    whole VRAM cannot start ("pack: out of memory"), so the setup ends here and says so (--force-fit: a warning, and
+    on).  Only for the quants whose figures are known (G53_MODELS), on discrete GPUs whose VRAM reads (an APU's is its
+    RAM).  True: it fits (or the check does not apply)."""
+    gpus = pc.get("gpus") or []
+    vram = sum(g.get("vram_gb") or 0 for g in gpus)
+    if quant not in G53_MODELS or not gpus or not vram or any(hip_unified_memory(g) for g in gpus):
+        return True
+    dense = g53_figures(quant)[1]
+    reserve = G53.RESERVE_MIB if reserve_mib is None else reserve_mib
+    need = dense + (G53.GPU_WORK_GB + reserve / 1024) * len(gpus)
+    if need <= vram:
+        return True
+    what = (f"{G53.LABEL} · {Q.glm53_quant(quant)} cannot start on {'this GPU' if len(gpus) == 1 else 'these GPUs'}: "
+            f"its dense weights (about {dense:.1f} GB) always go to the GPU, and with the engine's working memory they "
+            f"need about {need:.1f} GB of VRAM - {'this GPU has' if len(gpus) == 1 else 'these GPUs have'} "
+            f"{vram:.1f} GB in all. More RAM does not help: it needs more VRAM (another GPU, or a larger one)")
+    if getattr(a, "force_fit", False):
+        warn(what + " - going on (--force-fit)")
+        return False
+    fail(what + ". Nothing was downloaded",
+         "pick a smaller model in the setup; to try anyway: --force-fit")
+    return False
+
+
 def apu_memory(vram: float, ram: float, linux: bool) -> float:
     """A unified-memory APU's one memory, as fit_memory counts it: on Linux the GPU's memory is drawn from the RAM
     (the larger of the two figures), on Windows the carve-out sits beside the RAM Windows counts (the sum)."""
@@ -7665,6 +7692,9 @@ def _set_up(a, prev: dict) -> Path | None:
         ok(f"model: {choice[1]} (yours)")
     if g53_choice(choice):                             # GLM-5.3 (744B): the contexts its cache fits on these GPUs
         plan = g53_cache_plan(a, pc, choice)           # (as the config will run: write_config's)
+        # (dense weights that cannot fit these GPUs' VRAM: said here, before the tools, the build and the download -
+        # #1169; --force-fit goes on)
+        g53_fit_gate(a, pc, choice[1] if choice[0] == "download" else quant_of(Path(choice[1])), plan["reserve_mib"])
         contexts = g53_contexts(pc, **plan)
         # (a unified-memory APU: the largest context that keeps the whole model in memory - --context still wins)
         rec, line = g53_apu_context(pc, plan, choice[1] if choice[0] == "download" else quant_of(Path(choice[1])),

@@ -143,6 +143,28 @@ class Setup(unittest.TestCase):
         self.assertIsNone(maya.maya_sync.profile_for(self.dsa, self.shipped, self.g53_profile))
         self.assertEqual(maya.maya_sync.profile_for(self.flash, self.shipped, self.g53_profile), self.shipped)
 
+    def test_dense_weights_that_cannot_fit_end_the_setup(self):
+        """#1169: Maya-XS's dense weights (~17 GB) always go to VRAM, so on one 16 GB card the setup ends before the
+        download and says that VRAM, not RAM, is short (--force-fit: a warning, and on); where they fit it says nothing."""
+        one = lambda gb, **kw: {"gpus": [{"index": 0, "vram_gb": gb, **kw}]}   # noqa: E731
+        no = type("A", (), {"force_fit": False})()
+        with Quiet() as q, self.assertRaises(SystemExit):
+            maya.g53_fit_gate(no, one(16), "GLM-5.3-Maya-XS")
+        self.assertIn("dense weights (about 17.0 GB) always go to the GPU", q.text)
+        self.assertIn("this GPU has 16.0 GB in all", q.text)
+        self.assertIn("Nothing was downloaded", q.text)
+        with Quiet() as q:
+            self.assertFalse(maya.g53_fit_gate(type("A", (), {"force_fit": True})(), one(16), "GLM-5.3-Maya-XS"))
+        self.assertIn("going on (--force-fit)", q.text)
+        with Quiet() as q:
+            self.assertTrue(maya.g53_fit_gate(no, one(24), "GLM-5.3-Maya-XS"))
+            self.assertTrue(maya.g53_fit_gate(no, {"gpus": [{"index": i, "vram_gb": 12} for i in range(2)]},
+                                              "GLM-5.3-Maya-XS"))               # (24 GB in all: its layers split)
+            self.assertTrue(maya.g53_fit_gate(no, one(0.5, arch="gfx1151"), "GLM-5.3-Maya-XS"))   # (an APU: its RAM)
+            self.assertTrue(maya.g53_fit_gate(no, one(16), "some-local-quant"))  # (figures not known: not checked)
+            self.assertTrue(maya.g53_fit_gate(no, {"gpus": []}, "GLM-5.3-Maya-XS"))
+        self.assertEqual(q.text.strip(), "")
+
     def test_contexts_that_fit(self):
         one = lambda gb, **kw: {"gpus": [{"index": 0, "vram_gb": gb, **kw}]}   # noqa: E731
         with Quiet() as q:
