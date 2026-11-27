@@ -1160,26 +1160,28 @@ def _cpu_temp_hwmon(root):
         return None
     found = {}
     for n in dirs:
-        d = os.path.join(hwmon, n)
-        try:
-            with open(os.path.join(d, "name"), encoding="utf-8") as f:
-                chip = f.read().strip()
-        except (OSError, TypeError):
-            continue
-        if chip not in CPU_TEMP_CHIPS and chip not in CPU_TEMP_FALLBACK:
-            continue
-        try:
-            files = sorted(f for f in os.listdir(d) if f.startswith("temp") and f.endswith("_input"))
-        except OSError:
-            continue
-        for name in files:
+        # (only a CPU chip's temperatures are read: the name is a plain attribute, while another chip's temperature -
+        #  an NVMe drive's is a command to the drive - can take long in the kernel)
+        for d in (os.path.join(hwmon, n), os.path.join(hwmon, n, "device")):   # (older kernels: in device/)
             try:
-                with open(os.path.join(d, name), encoding="utf-8") as f:
-                    t = int(f.read().strip())
-            except (OSError, ValueError, TypeError):
+                with open(os.path.join(d, "name"), encoding="utf-8") as f:
+                    chip = f.read().strip()
+            except (OSError, TypeError):
                 continue
-            if t > 0:
-                found[chip] = max(found.get(chip, 0), t / 1000.0)
+            if chip not in CPU_TEMP_CHIPS and chip not in CPU_TEMP_FALLBACK:
+                continue
+            try:
+                files = sorted(f for f in os.listdir(d) if f.startswith("temp") and f.endswith("_input"))
+            except OSError:
+                continue
+            for name in files:
+                try:
+                    with open(os.path.join(d, name), encoding="utf-8") as f:
+                        t = int(f.read().strip())
+                except (OSError, ValueError, TypeError):
+                    continue
+                if t > 0:
+                    found[chip] = max(found.get(chip, 0), t / 1000.0)
     best = _cpu_temp_of(CPU_TEMP_CHIPS, found)
     return best if best is not None else _cpu_temp_of(CPU_TEMP_FALLBACK, found)
 
@@ -1194,26 +1196,32 @@ def _cpu_temp_thermal(root):
     except OSError:
         return None
     best = None
+    acpi = None                                         # (an ACPI zone: the board's, used when no CPU zone answers)
     for n in names:
         d = os.path.join(zones, n)
         try:
             with open(os.path.join(d, "type"), encoding="utf-8") as f:
                 kind = f.read().strip()
-            if kind not in CPU_TEMP_THERMAL:
+            if kind not in CPU_TEMP_THERMAL and kind not in CPU_TEMP_FALLBACK:
                 continue
             with open(os.path.join(d, "temp"), encoding="utf-8") as f:
                 t = int(f.read().strip())
         except (OSError, TypeError, ValueError):
             continue
-        if t > 0 and (best is None or t > best):
-            best = t
+        if t <= 0:
+            continue
+        if kind in CPU_TEMP_THERMAL:
+            best = t if best is None else max(best, t)
+        else:
+            acpi = t if acpi is None else max(acpi, t)
+    best = best if best is not None else acpi
     return best / 1000.0 if best is not None else None
 
 
 def cpu_temp(roots=None):
     """The CPU's temperature in °C: the hottest sensor of its own hwmon chip (k10temp / coretemp / zenpower), else its
-    kernel thermal zone (x86_pkg_temp and common ARM CPU zones), else psutil's sensors (where /sys is not the source,
-    as on macOS).  MAYA_CPU_SENSOR_ROOT puts another, host-provided or test sensor tree before /sys.  None when this
+    kernel thermal zone (x86_pkg_temp and common ARM CPU zones), else the board's ACPI zone, else psutil's sensors
+    (only where there is no /sys to read: on Linux psutil reads the same files, and every other device's as well).  MAYA_CPU_SENSOR_ROOT puts another, host-provided or test sensor tree before /sys.  None when this
     machine does not report the CPU's temperature to user space (Windows, a server whose sensors only reach IPMI, or a
     kernel module such as coretemp that is not loaded)."""
     if roots is None:
@@ -1226,6 +1234,11 @@ def cpu_temp(roots=None):
             best = _cpu_temp_thermal(root)
         if best is not None:
             return best
+    if any(_cpu_sensor_dir(root, kind) for root in roots for kind in ("hwmon", "thermal")):
+        # sysfs is there and holds no CPU sensor: psutil reads these same folders - every other chip's temperature too,
+        # each second, and a device's (an NVMe drive's: a command to the drive) can take long in the kernel, where the
+        # process cannot end until it returns (on a CI runner with many samplers the server ended minutes after SIGTERM)
+        return None
     try:
         import psutil
         sensors = psutil.sensors_temperatures()
@@ -1307,6 +1320,7 @@ class Telemetry:
         self.busy = busy
         self.watched_at = time.monotonic()           # (starts watched: the first readings come at the usual pace)
         self._wake = threading.Event()
+        self._stopped = threading.Event()
         self._slow = False
         self.lock = threading.Lock()
         self.now: dict = {}
@@ -1426,6 +1440,11 @@ class Telemetry:
         if self._slow:
             self._wake.set()
 
+    def stop(self) -> None:
+        """The sampler thread ends (its server stopped): no more readings."""
+        self._stopped.set()
+        self._wake.set()
+
     def pause(self) -> float:
         """The seconds to the next reading."""
         quiet = self.busy is not None and time.monotonic() - self.watched_at > WATCH_S
@@ -1436,7 +1455,7 @@ class Telemetry:
 
     def _loop(self):
         last = time.monotonic()
-        while True:
+        while not self._stopped.is_set():
             try:
                 s = self.sample()
             except Exception:  # noqa: BLE001 - a reading that fails is empty this second; the sampler goes on
@@ -1459,7 +1478,7 @@ class Telemetry:
                 self._wake.clear()
                 self._slow = False
             else:
-                time.sleep(wait)
+                self._stopped.wait(wait)
 
     def snapshot(self):
         self.touch()                                 # (somebody reads the numbers)
