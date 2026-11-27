@@ -779,15 +779,27 @@ __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
     }
     return __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0f, expf(__fmul_rn(-kOaiAlpha, gv)))), __fadd_rn(uv, 1.0f));
 }
+// Inkling 2's SITU (llama.cpp's LLM_FFN_SITU, ggml's operations in its order): beta tanh(g * (1 / beta)) times
+// sigmoid(g) = 1 / (1 + exp(-g)), times lb tanh(u * (1 / lb)) (lb <= 0: u) - every rounding explicit
+__device__ __forceinline__ float situ(float gv, float uv, float beta, float lb) {
+    const float a = fmul_no_fma(fmul_no_fma(tanhf(fmul_no_fma(gv, __fdiv_rn(1.0f, beta))), beta),
+                                __fdiv_rn(1.0f, fadd_no_fma(1.0f, expf(-gv))));
+    const float u = lb > 0.0f ? fmul_no_fma(tanhf(fmul_no_fma(uv, __fdiv_rn(1.0f, lb))), lb) : uv;
+    return fmul_no_fma(a, u);
+}
 // The gate / up kernels' epilogue, a template parameter EPI (DeepSeek's kernels: EPI 0, the code they always had):
 //   0  gate and up in one pass, h = DeepSeek's clamped SwiGLU      1  ... h = swigluoai (Args::act kActOai)
 //   2  the gate alone, its F32 sums out (h, or SetArgs::graw)       3  the up alone, h = act_split(those sums, up)
+//   4  gate and up in one pass, h = Inkling 2's SITU (kActSitu: situ_beta, situ_lb; no limit)
 // 2 then 3: a layer whose gate and up are of different types (Args::tu) - each value the one pass's
+constexpr int kEpiSitu = 4;
 template <int EPI>
-constexpr bool kBoth = EPI < 2;   // (gate and up in this pass)
+constexpr bool kBoth = EPI < 2 || EPI == kEpiSitu;   // (gate and up in this pass)
 template <int EPI>
-__device__ __forceinline__ float act_out(float gv, float uv, float limit, int pexp = 0) {
+__device__ __forceinline__ float act_out(float gv, float uv, float limit, int pexp = 0, float sbeta = 0.0f,
+                                         float slb = 0.0f) {
     if constexpr (EPI == 0) return pexp ? maya::ds4::par::swiglu_portable(gv, uv, limit) : swiglu(gv, uv, limit);
+    else if constexpr (EPI == kEpiSitu) return situ(gv, uv, sbeta, slb);
     else return swigluoai(gv, uv, limit);
 }
 // EPI 3's h: the gate's sums (EPI 2's) with the up's, the one pass's epilogue for the layer's activation (act: Args /
@@ -877,7 +889,7 @@ struct Ahead {
 // item the full grid's block (x, group), group by group.  An item's rows are the same warps' and lanes' as that block's,
 // summed in the same order: every output keeps its bits, whatever the grid.  The smaller codebooks keep the full grid (a
 // block there loads little, and one of an empty group leaves at once).  CUDA's maya-ds4 only: HIP and maya-mm3's build
-// of this file (MAYA_DS4_IQ_ONLY) keep the full grids, and so do MiniMax's epilogues (EPI 1..3).
+// of this file (MAYA_DS4_IQ_ONLY) keep the full grids, and so do MiniMax's and Inkling's epilogues (EPI 1..4).
 #if defined(MAYA_USE_HIP) || defined(MAYA_DS4_IQ_ONLY)
 #define DS4_IQ_PERSIST_BUILD 0
 #else
@@ -988,7 +1000,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                         float* hp = &a.h[(size_t) es[i] * a.n_ff + row];
                         if constexpr (TWO) {
                             const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
-                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp);
+                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp, a.situ_beta, a.situ_lb);
                         } else {
                             const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
                             if (lane == 0) *hp = EPI == 2 ? v : act_split(*hp, v, a.limit, a.act, a.pexp);
@@ -1157,7 +1169,8 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
             const int c = c0 + tx * TN + j;
             if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ag[i][j];
             else if constexpr (TWO)
-                a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_out<EPI>(ag[i][j], au[i][j], a.limit)));
+                a.h[lr * a.ldo + c] = __half_as_ushort(
+                    __float2half_rn(act_out<EPI>(ag[i][j], au[i][j], a.limit, 0, a.situ_beta, a.situ_lb)));
             else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = ag[i][j];
             else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + c], ag[i][j], a.limit, a.act)));
         }
@@ -1284,7 +1297,7 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
         if (q >= nrm) break;   // (uniform)
         if (TWO)
             for (int i = 0; i < (int) fg[q][j].num_elements; ++i)
-                fg[q][j].x[i] = act_out<EPI>(fg[q][j].x[i], fu[q][j].x[i], a.limit);
+                fg[q][j].x[i] = act_out<EPI>(fg[q][j].x[i], fu[q][j].x[i], a.limit, 0, a.situ_beta, a.situ_lb);
         wm::store_matrix_sync(ow, fg[q][j], 16, wm::mem_row_major);
         __syncthreads();   // (uniform: every warp stores, then reads its own tile)
         for (int i = lane; i < 16 * 16; i += 32) {
@@ -1361,6 +1374,49 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
             const float v = warp_sum(acc[c]);
             if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
         }
+}
+
+// mv_kernel for one job whose activation columns sit in LDS (mv_lds): each block copies the ncol int8 rows and their
+// scales into LDS once, then its warps take rows gridDim.x * warps apart - a lane's sub-blocks, the dot products, the
+// fmaf order and the warp's sum are mv_kernel's line for line (the same bits); only where the activations are read
+// from differs.  With 8 columns mv_kernel reads 8 x 32 activation bytes from the caches for every weight sub-block
+// (measured, R9700, a Q6_K output matrix of 201,024 x 4,608: 1 column 1,197 us, 8 columns 1,515 us)
+template <int T, int NC>
+__global__ void __launch_bounds__(1024) mv_lds_kernel(const MvJob b) {
+    pdl_wait();
+    pdl_trigger();
+    extern __shared__ __align__(16) uint8_t lds_x[];
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    const int nsb = b.k / 32, nc = b.ncol;
+    int8_t* sx = (int8_t*) lds_x;
+    float* sd = (float*) (lds_x + (size_t) nc * b.k);
+    for (int i = threadIdx.x; i < nc * b.k / 16; i += blockDim.x) ((int4*) sx)[i] = ((const int4*) b.xq)[i];
+    for (int i = threadIdx.x; i < nc * nsb; i += blockDim.x) sd[i] = b.xd[i];
+    __syncthreads();
+    const int nw = blockDim.x >> 5, lane = threadIdx.x & 31;
+    for (int row = blockIdx.x * nw + (threadIdx.x >> 5); row < b.n; row += gridDim.x * nw) {
+        const uint8_t* w = b.w + (size_t) row * b.ld;
+        float acc[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+        for (int kb = lane; kb < nsb; kb += 32) {
+            Sub s;
+            decode<T>(w, kb, tab, s);
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c < nc) {
+                    const int4* xp = (const int4*) (sx + (size_t) c * b.k + (size_t) kb * 32);
+                    acc[c] = fmaf(sd[(size_t) c * nsb + kb], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
+                }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < nc) {
+                const float v = warp_sum(acc[c]);
+                if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+            }
+    }
 }
 
 // mv_kernel for H jobs alike but for their offsets (a 3D matrix's heads: grid y = the head): head h's job is b0 with w,
@@ -1682,7 +1738,9 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
                 if (lane == 0) {
                     const size_t lr = (size_t) (lo + i);
                     if constexpr (!GATE_UP) a.y[lr * a.ldo + row] = v0;
-                    else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit)));
+                    else if constexpr (TWO)
+                        a.h[lr * a.ldo + row] =
+                            __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit, 0, a.situ_beta, a.situ_lb)));
                     else if constexpr (EPI == 2) a.graw[lr * a.n_ff + row] = v0;
                     else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + row], v0, a.limit, a.act)));
                 }
@@ -2071,6 +2129,9 @@ void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
 }
 // a set's gate and up of different types (SetArgs::tu): two passes, the gate's sums in graw between them
 bool split_gu(const SetArgs& a) { return a.tu != 0 && a.tu != a.tg; }
+// a SITU the kernels take (kActSitu): gate and up of one type, a positive beta
+template <class A>
+bool situ_ok(const A& a) { return (a.tu == 0 || a.tu == a.tg) && a.situ_beta > 0.0f; }
 // the gate / up's inputs (the up's own type too) and the down's in whole blocks of their types (256 values; IQ4_NL's 32)
 bool k_whole(int n_embd, int n_ff, int tg, int tu, int td) {
     return n_embd % block_values(tg) == 0 && (tu == 0 || n_embd % block_values(tu) == 0) && n_ff % block_values(td) == 0;
@@ -2079,11 +2140,18 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     const int K = gu ? a.n_embd : a.n_ff;
     if (gu && a.act != kActSwiglu && (a.tg == kMXFP4 || (split_gu(a) && a.graw == nullptr))) return false;
     if (gu && split_gu(a) && (a.graw == nullptr || a.tg == kMXFP4 || a.tu == kMXFP4)) return false;
+    if (gu && a.act == kActSitu && !situ_ok(a)) return false;
     LightBuf* b = light_buf(s, K);
     if (b == nullptr) return false;
     const dim3 gq((unsigned) ((K / 32 + kWarps - 1) / kWarps), (unsigned) (a.n_exp * kLightRows));
     pdl_launch(light_q8_kernel, gq, kThreads, 0, s, gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
                a.row0, b->q, b->d);
+    if (gu && a.act == kActSitu) {   // (Inkling's: one pass)
+#define LS_(T) launch_light<T, true, kEpiSitu>(a, *b, s)
+        DS4_IQ_SWITCH_EXP(a.tg, LS_)
+#undef LS_
+        return true;
+    }
     if (gu && a.act != kActSwiglu) {   // (MiniMax's: one pass, or the gate's then the up's on the same int8 rows)
         if (!split_gu(a)) {
 #define LO_(T) launch_light<T, true, 1>(a, *b, s)
@@ -2390,6 +2458,13 @@ const char* name(int t) {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
     if (!k_whole(a.n_embd, 0, a.tg, a.tu, 0) || a.n_ff % (kWarps * kGuRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
+    if (a.act == kActSitu) {   // Inkling 2's SITU: one pass (gate and up of one type)
+        if (!situ_ok(a)) return false;
+#define GS_(T) gu_ne<T, kEpiSitu>(a, grid, ne_max, s)
+        DS4_IQ_SWITCH_EXP(a.tg, GS_)
+#undef GS_
+        return true;
+    }
     if (a.act != kActSwiglu) {   // MiniMax's swigluoai: one pass, or (gate and up of different types) two
         if (a.tu == 0 || a.tu == a.tg) {
 #define GO_(T) gu_ne<T, 1>(a, grid, ne_max, s)
@@ -2514,6 +2589,7 @@ bool mmq_wanted(const SetArgs& a, bool gate_up) {
         if (rows < 0 || rows > a.max_rows) return false;
     }
     if (a.n_embd != 5120 || a.n_ff != 2304) return false;   // the DS4 pack's geometry
+    if (gate_up && a.act != kActSwiglu) return false;        // (mmq_epilogue: DeepSeek's SwiGLU; SITU: the tiles)
     if (a.ldx < (gate_up ? a.n_embd : a.n_ff) || a.ldo < (gate_up ? a.n_ff : a.n_embd)) return false;
     if (gate_up && a.ldx % 4 != 0) return false;   // the MMQ quantizer loads float4s
     if (gate_up ? (a.xf == nullptr || a.h == nullptr) : (a.xh == nullptr || a.y == nullptr)) return false;
@@ -2890,12 +2966,19 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 #endif
     if (!k_whole(a.n_embd, 0, a.tg, a.tu, 0) || a.n_ff % BN != 0) return false;
     if (split_gu(a) && a.graw == nullptr) return false;
+    if (a.act == kActSitu && !situ_ok(a)) return false;
     SetArgs t = a;
     if (light_gate_up(a, s)) {   // the experts of a few rows; the tiles the others
         if (a.max_rows <= kLightRows) return true;
         t.skip_le = kLightRows;
     }
     const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (a.n_ff / BN), (unsigned) a.n_exp);
+    if (a.act == kActSitu) {   // Inkling 2's SITU: one pass
+#define SS_(T) launch_set<T, true, kEpiSitu>(t, grid, s)
+        DS4_IQ_SWITCH_EXP(a.tg, SS_)
+#undef SS_
+        return true;
+    }
     if (a.act != kActSwiglu) {   // MiniMax's swigluoai: one pass, or the gate's then the up's (graw between them)
         if (!split_gu(a)) {
 #define SO_(T) launch_set<T, true, 1>(t, grid, s)
@@ -2982,6 +3065,39 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
     return true;
 }
+size_t mv_lds_bytes(const MvJob& b) { return (size_t) b.ncol * (size_t) b.k + (size_t) b.ncol * (size_t) (b.k / 32) * 4; }
+bool mv_lds(const MvJob& b, int grid, int threads, cudaStream_t s) {
+    if ((b.type != kQ6_K && b.type != kQ8_0) || b.n <= 0 || b.k % block_values(b.type) != 0 || b.k % 32 != 0 ||
+        b.ncol < 1 || b.ncol > 8 || mv_lds_bytes(b) > 65536 || threads < 64 || threads > 1024 || threads % 32 != 0 ||
+        ((uintptr_t) b.xq & 15) != 0)
+        return false;
+    const size_t smem = mv_lds_bytes(b);
+    if (grid <= 0) grid = (b.n + threads / 32 - 1) / (threads / 32);
+#define MVL_(T, NC)                                                                                          \
+    do {                                                                                                     \
+        static bool attr = false;                                                                            \
+        if (!attr) {                                                                                         \
+            if (cudaFuncSetAttribute((const void*) mv_lds_kernel<T, NC>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+                                     65536) != cudaSuccess) {                                                \
+                (void) cudaGetLastError();                                                                   \
+                return false;                                                                                \
+            }                                                                                                \
+            attr = true;                                                                                     \
+        }                                                                                                    \
+        pdl_launch(mv_lds_kernel<T, NC>, dim3((unsigned) grid), dim3((unsigned) threads), smem, s, b);       \
+    } while (0)
+    if (b.type == kQ6_K) {
+        if (b.ncol <= 1) MVL_(kQ6_K, 1);
+        else if (b.ncol <= 4) MVL_(kQ6_K, 4);
+        else MVL_(kQ6_K, 8);
+    } else {
+        if (b.ncol <= 1) MVL_(kQ8_0, 1);
+        else if (b.ncol <= 4) MVL_(kQ8_0, 4);
+        else MVL_(kQ8_0, 8);
+    }
+#undef MVL_
+    return true;
+}
 bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
               cudaStream_t s) {
     if (H <= 0 || b.n <= 0 || b.k % block_values(b.type) != 0 || b.ncol < 1 || b.ncol > 16) return false;
@@ -3043,6 +3159,20 @@ __global__ void __launch_bounds__(kThreads) swiglu_f16_kernel(const float* __res
         h[(size_t) r * ldh + c] = __half_as_ushort(__float2half_rn(swiglu(g[c], g[ff + c], limit)));
     }
 }
+__global__ void __launch_bounds__(kThreads) situ_f16_kernel(const float* __restrict__ gu, int ld, int n, int ff,
+                                                             float beta, float lb, uint16_t* __restrict__ h, int ldh) {
+#if DS4_IQ_STRICT_FP
+#pragma clang fp contract(off)
+#endif
+    pdl_wait();
+    pdl_trigger();
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < (long long) n * ff;
+         i += (long long) gridDim.x * blockDim.x) {
+        const int r = (int) (i / ff), c = (int) (i % ff);
+        const float* g = gu + (size_t) r * ld;
+        h[(size_t) r * ldh + c] = __half_as_ushort(__float2half_rn(situ(g[c], g[ff + c], beta, lb)));
+    }
+}
 static unsigned grid_for(long long items) {
     return (unsigned) std::max<long long>(1, std::min<long long>(4096, (items + kThreads - 1) / kThreads));
 }
@@ -3060,6 +3190,9 @@ void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16
 }
 void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s) {
     pdl_launch(swiglu_f16_kernel, grid_for((long long) n * ff), kThreads, 0, s, gu, ld, n, ff, limit, h, ldh);
+}
+void situ_f16(const float* gu, int ld, int n, int ff, float beta, float lb, uint16_t* h, int ldh, cudaStream_t s) {
+    pdl_launch(situ_f16_kernel, grid_for((long long) n * ff), kThreads, 0, s, gu, ld, n, ff, beta, lb, h, ldh);
 }
 
 bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* tile, cudaStream_t s) {
