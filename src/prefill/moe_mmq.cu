@@ -270,7 +270,8 @@ namespace {
 // IQ2_XXS / IQ2_S -> FP16 for the prompt's FP16 expert path (MAYA_GLM_PREFILL_BLAS): ggml's dequantize_iq2_xxs /
 // dequantize_iq2_s arithmetic value for value (bit-identical output), as 256-thread blocks with one 16-byte store a
 // thread, the grid table in shared memory and a grid-stride loop that loads it once a block. ggml's 32-thread blocks
-// of 2-byte stores move ~425 GB/s on a CMP 170HX; these ~930. MAYA_PREFILL_FAST_DEQUANT=0: ggml's. HIP keeps ggml's.
+// of 2-byte stores move ~425 GB/s on a CMP 170HX; these ~930. Opt-in, MAYA_PREFILL_FAST_DEQUANT=1 (unset or 0:
+// ggml's) until a same-tokens check on every card family has passed (a V100 run gave other tokens). HIP keeps ggml's.
 __global__ void __launch_bounds__(256) iq2_xxs_f16_kernel(const block_iq2_xxs* __restrict__ x, half* __restrict__ y,
                                                           int64_t nsb) {
     __shared__ uint64_t g[256];
@@ -317,7 +318,7 @@ __global__ void __launch_bounds__(256) iq2_s_f16_kernel(const block_iq2_s* __res
 bool iq2_to_f16(int t, const void* w, half* dst, int64_t n, cudaStream_t s) {
     static const bool on = [] {
         const char* v = std::getenv("MAYA_PREFILL_FAST_DEQUANT");
-        return v == nullptr || std::atoi(v) != 0;
+        return v != nullptr && std::atoi(v) != 0;
     }();
     if (!on || (t != GGML_TYPE_IQ2_XXS && t != GGML_TYPE_IQ2_S) || n % QK_K != 0) return false;
     static int sms[GGML_CUDA_MAX_DEVICES] = {};
