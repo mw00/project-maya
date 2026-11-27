@@ -1778,11 +1778,18 @@ if(MAYA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
     set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     # (the second-generation IQ2 rows: VEX encodings throughout - without /arch the compiler's own SSE code beside
-    #  them cost a third of their speed on Golden Cove; their AVX-512 form's intrinsics compile as they are, and the
-    #  caller runs each form only where the CPU takes it)
-    set_source_files_properties(src/kernels/cpu/iq2v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
+    #  them cost a third of their speed on Golden Cove.  Their AVX-512 forms are compiled on their own under
+    #  /arch:AVX512 (the *_z.cpp files, MAYA_IQV_SPLIT): under /arch:AVX2 they ran at about half their speed, so the
+    #  CPU's pick took AVX2 forms that lose once every thread runs - Windows decode -40% on a 48-thread Xeon, #1235.
+    #  The caller runs each form only where the CPU takes it)
+    target_sources(maya_kernels_cpu PRIVATE src/kernels/cpu/iq2v_rows_z.cpp src/kernels/cpu/iq3v_rows_z.cpp)
+    set_source_files_properties(src/kernels/cpu/iq2v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict"
+                                COMPILE_DEFINITIONS "MAYA_IQV_SPLIT=1")
+    set_source_files_properties(src/kernels/cpu/iq2v_rows_z.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:strict")
     # (the second-generation IQ3_XXS / IQ4_XS / 4-bit IQ2_XXS rows: the same, for the same reason)
-    set_source_files_properties(src/kernels/cpu/iq3v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
+    set_source_files_properties(src/kernels/cpu/iq3v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict"
+                                COMPILE_DEFINITIONS "MAYA_IQV_SPLIT=1")
+    set_source_files_properties(src/kernels/cpu/iq3v_rows_z.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:strict")
   elseif(MAYA_CPU_X86)
     # (the second-generation IQ2 rows: each function's instruction set its own, no contraction)
     set_source_files_properties(src/kernels/cpu/iq2v_rows.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
