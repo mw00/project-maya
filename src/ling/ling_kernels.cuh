@@ -165,6 +165,14 @@ void argmax_rows_f32(const float* logits, int W, int n, float* scratch_val, int*
 /// Copy W contiguous rows from src [W][E] into ring buffer ring [R][E] at positions (pos0 + t) % R.
 void store_hring(const float* src, int W, int E, float* ring, int R, int pos0, cudaStream_t s);
 void set_step(int* d_step, int tok, int pos, int n_kv, int rope_delta, cudaStream_t s);
+/// d_step: [tok, pos, n_kv, rope_delta]; on AMD (no tensor-core window kernel) set_step_win also writes each window
+/// row's own cache length at d_step[kStepWinCounts + i] (kStepInts in all), for the row-by-row MLA decode
+constexpr int kStepWinCounts = 4;
+#if defined(MAYA_USE_HIP)
+constexpr int kStepInts = 8;
+#else
+constexpr int kStepInts = 4;
+#endif
 void set_step_win(int* d_step, int* d_tok, int* d_pos, int t0, int t1, int t2, int t3, int W, int pos0, int rope_delta,
                   cudaStream_t s);
 

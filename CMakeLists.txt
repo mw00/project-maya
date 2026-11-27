@@ -1194,7 +1194,8 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     endif()
   endif()
   # Ling-3.2-air (llama.cpp's bailingmoe3): its own engine (src/ling) on maya-ds4's ggml block-type GEMVs
-  # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; Linux + NVIDIA sm_70+ only for now
+  # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; Linux: NVIDIA sm_70+, and AMD (HIP,
+  # through include/maya/hip_compat as maya-hy4 / maya-ds4; the tensor-core MLA decode kernel is CUDA's only)
   set(_ling_archs "")
   set(_ling_filter OFF)
   if(MAYA_ENABLE_CUDA AND NOT WIN32 AND _maya_archs)
@@ -1220,10 +1221,10 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     if(_ling_filter AND NOT _ling_archs)
       message(STATUS "Maya: maya-ling not built - it needs sm_70 or newer, arch ${_maya_archs}")
     endif()
-  elseif(MAYA_ENABLE_CUDA AND WIN32)
+  elseif((MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP) AND WIN32)
     message(STATUS "Maya: maya-ling not built on Windows for now")
   endif()
-  if(MAYA_ENABLE_CUDA AND NOT WIN32 AND (_ling_archs OR NOT _ling_filter))
+  if(NOT WIN32 AND ((MAYA_ENABLE_CUDA AND (_ling_archs OR NOT _ling_filter)) OR MAYA_ENABLE_HIP))
     add_executable(maya-ling src/ling/ling_main.cu src/ling/ling_model.cu src/ling/ling_kernels.cu src/ling/ling_vision.cu
                              src/ling/ling_parity.cpp
                              src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp
@@ -1241,6 +1242,10 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     target_compile_definitions(maya-ling PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS MAYA_LING_SWIGLU)
     if(_ling_filter)
       set_target_properties(maya-ling PROPERTIES CUDA_ARCHITECTURES "${_ling_archs}")
+    endif()
+    if(MAYA_ENABLE_HIP AND MAYA_HIPBLASLT_AVAILABLE)   # (ds4_lt.cu's dense GEMMs on AMD, as maya-hy4's)
+      set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS MAYA_HIPBLASLT_AVAILABLE=1)
+      target_link_libraries(maya-ling PRIVATE roc::hipblaslt)
     endif()
     if(MAYA_BUILD_TESTS)
       add_executable(ling_kernels_test tests/ling_kernels_test.cu src/ling/ling_kernels.cu)

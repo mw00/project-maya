@@ -273,6 +273,13 @@ static void test_mla_dec_wmma() {
     CHECK_CUDA(cudaMemcpy(d_nkv, &nkv_v, 4, cudaMemcpyHostToDevice));
 
     const bool ok = ling::k::mla_dec_wmma(d_qabs, d_qm, QH, QN, d_lat, 0, (const uint16_t*) d_kpe, NKV, d_nkv, T, H, KL, R, scale, d_part, d_ctx, 0);
+#if defined(MAYA_USE_HIP)
+    // AMD: no tensor-core kernel - it says so (nothing launched) and the engine takes glmd::mla_dec row by row
+    EXPECT(!ok, "mla_dec_wmma launched on HIP");
+    cudaFree(d_qabs); cudaFree(d_qm); cudaFree(d_lat); cudaFree(d_kpe); cudaFree(d_part); cudaFree(d_ctx); cudaFree(d_nkv);
+    std::printf("PASS test_mla_dec_wmma (HIP: not offered, as expected)\n");
+    return;
+#endif
     EXPECT(ok, "mla_dec_wmma returned false");
     CHECK_CUDA(cudaDeviceSynchronize());
 

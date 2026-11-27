@@ -59,6 +59,9 @@ HEADROOM_GIB = 1.25  # matches Model::Model headroom (absorbs optional MTP dense
 RAM_SPARE_GIB = 8.0
 MIN_VRAM_GIB = 7.5   # 8 GB class card minimum (zero-expert VRAM pool works)
 MIN_CC = 70          # Volta / Turing+ (sm_70+)
+# AMD (HIP, Linux): wave32 RDNA 3 / 3.5 / 4 (gfx11 / gfx12), the HIP build's own family - run on a Gorgon Halo's
+# Radeon 8065S (gfx1151); one GPU for now (the layer split across AMD cards is not run yet)
+AMD_ARCHS = ("gfx11", "gfx12")
 
 # Neutral fallback sizing when no local GGUF file size is supplied (maintainers add official quants in download.json).
 DEFAULT_EXPERTS_GIB = 52.0
@@ -287,7 +290,24 @@ def recommended_context(vram_gbs: list[float] | float, kv: str = DEFAULT_KV, qua
 
 
 def unsupported(backend: str, win: bool, gpus: list[dict], ram_gb: float = 0.0, avx2: bool = True) -> str | None:
-    """Clear refusal message for unsupported machines (None = supported)."""
+    """Clear refusal message for unsupported machines (None = supported).  AMD (backend "hip"): the setup's amd_gpus
+    entries ({"arch": "gfx1151", "vram_gb", "unified_memory": an APU whose memory is the RAM - no VRAM minimum})."""
+    if backend == "hip":
+        if win:
+            return ("Ling-3.2-air on AMD runs on Linux only for now (its engine is not built for AMD on Windows yet)")
+        if len(gpus) > 1:
+            return "Ling-3.2-air on AMD runs on one GPU for now: pick one (--gpu N)"
+        if gpus and not str(gpus[0].get("arch") or "").startswith(AMD_ARCHS):
+            return ("Ling-3.2-air on AMD needs a Radeon RX 7000 / 9000, a Radeon PRO W7000 / AI PRO R9700 or a Ryzen "
+                    "AI Max (Strix / Gorgon Halo) GPU - RDNA 3, 3.5 or 4 (gfx11 / gfx12); other AMD GPUs are not "
+                    "supported by its engine yet")
+        v = float(gpus[0].get("vram_gb") or 0) if gpus else 0.0
+        if gpus and not gpus[0].get("unified_memory") and 0 < v < MIN_VRAM_GIB:
+            return (f"GPU {gpus[0].get('name', '?')} has {v:.1f} GB VRAM (minimum {MIN_VRAM_GIB:.1f} GB for "
+                    "Ling-3.2-air trunk + KV)")
+        if not avx2:
+            return "This CPU lacks AVX2; maya-ling's CPU expert lane requires AVX2"
+        return None
     if win:
         return "Ling-3.2-air (maya-ling) is Linux CUDA only for now; Windows support is tracked upstream"
     if backend == "metal":

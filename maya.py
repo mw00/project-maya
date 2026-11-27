@@ -1771,7 +1771,8 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              "Linux) - if it does not start or its answers look wrong, docs/AMD_MAYA.md says how to report it and "
              "what to use instead")
     if a.backend == "hip":
-        return check_hip_pc(a, text_only=not (mm3 or hy4 or ik2))   # (Inkling 2: pictures on AMD too)
+        # (Inkling 2, Ling: pictures on AMD too)
+        return check_hip_pc(a, text_only=not (mm3 or hy4 or ik2 or family == "ling"))
     if a.backend == "metal":
         if family != "glm":
             fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or hy4 and HY4 or QWEN_SHOWN})",
@@ -12201,8 +12202,9 @@ def ling_about() -> str:
     sizes = [f"{LING_QUANTS[k]} ({ling_entry(k)['download_gb']:.0f} GB)" for k in LING_QUANTS if ling_published(k)]
     return ("inclusionAI's Ling-3.2-air (512 experts a layer, 8 a token) on its own engine"
             + (", in Maya's own GGUF quants: " + ", ".join(sizes) if sizes else "") +
-            "; NVIDIA from V100 / RTX 20 on, Linux only; one GPU or several (the layers split across "
-            "them), the experts that do not fit in VRAM computed from RAM, the rest read from the SSD; tool calls, "
+            "; Linux only: NVIDIA from V100 / RTX 20 on, one GPU or several (the layers split across "
+            "them), or one AMD RDNA 3 / 3.5 / 4 GPU (a Ryzen AI Max APU too); the experts that do not fit in VRAM "
+            "computed from RAM, the rest read from the SSD; tool calls, "
             "thinking on or off, up to a 256K context, MTP drafting where the file has the model's draft block "
             "(measured once on this PC), pictures (its vision file, 0.9 GB, downloaded with the model; not with "
             "--no-vision); one answer at a time.")
@@ -12336,6 +12338,20 @@ def ling_drafting(a, prev_args: list) -> str:
     return "off" if how in ("off", "none", "0") else "mtp" if how in ("mtp", "on", "1") else "auto"
 
 
+def ling_memory(pc: dict, ram_gb: float) -> tuple[list, float]:
+    """(each GPU's memory for the model, the RAM beside it) as the fit planner (tools/ling_fit.py) counts them: NVIDIA
+    the cards' VRAM and the PC's RAM.  AMD: a card's VRAM less what the engines leave the desktop (hip_reserve_mib); a
+    unified-memory APU (hip_unified_memory: Strix / Gorgon Halo) the GPU's share of the one memory (hy4_apu_gib: less
+    the system's margin, within the driver's limit) and only the rest of the RAM beside it - nothing counted twice."""
+    gpus = pc.get("gpus") or []
+    if pc.get("backend") != "hip":
+        return [float(g.get("vram_gb") or 0) for g in gpus], ram_gb
+    vrams = [hy4_apu_gib([g]) if hip_unified_memory(g) else
+             max(float(g.get("vram_gb") or 0) - hip_reserve_mib([g]) / 1024.0, 0.0) for g in gpus]
+    shared = sum(v for g, v in zip(gpus, vrams) if hip_unified_memory(g))
+    return vrams, (max(ram_gb - shared, 0.1) if ram_gb > 0 else 0.0)   # (0: the planner's "RAM not read")
+
+
 def ling_gguf_gib(gguf: Path) -> float:
     """The model's size on the disk, GiB: the file, or every shard of its set (<name>-0000N-of-0000M.gguf)."""
     m = SHARD_RE.search(gguf.name)
@@ -12361,6 +12377,13 @@ def write_config_ling(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, 
             "--kv", "fp16" if LINGF.normalize_kv(kv) == "f16" else "q8"]
     if len(gpus) > 1:                                  # (the config's GPUs as the engine counts them: 0..N-1)
         args += ["--gpus", ",".join(str(i) for i in range(len(gpus)))]
+    if pc.get("backend") == "hip":
+        # AMD: the memory the engine leaves free beside its expert pool (it sizes the pool from what HIP says is
+        # free) - an APU's free memory is the system's RAM: the margin the other engines keep there,
+        # max(8 GB, 10%); a card: what the engines leave its desktop (hip_reserve_mib)
+        apu = any(hip_unified_memory(g) for g in pc["gpus"])
+        res = apu_margin_gb(mem_gb()[0]) if apu else hip_reserve_mib(pc["gpus"]) / 1024.0
+        args += ["--reserve-gb", f"{res:.1f}"]
     args += ["--drafting", drafting if drafting in ("auto", "mtp") else "off"]
     if mmproj is not None and not getattr(a, "no_vision", False):
         args += ["--mmproj", str(mmproj)]
@@ -12428,11 +12451,15 @@ def set_up_ling(a, prev: dict) -> Path | None:
     prev_kv = prev_args[prev_args.index("--kv") + 1] if "--kv" in prev_args[:-1] else LINGF.DEFAULT_KV
     a.gpus_before = prev.get("gpu")
 
-    pc = check_pc(a)                                   # 1
+    pc = check_pc(a, "ling") if a.backend == "hip" else check_pc(a)   # 1
     ram_gb = mem_gb()[0]
-    why = LINGF.unsupported(pc.get("backend", "cuda"), WIN, pc.get("gpus") or [], ram_gb, ling_avx2_available())
+    amd = pc.get("backend") == "hip"
+    cards = [dict(g, unified_memory=hip_unified_memory(g)) for g in pc.get("gpus") or []] if amd else \
+        pc.get("gpus") or []
+    why = LINGF.unsupported(pc.get("backend", "cuda"), WIN, cards, ram_gb, ling_avx2_available())
     if why:
         fail(why)
+    vrams, fit_ram = ling_memory(pc, ram_gb)
 
     step(2, "your choices")                            # 2
     key = ling_choose_quant(a, pc, prev)
@@ -12457,12 +12484,11 @@ def set_up_ling(a, prev: dict) -> Path | None:
         m = ling_entry(key)
         ok(f"model: {Q.shown('ling', key, m['download_gb'])} - inclusionAI's Ling-3.2-air in Project Maya's GGUF "
            "quant (MIT)")
-    vrams = [float(g.get("vram_gb") or 0) for g in pc["gpus"]]
     kv = LINGF.normalize_kv(getattr(a, "kv", None) or prev_kv)
     rec_ctx = LINGF.recommended_context(vrams, kv, quant_name)
     ctx = choose_context(a, prev_ctx, LINGF.CONTEXTS, rec_ctx)
     label = Q.shown("ling", key)
-    word, line = LINGF.verdict(vrams, ram_gb, ctx, kv, quant_name, gguf_gib=gguf_gib)
+    word, line = LINGF.verdict(vrams, fit_ram, ctx, kv, quant_name, gguf_gib=gguf_gib)
     if word == "does not fit":
         if getattr(a, "force_fit", False):
             warn(f"{label} at {context_label(ctx)}: {line} - continuing (--force-fit)")
@@ -12485,7 +12511,8 @@ def set_up_ling(a, prev: dict) -> Path | None:
     meta = build_step(a, pc, llama, "maya-ling")       # 4
     if not LING_EXE.exists():
         fail(f"the engine was not built ({LING_EXE})",
-             "the reason is in the build's messages above (maya-ling needs a V100 / RTX 20 or newer card, on Linux)")
+             "the reason is in the build's messages above (maya-ling needs a V100 / RTX 20 or newer card, or an AMD "
+                 "RDNA 3 / 3.5 / 4 GPU, on Linux)")
 
     gguf = ling_model_step(a, d, key)                  # 5
     if gguf is None:
