@@ -2298,6 +2298,28 @@ class Setup(unittest.TestCase):
                 maya.hy4_pack_step(a, d, files)                  # (the tower left out: built again without it)
                 self.assertEqual((len(runs), runs[-1][runs[-1].index("--mmproj") + 1]), (3, "none"))
 
+    def test_a_shared_model_dir_keeps_other_models_vision_files(self):
+        """#1264: a --model-dir shared with Inkling holds Inkling's mmproj; Hy4's setup takes only an mmproj of Hy4's
+        projector (clip.projector_type hy_v4_flash), so with Inkling's file alone it has none of its own yet."""
+        import struct
+
+        def mmproj(path: Path, projector: str):
+            def s(x: str) -> bytes:
+                b = x.encode()
+                return struct.pack("<Q", len(b)) + b
+            kv = [("general.architecture", "clip"), ("general.type", "mmproj"), ("clip.projector_type", projector)]
+            body = b"".join(s(k) + struct.pack("<I", 8) + s(v) for k, v in kv)
+            path.write_bytes(struct.pack("<IIQQ", 0x46554747, 3, 0, len(kv)) + body)
+
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            mmproj(d / "mmproj-Inkling-2-Mini-F16.gguf", "inkling2")
+            self.assertIsNone(maya.hy4_vision_file(d, "maya-xs"))
+            (d / "mmproj-broken.gguf").write_bytes(b"not a gguf")
+            self.assertIsNone(maya.hy4_vision_file(d, "maya-xs"))
+            mmproj(d / "mmproj-Hy4-own.gguf", "hy_v4_flash")
+            self.assertEqual(maya.hy4_vision_file(d, "maya-xs"), d / "mmproj-Hy4-own.gguf")
+
     def test_the_ngram_table_from_mayas_repo(self):
         """Tencent's own Q4_K_M: its trunk from AngelSlim's repo at the commit it is pinned at, its n-gram table the
         one file every Hy4 set shares - from Maya's repo at the table's commit, with that file's sha256."""

@@ -10421,9 +10421,23 @@ def hy4_vision_entry(quant: str = HY4_Q4) -> dict | None:
             "download_gb": size / 1e9, "name": name}
 
 
+HY4_PROJECTOR = "hy_v4_flash"     # (clip.projector_type of Hy4's vision tower: tools/hy4/pack_gguf.py's ARCH)
+
+
+def gguf_projector(path: Path) -> str:
+    """An mmproj GGUF's clip.projector_type ("" when it is not a readable GGUF or has none).  Only the header is read."""
+    import struct
+    from gguf_reader import GGUFFile
+    try:
+        return str(GGUFFile(path).metadata.get("clip.projector_type") or "")
+    except (OSError, ValueError, KeyError, struct.error):
+        return ""
+
+
 def hy4_vision_file(d: Path, quant: str = HY4_Q4) -> Path | None:
     """The vision tower's mmproj file in a set's folder: the table's for the set, else the folder's one mmproj*.gguf
-    (a size's own from the repo, --model-dir) - or None."""
+    of Hy4's projector (a size's own from the repo, --model-dir) - or None.  Another model's mmproj in a shared
+    --model-dir (Inkling's, Ling's) is not taken (#1264)."""
     v = hy4_vision_entry(quant)
     if v and (d / v["name"]).is_file():
         return d / v["name"]
@@ -10431,6 +10445,7 @@ def hy4_vision_file(d: Path, quant: str = HY4_Q4) -> Path | None:
         found = sorted(p for p in d.glob("*.gguf") if "mmproj" in p.name.lower())
     except OSError:
         found = []
+    found = [p for p in found if gguf_projector(p) == HY4_PROJECTOR]
     return found[0] if len(found) == 1 else None
 
 
