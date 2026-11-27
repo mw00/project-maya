@@ -117,15 +117,16 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
     ccs = _nvidia_ccs(backend) if ccs is None else ccs
     # Hy4-Flash (maya-hy4): the sizes that are uploaded, on NVIDIA from V100 on only (no AMD or Mac engine yet)
     hy4 = _hy4_downloads() if backend not in ("hip", "metal") and (not ccs or max(ccs) >= HY4_MIN_CC) else {}
-    # Ling-3.2-air (maya-ling): the sizes the setup can download, on NVIDIA from V100 on under Linux only
-    ling = _ling_downloads() if backend == "cuda" and sys.platform.startswith("linux") and \
-        (not ccs or max(ccs) >= LING_MIN_CC) else {}
+    # Ling-3.2-air (maya-ling): the sizes the setup can download, under Linux only - on NVIDIA from V100 on, and on
+    # AMD (the setup's own check says which AMD GPUs)
+    ling = _ling_downloads() if sys.platform.startswith("linux") and (
+        backend == "hip" or backend == "cuda" and (not ccs or max(ccs) >= LING_MIN_CC)) else {}
     out = []
     for fam, key, _tier, ident in Q.QUANTS:
         if fam == "ling":                              # (a size not uploaded, or not made yet: no row)
             if key in ling:
                 out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya",
-                            "note": "Linux, NVIDIA; one answer at a time", "installed": (fam, key) in have,
+                            "note": "Linux, NVIDIA or AMD; one answer at a time", "installed": (fam, key) in have,
                             "size_gb": round(float(ling[key]["download_gb"]), 1)})
             continue
         if fam == "hy4":

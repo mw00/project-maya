@@ -1,6 +1,6 @@
 #pragma once
-// CUDA's <cuda_bf16.h> for the HIP build: the BF16 value type and the one conversion the engines use
-// (maya-hy4's vision tower makes BF16 operands for hipBLAS' GemmEx, HIP_R_16BF).  Self-contained: HIP's own
+// CUDA's <cuda_bf16.h> for the HIP build: the BF16 value type and the two conversions the engines use
+// (maya-hy4's and maya-ling's vision towers make BF16 operands for hipBLAS' GemmEx, HIP_R_16BF).  Self-contained: HIP's own
 // hip_bf16.h is not in every ROCm the build supports, and its type has another name.
 #include <hip/hip_runtime.h>
 
@@ -24,4 +24,14 @@ __host__ __device__ inline __nv_bfloat16 __float2bfloat16(float f) {
     }
     r.x = (uint16_t) ((v.u + 0x7fffu + ((v.u >> 16) & 1u)) >> 16);
     return r;
+}
+
+// exact, as CUDA's __bfloat162float: the 16 bits are a float's top half (maya-ling's vision tower)
+__host__ __device__ inline float __bfloat162float(__nv_bfloat16 h) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    v.u = (uint32_t) h.x << 16;
+    return v.f;
 }

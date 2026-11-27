@@ -427,7 +427,7 @@ class Steps(unittest.TestCase):
         self.assertEqual(hashlib.sha256(body[3]).hexdigest(),
                          "dbb08479531af61d736c16f92a8271f66eced23c8f4b403c808352e5b2631875")
 
-    def write(self, a, prev=None, key="maya-s", ctx=32768, drafting="auto", mmproj=True, gpus=1, meta=None):
+    def write(self, a, prev=None, key="maya-s", ctx=32768, drafting="auto", mmproj=True, gpus=1, meta=None, pc=None):
         td = self.root
         fake_root = td / "repo"
         (fake_root / "data").mkdir(parents=True, exist_ok=True)
@@ -437,7 +437,7 @@ class Steps(unittest.TestCase):
         mm.write_bytes(b"GGUF")
         tok = td / "tok"
         tok.mkdir(exist_ok=True)
-        pc = {"backend": "cuda", "gpus": [{"index": 3 + i, "vram_gb": 24.0, "cc": 86} for i in range(gpus)]}
+        pc = pc or {"backend": "cuda", "gpus": [{"index": 3 + i, "vram_gb": 24.0, "cc": 86} for i in range(gpus)]}
         with mock.patch.object(maya, "ROOT", fake_root), \
                 mock.patch.object(maya, "LING_EXE", fake_root / "build" / "maya-ling"), \
                 mock.patch.object(maya, "LING_PROFILE", fake_root / "data" / "none.bin"), \
@@ -503,6 +503,76 @@ class Steps(unittest.TestCase):
         self.assertNotIn("ling_quant", c2["installer"])
         self.assertEqual(c2["installer"]["quant"], "local")
 
+    def test_amd_linux_builds_the_hip_engine(self):
+        # an AMD APU under Linux: the PC check is the HIP one (pictures on), the fit counts the APU's memory, and
+        # step 4 compiles maya-ling for that PC (build_step on the HIP pc: compile_engine_hip's target)
+        pc = {"backend": "hip", "archs": ["gfx1151"], "gpus": [{"index": 0, "name": "AMD Radeon 8065S",
+                                                               "arch": "gfx1151", "vram_gb": 0.5, "vendor": "amd"}]}
+        seen = {}
+
+        class Built(Exception):
+            pass
+
+        def build(a, pc_, llama, target):
+            seen["build"] = (pc_["backend"], target)
+            raise Built
+
+        def check(a, family="glm", *rest, **kw):
+            seen["family"] = family
+            return pc
+
+        p1, p2 = with_manifest(manifest("0" * 40))
+        with p1, p2, mock.patch.object(maya, "check_pc", check), mock.patch.object(maya, "WIN", False), \
+                mock.patch.object(maya, "mem_gb", lambda: (187.0, 170.0)), \
+                mock.patch.object(maya, "hy4_apu_gib", return_value=168.0), \
+                mock.patch.object(maya, "ling_avx2_available", return_value=True), \
+                mock.patch.object(maya, "tools_step", return_value=Path("/llama")), \
+                mock.patch.object(maya, "build_step", build), self.assertRaises(Built):
+            maya.set_up_ling(args(backend="hip", ling_quant="maya-s", models_dir=str(self.root)), {})
+        self.assertEqual(seen, {"family": "ling", "build": ("hip", "maya-ling")})
+        # on Windows an AMD PC is refused in one line, before anything is built
+        with mock.patch.object(maya, "check_pc", check), mock.patch.object(maya, "WIN", True), \
+                mock.patch.object(maya, "mem_gb", lambda: (64.0, 50.0)), \
+                mock.patch.object(maya, "build_step", build), self.assertRaises(SystemExit):
+            maya.set_up_ling(args(backend="hip", ling_quant="maya-s"), {})
+
+    def test_amd_config_keeps_room_free(self):
+        apu = {"backend": "hip", "gpus": [{"index": 0, "name": "AMD Radeon 8065S", "arch": "gfx1151", "vram_gb": 0.5,
+                                           "vendor": "amd"}]}
+        with mock.patch.object(maya, "mem_gb", lambda: (187.0, 170.0)):
+            p, c = self.write(args(backend="hip"), pc=apu, meta={"lib_dirs": ["/opt/rocm/lib"]})
+        self.assertEqual(c["backend"], "hip")
+        self.assertEqual(c["args"][c["args"].index("--reserve-gb") + 1], "18.7")   # (max(8 GB, 10% of the RAM))
+        p.unlink()                                      # (a fresh setup each: a setup again keeps the value before)
+        card = {"backend": "hip", "gpus": [{"index": 0, "name": "Radeon RX 7900 XT", "arch": "gfx1100",
+                                            "vram_gb": 20.0, "vendor": "amd"}]}
+        p, c = self.write(args(backend="hip"), pc=card)
+        self.assertEqual(c["args"][c["args"].index("--reserve-gb") + 1], "3.0")
+        p.unlink()
+        _, c = self.write(args())                       # (NVIDIA: as before, the engine's own default)
+        self.assertNotIn("--reserve-gb", c["args"])
+
+    def test_memory_for_the_fit(self):
+        # NVIDIA: the cards' VRAM and the PC's RAM, as before
+        nv = {"backend": "cuda", "gpus": [{"index": 0, "vram_gb": 32.0, "cc": 70}, {"index": 1, "vram_gb": 24.0}]}
+        self.assertEqual(maya.ling_memory(nv, 183.0), ([32.0, 24.0], 183.0))
+        # an AMD card: its VRAM less what the engines leave the desktop
+        card = {"backend": "hip", "gpus": [{"index": 0, "name": "Radeon RX 7900 XT", "arch": "gfx1100",
+                                            "vram_gb": 20.0, "vendor": "amd"}]}
+        v, ram = maya.ling_memory(card, 64.0)
+        self.assertAlmostEqual(v[0], 20.0 - maya.hip_reserve_mib(card["gpus"]) / 1024.0)
+        self.assertEqual(ram, 64.0)
+        # an APU (Gorgon Halo): the GPU's share of the one memory, and only the rest of the RAM beside it
+        apu = {"backend": "hip", "gpus": [{"index": 0, "name": "AMD Radeon 8065S", "arch": "gfx1151", "vram_gb": 0.5,
+                                           "vendor": "amd"}]}
+        with mock.patch.object(maya, "hy4_apu_gib", return_value=168.0):
+            v, ram = maya.ling_memory(apu, 187.0)
+        self.assertEqual(v, [168.0])
+        self.assertAlmostEqual(ram, 19.0)
+        word, _ = LINGF.verdict(v, ram, 32768, "f16", "Ling-3.2-air-Maya-S")
+        self.assertEqual(word, "fits")
+        self.assertTrue(LINGF.plan(v, 32768, "f16", "Ling-3.2-air-Maya-S", ram_gb=ram)["resident"])
+
     def test_drafting(self):
         self.assertEqual(maya.ling_drafting(args(), []), "auto")
         self.assertEqual(maya.ling_drafting(args(drafting="off"), ["--drafting", "auto"]), "off")
@@ -549,9 +619,13 @@ class Catalog(unittest.TestCase):
                           ("ling-3.2-air-maya-m", "Ling-3.2-air · Maya-M", "maya", 46.0),
                           ("ling-3.2-air-maya-l", "Ling-3.2-air · Maya-L", "maya", 59.2)])
         self.assertEqual([r for r in after if r["family"] != "ling"], before)
-        for platform, backend in (("win32", "cuda"), ("linux", "hip"), ("darwin", "metal")):
+        for platform, backend in (("win32", "cuda"), ("win32", "hip"), ("darwin", "metal")):
             rows = self.catalog(manifest("0" * 40), platform, backend)
             self.assertEqual([r for r in rows if r["family"] == "ling"], [], (platform, backend))
+        # AMD under Linux: the same sizes (the setup's own check says which AMD GPUs)
+        amd = [r for r in self.catalog(manifest("0" * 40), "linux", "hip") if r["family"] == "ling"]
+        self.assertEqual([r["id"] for r in amd], [r["id"] for r in ling])
+        self.assertIn("AMD", amd[0]["note"])
 
     def test_setup_command(self):
         from serve import model_pull

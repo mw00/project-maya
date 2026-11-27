@@ -903,7 +903,7 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
             gp.d_top_pair = (float*) dev_alloc(gp, 2 * sizeof(float));
             gp.h_top_pair = (float*) host_alloc(gp, 2 * sizeof(float));
         }
-        gp.d_step = (int*) dev_alloc(gp, 4 * sizeof(int));
+        gp.d_step = (int*) dev_alloc(gp, k::kStepInts * sizeof(int));
         gp.d_iota = (int*) dev_alloc(gp, (size_t) o_.ctx * sizeof(int));
         k::fill_iota(gp.d_iota, o_.ctx, gp.s);
         k::mla_dec_wmma_init();
@@ -4027,8 +4027,19 @@ void Model::mla_decode_win(Gpu& gp, Layer& l, int il, int W, bool add_to_x) {
     k::kv_store_split(gp.kvall, W, KL, R, l.kv_a_norm, c.eps, gp.d_pos_win, 0, c.rope_base, l.lat, o_.kv_q8, l.k_pe, s, gp.d_step + 3);
 
     if (!k::mla_dec_wmma(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, o_.ctx,
-                         gp.d_step + 2, W, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s))
+                         gp.d_step + 2, W, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s)) {
+#if defined(MAYA_USE_HIP)
+        // AMD (no tensor-core window kernel): each row on the token path's kernel with its own cache length
+        // (set_step_win's counts) - the rows a verify window gets are the ones the tokens get one at a time
+        for (int t = 0; t < W; ++t)
+            if (!glmd::mla_dec(gp.q_abs + (size_t) t * H * KL, gp.qm + (size_t) t * H * c.qk_head, c.qk_head, c.qk_nope,
+                               l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, gp.d_iota, o_.ctx, gp.d_step + k::kStepWinCounts + t, H,
+                               KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo + (size_t) t * H * KL, s))
+                throw std::runtime_error("mla_win: mla_dec refused shape");
+#else
         throw std::runtime_error("mla_win: mla_dec_wmma failed");
+#endif
+    }
 
     hy::q8_heads(gp.ctxo, (size_t) H * KL, (size_t) KL, W, H, KL, gp.q8c, gp.d8c, s);
     iq::MvJob vb{l.wvb.p, l.wvb.ld, l.wvb.type, KL, c.v_head, W, gp.q8c, gp.d8c, gp.o128, (size_t) H * c.v_head, nullptr, 1.0f};

@@ -2,7 +2,9 @@
 #include "ling_kernels.cuh"
 
 #include <cuda_fp16.h>
-#include <mma.h>
+#if !defined(MAYA_USE_HIP)
+#include <mma.h>   // (nvcuda::wmma: CUDA only - on AMD the tensor-core MLA kernel's body is empty and never launched)
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +23,17 @@ __device__ __forceinline__ double warp_sum_d(double v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+}
+
+// a xor step among lanes 0..15 only (a block's per-warp sums, the other lanes outside the branch): CUDA's 16-lane
+// mask; the HIP compat layer takes full-wave masks only (a partial one traps), so on AMD the plain 16-wide xor - every
+// partner of a lane 0..15 is one of them, all active
+__device__ __forceinline__ float lanes16_xor_f(float v, int o) {
+#if defined(MAYA_USE_HIP)
+    return __shfl_xor(v, o, 16);
+#else
+    return __shfl_xor_sync(0x0000ffffu, v, o);
+#endif
 }
 
 __device__ __forceinline__ float warp_max_f(float v) {
@@ -1249,7 +1262,7 @@ __global__ void __launch_bounds__(512)
     __syncthreads();
     if (tid < 16) {
         float v = s_sum[tid];
-        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0x0000ffffu, v, o);
+        for (int o = 8; o > 0; o >>= 1) v += lanes16_xor_f(v, o);
         if (tid == 0) s_sum[0] = rsqrtf(v / (float) E + eps);
     }
     __syncthreads();
@@ -1617,6 +1630,11 @@ static int mla_dec_dev_sms() {
 // Returns 32 (TILE=32 supported), 16 (TILE=16 supported), or 0 (unsupported)
 template <int LQ8>
 static int mla_dec_wmma_tile_ok() {
+#if defined(MAYA_USE_HIP)
+    // AMD: no nvcuda::wmma (the kernel's body is compiled out, and HIP reports a compute capability such as 11.5 that
+    // would pass the checks below) - the decode attention takes the portable split kernel (glmd::mla_dec)
+    return 0;
+#endif
     int dev = 0;
     cudaGetDevice(&dev);
     static int checked[64] = {};
@@ -2005,6 +2023,9 @@ __global__ void set_step_win_kernel(int* __restrict__ d_step, int* __restrict__ 
     for (int i = 0; i < W; ++i) {
         d_tok[i] = ts[i];
         d_pos[i] = pos0 + i;
+#if defined(MAYA_USE_HIP)
+        d_step[kStepWinCounts + i] = pos0 + i + 1;   // (AMD: each window row's own cache length - mla_decode_win)
+#endif
     }
 }
 
@@ -2315,7 +2336,7 @@ __global__ void ref_rmsnorm_q8_kernel(const float* x, const float* w, int E, flo
     __syncthreads();
     if (tid < 16) {
         float v = s_sum[tid];
-        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0x0000ffffu, v, o);
+        for (int o = 8; o > 0; o >>= 1) v += lanes16_xor_f(v, o);
         if (tid == 0) s_sum[0] = rsqrtf(v / (float) E + eps);
     }
     __syncthreads();

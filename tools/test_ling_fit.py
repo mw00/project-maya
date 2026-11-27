@@ -69,6 +69,20 @@ class TestLingFit(unittest.TestCase):
         self.assertIsNotNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 86}], 128, False))
         self.assertIsNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 86}], 128, True))
 
+    def test_amd_linux(self):
+        # AMD (HIP) on Linux: one RDNA 3 / 3.5 / 4 GPU - a card of 8 GB or more, or an APU whose memory is the RAM
+        apu = {"name": "AMD Radeon 8065S", "arch": "gfx1151", "vram_gb": 0.5, "unified_memory": True}
+        card = {"name": "Radeon RX 7900 XT", "arch": "gfx1100", "vram_gb": 20.0}
+        for gpus in ([apu], [card], [dict(card, arch="gfx1201")], []):
+            self.assertIsNone(LINGF.unsupported("hip", False, gpus, 187, True), gpus)
+        for gpus in ([dict(card, arch="gfx1030")], [dict(card, arch="gfx942")], [dict(card, vram_gb=6.0)],
+                     [card, card]):
+            self.assertIsNotNone(LINGF.unsupported("hip", False, gpus, 187, True), gpus)
+        self.assertIn("Linux only", LINGF.unsupported("hip", True, [card], 64, True))
+        self.assertIn("AVX2", LINGF.unsupported("hip", False, [apu], 187, False))
+        # (no NVIDIA rule reaches an AMD card: it has no compute capability)
+        self.assertIsNone(LINGF.unsupported("hip", False, [dict(card, cc=11)], 64, True))
+
     def test_models_py_uses_same_planner_and_defaults(self):
         cfg = {
             "exe": str(ROOT / "build" / "maya-ling"),
