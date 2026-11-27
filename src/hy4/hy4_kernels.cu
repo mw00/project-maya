@@ -1333,15 +1333,41 @@ __global__ void attn_combine_kernel(int H, int nchunk, int kc, const int* __rest
     const int t = blockIdx.y, h = blockIdx.x, d = threadIdx.x;
     const int used = (nk[t] + kc - 1) / kc;
     const float* base = ws + ((size_t) t * H + h) * nchunk * (512 + 2);
+    // (the chunks' maxima and sums staged once a block, a thread a chunk, where every thread read them a chunk at a time;
+    //  then each chunk's factor once a block.  The same values in the same order: the same bits.  More chunks than
+    //  kCombS: as before)
+    constexpr int kCombS = 128;
+    __shared__ float s_m[kCombS], s_l[kCombS];
     float M = sinks ? sinks[h] : -INFINITY;
-    for (int c = 0; c < used; ++c) M = fmaxf(M, base[(size_t) c * 514]);
-    float den = sinks ? expf(sinks[h] - M) : 0.0f, num = 0.0f;
-    for (int c = 0; c < used; ++c) {
-        const float* o = base + (size_t) c * 514;
-        if (o[0] == -INFINITY) continue;
-        const float f = expf(o[0] - M);
-        den += o[1] * f;
-        num += o[2 + d] * f;
+    float den, num = 0.0f;
+    if (used <= kCombS && (int) blockDim.x >= kCombS) {
+        if (d < used) {
+            s_m[d] = base[(size_t) d * 514];
+            s_l[d] = base[(size_t) d * 514 + 1];
+        }
+        __syncthreads();
+        for (int c = 0; c < used; ++c) M = fmaxf(M, s_m[c]);
+        den = sinks ? expf(sinks[h] - M) : 0.0f;
+        __syncthreads();
+        if (d < used) s_m[d] = s_m[d] == -INFINITY ? -INFINITY : expf(s_m[d] - M);   // (each chunk's factor; -inf: none)
+        __syncthreads();
+#pragma unroll 4
+        for (int c = 0; c < used; ++c) {
+            const float f = s_m[c];
+            if (f == -INFINITY) continue;
+            den += s_l[c] * f;
+            num += base[(size_t) c * 514 + 2 + d] * f;
+        }
+    } else {
+        for (int c = 0; c < used; ++c) M = fmaxf(M, base[(size_t) c * 514]);
+        den = sinks ? expf(sinks[h] - M) : 0.0f;
+        for (int c = 0; c < used; ++c) {
+            const float* o = base + (size_t) c * 514;
+            if (o[0] == -INFINITY) continue;
+            const float f = expf(o[0] - M);
+            den += o[1] * f;
+            num += o[2 + d] * f;
+        }
     }
     const float o = den > 0.0f ? num / den : 0.0f;
     out[((size_t) t * H + h) * 512 + d] = o;
