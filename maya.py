@@ -93,7 +93,6 @@ import maya_bench as MB  # noqa: E402  --bench: the speed-test standard (one ses
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
 from serve import glm_link as GL  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
-from serve import server as SV  # noqa: E402  config GPU normalization and engine arguments
 from strata import maya_sync  # noqa: E402  (tools/strata/) a glm-dsa pack's expert profile and drafting
 
 WIN = S.WIN
@@ -5132,6 +5131,7 @@ def same_cuda_flash_service(old: dict, cfg: dict) -> bool:
             (cfg.get("backend") or "cuda") != "cuda" or (old.get("backend") or "cuda") != "cuda" or
             flag_value(old.get("args") or [], "--glm-pack") != flag_value(cfg["args"], "--glm-pack")):
         return False
+    import serve.server as SV                          # (the server's own reading of a config's GPUs)
     try:
         return bool(cfg["gpu"]) and SV.gpu_list(old) == cfg["gpu"]
     except (ValueError, TypeError):
