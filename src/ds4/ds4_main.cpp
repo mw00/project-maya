@@ -26,6 +26,7 @@
 // `LP <id> <logprob> <id>:<logprob> ...` line after each T line: the token's log-probability and its row's k most likely
 // (ds4_logprobs.hpp; INFO logprobs=20 says the engine has them).
 #include "ds4_evt.hpp"
+#include "ds4_keep.hpp"
 #include "ds4_logprobs.hpp"
 #include "ds4_marks.hpp"
 #include "ds4_gguf.cuh"       // (--pack-info: the types the kernels take, asked of them)
@@ -596,6 +597,10 @@ struct Req {
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
     long long rid = -1;   // rid=<id> (--parallel: every request's, its lines tagged with it)
+    // keep=<n> h=<hash> (DS4_GEN_KEEP, ds4_keep.hpp): the line's ids are the prompt from token n on, the first n the
+    // state's own - if their hash is h; -1: the line carries the whole prompt, as before
+    long long keep = -1;
+    std::string keep_h;
     // marks=<pos>,... and shared=<pos>: restore points the read keeps (the server's: the start of the last user
     // message, a point near the prompt's tail; the end of a start other conversations share, given up last) - a later
     // prompt that leaves this one past one of them goes back there (ds4_marks.hpp); none: as before
@@ -743,6 +748,8 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "think_weak") { for (int x : parse_ids(v)) r.soft_weak.insert(x); }
         else if (k == "think_dig") { for (int x : parse_ids(v)) r.soft_dig.insert(x); }
         else if (k == "rid") r.rid = std::atoll(v.c_str());
+        else if (k == "keep") r.keep = std::max(0LL, std::atoll(v.c_str()));
+        else if (k == "h") r.keep_h = v;
         else if (k == "ablate") r.ablate = std::atoi(v.c_str()) != 0;
         else if (k == "cold") r.cold = std::atoi(v.c_str()) != 0;
         else if (k == "marks") {
@@ -828,6 +835,12 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     if (m.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
         std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);
     const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
+    // DS4_GEN_KEEP=1 (default off): the server may send a prompt as keep=<n> h=<hash> and the ids from n on - the first n
+    // taken from the state when it holds them (ds4_keep.hpp), a RESEND line when not.  One conversation only; without
+    // the INFO line no server sends one, and a keep= that comes anyway is answered RESEND (never read as a prompt)
+    static const bool gen_keep = ds4_env("DS4_GEN_KEEP") != nullptr && std::atoi(ds4_env("DS4_GEN_KEEP")) != 0;
+    if (gen_keep && m.seq_count() <= 1) std::printf("INFO gen_keep=1\n");
+    maya::ds4::KeepHash keep_hash;
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -1937,6 +1950,15 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             std::fflush(stdout);
             continue;
         }
+        // (DS4_GEN_KEEP) the kept start from the state's own tokens, its hash checked: r.ids is then the whole prompt,
+        // as the whole line carries it; anything else - no request, the server sends the whole line
+        if (r.keep >= 0 && !(gen_keep && !geni && maya::ds4::keep_ids(keep_hash, m.tokens(), r.keep, r.keep_h, r.ids))) {
+            std::fprintf(stderr, "maya ds4 serve: keep=%lld is not held (the state has %zu tokens): RESEND\n", r.keep,
+                         m.tokens().size());
+            std::printf("RESEND\n");
+            std::fflush(stdout);
+            continue;
+        }
         const double tr_parsed = now_ms();
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
         if (round_log().f != nullptr) round_log().tag = "r" + std::to_string(++log_req);   // (DS4_ROUND_LOG)
@@ -2307,6 +2329,12 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             }
             if (r.rid < 0) {
                 std::printf("ERR this engine runs several conversations: GEN needs rid=<id>\n");
+                std::fflush(stdout);
+                return;
+            }
+            if (r.keep >= 0) {   // (DS4_GEN_KEEP is one conversation's: not announced here, so no server sends it)
+                std::printf("ERR %lld keep= is not taken with several conversations (--parallel)\n", r.rid);
+                std::printf("DONE %lld 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.rid, r.ids.size());
                 std::fflush(stdout);
                 return;
             }

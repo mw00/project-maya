@@ -24,6 +24,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import array
 import atexit
 import collections
 import contextlib
@@ -1733,12 +1734,21 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        kept = None                                       # (MAYA_GEN_KEEP: this line carries only the prompt's new ids)
+        if GEN_KEEP and not embeddings and (self.__dict__.get("info") or {}).get("gen_keep") == 1:
+            try:
+                with KEEP_LOCK:                           # (the memo is changed in place: one prompt at a time, so
+                    kept = keep_ids_memo(self.__dict__.setdefault("_keep_memo", {}), ids)   # h is this prompt's)
+            except (TypeError, ValueError, OverflowError):   # (ids that are no int32: the whole line, as before)
+                self.__dict__.pop("_keep_memo", None)
+
+        def whole():
+            if prompt_memo_on():
+                return f"{head} {join_ids_memo(self.__dict__.setdefault('_join_memo', {}), ids)}\n"
+            return f"{head} {','.join(str(int(t)) for t in ids)}\n"
         try:
             turn_mark("gen_start")
-            if prompt_memo_on():
-                self.proc.stdin.write(f"{head} {join_ids_memo(self.__dict__.setdefault('_join_memo', {}), ids)}\n")
-            else:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            self.proc.stdin.write(f"{head} keep={kept[0]} h={kept[1]} {kept[2]}\n" if kept else whole())
             turn_mark("gen_written")
             self.proc.stdin.flush()
             turn_mark("gen_flushed")
@@ -1775,6 +1785,17 @@ class StrataEngine:
                 if lp_wait is not None and not line.startswith("LP "):
                     t, lp_wait = lp_wait, None
                     yield t
+                if kept and line.startswith("RESEND"):
+                    # (MAYA_GEN_KEEP) the engine does not hold the kept start (or not that one): no request began,
+                    # and the whole line is this request - once: a second RESEND is not answered
+                    kept = None
+                    try:
+                        self.proc.stdin.write(whole())
+                        self.proc.stdin.flush()
+                    except OSError:
+                        done = True
+                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+                    continue
                 if line.startswith("T "):
                     if cancel.is_set():
                         return
@@ -1859,6 +1880,8 @@ class StrataEngine:
                     if line.startswith("STAT "):
                         self._parse_stat(line)   # the final snapshot can follow EOS or the consumer's last token
                         continue
+                    if kept and line.startswith("RESEND"):   # (MAYA_GEN_KEEP: the engine began no request - no DONE)
+                        break
                     if line.startswith("ERR"):
                         self._done_after_err()
                         break
@@ -2944,6 +2967,73 @@ def join_ids_memo(memo: dict, ids, block: int = 4096) -> str:
     out = "".join(parts)
     memo.update(ids=list(ids), text=out, offs=new_offs)
     return out
+
+
+# MAYA_GEN_KEEP=1 (off unless set; read once): a prompt goes to an engine that says INFO gen_keep=1 (maya-ds4 with
+# MAYA_DS4_GEN_KEEP=1, one conversation) as `keep=<n> h=<hash>` and the ids from n on, where n ids of it are the last
+# prompt's: the engine takes the first n from its own state when their hash is h, and answers RESEND - the whole line
+# follows - when it does not hold them (a fresh engine, another conversation, a read that was stopped).  The same ids
+# reach the engine's prompt either way; no other engine says the INFO line, so none gets a line with keep=.
+GEN_KEEP = os.environ.get("MAYA_GEN_KEEP", "") not in ("", "0")
+KEEP_LOCK = threading.Lock()
+
+
+def keep_ids_memo(memo: dict, ids, block: int = 1024):
+    """(n, h, text) for a GEN line with keep= (MAYA_GEN_KEEP): n = how many ids the prompt starts with as the last
+    prompt of this memo did (at most all but one: a line carries an id), h = BLAKE2b-128 of those n as little-endian
+    int32 (src/ds4/ds4_keep.hpp), text = ','.join of the rest.  None: nothing shared (the whole line).  The memo keeps
+    the last prompt and a running hash at every `block` ids of it; h is made from this prompt's own ids - the blocks
+    compared equal to the last prompt's take its hash, the rest is hashed here - so it is the hash of ids[:n] whatever
+    the memo held."""
+    ids = [int(t) for t in ids] if not isinstance(ids, list) else ids
+    last, cks = memo.setdefault("ids", []), memo.setdefault("cks", [])   # (the memo's own lists, changed in place)
+    lim = min(len(ids) - 1, len(last))
+    try:
+        # the usual turn - all of the last prompt, or all but its last tokens (the generation prompt's) - by compares
+        # of whole lists (slices of 200K ids cost more than the compare): the memo's list takes this prompt's ids from
+        # `cut` on and is this prompt if the two agree before it; then on by single ids to where they part
+        n = -1
+        for back in (0, 16, 256, 4096):
+            cut = lim - back
+            if cut <= 0:
+                break
+            was = last[cut:]
+            last[cut:] = ids[cut:]
+            if last == ids:
+                n = cut
+                while n < lim and ids[n] == was[n - cut]:
+                    n += 1
+                break
+            last[cut:] = was
+        if n < 0:                                        # (they part further back: by blocks, then by single ids)
+            k = 0
+            while k < len(cks) and (k + 1) * block <= lim and \
+                    ids[k * block:(k + 1) * block] == last[k * block:(k + 1) * block]:
+                k += 1
+            n = k * block
+            while n < lim and ids[n] == last[n]:
+                n += 1
+        k = n // block
+        last[n:] = ids[n:]
+
+        def pack(part) -> bytes:
+            a = array.array("i", part)
+            if a.itemsize != 4:
+                raise ValueError("int is not 32 bits here")
+            if sys.byteorder != "little":
+                a.byteswap()
+            return a.tobytes()
+        run = cks[k - 1].copy() if k else hashlib.blake2b(digest_size=16)
+        at = run.copy()
+        at.update(pack(ids[k * block:n]))
+        del cks[k:]
+        for i in range(k * block, len(ids) - block + 1, block):
+            run.update(pack(ids[i:i + block]))
+            cks.append(run.copy())
+        return (n, at.hexdigest(), ",".join(map(str, map(int, ids[n:])))) if n > 0 else None
+    except BaseException:
+        memo.clear()                                     # (half changed: nothing of it is used again)
+        raise
 
 
 def deepseek_restore_points_fast(ids, user_id, system_id=None, tail=512, least=None) -> dict:

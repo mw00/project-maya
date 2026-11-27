@@ -284,6 +284,10 @@ if(MAYA_BUILD_TESTS)
   add_executable(ds4_marks_test tests/ds4_marks_test.cpp)
   target_link_libraries(ds4_marks_test PRIVATE maya_warnings)
   add_test(NAME ds4_marks_test COMMAND ds4_marks_test)
+  # maya-ds4's incremental GEN line (keep= / h=, DS4_GEN_KEEP): the hash against Python's, the running hash, the refusals
+  add_executable(ds4_keep_test tests/ds4_keep_test.cpp)
+  target_link_libraries(ds4_keep_test PRIVATE maya_warnings)
+  add_test(NAME ds4_keep_test COMMAND ds4_keep_test)
   # maya-ds4's log-probabilities (GEN logprobs=): the reference, the penalties, ties, the kernel's pieces, the LP line
   add_executable(ds4_logprobs_test tests/ds4_logprobs_test.cpp)
   target_link_libraries(ds4_logprobs_test PRIVATE maya_warnings)
