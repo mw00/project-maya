@@ -2898,6 +2898,45 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | `IK2_PROF`, `IK2_STATS` | off | each request's time by phase; where its experts came from (cached, prefetched, copied on a miss, the CPU) |
 | `IK2_TRACE`, `IK2_POP_OUT`, `IK2_FORCE`, `IK2_LOGITS_OUT`, `IK2_MARGIN`, `IK2_VERIFY_CHECK`, `IK2_UP_MS`, `IK2_ALLOC_THREADS` | off | measurement: every layer's picks to a file; the pick counts (for `IK2_WARM`); fixed tokens fed (`--tokens` runs: two builds compared on the same text, and how often each one's pick agrees); every generated token's logits to a file (with `IK2_FORCE`: two builds' logits over the same tokens); the drafter's checks (`--draft`); the CPU lane's estimate of an expert's copy time; threads allocating host memory |
 
+### Inkling-2-Small on AMD: `maya-ik2s`
+
+Its own engine (`src/ik2s`, docs/INKLING2_AMD.md) for 2-4 AMD GPUs under Linux: unsloth's UD-Q2_K_XL read in place
+through a pack, the layers split over the GPUs (`--layer-split`, which the server adds), the most routed experts in
+VRAM and the rest computed on a CPU lane from RAM (or read in place from the SSD), the model's DSpark drafter.
+`./maya.sh --setup --backend hip --model inkling-2-small` sets it up. Defaults: temperature 1.0, top-p 1.0, the
+thinking level Auto, as `maya-ik2`'s above. Its flags are maya-ds4's where the setting is the same:
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--pack DIR` / `--model F` | - | the pack (`tools/ik2s/pack_gguf.py`), or the set's first shard (its folder's `maya-ik2s` pack) |
+| `--max-context N` | 32768 | positions the 8 global layers' caches hold (the setup writes DeepSeek's recommendation, 64K - 256K) |
+| `--kv f16\|q8` | f16 (the setup writes q8) | the 8 global layers' K / V: F16, or int8 rows with an F32 scale a (position, kv head) - half the bytes (8.0 -> 4.1 GiB at 262,144), ~380 more experts in VRAM, a pass 1-7% shorter; last-logit KL against F16 at the noise of an F16 reordering (docs/INKLING2_AMD.md, "Defaults") |
+| `--prefill-chunk N` | 512 (the setup writes 2048) | a prompt's tokens a chunk; above 512 the positions below 4,096 still go in 512-token chunks (`IK2_HIP_PF_SMALL_*` below). 2048: a 38.9K-token prompt 1,315 -> 1,781 tok/s, prompts under 8K ~3% slower |
+| `--reserve-mib N` | 600 | VRAM each GPU keeps free after the load (the setup writes 600 too; `--vram-reserve-mib` to the setup sets another - raise it where a card also drives a display) |
+| `--mmap-experts on\|off\|auto` | auto | the experts RAM does not hold read in place from the model's files (maya-ds4's flag) |
+| `--cpu-threads N` | 0 | the CPU lane's threads (0: one a physical core) |
+| `--expert-profile F` / `--profile-readonly` / `--profile-out F` | the pack's `expert-profile.bin` | the most routed experts in VRAM at the load, and this PC's routing written back |
+| `--no-expert-cache` | off | the experts stay where the load put them (the same bits run to run) |
+| `--dspark on\|off\|none`, `--dspark-index DIR`, `--dspark-cum F` | on (the setup writes none until the speed calibration); 0.5 | the DSpark drafter (maya-ds4's values), its Q8_0 index, the floor on the drafts' running probability |
+| `--rewind N` | 4096 | positions a rewind goes back without reading the prompt again |
+| `--parallel N` | 1 | conversations at once, 1 - 8 (maya-ds4's flag and protocol): each its own caches in VRAM, their tokens decoded together |
+
+Environment (each one only where it is set; an engine default that depends on the GPUs is taken where its variable is
+not set):
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `IK2_HIP_ATTN_FLASH`, `IK2_HIP_FLASH_TS` | `1`, `512` on RDNA 4 (every GPU a gfx12); off elsewhere | a prompt's attention as one flash kernel on the matrix cores, 512 tokens a pass (38.9K-token prompt +17%; parity with llama.cpp OK; not the same bits). gfx12's own instructions: asked for on another GPU it is turned off, said |
+| `IK2_HIP_ATTN_MMA` | `1` on RDNA 4; off elsewhere | the 8 global layers' decode attention on the matrix cores (a pass at 200K 56.2 -> 37.5 ms, at 13K 27.2 -> 26.3; not the same bits). `IK2_HIP_ATTN_MMA_SK` (512): keys a split; `IK2_HIP_ATTN_MMA_PREC=0`: queries and probabilities as one F16 each |
+| `DS4_IQ_TC_RM` | `2` on RDNA 4 | maya-ds4's tensor-core tiles, row groups a block (the same bits; a 38.9K-token prompt +4.7%) - this engine's default only, other engines keep maya-ds4's |
+| `IK2_HIP_PF_SMALL_CHUNK`, `IK2_HIP_PF_SMALL_UNTIL` | `512`, `4096` with `--prefill-chunk` above 512 | the prompt's positions below UNTIL read in chunks of SMALL_CHUNK (`0`: the one chunk size) |
+| `IK2_HIP_DRAFT_LOOKUP` | `8` | prompt lookup beside the drafter: where the answer repeats earlier text, the following tokens are offered as drafts (copying 95 -> 108 tok/s; greedy output the same as without drafts). `0`: off |
+| `IK2_HIP_DRAFT_REST_RULE`, `_REST_BLOCK` | `1`, `16` | drafting rests while a block of 16 drafted rounds gains less than plain decoding (seven-prompt geomean +3%) |
+| `IK2_HIP_DRAFT_CLAMP` | on | one stalled pass cannot set the window's cost estimate above 3x the current one (before it, one 3.5 s stall could turn drafting off until a restart) |
+| `IK2_HIP_PF_PREFETCH`, `IK2_HIP_PF_SPLIT_OLD`, `IK2_HIP_SORT_OLD`, `IK2_HIP_ATTN_P16_OLD`, `IK2_HIP_FUSE_OLD`, `IK2_HIP_MIX_OLD`, `IK2_HIP_ATTN_TILES` | on / off | A/B switches of measured, bit-identical changes (prompt: the RAM experts copied ahead, the VRAM experts between the streamed passes, the routing sort, F16 softmax; decode: fused small launches, the mix kernel, the chunked attention): the `_OLD` / `TILES` ones restore what was there before |
+| `IK2_HIP_RAM_MARGIN_GB` | 8 | RAM left to the rest of the PC beyond the CPU lane's experts |
+| `IK2_HIP_PHASES`, `_TIMELINE`, `_PROF`, `_ROUND_LOG`, `_VRAM_LOG`, `_PROMPT_HASH`, `_STEP_HASH` | off | measurement: where a step's time goes (`PHASES` adds ~1.8 ms a pass), a line a drafting round, free VRAM a GPU at each stage, hashes of a prompt's last logits and of each step's (two builds compared bit for bit) |
+
 ## GLM-5.3 (744B)
 
 GLM-5.3 ([the model's page](GLM53.md)) runs on the same engine as GLM-5.3-Flash, so the GLM settings above apply to it
