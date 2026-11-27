@@ -37,7 +37,6 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 How the engine works and how changes were measured. You do not need these to run Maya.
 
 - [GLM5-FLASH.md](GLM5-FLASH.md): the study of what it takes to run GLM-5.3-Flash on the engine, component by component.
-- [QUANT-PLAN.md](QUANT-PLAN.md): the plan for Maya's first GLM-5.3-Flash quants.
 - [GLM_MMQ_CORRECTNESS.md](GLM_MMQ_CORRECTNESS.md): the incoherent GLM prefill replies on Windows with CUDA 13.2.
 - [GLM-KDA-GRAPHS.md](GLM-KDA-GRAPHS.md): `MAYA_GLM_KDA_GRAPH=1`, experimental graph capture of GLM's recurrent layers.
 - [deepseek-prompt-format.md](deepseek-prompt-format.md): DeepSeek-V4.1's prompt encoding and the vendored `serve/ds41_encoding.py`.

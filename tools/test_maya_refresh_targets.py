@@ -55,6 +55,11 @@ class RefreshTargetsTests(unittest.TestCase):
                 maya.refresh_engine(ds4)
                 maya.refresh_engine(glm)
                 self.assertEqual(built, ["maya", "maya-ds4"])
+                ling = {"exe": str(build / "maya-ling"), "gpu": [0]}
+                with patch.object(maya, "LING_EXE", build / "maya-ling"):
+                    maya.refresh_engine(ling)
+                    self.assertEqual(built, ["maya", "maya-ds4", "maya-ling"])
+                    self.assertIn("maya-ling", json.loads(stamp.read_text())["targets"])
 
 
 class FailedUpdateBuildTests(unittest.TestCase):

@@ -36,8 +36,10 @@ GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
 # (Qwen3.8-Flash-Next itself: unsloth's UD-IQ2_XS only - its other UD quants run on the same code but are not listed;
 #  the setup id: maya_quants.QWEN_UD_IDS[0])
 QWEN_OTHER = (("qwen-ud-iq2_xs", "qwen", "ud-iq2_xs", "unsloth"),)
-# (Inkling-2-Mini on maya-ik2: unsloth's UD-Q4_K_XL - the setup id: maya_quants.IK2_IDS[0])
-IK2_OTHER = ((Q.IK2_IDS[0], "ik2", Q.IK2_QUANT, "unsloth"),)
+# (Inkling-2-Mini on maya-ik2: Maya's Maya-L among Maya's (IK2_MAYA), unsloth's UD-Q4_K_XL - the setup's file before
+#  v1.1.82 - here; the setup ids: maya_quants.IK2_FILE_IDS)
+IK2_MAYA = ("inkling-2-mini-maya-l", "ik2", Q.IK2_QUANT, "Maya")
+IK2_OTHER = (("inkling-2-mini-ud-q4_k_xl", "ik2", Q.IK2_UNSLOTH, "unsloth"),)
 OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [("minimax-exl3", "minimax", "exl3", "Mia-AiLab")] +
               [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER) + list(IK2_OTHER))
 GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gated: the setup sends the user's HF token)
@@ -115,8 +117,20 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
     ccs = _nvidia_ccs(backend) if ccs is None else ccs
     # Hy4-Flash (maya-hy4): the sizes that are uploaded, on NVIDIA from V100 on only (no AMD or Mac engine yet)
     hy4 = _hy4_downloads() if backend not in ("hip", "metal") and (not ccs or max(ccs) >= HY4_MIN_CC) else {}
+    # Ling-3.2-air (maya-ling): the sizes the setup can download - on NVIDIA from V100 on under Linux or Windows, and
+    # on AMD under Linux (the setup's own check says which AMD GPUs)
+    lin, win = sys.platform.startswith("linux"), sys.platform == "win32"
+    ling = _ling_downloads() if (backend == "hip" and lin) or (
+        backend == "cuda" and (lin or win) and (not ccs or max(ccs) >= LING_MIN_CC)) else {}
     out = []
     for fam, key, _tier, ident in Q.QUANTS:
+        if fam == "ling":                              # (a size not uploaded, or not made yet: no row)
+            if key in ling:
+                out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya",
+                            "note": ("AMD, Linux" if backend == "hip" else "NVIDIA") + "; one answer at a time",
+                            "installed": (fam, key) in have,
+                            "size_gb": round(float(ling[key]["download_gb"]), 1)})
+            continue
         if fam == "hy4":
             if key in hy4:
                 out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya",
@@ -128,6 +142,10 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
     out.append({"id": "cyber-frost", "family": "qwen", "name": Q.shown("qwen", "q5_k_m"), "group": "maya",
                 "by": "peasantsmith", "note": "", "installed": ("qwen", "q5_k_m") in have, "size_gb": None})
     extra = other_sizes if other_sizes is not None else (_other_sizes() if glm_sizes is None else {})
+    ident, fam, key, by = IK2_MAYA                     # (Inkling-2-Mini in Maya's GGUF: where the setup offers it)
+    if _offered(fam, key, backend, ccs):
+        out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": by,
+                    "note": _note(fam, key, backend), "installed": (fam, key) in have, "size_gb": extra.get(ident)})
     for ident, fam, key, by in OTHER:
         if not _offered(fam, key, backend, ccs):
             continue
@@ -174,6 +192,20 @@ def _hy4_downloads() -> dict:
         return {}
 
 
+LING_MIN_CC = 70                                     # (tools/ling_fit.py MIN_CC: maya-ling's kernels, V100 / RTX 20 on)
+
+
+def _ling_downloads() -> dict:
+    """Ling-3.2-air's downloads, by the setup's key ("maya-s"): the sizes whose files are uploaded
+    (maya.ling_published), each as maya.ling_entry says it - listed the day the setup's table names them."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import maya                                    # (the setup's own table; nothing runs on import)
+        return {k: maya.ling_entry(k) for k in maya.LING_QUANTS if maya.ling_published(k)}
+    except (Exception, SystemExit):  # noqa: BLE001 - a manifest not readable: not offered
+        return {}
+
+
 _other_gb: dict = {}
 
 
@@ -187,7 +219,7 @@ def _other_sizes() -> dict:
         import maya                                    # (the setup's own tables; nothing runs on import)
     except Exception:  # noqa: BLE001 - a size is a nicety
         return {}
-    for ident, fam, key, _by in OTHER:
+    for ident, fam, key, _by in (*OTHER, IK2_MAYA):
         try:
             if fam == "deepseek" and key == "exl3":
                 gb = 414                               # (the setup's own figure for it)
@@ -205,7 +237,7 @@ def _other_sizes() -> dict:
                 gb = maya.qwen_entry(key)["download_gb"] + (vision["download_gb"] if vision else 0)
             elif fam == "ik2":                         # (the GGUF, the vision tower and the drafter the setup fetches)
                 vision, drafter = maya.ik2_vision_model(), maya.ik2_drafter_model()
-                gb = maya.ik2_entry()["download_gb"] + sum(x["download_gb"] for x in (vision, drafter) if x)
+                gb = maya.ik2_entry(key)["download_gb"] + sum(x["download_gb"] for x in (vision, drafter) if x)
             else:
                 continue                               # (GLM's: the MODELS table, as Maya's own)
             _other_gb[ident] = round(float(gb), 1)

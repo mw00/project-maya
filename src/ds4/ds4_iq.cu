@@ -748,6 +748,21 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 #endif
 }
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only: a negative limit = the post-SiLU clamp; every other engine takes the #else)
+__device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's; < 0: post-SiLU clamp)
+    if (limit > 0.0f) {
+        gv = fminf(gv, limit);
+        uv = fminf(fmaxf(uv, -limit), limit);
+        return fmul_no_fma(__fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv))), uv);
+    }
+    const float act = __fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv)));
+    if (limit < 0.0f) {
+        const float L = -limit;
+        return fmul_no_fma(fminf(act, L), fminf(fmaxf(uv, -L), L));
+    }
+    return fmul_no_fma(act, uv);
+}
+#else
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
     if (limit > 0.0f) {
         gv = fminf(gv, limit);
@@ -755,6 +770,7 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // 
     }
     return fmul_no_fma(__fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv))), uv);
 }
+#endif
 // MiniMax-M3.1's swigluoai (mm3_exl3.cu's: the same operations)
 __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
     if (limit > 0.0f) {
@@ -765,7 +781,7 @@ __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
 }
 // The gate / up kernels' epilogue, a template parameter EPI (DeepSeek's kernels: EPI 0, the code they always had):
 //   0  gate and up in one pass, h = DeepSeek's clamped SwiGLU      1  ... h = swigluoai (Args::act kActOai)
-//   2  the gate alone, its F32 sums out (h, or SetArgs::graw)       3  the up alone, h = swigluoai(those sums, up)
+//   2  the gate alone, its F32 sums out (h, or SetArgs::graw)       3  the up alone, h = act_split(those sums, up)
 // 2 then 3: a layer whose gate and up are of different types (Args::tu) - each value the one pass's
 template <int EPI>
 constexpr bool kBoth = EPI < 2;   // (gate and up in this pass)
@@ -773,6 +789,11 @@ template <int EPI>
 __device__ __forceinline__ float act_out(float gv, float uv, float limit, int pexp = 0) {
     if constexpr (EPI == 0) return pexp ? maya::ds4::par::swiglu_portable(gv, uv, limit) : swiglu(gv, uv, limit);
     else return swigluoai(gv, uv, limit);
+}
+// EPI 3's h: the gate's sums (EPI 2's) with the up's, the one pass's epilogue for the layer's activation (act: Args /
+// SetArgs::act) - kActOai: swigluoai (EPI 1's); kActSwiglu: EPI 0's, maya-ling's post-SiLU clamp included
+__device__ __forceinline__ float act_split(float gv, float uv, float limit, int act, int pexp = 0) {
+    return act == kActOai ? swigluoai(gv, uv, limit) : act_out<0>(gv, uv, limit, pexp);
 }
 template <int EPI>
 constexpr int kRole0 = EPI == 3 ? 1 : 0;   // the matrix the pass reads first (3: the up)
@@ -955,7 +976,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                             const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
                             const int4 xa = xp[0], xb = xp[1];
                             const float dx = a.xd[(size_t) xr[i] * nsb + kb];
-                            ag[i] = fma_no_contract(dx, sub_dot<T, kMinG>(sg, xa, xb), ag[i]);
+                            ag[i] = fma_no_contract(dx, sub_dot<T, EPI == 3 ? kMinU : kMinG>(sg, xa, xb), ag[i]);
                             if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T, kMinU>(su, xa, xb), au[i]);
                         }
                     pg = ng;
@@ -970,7 +991,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                             if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp);
                         } else {
                             const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
-                            if (lane == 0) *hp = EPI == 2 ? v : swigluoai(*hp, v, a.limit);
+                            if (lane == 0) *hp = EPI == 2 ? v : act_split(*hp, v, a.limit, a.act, a.pexp);
                         }
                     }
             }
@@ -1138,7 +1159,7 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
             else if constexpr (TWO)
                 a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_out<EPI>(ag[i][j], au[i][j], a.limit)));
             else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = ag[i][j];
-            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + c], ag[i][j], a.limit)));
+            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + c], ag[i][j], a.limit, a.act)));
         }
     }
 }
@@ -1273,7 +1294,7 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
             if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ow[i];
             else if constexpr (TWO) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(ow[i]));
             else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = ow[i];
-            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + c], ow[i], a.limit)));
+            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + c], ow[i], a.limit, a.act)));
         }
         __syncthreads();
     }
@@ -1663,7 +1684,7 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
                     if constexpr (!GATE_UP) a.y[lr * a.ldo + row] = v0;
                     else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit)));
                     else if constexpr (EPI == 2) a.graw[lr * a.n_ff + row] = v0;
-                    else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + row], v0, a.limit)));
+                    else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + row], v0, a.limit, a.act)));
                 }
             }
     }
@@ -2048,8 +2069,8 @@ void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
     else if (a.max_rows <= 8) pdl_launch(light_kernel<T, 8, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
     else pdl_launch(light_kernel<T, kLightRows, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
 }
-// a set's gate and up of different types (SetArgs::tu, kActOai only): two passes, the gate's sums in graw between them
-bool split_gu(const SetArgs& a) { return a.act == kActOai && a.tu != 0 && a.tu != a.tg; }
+// a set's gate and up of different types (SetArgs::tu): two passes, the gate's sums in graw between them
+bool split_gu(const SetArgs& a) { return a.tu != 0 && a.tu != a.tg; }
 // the gate / up's inputs (the up's own type too) and the down's in whole blocks of their types (256 values; IQ4_NL's 32)
 bool k_whole(int n_embd, int n_ff, int tg, int tu, int td) {
     return n_embd % block_values(tg) == 0 && (tu == 0 || n_embd % block_values(tu) == 0) && n_ff % block_values(td) == 0;
@@ -2057,6 +2078,7 @@ bool k_whole(int n_embd, int n_ff, int tg, int tu, int td) {
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     const int K = gu ? a.n_embd : a.n_ff;
     if (gu && a.act != kActSwiglu && (a.tg == kMXFP4 || (split_gu(a) && a.graw == nullptr))) return false;
+    if (gu && split_gu(a) && (a.graw == nullptr || a.tg == kMXFP4 || a.tu == kMXFP4)) return false;
     LightBuf* b = light_buf(s, K);
     if (b == nullptr) return false;
     const dim3 gq((unsigned) ((K / 32 + kWarps - 1) / kWarps), (unsigned) (a.n_exp * kLightRows));
@@ -2075,6 +2097,15 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
 #define LO3_(T) launch_light<T, true, 3>(a, *b, s)
         DS4_IQ_SWITCH(a.tu, LO3_)
 #undef LO3_
+        return true;
+    }
+    if (gu && split_gu(a)) {   // (the clamped SwiGLU, gate and up of different types: maya-ling's - as MiniMax's two)
+#define LS2_(T) launch_light<T, true, 2>(a, *b, s)
+        DS4_IQ_SWITCH_EXP(a.tg, LS2_)
+#undef LS2_
+#define LS3_(T) launch_light<T, true, 3>(a, *b, s)
+        DS4_IQ_SWITCH_EXP(a.tu, LS3_)
+#undef LS3_
         return true;
     }
     if (gu) {
@@ -2374,6 +2405,16 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
 #undef GO3_
         return true;
     }
+    if (a.tu != 0 && a.tu != a.tg) {   // the clamped SwiGLU, gate and up of different types (maya-ling's): two passes
+        if (!expert_supported(a.tg) || !expert_supported(a.tu)) return false;
+#define GS2_(T) gu_ne<T, 2>(a, grid, ne_max, s)
+        DS4_IQ_SWITCH_EXP(a.tg, GS2_)
+#undef GS2_
+#define GS3_(T) gu_ne<T, 3>(a, grid, ne_max, s)
+        DS4_IQ_SWITCH_EXP(a.tu, GS3_)
+#undef GS3_
+        return true;
+    }
 #define GU_(T) gu_ne<T>(a, grid, ne_max, s)
     DS4_IQ_SWITCH_EXP(a.tg, GU_)
 #undef GU_
@@ -2476,6 +2517,7 @@ bool mmq_wanted(const SetArgs& a, bool gate_up) {
     if (a.ldx < (gate_up ? a.n_embd : a.n_ff) || a.ldo < (gate_up ? a.n_ff : a.n_embd)) return false;
     if (gate_up && a.ldx % 4 != 0) return false;   // the MMQ quantizer loads float4s
     if (gate_up ? (a.xf == nullptr || a.h == nullptr) : (a.xh == nullptr || a.y == nullptr)) return false;
+    if (gate_up && a.tu != 0 && a.tu != a.tg) return false;   // (MMQ's gate / up: one type for both)
     const int type = gate_up ? a.tg : a.td;
     if (type != kIQ2_S && type != kIQ2_XXS && type != kIQ3_S && type != kIQ3_XXS && type != kIQ1_S) return false;
     if (a.max_rows < mmq_min_rows(type)) return false;   // (no expert of the set would take it)
@@ -2590,9 +2632,25 @@ __global__ void mmq_epilogue(const float* __restrict__ g, uint16_t* __restrict__
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * nff) return;
     const int r = i / nff, c = i - r * nff;
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only)
+    const float g0 = g[(size_t) r * 2 * nff + c];
+    const float u0 = g[(size_t) r * 2 * nff + nff + c];
+    float v;
+    if (limit > 0.0f) {
+        const float gv = fminf(g0, limit);
+        const float uv = fminf(fmaxf(u0, -limit), limit);
+        v = gv / (1.0f + __expf(-gv)) * uv;
+    } else if (limit < 0.0f) {
+        const float L = -limit;
+        v = fminf(g0 / (1.0f + __expf(-g0)), L) * fminf(fmaxf(u0, -L), L);
+    } else {
+        v = g0 / (1.0f + __expf(-g0)) * u0;
+    }
+#else
     const float gv = fminf(g[(size_t) r * 2 * nff + c], limit);
     const float uv = fminf(fmaxf(g[(size_t) r * 2 * nff + nff + c], -limit), limit);
     const float v = gv / (1.0f + __expf(-gv)) * uv;
+#endif
     h[(size_t) r * ldo + c] = __half_as_ushort(__float2half_rn(v));
 }
 
@@ -2851,6 +2909,16 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 #define SO3_(T) launch_set<T, true, 3>(t, grid, s)
         DS4_IQ_SWITCH(a.tu, SO3_)
 #undef SO3_
+        return true;
+    }
+    if (split_gu(a)) {   // the clamped SwiGLU, gate and up of different types (maya-ling's): the same two passes
+        if (!expert_supported(a.tg) || !expert_supported(a.tu)) return false;
+#define SS2_(T) launch_set<T, true, 2>(t, grid, s)
+        DS4_IQ_SWITCH_EXP(a.tg, SS2_)
+#undef SS2_
+#define SS3_(T) launch_set<T, true, 3>(t, grid, s)
+        DS4_IQ_SWITCH_EXP(a.tu, SS3_)
+#undef SS3_
         return true;
     }
 #define SG_(T) launch_set<T, true>(t, grid, s)

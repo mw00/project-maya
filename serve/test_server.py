@@ -839,6 +839,144 @@ class RequestChecks(unittest.TestCase):
             svc.check_request({"ignore_eos": True, "max_tokens": 8})
 
 
+class SamplerEnds(unittest.TestCase):
+    def test_a_closed_server_stops_its_sampler(self):
+        """server_close(): the hardware sampler behind /metrics ends with the server. Every test server's sampler
+        used to read the sensors each second for the rest of the suite (50 of them by the stop tests, v1.1.82's CI)."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        tel = svc.telemetry
+        self.assertFalse(tel._stopped.is_set())
+        httpd.shutdown()
+        self.assertIs(svc.telemetry, tel)               # (main()'s stop: the stall watchdog still reads it)
+        httpd.server_close()
+        self.assertTrue(tel._stopped.is_set())
+        self.assertIsNone(svc.telemetry)
+        again = serve(svc, port=0)                      # (the same service served again: a sampler of its own)
+        self.addCleanup(lambda: (again.shutdown(), again.server_close()))
+        self.assertIsNotNone(svc.telemetry)
+        self.assertIsNot(svc.telemetry, tel)
+
+
+class BodylessRequests(unittest.TestCase):
+    """A POST with no usable `messages` is a 400 on every route, never a connection closed with no answer.
+
+    A client that probes which protocols a server speaks (M3 Code asks each path `POST {}` and reads only the status
+    code: 400/422/2xx means the route exists, 404/405 means it does not, anything else - a closed socket included -
+    means the server does not serve it at all) took the dropped connection for "no Chat Completions here" and refused
+    to link any agent.  /v1/responses already answered a bodyless POST with its own 400 (serve/responses.py); Chat
+    Completions and Anthropic's messages ran on to the chat template, which refused the empty list with a jinja2
+    TemplateError - no ValueError, so it escaped do_POST's except clauses and socketserver closed the socket."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        # (the closing marker comes first: the template opens a thinking segment, and an answer that never leaves it
+        # is replaced by the loop guard's stop note)
+        cls.engine = MockEngine(tok, "</think>\n\nthe answer", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.port = cls.httpd.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def raw(self, path, body):
+        """-> (status, body text).  A connection the server closed without answering is what these requests used to
+        do, so it fails here by name rather than as an opaque URLError from a client that hides it."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
+            r = conn.getresponse()
+            return r.status, r.read().decode("utf-8", "replace")
+        except (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionError) as e:
+            self.fail(f"{path} closed the connection with no answer for {body!r} "
+                      f"({type(e).__name__}: {e})")
+        finally:
+            conn.close()
+
+    def refused(self, path, body, word=None):
+        """The request is a 400 with OpenAI's error shape; returns its message.  (The handler logs the refused
+        request's traceback, which is not what these tests are about.)"""
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            s, text = self.raw(path, body)
+        self.assertEqual(s, 400, (path, body, text))
+        err = json.loads(text)["error"]
+        self.assertEqual(err["type"], "invalid_request_error", text)
+        self.assertTrue(err["message"].strip(), text)
+        if word:
+            self.assertIn(word, err["message"], text)
+        return err["message"]
+
+    def test_bodyless_chat_completions_are_a_400(self):
+        # what M3 Code's protocolServed() asks, and the two shapes between it and a real request
+        for body in ({}, {"model": "m"}, {"messages": []}, {"model": "m", "messages": []},
+                     {"model": "m", "messages": [], "stream": True}, {"model": "m", "messages": [], "max_tokens": 8}):
+            self.refused("/v1/chat/completions", body, "nonempty array")
+
+    def test_bodyless_anthropic_is_a_400(self):
+        for body in ({}, {"model": "m"}, {"model": "m", "messages": []},
+                     {"model": "m", "messages": [], "max_tokens": 8}):
+            self.refused("/v1/messages", body, "nonempty array")
+
+    def test_responses_and_unserved_routes_unchanged(self):
+        # /v1/responses keeps its own wording (serve/responses.py), and a route Maya does not serve stays a 404 -
+        # a probe must still be able to tell the two apart
+        self.refused("/v1/responses", {}, "input must be a string or a nonempty array of input items")
+        self.assertEqual(self.raw("/v1/completions", {})[0], 404)
+        self.assertEqual(self.raw("/v1/completions", {"model": "m", "prompt": "hi"})[0], 404)
+
+    def test_the_template_refusing_is_a_400_too(self):
+        """The same hole one layer down: what the chat template itself refuses (serve/chat_template.jinja's
+        raise_exception) is jinja2's exception, no ValueError, and escaped the except clauses the same way."""
+        for msgs in ([{"role": "bogus", "content": "x"}], [{"content": "x"}]):
+            self.refused("/v1/chat/completions", {"model": "m", "messages": msgs}, "Unexpected message role")
+            # (Anthropic's adapter reads the role first, so its own wording comes back; what matters is the 400)
+            self.refused("/v1/messages", {"model": "m", "messages": msgs, "max_tokens": 8})
+
+    def test_a_whole_request_still_answers(self):
+        # the fix answers nothing it answered before: the same 200 on both APIs, streamed and not
+        s, text = self.raw("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, text)
+        self.assertEqual(json.loads(text)["choices"][0]["message"]["content"], "the answer")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            conn.request("POST", "/v1/chat/completions",
+                         body=json.dumps({"model": "m", "stream": True,
+                                          "messages": [{"role": "user", "content": "hi"}]}),
+                         headers={"Content-Type": "application/json"})
+            r = conn.getresponse()
+            stream = r.read().decode()
+            self.assertEqual(r.status, 200)
+            # the answer, put back from the deltas: streaming is unchanged by the 400s above
+            text = "".join(json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
+                           for line in stream.splitlines() if line.startswith("data: ") and "[DONE]" not in line)
+            self.assertEqual(text, "the answer", stream)
+            self.assertTrue(stream.rstrip().endswith("data: [DONE]"), stream[-200:])
+        finally:
+            conn.close()
+        s, text = self.raw("/v1/messages", {"model": "m", "max_tokens": 32,
+                                            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, text)
+        self.assertEqual(json.loads(text)["content"][0]["text"], "the answer")
+
+    def test_model_api_empty_messages_is_still_a_load(self):
+        """/api/chat keeps Maya's model API's preload: an empty `messages` list there is a call of its own that answers 200
+        (load / unload), not a 400 - only the completion routes ask for a message."""
+        from serve.frontend import check_messages
+        check_messages({})                                    # no `messages`: fine, /api/chat reads it as a load
+        check_messages({"messages": []})
+        check_messages({"input": []}, "input")                 # /v1/responses checks its own `input` itself
+        for bad, key in (({"messages": [[]]}, "messages"), ({"messages": "hi"}, "messages"), ({"input": 7}, "input")):
+            with self.assertRaises(ValueError, msg=bad):
+                check_messages(bad, key)
+
+
 class PrometheusMetrics(unittest.TestCase):
     """GET /metrics/prometheus: llama-server's metric names in Prometheus' text format, behind the API key."""
 

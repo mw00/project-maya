@@ -69,7 +69,7 @@ struct Args {
     float* part = nullptr;   // [entries][n_embd]: each entry's down output
     int tg = 0, td = 0;      // gate / up's type, down's
     int act = kActSwiglu;    // the activation (kActOai: MiniMax's)
-    int tu = 0;              // (kActOai) the up's type when it is not the gate's (0: tg): gate and up then in two passes,
+    int tu = 0;              // the up's type when it is not the gate's (0: tg; any act): gate and up then in two passes,
                              // the gate's sums in h first - each value the same as one pass gives
     int pexp = 0;            // 1: the token kernels' SwiGLU takes exp_portable (ds4_par_exp.h, DS4_LANE_PARITY), the
                              // CPU lane's exp bit for bit, in place of CUDA's expf (its ex2.approx)
@@ -104,7 +104,7 @@ struct SetArgs {
     int xh_vec = 0;    // (launch_set's: xh 16-byte aligned rows - the tensor-core tiles load 8 values at once)
     int skip_ge = 0;   // (the tiles) > 0: the experts of at least this many rows are left out - the caller's GEMMs
     int act = kActSwiglu;      // the activation (Args::act)
-    int tu = 0;                // (kActOai) the up's type when it is not the gate's (0: tg) - two passes, as Args::tu
+    int tu = 0;                // the up's type when it is not the gate's (0: tg; any act) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
 };
 #if defined(MAYA_USE_HIP)

@@ -1,16 +1,31 @@
 {
- "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8): unsloth's UD-Q4_K_XL GGUF at the repo's top - Unsloth's looped layout (general.architecture inkling2: inkling2.num_loops, inkling2.loop.core_start), which maya-ik2 reads; the files in Mainline_Support/ (inkling2_loop, llama.cpp master's) are not offered. Experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. The drafter: \"drafter\" below (the model's own, from Maya's repo; drafting auto by default). The file pinned by revision, size and sha256: the setup checks them.",
- "name": "Inkling-2-Mini-UD-Q4_K_XL",
- "repo": "unsloth/Inkling-2-Mini-GGUF",
- "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",
- "folder": "",
+ "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8): Maya's own GGUF, Inkling-2-Mini-Maya-L-NVFP4 (peasantsmith/Inkling-2-Mini-Maya-GGUF, folder Maya-L/), written from the original model's files - the looped layout maya-ik2 reads (general.architecture inkling2); experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. A new setup downloads it; an install of unsloth's UD-Q4_K_XL (\"earlier\" below, the file before) keeps it. The drafter: \"drafter\" below (the model's own, from Maya's repo; drafting auto by default). Every file pinned by revision, size and sha256: the setup checks them.",
+ "name": "Inkling-2-Mini-Maya-L-NVFP4",
+ "quant": "maya-l",
+ "repo": "peasantsmith/Inkling-2-Mini-Maya-GGUF",
+ "revision": "f5bef914e8098c2f9920f59050c80ea3f17a54a4",
+ "folder": "Maya-L",
  "license": "Apache 2.0",
- "about": "UD-Q4_K_XL: NVFP4 experts in layers 0-19, Q8_0 elsewhere; 26B parameters, 8 of 128 experts a token",
+ "about": "Maya-L: NVFP4 experts in layers 0-19, Q8_0 elsewhere; 26B parameters, 8 of 128 experts a token",
  "vram_gb": 24,
  "files": {
-  "Inkling-2-Mini-UD-Q4_K_XL.gguf": [17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"]
+  "Inkling-2-Mini-Maya-L-NVFP4.gguf": [17629759680, "1945d7b212601f429ef9dc4f6b8208062f3b9f22a1ebbdc1665373f412ebf54a"]
  },
- "gguf": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+ "gguf": "Inkling-2-Mini-Maya-L-NVFP4.gguf",
+ "earlier": {
+  "ud-q4_k_xl": {
+   "_": "unsloth's UD-Q4_K_XL (unsloth/Inkling-2-Mini-GGUF, its repo's top: Unsloth's looped layout; experts of layers 0-19 NVFP4, the rest Q8_0) - the setup's file before v1.1.82. An install of it keeps it: the setup checks it as before and downloads nothing again; --model inkling-2-mini-ud-q4_k_xl sets it up by name.",
+   "repo": "unsloth/Inkling-2-Mini-GGUF",
+   "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",
+   "folder": "",
+   "license": "Apache 2.0",
+   "about": "UD-Q4_K_XL: NVFP4 experts in layers 0-19, Q8_0 elsewhere; 26B parameters, 8 of 128 experts a token",
+   "files": {
+    "Inkling-2-Mini-UD-Q4_K_XL.gguf": [17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"]
+   },
+   "gguf": "Inkling-2-Mini-UD-Q4_K_XL.gguf"
+  }
+ },
  "vision": {
   "_": "The pictures: the model's vision tower (llama.cpp's inkling2v projector, BF16) from Maya's own repo - unsloth's conversion byte for byte (their mmproj-BF16.gguf, the same size and sha256; a copy of it already on the disk is used as it is), read by maya-vision (tools/vision/inkling2v_patch.py) when a picture arrives; not with --no-vision.",
   "repo": "peasantsmith/Inkling-2-Mini-Maya-GGUF",

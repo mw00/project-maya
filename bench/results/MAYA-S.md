@@ -1,15 +1,11 @@
 # Maya-S against the FP8 model
 
-`GLM-5.3-Flash-Maya-S` (96.5 GB, the files `Maya-S-v2-IQ2_XXS/` on Hugging Face): IQ2_XXS gate/up experts rounded with
-error feedback (GPTQ-style, each expert with its own input statistics from the FP8 model), IQ2_S down projections and
-IQ3_XXS in the first and last four MoE layers, Q6_K attention / shared experts / dense layers / embeddings / output,
-Q8_0 small KDA projections and the DSA indexer, F32 router and mixing weights, the NextN (MTP) draft block.
-Recipe: `tools/maya_quant/recipes/maya-s-v2.json`, made from Z.ai's FP8 release.
+`GLM-5.3-Flash-Maya-S` (96.5 GB, the files `Maya-S-v2-IQ2_XXS/` on Hugging Face), made from Z.ai's FP8 release.
 
 ## Distribution match on held-out text
 
 The FP8 model's top-64 log-probabilities on 8 held-out sequences never used for calibration (7,672 positions) against
-Maya-S through the engine's one-token decode path (`tools/maya_quant/kl_eval.py`). KL is KL(FP8 || Maya-S) over the top
+Maya-S through the engine's one-token decode path (Maya's scoring tools). KL is KL(FP8 || Maya-S) over the top
 64 plus one bucket for the rest.
 
 | Text | KL | Same top token |
@@ -41,13 +37,13 @@ Maya-S through the engine's one-token decode path (`tools/maya_quant/kl_eval.py`
 | PIQA (acc norm) | 87.0 | 86.2 | 99.1% |
 | **Average** | **82.5** | **80.8** | **97.9%** |
 
-400 questions per task, the same questions for both models, scored the way lm-evaluation-harness scores them (the answer with the highest log-likelihood; length-normalized where the choices differ in length) - the FP8 model run layer by layer in PyTorch, Maya-S through Project Maya's engine (`tools/maya_quant/zs_*.py`).
+400 questions per task, the same questions for both models, scored the way lm-evaluation-harness scores them (the answer with the highest log-likelihood; length-normalized where the choices differ in length) - the FP8 model run layer by layer in PyTorch, Maya-S through Project Maya's engine (Maya's scoring tools).
 
 ## Long answers and long context
 
-`tools/maya_quant/loop_test.py` (a three.js scene, a canvas animation, an explanation, a study plan in Portuguese, a
-proof; temperature 1.0 and greedy, 6,000-14,000 new tokens) and `tools/maya_quant/ctx_fill_test.py` (a fact at the
-start of an 8K, 16K and 30K-token context, asked about at the end), run on the Maya-S line with the same rounding of the
+Maya's loop test (a three.js scene, a canvas animation, an explanation, a study plan in Portuguese, a
+proof; temperature 1.0 and greedy, 6,000-14,000 new tokens) and Maya's long-context test (a fact at the
+start of an 8K, 16K and 30K-token context, asked about at the end), run on the Maya-S line with the same quant of the
 experts: no loop in 14 long answers, and the fact found at every size.
 
 ## Speed

@@ -228,6 +228,7 @@ class TurboServer(unittest.TestCase):
 
     def tearDown(self):
         self.httpd.shutdown()
+        self.httpd.server_close()                       # (its sampler ends too)
         shutil.rmtree(self.d, ignore_errors=True)
 
     def call(self, path, body=None):

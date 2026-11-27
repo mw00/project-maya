@@ -114,7 +114,7 @@ class Template(unittest.TestCase):
     def test_levels(self):
         # its own names reach it as they are; thinking off is its "none" (0); none named: its default, 0.9
         t = public()
-        for word, num in (("none", "0"), (False, "0"), ("off", "0"), ("minimal", "0"), ("low", "0.2"),
+        for word, num in (("none", "0"), (False, "0"), ("off", "0"), ("minimal", "0.1"), ("low", "0.2"),
                           ("medium", "0.7"), ("high", "0.9"), ("xhigh", "0.99"), ("max", "0.99"), ("auto", "0.9"),
                           (None, "0.9")):
             with self.subTest(word=word):
@@ -185,10 +185,96 @@ class Parser(unittest.TestCase):
                     with self.subTest(name=name, thinking=thinking, step=step):
                         self.assertEqual(self.feed(text, thinking, step), (reasoning, content, calls))
 
-    def test_unfinished_call_is_text(self):
+    # A call streams once its name and the opening of "args" are there (see InklingRewriter), so a call that breaks after
+    # that point can no longer become text: what a client has been sent stays a call, ended where the model's JSON stops
+    # - the way OutputParser ends a streamed call of any model.  Before streaming these were text.
+    def test_streamed_call_ends_where_its_json_stops(self):
+        for body, args in (('{"name":"get_weather","args":{"city":"Paris"}} and more', {"city": "Paris"}),
+                           ('{"name":"get_weather","args":{"ci', {})):
+            for step in (1, 5, 1000):
+                with self.subTest(body=body, step=step):
+                    self.assertEqual(self.feed(MODEL + "get_weather" + CALL + body + END, False, step),
+                                     ("", "", [("get_weather", args)]))
+        # cut off by the end of the answer (max_tokens): a streaming client has the call's pieces - its JSON closed by
+        # OutputParser.finish as for any model (that final event carries no parsed arguments: OutputParser's own way)
+        for step in (1, 5, 1000):
+            p, events = OutputParser(thinking=False, stream_tools=True, inkling=True), []
+            text = MODEL + "get_weather" + CALL + '{"name":"get_weather","args":{"city":"Pa'
+            for i in range(0, len(text), step):
+                events += p.feed(text[i:i + step])
+            events += p.finish()
+            self.assertEqual(json.loads("".join(e.text for e in events if e.kind == "tool_args")), {"city": "Pa"})
+            self.assertEqual([e.call.name for e in events if e.kind == "tool_call"], ["get_weather"])
+
+    def test_unfinished_call_is_left_open(self):
+        # the answer cut off inside a streamed call (max_tokens): the rewriter leaves it open, OutputParser.finish ends it
         r = InklingRewriter(thinking=False)
         out = r.feed(MODEL + "get_weather" + CALL + '{"name":"get_weather","args":{"ci') + r.finish()
-        self.assertEqual(out, '{"name":"get_weather","args":{"ci')
+        self.assertEqual(out, "<tool_call>get_weather")
+
+    def test_other_shapes_as_before(self):
+        # a body the stream does not start on goes out whole at its end, as before streaming: a call where it is JSON,
+        # its text where it is not (here the comma before "args" left out, or no JSON at all)
+        for body in ('{"name":"get_weather"args":{"city":"Paris"}}', 'not json at all', '{"name":"get_wea'):
+            with self.subTest(body=body):
+                r = InklingRewriter(thinking=False)
+                out = r.feed(MODEL + "get_weather" + CALL + body + END) + r.finish()
+                self.assertEqual(out, body)
+                self.assertEqual(r.streamed_calls, 0)
+        r = InklingRewriter(thinking=False)
+        out = r.feed(MODEL + "get_weather" + CALL + '{"args":{"city":"Rome"},"name":"get_weather"}' + END) + r.finish()
+        self.assertEqual(out, "<tool_call>get_weather<arg_key>city</arg_key><arg_value>\"Rome\"</arg_value></tool_call>")
+
+
+class Streaming(unittest.TestCase):
+    """A call goes out as it is written: tool_start and tool_args pieces long before its end, the pieces one JSON object
+    equal to the call's arguments, the same call however the output is cut."""
+
+    BODIES = (
+        {},
+        {"city": "Paris"},
+        {"city": "a <b> \"c\" </arg_value></tool_call> <|x|>?", "days": -3, "x": 1.5e3, "t": True, "n": None},
+        {"path": "C:\\dir\\f.txt", "content": "line1\nline2\t\u00e9\u2603 \U0001f600 \\\" end"},
+        {"opts": {"x": [1, 2, {"y": "<z>"}], "s": "}{][,"}, "list": ["a", "b<", {}], "e": ""},
+        {"k\u00e9y \"q\"": "v", "<tag>": "<tag>"},
+    )
+
+    @staticmethod
+    def run_out(text, step):
+        p, events, first = OutputParser(thinking=True, stream_tools=True, inkling=True), [], None
+        for i in range(0, len(text), step):
+            got = p.feed(text[i:i + step])
+            if first is None and any(e.kind in ("tool_start", "tool_args") for e in got):
+                first = i + step
+            events += got
+        events += p.finish()
+        return events, first
+
+    def check(self, body_text, args, step):
+        text = MODEL + THINK + "Plan." + END + MODEL + "write" + CALL + body_text + END + EOS
+        events, first = self.run_out(text, step)
+        calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual([(c.call.name, c.call.arguments) for c in calls], [("write", args)])
+        pieces = "".join(e.text for e in events if e.kind == "tool_args")
+        # (a call with no arguments has no pieces: it goes out as its one final event, as it always did)
+        self.assertEqual(sum(e.kind == "tool_start" for e in events), 1 if args else 0)
+        if args:
+            self.assertEqual(json.loads(pieces), args)
+        return text, first
+
+    def test_bodies_however_cut(self):
+        for args in self.BODIES:
+            for body_text in (json.dumps({"name": "write", "args": args}),
+                              json.dumps({"name": "write", "args": args}, ensure_ascii=False, indent=2)):
+                for step in (1, 2, 3, 5, 13, 1000):
+                    with self.subTest(body=body_text[:60], step=step):
+                        self.check(body_text, args, step)
+
+    def test_a_long_write_streams(self):
+        content = "<html>\n" + "\n".join(f'<p class="x">line {i} \u00e9 "q" \\ </p>' for i in range(2000)) + "\n</html>"
+        args = {"path": "pelican.html", "content": content}
+        text, first = self.check(json.dumps({"name": "write", "args": args}), args, 7)
+        self.assertLess(first, len(text) // 20)        # the first pieces within the first 5% of the output
 
 
 class Serving(unittest.TestCase):

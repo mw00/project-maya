@@ -6,6 +6,10 @@ FAKE_MULTI_INTERLEAVE=<n> (MAYA_GLM_PREFILL_INTERLEAVE's line pattern): a prompt
 each, while the requests already running decode a token each between two pieces; one prompt is read at a time (later
 ones queue), and a STOP for the one being read ends it with no token.  A GEN with logprobs=<n> gets an LP line after
 each T line: logprob -0.25 * (the token's place % 4), then the token and n - 1 others (id + 1, + 2, ...) each 1 lower.
+FAKE_MULTI_GATE=<file> (with FAKE_MULTI_INTERLEAVE): a prompt read stops one piece before its end - still writing its
+PP line a piece - until the file exists (at most 60 s); once it exists the read then running ends with its next piece and the later
+ones run as without the gate: a test holds a long read open for exactly as long as it needs on a fast or a slow PC
+instead of sizing it in sleeps.
 
     serve/fake_multi_engine.py --serve <n>        (StrataEngine starts it as it starts `strata`)
 """
@@ -18,6 +22,8 @@ import time
 
 n = int(sys.argv[-1]) if len(sys.argv) > 1 and sys.argv[-1].isdigit() else 2
 piece = int(os.environ.get("FAKE_MULTI_INTERLEAVE", "0") or 0)
+gate = os.environ.get("FAKE_MULTI_GATE") or None
+gate_until = time.monotonic() + 60.0
 lock = threading.Lock()
 active: dict[int, dict] = {}
 reading: list[int] = []                               # FAKE_MULTI_INTERLEAVE: prompts to read, the first being read
@@ -72,7 +78,12 @@ def read_piece():
             del active[rid]
             out(f"DONE {rid} 0 {r['total']} 1.0 0.0 cancel 0 0 0")
             return True
+        global gate
         r["read"] = min(r["total"], r["read"] + piece)
+        if gate and os.path.exists(gate):
+            r["read"], gate = r["total"], None            # (FAKE_MULTI_GATE there: this read ends now, later ones run)
+        elif r["read"] >= r["total"] and gate and time.monotonic() < gate_until and r["total"] > piece:
+            r["read"] = r["total"] - piece                # (FAKE_MULTI_GATE: held one piece before its end)
         out(f"PP {rid} {r['read']} {r['total']} 1.0 1000.0")
         if r["read"] >= r["total"]:
             reading.pop(0)

@@ -150,6 +150,13 @@ class Dashboard(unittest.TestCase):
             ({"engine_kind": "ds4"}, {"dspark": True, "lookup": True}, ["DSpark", "Lookup"]),
             ({"engine_kind": "ds4"}, {"dspark": False, "lookup": True}, ["Lookup"]),
             ({"engine_kind": "ds4"}, {"dspark": False, "lookup": False}, []),
+            # (maya-ling: its INFO spec=, what its start decided - mtp= only says the draft block is loaded)
+            ({"engine_kind": "ling", "dspark": 0, "mtp": 1, "spec": "mtp+lookup"}, {}, ["MTP", "Lookup"]),
+            ({"engine_kind": "ling", "dspark": 0, "mtp": 1, "spec": "mtp"}, {}, ["MTP"]),
+            ({"engine_kind": "ling", "dspark": 0, "mtp": 1, "spec": "lookup"}, {}, ["Lookup"]),
+            ({"engine_kind": "ling", "dspark": 0, "mtp": 1, "spec": "off"}, {}, []),
+            ({"engine_kind": "ling", "dspark": 0, "mtp": 0, "spec": "off"}, {}, []),
+            ({"engine_kind": "glm-fast", "mtp": 1, "spec": "off"}, {}, ["MTP"]),       # (spec= read for Ling only)
         ]
         for info, kw, want in cases:
             with self.subTest(info=info, kw=kw):
@@ -988,6 +995,123 @@ console.log(JSON.stringify(out));""")
         self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo",
                                        "promo,ram_fetch,disk",                    # (Qwen: Promoted since #1103)
                                        "cpu,engram_ms", "ram_fetch,disk,promo"])
+
+    def test_ling_its_levels_its_own_settings_its_name_and_its_monitor(self):
+        # Ling-3.2-air ("ling-3.2-air", maya-ling): its template's one switch - Off ("detailed thinking off") and High
+        # (its default); chat settings of its own, its sampling the health's (the config's, from tools/ling/download.json)
+        # - none written in the page; its name as inclusionAI writes it; the Monitor: maya-ling's STAT tiers (its SSD
+        # bytes ssd_gb), its INFO cache and spec=; the other models' as they were
+        dl = json.loads((ROOT / "tools/ling/download.json").read_text(encoding="utf-8"))
+        health = {"model": "ling-3.2-air", "model_label": "Ling-3.2-air · Maya-S",
+                  "defaults": {**dl["sampling"], "reasoning_effort": dl["reasoning_effort"]}}
+        got = self.node("""
+const m = await import(web + "/monitor.js"), lib = await import(web + "/lib.js"), tc = await import(web + "/turbo-core.js");
+const set = await import(web + "/settings.js");
+const others = ["glm-5.3-flash", "glm-5.3", "deepseek-v4.1-flash", "minimax-m3.1-flash", "cyber-frost-3.8-ps", "hy4-flash",
+  "inkling-2-mini", "", "lingo-7b", "glm-ling"];
+const out = {family: st.familyOf("ling-3.2-air"), upper: st.familyOf("Ling-3.2-air"), others: others.map((x) => st.familyOf(x)),
+  names: others.map((x) => lib.modelName(x))};
+globalThis.fetch = async () => ({ok: true, json: async () => (HEALTH)});
+await sv.loadHealth();
+out.levels = st.LEVELS.map((l) => [l.id, l.name]); out.dflt = st.DEFAULTS.thinking; out.titles = st.thinkTitles(); out.key = st.prefsKey();
+out.sampling = {temperature: st.DEFAULTS.temperature, top_p: st.DEFAULTS.top_p, top_k: st.DEFAULTS.top_k, min_p: st.DEFAULTS.min_p};
+out.p = {temperature: st.P.temperature, top_p: st.P.top_p, top_k: st.P.top_k, thinking: st.P.thinking};
+out.nearest = ["none", "auto", "low", "medium", "high", "xhigh", "max"].map((l) => st.levelFor(l));
+out.fastest = tc.fastestThinking(st.THINKING);
+out.name = lib.modelName("ling-3.2-air"); out.short = lib.modelName("ling-3.2-air", true); out.logo = lib.modelLogo("ling-3.2-air");
+const eng = {engine_kind: "ling", model: "Ling-3.2-air", kv: "f16", experts: 20480, expert_slots: 12000, ram_slots: 8480,
+  dspark: 0, mtp: 1, spec: "mtp+lookup"};
+const n = {vram_used: 12000, ram_used: 8000, vram_gb: 9.5, ram_gb: 6.3, ssd_gb: 0.4, vram_hit: 0.4, ram_fetch: 3, disk: 0.2, promo: 0.1};
+out.set = m.tierSet(eng).map((x) => x.key).join(); out.subs = m.tierSet(eng).map((x) => x.sub);
+out.tip = m.tierTip(n, eng, {disk: 480}); out.shares = sv.tierShares(n, eng);
+out.glmShares = sv.tierShares(n, {engine_kind: "glm-fast", experts: 20480});
+out.sets = ["ds4", "mm3", "qwen", "hy4", "ik2", "glm-fast"].map((k) => m.tierSet({engine_kind: k}).map((x) => x.key).join());
+const row = (k) => (set.facts().find((r) => r[0] === k) || [k, null])[1];
+st.S.metrics = {engine: eng}; out.facts = {engine: row("Engine"), kv: row("KV cache"), spec: row("Speculation")};
+out.specs = ["mtp", "lookup", "off", "weird"].map((s) => { st.S.metrics = {engine: {...eng, spec: s}}; return row("Speculation"); });
+st.S.metrics = {engine: {...eng, kv: "q8"}}; out.kvQ8 = row("KV cache");
+st.S.metrics = {engine: {engine_kind: "ik2", kv: "fp8", dspark: 0}}; out.ik2 = [row("KV cache"), row("Speculation")];
+console.log(JSON.stringify(out));""".replace("HEALTH", json.dumps(health)))
+        self.assertEqual((got["family"], got["upper"]), ("ling", "ling"))
+        self.assertEqual(got["others"], ["glm", "glm", "deepseek", "minimax", "qwen", "hy4", "ik2", "glm", "glm", "glm"])
+        self.assertEqual(got["names"][:7], ["GLM 5.3 Flash", "GLM 5.3", "DeepSeek V4.1 Flash", "MiniMax M3.1 Flash",
+                                            "Qwen-3.8-Flash-Next (CYBER-FROST)", "Hy4 Flash", "Inkling 2 Mini"])
+        self.assertEqual(got["levels"], [["none", "Off"], ["high", "High"]])
+        self.assertEqual((got["dflt"], got["key"], got["fastest"]), ("high", "sampling_ling", "none"))
+        self.assertEqual(sorted(got["titles"]), ["high", "none"])
+        self.assertIn("detailed thinking off", got["titles"]["none"])
+        self.assertIn("its default", got["titles"]["high"])
+        self.assertEqual(got["nearest"], ["none", None, None, "high", "high", "high", "high"])
+        # (its sampling: download.json's, through the health - the page has no numbers of its own for Ling)
+        want = {**dl["sampling"], "min_p": dl["sampling"].get("min_p", 0)}
+        self.assertEqual(got["sampling"], want)
+        self.assertEqual(got["p"], {**{k: dl["sampling"][k] for k in ("temperature", "top_p", "top_k")},
+                                    "thinking": dl["reasoning_effort"]})
+        state = (ROOT / "serve/web/state.js").read_text(encoding="utf-8")
+        self.assertNotRegex(state, r"ling[^\n]*temperature")
+        self.assertEqual((got["name"], got["short"], got["logo"]), ("Ling-3.2-air", "Ling-3.2-air", None))
+        self.assertEqual(got["set"], "ram_fetch,disk,promo")
+        self.assertIn("computed on the CPU or copied to the GPU", got["subs"][0])
+        self.assertTrue(got["tip"].startswith("Most experts run on the CPU"))
+        self.assertEqual(got["shares"], {"vu": 12000, "ru": 8000, "total": 20480, "disk": 480, "vramGb": 9.5,
+                                         "ramGb": 6.3, "diskGb": 0.4})
+        self.assertIsNone(got["glmShares"]["diskGb"])                     # (the others' disk_gb, as before)
+        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "promo,ram_fetch,disk",
+                                       "cpu,engram_ms", "ram_fetch,cpu", "ram_fetch,disk,promo"])
+        self.assertEqual(got["facts"]["engine"], "Ling-3.2-air (maya-ling)")
+        self.assertTrue(got["facts"]["kv"].startswith("16-bit (F16), all in VRAM"))
+        self.assertTrue(got["kvQ8"].startswith("8-bit, all in VRAM"))
+        self.assertTrue(got["facts"]["spec"].startswith("MTP and the prompt lookup"))
+        self.assertNotIn("DSpark", got["facts"]["spec"])                  # (its INFO dspark=0: not DeepSeek's drafter)
+        self.assertEqual([x.split(":")[0] for x in got["specs"][:2]], ["MTP", "The prompt lookup"])
+        self.assertTrue(got["specs"][2].startswith("off"))
+        self.assertIsNone(got["specs"][3])                                # (a spec= it does not know: no row)
+        # (every key the page reads for Ling is one maya-ling prints: its INFO and STAT lines)
+        src = (ROOT / "src/ling/ling_main.cu").read_text(encoding="utf-8")
+        info = src[src.index('"INFO engine=ling'):src.index('READY %d')]
+        stat = src[src.index('"STAT tok_s='):src.index('"T %d')]
+        for k in ("engine_kind=ling", "kv=%s", "spec=%s", "experts=%zu", "expert_slots=%zu", "ram_slots=%zu"):
+            self.assertIn(k, info)
+        for k in ("vram_hit=", "ram_fetch=", "disk=", "promo=", "vram_used=", "ram_used=", "vram_gb=", "ram_gb=",
+                  "ssd_gb=", "draft_acc=", "draft_off="):
+            self.assertIn(k, stat)
+        self.assertIn('model.kv_q8() ? "q8" : "f16"', info)
+        self.assertIn('cal_dec.use_mtp ? (cal_dec.use_lookup ? "mtp+lookup" : "mtp")\n'
+                      '                                           : (cal_dec.use_lookup ? "lookup" : "off")', src)
+        self.assertTrue(got["ik2"][0].startswith("8-bit (FP8)"))          # (Inkling 2's, as before)
+        self.assertTrue(got["ik2"][1].startswith("off (the config's --dspark"))
+
+    def test_ling_models_page_offers_only_what_maya_ling_takes(self):
+        # Ling-3.2-air's engine settings: context, drafting (On / Off; a setup's auto shows as On), GPUs, KV cache (F16 / 8-bit), prompt chunk and CPU threads; no answers at once,
+        # no tensor parallel, no pictures; the planner's note where a context leaves experts outside VRAM
+        got = self.node("""
+const md = await import(web + "/models.js");
+const out = {opts: [md.lingDraftOptions().map((o) => o.id + ":" + o.label)],
+  fit: md.lingFitNote({fits_trunk: true, resident: true, vram_pct: 100, ssd_gib: 0}),
+  part: md.lingFitNote({fits_trunk: true, resident: false, vram_pct: 58.4, ssd_gib: 0}),
+  ssd: md.lingFitNote({fits_trunk: true, resident: false, vram_pct: 20, ssd_gib: 3.2}),
+  none: md.lingFitNote({fits_trunk: false, resident: false, vram_pct: 0, ssd_gib: 0}), empty: md.lingFitNote(undefined)};
+console.log(JSON.stringify(out));""")
+        self.assertEqual(got["opts"], [["on:On", "none:Off"]])
+        self.assertIsNone(got["fit"])
+        self.assertIsNone(got["empty"])
+        self.assertIn("about 58% of the experts fit in VRAM", got["part"])
+        self.assertNotIn("SSD", got["part"])
+        self.assertIn("from RAM and the SSD", got["ssd"])
+        self.assertIn("do not fit on these GPUs", got["none"])
+        js = (ROOT / "serve/web/models.js").read_text(encoding="utf-8")
+        body = js[js.index("function lingFields"):js.index("\n}\n", js.index("function lingFields"))]
+        flags = set(re.findall(r'flag=(?:"([^"]+)"|\$\{"([^"]+) ")', body))
+        self.assertEqual({a or b for a, b in flags}, {"--drafting", "--kv", "--prefill-chunk", "--cpu-threads"})
+        self.assertIn("contextRow(", body)                                  # (--max-context)
+        self.assertIn("gpus,", body)                                        # (the GPUs row: the layers split over them)
+        for word in ("--parallel", "Answers at once", "Images", "--vision", "Tensor", "--tp", "Windows", "AMD", "Mac"):
+            self.assertNotIn(word, body)
+        # (the server's keys for it are the page's; the other models' fields as they were)
+        from serve import models as M
+        sent = {"context", "draft", "gpus", "kv", "prefill_chunk", "cpu_threads"}
+        self.assertTrue(sent <= set(M.LING_KEYS))
+        self.assertIn('if (m.family === "ik2") return ik2Fields(m, d, ch);\n  if (m.family === "ling") return lingFields(', js)
 
     def test_about_has_the_support_line_always_and_the_update_card_none(self):
         # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold

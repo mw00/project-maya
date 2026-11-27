@@ -1315,6 +1315,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         // penalties, the history it would count: tokens[1..t] after what came before)
         tail->pick_tokens(WT.logits, T, *sp, tokens, 0, WT.tok, FT->cs);
     } else {
+        tail->dump_logits(WT.logits, T, FT->cs);
         for (int t = 0; t < T; ++t) gf::argmax(WT.logits + (size_t) t * g.n_vocab, g.n_vocab, WT.tok + t, FT->cs);
     }
     cudaMemcpyAsync(WT.tok_h, WT.tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
@@ -1573,6 +1574,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
             // (penalties: this window's tokens 1..t before it - pick_tok, written before token t was queued)
             m->pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
         } else {
+            m->dump_logits(lg, 1, F->cs);
             gf::argmax(lg, g.n_vocab, W.tok + sl, F->cs);
         }
     }

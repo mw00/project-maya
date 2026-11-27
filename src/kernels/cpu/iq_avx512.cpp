@@ -364,14 +364,37 @@ void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n
 template <int TY>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
-    switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
+    if constexpr (TY == 12 || TY == 13) {
+        // K-quants keep extra min-term accumulators; stay at <= 4 tokens per pass.
+        for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+            switch (k) {
+                case 1: dot_rows<TY, 1>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                case 2: dot_rows<TY, 2>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                case 3: dot_rows<TY, 3>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                default: dot_rows<TY, 4>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            }
+        }
+        return;
+    } else {
+        // Non-K i-quants amortize weight unpacking over up to 16 tokens per pass (bit-exact with NT=1..4).
+        for (int t0 = 0; t0 < nt; ) {
+            const int rem = nt - t0;
+            if (rem >= 16) { dot_rows<TY, 16>(w, row_bytes, n, act + t0, out + t0, r0, r1); t0 += 16; }
+            else if (rem >= 12) { dot_rows<TY, 12>(w, row_bytes, n, act + t0, out + t0, r0, r1); t0 += 12; }
+            else if (rem >= 8) { dot_rows<TY, 8>(w, row_bytes, n, act + t0, out + t0, r0, r1); t0 += 8; }
+            else {
+                switch (rem) {
+                    case 1: dot_rows<TY, 1>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 2: dot_rows<TY, 2>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 3: dot_rows<TY, 3>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 4: dot_rows<TY, 4>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 5: dot_rows<TY, 5>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 6: dot_rows<TY, 6>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    default: dot_rows<TY, 7>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                }
+                t0 += rem;
+            }
         }
     }
 }

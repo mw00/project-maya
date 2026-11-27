@@ -44,6 +44,7 @@
 #include "ds4_prefill_stats.hpp"
 #include "ds4_prompt_mem.hpp"
 #include "ds4_ram_slice.hpp"
+#include "ds4_tp_kind.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "maya/kernels/cpu/exl3_cpu.hpp"
@@ -2267,6 +2268,7 @@ struct Model::Impl {
     std::vector<std::vector<cudaEvent_t>> prof_pool;   // CUDA events belong to the device that created them
     bool prof_failed = false;
     bool prof_window = false;   // (decode windows only: T == 1)
+    int prof_T = 1;             // (the profiled window's rows: Stats::prof_rows)
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
@@ -2320,9 +2322,20 @@ struct Model::Impl {
     void prof_collect() {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
+        // (the caller's current device given back however this returns: the loops below select each mark's device, and a
+        //  tensor-parallel head group's lead (CUDA0) left on CUDA1 sent the main thread's next GPU0 work astray - the pair
+        //  then hung, CUDA1 spinning in an all-reduce for a partner that never started; TP1's head is the last GPU, whose
+        //  device the loops end on anyway)
+        int prof_cur_dev = 0;
+        cudaGetDevice(&prof_cur_dev);
+        struct DevBack {
+            int d;
+            ~DevBack() { cudaSetDevice(d); }
+        } prof_dev_back{prof_cur_dev};
         const bool chunk_sample = prof_chunk;
         bool sample_ok = !prof_failed;
         double sample_ms[8] = {};
+        double dev_ms[2][8] = {};   // (CUDA0 / CUDA1 apart: a tensor-parallel pair's members run the same layer at once)
         std::vector<std::pair<int, cudaEvent_t>> last;
         int current_dev = -1;
         if (sample_ok) {
@@ -2353,6 +2366,7 @@ struct Model::Impl {
                         break;
                     }
                     sample_ms[m.stage] += ms;
+                    if (m.dev < 2) dev_ms[m.dev][m.stage] += ms;
                     it->second = m.ev;
                 } else {
                     last.push_back({m.dev, m.ev});
@@ -2363,6 +2377,11 @@ struct Model::Impl {
             double* total = chunk_sample ? cprof_ms : st.prof_ms;
             const int stages = chunk_sample ? 8 : 6;
             for (int i = 0; i < stages; ++i) total[i] += sample_ms[i];
+            if (!chunk_sample) {
+                for (int dv = 0; dv < 2; ++dv)
+                    for (int i = 0; i < 6; ++i) st.prof_dev_ms[dv][i] += dev_ms[dv][i];
+                st.prof_rows += prof_T;
+            }
             for (const ProfMark& m : prof_marks) prof_pool[(size_t) m.dev].push_back(m.ev);
             prof_marks.clear();
             if (!chunk_sample) ++st.prof_tokens;
@@ -3907,7 +3926,8 @@ struct Model::Impl {
                 tp_uneven = false;
         } else
             tp_uneven = false;
-        // the groups: runs of tp devices of one kind (their memory), a device unlike the next alone
+        // the groups: runs of tp devices of one kind (their memory, within a small share: ds4_tp_kind.hpp, #1276), a
+        // device unlike the next alone
         // - or, tp the number of GPUs, one group of all of them whatever their kind (its tightest member sets the
         // experts' room); threads mode for the windows (decode) where a group is 2 wide or more or --threads on, the
         // prompt path (its own thread a GPU) as asked for - also where the experts' blocks took the groups' width down
@@ -3920,7 +3940,7 @@ struct Model::Impl {
             Group G;
             G.mem.push_back((int) i);
             size_t j = i + 1;
-            while ((int) G.mem.size() < tp && j < devs.size() && (tp_all || devs[j].total == devs[i].total))
+            while ((int) G.mem.size() < tp && j < devs.size() && (tp_all || tp_same_kind(devs[j].total, devs[i].total)))
                 G.mem.push_back((int) j++);
             if ((int) G.mem.size() < tp && G.mem.size() > 1) {   // a short run at the end: devices of their own
                 for (int m : G.mem) {
@@ -20011,12 +20031,29 @@ struct Model::Impl {
     static int pm_cls(int n) { return path_size_class(n); }
     // The flow factor is learned only within the prompt's own size class; an unmeasured class stays at one.
     double pm_k(int c) const { return pm.flow.factor_for_size_class(c); }
-    // n tokens through windows of 16, the last one's logits_rows rows of logits
+    // n tokens through windows of 16, the last one's logits_rows rows of logits.  logits_rows > kWin (only
+    // --dump-logits and --ppl ask for that) - every window's rows, gathered into chunk_logits as forward_chunks
+    // does, the last min(logits_rows, n) of them: the head projects rows it otherwise skips, the hidden states are
+    // the same
     bool feed_windows(const int* tokens, int n, int logits_rows, std::string& err) {
         logits_all = false;
+        const bool every = logits_rows > kWin;
+        std::vector<float> acc, row;
         for (int a = 0; a < n; a += kWin) {
             const int T = std::min(kWin, n - a);
-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, err)) return false;
+            if (!forward(tokens + a, T, every ? T : (a + T == n ? logits_rows : 0), err)) return false;
+            if (every) {
+                if (!logits(row)) {
+                    err = "feed_windows: the window's logits could not be read";
+                    return false;
+                }
+                acc.insert(acc.end(), row.begin(), row.end());
+            }
+        }
+        if (every) {
+            const size_t V = (size_t) g.vocab, rows = std::min<size_t>((size_t) logits_rows, (size_t) n);
+            chunk_logits.assign(acc.end() - (std::ptrdiff_t) (rows * V), acc.end());
+            logits_all = true;
         }
         return true;
     }
@@ -21894,6 +21931,7 @@ struct Model::Impl {
         if (helper_n > 0 && wplan.async) helper_window(T, wplan);   // (DS4_HELPER: its share, in seq order)
         static const bool prof_any_t = std::getenv("DS4_PROF_T") != nullptr;   // (DS4_PROF_T: the verify windows too)
         prof_window = prof_on && (T == 1 || prof_any_t);
+        prof_T = T;   // (DS4_PROF: the rows of the step being profiled - per GPU and per row in the request's line)
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
         if (par) {

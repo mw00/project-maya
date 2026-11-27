@@ -59,7 +59,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, hy4_vision, ling_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
@@ -163,7 +163,7 @@ from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Even
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
-                            unmark_literals, LiteralMemo)
+                            unmark_literals, LiteralMemo, TemplateError)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -253,7 +253,7 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 CONTEXT_MIN, CONTEXT_FALLBACK_MAX = models.CONTEXT_MIN, models.CONTEXT_FALLBACK_MAX
 CONTEXT_TESTED, CONTEXT_TESTED_DEFAULT = models.CONTEXT_TESTED, models.CONTEXT_TESTED_DEFAULT
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|ERR|error|"
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|^maya-ling:|^ling (?:prompt|stat|split|vram|cal|numa|profile|env|draft)|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -1026,6 +1026,31 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
     return out
 
 
+def ling_restore_points(ids, human_seq, tail=512, least=RESTORE_LEAST) -> dict:
+    """Ling-3.2-air restore points: shared system+tools prefix (first <role>HUMAN</role>), last user turn,
+    and optional tail point before the end.  maya-ling also checkpoints every 16K and persists restore points."""
+    if not human_seq or len(ids) < len(human_seq) + 2:
+        return {}
+    m = len(human_seq)
+    first = last = None
+    h0 = human_seq[0]
+    for i in range(len(ids) - m + 1):
+        if ids[i] == h0 and ids[i : i + m] == human_seq:
+            first = i if first is None else first
+            last = i
+    marks, out = [], {}
+    if first is not None and first >= least:
+        out["shared"] = first
+    if last is not None and last >= least and last != first:
+        marks.append(last)
+    t = len(ids) - tail
+    if tail > 0 and t >= least and (last is None or t > last):
+        out["tail"] = t
+    if marks:
+        out["marks"] = sorted(marks)
+    return out
+
+
 HY4_MEASURE_LEFT = re.compile(r"measuring this PC: (\d+) of (\d+) choices done in \d+ s - about (\d+) s more")
 # (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
 #  with the CPU lane; tools/setup_bridge.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
@@ -1220,6 +1245,8 @@ class StrataEngine:
         args = list(args)
         if "--max-context" in args[:-1]:
             args[args.index("--max-context") + 1] = str(int(n))
+        elif "--ctx" in args[:-1] and Path(str(exe)).name.startswith("maya-ling"):   # (maya-ling's own name for it)
+            args[args.index("--ctx") + 1] = str(int(n))
         else:
             args += ["--max-context", str(int(n))]
         self.spawn = (exe, args, cwd, log, env)
@@ -1280,10 +1307,10 @@ class StrataEngine:
         if part:
             self.vram = [part if v.get("dev") == part["dev"] else v for v in self.vram]
 
-    _TAGGED = ("T ", "LP ", "PP ", "DONE ", "ERR ")
+    _TAGGED = ("T ", "LP ", "PP ", "DP ", "DONE ", "ERR ")
 
     def _route(self, line: str) -> bool:
-        """Several conversations at once: a request's own lines (T / LP / PP / DONE / ERR <rid> ...) go to its queue, the
+        """Several conversations at once: a request's own lines (T / LP / PP / DP / DONE / ERR <rid> ...) go to its queue, the
         engine's (STAT, NOTE) are handled here; True when the line was taken."""
         if line.startswith(self._TAGGED):
             f = line.split(None, 2)
@@ -1293,7 +1320,7 @@ class StrataEngine:
                 if q is not None:
                     q.put(line)
                     return True
-                return line.startswith(("T ", "LP ", "PP ", "DONE "))   # a request already gone: dropped
+                return line.startswith(("T ", "LP ", "PP ", "DP ", "DONE "))   # a request already gone: dropped
             return False
         if line.startswith("STAT "):
             self._parse_stat(line)
@@ -1441,6 +1468,15 @@ class StrataEngine:
         else:
             self._last = v
 
+    def own_progress(self):
+        """The prompt progress of the request this thread runs, (read, total, reuse, ms) or None: with several
+        conversations at once (multi), from its own PP lines.  `progress` is the engine's latest of any request (the
+        Monitor's), and a heartbeat that read it put another conversation's read in this request's prompt_progress: a
+        request waiting behind a 600K read reported that read as its own, and its own count once the other ended."""
+        if self.multi:
+            return getattr(self._tls, "progress", None)
+        return self.progress
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -1449,6 +1485,47 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        dp = self.dp                                    # the drafts' split (DP just before this DONE; issue #590)
+        if dp:
+            self.last.update(dp)
+            self.dp = None
+
+    @property
+    def dp(self) -> dict | None:
+        """The DP line's split draft counters, waiting for the DONE that follows it (per request thread in multi)."""
+        if self.multi:
+            return getattr(self._tls, "dp", None)
+        return getattr(self, "_dp", None)
+
+    @dp.setter
+    def dp(self, v):
+        if self.multi:
+            self._tls.dp = v
+        else:
+            self._dp = v
+
+    def _parse_dp(self, line):
+        """DP [rid] kept=N offered=N ds_kept=N ds_offered=N lk_kept=N lk_offered=N rounds=N [pos=1:k/r,...]
+        (maya-ds4: the request's drafts by source - DSpark's and the prompt lookup's, issue #590; the DONE's
+        drafts_accepted/drafts_offered are their sum, as before)."""
+        names = {"kept": "drafts_accepted", "offered": "drafts_offered", "ds_kept": "dspark_accepted",
+                 "ds_offered": "dspark_offered", "lk_kept": "lookup_accepted", "lk_offered": "lookup_offered",
+                 "rounds": "lookup_rounds"}
+        st = {}
+        for kv in line.split()[1:]:
+            k, _, v = kv.partition("=")
+            if k in names:
+                try:
+                    st[names[k]] = int(v)
+                except ValueError:
+                    pass
+            elif k == "pos":
+                try:
+                    st["draft_positions"] = [[int(x) for x in p.split(":")[1].split("/")]
+                                             for p in v.split(",") if ":" in p]
+                except (ValueError, IndexError):
+                    pass
+        self.dp = st
 
     def _asked_end(self) -> int:
         """How many times the server told the engine to cut whatever runs (STOP for all, QUIT, WRAP): a request
@@ -1730,6 +1807,8 @@ class StrataEngine:
                     self._parse_stat(line)
                 elif line.startswith("NOTE "):                # what happens to the kept conversations
                     print("[maya] " + line[5:].strip(), flush=True)
+                elif line.startswith("DP "):                 # the drafts' split, right before this request's DONE
+                    self._parse_dp(line)
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
@@ -1783,6 +1862,9 @@ class StrataEngine:
                     if line.startswith("ERR"):
                         self._done_after_err()
                         break
+                    if line.startswith("DP "):
+                        self._parse_dp(line)
+                        continue
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         if said:
@@ -1854,6 +1936,7 @@ class StrataEngine:
         with self._routes_lock:
             self._routes[rid] = q
         self._tls.rid = rid
+        self._tls.progress = None                       # (own_progress: this request's, from its own PP lines)
         self.progress = None
         self.prefill_tok_s_mean = None
         keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
@@ -1932,13 +2015,15 @@ class StrataEngine:
                         yield t
                 elif line.startswith("PP "):
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
-                        self.progress = (int(f[2]), int(f[3]),
-                                         int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
-                                         float(f[4]) if len(f) >= 5 else 0.0)
+                        self.progress = self._tls.progress = (int(f[2]), int(f[3]),
+                                                              int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
+                                                              float(f[4]) if len(f) >= 5 else 0.0)
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
                     if cancel.is_set():
                         return
                     yield None
+                elif line.startswith("DP "):
+                    self._parse_dp("DP " + line.split(None, 2)[2])
                 elif line.startswith("DONE "):
                     self._parse_done("DONE " + line.split(None, 2)[2])
                     done = True
@@ -1968,6 +2053,9 @@ class StrataEngine:
                         break
                     if line is None or line.startswith("ERR "):
                         break
+                    if line.startswith("DP "):
+                        self._parse_dp("DP " + line.split(None, 2)[2])
+                        continue
                     if line.startswith("DONE "):
                         self._parse_done("DONE " + line.split(None, 2)[2])
                         break
@@ -2477,7 +2565,7 @@ def engine_args(cfg: dict) -> list[str]:
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
     # (maya-ik2 on two GPUs splits by experts, not layers - its --gpus 2 is in the config's args)
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) != "ik2":
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) not in ("ik2", "ling"):
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
     # needs its own room there.  On a card the model already fills (Maya-XS leaves ~130 MB) the third
@@ -2918,6 +3006,10 @@ def speculation_modes(info: dict, dspark=None, lookup=None) -> list:
             return float(v) > 0
         except (TypeError, ValueError):
             return False
+    if info.get("engine_kind") == "ling" and "spec" in info:
+        # (maya-ling's INFO spec=: what its start decided - mtp+lookup, mtp, lookup or off; its mtp= says only that the
+        #  draft block is loaded, also where the measurement then kept drafting off)
+        return [{"mtp": "MTP", "lookup": "Lookup"}[p] for p in str(info["spec"]).split("+") if p in ("mtp", "lookup")]
     modes = []
     ds = dspark if dspark is not None else info.get("dspark")
     if on(ds):
@@ -3050,6 +3142,8 @@ class Service:
                             _special_ids("[e~[") + _special_ids("]~b]") +
                             # Inkling 2 with <|content_model_end_sampling|>
                             _special_ids("<|content_model_end_sampling|>") +
+                            # Ling-3.2-air ends a turn with <|role_end|>
+                            _special_ids("<|role_end|>") +
                             # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
                             (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
                              _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
@@ -3057,6 +3151,7 @@ class Service:
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
+        self.ling_human_seq = list(self.tok.encode("<role>HUMAN</role>")) if getattr(template, "ling", False) else []
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
@@ -3428,6 +3523,8 @@ class Service:
             args = list(cfg.get("args") or [])
             if "--max-context" in args[:-1]:
                 args[args.index("--max-context") + 1] = str(int(n))
+            elif "--ctx" in args[:-1] and models.family(cfg) == "ling":   # (maya-ling's own name for it)
+                args[args.index("--ctx") + 1] = str(int(n))
             else:
                 args += ["--max-context", str(int(n))]
             cfg["args"] = args
@@ -4087,6 +4184,15 @@ class Service:
              "Prompts the loop guard left the model's repeats out of (a conversation that repeats itself)",
              guard["collapsed"]),
         ]
+        rows += [(f"maya:{name}", "counter", help_, t[key]) for name, key, help_ in (
+            ("drafts_offered_total", "drafts_offered", "Drafts verified (DSpark and prompt lookup)"),
+            ("drafts_accepted_total", "drafts_accepted", "Drafts kept"),
+            ("dspark_drafts_offered_total", "dspark_offered", "DSpark drafter's drafts verified"),
+            ("dspark_drafts_accepted_total", "dspark_accepted", "DSpark drafter's drafts kept"),
+            ("lookup_drafts_offered_total", "lookup_offered", "Prompt lookup's drafts verified"),
+            ("lookup_drafts_accepted_total", "lookup_accepted", "Prompt lookup's drafts kept"),
+            ("lookup_rounds_total", "lookup_rounds", "Prompt lookup rounds"),
+        ) if t.get(key) is not None]
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
                  if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
@@ -4222,6 +4328,7 @@ class Service:
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         if not prefill and not tools and getattr(self.template, "inkling", False) and \
+                kwargs.get("effort_name") != "minimal" and \
                 (kwargs.get("enable_thinking") is False or kwargs.get("reasoning_effort") == "none"):
             # Inkling 2 has no switch for its thinking, only its effort level - and at the lowest ("none": 0.0) it
             # still thinks a little.  With thinking off the prompt opens the answer's text segment itself, as the
@@ -4257,7 +4364,8 @@ class Service:
         if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
             # the engines' own vision towers (DeepSeek, MiniMax, Hy4) read pictures only: say so instead of dropping
             # the video (with a picture next to it) or failing on a missing video encoder (without one)
-            raise ValueError(("Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
+            raise ValueError(("Ling-3.2-air" if isinstance(self.vision, ling_vision.Vision) else
+                              "Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
                               "MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
                              + " reads pictures, not videos")
         if images and isinstance(self.vision, ENGINE_VISION):
@@ -5175,6 +5283,10 @@ class Service:
                            else deepseek_restore_points)(ids, self.ds_user_id, self.ds_system_id, tail)
                     if pts:
                         sampling = {**(sampling or {}), "_restore": pts}
+                elif on and getattr(self.template, "ling", False) and self.ling_human_seq:
+                    pts = ling_restore_points(ids, self.ling_human_seq, tail)
+                    if pts:
+                        sampling = {**(sampling or {}), "_restore": pts}
 
                 def attempts(prompt, left):
                     """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
@@ -5246,7 +5358,8 @@ class Service:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
-                            pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            own = getattr(self.engine, "own_progress", None)   # this request's (multi: not the latest
+                            pr = own() if callable(own) else getattr(self.engine, "progress", None)   # of any)
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
@@ -5556,7 +5669,14 @@ class Service:
                         "hit_rate": hit_rate,
                         # the drafts offered and kept (the engine's DONE line; None: it reported none)
                         "drafts_offered": last.get("drafts_offered"), "drafts_accepted": last.get("drafts_accepted"),
+                        "drafts_kept": last.get("drafts_accepted"),   # (issue #590's name for the kept drafts)
                         "spec_off": stat.spec_off,
+                        # the drafts' split, when the engine's DP line reported it (issue #590)
+                        **({dst: last[src] for src, dst in (
+                            ("dspark_accepted", "dspark_kept"), ("dspark_offered", "dspark_offered"),
+                            ("lookup_accepted", "lookup_kept"), ("lookup_offered", "lookup_offered"),
+                            ("lookup_rounds", "lookup_rounds"), ("draft_positions", "draft_positions"))
+                            if src in last}),
                         "loop_guard": guards[0].summary() if guards and guards[0].events else None}
                     self.history.append(row)
                     t = self.totals
@@ -5568,6 +5688,11 @@ class Service:
                     book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
+                    # the drafts (their DP split too, when the engine reported it): the stat dashboard reads these
+                    for k in ("drafts_accepted", "drafts_offered", "dspark_accepted", "dspark_offered",
+                              "lookup_accepted", "lookup_offered", "lookup_rounds"):
+                        if last.get(k) is not None:
+                            t[k] = t.get(k, 0) + last[k]
                     fresh = getattr(self.engine, "last", None)
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                         timings = request_timings(len(ids), n, last)
@@ -5602,7 +5727,8 @@ class Service:
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
 
 
-CALL_SUMS = ("generated", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups")
+CALL_SUMS = ("generated", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups",
+             "dspark_accepted", "dspark_offered", "lookup_accepted", "lookup_offered", "lookup_rounds")
 
 
 def merge_calls(calls: list[dict]) -> dict:
@@ -5624,6 +5750,7 @@ def merge_calls(calls: list[dict]) -> dict:
         for k in CALL_SUMS:
             if all(k in c for c in calls):
                 merged[k] = sum(c[k] for c in calls)
+        merged.pop("draft_positions", None)   # per-slice arrays do not merge into one request's
     return merged
 
 
@@ -6906,11 +7033,11 @@ def make_handler(svc: Service):
                         svc.default_effort) or svc.default_effort
                     if getattr(svc.template, "forced_thinking", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
-                    if getattr(svc.template, "hy4", False):   # (Hy4-flash: the level it runs at, none / high)
+                    if getattr(svc.template, "hy4", False) or getattr(svc.template, "ling", False):   # (none / high)
                         rec["reasoning_effort"] = svc.template.effort_shown(svc.default_effort) or \
                             rec["reasoning_effort"]
                 # Hy4-flash alone: its two levels (the page offers these and no others)
-                levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
+                levels = svc.template.thinking_levels()
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -7154,8 +7281,11 @@ def make_handler(svc: Service):
                     self.wfile.write(body)
                     return
                 if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
-                    # (a list of messages of the wrong shape: a 400 in plain words before anything reads it)
-                    check_messages(req, "input" if path == "/v1/responses" else "messages")
+                    # (a list of messages of the wrong shape, or no message at all: a 400 in plain words before
+                    # anything reads it.  Only Chat Completions and Anthropic's messages need a message to answer
+                    # with; /v1/responses checks its own `input` (serve/responses.py, whose message stays as is))
+                    check_messages(req, "input" if path == "/v1/responses" else "messages",
+                                   nonempty=path != "/v1/responses")
                     # file parts (OpenAI file / Responses input_file / Anthropic document): their text, or a
                     # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
                     attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
@@ -7186,6 +7316,13 @@ def make_handler(svc: Service):
                     self._json(ENGINE_ERROR_STATUS, engine_error_body(e, anthropic=path == "/v1/messages"))
             except EngineDied as e:
                 self._fail(503, "server_error", died_text(e))
+            except TemplateError as e:
+                # the chat template refusing the request it was handed (a message with an unknown role, or no role:
+                # serve/chat_template.jinja's raise_exception).  jinja2's exception is no ValueError, so it escaped
+                # every clause above and socketserver closed the socket with no answer at all - and a client that gets
+                # nothing cannot tell a bad request from a route the server does not serve
+                traceback.print_exc()
+                self._fail(400, "invalid_request_error", f"malformed request ({e})")
             except (KeyError, TypeError, AttributeError, IndexError) as e:
                 # a field of the wrong shape (Strata: a 400 with the traceback in the log, not a dropped connection)
                 traceback.print_exc()
@@ -7636,6 +7773,14 @@ class Server(ThreadingHTTPServer):
         try:
             if service is not None:
                 service.response_jobs.close()
+                # the hardware sampler behind /metrics ends with its server's socket: each server closed with its
+                # sampler left reading the sensors every second - every test server of the suite - kept a thread for
+                # ever. (main()'s stop does not close the socket: the stall watchdog reads the sampler while the
+                # request in progress wraps up.)
+                tel = getattr(service, "telemetry", None)
+                if tel is not None and callable(getattr(tel, "stop", None)):
+                    tel.stop()
+                    service.telemetry = None            # (a later serve() of the same service starts a new one)
         finally:
             super().server_close()
 
@@ -8255,6 +8400,13 @@ def main() -> int:
                      + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
             print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}: "
                   f"{where}), up to {vision.g.max_tokens} tokens a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("vision") == "ling":
+            vision = ling_vision.Vision(ling_vision.Geometry.from_info(engine.info),
+                                        Path(tempfile.mkdtemp(prefix="maya-ling-pictures-")), Vision.load)
+            where = (f"; no permanent VRAM (~{engine.info.get('vision_room_mib')} MiB lent while encoding)"
+                     if engine.info.get("vision_room") == "tail" else "")
+            print(f"[maya] images: Ling-3.2-air vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
+                  f"({vision.g.max_tokens} tokens) a picture{where}", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "hy4":
             # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
             vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
@@ -8321,7 +8473,7 @@ def main() -> int:
                                                      else "none")
         if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
             level = QWEN_EFFORT.get(level, level)
-        if getattr(svc.template, "hy4", False):               # (Hy4-flash: the level it runs at, none / high)
+        if getattr(svc.template, "hy4", False) or getattr(svc.template, "ling", False):   # (Hy4-flash, Ling: none / high)
             level = svc.template.effort_shown(svc.default_effort) or level
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
@@ -8371,10 +8523,13 @@ def main() -> int:
         if kept:
             print(f"[maya] {kept} web-chat answer(s) of the last day kept for the page (answers/)", flush=True)
     args = [str(x) for x in cfg.get("args") or []]
-    flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
+    tc_flags = ("--glm-pack", "--gguf", "--model", "-m") if models.family(cfg) == "ling" else ("--glm-pack", "--gguf")
+    flag = next((f for f in tc_flags if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack; Ling: --gguf/--model/-m)
     if flag:                                            # the model's folder: the parent of the pack or GGUF file
-        svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
-        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
+        target_p = Path(args[args.index(flag) + 1]).resolve()
+        svc.model_dir = target_p.parent
+        tc_src = target_p if (models.family(cfg) == "ling" and target_p.is_file()) else svc.model_dir
+        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(tc_src)),
                          daemon=True).start()
     elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])

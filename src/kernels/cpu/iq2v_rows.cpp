@@ -1,8 +1,9 @@
 // src/kernels/cpu/iq2v_rows.cpp - the CPU lane's IQ2_XXS and IQ2_S rows, second generation: ggml-cpu's dot to the
 // bit, a third to a half faster than the lane's earlier rows.  ds4_iq_cpu.cpp checks each form against ggml-cpu's dot
 // and takes the fastest this CPU runs (own(): g_iq2v / g_iq2sv).  Built for the baseline x86-64 with each function's
-// instruction set its own (GCC / Clang target attributes; MSVC: /arch:AVX2 on this file, for its VEX encodings - the
-// AVX-512 form's intrinsics compile as they are), so a form runs only where the caller found the CPU takes it.
+// instruction set its own (GCC / Clang target attributes; MSVC: /arch:AVX2 on this file, for its VEX encodings, and
+// the AVX-512 form in iq2v_rows_z.cpp under /arch:AVX512 - IQ2V_PART below), so a form runs only where the caller
+// found the CPU takes it.
 //
 // The arithmetic is ggml's: per block the same exact int32 lanes (lane l: every 32-value chunk's values 4 l .. 4 l + 3,
 // |grid| x sign(q8), times the chunk's 2 s + 1), then fma(d_x d_y, lanes, acc) block by block and hsum_float_8 x 1/8.
@@ -47,6 +48,17 @@
     (defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) || \
      (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11))
 #define IQ2V_AVXVNNI 1
+#endif
+// MSVC's /arch is a file's (#1235): the AVX-512 form compiled under /arch:AVX2 ran at about half its speed there, so the
+// CPU's pick took AVX2 forms that lose once every thread runs.  So on MSVC (CMake: MAYA_IQV_SPLIT) this file holds the
+// AVX2 forms and the dispatch (part 1), and iq2v_rows_z.cpp compiles the AVX-512 form alone under /arch:AVX512 (part 2,
+// pass_z).  GCC / Clang: one file, each function's own target attribute (part 0) - the same code as before.
+#if !defined(IQ2V_PART)
+#if defined(MAYA_IQV_SPLIT)
+#define IQ2V_PART 1
+#else
+#define IQ2V_PART 0
+#endif
 #endif
 
 namespace maya::kernels::cpu::iq2v {
@@ -127,6 +139,7 @@ constexpr Tabs kT{};
 #else
 #define IQ2V_FI inline __attribute__((always_inline))
 #endif
+#if IQ2V_PART != 2
 #define IQ2A_NS a2
 #define IQ2A_ATTR IQX_TARGET("avx2,fma")
 #define IQ2A_VNNI 0
@@ -137,8 +150,10 @@ constexpr Tabs kT{};
 #define IQ2A_VNNI 1
 #include "iq2v_avx2.inc"
 #endif
+#endif
 
 // ---- the AVX-512 form (3)
+#if IQ2V_PART != 1
 #define IQ2V_Z IQX_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512bitalg,avx512vnni,avx2,fma")
 IQ2V_Z IQ2V_FI void prepz(const uint8_t* qs, __m512i fld, __m512i ks0, __m512i ks1, __m512i one, __m512i& S,
                           __m512i& SC) {
@@ -260,19 +275,44 @@ IQ2V_Z void rowszs(const uint8_t* w, size_t rb, int nb, const block_q8_K* const*
     }
 }
 #undef IQ2V_Z
+#endif  // IQ2V_PART != 1
 #undef IQ2V_FI
+
+#if IQ2V_PART == 2
+}  // namespace
+// the AVX-512 form's rows for part 1's pass (v 3: IQ2_XXS, 13: IQ2_S), nt 1-4 tokens
+void pass_z(int v, int nt, const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* o, int r0,
+            int r1) {
+    switch (nt) {
+        case 1: if (v == 13) rowszs<1>(w, rb, nb, y, o, r0, r1); else rowsz<1>(w, rb, nb, y, o, r0, r1); break;
+        case 2: if (v == 13) rowszs<2>(w, rb, nb, y, o, r0, r1); else rowsz<2>(w, rb, nb, y, o, r0, r1); break;
+        case 3: if (v == 13) rowszs<3>(w, rb, nb, y, o, r0, r1); else rowsz<3>(w, rb, nb, y, o, r0, r1); break;
+        default: if (v == 13) rowszs<4>(w, rb, nb, y, o, r0, r1); else rowsz<4>(w, rb, nb, y, o, r0, r1); break;
+    }
+}
+}  // namespace maya::kernels::cpu::iq2v
+#else
+#if IQ2V_PART == 1
+}  // namespace
+void pass_z(int v, int nt, const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* o, int r0,
+            int r1);   // (iq2v_rows_z.cpp)
+namespace {
+#define IQ2V_ZROWS(f) pass_z(v, NT, w, rb, nb, y, o, r0, r1)
+#else
+#define IQ2V_ZROWS(f) f<NT>(w, rb, nb, y, o, r0, r1)
+#endif
 
 // rows [r0, r1) of form v for nt tokens, 4 a pass (act: Q8_K rows of n values): v 1-3 IQ2_XXS's forms, 11-13 IQ2_S's
 template <int NT>
 void pass(int v, const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* o, int r0, int r1) {
     if (v >= 11) {   // (IQ2_S: 10 + its form)
-        if (v == 13) return rowszs<NT>(w, rb, nb, y, o, r0, r1);
+        if (v == 13) return IQ2V_ZROWS(rowszs);
 #if defined(IQ2V_AVXVNNI)
         if (v == 12) return a2v::rows2s<NT>(w, rb, nb, y, o, r0, r1);
 #endif
         return a2::rows2s<NT>(w, rb, nb, y, o, r0, r1);
     }
-    if (v == 3) return rowsz<NT>(w, rb, nb, y, o, r0, r1);
+    if (v == 3) return IQ2V_ZROWS(rowsz);
 #if defined(IQ2V_AVXVNNI)
     if (v == 2) return a2v::rows2<NT, 0, 0>(w, rb, nb, y, o, r0, r1);
 #endif
@@ -309,6 +349,8 @@ bool vnni_form() {
 }
 
 }  // namespace maya::kernels::cpu::iq2v
+#undef IQ2V_ZROWS
+#endif  // IQ2V_PART == 2
 
 #else   // not x86-64: no forms (the caller never asks)
 namespace maya::kernels::cpu::iq2v {

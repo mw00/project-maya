@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -587,10 +588,22 @@ double nvfp4_def(const uint8_t* blocks, size_t v) {
     return kv[j < 8 ? (byte & 0xF) : (byte >> 4)] * d;
 }
 
+// IQ1_M keeps its F16 block scale in the top nibbles of its 4 scale words (bytes 49, 51, 53, 55 of the block): the
+// same finite and moderate exponent as the other types' d
+void fix_iq1m_d(uint8_t* blk) {
+    uint8_t* sc = blk + 48;
+    uint16_t h = (uint16_t) ((sc[1] >> 4) | (sc[3] & 0xF0) | ((sc[5] & 0xF0) << 4) | ((sc[7] & 0xF0) << 8));
+    h = (uint16_t) ((h & 0x83FF) | ((uint16_t) (8 + (h >> 10) % 8) << 10));
+    for (int w = 0; w < 4; ++w) sc[2 * w + 1] = (uint8_t) ((sc[2 * w + 1] & 0x0F) | (((h >> (4 * w)) & 0xF) << 4));
+}
+
 void test_decode() {
-    const int types[] = {k::kNVFP4, k::kQ8_0, k::kQ5_K, k::kQ6_K, k::kIQ3_XXS, k::kIQ4_XS};
-    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS"};
-    for (int ti = 0; ti < 6; ++ti) {
+    const int types[] = {k::kNVFP4,    k::kQ8_0,    k::kQ5_K,     k::kQ6_K,    k::kIQ3_XXS, k::kIQ4_XS,
+                         k::kQ4_K,     k::kIQ2_XXS, k::kIQ2_XS,   k::kIQ2_S,   k::kIQ3_S,   k::kIQ4_NL,
+                         k::kIQ1_S,    k::kIQ1_M};
+    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS",
+                           "Q4_K",  "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_S", "IQ4_NL", "IQ1_S", "IQ1_M"};
+    for (int ti = 0; ti < 14; ++ti) {
         const int type = types[ti], bv = k::block_values(type);
         const size_t bb = k::block_bytes(type), nblk = 777, n = nblk * bv;
         std::vector<uint8_t> raw(nblk * bb);
@@ -607,6 +620,11 @@ void test_decode() {
             if (type == k::kQ5_K) fix(0), fix(2);
             if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
+            if (type == k::kQ4_K) fix(0), fix(2);
+            if (type == k::kIQ2_XXS || type == k::kIQ2_XS || type == k::kIQ2_S || type == k::kIQ3_S ||
+                type == k::kIQ4_NL || type == k::kIQ1_S)
+                fix(0);
+            if (type == k::kIQ1_M) fix_iq1m_d(raw.data() + b * bb);
         }
         std::vector<float> hostv(n);
         k::decode_host(type, raw.data(), n, hostv.data());
@@ -655,6 +673,11 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
         if (type == k::kQ5_K) fix(0), fix(2);
         if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
+        if (type == k::kQ4_K) fix(0), fix(2);
+        if (type == k::kIQ2_XXS || type == k::kIQ2_XS || type == k::kIQ2_S || type == k::kIQ3_S ||
+            type == k::kIQ4_NL || type == k::kIQ1_S)
+            fix(0);
+        if (type == k::kIQ1_M) fix_iq1m_d(raw.data() + b * bb);
     }
     return raw;
 }
@@ -710,15 +733,216 @@ void ggml_iq4_xs(const uint8_t* x, float* y, size_t k) {
         }
     }
 }
+// ggml's ksigns_iq2xs[v]: the 7 sign bits of v, bit 7 their parity (folded here: portable)
+uint32_t ksigns_host(uint32_t v) {
+    v &= 127u;
+    uint32_t p = v ^ (v >> 4);
+    p ^= p >> 2;
+    p ^= p >> 1;
+    return v | ((p & 1u) << 7);
+}
+static const uint64_t* const g_iq2xxs_grid = ik2_iq::host::iq2xxs_grid;
+static const uint64_t* const g_iq2xs_grid = ik2_iq::host::iq2xs_grid;
+static const uint64_t* const g_iq2s_grid = ik2_iq::host::iq2s_grid;
+static const uint32_t* const g_iq3s_grid = ik2_iq::host::iq3s_grid;
+// ggml's dequantize_row_iq2_xxs, transcribed
+void ggml_iq2_xxs(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 66;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        uint32_t aux32[2];
+        const uint8_t* aux8 = (const uint8_t*) aux32;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            std::memcpy(aux32, b + 2 + 8 * ib32, 8);
+            const float db = d * (0.5f + (float) (aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* grid = (const uint8_t*) (g_iq2xxs_grid + aux8[l]);
+                const uint8_t signs = (uint8_t) ksigns_host(aux32[1] >> (7 * l));
+                for (int j = 0; j < 8; ++j)
+                    y[i * 256 + ib32 * 32 + 8 * l + j] = db * (float) grid[j] * (signs & (1 << j) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq2_xs (qs: uint16_t[32] past d, each a 9-bit grid index and 7 sign bits)
+void ggml_iq2_xs(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 74;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db[2] = {d * (0.5f + (float) (b[66 + ib32] & 0xF)) * 0.25f,
+                                 d * (0.5f + (float) (b[66 + ib32] >> 4)) * 0.25f};
+            for (int l = 0; l < 4; ++l) {
+                uint16_t q16 = 0;
+                std::memcpy(&q16, b + 2 + 8 * ib32 + 2 * l, 2);
+                const uint8_t* grid = (const uint8_t*) (g_iq2xs_grid + (q16 & 511));
+                const uint8_t signs = (uint8_t) ksigns_host(q16 >> 9);
+                for (int j = 0; j < 8; ++j)
+                    y[i * 256 + ib32 * 32 + 8 * l + j] =
+                        db[l / 2] * (float) grid[j] * (signs & (1 << j) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq2_s (qs [64]: 32 grid bytes then 32 sign bytes; qh [8]; scales [8])
+void ggml_iq2_s(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 82;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t* qs = b + 2;
+        const uint8_t* qh = b + 66;
+        const uint8_t* signs = b + 34;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db[2] = {d * (0.5f + (float) (b[74 + ib32] & 0xF)) * 0.25f,
+                                 d * (0.5f + (float) (b[74 + ib32] >> 4)) * 0.25f};
+            for (int l = 0; l < 4; ++l) {
+                const int idx = qs[4 * ib32 + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+                const uint8_t* grid = (const uint8_t*) (g_iq2s_grid + idx);
+                const uint8_t sg = signs[4 * ib32 + l];
+                for (int j = 0; j < 8; ++j)
+                    y[i * 256 + ib32 * 32 + 8 * l + j] =
+                        db[l / 2] * (float) grid[j] * (sg & (1 << j) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq3_s (a scale a 32-value half: 1 + 2 s)
+void ggml_iq3_s(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 110;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t* scales = b + 106;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db = d * (float) (1 + 2 * ((scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xF));
+            const uint8_t* qs = b + 2 + 8 * ib32;
+            const uint8_t h = b[66 + ib32];
+            const uint8_t* sg = b + 74 + 4 * ib32;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* g1 = (const uint8_t*) (g_iq3s_grid + (qs[2 * l + 0] | ((h << (8 - 2 * l)) & 256)));
+                const uint8_t* g2 = (const uint8_t*) (g_iq3s_grid + (qs[2 * l + 1] | ((h << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[i * 256 + ib32 * 32 + 8 * l + j + 0] = db * (float) g1[j] * (sg[l] & (1 << j) ? -1.f : 1.f);
+                    y[i * 256 + ib32 * 32 + 8 * l + j + 4] =
+                        db * (float) g2[j] * (sg[l] & (1 << (j + 4)) ? -1.f : 1.f);
+                }
+            }
+        }
+    }
+}
+// ggml's dequantize_row_iq4_nl
+void ggml_iq4_nl(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 32; ++i) {
+        const uint8_t* b = x + i * 18;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        for (int j = 0; j < 16; ++j) {
+            y[i * 32 + j + 0] = d * (float) g_iq4nl[b[2 + j] & 0xF];
+            y[i * 32 + j + 16] = d * (float) g_iq4nl[b[2 + j] >> 4];
+        }
+    }
+}
+// ggml's get_scale_min_k4 and dequantize_row_q4_K
+void get_scale_min_k4_host(int j, const uint8_t* q, int& d, int& m) {
+    if (j < 4) {
+        d = q[j] & 63, m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+void ggml_q4_K(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 144;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        const float mn = h2f_host((uint16_t) (b[2] | (b[3] << 8)));
+        const uint8_t* q = b + 16;
+        float* yy = y + i * 256;
+        int v = 0, is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            int sc, m;
+            get_scale_min_k4_host(is + 0, b + 4, sc, m);
+            const float d1 = d * (float) sc, m1 = mn * (float) m;
+            get_scale_min_k4_host(is + 1, b + 4, sc, m);
+            const float d2 = d * (float) sc, m2 = mn * (float) m;
+            for (int l = 0; l < 32; ++l) yy[v++] = d1 * (float) (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) yy[v++] = d2 * (float) (q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+// ggml's dequantize_row_iq1_s / dequantize_row_iq1_m, transcribed (the host's grid: 8 int8 an entry; the delta 1/8)
+static const uint64_t* const g_iq1s_grid = ik2_iq::host::iq1s_grid;
+void ggml_iq1_s(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 50;
+        const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t* qs = b + 2;
+        for (int ib = 0; ib < 8; ++ib) {
+            uint16_t qh = 0;
+            std::memcpy(&qh, b + 34 + 2 * ib, 2);
+            const float dl = d * (float) (2 * ((qh >> 12) & 7) + 1);
+            const float delta = qh & 0x8000 ? -0.125f : 0.125f;
+            for (int l = 0; l < 4; ++l) {
+                const int8_t* grid = (const int8_t*) (g_iq1s_grid + (qs[l] | (((qh >> 3 * l) & 7) << 8)));
+                for (int j = 0; j < 8; ++j) y[i * 256 + ib * 32 + 8 * l + j] = dl * ((float) grid[j] + delta);
+            }
+            qs += 4;
+        }
+    }
+}
+void ggml_iq1_m(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* b = x + i * 56;
+        const uint8_t* qs = b;
+        const uint8_t* qh = b + 32;
+        uint16_t sc[4];
+        std::memcpy(sc, b + 48, 8);
+        const uint16_t u16 =
+            (uint16_t) ((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+        const float d = h2f_host(u16);
+        float delta[4];
+        uint16_t idx[4];
+        for (int ib = 0; ib < 8; ++ib) {
+            const float dl1 = d * (float) (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+            const float dl2 = d * (float) (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+            idx[0] = (uint16_t) (qs[0] | ((qh[0] << 8) & 0x700));
+            idx[1] = (uint16_t) (qs[1] | ((qh[0] << 4) & 0x700));
+            idx[2] = (uint16_t) (qs[2] | ((qh[1] << 8) & 0x700));
+            idx[3] = (uint16_t) (qs[3] | ((qh[1] << 4) & 0x700));
+            delta[0] = qh[0] & 0x08 ? -0.125f : 0.125f;
+            delta[1] = qh[0] & 0x80 ? -0.125f : 0.125f;
+            delta[2] = qh[1] & 0x08 ? -0.125f : 0.125f;
+            delta[3] = qh[1] & 0x80 ? -0.125f : 0.125f;
+            for (int l = 0; l < 4; ++l) {
+                const int8_t* grid = (const int8_t*) (g_iq1s_grid + idx[l]);
+                for (int j = 0; j < 8; ++j)
+                    y[i * 256 + ib * 32 + 8 * l + j] = (l < 2 ? dl1 : dl2) * ((float) grid[j] + delta[l]);
+            }
+            qs += 4;
+            qh += 2;
+        }
+    }
+}
 void test_iq_ref() {
-    for (int type : {k::kIQ3_XXS, k::kIQ4_XS}) {
+    struct Ref {
+        int type;
+        void (*fn)(const uint8_t*, float*, size_t);
+        const char* name;
+    };
+    const Ref refs[] = {{k::kIQ3_XXS, ggml_iq3_xxs, "IQ3_XXS"}, {k::kIQ4_XS, ggml_iq4_xs, "IQ4_XS"},
+                        {k::kQ4_K, ggml_q4_K, "Q4_K"},         {k::kIQ2_XXS, ggml_iq2_xxs, "IQ2_XXS"},
+                        {k::kIQ2_XS, ggml_iq2_xs, "IQ2_XS"},   {k::kIQ2_S, ggml_iq2_s, "IQ2_S"},
+                        {k::kIQ3_S, ggml_iq3_s, "IQ3_S"},     {k::kIQ4_NL, ggml_iq4_nl, "IQ4_NL"},
+                        {k::kIQ1_S, ggml_iq1_s, "IQ1_S"},     {k::kIQ1_M, ggml_iq1_m, "IQ1_M"}};
+    for (const Ref& r : refs) {
         const size_t n = 256 * 333;
-        auto raw = rand_blocks(type, n);
+        auto raw = rand_blocks(r.type, n);
         std::vector<float> want(n), got(n);
-        (type == k::kIQ3_XXS ? ggml_iq3_xxs : ggml_iq4_xs)(raw.data(), want.data(), n);
-        k::decode_host(type, raw.data(), n, got.data());
-        expect(type == k::kIQ3_XXS ? "decode_host IQ3_XXS = ggml" : "decode_host IQ4_XS = ggml", got,
-               std::vector<double>(want.begin(), want.end()), 0.0, 0.0);
+        r.fn(raw.data(), want.data(), n);
+        k::decode_host(r.type, raw.data(), n, got.data());
+        char name[64];
+        std::snprintf(name, sizeof name, "decode_host %s = ggml", r.name);
+        expect(name, got, std::vector<double>(want.begin(), want.end()), 0.0, 0.0);
     }
 }
 
@@ -732,7 +956,18 @@ void test_experts_mv() {
                           {k::kQ5_K, k::kQ5_K, k::kQ6_K, "Q5_K / Q6_K"},
                           {k::kQ8_0, k::kNVFP4, k::kQ6_K, "mixed"},
                           {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4, "IQ3_XXS / NVFP4"},
-                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"}};
+                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"},
+                          {k::kIQ2_XXS, k::kIQ2_XXS, k::kNVFP4, "IQ2_XXS / NVFP4"},
+                          {k::kIQ2_XS, k::kIQ2_XS, k::kNVFP4, "IQ2_XS / NVFP4"},
+                          {k::kIQ2_S, k::kIQ2_S, k::kIQ4_NL, "IQ2_S / IQ4_NL"},
+                          {k::kIQ3_S, k::kIQ3_S, k::kNVFP4, "IQ3_S / NVFP4"},
+                          {k::kIQ3_XXS, k::kIQ3_XXS, k::kIQ4_NL, "IQ3_XXS / IQ4_NL"},
+                          {k::kIQ4_NL, k::kIQ4_NL, k::kNVFP4, "IQ4_NL / NVFP4"},
+                          {k::kQ4_K, k::kQ4_K, k::kNVFP4, "Q4_K / NVFP4"},
+                          {k::kIQ1_S, k::kIQ1_S, k::kIQ1_S, "IQ1_S"},
+                          {k::kIQ1_M, k::kIQ1_M, k::kIQ1_M, "IQ1_M"},
+                          {k::kIQ2_XXS, k::kIQ2_XXS, k::kIQ1_S, "IQ2_XXS / IQ1_S"},
+                          {k::kIQ2_XXS, k::kIQ2_XXS, k::kIQ1_M, "IQ2_XXS / IQ1_M"}};
     for (const Case& cs : cases) {
         const int E = 3;
         auto g = rand_blocks(cs.tg, (size_t) E * F * C), u = rand_blocks(cs.tu, (size_t) E * F * C),
@@ -811,9 +1046,16 @@ void test_experts_grouped() {
                             {k::kQ8_0, k::kQ8_0, k::kQ8_0},
                             {k::kQ8_0, k::kNVFP4, k::kQ6_K},
                             {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4},
-                            {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K}};
-    const char* tnames[] = {"NVFP4", "Q5_K/Q6_K", "Q8_0", "Q8_0/NVFP4/Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K"};
-    for (int ti = 0; ti < 6; ++ti) {
+                            {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K},
+                            {k::kIQ2_XXS, k::kIQ2_XS, k::kNVFP4},
+                            {k::kIQ2_S, k::kIQ3_S, k::kIQ4_NL},
+                            {k::kQ4_K, k::kQ4_K, k::kNVFP4},
+                            {k::kIQ2_XXS, k::kIQ2_XXS, k::kIQ1_S},
+                            {k::kIQ1_S, k::kIQ1_M, k::kIQ1_M}};
+    const char* tnames[] = {"NVFP4", "Q5_K/Q6_K", "Q8_0", "Q8_0/NVFP4/Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K",
+                            "IQ2_XXS/IQ2_XS/NVFP4", "IQ2_S/IQ3_S/IQ4_NL", "Q4_K/NVFP4", "IQ2_XXS/IQ1_S",
+                            "IQ1_S/IQ1_M"};
+    for (int ti = 0; ti < 11; ++ti) {
         const auto& ty = types[ti];
         auto g = rand_blocks(ty[0], (size_t) E * F * C), u = rand_blocks(ty[1], (size_t) E * F * C),
              d = rand_blocks(ty[2], (size_t) E * C * F);
@@ -929,9 +1171,19 @@ void test_mv_blocks() {
         {k::kQ8_0, 33, 96, "Q8_0 odd nb"},
         {k::kNVFP4, 1031, 6144, "NVFP4 N=1031"},
         {k::kQ6_K, 1031, 6144, "Q6_K N=1031"},
+        {k::kQ6_K, 4608, 4608, "Q6_K N=4608"},
+        {k::kQ6_K, 7, 256, "Q6_K N=7 K=256"},
         {k::kQ5_K, 513, 4608, "Q5_K N=513"},
         {k::kIQ3_XXS, 1031, 4608, "IQ3_XXS N=1031"},
         {k::kIQ4_XS, 513, 4608, "IQ4_XS N=513"},
+        {k::kQ4_K, 513, 4608, "Q4_K N=513"},
+        {k::kIQ2_XXS, 1031, 4608, "IQ2_XXS N=1031"},
+        {k::kIQ2_XS, 513, 4608, "IQ2_XS N=513"},
+        {k::kIQ2_S, 1031, 4608, "IQ2_S N=1031"},
+        {k::kIQ3_S, 513, 4608, "IQ3_S N=513"},
+        {k::kIQ4_NL, 1031, 4608, "IQ4_NL N=1031"},
+        {k::kIQ1_S, 1031, 4608, "IQ1_S N=1031"},
+        {k::kIQ1_M, 513, 4608, "IQ1_M N=513"},
     };
     for (const Case& cs : cases) {
         const int N = cs.N, K = cs.K;
@@ -953,6 +1205,26 @@ void test_mv_blocks() {
         std::snprintf(name, sizeof name, "mv_blocks %s", cs.name);
         // Cancellation over K=4608..6144 random blocks leaves ~1e-2 F32 rounding residual (same as test_experts_grouped).
         expect(name, host(dy, N), want, 2e-4, K > 2048 ? 3e-2 : 2e-3);
+        // a window's tokens in one launch: each token's row is mv_blocks' to the bit
+        for (int T : {2, 5, 8}) {
+            const int x_ld = K + 16, y_ld = N + 3;
+            auto xt = fvec((size_t) T * x_ld, 2.0f);
+            float *dxt = dev(xt), *dyt = dev_n<float>((size_t) T * y_ld), *dy1 = dev_n<float>(N);
+            k::mv_blocks_rows(cs.type, dw, N, K, dxt, x_ld, T, dyt, y_ld, 0);
+            const auto got = host(dyt, (size_t) T * y_ld);
+            size_t diff = 0;
+            for (int t = 0; t < T; ++t) {
+                k::mv_blocks_ref(cs.type, dw, N, K, dxt + (size_t) t * x_ld, dy1, 0);
+                const auto one = host(dy1, N);
+                diff += std::memcmp(one.data(), got.data() + (size_t) t * y_ld, (size_t) N * sizeof(float)) != 0;
+                k::mv_blocks(cs.type, dw, N, K, dxt + (size_t) t * x_ld, dy1, 0);   // (a token's own kernel too)
+                const auto tok = host(dy1, N);
+                diff += std::memcmp(one.data(), tok.data(), (size_t) N * sizeof(float)) != 0;
+            }
+            std::snprintf(name, sizeof name, "mv_blocks_rows / mv_blocks %s T=%d = the row dots bit for bit", cs.name, T);
+            expect_true(name, diff == 0);
+            cudaFree(dxt), cudaFree(dyt), cudaFree(dy1);
+        }
         cudaFree(dw), cudaFree(dx), cudaFree(dy);
     }
 }
@@ -1461,11 +1733,60 @@ void test_attn_decode_mma() {
             float* dscr = dev_n<float>(k::attn_decode_mma_scratch(H, c.n_split));
             std::vector<int> pos_h = {c.qpos};
             int* dpos = dev(pos_h);
+            // attn_decode_rdna_kernel (AMD's RDNA 3 / 4, IK2_ATTN_RDNA=1): run twice, and a window of the same token
+            // twice; the checks above it run attn_decode_mma_kernel whatever the mode
+            const bool rdna = fp8 && k::attn_decode_rdna_available();
+            std::vector<float> rd_o[2], rd_t;
+            std::vector<uint16_t> rd_h[2], rd_th;
             if (fp8) {
                 uint8_t *dk = dev(k8), *dv = dev(v8);
+                const int rdna_mode = k::attn_decode_rdna_mode();
+                k::attn_decode_rdna_set(0);
                 k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv, dp,
                                        d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
                 CU(cudaDeviceSynchronize());
+                {   // the other FP8 dequant (e4m3x4_h4 / e4m3x4_h4_s8): the same output to the bit, the FP16 copy too
+                    const auto o1 = host(dout, (size_t) H * D);
+                    const auto h1 = host(dout16, (size_t) H * D);
+                    const bool s8 = k::attn_decode_mma_s8();
+                    k::attn_decode_mma_set_s8(!s8);
+                    k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv,
+                                           dp, d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
+                    CU(cudaDeviceSynchronize());
+                    k::attn_decode_mma_set_s8(s8);
+                    const auto o2 = host(dout, (size_t) H * D);
+                    const auto h2 = host(dout16, (size_t) H * D);
+                    char lb[112];
+                    std::snprintf(lb, sizeof lb, "mma fp8 %s: s8 and h4 dequant the same to the bit", c.name);
+                    expect_true(lb, !std::memcmp(o1.data(), o2.data(), o1.size() * sizeof(o1[0])) &&
+                                        !std::memcmp(h1.data(), h2.data(), h1.size() * sizeof(h1[0])));
+                }
+                if (rdna) {
+                    k::attn_decode_rdna_set(1);
+                    for (int md = 1; md <= 2; ++md) {
+                        k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv,
+                                               v_inv, dp, d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
+                        CU(cudaDeviceSynchronize());
+                        rd_o[md - 1] = host(dout, (size_t) H * D);
+                        rd_h[md - 1] = host(dout16, (size_t) H * D);
+                    }
+                    auto twice = [](auto v) { auto w = v; w.insert(w.end(), v.begin(), v.end()); return w; };
+                    const std::vector<int> pos2 = {c.qpos, c.qpos};
+                    uint16_t* dq2 = dev(twice(q16));
+                    float *dr2 = dev(twice(r)), *ds2 = dev(twice(sink)), *dg2 = dev(twice(gate));
+                    float* dout2 = dev_n<float>((size_t) 2 * H * D);
+                    uint16_t* dout2h = dev_n<uint16_t>((size_t) 2 * H * D);
+                    float* dscr2 = dev_n<float>(2 * k::attn_decode_mma_scratch(H, c.n_split));
+                    int* dpos2 = dev(pos2);
+                    const bool ran = k::attn_decode_mma_toks_fp8(dq2, H * D, dr2, H * d_rel, ds2, dk, dv, c.kv_cap, H, KV,
+                                                                 dpos2, 2, c.n_split, scale * k_inv, v_inv, dp, d_rel,
+                                                                 c.extent, c.window, dscr2, dout2, dg2, H * D, dout2h, 0);
+                    CU(cudaDeviceSynchronize());
+                    if (ran) rd_t = host(dout2, (size_t) 2 * H * D), rd_th = host(dout2h, (size_t) 2 * H * D);
+                    cudaFree(dq2), cudaFree(dout2h), cudaFree(dpos2);
+                    for (float* p : {dr2, ds2, dg2, dout2, dscr2}) cudaFree(p);
+                }
+                k::attn_decode_rdna_set(rdna_mode);
                 cudaFree(dk), cudaFree(dv);
             } else {
                 uint16_t *dk = dev(k16), *dv = dev(v16);
@@ -1515,6 +1836,27 @@ void test_attn_decode_mma() {
                 bool same = true;
                 for (size_t i = 0; i < got.size(); ++i) same &= h16[i] == f2h_host(got[i]);
                 if (!same) expect_true("mma fp8: the FP16 copy is the output rounded", false);
+            }
+            if (rdna) {
+                std::snprintf(label, sizeof label, "rdna fp8 %s", c.name);
+                expect(label, rd_o[0], want, 1e-2, std::max(1e-6, 1e-3 * mag));
+                bool same = true;
+                for (size_t i = 0; i < rd_o[0].size(); ++i) same &= rd_h[0][i] == f2h_host(rd_o[0][i]);
+                if (!same) expect_true("rdna fp8: the FP16 copy is the output rounded", false);
+            }
+            if (rdna) {
+                const size_t n = (size_t) H * D;
+                char lb2[160];
+                std::snprintf(lb2, sizeof lb2, "rdna fp8 %s: two runs the same to the bit", c.name);
+                expect_true(lb2, !std::memcmp(rd_o[0].data(), rd_o[1].data(), n * sizeof(float)) &&
+                                       !std::memcmp(rd_h[0].data(), rd_h[1].data(), n * sizeof(uint16_t)));
+                std::snprintf(lb2, sizeof lb2, "rdna fp8 %s: a window's two tokens the one-token output to the bit",
+                              c.name);
+                expect_true(lb2, rd_t.size() == 2 * n &&
+                                       !std::memcmp(rd_t.data(), rd_o[0].data(), n * sizeof(float)) &&
+                                       !std::memcmp(rd_t.data() + n, rd_o[0].data(), n * sizeof(float)) &&
+                                       !std::memcmp(rd_th.data(), rd_h[0].data(), n * sizeof(uint16_t)) &&
+                                       !std::memcmp(rd_th.data() + n, rd_h[0].data(), n * sizeof(uint16_t)));
             }
             cudaFree(dq), cudaFree(dpos), cudaFree(dout16);
             for (float* p : {dr, dp, ds, dout, dscr, dg}) cudaFree(p);
@@ -1773,6 +2115,13 @@ void test_round2_fused() {
             {k::kQ8_0, k::kNVFP4, 0, true, "Q8_0/NVFP4 mixed"},
             {k::kIQ3_XXS, k::kIQ3_XXS, 0, true, "IQ3_XXS scaled"},
             {k::kIQ4_XS, k::kIQ4_XS, 0, false, "IQ4_XS unscaled"},
+            {k::kIQ2_XXS, k::kIQ2_XXS, 0, true, "IQ2_XXS scaled"},
+            {k::kIQ2_XS, k::kIQ2_S, 0, true, "IQ2_XS/IQ2_S mixed"},
+            {k::kIQ3_S, k::kIQ3_S, 0, false, "IQ3_S unscaled"},
+            {k::kIQ4_NL, k::kIQ4_NL, 0, true, "IQ4_NL scaled"},
+            {k::kQ4_K, k::kQ4_K, 0, true, "Q4_K scaled"},
+            {k::kIQ1_S, k::kIQ1_S, 0, true, "IQ1_S scaled"},
+            {k::kIQ1_M, k::kIQ1_S, 0, false, "IQ1_M/IQ1_S unscaled"},
         };
         for (const Case& cs : cases) {
             auto g = rand_blocks(cs.tg, (size_t) E * F * C), u = rand_blocks(cs.tu, (size_t) E * F * C);
@@ -1831,10 +2180,16 @@ void test_round2_fused() {
                                 {k::kQ8_0, k::kQ8_0},
                                 {k::kQ8_0, k::kNVFP4},
                                 {k::kIQ3_XXS, k::kIQ3_XXS},
-                                {k::kIQ4_XS, k::kIQ4_XS}};
-        const char* tnames[] = {"NVFP4", "Q5_K", "Q6_K", "Q8_0", "Q8_0/NVFP4", "IQ3_XXS", "IQ4_XS"};
+                                {k::kIQ4_XS, k::kIQ4_XS},
+                                {k::kIQ2_XXS, k::kIQ2_XS},
+                                {k::kIQ2_S, k::kIQ3_S},
+                                {k::kIQ4_NL, k::kIQ4_NL},
+                                {k::kQ4_K, k::kQ4_K},
+                                {k::kIQ1_S, k::kIQ1_M}};
+        const char* tnames[] = {"NVFP4",    "Q5_K",    "Q6_K",          "Q8_0",    "Q8_0/NVFP4", "IQ3_XXS",
+                                "IQ4_XS",   "IQ2_XXS/IQ2_XS", "IQ2_S/IQ3_S", "IQ4_NL", "Q4_K", "IQ1_S/IQ1_M"};
         const int want_ng[E] = {1, 2, 3, 5, 8};
-        for (int ti = 0; ti < 7; ++ti) {
+        for (int ti = 0; ti < 12; ++ti) {
             const int tg = types[ti][0], tu = types[ti][1];
             auto g = rand_blocks(tg, (size_t) E * F * C), u = rand_blocks(tu, (size_t) E * F * C);
             const size_t eb0 = g.size() / E, eb1 = u.size() / E, slot = (eb0 + eb1 + 255) / 256 * 256;
@@ -2490,9 +2845,16 @@ void test_round6() {
                                 {k::kQ5_K, k::kQ5_K, k::kQ5_K},
                                 {k::kQ6_K, k::kQ6_K, k::kQ6_K},
                                 {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4},
-                                {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K}};
-        const char* tnames[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K"};
-        for (int ti = 0; ti < 6; ++ti) {
+                                {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K},
+                                {k::kIQ2_XXS, k::kIQ2_XS, k::kNVFP4},
+                                {k::kIQ2_S, k::kIQ3_S, k::kIQ4_NL},
+                                {k::kQ4_K, k::kQ4_K, k::kNVFP4},
+                                {k::kIQ2_XXS, k::kIQ2_XXS, k::kIQ1_S},
+                                {k::kIQ1_S, k::kIQ1_M, k::kIQ1_M}};
+        const char* tnames[] = {"NVFP4",         "Q8_0",         "Q5_K",         "Q6_K",    "IQ3_XXS/NVFP4",
+                                "IQ4_XS/Q6_K", "IQ2_XXS/IQ2_XS/NVFP4", "IQ2_S/IQ3_S/IQ4_NL", "Q4_K/NVFP4",
+                                "IQ2_XXS/IQ1_S", "IQ1_S/IQ1_M"};
+        for (int ti = 0; ti < 11; ++ti) {
             const int tg = types[ti][0], tu = types[ti][1], td = types[ti][2];
             const int Cin = 512;   // weight row width for gate/up (multiple of 256 for Q5_K/Q6_K)
             auto g = rand_blocks(tg, (size_t) E * F * Cin), u = rand_blocks(tu, (size_t) E * F * Cin),
@@ -2567,15 +2929,32 @@ void test_round6() {
 // AMD: the grouped prompt experts on the matrix cores (ik2_rdna.inc) against double references - rows grouped by
 // expert (37 = a tile of 32 and one of 5, 1, 6), gate / up + SwiGLU (FP16 out), down, each token's picks summed
 void test_experts_rdna() {
-    const int C = 256, F = 128, E = 3, cnt[E] = {37, 1, 6};
+    const int E = 3, cnt[E] = {37, 1, 6};
     const float gcap = 4.0f, ucap = 25.0f;
-    for (int ty : {k::kNVFP4, k::kQ8_0}) {
-        if (!k::experts_rdna_available(ty, ty, ty, C, F)) {
-            std::printf("skip experts_rdna: not this GPU\n");
-            return;
+    // (gate / up type, down type; the IQ types' 256-value blocks want widths of 256s)
+    struct Case {
+        int tg, td, C, F;
+        const char* nm;
+    };
+    const Case cases[] = {
+        {k::kNVFP4, k::kNVFP4, 256, 128, "NVFP4"},
+        {k::kQ8_0, k::kQ8_0, 256, 128, "Q8_0"},
+        {k::kIQ2_XXS, k::kIQ1_S, 512, 256, "IQ2_XXS / IQ1_S"},
+        {k::kIQ2_XXS, k::kIQ2_XXS, 512, 256, "IQ2_XXS"},
+        {k::kIQ2_XXS, k::kIQ2_XS, 768, 256, "IQ2_XXS / IQ2_XS"},
+        {k::kIQ2_XXS, k::kIQ1_M, 512, 512, "IQ2_XXS / IQ1_M"},
+        {k::kIQ2_XS, k::kIQ1_S, 512, 256, "IQ2_XS / IQ1_S"},
+        {k::kIQ1_S, k::kQ8_0, 512, 256, "IQ1_S / Q8_0"},
+        {k::kIQ1_M, k::kNVFP4, 512, 256, "IQ1_M / NVFP4"},
+    };
+    for (const Case& cs : cases) {
+        const int C = cs.C, F = cs.F, tg = cs.tg, td = cs.td;
+        if (!k::experts_rdna_available(tg, tg, td, C, F)) {
+            std::printf("skip experts_rdna %s: not this GPU\n", cs.nm);
+            continue;
         }
-        auto g = rand_blocks(ty, (size_t) E * F * C), u = rand_blocks(ty, (size_t) E * F * C),
-             d = rand_blocks(ty, (size_t) E * C * F);
+        auto g = rand_blocks(tg, (size_t) E * F * C), u = rand_blocks(tg, (size_t) E * F * C),
+             d = rand_blocks(td, (size_t) E * C * F);
         const size_t eb0 = g.size() / E, eb1 = u.size() / E, eb2 = d.size() / E;
         const size_t slot = (eb0 + eb1 + eb2 + 255) / 256 * 256;
         std::vector<uint8_t> pool(slot * E);
@@ -2605,14 +2984,15 @@ void test_experts_rdna() {
         uint16_t *dx = dev(x16), *dh = dev_n<uint16_t>((size_t) rows * F);
         float *dsg = dev(sg), *dsu = dev(su), *dy = dev_n<float>((size_t) rows * C);
         const int nt = (int) tiles.size() / 4;
-        k::experts_rdna_gu(deptr, dtiles, nt, ty, eb0, dx, C, F, dsg, dsu, gcap, ucap, dh, 0);
-        k::experts_rdna_down(deptr, dtiles, nt, ty, eb0 + eb1, dh, C, F, dy, 0);
+        k::experts_rdna_gu(deptr, dtiles, nt, tg, eb0, dx, C, F, dsg, dsu, gcap, ucap, dh, 0);
+        k::experts_rdna_down(deptr, dtiles, nt, td, eb0 + eb1, dh, C, F, dy, 0);
         const auto h16 = host(dh, (size_t) rows * F);
-        std::vector<float> hgot(h16.size()), row(C);
+        std::vector<float> hgot(h16.size());
         for (size_t i = 0; i < h16.size(); ++i) hgot[i] = h2f_host(h16[i]);
         std::vector<double> want_h((size_t) rows * F), want_y((size_t) rows * C);
         // (the weights as the kernel holds them: FP16 - NVFP4's exact, Q8_0's d q rounded, as decode_f16's are)
-        auto dec = [&](const uint8_t* w, int n) {
+        std::vector<float> row(std::max(C, F));
+        auto dec = [&](int ty, const uint8_t* w, int n) {
             k::decode_host(ty, w, n, row.data());
             for (int i = 0; i < n; ++i) row[i] = h2f_host(f2h_host(row[i]));
         };
@@ -2625,10 +3005,10 @@ void test_experts_rdna() {
             const int e = row_e[r];
             for (int j = 0; j < F; ++j) {
                 double gg = 0, uu = 0, mg = 0, mu = 0;
-                dec(g.data() + e * eb0 + (size_t) j * (eb0 / F), C);
+                dec(tg, g.data() + e * eb0 + (size_t) j * (eb0 / F), C);
                 for (int c = 0; c < C; ++c) gg += (double) row[c] * xf[(size_t) r * C + c];
                 for (int c = 0; c < C; ++c) mg += std::fabs((double) row[c] * xf[(size_t) r * C + c]);
-                dec(u.data() + e * eb1 + (size_t) j * (eb1 / F), C);
+                dec(tg, u.data() + e * eb1 + (size_t) j * (eb1 / F), C);
                 for (int c = 0; c < C; ++c) uu += (double) row[c] * xf[(size_t) r * C + c];
                 for (int c = 0; c < C; ++c) mu += std::fabs((double) row[c] * xf[(size_t) r * C + c]);
                 gg *= sg[r], uu *= su[r], mg *= std::fabs(sg[r]) * 1e-6, mu *= std::fabs(su[r]) * 1e-6;
@@ -2641,7 +3021,7 @@ void test_experts_rdna() {
                 want_h[(size_t) r * F + j] = w;
             }
             for (int c = 0; c < C; ++c) {   // (down over the hidden the kernel wrote: its FP16 rounding not counted)
-                dec(d.data() + e * eb2 + (size_t) c * (eb2 / C), F);
+                dec(td, d.data() + e * eb2 + (size_t) c * (eb2 / C), F);
                 double a = 0, mag = 0;
                 for (int j = 0; j < F; ++j) a += (double) row[j] * hgot[(size_t) r * F + j];
                 for (int j = 0; j < F; ++j) mag += std::fabs((double) row[j] * hgot[(size_t) r * F + j]);
@@ -2649,8 +3029,38 @@ void test_experts_rdna() {
                 worst_mag = std::max(worst_mag, mag);
             }
         }
-        const char* nm = ty == k::kNVFP4 ? "NVFP4" : "Q8_0";
-        char name[64];
+        const char* nm = cs.nm;
+        char name[96];
+        {   // the IQ types: the same launches over the experts' FP16 rows as decode_f16 gives them - the same bits (the
+            // kernel makes those FP16 values in shared memory and runs the same products in the same order).
+            // (NVFP4 / Q8_0 are not held to this: their FP16 products are rounded once in FP16 there)
+            auto iq = [](int t) {
+                return t == k::kIQ2_XXS || t == k::kIQ2_XS || t == k::kIQ1_S || t == k::kIQ1_M;
+            };
+            const size_t n0 = (size_t) F * C, slot16 = 3 * n0 * 2;
+            uint16_t* dp16 = dev_n<uint16_t>((size_t) E * 3 * n0);
+            std::vector<const uint8_t*> eptr16(E);
+            for (int e = 0; e < E; ++e) {
+                eptr16[e] = (const uint8_t*) dp16 + e * slot16;
+                k::decode_f16(tg, eptr[e], n0, dp16 + (size_t) e * 3 * n0, 0);
+                k::decode_f16(tg, eptr[e] + eb0, n0, dp16 + (size_t) e * 3 * n0 + n0, 0);
+                k::decode_f16(td, eptr[e] + eb0 + eb1, n0, dp16 + (size_t) e * 3 * n0 + 2 * n0, 0);
+            }
+            const uint8_t** deptr16 = nullptr;
+            CU(cudaMalloc(&deptr16, E * sizeof(void*)));
+            CU(cudaMemcpy(deptr16, eptr16.data(), E * sizeof(void*), cudaMemcpyHostToDevice));
+            uint16_t* dh2 = dev_n<uint16_t>((size_t) rows * F);
+            float* dy2 = dev_n<float>((size_t) rows * C);
+            k::experts_rdna_gu(deptr16, dtiles, nt, k::kRdnaF16Rows, n0 * 2, dx, C, F, dsg, dsu, gcap, ucap, dh2, 0);
+            k::experts_rdna_down(deptr16, dtiles, nt, k::kRdnaF16Rows, n0 * 4, dh, C, F, dy2, 0);
+            const auto h2 = host(dh2, (size_t) rows * F);
+            const auto y1 = host(dy, (size_t) rows * C), y2 = host(dy2, (size_t) rows * C);
+            std::snprintf(name, sizeof name, "experts_rdna_gu %s = over decode_f16's rows, bit for bit", nm);
+            if (iq(tg)) expect_true(name, std::memcmp(h2.data(), h16.data(), h16.size() * 2) == 0);
+            std::snprintf(name, sizeof name, "experts_rdna_down %s = over decode_f16's rows, bit for bit", nm);
+            if (iq(td)) expect_true(name, std::memcmp(y1.data(), y2.data(), y1.size() * 4) == 0);
+            for (void* p : {(void*) dp16, (void*) deptr16, (void*) dh2, (void*) dy2}) cudaFree(p);
+        }
         std::snprintf(name, sizeof name, "experts_rdna_gu %s: %d of %zu off%s", nm, gu_bad, want_h.size(),
                       gu_bad ? " (first below)" : "");
         expect_true(name, gu_bad == 0);
@@ -2664,12 +3074,18 @@ void test_experts_rdna() {
         float *dw = dev(wtr), *dout = dev_n<float>((size_t) T * C);
         k::moe_rows_combine(dy, dinv, dw, T, K, C, dout, 0);
         const auto yv = host(dy, (size_t) rows * C);
-        std::vector<double> want_o((size_t) T * C, 0.0);
+        std::vector<double> want_o((size_t) T * C, 0.0), mag_o((size_t) T * C, 0.0);
         for (int t = 0; t < T; ++t)
             for (int kk = 0; kk < K; ++kk)
-                for (int c = 0; c < C; ++c) want_o[(size_t) t * C + c] += (double) wtr[inv[t * K + kk]] * yv[(size_t) inv[t * K + kk] * C + c];
+                for (int c = 0; c < C; ++c) {
+                    const double v = (double) wtr[inv[t * K + kk]] * yv[(size_t) inv[t * K + kk] * C + c];
+                    want_o[(size_t) t * C + c] += v, mag_o[(size_t) t * C + c] += std::fabs(v);
+                }
+        // (the F32 sum's error bound scales with the largest sum of |terms|, as down's above: picks that cancel leave
+        //  a small sum of large terms)
         std::snprintf(name, sizeof name, "moe_rows_combine %s", nm);
-        expect(name, host(dout, want_o.size()), want_o, 1e-5, 1e-5);
+        expect(name, host(dout, want_o.size()), want_o, 1e-5,
+               1e-5 + 1e-6 * *std::max_element(mag_o.begin(), mag_o.end()));
         for (void* p : {(void*) dpool, (void*) deptr, (void*) dtiles, (void*) dx, (void*) dh, (void*) dsg, (void*) dsu,
                         (void*) dy, (void*) dinv, (void*) dw, (void*) dout})
             cudaFree(p);
@@ -2773,7 +3189,7 @@ void test_window_exact(bool mma) {
             for (void* p : {(void*) dqb, (void*) ddb, (void*) yb}) CU(cudaFree(p));
         }
     }
-    for (const int ty : {k::kNVFP4, k::kQ8_0}) {   // the experts: a window of T tokens' picks grouped by expert
+    for (const int ty : {k::kNVFP4, k::kQ8_0, k::kIQ4_NL}) {   // the experts: a window of T tokens' picks grouped by expert
         const size_t mb = (size_t) C * F / k::block_values(ty) * k::block_bytes(ty);
         auto pool = rand_blocks(ty, (size_t) E * 3 * C * F);
         auto* dpool = dev(pool);
@@ -2917,7 +3333,7 @@ void test_window_exact(bool mma) {
                 for (void* p : {(void*) dbls[t], (void*) dsgs[t], (void*) dsus[t]}) CU(cudaFree(p));
             char name[160];
             std::snprintf(name, sizeof name, "window experts %s (%s), %d tokens: h and y the one-token path's to the bit",
-                          ty == k::kNVFP4 ? "NVFP4" : "Q8_0", tc ? "tensor cores" : "row dots", T);
+                          ty == k::kNVFP4 ? "NVFP4" : ty == k::kQ8_0 ? "Q8_0" : "IQ4_NL", tc ? "tensor cores" : "row dots", T);
             expect_true(name, h_same && y_same);
             for (void* p : {(void*) dtop, (void*) dx, (void*) dw, (void*) gblob, (void*) gn, (void*) gtok, (void*) grow,
                             (void*) ginv, (void*) gsg, (void*) gsu, (void*) gwt, (void*) h_win, (void*) y_win,
@@ -3238,12 +3654,86 @@ void test_window_launches() {
     }
 }
 
+// IK2_TEST_TIME=1: the row kernels' speed on matrices larger than the caches (GB of blocks a second), no checks
+void time_rows() {
+    struct Case {
+        int type;
+        const char* name;
+    };
+    const Case cases[] = {{k::kQ8_0, "Q8_0"}, {k::kQ6_K, "Q6_K"}, {k::kIQ2_XXS, "IQ2_XXS"}, {k::kIQ2_XS, "IQ2_XS"},
+                          {k::kIQ1_S, "IQ1_S"}, {k::kIQ1_M, "IQ1_M"}};
+    {   // the planar Q8_0 product (the dense matrices' default), at a few row counts
+        const int K = 4608;
+        for (int N : {49152, 9216, 4608}) {
+            std::vector<int8_t> q((size_t) N * K);
+            std::vector<uint16_t> d((size_t) N * (K >> 5), 0x3c00);
+            for (auto& v : q) v = (int8_t) (std::rand() & 0xFF);
+            auto x = fvec((size_t) 8 * K, 2.0f);
+            int8_t* dq = dev(q);
+            uint16_t* dd = dev(d);
+            float *dx = dev(x), *dy = dev_n<float>((size_t) 8 * N);
+            auto run = [&](int T) {
+                double best = 1e30;
+                for (int r = 0; r < 6; ++r) {
+                    CU(cudaDeviceSynchronize());
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (T == 0) k::mv_q8p(dq, dd, N, K, dx, dy, 0);
+                    else k::mv_q8p_cols(dq, dd, N, K, dx, K, T, dy, N, 0);
+                    CU(cudaDeviceSynchronize());
+                    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    if (r) best = std::min(best, dt);
+                }
+                return best;
+            };
+            const double gb = (double) N * (K + (K >> 5) * 2) / 1e9, t1 = run(0);
+            std::printf("Q8 planar N=%-5d %6.1f MB: a token %7.3f ms (%5.1f GB/s) | cols T=1 %7.3f ms, T=4 %7.3f ms, "
+                        "T=8 %7.3f ms\n", N, gb * 1e3, t1 * 1e3, gb / t1, run(1) * 1e3, run(4) * 1e3, run(8) * 1e3);
+            cudaFree(dq), cudaFree(dd), cudaFree(dx), cudaFree(dy);
+        }
+    }
+    const int N = 49152, K = 4608, reps = 5;
+    for (const Case& cs : cases) {
+        auto raw = rand_blocks(cs.type, (size_t) N * K);
+        uint8_t* dw = dev(raw);
+        const int x_ld = K;
+        auto x = fvec((size_t) 8 * x_ld, 2.0f);
+        float *dx = dev(x), *dy = dev_n<float>((size_t) 8 * N);
+        auto run = [&](int T, bool rows) {
+            double best = 1e30;
+            for (int r = 0; r < reps + 1; ++r) {
+                CU(cudaDeviceSynchronize());
+                const auto t0 = std::chrono::steady_clock::now();
+                if (rows) k::mv_blocks_rows(cs.type, dw, N, K, dx, x_ld, T, dy, N, 0);
+                else if (T == 0) k::mv_blocks_ref(cs.type, dw, N, K, dx, dy, 0);
+                else
+                    for (int t = 0; t < T; ++t) k::mv_blocks(cs.type, dw, N, K, dx + (size_t) t * x_ld, dy + (size_t) t * N, 0);
+                CU(cudaDeviceSynchronize());
+                const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (r) best = std::min(best, dt);
+            }
+            return best;
+        };
+        const double gb = (double) raw.size() / 1e9;
+        const double t1 = run(1, false);
+        std::printf("%-8s %6.1f MB: a token %7.2f ms (%5.1f GB/s, %5.1f G values/s)", cs.name, gb * 1e3, t1 * 1e3, gb / t1,
+                    (double) N * K / 1e9 / t1);
+        std::printf(" | row dots %7.2f ms", run(0, false) * 1e3);
+        for (int T : {2, 4, 8}) std::printf(" | T=%d rows %7.2f ms (x%.2f)", T, run(T, true) * 1e3, run(T, true) / t1);
+        std::printf("\n");
+        cudaFree(dw), cudaFree(dx), cudaFree(dy);
+    }
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
     cudaDeviceProp p{};
     CU(cudaGetDeviceProperties(&p, 0));
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
+    if (getenv("IK2_TEST_TIME")) {
+        time_rows();
+        return 0;
+    }
     if (getenv("IK2_TEST_WINDOW_ONLY")) {   // (the exact window's checks alone: a GPU without the tensor-core kernels)
         test_window_exact(p.major >= 7);   // (Volta and Turing: their own tensor-core kernels)
         std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);

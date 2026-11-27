@@ -116,11 +116,20 @@ bool attn_prompt_v70_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const
 /// can this build run attn_flash_* on the current GPU (CUDA: always; AMD: the RDNA matrix-core kernel's archs)
 bool attn_flash_available();
 
+/// out [T][C] = sum over token t's K picks (inv [T * K]: their rows) of wtr[row] y32[row], in row order (the prompt's
+/// batched experts: the AMD path, IK2_BATCH_PREFILL on NVIDIA)
+void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
+                      cudaStream_t s);
+
 #ifdef MAYA_USE_HIP
 /// AMD, RDNA 3 / 3.5 / 4 (ik2_rdna.inc): the prompt's routed experts of a layer in three launches from their blocks.
 /// Rows: a token's pick each, grouped by expert in expert order; tiles: int4 {expert, first row, rows <= 32, 0} over
 /// them; eptr [E]: an expert's blocks (gate, then up at off_up / down at off_down, as a cache slot holds them).
-/// Can the current GPU take it for these expert types (all NVFP4 or all Q8_0) and widths (IK2_RDNA_MOE=0: no)?
+/// Can the current GPU take it for these expert types (all NVFP4 or all Q8_0; or gate and up of one type and down of
+/// its own among those and IQ2_XXS / IQ2_XS / IQ1_S / IQ1_M with one of the IQ types there - IK2_RDNA_IQ=0: not
+/// these) and widths (IK2_RDNA_MOE=0: no)?
+/// (kRdnaF16Rows as experts_rdna_gu / _down's type: rows that are FP16 already - the tests' reference)
+constexpr int kRdnaF16Rows = -16;
 bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F);
 /// h16 [rows][F] = SwiGLU(x16 . gate^T * sg[row], x16 . up^T * su[row]) (softcaps gcap / ucap), x16 [rows][C]
 void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_up,
@@ -129,12 +138,11 @@ void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, 
 /// y32 [rows][C] = h16 . down^T
 void experts_rdna_down(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_down,
                        const uint16_t* h16, int C, int F, float* y32, cudaStream_t s);
-/// out [T][C] = sum over token t's K picks (inv [T * K]: their rows) of wtr[row] y32[row], in row order
-void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
-                      cudaStream_t s);
 /// AMD: y [T][ldy] = x [T][K] . W [N][K]^T, BF16 in, F32 sums, T <= 8 (the drafter's block): the weights read once,
 /// a warp's rows sharing each x load.  False (nothing launched): not this shape (K % 8, alignment, T) - the BLAS then.
 bool gemm_bf16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
+/// ... FP16 in (the drafter's base logits through an FP16 copy of the head: the BLAS has no FP16-in F32-out product)
+bool gemm_f16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
 #endif
 
 /// o *= sigmoid(g), n values.
@@ -182,6 +190,48 @@ void two_take_rows(const uint8_t* const* blob, const float* other, int S, int C,
 /// experts_*_mem) leave such a group, and one with a null block, alone.
 void two_take_rows_g(const uint8_t* const* blob, const int* n, const int* row, const float* other, int G, int C,
                      float* y, cudaStream_t s);
+
+/// Two GPUs, a visit's hand-off through host memory both map (maya-ik2, IK2_PEER_DIRECT_SIGNAL=1; CUDA, NVIDIA sm_70 and newer):
+/// a ring of kMailSlots slots, each holding a visit's x [C] and router logits [E], its rows [K][C], and two words that
+/// carry the visit's number n (1, 2, ..) - the slot's "free again" once GPU 1 read the message, the rows' once GPU 1
+/// wrote them.  GPU 0 writes the message and GPU 1 is woken by an event (the host waits its stream on it); GPU 0 takes the
+/// rows by waiting for the rows word.  A word of host memory another GPU writes is read again each time (never a line
+/// kept from a read before) and written through.  A wait is bounded: out of time (kMailWaitNs) the kernel puts n into
+/// err, which the host reads once the token is done.  mail_layout: where each of them is in a slot (the words each on a
+/// line of 128 bytes of its own).
+constexpr int kMailSlots = 4;
+constexpr unsigned long long kMailWaitNs = 5000000000ull;   // (5 s: a hand-off is tens of microseconds)
+struct MailLayout {
+    size_t x = 0, logits = 0, rows = 0;            // in a slot: the visit's x, its router logits, its rows
+    size_t freed = 0, rows_word = 0;               // in a slot: the visit's number, once each is in place
+    size_t slot = 0;                               // a slot's bytes
+    size_t ring = 0;                               // the slots' bytes
+    size_t err = 0;                                // after them, on a line of its own
+};
+MailLayout mail_layout(int C, int E, int K, int max_t = 1);
+/// GPU 0, visit n: waits for the slot's freed word to read free_n (n - kMailSlots: the visit that used the slot last was
+/// read; 0 on the first turn), writes x and the logits into the slot (its writes through to the host memory by the end).
+void mail_send(const float* x, const float* logits, int C, int E, float* slot_x, const unsigned* freed, unsigned n,
+               unsigned free_n, unsigned* err, cudaStream_t s);
+/// GPU 1, visit n, its stream ordered after GPU 0's mail_send (the host waits it on an event): copies the slot's x and
+/// logits into its own memory (x, the logits), sets the slot's freed word to n.
+void mail_recv(const float* slot_x, int C, int E, float* x, float* logits, unsigned* freed, unsigned n, cudaStream_t s);
+/// GPU 1, visit n, its picks run (y [K][C] on its device): the rows of the slots it ran (blob [K]: a block's pointer -
+/// not a null, not kHeldElsewhere) written into the slot's rows; the slot's rows word set to n.
+void mail_publish(const uint8_t* const* blob, const float* y, int K, int C, float* rows, unsigned* rows_word, unsigned n,
+                  cudaStream_t s);
+/// Grouped form of mail_publish for a verify window (groups 0..G-1 from group_route).
+void mail_publish_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* y, int G, int C,
+                    float* rows, unsigned* rows_word, unsigned visit_n, cudaStream_t s);
+/// GPU 0, visit n: the rows of its picks marked kHeldElsewhere (blob [K]) taken from the slot's rows into y [K][C].  A
+/// block with no such pick leaves at once - most visits have none (GPU 1 holds the experts the profile picks rarely);
+/// one with waits for the rows word to read n.
+void two_take_rows_mail(const uint8_t* const* blob, const float* rows, const unsigned* rows_word, unsigned n, int S, int C,
+                        float* y, unsigned* err, cudaStream_t s);
+/// Grouped form of two_take_rows_mail for a verify window.
+void two_take_rows_mail_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* rows,
+                          const unsigned* rows_word, unsigned visit_n, int G, int C, float* y, unsigned* err,
+                          cudaStream_t s);
 
 /// y = a + b, n values (y may alias either).
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
@@ -242,6 +292,13 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
 /// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
 /// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
 void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+/// ... through the row dots whatever the GPU and the type (mv_blocks may take another kernel with the same sums: the
+/// tests hold the two together bit for bit).
+void mv_blocks_ref(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+/// ... for T tokens, x [T] rows x_ld apart, y [T] rows y_ld apart: each token's y is mv_blocks' to the bit, the matrix
+/// read from the memory once (a verify window's products over a matrix kept as blocks).
+void mv_blocks_rows(int type, const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                    cudaStream_t s);
 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.
@@ -395,6 +452,18 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 /// once, a window of w keys needs no more than w / 64.  scratch: attn_decode_mma_scratch(H, n_split) floats.
 /// gate [H][128] (or null): the output times its sigmoid (gate_mul's); out16 (or null): an FP16 copy of the output.
 int attn_decode_mma_blocks(int Hkv);
+/// The one-token FP8 path's dequant (attn_decode_mma_fp8, not the window's): e4m3x4_h4_s8, the same bits in fewer
+/// operations (AMD only, on by default; IK2_ATTN_S8=0 in maya-ik2 turns it off; NVIDIA keeps e4m3x4_h4).
+void attn_decode_mma_set_s8(bool on);
+bool attn_decode_mma_s8();
+/// AMD's RDNA 3 / 4 (wave32): the FP8 cache's one-token attention (attn_decode_mma_fp8 and the window's
+/// attn_decode_mma_toks_fp8) on attn_decode_rdna_kernel - v_dot2 and DPP for the emulated m16n8k16, the same blocks,
+/// partials and combine, always the e4m3x4_h4_s8 dequant.  0: off (the default); 1: on.
+/// Not attn_decode_mma_kernel's bits (its sums in another order).  Elsewhere, or a K / V head's R over 8: off whatever
+/// the mode.
+void attn_decode_rdna_set(int mode);
+int attn_decode_rdna_mode();
+bool attn_decode_rdna_available();   // (this GPU takes it: RDNA 3 / 4, wave32)
 size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
@@ -512,7 +581,8 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 // ---- the weights' decodes (ggml's block types; values exactly ggml's dequantize_row_*, then rounded to the output)
 
 /// ggml type ids of the blocks these decode.
-constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_XS = 23, kNVFP4 = 40;
+constexpr int kQ4_K = 12, kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18,
+               kIQ1_S = 19, kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29, kNVFP4 = 40;
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);
 size_t block_bytes(int type);

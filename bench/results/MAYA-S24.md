@@ -3,20 +3,13 @@
 Maya-S24 (94.7 GB, `Maya-S24/` on [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF)) is
 Maya-S with the weights every token uses in 4-bit instead of 6-bit, for GPUs with 24 GB or less.
 
-| Tensors | Maya-S | Maya-S24 |
-| --- | --- | --- |
-| routed experts (95% of the model) | IQ2_XXS gate/up, IQ2_S / IQ3_XXS down | Maya-S's, byte for byte |
-| attention projections (KDA q/k/v/output, MLA q_a/q_b/kv_a/output), shared experts | Q6_K | **Q4_K** |
-| attention k_b / v_b (read as BF16 by the engine), dense layers, embeddings, output | Q6_K | Q6_K |
-| KDA gates, the DSA indexer / router, norms | Q8_0 / F32 | Q8_0 / F32 |
+S24 swaps the attention projections and shared experts (the weights every token uses) for smaller ones; the routed experts are Maya-S's.
 
 **Why:** the weights every token uses stay on the GPU.
 - In Maya-S they take 6.86 GB, 29% of a 24 GB card such as an RTX 3090 or 4090. That leaves fewer experts in VRAM, so more of each token's experts come from RAM or the SSD.
 - In 4-bit they take about 1.5 GB less, room for about 200 more experts.
 
-**How it was made:**
-- The 4-bit tensors were quantized straight from Z.ai's FP8 release, with the same calibration statistics as Maya-S (an importance matrix from the FP8 model).
-- They were then put in place of Maya-S's 6-bit ones; every other tensor is Maya-S's, byte for byte. Recipe: `tools/maya_quant/recipes/maya-s24.json`.
+**How it was made:** from Z.ai's FP8 release; every other tensor is Maya-S's.
 
 ## Speed
 

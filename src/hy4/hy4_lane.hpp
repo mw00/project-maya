@@ -108,9 +108,12 @@ struct CpuExperts {
     // (0: g_stride / d_stride) the step from one expert's matrix to the next's - the GPU fetch's RAM store, where an
     // expert's three matrices lie side by side in one blob (gate, up, down at its offsets): the blob's bytes
     size_t step = 0;
-    const uint8_t* G(size_t e) const { return gate + e * (step ? step : g_stride); }
-    const uint8_t* U(size_t e) const { return up + e * (step ? step : g_stride); }
-    const uint8_t* D(size_t e) const { return down + e * (step ? step : d_stride); }
+    // (HY4_PSTREAM: an expert's blob in pinned RAM, gate / up / down at these offsets - null: the matrices above)
+    const uint8_t* const* blobp = nullptr;
+    size_t off_g = 0, off_u = 0, off_d = 0;
+    const uint8_t* G(size_t e) const { return blobp && blobp[e] ? blobp[e] + off_g : gate + e * (step ? step : g_stride); }
+    const uint8_t* U(size_t e) const { return blobp && blobp[e] ? blobp[e] + off_u : up + e * (step ? step : g_stride); }
+    const uint8_t* D(size_t e) const { return blobp && blobp[e] ? blobp[e] + off_d : down + e * (step ? step : d_stride); }
     float limit = 0.0f;
     std::shared_ptr<Q4xSet> q4x;         // (null: no copies for this layer)
     size_t q4x_gu = 0, q4x_d = 0;        // the form's bytes of an expert's gate (= up) matrix, its down matrix

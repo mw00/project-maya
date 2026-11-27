@@ -437,6 +437,78 @@ class Settings(unittest.TestCase):
         self.assertTrue(plan["ok"], plan.get("why"))
         self.assertEqual(Path(plan["folder"]).name, "Inkling-2-Mini")
 
+    def ling_cfg(self, extra=()) -> Path:
+        """Ling-3.2-air as the setup writes it (maya.write_config_ling): its GGUF in the model's folder, maya-ling's own
+        flags, the model's sampling and level."""
+        d = self.d / "models" / "Ling-3.2-air"
+        (d / "maya-ling" / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (d / "Ling-3.2-air-Maya-S-IQ2_XXS.gguf").write_bytes(b"x" * 1000)
+        args = ["--serve", "--gguf", str(d / "Ling-3.2-air-Maya-S-IQ2_XXS.gguf"), "--max-context", "65536", "--kv", "fp16",
+                "--drafting", "auto", "--cal-file", str(d / "maya-ling" / "ling-calibration.txt"), *extra]
+        cfg = {"exe": "/b/maya-ling", "backend": "cuda", "gpu": [0], "args": args, "tokenizer": str(d / "maya-ling" / "tokenizer"),
+               "model_name": "ling-3.2-air", "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+               "reasoning_effort": "high", "installer": {"family": "ling", "quant": "Ling-3.2-air-Maya-S",
+                                                         "ling_quant": "Ling-3.2-air-Maya-S", "drafting": "auto"}}
+        p = self.d / "maya-ling-3.2-air-maya-s.json"
+        p.write_text(json.dumps(cfg))
+        return p
+
+    def test_ling_read_and_written_with_its_own_flags(self):
+        """Ling-3.2-air on the Models page: context, drafting (on / off; the setup's auto shows as on), KV cache (F16 / 8-bit), GPUs, prompt chunk
+        and CPU threads - maya-ling's own flags; a save from the page (every setting sent back) changes nothing it did
+        not change, and writes no --vision (the page offers no pictures for it); one answer at a time."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0},
+                                                                   {"index": 1, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        cfg = M.read(self.ling_cfg())
+        self.assertEqual(M.family(cfg), "ling")
+        s = M.settings_of(cfg)
+        self.assertEqual(s, {"context": 65536, "gpus": [0], "env": {}, "ablate": False, "images": False, "kv": "f16",
+                             "draft": "on", "parallel": 1, "prefill_chunk": None, "cpu_threads": None})
+        self.assertEqual(M.choices(cfg)["draft"], ["on", "none"])
+        self.assertEqual(M.flag(M.apply(cfg, {"draft": "on"})["args"], "--drafting"), "auto")   # (On: auto stays)
+        self.assertEqual(M.choices(cfg)["kv"], ["f16", "q8"])
+        self.assertFalse(M.choices(cfg)["images"])                  # (no vision file: tools/ling/download.json has none)
+        self.assertEqual(M.apply(cfg, {}), cfg)
+        self.assertEqual(M.apply(cfg, s), cfg)                       # (the page's save: every setting, none changed)
+        new = M.apply(cfg, {**s, "context": 131072, "kv": "q8", "draft": "none", "prefill_chunk": 1024, "cpu_threads": 12})
+        for f, v in (("--max-context", "131072"), ("--kv", "q8"), ("--drafting", "off"), ("--prefill-chunk", "1024"),
+                     ("--cpu-threads", "12")):
+            self.assertEqual(M.flag(new["args"], f), v, f)
+        self.assertNotIn("--vision", new["args"])
+        self.assertEqual({M.settings_of(new)[k] for k in ("kv", "draft")}, {"q8", "none"})
+        back = M.apply(new, {"draft": "on"})                         # (On again: --drafting on, no measuring)
+        self.assertEqual((M.flag(back["args"], "--drafting"), M.settings_of(back)["draft"]), ("on", "on"))
+        self.assertEqual(M.apply(back, M.settings_of(back)), back)
+        for args, want in ((["--drafting", "mtp"], "on"), (["--drafting", "none"], "none"), (["--mtp"], "on"),
+                           (["--spec-k", "2"], "on"), (["--spec-k", "0"], "none"), ([], "none")):
+            self.assertEqual(M.ling_draft_of(args), want, args)
+        two = M.apply(cfg, {**s, "gpus": [0, 1]})
+        self.assertEqual((two["gpu"], M.flag(two["args"], "--gpus")), ([0, 1], "0,1"))
+        for bad, why in (({"parallel": 2}, "one request at a time"), ({"kv": "fp8"}, "f16 or q8"), ({"draft": "auto"}, "on or off"),
+                         ({"prefill_chunk": 32}, "Prefill chunk"), ({"tp": 2}, "not a setting"),
+                         ({"reserve_gb": 1.0}, "not a setting")):
+            with self.assertRaises(ValueError, msg=str(bad)) as e:
+                M.apply(cfg, bad)
+            self.assertIn(why, str(e.exception))
+        # (a vision file the user added by hand: the page's save keeps it as it is)
+        own = M.read(self.ling_cfg(extra=("--mmproj", "/m/mmproj.gguf")))
+        self.assertEqual(M.apply(own, M.settings_of(own)), own)
+
+    def test_ling_described_for_the_page(self):
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        m = M.describe(self.ling_cfg(), None)
+        self.assertEqual((m["family"], m["model"], m["ok"]), ("ling", "ling-3.2-air", True))
+        self.assertEqual(m["contexts"], [8192, 16384, 32768, 65536, 131072, 262144])
+        self.assertEqual(m["context_range"]["tested"], 262144)
+        self.assertEqual(m["ling_kv_bytes"], {"f16": 8064, "q8": 4704})
+        fit = m["ling_fit"]["f16"]["65536"]
+        self.assertTrue({"fits_trunk", "resident", "vram_pct", "ssd_gib"} <= set(fit))   # (what the page's note reads)
+        self.assertEqual(sorted(m["ling_fit"]), ["f16", "q8"])
+
     def test_hy4_read_and_written_with_its_own_flags(self):
         cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": i, "name": "V100", "vram_gb": 16.0}
                                                                    for i in range(4)])
@@ -508,6 +580,22 @@ class Settings(unittest.TestCase):
         # (no VRAM figure: the contexts up to the one the setup wrote - test_hy4_contexts_that_fit)
         self.assertEqual((row["family"], row["quant"], row["contexts"]), ("hy4", "Maya-XS", [4096, 8192, 16384, 32768]))
         self.assertEqual(row["context_range"], {"min": 4096, "max": 32768, "trained": 1048576, "tested": 32768})
+
+    def test_hy4_tensor_parallel_auto_round_trip(self):
+        """#1249: Hy4-Flash shows tp "auto"; saving it (or going back to it) writes no --tp, a number writes one."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": i, "name": "V100", "vram_gb": 16.0}
+                                                                   for i in range(4)])
+        cards.start()
+        self.addCleanup(cards.stop)
+        cfg = M.read(hy4_cfg(self.d))
+        self.assertEqual(M.settings_of(cfg)["tp"], "auto")
+        self.assertNotIn("--tp", M.apply(cfg, {"tp": "auto"})["args"])
+        two = M.apply(cfg, {"tp": 2})
+        self.assertEqual((M.flag(two["args"], "--tp"), M.settings_of(two)["tp"]), ("2", 2))
+        back = M.apply(two, {"tp": "auto"})
+        self.assertNotIn("--tp", back["args"])
+        self.assertEqual(M.settings_of(back)["tp"], "auto")
+        self.assertEqual(M.apply(cfg, {"tp": ""})["args"], M.apply(cfg, {"tp": "auto"})["args"])
 
     def test_hy4_a_new_context_gets_the_setups_chunk_again(self):
         """A small-card layout's prompt chunk is the setup's choice for one context (maya.py's hy4_fit: a picture's
@@ -987,6 +1075,32 @@ class Settings(unittest.TestCase):
                "installer": {"family": "qwen", "quant": "CYBER-FROST-3.8-PS", "qwen_quant": "q5_k_m"}}
         self.assertEqual(M.quant_label(cfg, Path("maya-cyber-frost.json")), "Q5_K_M")
         self.assertEqual(M.maya_quants.config_label(cfg), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
+
+
+class PageValidity(unittest.TestCase):
+    """The Models page's own check of a draft (serve/web/models.js badField), run with node where it is installed."""
+
+    def test_tp_auto_is_a_valid_value(self):       # #1249: "Save and restart" stayed disabled for Hy4-Flash
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        import re
+        src = (ROOT / "serve/web/models.js").read_text(encoding="utf-8")
+        parts = [re.search(pat, src, re.S).group(0) for pat in (
+            r"const NUMS = \[.*?\];", r"const DECS = \[.*?\];", r"const whole = [^\n]*;",
+            r"const decimal = [^\n]*;", r"function badField\(k, v\) \{.*?\n\}")]
+        script = "\n".join(parts) + """
+const r = {auto: badField("tp", "auto"), two: badField("tp", "2"), empty: badField("tp", ""), zero: badField("tp", 0),
+  word: badField("tp", "fast"), ctxAuto: badField("context", "auto"), other: badField("prefill_chunk", "x"),
+  dec: badField("reserve_gb", "1.5"), decBad: badField("reserve_gb", "a")};
+console.log(JSON.stringify(r));"""
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"auto": False, "two": False, "empty": False, "zero": False,
+                                                  "word": True, "ctxAuto": True, "other": True,
+                                                  "dec": False, "decBad": True})
 
 
 class Served(unittest.TestCase):
