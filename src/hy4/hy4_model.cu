@@ -405,6 +405,18 @@ struct Gpu {
     // picture is lent from its start: vis_encode)
     uint8_t* arena = nullptr;
     size_t arena_b = 0;
+    // (--lend: the prompt path's buffers, then the token path's own W-sized ones after the picture's room - an arena's
+    //  worth of prompt buffers becomes expert slots at decode, and the token path reads and writes its small copies.
+    //  use_path() points every carved buffer at the path this forward runs.)
+    std::vector<std::pair<void**, size_t>> ppath, dpath;
+    std::vector<std::pair<void**, void*>> pabs;   // (--lend: the lent buffers' own addresses, not the arena's)
+    uint8_t *pbase = nullptr, *dbase = nullptr;
+    void use_path(bool prompt) {
+        const uint8_t* b = prompt ? pbase : dbase;
+        for (const auto& e : (prompt ? ppath : dpath)) *(void**) e.first = (void*) (b + e.second);
+        if (prompt)
+            for (const auto& e : pabs) *(void**) e.first = e.second;
+    }
     // a window's activations
     float *x = nullptr, *cur = nullptr, *post = nullptr, *xa = nullptr, *qa = nullptr, *qr = nullptr, *q = nullptr;
     float *qcat = nullptr, *kvr = nullptr, *o = nullptr, *ob = nullptr, *g = nullptr, *y = nullptr, *xf = nullptr;
@@ -1021,13 +1033,7 @@ struct Model::Impl {
         if (h_pos) cudaFreeHost(h_pos);
         if (h_emb) cudaFreeHost(h_emb);
         if (df.h_emb) cudaFreeHost(df.h_emb);
-        if (h_ids) cudaFreeHost(h_ids);
         if (h_who) cudaFreeHost(h_who);
-        if (h_w) cudaFreeHost(h_w);
-        if (h_lat) cudaFreeHost(h_lat);
-        if (h_cpu) cudaFreeHost(h_cpu);
-        if (h_stage) cudaFreeHost(h_stage);
-        if (h_pmap) cudaFreeHost(h_pmap);
         for (uint16_t* p : kv_host)
             if (p) cudaFreeHost(p);
         for (int* p : sp_host)
@@ -1035,6 +1041,8 @@ struct Model::Impl {
         for (Gpu& gp : G)
             for (void* p : {(void*) gp.hs_ids, (void*) gp.hs_stage, (void*) gp.hs_pmap})
                 if (p) cudaFreeHost(p);
+        for (Lender& ln : lenders)
+            if (ln.bounce) cudaFreeHost(ln.bounce);
         crew.reset();
         summer.reset();
         for (void* p : {(void*) tp_part, (void*) tp_sum, (void*) tp_xo, (void*) tp_fout, (void*) tp_fin, (void*) tp_fx,
@@ -3589,12 +3597,188 @@ struct Model::Impl {
 
     // (only_bytes: nothing allocated - what the buffers come to for this GPU's sH / sFF.  stage_b: the GPU's staging
     //  slots for a prompt's streamed experts, at the allocation's end - a pass's copy, idle between prompts as the rest)
+    // (--lend: the prompt-only buffers live in expert slots on each GPU - the experts' F16 set rows (sh16, sy), the
+    //  GEMM's F16 rows and weight band (xh16, wband), the staging slots (stage).  One lender a buffer now, each in a
+    //  layer of its own - one layer's slots could hold 511 experts, so the five buffers in one layer left most of the
+    //  idle space unborrowed; a buffer a layer uses all of it.  Between prompts the slots hold that layer's next
+    //  most-routed experts; a prompt's first chunk vacates them (those experts to the CPU lane, the buffers its own),
+    //  and the first token window after it refills them from the model's file (the prompt overwrote them).  The bytes
+    //  are the scratch's own - used by the two paths in turn, not extra VRAM.)
+    struct Lender {
+        int gi = -1, il = -1, slot0 = 0, n = 0;   // (the slots [slot0, slot0 + n) lent)
+        std::vector<std::pair<int, size_t>> bufs; // (the buffers it holds, and each one's offset in its span)
+        size_t total = 0;                         // (the span's bytes: its buffers')
+        std::vector<int> experts, slots;          // (the experts in them, slot order)
+        uint8_t* bounce = nullptr;                // (the refill's gather, pinned: the copy does not wait on it)
+        size_t bounce_b = 0;
+    };
+    std::vector<Lender> lenders;   // (every GPU's lenders, in order)
+    static constexpr int kLendBuffers = 15;   // (the prompt arena's buffers: the five prompt-only ones, then the big
+                                              //  shared ones - the split makes every one of them the prompt path's alone)
+    static constexpr int kLendLayers = 5;     // (a GPU's lender layers: the buffers are packed into them, 256 bytes
+                                              //  apart, so the slot rounding is a lender's blob - not a buffer's each)
+    std::vector<std::vector<std::pair<int, size_t>>> lend_map;   // [gpu][buffer] -> (lender, offset); -1: in the arena
+    // (a lent slot holds a prompt buffer between prompts: the experts in it are the lender's own list and HY4_HOT must
+    //  leave them where they are - a swap into one would leave its expert mapped to buffer bytes at the next prompt)
+    bool lent_slot(int il, int slot) const {
+        for (const Lender& ln : lenders)
+            if (ln.il == il && slot >= ln.slot0 && slot < ln.slot0 + ln.n) return true;
+        return false;
+    }
+    bool lend_vacated = false;
+    bool lend_ready() const {
+        for (const Lender& l : lenders)
+            if (l.il >= 0) return true;
+        return false;
+    }
+    // (a layer's expert blob bytes, as load_layer sizes it: gate and up padded to 256 bytes, down after them)
+    size_t blob_of(int il) const {
+        const std::string pre = "blk." + std::to_string(il) + ".";
+        const Tensor* tg = pk.get(pre + "ffn_gate_exps.weight");
+        const Tensor* tu = pk.get(pre + "ffn_up_exps.weight");
+        const Tensor* td = pk.get(pre + "ffn_down_exps.weight");
+        if (!tg || !tu || !td) return 0;
+        const int lat = g.n_lat, ff = g.n_ff_exp;
+        auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+        const size_t gb = iq::row_bytes(type_id(tg->type), lat) * (size_t) ff;
+        const size_t db = iq::row_bytes(type_id(td->type), ff) * (size_t) lat;
+        return al(2 * al(gb) + db);
+    }
+    // (--lend: a prompt's read takes the slots back for its buffers; a token window hands them to their experts again -
+    //  the blobs gathered in one pass over all the lenders' experts, then a copy a GPU, queued before its kernels)
+    bool lend_apply(bool prompt, std::string& err) {
+        if (!lend_ready() || prompt == lend_vacated) return true;
+        for (Lender& ln : lenders) {   // the routing tables first
+            if (ln.il < 0) continue;
+            Layer& l = L[(size_t) ln.il];
+            Gpu& gp = G[(size_t) ln.gi];
+            if (cudaSetDevice(gp.dev) != cudaSuccess) {
+                err = "the lent slots: selecting CUDA " + std::to_string(gp.dev) + " failed";
+                return false;
+            }
+            if (prompt) {
+                for (int e : ln.experts) l.slot_of[(size_t) e] = -1;
+            } else {
+                for (size_t i = 0; i < ln.experts.size(); ++i) l.slot_of[(size_t) ln.experts[i]] = ln.slots[(size_t) i];
+            }
+            if (cudaMemcpyAsync(l.slot_d, l.slot_of.data(), sizeof(int) * (size_t) g.n_expert, cudaMemcpyHostToDevice,
+                                gp.s) != cudaSuccess) {
+                err = "the lent slots: the routing table did not go (" +
+                      std::string(cudaGetErrorString(cudaGetLastError())) + ")";
+                return false;
+            }
+        }
+        if (!prompt) {
+            // (the blobs: one gather pass over every lender's experts - the lane's threads once - then a copy a GPU)
+            struct Item {
+                Lender* ln;
+                int i;
+            };
+            std::vector<Item> items;
+            for (Lender& ln : lenders) {
+                if (ln.il < 0) continue;
+                Layer& l = L[(size_t) ln.il];
+                const size_t nb = ln.experts.size();
+                if (nb == 0) continue;
+                if (ln.bounce_b < nb * l.blob) {
+                    if (ln.bounce) cudaFreeHost(ln.bounce);
+                    ln.bounce = nullptr;
+                    if (cudaMallocHost((void**) &ln.bounce, nb * l.blob) != cudaSuccess) {
+                        ln.bounce_b = 0;
+                        err = "the lent slots: the refill's pinned buffer did not come";
+                        return false;
+                    }
+                    ln.bounce_b = nb * l.blob;
+                }
+                for (int i = 0; i < (int) nb; ++i) items.push_back({&ln, i});
+            }
+            auto gather = [&](int k) {
+                Lender& ln = *items[(size_t) k].ln;
+                const Layer& l = L[(size_t) ln.il];
+                const size_t i = (size_t) items[(size_t) k].i;
+                uint8_t* b = ln.bounce + i * l.blob;
+                const size_t e = (size_t) ln.experts[i];
+                std::memcpy(b + l.tr[0], l.cex.G(e), l.cex.g_stride);
+                std::memcpy(b + l.tr[1], l.cex.U(e), l.cex.g_stride);
+                std::memcpy(b + l.tr[2], l.cex.D(e), l.cex.d_stride);
+            };
+            const double tg = now_s();
+            if (lane && items.size() >= 2) lane->parallel_for((int) items.size(), gather);
+            else
+                for (int k = 0; k < (int) items.size(); ++k) gather(k);
+            if (std::getenv("HY4_LEND_TRACE"))
+                std::fprintf(stderr, "maya-hy4: lend refill: %zu experts gathered in %.1f ms\n", items.size(),
+                             (now_s() - tg) * 1e3);
+            for (Lender& ln : lenders) {
+                if (ln.il < 0 || ln.experts.empty()) continue;
+                Layer& l = L[(size_t) ln.il];
+                Gpu& gp = G[(size_t) ln.gi];
+                if (cudaSetDevice(gp.dev) != cudaSuccess) {
+                    err = "the lent slots: selecting CUDA " + std::to_string(gp.dev) + " failed";
+                    return false;
+                }
+                const double tc0 = now_s();
+                if (cudaMemcpyAsync(l.experts + (size_t) ln.slot0 * l.blob, ln.bounce, ln.experts.size() * l.blob,
+                                    cudaMemcpyHostToDevice, gp.s) != cudaSuccess) {
+                    err = "the lent slots' experts did not go back (" +
+                          std::string(cudaGetErrorString(cudaGetLastError())) + ")";
+                    return false;
+                }
+                if (std::getenv("HY4_LEND_TRACE")) {
+                    if (cudaStreamSynchronize(gp.s) == cudaSuccess)
+                        std::fprintf(stderr, "maya-hy4: lend refill gpu %d: %.1f MB copied in %.1f ms\n", ln.gi,
+                                     (double) (ln.experts.size() * l.blob) / 1e6, (now_s() - tc0) * 1e3);
+                }
+            }
+        }
+        lend_vacated = prompt;
+        if (std::getenv("HY4_LEND_VERIFY") && !prompt) {   // (the refill's bytes: every slot's blob against the gathered one)
+            for (Lender& ln : lenders) {
+                if (ln.il < 0 || ln.experts.empty()) continue;
+                Layer& l = L[(size_t) ln.il];
+                Gpu& gp = G[(size_t) ln.gi];
+                if (cudaSetDevice(gp.dev) != cudaSuccess || cudaStreamSynchronize(gp.s) != cudaSuccess) continue;
+                std::vector<uint8_t> back(ln.experts.size() * l.blob);
+                if (cudaMemcpy(back.data(), l.experts + (size_t) ln.slot0 * l.blob, back.size(),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    continue;
+                }
+                size_t bad = 0;
+                for (size_t i = 0; i < ln.experts.size(); ++i)
+                    if (std::memcmp(back.data() + i * l.blob, ln.bounce + i * l.blob, l.blob) != 0) ++bad;
+                std::fprintf(stderr, "maya-hy4: lend verify gpu %d layer %d: %zu of %zu experts differ in VRAM\n",
+                             ln.gi, ln.il, bad, ln.experts.size());
+            }
+        }
+        if (std::getenv("HY4_LEND_TRACE"))
+            std::fprintf(stderr, "maya-hy4: lend: the slots %s\n",
+                         prompt ? "vacated (a prompt's buffers)" : "refilled (their experts)");
+        return true;
+    }
+    // scratch() for a GPU that lends its prompt-only buffers a layer's slots
     bool scratch(Gpu& gp, std::string& err, size_t* only_bytes = nullptr, size_t stage_b = 0) {
         VPart vpart(kVPrompt);
         if (!only_bytes) CK(cudaSetDevice(gp.dev));
         const size_t E = (size_t) g.n_embd, hc = (size_t) g.hc, H = (size_t) gp.sH, maxk = (size_t) g.ix_top_k + g.ix_kpool;
-        const size_t lat = (size_t) g.n_lat, ff = (size_t) (gp.sFF ? gp.sFF : g.n_ff), ffe = (size_t) g.n_ff_exp,
-                     T = (size_t) Tc;
+        const size_t lat = (size_t) g.n_lat, ffe = (size_t) g.n_ff_exp;
+        size_t T = (size_t) Tc;   // (--lend: the carve's token count - W for the token path's own buffers)
+        // (the widest FFN this card's own layers run: the dense layer's on the card that holds it, else the MoE layers'
+        //  shared expert - 1536, not the dense width 13824: gu and hd below were the dense width's on every card, 576
+        //  MiB of VRAM a card over; the size-only pass keeps the widest, as the plan reserves it)
+        size_t ff = (size_t) (gp.sFF ? gp.sFF : g.n_ff);
+        if (!only_bytes && tp <= 1) {
+            int gi = -1;
+            for (size_t i = 0; i < G.size(); ++i)
+                if (&G[i] == &gp) gi = (int) i;
+            size_t widest = 0;
+            for (const Layer& l : L) {
+                if (gi < 0 || l.gpu != gi) continue;
+                if (l.dense && l.ffn_gate.w != nullptr) widest = std::max(widest, (size_t) l.ffn_gate.n);
+                if (!l.dense && l.sh_gate.w != nullptr) widest = std::max(widest, (size_t) l.sh_gate.n);
+            }
+            if (widest > 0) ff = widest;
+        }
         const size_t egc = (size_t) std::max(1, pk.eg.cols()) * std::max(1, pk.eg.head_dim);
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
         const size_t npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
@@ -3626,21 +3810,61 @@ struct Model::Impl {
         // the one allocation in the same order
         size_t at = 0;
         bool carve = false;
-        auto take = [&](auto*& p, size_t n) {
+        uint8_t* car_base = nullptr;
+        std::vector<std::pair<void**, size_t>>* car_rec = nullptr;
+        std::vector<size_t>* rec_sz = nullptr;              // (this pass's bytes a buffer, by its call's index)
+        const std::vector<size_t>* same_sz = nullptr;       // (the prompt pass's: equal -> the buffer does not scale
+                                                            //  with T and the token path shares the prompt one)
+        size_t call_i = 0;
+        auto take_at = [&](auto*& p, size_t n, size_t idx) {
             const size_t b = (std::max<size_t>(n * sizeof(*p), 256) + 255) & ~(size_t) 255;
-            if (carve) p = (std::remove_reference_t<decltype(p)>) (void*) (gp.arena + at);
+            if (rec_sz) {
+                if (rec_sz->size() <= idx) rec_sz->resize(idx + 1, 0);
+                (*rec_sz)[idx] = b;
+            }
+            if (same_sz && idx < same_sz->size() && (*same_sz)[idx] == b) return true;   // (the prompt pointer stays)
+            if (carve) p = (std::remove_reference_t<decltype(p)>) (void*) (car_base + at);
+            if (car_rec) car_rec->push_back({(void**) &p, at});
             at += b;
             return true;
         };
+        auto take = [&](auto*& p, size_t n) { return take_at(p, n, call_i++); };
+        // (--lend: this GPU's prompt-only buffers, in the lender layer's slots instead of the arena)
+        int gi_self = -1;
+        if (!only_bytes)
+            for (size_t i = 0; i < G.size(); ++i)
+                if (&G[i] == &gp) gi_self = (int) i;
+        auto take_l = [&](auto*& p, size_t n, int k) {
+            const size_t idx = call_i++;   // (the call order is the same in every pass: the shared check's index)
+            if (T == (size_t) Tc && gi_self >= 0 && (size_t) gi_self < lend_map.size() &&
+                (size_t) k < lend_map[(size_t) gi_self].size()) {   // (the lent buffers are the prompt path's)
+                const std::pair<int, size_t>& m = lend_map[(size_t) gi_self][(size_t) k];
+                if (m.first >= 0 && (size_t) m.first < lenders.size() && lenders[(size_t) m.first].il >= 0) {
+                    const Lender& ln = lenders[(size_t) m.first];
+                    const Layer* ll = &L[(size_t) ln.il];
+                    p = (std::remove_reference_t<decltype(p)>) (void*) (ll->experts + (size_t) ln.slot0 * ll->blob +
+                                                                       m.second);
+                    // (a lent buffer is not in the arena: its prompt pointer kept beside the path's, to be put back
+                    //  after a token forward's own pointers)
+                    if (rec_sz) {
+                        if (rec_sz->size() <= idx) rec_sz->resize(idx + 1, 0);
+                        (*rec_sz)[idx] = (std::max<size_t>(n * sizeof(*p), 256) + 255) & ~(size_t) 255;
+                    }
+                    if (carve && car_rec == &gp.ppath) gp.pabs.push_back({(void**) &p, (void*) p});
+                    return true;
+                }
+            }
+            return take_at(p, n, idx);
+        };
         auto all = [&]() {
-            return take(gp.x, T * hc * E) && take(gp.cur, T * E) && take(gp.post, T * hc) &&
+            return take_l(gp.x, T * hc * E, 7) && take(gp.cur, T * E) && take(gp.post, T * hc) &&
                take(gp.xa, T * E) && take(gp.qa, T * g.q_lora) && take(gp.qr, T * g.q_lora) &&
-               take(gp.q, T * H * g.k_mla) && take(gp.qcat, T * H * g.kv_row()) &&
-               take(gp.kvr, T * g.kv_row()) && take(gp.o, T * H * g.kv_lora) &&
-               take(gp.ob, T * H * g.v_mla) && take(gp.g, T * H * g.v_mla) &&
-               take(gp.y, T * E) && take(gp.xf, T * E) && take(gp.gu, T * ff * 2) &&
+               take_l(gp.q, T * H * g.k_mla, 10) && take_l(gp.qcat, T * H * g.kv_row(), 5) &&
+               take(gp.kvr, T * g.kv_row()) && take_l(gp.o, T * H * g.kv_lora, 6) &&
+               take_l(gp.ob, T * H * g.v_mla, 11) && take_l(gp.g, T * H * g.v_mla, 12) &&
+               take_l(gp.y, T * E, 13) && take_l(gp.xf, T * E, 14) && take_l(gp.gu, T * ff * 2, 8) &&
                take(gp.hd, T * ff) && take(gp.rl, T * g.n_expert) && take(gp.rw, T * 16) &&
-               take(gp.ids, T * 16) && take(gp.lat, T * lat) && take(gp.latout, T * (lat + (gp.sFF ? E : 0))) &&
+               take(gp.ids, T * 16) && take(gp.lat, T * lat) && take_l(gp.latout, T * (lat + (gp.sFF ? E : 0)), 9) &&
                take(gp.xq, W * qk) && take(gp.xd, W * qk / 32) &&
                take(gp.xq4, W * E) && take(gp.xd4, W * E / 32) &&
                take(gp.x2q, 2 * W * lat) && take(gp.x2d, 2 * W * lat / 32) &&
@@ -3650,33 +3874,88 @@ struct Model::Impl {
                take(gp.grp_start, 16 * W + 2) && take(gp.grp_ent, 16 * W) &&
                take(gp.n_groups, 1) &&
                take(gp.ws, k::attn_ws_floats(kSub, (int) H, g.kv_lora, (int) maxk)) &&
-               take(gp.pos, 3 * T) && take(gp.keys, T * maxk) && take(gp.knk, T) &&
+               take(gp.pos, 3 * (size_t) Tc) && take(gp.keys, T * maxk) && take(gp.knk, T) &&
                take(gp.iq, T * g.ix_heads * g.ix_dim) && take(gp.ik, T * g.ix_dim) &&
                take(gp.ivt, T * 2 * g.ix_dim) && take(gp.wt, T * g.ix_heads) &&
                take(gp.score, (size_t) kSub * npool) && take(gp.eg_rows, T * egc) &&
                take(gp.eg_valid, T) && take(gp.eg_r, T * egc) &&
                (eg_scale == nullptr || take(gp.eg_sc, T * (size_t) std::max(1, pk.eg.cols()))) &&
                take(gp.eg_kvo, T * (hc + 1) * E) && take(gp.hcur, T * E) &&
-               take(gp.xh16, T * qk) && take(gp.wband, kBand) && take(gp.sh16, 16 * T * ffe) &&
-               take(gp.sy, 16 * T * lat) && take(gp.cpo, T * lat) && take(gp.bounds, 1025) && take(gp.stok, 16 * T) &&
+               take_l(gp.xh16, T * qk, 0) && take_l(gp.wband, kBand, 1) && take_l(gp.sh16, 16 * T * ffe, 2) &&
+               take_l(gp.sy, 16 * T * lat, 3) && take(gp.cpo, T * lat) && take(gp.bounds, 1025) && take(gp.stok, 16 * T) &&
                take(gp.srow, 16 * T) && take(gp.sS, att) && take(gp.sP, att) &&
                take(gp.dmask, (size_t) kSub * dense_max) &&
                take(gp.kbuf, deq_rows() * g.kv_row()) &&
-               (stage_b == 0 || take(gp.stage, stage_b));
+               (stage_b == 0 || take_l(gp.stage, stage_b, 4));
         };
         // (the head GPU's: what its buffers lack of the largest picture's room - the plan's vis_keep - at their end)
         const size_t pad_b = !only_bytes && vis_lend_on && !G.empty() && &gp == &G[(size_t) head_gpu] ? (size_t) vis_keep : 0;
-        all();
+        std::vector<size_t> psz, dsz;
+        rec_sz = &psz;
+        call_i = 0;
+        all();                       // (the prompt path's buffers, T = Tc)
+        const size_t at_p = at;
+        at = 0;
+        const bool split = o.lend && tp <= 1 && !M.mtp;   // (--lend: the token path's own W-sized buffers after them)
+        size_t at_d = 0;
+        if (split) {
+            T = (size_t) W;
+            same_sz = &psz;          // (a buffer of the same bytes does not scale with T: the token path shares it)
+            rec_sz = &dsz;
+            call_i = 0;              // (the same call order as the prompt pass: by index the sizes are compared)
+            all();
+            same_sz = nullptr;
+            rec_sz = nullptr;
+            T = (size_t) Tc;
+            at_d = at;
+        }
+        rec_sz = nullptr;
+        at = 0;
         if (only_bytes) {
-            *only_bytes = at;
+            *only_bytes = at_p + at_d;
             return true;
         }
-        if (!gp.alloc(gp.arena, at + pad_b, err)) return false;
-        gp.arena_b = at + pad_b;
+        if (!gp.alloc(gp.arena, at_p + pad_b + at_d, err)) return false;
+        if (std::getenv("HY4_VRAM_LOG"))
+            std::fprintf(stderr, "maya-hy4: scratch: prompt %.1f MiB, token %.1f MiB, pad %.1f MiB (arena %.1f MiB)\n",
+                         at_p / 1048576.0, at_d / 1048576.0, pad_b / 1048576.0, gp.arena_b / 1048576.0);
+        if (std::getenv("HY4_VRAM_LOG")) {
+            size_t m = 0, sum_m = 0, sum_d = 0;
+            for (size_t i = 0; i < dsz.size() && i < psz.size(); ++i) {
+                sum_d += dsz[i];
+                if (dsz[i] == psz[i]) {
+                    ++m;
+                    sum_m += dsz[i];
+                }
+            }
+            std::fprintf(stderr, "maya-hy4: split check: %zu calls (prompt %zu), %zu sized alike (%.1f MiB token)\n",
+                         dsz.size(), psz.size(), m, sum_m / 1048576.0);
+        }
+        gp.arena_b = at_p + pad_b + at_d;
         k::hc_reserve(Tc);   // (the hyper-connections' buffers for a chunk's rows: never grown inside a forward)
-        at = 0;
         carve = true;
-        all();
+        car_base = gp.arena;
+        gp.ppath.clear();
+        gp.pabs.clear();
+        car_rec = &gp.ppath;
+        call_i = 0;
+        all();                       // (the prompt pointers)
+        if (split) {
+            at = 0;
+            T = (size_t) W;
+            same_sz = &psz;
+            car_base = gp.arena + at_p + pad_b;
+            gp.dpath.clear();
+            car_rec = &gp.dpath;
+            call_i = 0;
+            all();                   // (the token pointers; the T-independent buffers stay the prompt's)
+            same_sz = nullptr;
+            T = (size_t) Tc;
+            gp.pbase = gp.arena;
+            gp.dbase = gp.arena + at_p + pad_b;
+            gp.use_path(true);
+        }
+        car_rec = nullptr;
         gp.sS_n = att;
         gp.lo = gp.pos + T;
         gp.nk = gp.pos + 2 * T;
@@ -4177,6 +4456,167 @@ struct Model::Impl {
                 });
             }
         }
+        // (--lend: each GPU's prompt-only buffers in one layer's slots - the layer with the most room under n_expert;
+        //  a blob a slot, the layer's next most-routed experts in them between prompts.  The head GPU keeps the
+        //  picture's room the vision tower borrows from its arena.)
+        if (const char* e = std::getenv("HY4_LEND"); e && *e && std::atoi(e) != 0) o.lend = true;
+        lenders.clear();
+        lend_map.assign(G.size(), std::vector<std::pair<int, size_t>>((size_t) kLendBuffers, {-1, 0}));
+        if (std::getenv("HY4_LEND_TRACE"))
+            std::fprintf(stderr, "maya-hy4: lend plan: on=%d tp=%d mtp=%d gpus=%zu vis_room=%.0f vis_keep=%.0f arena=%.1f GB\n",
+                         (int) o.lend, tp, (int) M.mtp, G.size(), vis_room, vis_keep, (double) arena_bytes() / 1e9);
+        if (o.lend && tp <= 1 && !M.mtp) {
+            const size_t T = (size_t) Tc;
+            size_t stage_max = 0;
+            for (int il = 0; il < g.n_layer; ++il) stage_max = std::max(stage_max, blob_of(il));
+            const size_t stage_b = stage_max * (size_t) kStage;
+            const size_t egc = (size_t) std::max(1, pk.eg.cols()) * std::max(1, pk.eg.head_dim);
+            const double full_arena = (double) arena_bytes();
+            for (size_t gi = 0; gi < G.size(); ++gi) {
+                std::vector<int> cand;   // (this GPU's MoE trunk layers, least residents first - L; l.il not set yet)
+                for (size_t i2 = 0; i2 < L.size(); ++i2) {
+                    const Layer& l = L[i2];
+                    if (l.gpu != (int) gi || (int) i2 < g.n_dense_lead || (int) i2 >= g.n_layer) continue;
+                    cand.push_back((int) i2);
+                }
+                if (cand.empty()) continue;
+                std::sort(cand.begin(), cand.end(), [&](int a, int b) { return L[(size_t) a].n_res < L[(size_t) b].n_res; });
+                const size_t H = (size_t) G[gi].sH;
+                const bool dense_here = g.n_dense_lead > 0 && L[0].gpu == (int) gi;
+                // (the widest FFN this card's layers run - the carve's own rule, read from the tensors' shapes: the
+                //  dense layer's gate, else the shared expert's.  A formula guessed from the geometry under-sized the
+                //  buffers where the shared expert is wider, and a lender's span let one write over its neighbours)
+                size_t widest_ff = 0;
+                for (size_t i2 = 0; i2 < L.size() && (int) i2 < g.n_layer; ++i2) {
+                    const Layer& l = L[i2];
+                    if (l.gpu != (int) gi) continue;
+                    const std::string pre = "blk." + std::to_string((int) i2) + ".";
+                    const Tensor* t = pk.get(pre + ((int) i2 < g.n_dense_lead ? "ffn_gate.weight" : "ffn_gate_shexp.weight"));
+                    if (t) widest_ff = std::max(widest_ff, (size_t) std::max<int64_t>(1, t->n(1)));
+                }
+                const size_t ffg = widest_ff ? widest_ff : (dense_here ? (size_t) g.n_ff : (size_t) g.n_ff_exp);
+                const size_t qk = std::max({H * (size_t) g.v_mla, ffg, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc,
+                                            (size_t) g.n_embd});
+                const size_t bytes[kLendBuffers] = {
+                    T * qk * 2,                                            // 0 xh16
+                    (size_t) kBand * 2,                                    // 1 wband
+                    16 * T * (size_t) g.n_ff_exp * 2,                      // 2 sh16
+                    16 * T * (size_t) g.n_lat * 4,                         // 3 sy
+                    stage_b,                                               // 4 stage
+                    T * H * (size_t) g.kv_row() * 4,                       // 5 qcat
+                    T * H * (size_t) g.kv_lora * 4,                        // 6 o
+                    T * (size_t) g.hc * (size_t) g.n_embd * 4,             // 7 x
+                    T * ffg * 2 * 4,                                       // 8 gu
+                    T * ((size_t) g.n_lat + (G[gi].sFF ? (size_t) g.n_embd : 0)) * 4,   // 9 latout
+                    T * H * (size_t) g.k_mla * 4,                          // 10 q
+                    T * H * (size_t) g.v_mla * 4,                          // 11 ob
+                    T * H * (size_t) g.v_mla * 4,                          // 12 g
+                    T * (size_t) g.n_embd * 4,                             // 13 y
+                    T * (size_t) g.n_embd * 4};                            // 14 xf
+                int order[kLendBuffers];
+                for (int i = 0; i < kLendBuffers; ++i) order[i] = i;
+                std::sort(order, order + kLendBuffers, [&](int a, int b) { return bytes[a] > bytes[b]; });
+                std::vector<char> used_buf((size_t) kLendBuffers, 0);
+                std::vector<Lender> mine;
+                double lent = 0;
+                // (the plan's scratch_bytes() is the widest card's (H 64, the dense FFN's width) and it is kept free on
+                //  every GPU: this card's own scratch is smaller - the difference is VRAM no part took.  The first
+                //  lender's range takes it as extra expert-cache slots (the experts there are the layer's next most
+                //  routed; a prompt vacates them to the lane with the buffer slots and the first token window refills
+                //  them; a margin stays for the driver's own late allocations)
+                size_t extra_b = 0;
+                const char* lr = std::getenv("HY4_LEND_ROOM");   // (opt-in: the plan's late allocations spend most of
+                if (lr && *lr && std::atoi(lr) != 0)             //  this room at 1M - it is not free there)
+                    extra_b = (size_t) std::max(0.0, (double) scratch_bytes() -
+                                           (double) scratch_bytes((size_t) G[gi].sH,
+                                                                  dense_here ? (size_t) g.n_ff : (size_t) g.n_ff_exp) -
+                                           160.0 * 1048576.0);
+                for (size_t ci = 0; ci < cand.size() && mine.size() < (size_t) kLendLayers; ++ci) {
+                    const int il = cand[ci];
+                    Layer& ll = L[(size_t) il];
+                    const size_t blob = blob_of(il);
+                    if (blob == 0) continue;
+                    const size_t cap = (size_t) std::max(0, g.n_expert - 1 - ll.n_res) * blob;
+                    if (cap == 0) continue;
+                    std::vector<std::pair<int, size_t>> bufs;   // (buffer, its offset in the span)
+                    size_t span = 0;
+                    const char* nb = std::getenv("HY4_LEND_BUFS");   // (the bisect's: how many of them are lent)
+                    const int nbuf = nb && *nb ? std::max(0, std::atoi(nb)) : kLendBuffers;
+                    for (int oi = 0; oi < kLendBuffers; ++oi) {   // (the biggest first)
+                        const int k = order[oi];
+                        if (k >= nbuf) continue;
+                        if (used_buf[(size_t) k] || bytes[(size_t) k] == 0) continue;
+                        if (span + bytes[(size_t) k] > cap) continue;
+                        bufs.push_back({k, span});
+                        span += bytes[(size_t) k];
+                        used_buf[(size_t) k] = 1;
+                    }
+                    if (bufs.empty()) continue;
+                    int need = (int) ((span + blob - 1) / blob);
+                    if (need < 8) {
+                        for (const auto& b : bufs) used_buf[(size_t) b.first] = 0;
+                        continue;
+                    }
+                    int more = 0;   // (the free room the plan kept and no part took: the first lender's here)
+                    if (mine.empty() && extra_b > 0) {
+                        more = (int) std::min<size_t>(extra_b / blob,
+                                                      (size_t) std::max(0, g.n_expert - 1 - ll.n_res - need));
+                        extra_b -= (size_t) more * blob;
+                    }
+                    Lender ln;
+                    ln.gi = (int) gi;
+                    ln.il = il;
+                    ln.slot0 = ll.n_res;
+                    ln.n = need + more;
+                    ln.total = span;
+                    ln.bufs = bufs;
+                    ll.n_res += need + more;
+                    for (const auto& b : bufs) lent += (double) bytes[(size_t) b.first];
+                    mine.push_back(std::move(ln));
+                }
+                if (mine.empty()) continue;
+                if ((int) gi == head_gpu && vis_room > 0 &&
+                    full_arena - lent + (double) vis_keep < (double) vis_room) {
+                    for (const Lender& ln : mine) L[(size_t) ln.il].n_res -= ln.n;   // (the picture's room would not be
+                    continue;                                                       //  there: this GPU does not lend)
+                }
+                if (std::getenv("HY4_LEND_TRACE"))
+                    for (const Lender& ln : mine) {
+                        std::fprintf(stderr, "maya-hy4: lend gpu %zu: layer %d slot0 %d n %d span %.2f MB:",
+                                     gi, ln.il, ln.slot0, ln.n, (double) ln.total / 1e6);
+                        for (const auto& b : ln.bufs)
+                            std::fprintf(stderr, " buffer %d at %.2f MB", b.first, (double) b.second / 1e6);
+                        std::fprintf(stderr, "\n");
+                    }
+                for (Lender& ln : mine) {
+                    const size_t flat = lenders.size();
+                    for (const auto& b : ln.bufs)
+                        lend_map[gi][(size_t) b.first] = {(int) flat, b.second};
+                    lenders.push_back(std::move(ln));
+                }
+            }
+        }
+        if (o.lend) {
+            int nl_layers = 0, nl_slots = 0, extra_slots = 0;
+            double nl_gb = 0;
+            for (const Lender& l : lenders) {
+                if (l.il < 0) continue;
+                ++nl_layers;
+                nl_slots += l.n;
+                nl_gb += (double) l.total / 1e9;
+                const size_t blob = L[(size_t) l.il].blob;
+                const int slots_buf = blob ? (int) ((l.total + blob - 1) / blob) : 0;   // (the buffers' own slots)
+                extra_slots += std::max(0, l.n - slots_buf);                            // (the free room's)
+            }
+            if (nl_layers > 0) {
+                char buf[320];
+                std::snprintf(buf, sizeof buf,
+                              "INFO --lend: %d layers' %d expert slots (%.2f GB of prompt buffers between prompts, and "
+                              "%d slots of the room the plan kept free and no part took) - vacated while a prompt is "
+                              "read, refilled after it", nl_layers, nl_slots, nl_gb, extra_slots);
+                info.push_back(buf);
+            }
+        }
         // every GPU's layers, a thread a GPU (tensor parallel: every member's slices)
         if (tp > 1) {
             if (!load_tp(err)) return false;
@@ -4190,11 +4630,34 @@ struct Model::Impl {
                         if (l.gpu == (int) gi && !load_layer(l, errs[gi])) return;
                 });
             for (auto& t : th) t.join();
+            if (std::getenv("HY4_VRAM_LOG"))   // (the load's ledger: where the VRAM goes, a step at a time)
+                for (Gpu& gp : G) {
+                    size_t fr = 0, tot = 0;
+                    if (cudaSetDevice(gp.dev) == cudaSuccess && cudaMemGetInfo(&fr, &tot) == cudaSuccess)
+                        std::fprintf(stderr, "maya-hy4: vram after the layers, GPU %d: free %.1f MiB of %.1f\n", gp.dev,
+                                     fr / 1048576.0, tot / 1048576.0);
+                }
             for (auto& e : errs)
                 if (!e.empty()) {
                     err = e;
                     return false;
                 }
+            for (Lender& ln : lenders) {   // (the lent slots' experts, slot order)
+                if (ln.il < 0) continue;
+                const Layer& l = L[(size_t) ln.il];
+                ln.experts.clear();
+                ln.slots.clear();
+                std::vector<std::pair<int, int>> got;   // (slot, expert)
+                for (int e = 0; e < g.n_expert; ++e) {
+                    const int sl = l.slot_of[(size_t) e];
+                    if (sl >= ln.slot0 && sl < ln.slot0 + ln.n) got.push_back({sl, e});
+                }
+                std::sort(got.begin(), got.end());
+                for (const auto& p : got) {
+                    ln.slots.push_back(p.first);
+                    ln.experts.push_back(p.second);
+                }
+            }
             // each GPU's scratch, after its layers as before - with its staging slots (a GPU with layers whose
             // experts are not all in VRAM: kStage of the largest blob) at its end, one allocation
             size_t blob = 0;
@@ -4347,6 +4810,19 @@ struct Model::Impl {
                     !G[gi].alloc(G[gi].pmap, (size_t) g.n_expert, err))
                     return false;
                 // the GPU's PCIe as streaming sees it: the pinned bounce to the staging slots
+                if (std::getenv("HY4_LEND_TRACE")) {
+                    std::fprintf(stderr, "maya-hy4: lend prime gpu %zu stage=%p h=%p blob=%.3f MB kStage size=%.1f MB\n",
+                                 gi, (void*) G[gi].stage, (void*) h_stage, (double) blob / 1e6, blob * kStage / 1e6);
+                    for (const Lender& ln : lenders) {
+                        if (ln.il < 0 || ln.gi != (int) gi) continue;
+                        const Layer* ll = &L[(size_t) ln.il];
+                        std::fprintf(stderr, "maya-hy4:   lender layer %d slot0 %d n %d blob %.3f MB arena %.1f MB:",
+                                     ln.il, ln.slot0, ln.n, (double) ll->blob / 1e6,
+                                     (double) (ll->blob * (size_t) ll->n_res) / 1e6);
+                        for (const auto& b : ln.bufs) std::fprintf(stderr, " buffer %d", b.first);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
                 CK(cudaMemcpy(G[gi].stage, h_stage, blob * kStage, cudaMemcpyHostToDevice));
                 const double t0 = now_s();
                 for (int r = 0; r < 2; ++r)
@@ -6601,6 +7077,7 @@ struct Model::Impl {
             std::stable_sort(cpu.begin(), cpu.end(), [&](int a, int b) { return sc[a] > sc[b]; });
             for (size_t i = 0; i < res.size() && i < cpu.size(); ++i) {
                 if (sc[cpu[i]] <= (float) hot.ratio * sc[res[i]] + (float) hot.margin) break;
+                if (lent_slot(l.il, l.slot_of[(size_t) res[i]])) continue;   // (--lend: not that slot's expert to move)
                 plan.push_back({sc[cpu[i]] - sc[res[i]], l.il, res[i], cpu[i]});
             }
         }
@@ -9463,6 +9940,11 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         return false;
     }
     m->tops_n = 0;
+    // (--lend: this forward's buffers, its path's: a prompt's the arena at its start (which is expert slots at decode),
+    //  a token's the W-sized copies after the picture's room.  The positions' buffer is the same on both paths (its
+    //  [3][Tc] blocks - pos, lo, nk - are what the host fills and copies), so gp.lo/gp.nk stay the carve's)
+    for (size_t gi = 0; gi < m->G.size(); ++gi)
+        if (m->G[gi].pbase != nullptr) m->G[gi].use_path(n > W);
     // (HY4_HOT: the last token window's rows before pos0 were kept - their routes count - the others are read again
     //  or were drafts not kept; this one's rows wait until the next forward or Model::answered says which are kept.
     //  No experts move here: an answer runs on one placement)
@@ -9475,6 +9957,10 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
             m->hot.pend_T = n;
         }
     }
+    const bool lend_refill_fwd = m->lend_ready() && n <= W && m->lend_vacated &&
+                                 std::getenv("HY4_LEND_TRACE") != nullptr;
+    const double lf0 = lend_refill_fwd ? now_s() : 0.0;
+    if (m->lend_ready() && !m->lend_apply(n > W, err)) return false;   // (--lend: a prompt's buffers / decode's experts)
     m->ring_lo = ring_lo_at(pos0, m->ring_lo, m->end, m->ring);   // (#1091)
     m->tokens.resize((size_t) pos0);
     // (the MTP cache's rows from pos0 on are the drafts' own - but the row at pos0 when this is the token the last
