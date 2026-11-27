@@ -607,7 +607,8 @@ Mat load_fused_f16(const Shards& S, const std::vector<MatPart>& parts, int Kd) {
     return m;
 }
 
-bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int Kd, Mat& out) {
+bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int Kd, Mat& out,
+                        std::string& mixed_dense_reason) {
     int ty = -1, N_tot = 0;
     size_t nb_tot = 0;
     for (const auto& pt : parts) {
@@ -618,7 +619,13 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
         if (!k::block_values((int) t->type) || Kd % k::block_values((int) t->type))
             die(pt.name + ": type " + t->type_name() + " not read here");
         if (ty < 0) ty = (int) t->type;
-        else if (ty != (int) t->type) return false;
+        else if (ty != (int) t->type) {
+            if (mixed_dense_reason.empty())
+                mixed_dense_reason = "mixed projection types prevent fusion: " + parts.front().name + " (" +
+                                     S.info(parts.front().name)->type_name() + ") and " + pt.name + " (" +
+                                     t->type_name() + ")";
+            return false;
+        }
         N_tot += pt.N;
         nb_tot += tensor_bytes(*t);
     }
@@ -7224,6 +7231,7 @@ int main(int argc, char** argv) {
 
     // the dense weights
     const double t_dense = now();
+    std::string mixed_dense_reason;   // the first mixed projection, for a resident-path refusal at load
     const size_t C = c.C, HD = (size_t) c.H * c.D, KD = (size_t) c.KV * c.D;
     M.L.resize(c.n_layer);
     // two layouts: llama.cpp PR #32187's (ref/inkling2.py's: the short convs folded, gate and up apart) and unsloth's
@@ -7295,7 +7303,7 @@ int main(int argc, char** argv) {
                 qkv_parts.push_back({"", c.H, std::move(sink_v)});
                 Ly.wqkvrg = load_fused_f16(S, qkv_parts, (int) C);
             } else {
-                if (!try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg)) {
+                if (!try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg, mixed_dense_reason)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C);
                     Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C);
@@ -7320,7 +7328,7 @@ int main(int argc, char** argv) {
                 Ly.wv_dyn = load_fused_f16(S, {{b + "attn_v.weight", (int) KD, {}}, {"", c.KV * 4, std::move(vd_v)}},
                                            (int) C);
             } else {
-                if (!try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg)) {
+                if (!try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg, mixed_dense_reason)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wr = load_mat(S, nm(b, "attn_r.weight"), c.H * c.d_rel, (int) C);
                     Ly.wgate = load_mat(S, b + "attn_gate.weight", (int) HD, (int) C);
@@ -8481,7 +8489,10 @@ int main(int argc, char** argv) {
             std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
                         now() - tw, g_graph ? ", a CUDA graph each" : "");
         } else {
-            std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
+            const char* why = !all ? "the cache does not hold every expert"
+                            : !mixed_dense_reason.empty() ? mixed_dense_reason.c_str()
+                                                          : "a dense matrix is not kept as blocks";
+            std::printf("resident path off: %s\n", why);
         }
     }
     std::fflush(stdout);

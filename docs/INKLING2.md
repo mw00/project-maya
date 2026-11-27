@@ -284,6 +284,11 @@ With these three, same card and file, FP8 cache: 124.8 tok/s 47 tokens deep (was
 median KL of 5.7e-5 from it with 394 of the top tokens the same (the tensor-core attention against its scalar
 kernel on that text: 1.7e-4 and 393), and on 96 GSM8K questions they solve 74 where the scalar ones solve 73.
 
+The resident path also needs compatible dense projection layouts. Projection parts with different GGUF types
+stay separate, which disables this path even when every expert fits in VRAM. The startup line
+`resident path off: mixed projection types prevent fusion: ...` names the first conflicting tensors and their
+types, for example `blk.0.attn_q.weight (Q6_K)` and `blk.0.attn_k.weight (Q8_0)`.
+
 A prompt goes the cache path's way with every expert a hit; the attention's flash kernel reads an FP8 cache too
 (the tile's bytes by `cp.async`, FP16 of them in shared memory), and a looped layer's gates are cuBLAS products
 over a chunk. A short prompt - a chat turn, up to 96 tokens (`IK2_RG_SLOTS`) - has its experts read by groups, an
