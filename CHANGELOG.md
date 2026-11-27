@@ -4,6 +4,28 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.83 - 2026-11-27
+
+Ling-3.2-air now runs on Windows with NVIDIA cards and on AMD under Linux; Inkling 2 Mini decodes much faster on 8-16 GB cards; and 32 community changes for Hy4-Flash, Inkling 2 Mini, DeepSeek and the server.
+
+- **Ling-3.2-air on Windows (NVIDIA).** `START-MAYA.bat` builds `maya-ling`, and the setup and the Models page offer Ling-3.2-air on NVIDIA cards from the V100 and RTX 20 series on, from 8 GB, with pictures, tool calls and drafting as on Linux. The setup notes that Windows' Smart App Control may block programs built on your PC.
+- **Ling-3.2-air on AMD under Linux.** One RDNA 3 / 3.5 / 4 GPU from 8 GB, or a Ryzen AI Max APU: `./maya.sh --setup --backend hip --model ling-3.2-air-maya-s`. It gives the same top token as NVIDIA almost every time (the differences are near-ties). AMD on Windows and several AMD GPUs are not supported yet; the setup says so in one line.
+- **Inkling 2 Mini: much faster decode where the experts don't all fit in VRAM.** The model runs its middle layers three times per token, so the VRAM now holds whole layers, those looped layers first. On 8 / 12 / 16 GB cards decode is about 1.5x to 1.8x faster, with the same answers; prompt reading is 6-10% slower. `IK2_TIER_ORDER=picks` gives v1.1.82's placement.
+- **Hy4-Flash: faster, the same answers.** The Engram table is read without the page cache's read-ahead and its pages are asked for first (#1291, #1305, Linux), and four engine steps are quicker (#1251, #1304): decode about 3% faster on our V100s.
+- **Fix: Hy4-Flash setup took another model's vision file (#1264)** when several models shared one `--model-dir`.
+- **Fix: DeepSeek `--tp 2` paired the wrong GPUs (#1276)** when the first card reports a few MiB less than its twin.
+- **Fix: Windows: the CPU lane's AVX-512 rows were built without AVX-512 (#1235)**, which cost about 40% of decode on AVX-512 CPUs. They are AVX-512 code again.
+- **Fix: GLM-5.3 on a GPU too small for its dense weights (#1169)** is now said plainly, by the setup before the download and by the engine.
+- **Fix: a request with no messages (#1290)** is a 400 on every API instead of a closed connection.
+- **Prompt progress per request (#1271):** with several conversations at once, each request reports its own prompt progress.
+- **DeepSeek:** `--ppl` and `--dump-logits` work through decode windows (#1197); CPU lane rows for AVX CPUs without AVX2 such as Sandy / Ivy Bridge (#1204; AVX2 CPUs pick the same rows as before); AVX-512 prompt rows reuse their unpacked weights across up to 16 tokens (#1252); DSpark and prompt-lookup drafts are counted apart in the log and on `/metrics` (#684); `DS4_PROF` per GPU on a tensor-parallel pair (#1239).
+- **GLM-5.3-Flash:** a repeated CUDA setup keeps your manual tuning (#1125); `MAYA_GLM_DUMP_LOGITS` for comparing two builds (#1146). `ref_gguf --workers N` for the reference tool (#1061).
+- **Opt-ins, off by default.** Hy4-Flash: `HY4_PSTREAM` (#1222, prompt reading up to 44% faster where experts stream from RAM; answers can differ slightly), `HY4_STREAM_PIPE` (#1300, up to 26%), `HY4_PP` (#1269, two-GPU prompt reading about 20% faster at 8K), `HY4_LAT16` (#1175, about 4-5%, the same tokens), `--snap-every N` restore points (#1123), and attention and FFN switches (#1298, #1301, #1302, #1303). Inkling 2 Mini: `IK2_SESSION_CACHE_GB` (#1130, a session cache in RAM: a conversation taking turns with others resumes about 6x faster), `IK2_BATCH_PREFILL=1` (#1144, prompts about 5% faster, the same tokens), `IK2_ATTN_RDNA=1` (#1283, AMD decode up to 4% faster; answers can differ slightly), `IK2_PAR_DECODE_PCT` (#1192, with `--parallel`), and `IK2_PEER_DIRECT_SIGNAL=1` (#1257, #1265, only for GPU pairs that cannot talk directly). Prompts: `MAYA_PREFILL_FAST_DEQUANT=1` (#1225). Details in docs/SETTINGS.md.
+- **Inkling 2 Mini:** on AMD the FP8 cache is read faster in a token's attention (#1282, the same tokens, decode about 1% faster), and the CPU lane uses Hy4's thread pool (#1240).
+- **`maya-ling --help`** prints its usage, and a wrong argument prints the reason instead of stopping the program.
+- **Linux: the CPU temperature is read from the CPU's own sensor only**, without scanning every device each second (matters on VMs and cloud machines without a CPU sensor).
+- **Credits.** @acochrane (#1290), @mgabor3141 (#1271), @vdkcf (#1197, #1146), @oscarlius (#1125, #1252), @handmade0octopus (#684, #1239), @sramteare (#1061), @PrimusInterParis (#1204), @Kanorin-chan (#1225), @merbanan (#1291, #1305, #1304, #1300, #1298, #1301, #1302, #1303), @lastbl0c (#1251, #1192), @lij768423-svg (#1222, #1123), @arpleasa (#1269), @gappoi001-droid (#1175), @Antero128 (#1282, #1283), @OscarSheng (#1240), @mrexodia (#1144 from @alesha-pro's engine, #1130), @cobra91 (#1257, #1265).
+
 ## v1.1.82 - 2026-11-26
 
 Ling-3.2-air arrives on Maya: inclusionAI's model on its own engine, `maya-ling`, with Maya's own quants from 36.9 GB, thinking on or off, tool calls and drafting with the model's own MTP block, on NVIDIA cards under Linux.
