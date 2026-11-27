@@ -8668,8 +8668,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         } else {
             m->dump_logits(m->sc_ + m->sc_logits, 1, FL->cs);
-            m->dump_logits(m->sc_ + m->sc_logits, 1, FL->cs);
-    gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
+            gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
             cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         }
         cudaEventRecord(FL->ev_done, FL->cs);
