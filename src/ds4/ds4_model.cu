@@ -1205,6 +1205,39 @@ struct Model::Impl {
                           c.at_k.load(std::memory_order_relaxed), c.at_il.load(std::memory_order_relaxed));
             s += b;
         }
+        {   // #831 diag: handshake flag banks + shared put counters (diag build only)
+            char f[2048];
+            std::snprintf(f, sizeof f, "; win_seq %u", win_seq);
+            s += f;
+            for (size_t di = 0; di < chunks.size() && di < devs.size(); ++di) {
+                const Chunk& c = *chunks[di];
+                std::snprintf(f, sizeof f, "; D%d xcnt %u hf %u/%u ha", (int) di,
+                              devs[di].xcnt ? *devs[di].xcnt : 0u,
+                              c.hand_flag[0] ? *c.hand_flag[0] : 0u,
+                              c.hand_flag[1] ? *c.hand_flag[1] : 0u);
+                s += f;
+                if (c.hand_ack != nullptr)
+                    for (int sl = 0; sl < 2; ++sl) {
+                        std::snprintf(f, sizeof f, " %u,%u,%u,%u,%u,%u,%u,%u",
+                            c.hand_ack[(size_t)(sl*8+0)*8], c.hand_ack[(size_t)(sl*8+1)*8],
+                            c.hand_ack[(size_t)(sl*8+2)*8], c.hand_ack[(size_t)(sl*8+3)*8],
+                            c.hand_ack[(size_t)(sl*8+4)*8], c.hand_ack[(size_t)(sl*8+5)*8],
+                            c.hand_ack[(size_t)(sl*8+6)*8], c.hand_ack[(size_t)(sl*8+7)*8]);
+                        s += f;
+                    }
+            }
+            for (size_t si = 0; si < srcs.size(); ++si) {
+                const Src& sr = srcs[si];
+                std::snprintf(f, sizeof f, "; S%zu L%d rem %d f %u/%u xa", si, sr.layer, (int) sr.remote,
+                              sr.x_flag ? *sr.x_flag : 0u, sr.x_flag1 ? *sr.x_flag1 : 0u);
+                s += f;
+                if (sr.x_ack != nullptr)
+                    for (size_t r = 0; r < devs.size(); ++r) {
+                        std::snprintf(f, sizeof f, " %u", sr.x_ack[(size_t) r * 8]);
+                        s += f;
+                    }
+            }
+        }
         return s;
     }
     std::vector<cudaEvent_t> chunk_done;     // on the last layer's device: chunk k through every layer
