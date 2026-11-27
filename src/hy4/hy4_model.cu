@@ -5769,6 +5769,7 @@ struct Model::Impl {
         std::vector<double> prev_str;
         int windows = 0;
     } route;
+    std::mutex route_mu;   // (--prefill-pipe: the layer groups' route turns and times, one at a time)
     // the lane's prompt calls run on 4-bit copies (made or being made, in use: kept or forced - not on trial)
     bool q4x_in_use() const {
         if (lane_count().q4x_mode.load(std::memory_order_relaxed) != 1) return false;
@@ -7100,18 +7101,22 @@ struct Model::Impl {
     }
 
     // the Engram rows of the window's tokens for module e -> h_eg's part e; valid -> h_valid
-    void engram_gather(int e, int T, int64_t p0) {
-        for (int t = 0; t < T; ++t) engram_row(e, t, p0);
+    void engram_gather(int e, int T, int64_t p0, uint8_t* eg_b = nullptr, float* egs_b = nullptr,
+                       float* val_b = nullptr) {
+        for (int t = 0; t < T; ++t) engram_row(e, t, p0, eg_b, egs_b, val_b);
     }
     // ... a token's (t of the window at p0): its n-grams' hashed rows of the table - a random page each, so a window's
     // are looked up on several threads (eg_crew)
-    void engram_row(int e, int t, int64_t p0) {
+    void engram_row(int e, int t, int64_t p0, uint8_t* eg_b = nullptr, float* egs_b = nullptr,
+                    float* val_b = nullptr) {
         const Engram& eg = pk.eg;
         const int n = eg.ngram, cols = eg.cols(), hd = eg.head_dim;
         const uint64_t* mult = eg.mult.data() + (size_t) e * n;
         const uint64_t* primes = eg.primes.data() + (size_t) e * cols;
         const uint64_t* offs = eg.offsets.data() + (size_t) e * cols;
-        uint8_t* dst = h_eg + (size_t) e * Tc * cols * hd;
+        uint8_t* dst = (eg_b ? eg_b : h_eg) + (size_t) e * Tc * cols * hd;
+        float* egs_s = egs_b ? egs_b : h_egs;
+        float* val_s = val_b ? val_b : h_valid;
         auto cid = [&](int t) -> int64_t {
             return t < 0 || t >= eg.vocab ? -1 : (int64_t) eg.token_map[(size_t) t];
         };
@@ -7137,7 +7142,7 @@ struct Model::Impl {
                         uint16_t sb;
                         std::memcpy(&sb, eg_scale + row * 2, 2);
                         bf16_to_f32(&sb, 1, &sc);
-                        h_egs[((size_t) e * Tc + (size_t) t) * cols + col] = sc;
+                        if (egs_s != nullptr) egs_s[((size_t) e * Tc + (size_t) t) * cols + col] = sc;
                     }
                     if (eg_dump != nullptr) {   // (int64 module, position, column, row; float scale; the row's bytes)
                         std::lock_guard<std::mutex> lk(eg_dump_mu);
@@ -7148,7 +7153,7 @@ struct Model::Impl {
                     }
                 }
             }
-            if (e == 0) h_valid[t] = dead ? 0.0f : 1.0f;
+            if (e == 0 && val_s != nullptr) val_s[t] = dead ? 0.0f : 1.0f;
         }
     }
     std::unique_ptr<Crew> eg_crew;   // (the Engram lookups' threads)
@@ -7162,8 +7167,10 @@ struct Model::Impl {
     std::atomic<unsigned> eg_ready{0}, eg_win{0};
     bool eg_wait = false;
 
-    // (r0: the rows' start in the window - a staggered half)
-    bool engram(Layer& l, Gpu& gp, int T, std::string& err, int r0 = 0) {
+    // (r0: the rows' start in the window - a staggered half; eg_b / egs_b / val_b: another chunk's host rows - a
+    //  --prefill-pipe stage's, the window's buffers else)
+    bool engram(Layer& l, Gpu& gp, int T, std::string& err, int r0 = 0, const uint8_t* eg_b = nullptr,
+                const float* egs_b = nullptr, const float* val_b = nullptr) {
         const Engram& eg = pk.eg;
         const int cols = eg.cols(), hd = eg.head_dim, E = g.n_embd;
         cudaStream_t s = gp.s;
@@ -8089,6 +8096,348 @@ struct Model::Impl {
         return true;
     }
 
+    // ------------------------------------------------------------ the prefill pipeline (--prefill-pipe)
+    // A prompt chunk's micro-chunks through the layer groups: group k computes micro-chunk i while group k+1 computes
+    // i-1, so every GPU computes and streams its experts at once instead of one layer group at a time.  The groups are
+    // the layer split's contiguous ranges; each micro-chunk's activations go to the next group through pinned host
+    // memory (the same bytes hand_off moves, with two halves so a copy out and a copy in overlap).  The head's GPU
+    // stores each micro-chunk's final state in hring (the drafts read it) and the last micro-chunk's wanted rows get
+    // the logits.  Layer split only, prompts only, and not beside the pack's MTP block (its pass stays on the old path).
+    // ------------------------------------------------------------ --prefill-pipe: the prompt's chunks as stages
+    // (a prompt longer than a chunk: its chunks go through the layers' GPU groups as a pipeline, o.prefill_pipe
+    //  chunks in flight (2 at least) - group 0 reads a chunk while group 1 reads the chunk before it, and so on; each
+    //  group hands its rows to the next through pinned host memory, a slot a chunk, the copies ordered on the host as
+    //  the native prefill's layer split and ds4's chunked prompt path link their stages.  The chunks' rows - the
+    //  embeddings, the Engram lookups, the positions - are prepared on the calling thread meanwhile.  The same
+    //  kernels on the same rows: a chunk makes the bits it makes read on its own, the wall time the stages' longest
+    //  rather than their sum.)
+    bool pipe_ok(int n) const {
+        if (o.prefill_pipe < 2 || tp > 1 || G.size() < 2 || M.mtp || dump || inject || !imgs.empty()) return false;
+        if (spill() || check_tp || o.trial || !o.profile_out.empty() || prof) return false;
+        if (n <= Tc) return false;
+        int groups = 0, prev = -1000;
+        for (const Layer& l : L)
+            if (l.gpu != prev) {
+                prev = l.gpu;
+                ++groups;
+            }
+        return groups >= 2;
+    }
+    struct PipeChunk {
+        std::vector<float> x;        // [T][E] the chunk's embedding rows
+    };
+    // (a chunk's Engram rows: every stage reads them, so a chunk's own - alive until the whole run is done)
+    struct PipeEg {
+        std::vector<uint8_t> eg;     // [modules][Tc][cols][hd] (the chunk's rows in the first T)
+        std::vector<float> egs;      // [modules][Tc][cols]
+        std::vector<float> valid;    // [Tc]
+    };
+    // (HY4_EG_TRACE: the Engram rows' hash a module - the stages' buffers against the window's)
+    void eg_trace(const char* where, const uint8_t* eg, int64_t p0, int T) {
+        const int cols = std::max(1, pk.eg.cols()), hd = std::max(1, pk.eg.head_dim);
+        for (int e = 0; e < pk.eg.modules; ++e) {
+            uint64_t s = 1469598103934665603ull;
+            const uint8_t* b = eg + (size_t) e * Tc * cols * hd;
+            for (size_t i = 0; i < (size_t) T * cols * hd; ++i) s = (s ^ b[i]) * 1099511628211ull;
+            std::fprintf(stderr, "EGT %s p0=%lld e=%d h=%016llx\n", where, (long long) p0, e, (unsigned long long) s);
+        }
+    }
+    // (a chunk's rows on the calling thread: its tokens' embedding rows and Engram lookups)
+    bool pipe_prep(const int* ids, int T, int64_t p0, PipeChunk& tk, PipeEg& pe, std::string& err) {
+        const int E = g.n_embd;
+        tk.x.resize((size_t) T * (size_t) E);
+        for (int t = 0; t < T; ++t) {
+            const int id = ids[t];
+            if (id < 0 || id >= g.n_vocab) {
+                err = "token id " + std::to_string(id) + " outside the vocabulary";
+                return false;
+            }
+            tok_row(tok_type, tok_embd + (size_t) id * tok_ld, E, tk.x.data() + (size_t) t * E);
+        }
+        const int cols = std::max(1, pk.eg.cols()), hd = std::max(1, pk.eg.head_dim);
+        const int nm = std::max(1, pk.eg.modules);
+        pe.eg.resize((size_t) nm * (size_t) Tc * (size_t) cols * (size_t) hd);
+        if (eg_scale != nullptr) pe.egs.resize((size_t) nm * (size_t) Tc * (size_t) cols);
+        pe.valid.resize((size_t) Tc);
+        const int n_look = pk.eg.modules * T;
+        const double te = now_s();
+        float* es = pe.egs.empty() ? nullptr : pe.egs.data();
+        if (n_look >= 8 && T > W && !std::getenv("HY4_EG_SERIAL")) {
+            if (!eg_crew) eg_crew = std::make_unique<Crew>(8);
+            const int nt = eg_crew->size();
+            eg_crew->start([&](int w) {
+                for (int i = w; i < n_look; i += nt) engram_row(i / T, i % T, p0, pe.eg.data(), es, pe.valid.data());
+            });
+            eg_crew->wait();
+        } else {
+            for (int e = 0; e < pk.eg.modules; ++e) engram_gather(e, T, p0, pe.eg.data(), es, pe.valid.data());
+        }
+        st.engram_ms += (now_s() - te) * 1e3;
+        if (std::getenv("HY4_EG_TRACE")) eg_trace("prep", pe.eg.data(), p0, T);
+        return true;
+    }
+    // (HY4_X_TRACE: the rows after each layer hashed, the first chunk's - a staged read against a plain one)
+    const bool trace_x_on = std::getenv("HY4_X_TRACE") != nullptr;
+    std::function<void(int64_t)> on_chunk;   // (a staged prompt's progress: the position each chunk completes)
+    std::function<bool()> on_stop;           // (... and its stop, asked between chunks)
+    void trace_x(const char* tag, int il, int64_t p0, Gpu& gp, int T) {
+        std::vector<float> h((size_t) T * (size_t) g.hc * (size_t) g.n_embd);
+        if (cudaMemcpyAsync(h.data(), gp.x, sizeof(float) * h.size(), cudaMemcpyDeviceToHost, gp.s) != cudaSuccess ||
+            cudaStreamSynchronize(gp.s) != cudaSuccess)
+            return;
+        uint64_t s = 1469598103934665603ull;
+        for (float v : h) {
+            uint32_t b;
+            std::memcpy(&b, &v, 4);
+            s = (s ^ b) * 1099511628211ull;
+        }
+        std::fprintf(stderr, "%s il=%d p0=%lld h=%016llx\n", tag, il, (long long) p0, (unsigned long long) s);
+    }
+    // (a group's layers over a whole chunk: its rows in gp.x, its positions in gp.pos)
+    bool pipe_layers(int lo, int hi, Gpu& gp, int T, int64_t p0, const uint8_t* eg, const float* egs, const float* val,
+                     std::string& err) {
+        for (int li = lo; li < hi; ++li) {
+            Layer& l = L[(size_t) li];
+            if (l.eg >= 0 && !engram(l, gp, T, err, 0, eg, egs, val)) return false;
+            if (l.eg >= 0 && trace_x_on && p0 < Tc) trace_x("XEG", l.il, p0, gp, T);
+            if (!attention(l, gp, T, p0, err)) return false;
+            if (trace_x_on && p0 < Tc) trace_x("XAT", l.il, p0, gp, T);
+            if (!ffn(l, gp, T, err)) return false;
+            if (trace_x_on && p0 < Tc) trace_x("XTR", l.il, p0, gp, T);
+        }
+        return true;
+    }
+    bool forward_piped(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err) {
+        const int E = g.n_embd, hc = g.hc;
+        struct Grp { int gpu, lo, hi; };
+        std::vector<Grp> gr;
+        for (int i = 0; i < (int) L.size(); ++i) {
+            const int gu = L[(size_t) i].gpu;
+            if (gr.empty() || gr.back().gpu != gu) gr.push_back({gu, i, i + 1});
+            else gr.back().hi = i + 1;
+        }
+        const int NG = (int) gr.size();
+        if (NG < 2) return false;
+        if (!fetch_sync_slots(err)) return false;   // (the GPU fetch's slots moved: the prompt reads the host's tables)
+        // (the chunks, as Model::forward splits them: the last one takes the last min(n, Tc) tokens)
+        const int last = std::min(n, Tc), headn = n - last;
+        std::vector<int> cT, cWant;
+        std::vector<int64_t> cOff;
+        std::vector<std::vector<int>> cIds;
+        for (int done = 0; done < n;) {
+            const int T = done < headn ? std::min(Tc, headn - done) : last;
+            cT.push_back(T);
+            cOff.push_back(done);
+            cWant.push_back(done + T == n ? want : 0);
+            cIds.emplace_back(ids + done, ids + done + T);
+            done += T;
+        }
+        const int C = (int) cT.size();
+        const int depth = std::max(2, std::min(o.prefill_pipe, 3));
+        static std::atomic<bool> pipe_said{false};   // (the line once a run)
+        if (!pipe_said.exchange(true))
+            std::fprintf(stderr, "maya-hy4: prefill pipeline: %d chunks of %d tokens through %d layer groups, %d in "
+                         "flight\n", C, Tc, NG, depth);
+        const size_t row = (size_t) hc * (size_t) E;
+        const size_t slot_b = sizeof(float) * (size_t) Tc * row;
+        // the boundary slots: depth a boundary (a chunk's rows in each), written by the group before
+        std::vector<std::vector<float*>> lk((size_t) NG);
+        std::vector<void*> lk_mem;
+        bool aok = true;
+        for (int gi = 1; gi < NG && aok; ++gi) {
+            lk[(size_t) gi].assign((size_t) depth, nullptr);
+            for (int s = 0; s < depth && aok; ++s) {
+                void* p = nullptr;
+                if (cudaHostAlloc(&p, slot_b, cudaHostAllocPortable) != cudaSuccess) {
+                    aok = false;
+                    break;
+                }
+                lk[(size_t) gi][(size_t) s] = (float*) p;
+                lk_mem.push_back(p);
+            }
+        }
+        auto free_slots = [&]() {
+            for (void* p : lk_mem)
+                if (p) cudaFreeHost(p);
+            lk_mem.clear();
+        };
+        if (!aok) {
+            (void) cudaGetLastError();
+            free_slots();
+            err = "the prefill pipeline: a hand-off slot did not come (" + std::to_string(slot_b >> 20) +
+                  " MiB a slot)";
+            return false;
+        }
+        std::vector<PipeChunk> tk((size_t) depth);
+        std::vector<PipeEg> ceg((size_t) C);
+        struct Flag {
+            std::atomic<int> v{-1};
+        };
+        std::vector<Flag> ready((size_t) depth), done0((size_t) depth);
+        std::vector<Flag> filled((size_t) NG * (size_t) depth), taken((size_t) NG * (size_t) depth);
+        std::atomic<bool> fail{false};
+        std::mutex mu;
+        std::string perr;
+        auto set_err = [&](const std::string& e) {
+            std::lock_guard<std::mutex> g(mu);
+            if (perr.empty()) perr = e;
+            fail.store(true, std::memory_order_release);
+        };
+        auto wait_flag = [&](Flag& f, int c) {
+            while (f.v.load(std::memory_order_acquire) < c) {
+                if (fail.load(std::memory_order_acquire)) return false;
+                std::this_thread::yield();
+            }
+            return true;
+        };
+        auto stage_chunk = [&](int gi, int c) {
+            Gpu& gp = G[(size_t) gr[(size_t) gi].gpu];
+            cudaSetDevice(gp.dev);
+            std::vector<int> pos((size_t) 3 * Tc);
+            {
+                const int s = c % depth, T = cT[(size_t) c];
+                const int64_t p0 = pos0 + cOff[(size_t) c];
+                const size_t nb = (size_t) T * row * sizeof(float);
+                for (int t = 0; t < T; ++t) {
+                    const int64_t p = p0 + t;
+                    pos[(size_t) t] = (int) p;
+                    pos[(size_t) Tc + t] = (int) std::max<int64_t>(0, p - g.n_swa + 1);
+                    pos[(size_t) 2 * Tc + t] = (int) (p - pos[(size_t) Tc + t] + 1);
+                }
+                if (cudaMemcpyAsync(gp.pos, pos.data(), sizeof(int) * (size_t) 3 * Tc, cudaMemcpyHostToDevice, gp.s) !=
+                    cudaSuccess) {
+                    set_err("the prefill pipeline: the positions: " + std::string(cudaGetErrorString(cudaGetLastError())));
+                    return;
+                }
+                const PipeEg& ce = ceg[(size_t) c];
+                if (gi == 0) {
+                    if (!wait_flag(ready[(size_t) s], c)) return;
+                    const PipeChunk& t = tk[(size_t) s];
+                    if (cudaMemcpyAsync(gp.cur, t.x.data(), sizeof(float) * (size_t) T * E, cudaMemcpyHostToDevice,
+                                        gp.s) != cudaSuccess) {
+                        set_err("the prefill pipeline: the embeddings: " +
+                                std::string(cudaGetErrorString(cudaGetLastError())));
+                        return;
+                    }
+                    k::expand_streams(gp.cur, T, hc, E, gp.x, gp.s);
+                } else {
+                    if (!wait_flag(filled[(size_t) gi * (size_t) depth + (size_t) s], c)) return;
+                    if (cudaMemcpyAsync(gp.x, lk[(size_t) gi][(size_t) s], nb, cudaMemcpyHostToDevice, gp.s) !=
+                            cudaSuccess ||
+                        cudaStreamSynchronize(gp.s) != cudaSuccess) {
+                        set_err("the prefill pipeline: the rows in: " +
+                                std::string(cudaGetErrorString(cudaGetLastError())));
+                        return;
+                    }
+                    taken[(size_t) gi * (size_t) depth + (size_t) s].v.store(c, std::memory_order_release);
+                }
+                // (the chunk's rows: after the wait - their buffers are the prep's, set before it published the chunk)
+                const uint8_t* eg = ce.eg.data();
+                const float* egs = ce.egs.empty() ? nullptr : ce.egs.data();
+                const float* val = ce.valid.data();
+                if (trace_x_on && p0 < Tc) trace_x("XIN", gr[(size_t) gi].lo, p0, gp, T);
+                std::string e;
+                if (!pipe_layers(gr[(size_t) gi].lo, gr[(size_t) gi].hi, gp, T, p0, eg, egs, val, e)) {
+                    set_err(e.empty() ? "a layer of the prefill pipeline failed" : e);
+                    return;
+                }
+                if (gi + 1 < NG) {
+                    // (the slot is free once the next group copied the chunk depth back in)
+                    if (c >= depth && !wait_flag(taken[(size_t) (gi + 1) * (size_t) depth + (size_t) s], c - depth))
+                        return;
+                    if (cudaMemcpyAsync(lk[(size_t) gi + 1][(size_t) s], gp.x, nb, cudaMemcpyDeviceToHost, gp.s) !=
+                            cudaSuccess ||
+                        cudaStreamSynchronize(gp.s) != cudaSuccess) {
+                        set_err("the prefill pipeline: the rows out: " +
+                                std::string(cudaGetErrorString(cudaGetLastError())));
+                        return;
+                    }
+                    filled[(size_t) (gi + 1) * (size_t) depth + (size_t) s].v.store(c, std::memory_order_release);
+                } else {
+                    Gpu& hg = G[(size_t) head_gpu];
+                    if (gr[(size_t) gi].gpu != head_gpu) {   // (the head's GPU holds no layer: its rows through the host)
+                        std::vector<float> hb((size_t) T * row);
+                        if (cudaMemcpyAsync(hb.data(), gp.x, nb, cudaMemcpyDeviceToHost, gp.s) != cudaSuccess ||
+                            cudaStreamSynchronize(gp.s) != cudaSuccess) {
+                            set_err("the prefill pipeline: the head's rows: " +
+                                    std::string(cudaGetErrorString(cudaGetLastError())));
+                            return;
+                        }
+                        cudaSetDevice(hg.dev);
+                        if (cudaMemcpyAsync(hg.pos, pos.data(), sizeof(int) * (size_t) 3 * Tc, cudaMemcpyHostToDevice,
+                                            hg.s) != cudaSuccess ||
+                            cudaMemcpyAsync(hg.x, hb.data(), nb, cudaMemcpyHostToDevice, hg.s) != cudaSuccess) {
+                            set_err("the prefill pipeline: the head's rows: " +
+                                    std::string(cudaGetErrorString(cudaGetLastError())));
+                            return;
+                        }
+                    }
+                    const int cw = cWant[(size_t) c];
+                    if (!head_tail(cIds[(size_t) c].data(), T, p0, cw, cw > 0 ? logits_out : nullptr, e)) {
+                        set_err(e.empty() ? "the prefill pipeline: the head failed" : e);
+                        return;
+                    }
+                    if (cudaStreamSynchronize(hg.s) != cudaSuccess) {
+                        set_err("the prefill pipeline: the head: " +
+                                std::string(cudaGetErrorString(cudaGetLastError())));
+                        return;
+                    }
+                    if (on_chunk) on_chunk(p0 + T);   // (the caller's progress: this chunk's rows are in)
+                    if (gr[(size_t) gi].gpu != head_gpu) cudaSetDevice(gp.dev);
+                }
+                if (gi == 0) done0[(size_t) s].v.store(c, std::memory_order_release);
+            }
+        };
+        auto stage_run = [&](int gi) {
+            for (int c = 0; c < C; ++c) {
+                if (fail.load(std::memory_order_acquire)) return;
+                if (on_stop && on_stop()) {   // (a Stop: the chunk boundaries are where a staged prompt ends)
+                    set_err("stopped");
+                    return;
+                }
+                stage_chunk(gi, c);
+            }
+        };
+        // (HY4_PIPE_SERIAL: the chunks one after another, every group in turn - the staged path without its overlap:
+        //  a test control)
+        if (std::getenv("HY4_PIPE_SERIAL")) {
+            for (int c = 0; c < C && !fail.load(std::memory_order_acquire); ++c) {
+                const int s = c % depth;
+                std::string pe;
+                if (!pipe_prep(ids + cOff[(size_t) c], cT[(size_t) c], pos0 + cOff[(size_t) c], tk[(size_t) s],
+                               ceg[(size_t) c], pe)) {
+                    set_err(pe);
+                    break;
+                }
+                ready[(size_t) s].v.store(c, std::memory_order_release);
+                for (int gi = 0; gi < NG && !fail.load(std::memory_order_acquire); ++gi) stage_chunk(gi, c);
+            }
+        } else {
+        std::vector<std::thread> th;
+        for (int gi = 0; gi < NG; ++gi) th.emplace_back([&, gi]() { stage_run(gi); });
+        for (int c = 0; c < C; ++c) {   // the chunks' rows, on this thread, while the stages read the ones before
+            if (fail.load(std::memory_order_acquire)) break;
+            const int s = c % depth;
+            if (c >= depth && !wait_flag(done0[(size_t) s], c - depth)) break;
+            std::string pe;
+            if (!pipe_prep(ids + cOff[(size_t) c], cT[(size_t) c], pos0 + cOff[(size_t) c], tk[(size_t) s],
+                               ceg[(size_t) c], pe)) {
+                set_err(pe);
+                break;
+            }
+            ready[(size_t) s].v.store(c, std::memory_order_release);
+        }
+        for (auto& t : th) t.join();
+        }
+        free_slots();
+        if (fail.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> g(mu);
+            err = perr.empty() ? "the prefill pipeline failed" : perr;
+            return false;
+        }
+        return true;
+    }
+
     // (HY4_LOGIT_HASH: every window's logits rows hashed, bit by bit, as they come - printed with the reports at the
     //  end; two builds or settings that print the same hash made the same logits for every row)
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
@@ -8144,12 +8493,14 @@ struct Model::Impl {
             eg_last_s = now_s() - te;
             st.engram_ms += eg_last_s * 1e3;
         }
+        if (std::getenv("HY4_EG_TRACE")) eg_trace("win", h_eg, p0, T);
         for (int t = 0; t < T; ++t) {
             const int64_t p = p0 + t;
             h_pos[t] = (int) p;
             h_pos[Tc + t] = (int) std::max<int64_t>(0, p - g.n_swa + 1);
             h_pos[2 * Tc + t] = (int) (p - h_pos[Tc + t] + 1);
         }
+        // (--prefill-pipe: a prompt of more than a chunk goes through forward_piped instead - the chunks as stages)
         if (tp > 1) return window_tp(ids, T, p0, want, logits_out, err);
         // (HY4_FETCH_PROF=1, one GPU's token windows: the host's time to queue the layers, the GPU's from the first
         //  layer to the head, the wall time - reported at the end)
@@ -9485,6 +9836,27 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
     m->mtp_apos = -1;
     m->tokens.insert(m->tokens.end(), ids, ids + n);
     m->end = pos0;
+    if (m->pipe_ok(n)) {   // (--prefill-pipe: the prompt's chunks through the layer groups as stages)
+        std::string e;
+        if (!m->forward_piped(ids, n, pos0, want, logits_out, e)) {
+            m->name_fault(e);
+            err = e;
+            return false;
+        }
+        if (m->logit_hash && want > 0 && logits_out != nullptr) {   // (the hash window() keeps on the one-group path)
+            const size_t nv = (size_t) want * (size_t) m->g.n_vocab;
+            for (size_t i = 0; i < nv; ++i) {
+                uint32_t b;
+                std::memcpy(&b, logits_out + i, 4);
+                m->lh_sum = (m->lh_sum ^ b) * 1099511628211ull;
+            }
+            m->lh_rows += want;
+        }
+        m->end = pos0 + n;
+        m->st.tokens += n;
+        m->hot.rec = false;
+        return true;
+    }
     // the last chunk takes the last min(n, Tc) tokens (the wanted rows among them), the ones before it chunks of Tc
     const int Tc = m->Tc, last = std::min(n, Tc), head = n - last;
     int done = 0;
@@ -9520,6 +9892,9 @@ int Model::vocab() const { return m->g.n_vocab; }
 int Model::row_top(int r) const { return m->row_top(r); }
 int64_t Model::max_ctx() const { return m->o.max_ctx; }
 int Model::chunk() const { return m->Tc; }
+bool Model::staged_prefill() const { return m->pipe_ok(m->Tc + 1); }
+void Model::set_progress(std::function<void(int64_t)> f) { m->on_chunk = std::move(f); }
+void Model::set_cancel(std::function<bool()> f) { m->on_stop = std::move(f); }
 int Model::tensor_parallel() const { return std::max(1, m->tp); }
 bool Model::draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& c,
                   std::string& err, int base, float sure) {
