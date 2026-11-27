@@ -2949,8 +2949,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
 #endif
         const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         if (g_two.on) {   // (two GPUs: GPU 1's picks there, beside GPU 0's - through the ring when IK2_PEER_DIRECT_SIGNAL=1)
+#if !defined(MAYA_USE_HIP)   // (the ring is NVIDIA's: g_two.mail stays false in a HIP build)
             if (g_two.mail) two_send_mail(M, l, W, exp_tc);
-            else two_send(M, l, W, exp_tc);
+            else
+#endif
+            two_send(M, l, W, exp_tc);
         }
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
@@ -2983,8 +2986,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
         if (g_two.on) {
+#if !defined(MAYA_USE_HIP)
             if (g_two.mail) two_take_mail(M, W);
-            else two_take(M, W);
+            else
+#endif
+            two_take(M, W);
         }
         combine_write(W, Ly, c.K, C, abl::cur());
     }
