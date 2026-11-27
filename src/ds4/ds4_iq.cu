@@ -932,7 +932,11 @@ __device__ __forceinline__ int live_groups(const Args& a, int groups) {
 // grid (n_ff / (8 RW RP), groups): RW rows of the gate and of the up a warp a pass, NE of the group's entries a pass
 // (each sub-block decoded once for them) -> h = the clamped swiglu (EPI: act_out's).  PS (RP 1): the persistent grid
 // above, an item the full grid's block (bx, group)
-template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW, int EPI = 0, bool PS = false>
+// PAIR (RW 2): 16 lanes a row, each lane's sub-blocks in two sums - kb = lane, lane + 32, .. and lane + 16, lane + 48, ..,
+// the sums RW 1's lanes lane and lane + 16 make - added, then lanes_sum<2>: RW 1's tree (its xor-16 step that add), the
+// same bits as RW 1 with half the lanes a row (a V100, Hy4's 1536-wide experts: 48 sub-blocks were 2 for lanes 0-15
+// and 1 for 16-31)
+template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW, int EPI = 0, bool PS = false, bool PAIR = false>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int groups) {
 #if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
@@ -974,9 +978,10 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                 if (row >= a.n_ff) continue;   // (a whole warp: n_ff % (8 RW) == 0)
                 const uint8_t* g = blob + a.tr[kRole0<EPI>] + (size_t) row * rb;
                 const uint8_t* u = blob + a.tr[1] + (size_t) row * rb;
-                float ag[NE], au[NE];
+                float ag[NE], au[NE], bg[NE], bu[NE];
 #pragma unroll
-                for (int i = 0; i < NE; ++i) ag[i] = au[i] = 0.0f;
+                for (int i = 0; i < NE; ++i) ag[i] = au[i] = bg[i] = bu[i] = 0.0f;
+                bool odd = false;   // (PAIR: this step's sum - kb's (kb - lane) / 16 odd: the second)
                 Ahead<T, AH, CT> pg, pu;
                 if (lane < nsb) {
                     pg.load(g, lane);
@@ -997,11 +1002,24 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                             const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
                             const int4 xa = xp[0], xb = xp[1];
                             const float dx = a.xd[(size_t) xr[i] * nsb + kb];
-                            ag[i] = fma_no_contract(dx, sub_dot<T, EPI == 3 ? kMinU : kMinG>(sg, xa, xb), ag[i]);
-                            if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T, kMinU>(su, xa, xb), au[i]);
+                            if (PAIR && odd) {
+                                bg[i] = fma_no_contract(dx, sub_dot<T, EPI == 3 ? kMinU : kMinG>(sg, xa, xb), bg[i]);
+                                if constexpr (TWO) bu[i] = fma_no_contract(dx, sub_dot<T, kMinU>(su, xa, xb), bu[i]);
+                            } else {
+                                ag[i] = fma_no_contract(dx, sub_dot<T, EPI == 3 ? kMinU : kMinG>(sg, xa, xb), ag[i]);
+                                if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T, kMinU>(su, xa, xb), au[i]);
+                            }
                         }
                     pg = ng;
                     if constexpr (TWO) pu = nu;
+                    if constexpr (PAIR) odd = !odd;
+                }
+                if constexpr (PAIR) {
+#pragma unroll
+                    for (int i = 0; i < NE; ++i) {
+                        ag[i] = fadd_no_fma(ag[i], bg[i]);
+                        if constexpr (TWO) au[i] = fadd_no_fma(au[i], bu[i]);
+                    }
                 }
 #pragma unroll
                 for (int i = 0; i < NE; ++i)
@@ -2048,6 +2066,11 @@ static bool dn_rw4() {
     return on;
 }
 // grid.x: the blocks of one pass (n / (kWarps RW))
+// (gate_up_kernel's PAIR form for the token windows' experts - MAYA_IQ_GU_PAIR=0: a row a warp, as before)
+static bool gu_pair() {
+    static const bool on = !(std::getenv("MAYA_IQ_GU_PAIR") && std::getenv("MAYA_IQ_GU_PAIR")[0] == '0');
+    return on;
+}
 template <int T, int NE, int EPI = 0>
 void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
 #if DS4_IQ_PERSIST_BUILD
@@ -2066,6 +2089,15 @@ void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
         if (rp && ah) { pdl_launch(gate_up_kernel<T, NE, 4, true, kGuRW, EPI>, g4, kThreads, 0, s, a, ng); return; }
         if (rp) { pdl_launch(gate_up_kernel<T, NE, 4, false, kGuRW, EPI>, g4, kThreads, 0, s, a, ng); return; }
         if (ah) { pdl_launch(gate_up_kernel<T, NE, 1, true, kGuRW, EPI>, grid, kThreads, 0, s, a, ng); return; }
+    }
+    // (PAIR: 2 rows a warp, RW 1's bits - a V100, Hy4's experts: IQ2_XXS -12..-20% at 1-4 entries an expert, IQ3_XXS
+    //  -17% at one and 2-5% slower at more, its doubled sums' registers; other types: as before)
+    if constexpr ((T == kIQ2_XXS || (T == kIQ3_XXS && NE == 1)) && EPI == 0 && kGuRW == 1) {
+        if (gu_pair() && grid.x % 2 == 0 && a.n_embd / 32 >= 32) {
+            pdl_launch(gate_up_kernel<T, NE, 1, false, 2, EPI, false, true>, dim3(grid.x / 2, grid.y), kThreads, 0, s, a,
+                       (int) grid.y);
+            return;
+        }
     }
     pdl_launch(gate_up_kernel<T, NE, 1, false, kGuRW, EPI>, grid, kThreads, 0, s, a, (int) grid.y);
 }
