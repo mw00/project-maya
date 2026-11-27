@@ -12102,7 +12102,7 @@ def ling_about() -> str:
     sizes = [f"{LING_QUANTS[k]} ({ling_entry(k)['download_gb']:.0f} GB)" for k in LING_QUANTS if ling_published(k)]
     return ("inclusionAI's Ling-3.2-air (512 experts a layer, 8 a token) on its own engine"
             + (", in Maya's own GGUF quants: " + ", ".join(sizes) if sizes else "") +
-            "; NVIDIA from V100 / RTX 20 on, Linux only; one GPU or several (the layers split across "
+            "; NVIDIA from V100 / RTX 20 on, Linux and Windows; one GPU or several (the layers split across "
             "them), the experts that do not fit in VRAM computed from RAM, the rest read from the SSD; tool calls, "
             "thinking on or off, up to a 256K context, MTP drafting where the file has the model's draft block "
             "(measured once on this PC), pictures (its vision file, 0.9 GB, downloaded with the model; not with "
@@ -12162,8 +12162,12 @@ def ling_model_step(a, d: Path, key: str | None) -> Path | None:
 
 def ling_avx2_available() -> bool:
     """Check whether the host CPU supports AVX2 (required for maya-ling CPU expert lane)."""
-    if WIN:
-        return True
+    if WIN:   # (Windows' feature bit, else the CPU itself - setup.py's cpu_info test, without its PowerShell call)
+        try:
+            import ctypes
+            return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40)) or S._cpuid_avx2()
+        except Exception:  # noqa: BLE001 - it cannot be asked: as before (the engine says so itself)
+            return True
     try:
         txt = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
         return " avx2" in txt or "	avx2" in txt
@@ -12314,7 +12318,7 @@ def reset_ling_calibration(cfg: dict) -> bool:
 
 
 def set_up_ling(a, prev: dict) -> Path | None:
-    """Ling-3.2-air's steps 1-8: the PC (refused in one line where maya-ling does not run: Windows, a Mac, AMD, a card
+    """Ling-3.2-air's steps 1-8: the PC (refused in one line where maya-ling does not run: a Mac, AMD, a card
     older than V100 / RTX 20 or under 8 GB, no AVX2), the size (--model's, the one before, else the largest that fits
     this PC), the context and the fit (tools/ling_fit.py, the planner the Models page reads too), the engine
     (build/maya-ling), the file (pinned and sha256-checked for a Maya size), the tokenizer with the model's own chat

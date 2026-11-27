@@ -209,7 +209,7 @@ class Picker(unittest.TestCase):
         with p1, p2:
             got, _ = self.rows()
             self.assertEqual(got["rows"][-2:], ["Ling-3.2-air", "Inkling 2 Mini"])
-            for part in ("inclusionAI's Ling-3.2-air", "Ling-3.2-air-Maya-S (37 GB)", "Linux only", "thinking on or off",
+            for part in ("inclusionAI's Ling-3.2-air", "Ling-3.2-air-Maya-S (37 GB)", "Linux and Windows", "thinking on or off",
                          "one answer at a time"):
                 self.assertIn(part, got["about"]["Ling-3.2-air"])
             self.assertIn("Ling-3.2-air-Maya-M (46 GB)", got["about"]["Ling-3.2-air"])
@@ -262,6 +262,34 @@ class Steps(unittest.TestCase):
         p = mock.patch.object(maya, "rotational", lambda d: False)
         p.start()
         self.addCleanup(p.stop)
+
+    def test_windows_nvidia_passes_step_one_amd_refused(self):
+        """v1.1.83: a Windows PC with an NVIDIA card goes on to step 2 (no "Linux only" refusal); AMD on Windows is
+        refused in one line before anything."""
+        class Step2(Exception):
+            pass
+
+        def choose(*a, **kw):
+            raise Step2
+
+        for backend, gpus in (("cuda", [{"vram_gb": 8.0, "cc": 86}]), ("hip", [{"vram_gb": 24.0}])):
+            with mock.patch.object(maya, "WIN", True), \
+                    mock.patch.object(maya, "check_pc", lambda a, *x, **k: {"backend": backend, "gpus": gpus}), \
+                    mock.patch.object(maya, "mem_gb", lambda: (64.0, 60.0)), \
+                    mock.patch.object(maya, "ling_avx2_available", lambda: True), \
+                    mock.patch.object(maya, "ling_choose_quant", choose), \
+                    mock.patch.object(maya, "fail", lambda *m: (_ for _ in ()).throw(SystemExit(" ".join(m)))):
+                if backend == "cuda":
+                    with self.assertRaises(Step2):
+                        maya.set_up_ling(args(), {})
+                else:
+                    with self.assertRaises(SystemExit) as cm:
+                        maya.set_up_ling(args(), {})
+                    self.assertIn("AMD", str(cm.exception.code))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows' CPU feature bit")
+    def test_avx2_check_asks_windows(self):
+        self.assertEqual(maya.ling_avx2_available(), maya.S.cpu_info()[1])
 
     def small_table(self, revision=""):
         """The table with a small file in the size's place: its real size and sha256."""
@@ -531,7 +559,7 @@ class Steps(unittest.TestCase):
 
 class Catalog(unittest.TestCase):
     """The Models page's download list (serve/model_pull.py): Ling's sizes only once they can be downloaded, on
-    NVIDIA under Linux; every other row as before."""
+    NVIDIA under Linux or Windows; every other row as before."""
 
     def catalog(self, man, platform="linux", backend="cuda"):
         from serve import model_pull
@@ -549,7 +577,11 @@ class Catalog(unittest.TestCase):
                           ("ling-3.2-air-maya-m", "Ling-3.2-air · Maya-M", "maya", 46.0),
                           ("ling-3.2-air-maya-l", "Ling-3.2-air · Maya-L", "maya", 59.2)])
         self.assertEqual([r for r in after if r["family"] != "ling"], before)
-        for platform, backend in (("win32", "cuda"), ("linux", "hip"), ("darwin", "metal")):
+        # (Windows + NVIDIA: the same rows, v1.1.83)
+        win = [r for r in self.catalog(manifest("0" * 40), "win32", "cuda") if r["family"] == "ling"]
+        self.assertEqual([(r["id"], r["size_gb"]) for r in win], [(r["id"], r["size_gb"]) for r in ling])
+        self.assertTrue(all("Linux" not in r["note"] for r in win))
+        for platform, backend in (("win32", "hip"), ("linux", "hip"), ("darwin", "metal")):
             rows = self.catalog(manifest("0" * 40), platform, backend)
             self.assertEqual([r for r in rows if r["family"] == "ling"], [], (platform, backend))
 

@@ -62,8 +62,18 @@ class TestLingFit(unittest.TestCase):
         word_no, _ = LINGF.verdict(4.0, 64.0, 32768, "f16", gguf_gib=55.6)
         self.assertEqual(word_no, "does not fit")
 
+    def test_windows_nvidia_supported_amd_refused(self):
+        # (v1.1.83: Windows + NVIDIA as Linux, the same card rules; AMD on Windows refused in one line)
+        self.assertIsNone(LINGF.unsupported("cuda", True, [{"vram_gb": 8, "cc": 86}], 64, True))
+        self.assertIn("sm_70", LINGF.unsupported("cuda", True, [{"vram_gb": 24, "cc": 61}], 128, True))
+        self.assertIn("VRAM", LINGF.unsupported("cuda", True, [{"vram_gb": 6, "cc": 86}], 128, True))
+        self.assertIn("AVX2", LINGF.unsupported("cuda", True, [{"vram_gb": 24, "cc": 86}], 128, False))
+        amd = LINGF.unsupported("hip", True, [{"vram_gb": 24}], 128, True)
+        self.assertIn("Windows", amd)
+        self.assertIn("AMD", amd)
+
     def test_unsupported_refusals(self):
-        self.assertIsNotNone(LINGF.unsupported("cuda", True, [{"vram_gb": 24, "cc": 86}], 128, True))
+        self.assertIsNotNone(LINGF.unsupported("hip", True, [{"vram_gb": 24, "cc": 86}], 128, True))
         self.assertIsNotNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 61}], 128, True))
         self.assertIsNotNone(LINGF.unsupported("cuda", False, [{"vram_gb": 6, "cc": 86}], 128, True))
         self.assertIsNotNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 86}], 128, False))

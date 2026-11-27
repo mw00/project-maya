@@ -1157,10 +1157,10 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     endif()
   endif()
   # Ling-3.2-air (llama.cpp's bailingmoe3): its own engine (src/ling) on maya-ds4's ggml block-type GEMVs
-  # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; NVIDIA sm_70+, Linux by default
-  # (Windows + NVIDIA: compiles and starts with MSVC + CUDA 12.8; left out until a model run is checked there -
-  #  -DMAYA_LING_WINDOWS=ON builds it)
-  option(MAYA_LING_WINDOWS "Build maya-ling on Windows with NVIDIA" OFF)
+  # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; NVIDIA sm_70+, Linux and Windows
+  # (Windows + NVIDIA: built by default since v1.1.83 with MSVC + CUDA, as maya-ik2 and maya-hy4 -
+  #  MAYA_LING_WINDOWS=OFF leaves it out; its Windows OS layer: src/ling/ling_sys.hpp)
+  option(MAYA_LING_WINDOWS "Build maya-ling on Windows with NVIDIA" ON)
   set(_ling_os OFF)
   if(NOT WIN32 OR MAYA_LING_WINDOWS)
     set(_ling_os ON)

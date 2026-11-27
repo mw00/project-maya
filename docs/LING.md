@@ -20,8 +20,9 @@ alesha-pro contributed (PR #1224).
 | | |
 | --- | --- |
 | NVIDIA, Linux | V100 / RTX 20 and newer (compute capability 7.0 on), one GPU or several |
+| NVIDIA, Windows | the same cards (`START-MAYA.bat --setup --model ling-3.2-air-maya-s`); the experts read from the SSD go through Windows' file cache (no unbuffered reads there) |
 | CPU | AVX2 (the experts that are not in VRAM are computed on the CPU) |
-| Windows, AMD, Mac | not yet: the setup says so in one line and stops |
+| AMD, Mac | not yet: the setup says so in one line and stops |
 
 ## 3. Setting it up
 
@@ -100,7 +101,9 @@ Off by default. `--restore-dir <folder>` in the config's arguments turns them on
 
 - One answer at a time: no `--parallel`.
 - No tensor parallel.
-- Windows, AMD (Linux and Windows) and Mac.
+- AMD (Linux and Windows) and Mac.
+- Windows: one node's CPU pinning only (a PC with several NUMA nodes runs as one); `--image` on the engine's own
+  command line takes PPM files only (the server's pictures are not affected).
 - The same answer on one GPU and on several holds with `--repeatable` only; a normal run can differ in the last
   digits between layouts.
 
