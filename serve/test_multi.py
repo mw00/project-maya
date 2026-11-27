@@ -80,11 +80,20 @@ class Engine(unittest.TestCase):
     def test_each_request_reads_its_own_progress(self):
         """A request waiting for the engine behind another's prompt read gets heartbeats (None) while it waits, and the
         server's prompt_progress for it is own_progress() at each: it carried the engine's latest PP line, the other
-        request's read (a 17K prompt showed a 600K read as its own, and its own count once that one was cancelled)."""
+        request's read (a 17K prompt showed a 600K read as its own, and its own count once that one was cancelled).
+        The long read is held open (FAKE_MULTI_GATE) until the short request's wait heartbeat came, then let end: a
+        read sized in sleeps ended before that heartbeat on a fast PC, or outlasted the short one's quiet limit (10 s,
+        it was stopped) on a slow one."""
         import serve.server as srv
+        tmp = tempfile.mkdtemp(prefix="maya-test-gate-")
+        gate = Path(tmp) / "go"
         os.environ["FAKE_MULTI_INTERLEAVE"] = "20"        # one prompt read at a time, 20 ids a PP line
+        os.environ["FAKE_MULTI_GATE"] = str(gate)         # each read held one piece before its end until `gate` exists
         quiet0, srv.REQUEST_QUIET_S = srv.REQUEST_QUIET_S, 10.0   # a heartbeat after 5 s of quiet (not 10)
-        engine = StrataEngine(script_exe(FAKE), ["2"])
+        try:
+            engine = StrataEngine(script_exe(FAKE), ["2"])
+        finally:
+            del os.environ["FAKE_MULTI_GATE"]
         try:
             seen: dict[str, list] = {}
 
@@ -94,6 +103,8 @@ class Engine(unittest.TestCase):
                 for t in engine.generate(list(range(n)), 3, {}, threading.Event()):
                     if t is None:
                         got.append(engine.own_progress())
+                        if name == "short" and not gate.exists():
+                            gate.touch()                  # its wait's heartbeat came: the long read may end
 
             ths = [threading.Thread(target=one, args=("long", 34000, 0.0)),
                    threading.Thread(target=one, args=("short", 800, 0.3))]
@@ -103,6 +114,7 @@ class Engine(unittest.TestCase):
             engine.close()
             srv.REQUEST_QUIET_S = quiet0
             del os.environ["FAKE_MULTI_INTERLEAVE"]
+            shutil.rmtree(tmp, ignore_errors=True)
         self.assertEqual({p[1] for p in seen["long"] if p}, {34000})
         self.assertEqual({p[1] for p in seen["short"] if p}, {800})
         self.assertIsNone(seen["short"][0])               # its wait's heartbeat: no read of its own yet
