@@ -745,8 +745,8 @@ struct Held {
 // conversation in the caches, that one is set aside (Model::slot_save) and the kept one this prompt continues the
 // furthest is taken back (Model::slot_load), so agents taking turns on one model - an agent's parent and its workers,
 // chats - read only their new tokens.  The newest MAYA_HY4_SLOT_CAP (4) in RAM (at most MAYA_HY4_SLOT_RAM_GB of them,
-// 8; 0: no byte cap), the older ones in MAYA_HY4_SLOT_DIR (<pack>/slots: a .bin and a .meta a conversation, kept
-// across runs; MAYA_HY4_SLOT_GB 64 at most, unused MAYA_HY4_SLOT_DAYS 7 removed at a start), conversations of
+// 0: no byte cap, the count alone), the older ones in MAYA_HY4_SLOT_DIR (<pack>/slots: a .bin and a .meta a conversation, kept
+// across runs; MAYA_HY4_SLOT_GB 16 at most, unused MAYA_HY4_SLOT_DAYS 7 removed at a start), conversations of
 // MAYA_HY4_SLOT_MIN (1024) tokens on.  A slot keeps its rings' rows of its last MAYA_HY4_SLOT_RING (4096) positions:
 // it is taken back whole, or at a position that far back less the window (a history whose last answer was
 // rendered again).  MAYA_HY4_SLOT_KEEP=1 turns it on.
@@ -924,8 +924,8 @@ struct Slots {
         }
         min_tokens = (size_t) env_num("MAYA_HY4_SLOT_MIN", 1024);
         ring_keep = (int64_t) env_num("MAYA_HY4_SLOT_RING", 4096);
-        ram_gb = env_num("MAYA_HY4_SLOT_RAM_GB", 8);
-        dir_gb = env_num("MAYA_HY4_SLOT_GB", 64);
+        ram_gb = env_num("MAYA_HY4_SLOT_RAM_GB", 0);
+        dir_gb = env_num("MAYA_HY4_SLOT_GB", 16);
         days = env_num("MAYA_HY4_SLOT_DAYS", 7);
         const char* d = std::getenv("MAYA_HY4_SLOT_DIR");
         dir = d && *d ? d : pack + "/slots";

@@ -2872,8 +2872,8 @@ the last bits of every answer, slots on or off: the test says so and claims the 
 | --- | --- | --- |
 | `MAYA_HY4_SLOT_KEEP` | off | `1`: keep the conversation when another one takes the model, and across runs in the folder |
 | `MAYA_HY4_SLOT_CAP` | 4 | the conversations kept in RAM; past it (or past `MAYA_HY4_SLOT_RAM_GB`) the least recently used is written to the folder; `0` = none kept |
-| `MAYA_HY4_SLOT_RAM_GB` | 8 | their RAM at most (GB; one is always kept, even alone over it): a Hy4-Flash conversation is large and the RAM holds the CPU lane's experts; `0` = the count alone |
-| `MAYA_HY4_SLOT_GB` | 64 | the folder's conversations' total size (GB): the least recently used removed past it, never the one just written |
+| `MAYA_HY4_SLOT_RAM_GB` | 0 | their RAM at most (GB; one is always kept, even alone over it); `0` = the count alone (as DeepSeek). A Hy4-Flash conversation is large and the RAM also holds the CPU lane's experts, so a PC short of RAM can set a cap |
+| `MAYA_HY4_SLOT_GB` | 16 | the folder's conversations' total size (GB): the least recently used removed past it, never the one just written |
 | `MAYA_HY4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its rows) and a `.meta` (the identity, its tokens, its rings' rows, its pictures), each written under a temporary name first; less than 8 GB free beside one: not written |
 | `MAYA_HY4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens) |
 | `MAYA_HY4_SLOT_RING` | 4096 | the ring rows a conversation keeps (positions before its end): how far back before its end it can be taken (less 512); each 4096 costs ~0.25 GB a conversation |
