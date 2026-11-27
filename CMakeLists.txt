@@ -1098,6 +1098,11 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
         set_tests_properties(hy4_experts_test PROPERTIES TIMEOUT 300)
       endif()
     endif()
+    # maya-ik2s: Inkling 2 Small on 2-4 AMD GPUs (src/ik2s, docs/INKLING2_AMD.md) - its own engine beside maya-ik2;
+    # AMD under Linux only.  NVIDIA builds are unchanged.
+    if(MAYA_ENABLE_HIP AND NOT WIN32)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ik2s.cmake)
+    endif()
     if(MAYA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
