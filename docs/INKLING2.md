@@ -513,8 +513,10 @@ routes them with its own table and runs the picks it holds with the token path's
 those picks' places before the sum - so every row and the sum's order are one card's, and the answers do not depend
 on which card holds an expert (two cards of one kind: the one-card offload path's answers, checked on the CLI and the
 server's answers, tool calls, pictures and loop guard). Copies between the cards: peer to peer only where the driver
-offers it, the IOMMU translates neither card and a test copy at load arrives intact, else through pinned host memory
-(`IK2_HOST_STAGE=1` forces that; the same answers). `IK2_PEER_DIRECT_SIGNAL=1` takes the copies out of a visit altogether: a ring of four slots in host memory both cards map -
+offers it, the IOMMU translates neither card and a test copy at load arrives intact, else the shorter wait of the
+driver's copy and pinned host memory, timed at load (`IK2_HOST_STAGE=1` forces the latter, `MAYA_LINK_PICK=driver` the
+former; the same answers: on an RTX 5080 + RTX 4060 Ti without P2P, 97-116 us a round trip against 120-170 us by the
+driver). `IK2_PEER_DIRECT_SIGNAL=1` takes the copies out of a visit altogether: a ring of four slots in host memory both cards map -
 GPU 0 writes x and the router's logits into one, GPU 1 (woken by an event) copies them in and writes its rows back with
 the visit's number, and GPU 0 takes the rows only where it has a pick of GPU 1's, which most visits do not. With the
 copies the first card is busy 55 percent of a token (it waits for the round trip of each of the 48 visits); with the ring
