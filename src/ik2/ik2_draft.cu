@@ -408,12 +408,13 @@ struct Drafter {
     float eps = 1e-6f, theta = 1e6f;
     bool q8 = false;   // the layers' matrices Q8_0 (a GGUF's): their inputs FP16, else BF16
     bool is_dflash2 = false;   // DFlash2DraftModel (5 layers, convs, top-16 selector)
+    int mask_tok_id = -1;
     DMat fc_w, sel_hidden;
     float* enc_norm = nullptr;
     uint16_t *sel_pred_bf = nullptr, *sel_succ_bf = nullptr;
     float *taps_cat = nullptr, *ds2_conv_dyn = nullptr, *ds2_gate = nullptr;
     int32_t *ds2_pidx = nullptr, *ds2_idx = nullptr;
-    float *ds2_pval = nullptr, *ds2_val = nullptr;
+    float *ds2_pval = nullptr, *ds2_val = nullptr, *ds2_cv = nullptr;
     int* ds2_out_tok = nullptr;
     bool kv8 = false;  // the layer without a window's context rows FP8 E4M3, K times k_scale, V times v_scale
     // (K is RMS-normed a head - |k| <= sqrt(128) x its norm's weight, 12.4 at most measured - V not: 17.7 at most
@@ -764,6 +765,8 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         d->norm = upf("output_norm.weight");
         d->mask = dalloc<float>(C);
         cu(cudaMemset(d->mask, 0, (size_t) C * 4), "mask");
+        if (const auto* mt = f.g->get("tokenizer.ggml.mask_token_id")) d->mask_tok_id = (int) mt->u;
+        else d->mask_tok_id = 200056;
     } else {
         d->V = (int) src_dim0(f, "markov_head.markov_w1.weight");
     }
@@ -845,6 +848,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     } else {
         d->taps_cat = dalloc<float>((size_t) kMixRows * 4 * C);
         d->ds2_conv_dyn = dalloc<float>((size_t) kBlock * 576);
+        d->ds2_cv = dalloc<float>((size_t) kBlock * C);
         d->ds2_gate = dalloc<float>((size_t) (kBlock - 1) * R);
         d->ds2_pidx = dalloc<int32_t>((size_t) (kBlock - 1) * 32 * 16);
         d->ds2_pval = dalloc<float>((size_t) (kBlock - 1) * 32 * 16);
@@ -860,7 +864,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->kk = dalloc<float>(std::max<size_t>(T, kMixRows) * KV * 128), d->vv = dalloc<float>(T * KV * 128);
     d->gu = dalloc<float>(T * 2 * F);
     d->hb = dalloc<uint16_t>(std::max<size_t>(T * std::max<int64_t>(C, H * 128), (size_t) kMixRows * C));
-    d->hb2 = dalloc<uint16_t>(T * F);
+    d->hb2 = dalloc<uint16_t>(std::max<size_t>(T * F, (size_t) kMixRows * 4 * C));
     // (draft_attn's: the chunks' outputs [64][H][8][128] and (max, sum) - nothing that grows with the context)
     d->ctx_tmp = dalloc<float>((size_t) 2 * kMixRows * KV * 128);
     d->scratch = dalloc<float>(k::draft_attn_scratch((int) H));
@@ -1216,28 +1220,38 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
     // pre-norm layers, the residual carried apart (res = x + res before each norm)
     for (size_t i = 0; i < d->L.size(); ++i) {
         DLayer& l = d->L[i];
-        if (i > 0) k::add(d->x, d->res, TC, d->res, d->s);
+        if (!d->is_dflash2 && i > 0) k::add(d->x, d->res, TC, d->res, d->s);
         k::rms(d->res, l.in_norm, T, C, d->eps, d->h, d->s);
-        layer_attn(d, l, P, d->x, dyn);
+        const int dyn_r = 2 * 2 * (C / 16);
         if (d->is_dflash2 && l.attn_conv_proj.bf) {
-            const int dyn_r = 2 * 4 * (C / 32);
-            k::to_bf16(d->h, (size_t) T * C, (uint16_t*) d->x16, d->s);
+            k::to_bf16(d->h, TC, (uint16_t*) d->x16, d->s);
             gemm_bf(d, l.attn_conv_proj.bf, dyn_r, C, (const uint16_t*) d->x16, T, d->ds2_conv_dyn, dyn_r);
             ds2_conv_kernel<<<dim3((C + 255) / 256, T), 256, 0, d->s>>>(
-                d->h, d->ds2_conv_dyn, dyn_r, l.attn_conv_base, 0, 4, 32, C, d->x, d->x);
+                d->h, d->ds2_conv_dyn, dyn_r, l.attn_conv_base, 0, 2, 16, C, nullptr, d->ds2_cv);
+            cu(cudaMemcpyAsync(d->h, d->ds2_cv, TC * sizeof(float), cudaMemcpyDeviceToDevice, d->s), "ds2_cv");
         }
-        k::add(d->x, d->res, TC, d->res, d->s);
+        layer_attn(d, l, P, d->x, dyn);
+        if (d->is_dflash2 && l.attn_conv_proj.bf) {
+            ds2_conv_kernel<<<dim3((C + 255) / 256, T), 256, 0, d->s>>>(
+                d->x, d->ds2_conv_dyn, dyn_r, l.attn_conv_base, 1, 2, 16, C, d->res, d->res);
+        } else {
+            k::add(d->x, d->res, TC, d->res, d->s);
+        }
         k::rms(d->res, l.post_norm, T, C, d->eps, d->h, d->s);
-        layer_mlp(d, l, d->x);
         if (d->is_dflash2 && l.ffn_conv_proj.bf) {
-            const int dyn_r = 2 * 4 * (C / 32);
-            k::to_bf16(d->h, (size_t) T * C, (uint16_t*) d->x16, d->s);
+            k::to_bf16(d->h, TC, (uint16_t*) d->x16, d->s);
             gemm_bf(d, l.ffn_conv_proj.bf, dyn_r, C, (const uint16_t*) d->x16, T, d->ds2_conv_dyn, dyn_r);
             ds2_conv_kernel<<<dim3((C + 255) / 256, T), 256, 0, d->s>>>(
-                d->h, d->ds2_conv_dyn, dyn_r, l.ffn_conv_base, 0, 4, 32, C, d->x, d->x);
+                d->h, d->ds2_conv_dyn, dyn_r, l.ffn_conv_base, 0, 2, 16, C, nullptr, d->ds2_cv);
+            cu(cudaMemcpyAsync(d->h, d->ds2_cv, TC * sizeof(float), cudaMemcpyDeviceToDevice, d->s), "ds2_cv");
+        }
+        layer_mlp(d, l, d->x);
+        if (d->is_dflash2 && l.ffn_conv_proj.bf) {
+            ds2_conv_kernel<<<dim3((C + 255) / 256, T), 256, 0, d->s>>>(
+                d->x, d->ds2_conv_dyn, dyn_r, l.ffn_conv_base, 1, 2, 16, C, d->res, d->res);
         }
     }
-    k::add(d->x, d->res, TC, d->res, d->s);
+    if (!d->is_dflash2) k::add(d->x, d->res, TC, d->res, d->s);
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
     k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
@@ -1253,7 +1267,7 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
         k::to_bf16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
         gemm_bf(d, d->sel_hidden.bf, d->R, C, (const uint16_t*) d->x16, proposals, d->ds2_gate, d->R);
         ds2_select_kernel<<<1, 512, 0, d->s>>>(
-            d->ds2_idx, d->ds2_val, d->ds2_gate, d->R, d->sel_pred_bf, d->sel_succ_bf, proposals, anchor, d->noise_cap,
+            d->ds2_idx, d->ds2_val, d->ds2_gate, d->R, d->sel_pred_bf, d->sel_succ_bf, proposals, anchor, 30.0f,
             d->ds2_out_tok);
         cu(cudaMemcpyAsync(d->h_out, d->ds2_out_tok, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
         return;
@@ -1399,6 +1413,14 @@ void load_context(Drafter* d, int pos, const std::vector<uint8_t>& in) {
         at += b;
     });
     cu(cudaStreamSynchronize(d->s), "load_context");
+}
+
+int mask_token_id(const Drafter* d) { return d ? d->mask_tok_id : -1; }
+
+void set_mask(Drafter* d, const float* mask_h) {
+    if (!d || !d->mask || !mask_h) return;
+    cu(cudaMemcpyAsync(d->mask, mask_h, (size_t) d->C * sizeof(float), cudaMemcpyDeviceToDevice, d->s), "set_mask");
+    cu(cudaStreamSynchronize(d->s), "set_mask");
 }
 
 }  // namespace ik2::draft
