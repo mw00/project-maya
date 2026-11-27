@@ -477,6 +477,24 @@ the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not
 24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting stays off on
 the offload path (its window runs only where every expert is in VRAM; a NOTE says so).
 
+**Which experts the tier holds (v1.1.83).** Layers 6 .. 17 run three times a token on the same weights, so one VRAM
+copy of their experts serves 36 of the 48 layer visits. Filling the tier by picks a byte (v1.1.82) left a few experts
+of almost every layer in RAM, and each visit with one miss waits for the CPU lane or a copy before it can sum: the
+cost is a visit that waits, not the bytes. Where the decode is lane parity the tier is now filled with whole layers,
+the most layer visits a byte first - the looped layers, then the other NVFP4 layers, then the Q8_0 ones (20 .. 23) -
+inside a layer by picks (`src/ik2/ik2_tier.hpp`, `tests/ik2_tier_test.cpp`); the KV lending and GPU 1's share take
+the next experts in the same order. Mode A (two GPUs, AMD, drafting on the offload path, a PC whose CPU lane is not
+the faster) keeps v1.1.82's order until it is measured per PC. The decode mode is chosen as before, from the share
+of the profile's picks v1.1.82's tier holds, and the prompts' prefetch keeps the profile's counts. Only where the
+experts sit changes, so the answers are those of the same decode mode. `IK2_TIER_ORDER=layers` / `picks` forces one
+(tests). Measured on a V100 (PCIe 3, 40-core Xeon CPU lane) set to act as an 8 / 12 / 16 GB card, `--bench`
+against v1.1.82 at 32K (FP8 cache, lane parity chosen by both, the same greedy tokens): decode 24.1 -> 37.0 /
+28.8 -> 51.2 / 41.0 -> 60.9 tok/s, and the speed no longer swings with the question (12 GB: 50.8 - 52.0 against
+22.9 - 40.2). Prompts read 6-10% slower (2K: 975 -> 874 / 1208 -> 1131 / 1393 -> 1293 tok/s), most likely because a
+prompt pass uses nearly every expert, and with whole layers the ones not in VRAM sit together in a few layers whose
+copies have little of that layer's work to hide behind (not yet measured apart). The lane carries more of a token's misses this way, so a CPU busy with
+other work costs this order more than the old one.
+
 **What it runs on.** Inkling-2-Mini is a supported model: Linux or Windows, one NVIDIA GPU of 8 GB or more, sm_70
 (Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
 (sm_100 / sm_120) compile-checked only; Windows run on an RTX 3050 8 GB (@cobra91's MSVC port, its VRAM as CUDA gets it

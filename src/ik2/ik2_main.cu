@@ -27,6 +27,7 @@
 #include "ik2_kernels.cuh"
 #include "ik2_lane.hpp"
 #include "ik2_off.cuh"
+#include "ik2_tier.hpp"
 #include "mm3_link.cuh"   // (two GPUs: the copies between them, peer only where tested)
 #include "maya/artifact/gguf_reader.hpp"
 #include "maya/spec/suffix_drafter.hpp"
@@ -948,8 +949,11 @@ struct ExpertCache {
         die("expert cache: no slot free");
     }
 
+    // order (the offload path's tier, given): the experts' keys in the order the pools take them (ik2_tier.hpp's
+    // layer_order) instead of by picks a byte; alloc false: the pools only sized (what v1.1.82's tier would hold)
     void init(const std::vector<Layer>& L, int dev, int n_layers_in, int E_in, size_t budget,
-              const std::vector<double>* value = nullptr) {
+              const std::vector<double>* value = nullptr, const std::vector<int>* order = nullptr,
+              bool alloc = true) {
         n_layers = n_layers_in;
         E = E_in;
         layer_pool.assign(n_layers, -1);
@@ -1019,7 +1023,14 @@ struct ExpertCache {
             pools[p].n_slots = std::clamp((int) std::floor(pools[p].n_layers * lo), pmin[p], pmax[p]);
             used += (size_t) pools[p].n_slots * pools[p].slot_bytes;
         }
-        if (value && value->size() == (size_t) n_layers * E) {
+        if (value && value->size() == (size_t) n_layers * E && order && order->size() == (size_t) n_layers * E) {
+            std::vector<size_t> psb(pools.size());
+            std::vector<int> ns;
+            for (size_t p = 0; p < pools.size(); ++p) psb[p] = pools[p].slot_bytes;
+            const size_t left = ik2::tier::size_pools(*order, layer_pool, E, psb, pmin, pmax, budget, ns);
+            for (size_t p = 0; p < pools.size(); ++p) pools[p].n_slots = ns[p];
+            used = budget - left;
+        } else if (value && value->size() == (size_t) n_layers * E) {
             // (the offload path's tier: the pools sized by what their experts are worth a byte - a profile's picks
             //  over the slot's bytes, the most first - each pool at least its minimum, the prompt path's)
             std::vector<std::pair<double, int>> ord;   // (picks a byte, pool)
@@ -1057,6 +1068,8 @@ struct ExpertCache {
         for (size_t p = 0; p < pools.size(); ++p) {
             Pool& P = pools[p];
             P.prob_cap = std::max(1, P.n_slots / 5);
+            P.n_active = P.n_slots;
+            if (!alloc) continue;
             P.data = dalloc<uint8_t>((size_t) P.n_slots * P.slot_bytes);
             P.owner.assign(P.n_slots, -1);
             P.used.assign(P.n_slots, 0);
@@ -1937,6 +1950,12 @@ struct OffState {
 };
 OffState g_offs;
 bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at load)
+// The VRAM tier's order (ik2_tier.hpp, set at load; IK2_TIER_ORDER=layers / picks: tests): each expert key's place
+// in the whole-layer order where the tier was filled that way, empty for picks a byte (v1.1.82's order) - the KV
+// lending and GPU 1's share then take the same order.  g_tier_h_picks: the share of the profile's picks v1.1.82's
+// tier holds (the decode mode's estimate, whatever the order; -1: not worked out)
+std::vector<int> g_tier_rank;
+double g_tier_h_picks = -1;
 // Drafting on the offload path (a long context on a card that then keeps a tier of the experts): the verify window
 // takes the token path's mode A arithmetic - the resident kernels over the tier's or staging's bytes - so it runs
 // where mode A decodes (not lane parity, whose sums are ik2_exact.h's), with the whole cache in VRAM, on one GPU.
@@ -3111,9 +3130,12 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
     for (int i = 0; i < nE; ++i)
         if (!tier[i]) cand.push_back(i);
     auto val = [&](int i) { return value.empty() ? 1.0 : value[(size_t) i] + 1.0; };
-    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
-        return val(a) / (double) M.L[a / E].slot_bytes > val(b) / (double) M.L[b / E].slot_bytes;
-    });
+    if (g_tier_rank.size() == (size_t) nE)   // (the tier's whole-layer order: GPU 1 takes the next in it)
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return g_tier_rank[a] < g_tier_rank[b]; });
+    else
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
+            return val(a) / (double) M.L[a / E].slot_bytes > val(b) / (double) M.L[b / E].slot_bytes;
+        });
     T.own.assign(nE, 0);
     std::vector<int> per(c.n_layer, 0);
     size_t used = 0;
@@ -3332,9 +3354,12 @@ void lend_grow(Model& M, int end) {
     std::vector<int> cand;
     for (int key = 0; key < c.n_layer * c.E; ++key)
         if (EC.loc[key] < 0 && !g_lend.placed[key]) cand.push_back(key);
-    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
-        return val[a] / M.L[a / c.E].slot_bytes > val[b] / M.L[b / c.E].slot_bytes;
-    });
+    if (g_tier_rank.size() == (size_t) c.n_layer * c.E)   // (the tier's whole-layer order: the next in it first)
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return g_tier_rank[a] < g_tier_rank[b]; });
+    else
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
+            return val[a] / M.L[a / c.E].slot_bytes > val[b] / M.L[b / c.E].slot_bytes;
+        });
     const double t0 = now();
     int n = 0;
     for (int key : cand) {
@@ -3383,6 +3408,58 @@ inline void lend_check(Model& M, int end, bool token = false) {
 // The lane-parity mode (IK2_LANE=1, =fetch / =cpu: every miss to one side - tests): the CPU lane started and the
 // split's figures measured here (an expert on the lane, over the bus, on the GPU).  False: the layers' experts are
 // not in formats the exact lane has (NVFP4 / Q8_0, gate and up of one type) - the offload path goes on without it.
+// (whether the exact lane has every layer's expert formats - lane_init's own test, also asked before the tier's plan)
+bool lane_formats(const Model& M) {
+    const Config& c = M.c;
+    auto fmt_ok = [](int t) { return t == k::kNVFP4 || t == k::kQ8_0; };
+    if (c.F % 32 || c.C % 64 || c.K > k::kOffMaxK) return false;
+    for (int l = 0; l < c.n_layer; ++l) {
+        const Layer& Ly = M.L[l];
+        if (!fmt_ok(Ly.ty[0]) || Ly.ty[1] != Ly.ty[0] || !fmt_ok(Ly.ty[2])) return false;
+    }
+    return true;
+}
+
+// The per-PC calibration's file (IK2_CALIB: its file, default ~/.maya/ik2-offload-calib.txt; "0" or empty: none)
+// and this GPU's, CPU's and lane's key in it; lane_calib_read: the key's last line (false: none kept yet)
+std::string lane_calib_path() {
+    const char* ce = getenv("IK2_CALIB");
+    std::string cal_path = ce && *ce ? ce : "";
+    if (cal_path.empty()) {
+        const char* home = getenv("HOME") ? getenv("HOME") : getenv("USERPROFILE");
+        if (home) cal_path = std::string(home) + "/.maya/ik2-offload-calib.txt";
+    }
+    return cal_path;
+}
+std::string lane_calib_key(const Config& c, int threads) {
+    cudaDeviceProp p{};
+    CU(cudaGetDeviceProperties(&p, 0));
+    size_t fr = 0, tot = 0;
+    CU(mem_info(&fr, &tot));
+    char kb[256];
+    std::snprintf(kb, sizeof kb, "%s|%zu MiB|%u logical|%zu physical|%s|lane %d|C %d F %d", p.name, tot >> 20,
+                  std::thread::hardware_concurrency(), maya::kernels::cpu::physical_cores(false).size(),
+                  ik2::lane::rows_form(), threads, c.C, c.F);
+    std::string key = kb;
+    for (char& ch : key) ch = ch == ' ' ? '_' : ch;
+    return key;
+}
+bool lane_calib_read(const std::string& cal_path, const std::string& key, k::LaneCost& cal, int& cal_thr) {
+    bool have = false;
+    if (!cal_path.empty() && cal_path != "0")
+        if (std::ifstream in(cal_path); in)
+            for (std::string ln; std::getline(in, ln);) {
+                std::istringstream is(ln);
+                std::string kk;
+                k::LaneCost t{};
+                int th = 0;
+                if ((is >> kk >> th >> t.cpu[0] >> t.cpu[1] >> t.fetch[0] >> t.fetch[1] >> t.gpu[0] >> t.gpu[1] >> t.lat) &&
+                    kk == key && th > 0)
+                    cal = t, cal_thr = th, have = true;   // (the last line of the key wins)
+            }
+    return have;
+}
+
 bool lane_init(Model& M, const std::string& want, int threads) {
     const Config& c = M.c;
     const int C = c.C, F = c.F, K = c.K;
@@ -3433,39 +3510,10 @@ bool lane_init(Model& M, const std::string& want, int threads) {
     // The per-PC calibration (IK2_CALIB: its file, default ~/.maya/ik2-offload-calib.txt; 0: measured every start,
     // not kept): the lane's size and the split's figures measured once for this GPU, CPU and layer formats, kept
     // under that key and read back on the next start (the decode re-times the lane as it goes either way).
-    const char* ce = getenv("IK2_CALIB");
-    std::string cal_path = ce && *ce ? ce : "";
-    if (cal_path.empty()) {
-        const char* home = getenv("HOME") ? getenv("HOME") : getenv("USERPROFILE");
-        if (home) cal_path = std::string(home) + "/.maya/ik2-offload-calib.txt";
-    }
-    std::string key;
-    {
-        cudaDeviceProp p{};
-        CU(cudaGetDeviceProperties(&p, 0));
-        size_t fr = 0, tot = 0;
-        CU(mem_info(&fr, &tot));
-        char kb[256];
-        std::snprintf(kb, sizeof kb, "%s|%zu MiB|%u logical|%zu physical|%s|lane %d|C %d F %d", p.name, tot >> 20,
-                      std::thread::hardware_concurrency(), maya::kernels::cpu::physical_cores(false).size(),
-                      ik2::lane::rows_form(), threads, C, F);
-        key = kb;
-        for (char& ch : key) ch = ch == ' ' ? '_' : ch;
-    }
+    const std::string cal_path = lane_calib_path(), key = lane_calib_key(c, threads);
     k::LaneCost cal{};
     int cal_thr = 0;
-    bool have = false;
-    if (!cal_path.empty() && cal_path != "0")
-        if (std::ifstream in(cal_path); in)
-            for (std::string ln; std::getline(in, ln);) {
-                std::istringstream is(ln);
-                std::string kk;
-                k::LaneCost t{};
-                int th = 0;
-                if ((is >> kk >> th >> t.cpu[0] >> t.cpu[1] >> t.fetch[0] >> t.fetch[1] >> t.gpu[0] >> t.gpu[1] >> t.lat) &&
-                    kk == key && th > 0)
-                    cal = t, cal_thr = th, have = true;   // (the last line of the key wins)
-            }
+    const bool have = lane_calib_read(cal_path, key, cal, cal_thr);
     if (have) g_offs.lane->set_threads(cal_thr - 1);
     if (threads < 0 && !have) {   // the lane's size: counts below the CPU's cores timed on experts read from memory, the
                          // fastest kept (a smaller one within 5%) - a lane as wide as the CPU loses on a busy PC
@@ -8018,7 +8066,69 @@ int main(int argc, char** argv) {
                     off_value.assign(cnt.begin(), cnt.end());
                 std::fclose(in);
             }
-    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, off_value.empty() ? nullptr : &off_value);
+    // The tier's order (ik2_tier.hpp; owner, v1.1.83): on a looped model's offload path where the decode will be lane
+    // parity, whole layers by visits a byte (the looped layers first), inside a layer by picks - fewer layer visits a
+    // token then wait for an expert from RAM; elsewhere picks a byte, v1.1.82's order (mode A: until it is measured
+    // per PC).  IK2_TIER_ORDER=layers / picks: either one (tests).  The decode mode is chosen as v1.1.82 chose it:
+    // from the share of the profile's picks v1.1.82's tier holds (worked out here, or after the warm below).
+    std::vector<int> tier_order, tier_rank;
+    bool tier_guess = false;   // (lane parity assumed: no calibration of this PC kept yet - its first start)
+    auto picks_share = [&]() {   // (v1.1.82's tier - the pools sized by picks a byte, each the most picked - its share)
+        ExpertCache T;
+        T.tp = EC.tp, T.tier_only = EC.tier_only;
+        T.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, &off_value, nullptr, false);
+        std::vector<char> held((size_t) c.n_layer * c.E, 0);
+        for (size_t p = 0; p < T.pools.size(); ++p) {
+            std::vector<int> idx;
+            for (int l = 0; l < c.n_layer; ++l)
+                if (T.layer_pool[l] == (int) p)
+                    for (int e = 0; e < c.E; ++e)
+                        if (!g_ep || ep_owner(l, e) == d) idx.push_back(l * c.E + e);
+            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return off_value[a] > off_value[b]; });
+            for (int i = 0; i < std::min((int) idx.size(), T.pools[p].n_active); ++i) held[(size_t) idx[i]] = 1;
+        }
+        double hit = 0, all = 0;   // (summed as the decode mode's estimate sums them)
+        for (int i = 0; i < c.n_layer * c.E; ++i) all += off_value[(size_t) i], hit += held[(size_t) i] ? off_value[(size_t) i] : 0.0;
+        return all > 0 ? hit / all : 0.0;
+    };
+    if (g_off_want && d == 0 && !off_value.empty()) {
+        int want = ik2::tier::forced_order(getenv("IK2_TIER_ORDER"));
+        if (want < 0) {   // (the decode mode the load below will choose - its own rules)
+            const char* le = getenv("IK2_LANE");
+#ifdef MAYA_USE_HIP
+            const char* lane_def = "0";
+#else
+            const char* lane_def = "auto";
+#endif
+            const bool meas = g_off_measure && g_off_draft && !g_two.want && !g_kv_streaming;
+            const std::string lw = g_two.want || g_kv_streaming || (g_off_draft && !meas) ? "0"
+                                   : le && *le ? le : lane_def;
+            want = 0;
+            if (c.n_pass > 1 && lw != "0" && lane_formats(M)) {
+                k::LaneCost cal{};
+                int th = 0;
+                const int thr = getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1;
+                if (lw != "auto") want = 1;
+                else if (lane_calib_read(lane_calib_path(), lane_calib_key(c, thr), cal, th)) {
+                    g_tier_h_picks = picks_share();
+                    want = ik2::tier::lane_estimate(g_tier_h_picks, c.K, cal.lat, cal.cpu[0], cal.fetch[0], cal.gpu[0]).lane;
+                } else
+                    want = 1, tier_guess = true;
+            }
+        }
+        if (want == 1) {
+            std::vector<int> visits(c.n_layer, 0);
+            for (const auto& Vi : M.V) ++visits[Vi.l];
+            std::vector<size_t> sb(c.n_layer);
+            for (int l = 0; l < c.n_layer; ++l) sb[l] = M.L[l].slot_bytes;
+            tier_order = ik2::tier::layer_order(visits, sb, off_value, c.E);
+            tier_rank = ik2::tier::ranks(tier_order);
+            if (g_tier_h_picks < 0) g_tier_h_picks = picks_share();
+        }
+        g_tier_rank = tier_rank;
+    }
+    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, off_value.empty() ? nullptr : &off_value,
+            tier_order.empty() ? nullptr : &tier_order);
     if (g_off_want && d == 0) g_lend.value = off_value;
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
                 EC.pools.size(), EC.total_bytes() / 1073741824.0, now() - t_start);
@@ -8051,7 +8161,11 @@ int main(int argc, char** argv) {
                             if (!g_ep || ep_owner(l, e) == d) idx.push_back(l * c.E + e);
                 // the most picked first; the chosen ones then go in least picked first, so that the evictions that
                 // start from the oldest take the least picked
-                std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
+                // (the tier's whole-layer order, where it was filled so: the first in it, as the pools were sized)
+                if (!tier_rank.empty())
+                    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return tier_rank[a] < tier_rank[b]; });
+                else
+                    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
                 const int k = std::min((int) idx.size(), EC.pools[p].n_active);
                 for (int i = k - 1; i >= 0; --i) {
                     const int l = idx[i] / c.E, e = idx[i] % c.E;
@@ -8247,25 +8361,38 @@ int main(int argc, char** argv) {
             // a visit's expected misses from the tier's share of the profile's picks (all picks' share of the bytes
             // when there is no profile), then mode A's time (copies, then the experts; the resident kernels taken
             // as twice as fast as the exact ones) against lane parity's best split of them
-            double hit = 0, all = 0;
-            for (int i = 0; i < c.n_layer * c.E; ++i) {
-                const double v = off_value.empty() ? 1.0 : off_value[(size_t) i];
-                all += v, hit += EC.loc[(size_t) i] >= 0 ? v : 0.0;
+            // (the profile's own counts and v1.1.82's tier - picks a byte - whatever order the tier was filled in, so
+            //  the mode is the one v1.1.82 chose: ik2_tier.hpp's lane_estimate)
+            double h = g_tier_h_picks;
+            if (h < 0) {
+                double hit = 0, all = 0;
+                for (int i = 0; i < c.n_layer * c.E; ++i) {
+                    const double v = off_value.empty() ? 1.0 : off_value[(size_t) i];
+                    all += v, hit += EC.loc[(size_t) i] >= 0 ? v : 0.0;
+                }
+                h = all > 0 ? hit / all : 0.0;
             }
-            const double h = all > 0 ? hit / all : 0.0, nm = c.K * (1.0 - h);
             const k::LaneCost& cs = g_offs.cost_h;
-            const double t_a = nm * cs.fetch[0] + 0.5 * c.K * cs.gpu[0];
-            double t_b = 1e30;
-            for (int n = 0; n <= (int) std::ceil(nm); ++n) {
-                const double nn = std::min<double>(n, nm);
-                t_b = std::min(t_b, std::max(nn > 0 ? cs.lat + nn * cs.cpu[0] : 0.0,
-                                             (nm - nn) * cs.fetch[0] + c.K * cs.gpu[0]));
-            }
-            const bool faster = t_b < 0.95 * t_a;
+            const auto est = ik2::tier::lane_estimate(h, c.K, cs.lat, cs.cpu[0], cs.fetch[0], cs.gpu[0]);
+            const bool faster = est.lane;
             std::printf("decode mode: %s (a visit ~%.0f us with the lane, ~%.0f us without; tier %.0f%% of the "
-                        "profile's picks)\n", faster ? "lane parity" : "A (the lane is not faster here)", t_b, t_a,
-                        100.0 * h);
+                        "profile's picks)\n", faster ? "lane parity" : "A (the lane is not faster here)", est.t_b,
+                        est.t_a, 100.0 * h);
             if (!faster) g_lane = false, g_offs.lane.reset();
+            if (!faster && tier_guess)
+                std::printf("NOTE maya-ik2: the VRAM tier was filled for lane parity (whole layers, the looped ones "
+                            "first: no calibration of this PC kept yet); once it is kept (the next start) the tier is "
+                            "filled for mode A (picks a byte). The answers are mode A's either way.\n");
+        }
+        if (!tier_rank.empty()) {   // (the tier's order and what it holds of the profile's picks)
+            double hit = 0, all = 0;
+            for (int i = 0; i < c.n_layer * c.E; ++i)
+                all += off_value[(size_t) i], hit += EC.loc[(size_t) i] >= 0 ? off_value[(size_t) i] : 0.0;
+            const std::string core = c.n_pass > 1 ? " (looped layers " + std::to_string(c.core0) + " .. " +
+                                                        std::to_string(c.core1 - 1) + " first)" : "";
+            std::printf("vram tier: whole layers, the most layer visits a byte first%s, inside a layer by picks: %.0f%% "
+                        "of the profile's picks (by picks a byte it would be %.0f%%)\n", core.c_str(),
+                        all > 0 ? 100.0 * hit / all : 0.0, 100.0 * g_tier_h_picks);
         }
         g_off_measure = g_off_measure && g_lane;   // (mode A is this PC's plain decoding anyway: measured as everywhere)
         // two GPUs: GPU 1's experts - a token's launches on both devices one by one (2x V100, 2x 12 GB: 78.7 tok/s,
