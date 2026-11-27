@@ -1712,8 +1712,9 @@ static int glm_pack_generate(const Options& o) {
     // tokens - only where at least 512 fresh tokens lie before.  A prompt that leaves the conversation before the
     // snapshot's position - an edited or replaced last message, another chat with the same system prompt and tools, a
     // client that rewrote an older turn - restores the longest checkpoint it starts with and reads only the rest,
-    // where it read everything from token 0.  Text prompts only; MAYA_GLM_NO_REUSE turns it off with the rest of the
-    // reuse.  SEVERAL CONVERSATIONS AT ONCE (MAYA_GLM_SEQS > 1) keep them only with MAYA_GLM_MULTI_CKPTS=1 (#711):
+    // where it read everything from token 0.  A checkpoint of a conversation with pictures is matched only by a prompt
+    // with the same pictures at the same places (its img hash, the snapshot's rule); MAYA_GLM_NO_REUSE turns it off
+    // with the rest of the reuse.  SEVERAL CONVERSATIONS AT ONCE (MAYA_GLM_SEQS > 1) keep them only with MAYA_GLM_MULTI_CKPTS=1 (#711):
     // each context then has checkpoints of its own conversation.  The model's checkpoint slots are host buffers that
     // take whichever sequence is bound when one is written, and a checkpoint is good only for the sequence whose DSA
     // rows it stood on, so context c owns the slots [c * ckpt_max, (c + 1) * ckpt_max): its list goes in and out with
@@ -1723,6 +1724,9 @@ static int glm_pack_generate(const Options& o) {
     struct Ckpt {
         std::vector<int32_t> tokens;   // the conversation's first tokens the checkpoint holds the state after (empty: free)
         uint64_t used = 0;
+        uint64_t img = kNoImages;      // img_hash() of the pictures inside the checkpointed prefix: a checkpoint of a
+                                       // conversation with pictures is good only for the same pictures at the same
+                                       // places - the snapshot's rule, so image prompts keep checkpoints too
     };
     std::vector<Ckpt> ckpts;   // the bound context's (several conversations: each context's in turn, see bind_ctx)
     uint64_t ckpt_clock = 0;
@@ -1757,7 +1761,7 @@ static int glm_pack_generate(const Options& o) {
     const auto ckpt_marks = [&](const std::vector<int32_t>& prompt, size_t from, size_t end) {
         constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
         std::vector<size_t> at;
-        if (ckpt_max <= 0 || !cur_img_pos.empty() || end <= from + 512) return at;
+        if (ckpt_max <= 0 || end <= from + 512) return at;
         size_t first = 0, last = 0;
         for (size_t i = 1; i < end; ++i)
             if (prompt[i] == kUserTok || prompt[i] == kObsTok) {
@@ -1825,7 +1829,8 @@ static int glm_pack_generate(const Options& o) {
             return;
         }
         ckpts[c].tokens.assign(prompt.begin(), prompt.begin() + (long) p);
-        ckpts[c].used = ++ckpt_clock;
+        ckpts[c].img = img_hash(p);   // (the same rule the snapshot follows: the state is only good for these pictures
+        ckpts[c].used = ++ckpt_clock;  //  at these places - for a prefix without them, kNoImages, as the default)
     };
     // A route that found a non-finite score (or an expert id out of range) means a NaN or an infinity in the state the
     // request ran on: its conversation must not be served again.  The kept snapshot and every slot this prompt
@@ -1888,11 +1893,11 @@ static int glm_pack_generate(const Options& o) {
                              img_hash(snap_tokens.size()) == snap_img_hash && !no_reuse;
         // the longest checkpoint this prompt starts with (it holds less than the snapshot when both match)
         int ck = -1;
-        if (ckpt_max > 0 && cur_img_pos.empty() && !abl_flip)
+        if (ckpt_max > 0 && !abl_flip)
             for (int c = 0; c < (int) ckpts.size(); ++c) {
                 const auto& t = ckpts[(size_t) c].tokens;
                 if (!t.empty() && t.size() < prompt.size() && (ck < 0 || t.size() > ckpts[(size_t) ck].tokens.size()) &&
-                    std::equal(t.begin(), t.end(), prompt.begin()))
+                    std::equal(t.begin(), t.end(), prompt.begin()) && ckpts[(size_t) c].img == img_hash(t.size()))
                     ck = c;
             }
         const size_t ck_len = ck >= 0 ? ckpts[(size_t) ck].tokens.size() : 0;
@@ -1955,16 +1960,17 @@ static int glm_pack_generate(const Options& o) {
         // while this prompt runs, so it costs the prompt nothing.  MAYA_GLM_CKPT_TURN=0: off.  After the slot
         // restore and ckpt_drop_past: a conversation just taken back from a slot gets it too (before, the restore
         // dropped the checkpoint kept here, and an edited turn after A -> B -> A read all of A again: #400)
-        if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0 &&
-            cur_img_pos.empty()) {
+        if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0) {
             static const bool turn_on = [] { const char* v = getenv("MAYA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
             constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
             size_t last = 0;
             for (size_t i = prompt.size() - 1; i-- > reuse;)
                 if (prompt[i] == kUserTok || prompt[i] == kObsTok) { last = i; break; }
             bool have = false;
+            const uint64_t want_img = img_hash(reuse);
             for (const auto& c : ckpts)
-                have = have || (c.tokens.size() == reuse && std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
+                have = have || (c.tokens.size() == reuse && c.img == want_img &&
+                                std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
             if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
         }
         std::vector<float> lg;
@@ -2145,7 +2151,7 @@ static int glm_pack_generate(const Options& o) {
                 static const bool keep_cancelled = env_num("MAYA_GLM_KEEP_CANCELLED", 1) != 0;
                 const size_t reached = later.empty() ? at : std::max(at, read_to.load(std::memory_order_relaxed));
                 size_t kept = 0;
-                if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                if (keep_cancelled && ckpt_max > 0) {
                     // (the marks in (at, reached]: each is longer than any checkpoint the read started from, so the
                     // restore below takes the last of them and ckpt_drop_past keeps them all)
                     keep_later(reached);
@@ -2154,7 +2160,8 @@ static int glm_pack_generate(const Options& o) {
                         const auto& t = ckpts[(size_t) c].tokens;
                         if (!t.empty() && t.size() <= reached &&
                             (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
-                            std::equal(t.begin(), t.end(), prompt.begin()))
+                            std::equal(t.begin(), t.end(), prompt.begin()) &&
+                            ckpts[(size_t) c].img == img_hash(t.size()))
                             best = c;
                     }
                     std::string ce;
@@ -3145,11 +3152,12 @@ static int glm_pack_generate(const Options& o) {
             if (abl_same && !st.empty() && st.size() < g->prompt.size() &&
                 std::equal(st.begin(), st.end(), g->prompt.begin()) && img_hash(st.size()) == hh)
                 len = st.size();
-            if (abl_same && ckpt_max > 0 && cur_img_pos.empty()) {   // (checkpoints are kept of text prompts only)
-                const std::vector<Ckpt>& cl = c == cur_ctx ? ckpts : ctxs[(size_t) c].ckpts;
-                for (const Ckpt& k : cl)
+            if (abl_same && ckpt_max > 0) {   // (a checkpoint of a conversation with pictures matches the same
+                const std::vector<Ckpt>& cl = c == cur_ctx ? ckpts : ctxs[(size_t) c].ckpts;   // pictures in the same
+                for (const Ckpt& k : cl)                                                      // places: its img hash
                     if (k.tokens.size() > len && k.tokens.size() < g->prompt.size() &&
-                        std::equal(k.tokens.begin(), k.tokens.end(), g->prompt.begin()))
+                        std::equal(k.tokens.begin(), k.tokens.end(), g->prompt.begin()) &&
+                        img_hash(k.tokens.size()) == k.img)
                         len = k.tokens.size();
             }
             if (len > blen) {
