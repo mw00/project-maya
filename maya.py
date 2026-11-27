@@ -929,6 +929,10 @@ IK2S_RECOMMENDED_CONTEXT = 262144                   # (DS4_RECOMMENDED_CONTEXT)
 # fast; the engine reads the first 4,096 positions in 512-token chunks, so short prompts keep their speed)
 IK2S_DEFAULT_KV = "q8"
 IK2S_PREFILL_CHUNK = 2048
+# the VRAM each GPU keeps free beside the engine (--reserve-mib): the engine's own 600 MiB, what it was measured with
+# on 4x R9700 (no display on the cards) - not hip_reserve_mib's 3072, which is meant for a desktop on the card; a card
+# that also drives a display wants more (the setup's --vram-reserve-mib)
+IK2S_RESERVE_MIB = 600
 # VRAM + RAM that hold the whole model, the context aside (as DS4_MEMORY_GB: GiB), tools/ik2s/download.json's
 # "memory_gb": ceil(files + margin + drafter) = ceil(190.9 + 8 + 3.2) = 203 -
 #   files    204,969,055,296 bytes = 190.9 GiB, the six shards' sizes in download.json: every tensor, each once (in
@@ -11995,8 +11999,8 @@ def write_config_ik2s(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Pat
                       index: Path | None, quant: str = IK2S_QUANT) -> Path:
     """maya-inkling-2-small.json and its start script.  The engine's settings the setup chooses: the context, the
     global layers' 8-bit cache (--kv q8: IK2S_DEFAULT_KV), 2048-token prompt chunks (IK2S_PREFILL_CHUNK; the
-    engine reads the first 4,096 positions in 512-token ones), the VRAM kept free (DeepSeek's on AMD:
-    --vram-reserve-mib, else hip_reserve_mib); the drafter's index whenever it is there (--dspark-index), with
+    engine reads the first 4,096 positions in 512-token ones), the VRAM kept free (--vram-reserve-mib, else
+    IK2S_RESERVE_MIB); the drafter's index whenever it is there (--dspark-index), with
     --dspark none until the speed calibration finds that drafting pays here (DeepSeek's setup's rule - the Models page
     switches it); the model's own sampling and thinking level at every setup.  A setup again keeps what the config
     before says that this one does not ask - where the server listens, its key, the env, and the engine settings set
@@ -12030,10 +12034,9 @@ def write_config_ik2s(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Pat
         set_arg(args, "--reserve-mib", a.vram_reserve_mib)
         ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
     elif "--reserve-mib" not in args[:-1]:
-        mib = hip_reserve_mib(pc["gpus"])
-        set_arg(args, "--reserve-mib", mib)
-        ok(f"VRAM kept free on each GPU: {mib} MiB (the desktop and other programs on an AMD GPU allocate beside the "
-           "engine; --vram-reserve-mib changes it)")
+        set_arg(args, "--reserve-mib", IK2S_RESERVE_MIB)
+        ok(f"VRAM kept free on each GPU: {IK2S_RESERVE_MIB} MiB (a GPU that also drives a display wants more: "
+           "--vram-reserve-mib)")
     inst = {"family": "ik2s", "ik2s_quant": quant, "quant": Q.OTHERS[("ik2s", quant)]}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(ik2s_exe()), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),

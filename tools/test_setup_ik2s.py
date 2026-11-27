@@ -467,7 +467,7 @@ class Config(unittest.TestCase):
         self.assertEqual(cfg["args"], ["--pack", str(self.lay.d / maya.IK2S_PACK), "--max-context", "262144",
                                        "--dspark-index", str(self.lay.mtp / SM.IK2S_DSPARK), "--kv", "q8",
                                        "--prefill-chunk", "2048", "--dspark", "none",
-                                       "--reserve-mib", str(maya.hip_reserve_mib(AMD))])
+                                       "--reserve-mib", "600"])
         self.assertEqual((cfg["gpu"], cfg["backend"]), ([0, 1, 2, 3], "hip"))
         self.assertNotIn("layer_split", cfg)                            # (the server's auto split)
         self.assertEqual(cfg["tokenizer"], str(self.lay.d / maya.IK2S_PACK / "tokenizer"))
@@ -522,6 +522,11 @@ class Config(unittest.TestCase):
         self.assertNotIn("ik2", maya.PARALLEL_FAMILIES)                  # (Inkling-2-Mini: as before)
 
     def test_the_vram_kept_free(self):
+        """The engine's own 600 MiB, measured with (not hip_reserve_mib's desktop figure, which the other engines keep);
+        --vram-reserve-mib sets another, and a setup again keeps it."""
+        self.assertEqual(maya.IK2S_RESERVE_MIB, 600)
+        self.assertNotEqual(maya.hip_reserve_mib(AMD), 600)
+        self.assertIn("int64_t reserve_mib = 600;", (SRC / "ik2_hip_model.hpp").read_text(encoding="utf-8"))
         self.assertEqual(maya.flag_value(self.write(args(vram_reserve_mib=900))["args"], "--reserve-mib"), "900")
         self.assertEqual(maya.flag_value(self.write()["args"], "--reserve-mib"), "900")   # (a setup again keeps it)
 
