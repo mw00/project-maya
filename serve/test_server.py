@@ -853,8 +853,9 @@ class BodylessRequests(unittest.TestCase):
     def setUpClass(cls):
         tok = ByteTokenizer()
         # (the closing marker comes first: the template opens a thinking segment, and an answer that never leaves it
-        # is replaced by the loop guard's stop note)
-        cls.engine = MockEngine(tok, "</think>\n\nthe answer", max_context=CTX)
+        # is replaced by the loop guard's stop note).  LifecycleEngine rather than MockEngine: the Ollama case below
+        # has to show the engine really closes and starts again, not only that the answer says it did
+        cls.engine = LifecycleEngine(tok, "</think>\n\nthe answer", max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
@@ -945,9 +946,25 @@ class BodylessRequests(unittest.TestCase):
         self.assertEqual(s, 200, text)
         self.assertEqual(json.loads(text)["content"][0]["text"], "the answer")
 
+    def preload(self, body, reason):
+        """One Ollama preload / unload POST, its 200 checked in full.  A 400 here is the regression these requests
+        exist for: `nonempty=True` on the one call in _mapi_chat, which the checker below cannot see."""
+        status, text = self.raw("/api/chat", body)
+        self.assertEqual(status, 200, (body, text))
+        out = json.loads(text)
+        self.assertTrue(out["done"], text)
+        self.assertEqual(out["done_reason"], reason, (body, text))
+        self.assertEqual(out["message"], {"role": "assistant", "content": ""}, text)
+
     def test_model_api_empty_messages_is_still_a_load(self):
-        """/api/chat keeps Ollama's preload: an empty `messages` list there is a call of its own that answers 200
-        (load / unload), not a 400 - only the completion routes ask for a message."""
+        """Two checks, because the checker and the route can break apart on their own: `check_messages` left alone,
+        and the real /api/chat still answering 200 to a request with no message - which is where Ollama's preload
+        and unload live, the reason `nonempty` is off by default at all.  The requests are the one that matters:
+        put a `nonempty=True` on _mapi_chat's own call and every checker assertion here still passes, while
+        /api/chat answers 400 and an agent's model never loads.  Nothing else in the repository sends /api/chat
+        with no message, so nothing else would notice.  Model management is what lets the request through (without
+        it _mapi_gate answers 404 first), and the fixture belongs to the class, so what these requests write -
+        keep_alive_s, the running engine - is put back."""
         from serve.frontend import check_messages
         check_messages({})                                    # no `messages`: fine, /api/chat reads it as a load
         check_messages({"messages": []})
@@ -955,6 +972,20 @@ class BodylessRequests(unittest.TestCase):
         for bad, key in (({"messages": [[]]}, "messages"), ({"messages": "hi"}, "messages"), ({"input": 7}, "input")):
             with self.assertRaises(ValueError, msg=bad):
                 check_messages(bad, key)
+        management = getattr(self.svc, "model_management", False)
+        keep_alive = self.svc.keep_alive_s
+        self.svc.model_management = True
+        try:
+            for body in ({}, {"messages": []}, {"messages": [], "keep_alive": -1}):   # (-1: stay loaded, never idle down)
+                self.preload(body, "load")
+            self.preload({"messages": [], "keep_alive": 0}, "unload")
+            self.assertFalse(self.engine.running)              # ended for real, not only by the label
+            self.preload({"messages": []}, "load")             # ... and the next request starts it again
+            self.assertTrue(self.engine.running)
+        finally:
+            self.svc.model_management, self.svc.keep_alive_s = management, keep_alive
+            if not self.engine.running:
+                self.engine.restart()
 
 
 class PrometheusMetrics(unittest.TestCase):
