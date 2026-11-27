@@ -1700,6 +1700,10 @@ int main(int argc, char** argv) {
             const std::string v = next();
             o.prefill_chunk = v == "auto" ? 0 : std::atoi(v.c_str());
         }
+        else if (a == "--prefill-pipe") o.prefill_pipe = std::atoi(next().c_str());   // (0: off; chunks in flight)
+        else if (a == "--pin-experts") o.pin_experts = true;   // (the CPU lane's expert pages locked in RAM)
+        else if (a == "--pin-engram") o.pin_engram = true;     // (the Engram table's pages locked in RAM)
+        else if (a == "--lend") o.lend = true;                 // (the prompt buffers in a layer's expert slots)
         else if (a == "--vram-experts") o.vram_experts = std::atof(next().c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next().c_str());
         else if (a == "--gpu-fetch") o.gpu_fetch = next();
