@@ -4128,11 +4128,16 @@ struct Model::Impl {
                 cum += lb;
             }
             // with the chunked prompt path: the contiguous split that streams the least into its busiest member (its
-            // VRAM short of its layers' experts, per member) - a chunk's groups run as a pipeline, its slowest stage
-            // sets the pace; a token's decode passes every layer either way, the experts in VRAM the same in all
+            // VRAM short of its layers' experts, per member), each group's bytes over its link (#733: 3x 7900 XTX, one
+            // on PCIe 3 x16 and two on x8 - by bytes alone 14,13,13, the x8 cards waiting on their rings; by link
+            // 18,11,11, the split that read its prompts fastest by hand) - a chunk's groups run as a pipeline, its
+            // slowest stage sets the pace; a token's decode passes every layer either way, the experts in VRAM the
+            // same in all.  DS4_SPLIT_LINK (MAYA_DS4_SPLIT_LINK): 1 by link, 0 by bytes alone (as before); unset: by
+            // link on an AMD build (measured there), by bytes on NVIDIA
             if (chunk > 0 && groups.size() > 1 && groups.size() <= 6 && std::getenv("DS4_SPLIT") == nullptr) {
                 const int G = (int) groups.size(), NL = g.nl;
                 std::vector<double> cap(groups.size());
+                std::vector<int> nmem(groups.size());
                 for (int gi = 0; gi < G; ++gi) {
                     const int nm = (int) groups[(size_t) gi].mem.size();
                     double mn = 1e300;
@@ -4140,6 +4145,7 @@ struct Model::Impl {
                         mn = std::min(mn, std::max(0.0, (double) devs[(size_t) m].free0 - (double) keep_b(devs[(size_t) m]) -
                                                             400.0 * (1 << 20) - 1.1 * (1 << 30)));   // (the chunk's buffers)
                     cap[(size_t) gi] = mn * nm;
+                    nmem[(size_t) gi] = nm;
                 }
                 for (const Layer& l : L)
                     if (l.mtp) cap[0] -= (double) l.dense_bytes + (double) l.blob * l.n_exp;
@@ -4149,29 +4155,36 @@ struct Model::Impl {
                     pe[(size_t) il + 1] = pe[(size_t) il] + (double) L[(size_t) il].blob * L[(size_t) il].n_exp;
                     pd[(size_t) il + 1] = pd[(size_t) il] + (double) L[(size_t) il].dense_bytes;
                 }
-                auto cost = [&](int gi, int a, int b) {   // per-member streaming of layers [a, b) on group gi
-                    const int nm = (int) groups[(size_t) gi].mem.size();
-                    const double dense = (pd[(size_t) b] - pd[(size_t) a]) * (nm > 1 ? 1.3 : 1.0);
-                    return std::max(0.0, pe[(size_t) b] - pe[(size_t) a] - (cap[(size_t) gi] - dense)) / nm;
-                };
-                // best[gi][b]: the least max cost of layers [0, b) over groups 0..gi (each at least one layer)
-                std::vector<std::vector<double>> best((size_t) G, std::vector<double>((size_t) NL + 1, 1e300));
-                std::vector<std::vector<int>> cut((size_t) G, std::vector<int>((size_t) NL + 1, 0));
-                for (int b = 1; b <= NL; ++b) best[0][(size_t) b] = cost(0, 0, b);
-                for (int gi = 1; gi < G; ++gi)
-                    for (int b = gi + 1; b <= NL; ++b)
-                        for (int a = gi; a < b; ++a) {
-                            const double v = std::max(best[(size_t) gi - 1][(size_t) a], cost(gi, a, b));
-                            if (v < best[(size_t) gi][(size_t) b]) {
-                                best[(size_t) gi][(size_t) b] = v;
-                                cut[(size_t) gi][(size_t) b] = a;
-                            }
-                        }
-                int b = NL;
-                for (int gi = G - 1; gi >= 0; --gi) {
-                    const int a = gi > 0 ? cut[(size_t) gi][(size_t) b] : 0;
-                    for (int il = a; il < b; ++il) L[(size_t) il].grp = gi;
-                    b = a;
+                std::vector<double> link((size_t) G, 0.0), w((size_t) G, 1.0);
+#if defined(MAYA_USE_HIP)
+                const bool link_default = true;
+#else
+                const bool link_default = false;
+#endif
+                const char* sl = ds4_env("DS4_SPLIT_LINK");
+                if (sl != nullptr ? std::atoi(sl) != 0 : link_default) {
+                    int cur = 0;
+                    cudaGetDevice(&cur);   // (link_h2d sets each device)
+                    for (int gi = 0; gi < G; ++gi) {   // (a group's slowest member; link_h2d keeps it for the ring)
+                        double mn = 1e300;
+                        for (int m : groups[(size_t) gi].mem) mn = std::min(mn, link_h2d(devs[(size_t) m]));
+                        link[(size_t) gi] = mn;
+                    }
+                    cudaSetDevice(cur);
+                    w = place::link_weights(link);
+                }
+                const std::vector<int> grp = place::stream_split(cap, pe, pd, nmem, w);
+                for (int il = 0; il < (int) grp.size(); ++il) L[(size_t) il].grp = grp[(size_t) il];
+                if (std::any_of(w.begin(), w.end(), [](double x) { return x != 1.0; })) {
+                    std::string s;
+                    for (int gi = 0; gi < G; ++gi) {
+                        char b[64];
+                        std::snprintf(b, sizeof b, "%s%d (%.1f GB/s)", gi ? ", " : "",
+                                      (int) std::count(grp.begin(), grp.end(), gi), link[(size_t) gi] / 1e9);
+                        s += b;
+                    }
+                    std::fprintf(stderr, "ds4: layers by each group's link: %s (DS4_SPLIT_LINK=0: by bytes alone)\n",
+                                 s.c_str());
                 }
             }
             // DS4_SPLIT=a,b,..: the trunk layers each group takes (the drafter stays with the first).  n@g: the
