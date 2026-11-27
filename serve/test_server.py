@@ -839,6 +839,155 @@ class RequestChecks(unittest.TestCase):
             svc.check_request({"ignore_eos": True, "max_tokens": 8})
 
 
+class BodylessRequests(unittest.TestCase):
+    """A POST with no usable `messages` is a 400 on every route, never a connection closed with no answer.
+
+    A client that probes which protocols a server speaks (M3 Code asks each path `POST {}` and reads only the status
+    code: 400/422/2xx means the route exists, 404/405 means it does not, anything else - a closed socket included -
+    means the server does not serve it at all) took the dropped connection for "no Chat Completions here" and refused
+    to link any agent.  /v1/responses already answered a bodyless POST with its own 400 (serve/responses.py); Chat
+    Completions and Anthropic's messages ran on to the chat template, which refused the empty list with a jinja2
+    TemplateError - no ValueError, so it escaped do_POST's except clauses and socketserver closed the socket."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        # (the closing marker comes first: the template opens a thinking segment, and an answer that never leaves it
+        # is replaced by the loop guard's stop note).  LifecycleEngine rather than MockEngine: the Ollama case below
+        # has to show the engine really closes and starts again, not only that the answer says it did
+        cls.engine = LifecycleEngine(tok, "</think>\n\nthe answer", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.port = cls.httpd.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def raw(self, path, body):
+        """-> (status, body text).  A connection the server closed without answering is what these requests used to
+        do, so it fails here by name rather than as an opaque URLError from a client that hides it."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
+            r = conn.getresponse()
+            return r.status, r.read().decode("utf-8", "replace")
+        except (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionError) as e:
+            self.fail(f"{path} closed the connection with no answer for {body!r} "
+                      f"({type(e).__name__}: {e})")
+        finally:
+            conn.close()
+
+    def refused(self, path, body, word=None):
+        """The request is a 400 with OpenAI's error shape; returns its message.  (The handler logs the refused
+        request's traceback, which is not what these tests are about.)"""
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            s, text = self.raw(path, body)
+        self.assertEqual(s, 400, (path, body, text))
+        err = json.loads(text)["error"]
+        self.assertEqual(err["type"], "invalid_request_error", text)
+        self.assertTrue(err["message"].strip(), text)
+        if word:
+            self.assertIn(word, err["message"], text)
+        return err["message"]
+
+    def test_bodyless_chat_completions_are_a_400(self):
+        # what M3 Code's protocolServed() asks, and the two shapes between it and a real request
+        for body in ({}, {"model": "m"}, {"messages": []}, {"model": "m", "messages": []},
+                     {"model": "m", "messages": [], "stream": True}, {"model": "m", "messages": [], "max_tokens": 8}):
+            self.refused("/v1/chat/completions", body, "nonempty array")
+
+    def test_bodyless_anthropic_is_a_400(self):
+        for body in ({}, {"model": "m"}, {"model": "m", "messages": []},
+                     {"model": "m", "messages": [], "max_tokens": 8}):
+            self.refused("/v1/messages", body, "nonempty array")
+
+    def test_responses_and_unserved_routes_unchanged(self):
+        # /v1/responses keeps its own wording (serve/responses.py), and a route Maya does not serve stays a 404 -
+        # a probe must still be able to tell the two apart
+        self.refused("/v1/responses", {}, "input must be a string or a nonempty array of input items")
+        self.assertEqual(self.raw("/v1/completions", {})[0], 404)
+        self.assertEqual(self.raw("/v1/completions", {"model": "m", "prompt": "hi"})[0], 404)
+
+    def test_the_template_refusing_is_a_400_too(self):
+        """The same hole one layer down: what the chat template itself refuses (serve/chat_template.jinja's
+        raise_exception) is jinja2's exception, no ValueError, and escaped the except clauses the same way."""
+        for msgs in ([{"role": "bogus", "content": "x"}], [{"content": "x"}]):
+            self.refused("/v1/chat/completions", {"model": "m", "messages": msgs}, "Unexpected message role")
+            # (Anthropic's adapter reads the role first, so its own wording comes back; what matters is the 400)
+            self.refused("/v1/messages", {"model": "m", "messages": msgs, "max_tokens": 8})
+
+    def test_a_whole_request_still_answers(self):
+        # the fix answers nothing it answered before: the same 200 on both APIs, streamed and not
+        s, text = self.raw("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, text)
+        self.assertEqual(json.loads(text)["choices"][0]["message"]["content"], "the answer")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            conn.request("POST", "/v1/chat/completions",
+                         body=json.dumps({"model": "m", "stream": True,
+                                          "messages": [{"role": "user", "content": "hi"}]}),
+                         headers={"Content-Type": "application/json"})
+            r = conn.getresponse()
+            stream = r.read().decode()
+            self.assertEqual(r.status, 200)
+            # the answer, put back from the deltas: streaming is unchanged by the 400s above
+            text = "".join(json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
+                           for line in stream.splitlines() if line.startswith("data: ") and "[DONE]" not in line)
+            self.assertEqual(text, "the answer", stream)
+            self.assertTrue(stream.rstrip().endswith("data: [DONE]"), stream[-200:])
+        finally:
+            conn.close()
+        s, text = self.raw("/v1/messages", {"model": "m", "max_tokens": 32,
+                                            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, text)
+        self.assertEqual(json.loads(text)["content"][0]["text"], "the answer")
+
+    def preload(self, body, reason):
+        """One Ollama preload / unload POST, its 200 checked in full.  A 400 here is the regression these requests
+        exist for: `nonempty=True` on the one call in _mapi_chat, which the checker below cannot see."""
+        status, text = self.raw("/api/chat", body)
+        self.assertEqual(status, 200, (body, text))
+        out = json.loads(text)
+        self.assertTrue(out["done"], text)
+        self.assertEqual(out["done_reason"], reason, (body, text))
+        self.assertEqual(out["message"], {"role": "assistant", "content": ""}, text)
+
+    def test_model_api_empty_messages_is_still_a_load(self):
+        """Two checks, because the checker and the route can break apart on their own: `check_messages` left alone,
+        and the real /api/chat still answering 200 to a request with no message - which is where Ollama's preload
+        and unload live, the reason `nonempty` is off by default at all.  The requests are the one that matters:
+        put a `nonempty=True` on _mapi_chat's own call and every checker assertion here still passes, while
+        /api/chat answers 400 and an agent's model never loads.  No other test asks what an empty one answers (the
+        only other /api/chat that sends no message checks the API key, and stops at the 401 before the route).  Model management is what lets the request through (without
+        it _mapi_gate answers 404 first), and the fixture belongs to the class, so what these requests write -
+        keep_alive_s, the running engine - is put back."""
+        from serve.frontend import check_messages
+        check_messages({})                                    # no `messages`: fine, /api/chat reads it as a load
+        check_messages({"messages": []})
+        check_messages({"input": []}, "input")                 # /v1/responses checks its own `input` itself
+        for bad, key in (({"messages": [[]]}, "messages"), ({"messages": "hi"}, "messages"), ({"input": 7}, "input")):
+            with self.assertRaises(ValueError, msg=bad):
+                check_messages(bad, key)
+        management = getattr(self.svc, "model_management", False)
+        keep_alive = self.svc.keep_alive_s
+        self.svc.model_management = True
+        try:
+            for body in ({}, {"messages": []}, {"messages": [], "keep_alive": -1}):   # (-1: stay loaded, never idle down)
+                self.preload(body, "load")
+            self.preload({"messages": [], "keep_alive": 0}, "unload")
+            self.assertFalse(self.engine.running)              # ended for real, not only by the label
+            self.preload({"messages": []}, "load")             # ... and the next request starts it again
+            self.assertTrue(self.engine.running)
+        finally:
+            self.svc.model_management, self.svc.keep_alive_s = management, keep_alive
+            if not self.engine.running:
+                self.engine.restart()
+
+
 class PrometheusMetrics(unittest.TestCase):
     """GET /metrics/prometheus: llama-server's metric names in Prometheus' text format, behind the API key."""
 
