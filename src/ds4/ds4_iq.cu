@@ -2266,9 +2266,9 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
     else if (max_c <= 8 && mv8()) pdl_launch(mv_kernel<T, 8>, grid, kThreads, 0, s, J);
     else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
-// MAYA_IQ_MV_RW: mv_heads_rows_kernel for short heads (the same bits); unset: on with AMD's gfx1100, where it was
-// measured (3 x RX 7900 XTX: Hy4's k_b / v_b GEMVs a third faster, a window 0.5%), off with other GPUs; 1 / 0: on /
-// off on any GPU.  set_mv_rows: the tests' override
+// MAYA_IQ_MV_RW: mv_heads_rows_kernel for short heads (the same bits); unset: on with AMD's gfx1100 and NVIDIA's Volta,
+// where it was measured (3 x RX 7900 XTX: Hy4's k_b / v_b GEMVs a third faster, a window 0.5%; a V100: a window 2%),
+// off with other GPUs; 1 / 0: on / off on any GPU.  set_mv_rows: the tests' override
 std::atomic<int> g_mv_rows{-1};
 bool mv_rows() {
     const int o = g_mv_rows.load(std::memory_order_relaxed);
@@ -2291,7 +2291,20 @@ bool mv_rows() {
     }
     return known[dev] == 1;
 #else
-    return false;
+    // (Volta: on - a V100, Hy4-Flash's k_b / v_b heads: a decode window's verify 38.4-39.1 -> 37.8 ms, 61.1 -> 62.6 tok/s,
+    //  the same tokens; other NVIDIA GPUs not measured: off)
+    static signed char known[64] = {};
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (known[dev] == 0) {
+        int major = 0;
+        known[dev] = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major == 7 ? 1 : -1;
+        (void) cudaGetLastError();
+    }
+    return known[dev] == 1;
 #endif
 }
 template <int T, int RW>
