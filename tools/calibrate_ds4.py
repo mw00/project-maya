@@ -1,5 +1,5 @@
-"""The speed calibration for DeepSeek-V4.1 (maya-ds4) and MiniMax-M3.1 (maya-mm3): does the DSpark drafter make THIS
-PC faster?  (The setup, the first start of a config that has the drafter and no calibration yet, ./maya.sh
+"""The speed calibration for DeepSeek-V4.1 (maya-ds4), MiniMax-M3.1 (maya-mm3) and Inkling-2-Small (maya-ik2s): does
+the DSpark drafter make THIS PC faster?  (The setup, the first start of a config that has the drafter and no calibration yet, ./maya.sh
 --speed-calibration.)
 
 DSpark drafts up to 5 tokens a round and the model checks them in one window.  Where the model's experts sit in the
@@ -114,9 +114,18 @@ def with_dspark(cfg: dict, mode: str) -> dict:
     return out
 
 
+def is_ik2s(cfg: dict) -> bool:
+    """An Inkling-2-Small config (maya-ik2s): its DSpark drafter is measured the same way."""
+    return (cfg.get("installer") or {}).get("family") == "ik2s" or Path(cfg.get("exe", "")).name.startswith("maya-ik2s")
+
+
 def has_drafter(cfg: dict) -> bool:
     """The config's pack holds the DSpark drafter (an EXL3 pack's, or a GGUF pack's from drafter_pack.py; maya-mm3's
-    pack indexes its dspark/ folder as dspark.* tensors)."""
+    pack indexes its dspark/ folder as dspark.* tensors; maya-ik2s's is the index --dspark-index names, from
+    tools/ik2s/convert_dspark.py)."""
+    if is_ik2s(cfg):
+        index = option(cfg.get("args") or [], "--dspark-index")
+        return bool(index) and (Path(index) / "dspark.txt").is_file()
     pack = option(cfg.get("args") or [], "--pack")
     t = Path(pack) / "tensors.txt" if pack else None
     if t is None or not t.is_file():

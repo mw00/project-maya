@@ -40,8 +40,11 @@ QWEN_OTHER = (("qwen-ud-iq2_xs", "qwen", "ud-iq2_xs", "unsloth"),)
 #  v1.1.82 - here; the setup ids: maya_quants.IK2_FILE_IDS)
 IK2_MAYA = ("inkling-2-mini-maya-l", "ik2", Q.IK2_QUANT, "Maya")
 IK2_OTHER = (("inkling-2-mini-ud-q4_k_xl", "ik2", Q.IK2_UNSLOTH, "unsloth"),)
+# (Inkling-2-Small on its engine maya-ik2s: unsloth's UD-Q2_K_XL, AMD under Linux - the setup id: maya_quants.IK2S_IDS[0])
+IK2S_OTHER = ((Q.IK2S_IDS[0], "ik2s", Q.IK2S_QUANT, "unsloth"),)
 OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [("minimax-exl3", "minimax", "exl3", "Mia-AiLab")] +
-              [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER) + list(IK2_OTHER))
+              [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER) + list(IK2_OTHER) +
+              list(IK2S_OTHER))
 GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gated: the setup sends the user's HF token)
 EXL3_MIN_CC = 70                                     # (maya.DS4_MIN_CC / mm3_min_cc: the EXL3 quants from V100 on)
 QWEN_MIN_CC = 70                                     # (maya.QWEN_MIN_CC: the Qwen path from V100 on)
@@ -58,6 +61,8 @@ def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
         return max(ccs) >= EXL3_MIN_CC                                  # maya-ds4's / maya-mm3's kernels, V100 on)
     if fam == "qwen" and backend != "hip" and ccs:                     # (unsloth's Qwen GGUF: the setup's check_pc)
         return max(ccs) >= QWEN_MIN_CC
+    if fam == "ik2s":                                  # (Inkling-2-Small on maya-ik2s: AMD under Linux - check_pc)
+        return backend == "hip" and sys.platform.startswith("linux")
     if fam == "ik2":                                   # (Inkling-2-Mini: NVIDIA, Linux / Windows - check_pc)
         return backend == "cuda" and (sys.platform.startswith("linux") or sys.platform == "win32") and \
             (not ccs or max(ccs) >= IK2_MIN_CC)
@@ -70,6 +75,9 @@ def _note(fam: str, key: str, backend: str) -> str:
         out.append("gated repo: needs your Hugging Face token (HF_TOKEN or `hf auth login`)")
     if fam == "ik2":
         out.append("text only; an NVIDIA GPU of 8 GB or more (Linux or Windows) or an AMD one of 12 GB or more (Linux)")
+    if fam == "ik2s":
+        out.append("text only; 2-4 AMD GPUs (Linux) and about 203 GB of VRAM and RAM together; with the model's DSpark "
+                   "drafter")
     return "; ".join(out)
 
 
@@ -235,6 +243,8 @@ def _other_sizes() -> dict:
             elif fam == "qwen":                        # (its files and the vision tower the setup fetches with them)
                 vision = maya.qwen_vision_model()
                 gb = maya.qwen_entry(key)["download_gb"] + (vision["download_gb"] if vision else 0)
+            elif fam == "ik2s":                        # (the GGUF set and the drafter the setup fetches with it)
+                gb = maya.ik2s_entry(key)["download_gb"] + maya.ik2s_drafter_entry()["download_gb"]
             elif fam == "ik2":                         # (the GGUF, the vision tower and the drafter the setup fetches)
                 vision, drafter = maya.ik2_vision_model(), maya.ik2_drafter_model()
                 gb = maya.ik2_entry(key)["download_gb"] + sum(x["download_gb"] for x in (vision, drafter) if x)
@@ -263,7 +273,7 @@ def setup_command(model_id: str, cfg: dict | None) -> list:
         which = ["--model", model_id]
     elif other[0] == "glm":                            # (a GLM download by its name)
         which = ["--model", other[1]]
-    elif other[0] in ("qwen", "ik2"):                  # (their setup ids: maya_quants.QWEN_UD_IDS, IK2_IDS)
+    elif other[0] in ("qwen", "ik2", "ik2s"):          # (their setup ids: maya_quants.QWEN_UD_IDS, IK2_IDS, IK2S_IDS)
         which = ["--model", model_id]
     else:                                              # (the model, its files by --ds4-quant / --mm3-quant)
         which = ["--model", Q.MODEL[other[0]], "--ds4-quant" if other[0] == "deepseek" else "--mm3-quant", other[1]]

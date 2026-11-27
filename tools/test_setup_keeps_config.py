@@ -163,7 +163,8 @@ class ThinkingBudgetKept(unittest.TestCase):
 
     def test_every_other_writer_calls_it(self):
         src = (HERE.parent / "maya.py").read_text(encoding="utf-8")
-        self.assertEqual(src.count("    keep_thinking_budget(cfg, old)"), 4)   # (DeepSeek, MiniMax, Hy4-flash, Inkling)
+        # (DeepSeek, MiniMax, Hy4-flash, Inkling-2-Mini, Inkling-2-Small)
+        self.assertEqual(src.count("    keep_thinking_budget(cfg, old)"), 5)
 
 
 class Backups(unittest.TestCase):
