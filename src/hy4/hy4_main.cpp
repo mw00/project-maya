@@ -2,6 +2,7 @@
 //
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--drafting auto|on|off|mtp|dfly2 | --mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F]
+//            [--lookup on|off [--lookup-max N] [--lookup-match N] [--lookup-hot N]]
 //            [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
 //            [--kv-streaming on|off|auto] [--kv-resident N] [--kv-spill on|off|auto] [--kv-spill-dir D]
@@ -108,6 +109,8 @@
 #include "hy4_pack.hpp"
 #include "mm3_os.hpp"
 #include "mm3_sample.hpp"
+
+#include "maya/spec/suffix_drafter.hpp"
 
 namespace {
 
@@ -701,6 +704,99 @@ inline bool plain_sampling(const mm3::sample::Req& r) {
            !(r.min_p > 0.0f);
 }
 
+// The copy drafts (--lookup on|off, on; HY4_LOOKUP=0 off): where an answer repeats text it has seen - its prompt or
+// itself: an edit, a quote, a refactor - the tokens that followed the longest earlier occurrence of its last tokens
+// (maya::spec's suffix drafter: no weights, no GPU, microseconds) are drafts the model keeps many of at once, a window
+// of up to 8 tokens for one pass and no draft step before it.  Every step the run is set against what the step then
+// made (the drafts kept and the token after them) at no cost: a run is taken without asking the drafter once the runs
+// before it foretold `hot_need` tokens in a row and its match is `match_need` long - and, before that, where the
+// drafter's own drafts agree with its start as far as they go and it is longer than they are.  With no drafter loaded:
+// where the match is `need` tokens long.  Verified token by token like the drafter's, so the tokens are the model's
+// either way.
+struct Lookup {
+    static constexpr int kMaxMatch = 64;
+    maya::spec::SuffixDrafter sd{3, kMaxMatch, (size_t) 1 << 19};
+    bool on = false;
+    // (a run of 7 drafts - a window of 8 tokens: 18 ms on eight RTX 5060 Ti, where the drafter's 5 are 13.6 - and, once
+    //  such a window was kept whole, of up to cap_max: 16 tokens are 31 ms, every token past the 8th 1.5 to 1.7 ms;
+    //  back to 7 after a window that was not kept whole)
+    int cap_max = hy4::k::kMaxWin - 1, cap0 = 7, cap = 7, need = 12, hot_need = 4, match_need = 6;
+    int hot = 0;      // (the tokens in a row the runs foretold, up to now)
+    int prev_n = 0, prev_match = 0, since = 0;   // (the run before: its length and match, the tokens made since)
+    long long off = 0, acc = 0, rounds = 0;
+    int32_t buf[hy4::k::kMaxWin];
+    void start(const int* ids, size_t n) {
+        if (!on) return;
+        sd.reset();
+        sd.append(ids, n);
+        hot = 0;
+        cap = std::min(cap0, cap_max);
+        prev_n = prev_match = since = 0;
+    }
+    void add(int t) {
+        if (!on) return;
+        sd.append(t);
+        ++since;
+    }
+    // the run after the text's last tokens -> buf (0: none)
+    // (a run that goes on where the one before it stood has its match longer by the tokens made since: one whose match
+    //  is shorter is another place in the text - what the runs before it foretold says nothing of it - and a run past
+    //  7 drafts is taken from a match of 16 and more)
+    int propose(long long room) {
+        if (!on || room <= 0 || cap_max <= 0) return 0;
+        int n = sd.propose((int) std::min<long long>(room, cap), buf);
+        const int m = n > 0 ? sd.last_match() : 0;
+        if (n <= 0 || prev_n <= 0 || m < std::min(kMaxMatch, prev_match + since)) hot = 0;
+        if (n > cap0 && m < 16) n = cap0;
+        prev_n = n;
+        prev_match = m;
+        since = 0;
+        return n;
+    }
+    int match() const { return sd.last_match(); }
+    bool sure() const { return hot >= hot_need && match() >= match_need; }
+    void seen(int k, int kept) {   // (a window of the run's drafts: counted, the next run's length by it)
+        ++rounds;
+        off += k;
+        acc += kept;
+        cap = kept == k && k >= std::min(cap0, cap_max) ? cap_max : std::min(cap0, cap_max);
+    }
+    // the step's run (nl tokens in buf) against what the step made: the drafts kept, then the token after them
+    // (next < 0: none - the answer ended)
+    void judge(int nl, const int* kept_tok, int kept, int next) {
+        if (!on) return;
+        int n = 0;
+        bool right = nl > 0;
+        for (int i = 0; right && i < kept && i < nl; ++i, ++n) right = buf[i] == kept_tok[i];
+        if (right && kept < nl && next >= 0) {
+            right = buf[kept] == next;
+            ++n;
+        }
+        hot = right && n > 0 ? std::min(hot + n, 1 << 20) : 0;
+    }
+    // This step's drafts from a run of nl tokens (propose's) and the drafter's own (drafts, k of them above the floor;
+    // none where it was not asked): true where the run is taken - drafts and k are then the run's
+    bool take(int nl, bool asked, bool drafter, std::vector<int>& drafts, int& k) {
+        if (nl <= 0) return false;
+        if (asked) {
+            if (drafts.empty()) return false;
+            const size_t lim = std::min(drafts.size(), (size_t) nl);
+            for (size_t i = 0; i < lim; ++i)
+                if (drafts[i] != buf[i]) return false;
+            if (nl <= k) return false;   // (no longer than the drafter's own)
+        } else if (!sure() && (drafter || match() < need)) {
+            return false;
+        }
+        drafts.assign(buf, buf + nl);
+        k = nl;
+        return true;
+    }
+};
+struct LookupArgs {
+    bool on = true;
+    int cap_max = hy4::k::kMaxWin - 1, need = 12, hot_need = 4;
+};
+
 // The drafts a step may add to its usual ones: one more for every `need` steps in a row whose drafts were all kept, up
 // to n_more (need 0: n_more always) - and none for a while once the added drafts are not being kept: an added draft
 // costs a draft step and a token more in the window, about half of what a kept token is worth, so while fewer than
@@ -732,7 +828,8 @@ struct Extra {
     }
 };
 
-int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need) {
+int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need,
+          const LookupArgs& la = LookupArgs{}) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
     std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
@@ -924,13 +1021,23 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         std::vector<int> drafts;
         Weights wts;   // (plain sampling's rows)
         std::vector<float> confs;
-        std::vector<float> lgw(spec ? (size_t) (n_draft + n_more + 1) * m.vocab() : 0);
+        // (the copy drafts: on with the request's drafts - spec=0 turns both off - the text so far its history)
+        Lookup lk;
+        lk.on = la.on && la.cap_max > 0 && (r.spec < 0 || r.spec != 0);
+        lk.cap_max = std::min(la.cap_max, hy4::k::kMaxWin - 1);
+        lk.need = la.need;
+        lk.hot_need = la.hot_need;
+        lk.start(state.data(), state.size());
+        static const bool lk_log = std::getenv("HY4_LOOKUP_LOG") != nullptr;   // (debugging: a line a step)
+        const int win_rows = std::max(spec ? n_draft + n_more + 1 : 0, lk.on ? lk.cap_max + 1 : 0);
+        std::vector<float> lgw((size_t) win_rows * m.vocab());
         Unpin lgw_unpin{lgw.data(), hy4::Model::pin(lgw.data(), lgw.size() * sizeof(float))};
         std::string fail;
         // one token out: false when the answer ends with it (an end token, max_new, the context)
         auto emit = [&](int t) -> bool {
             std::printf("T %d\n", t);
             ++produced;
+            lk.add(t);
             if (in_think && t == r.think_end) in_think = false;
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
@@ -953,13 +1060,18 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             if (in_think) room = std::min<long long>(room, r.think_budget - produced);
             if (in_think && in.wrap.load()) room = 0;
             int k = 0;
-            if (spec && room > 0) {
+            // (a copy's run first where the runs before it held - or there is no drafter to ask)
+            const int nl = lk.propose(room);
+            drafts.clear();
+            bool lk_round = nl > 0 && lk.take(nl, false, spec, drafts, k);
+            if (!lk_round && spec && room > 0) {
                 if (!m.draft(tok, pos, (int) std::min<long long>(room, n_draft + extra.now()), floor,
                              drafts, confs, err, n_draft, sure)) {
                     fail = err;
                     break;
                 }
                 while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
+                lk_round = lk.take(nl, true, true, drafts, k);
             }
             if (k == 0) {
                 extra.seen(0, 0, n_draft);
@@ -974,6 +1086,10 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 } else {
                     tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state, m.row_top(0)), rng);
                 }
+                if (lk_log)
+                    std::fprintf(stderr, "LK one pos %lld nl %d match %d hot %d drafted %zu conf %.2f\n", (long long) pos, nl,
+                                 nl > 0 ? lk.match() : 0, lk.hot, drafts.size(), confs.empty() ? -1.0f : confs[0]);
+                lk.judge(nl, nullptr, 0, tok);
                 continue;
             }
             std::vector<int> win(1, tok);
@@ -1036,7 +1152,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 more = emit(x);
                 state.push_back(x);
             }
-            extra.seen(k, (int) (d_acc - acc0), n_draft);
+            if (lk_round) lk.seen(k, (int) (d_acc - acc0));
+            else extra.seen(k, (int) (d_acc - acc0), n_draft);
+            if (lk_log)
+                std::fprintf(stderr, "LK %s pos %lld nl %d match %d hot %d k %d kept %d\n", lk_round ? "copy" : "mtp",
+                             (long long) pos, nl, nl > 0 ? lk.match() : 0, lk.hot, k, (int) (d_acc - acc0));
+            lk.judge(nl, drafts.data(), (int) (d_acc - acc0), more ? next : -1);
             if (!more) break;
             tok = next;
         }
@@ -1048,7 +1169,13 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             state.clear();
             held.clear();
         }
-        if (spec && d_off > 0) std::fprintf(stderr, "maya hy4 serve: %s kept %lld of %lld drafts\n", m.has_dfly2() ? "DFly2" : "MTP", d_acc, d_off);
+        // (the drafter's own drafts as before; the copy's beside them)
+        if (spec && d_off - lk.off > 0)
+            std::fprintf(stderr, "maya hy4 serve: %s kept %lld of %lld drafts\n", m.has_dfly2() ? "DFly2" : "MTP",
+                         d_acc - lk.acc, d_off - lk.off);
+        if (lk.rounds > 0)
+            std::fprintf(stderr, "maya hy4 serve: the copy kept %lld of %lld drafts in %lld windows\n", lk.acc, lk.off,
+                         lk.rounds);
         stat_line();
         const double t2 = now() * 1e3;
         // (its last two: the routed experts the answer ran in VRAM, of all it ran - the web app's VRAM hit)
@@ -1671,6 +1798,8 @@ int main(int argc, char** argv) {
     int n_draft = -1;   // (the loaded drafter's own: 3 with the MTP block, the DFly2 drafter's count)
     float floor = -1.0f;   // (the loaded drafter's own: 0.55 with the MTP block, 0.8 with the DFly2 drafter)
     int n_more = 1, need = 1;   // (--draft-more / --draft-streak: the MTP block's drafts)
+    LookupArgs la;              // (--lookup on|off / --lookup-max N / --lookup-match N: the copy drafts)
+    if (const char* e = std::getenv("HY4_LOOKUP")) la.on = std::atoi(e) != 0;
     float sure = 0.8f;
     std::string images, enc_rgb, enc_size, enc_out, kld_save;
     int kv_stream = -1;  // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
@@ -1736,6 +1865,10 @@ int main(int argc, char** argv) {
         else if (a == "--draft-more") n_more = std::max(0, std::atoi(next().c_str()));
         else if (a == "--draft-sure") sure = (float) std::atof(next().c_str());
         else if (a == "--draft-streak") need = std::max(0, std::atoi(next().c_str()));
+        else if (a == "--lookup") la.on = next() != "off";   // (the copy drafts: on | off)
+        else if (a == "--lookup-max") la.cap_max = std::max(0, std::min(hy4::k::kMaxWin - 1, std::atoi(next().c_str())));
+        else if (a == "--lookup-match") la.need = std::max(3, std::atoi(next().c_str()));
+        else if (a == "--lookup-hot") la.hot_need = std::max(1, std::atoi(next().c_str()));
         else if (a == "--eos") eos = parse_list(next());
         else if (a == "--vision") {   // (on by default when the pack has the tower; --vision on: it must)
             const std::string v = next();
@@ -1832,7 +1965,7 @@ int main(int argc, char** argv) {
     // (--draft-more: the MTP block's drafts - the DFly2 drafter's round is one pass of its own count; a step's window,
     //  the token and its drafts, is kMaxWin positions at most: the added drafts within it)
     n_more = m.has_dfly2() ? 0 : std::min(n_more, std::max(0, hy4::k::kMaxWin - 1 - n_draft));
-    if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need);
+    if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need, la);
     if (kld.rfind("topk:", 0) == 0) return run_kld_topk(m, kld.substr(5), chunks, kld_save);
     if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);
@@ -1873,7 +2006,13 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     int64_t pos = (int64_t) ids.size();
     if (m.has_draft() && n_draft > 0 && gen > 0) {   // greedy with the drafts (the MTP block's, or the DFly2 drafter's)
-        std::vector<float> lw((size_t) (n_draft + n_more + 1) * m.vocab());
+        Lookup lk;   // (the copy drafts, as a request's)
+        lk.on = la.on && la.cap_max > 0;
+        lk.cap_max = std::min(la.cap_max, hy4::k::kMaxWin - 1);
+        lk.need = la.need;
+        lk.hot_need = la.hot_need;
+        lk.start(ids.data(), ids.size());
+        std::vector<float> lw((size_t) std::max(n_draft + n_more + 1, lk.on ? lk.cap_max + 1 : 0) * m.vocab());
         const bool lw_pinned = hy4::Model::pin(lw.data(), lw.size() * sizeof(float));
         (void) lw_pinned;
         std::vector<int> drafts;
@@ -1891,16 +2030,23 @@ int main(int argc, char** argv) {
         int tok = top_of(logits.data(), 0);
         while ((int) out.size() < gen) {
             out.push_back(tok);
+            lk.add(tok);
             if (tok == m.eos() || (int) out.size() >= gen) break;
             const double ta = now();
-            if (!m.draft(tok, pos, std::min(n_draft + extra.now(), gen - (int) out.size()), floor,
-                         drafts, confs, err, n_draft, sure)) {
-                std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
-                return 1;
+            int k = 0;
+            const int nl = lk.propose(gen - (int) out.size());
+            drafts.clear();
+            bool lk_round = nl > 0 && lk.take(nl, false, true, drafts, k);
+            if (!lk_round) {
+                if (!m.draft(tok, pos, std::min(n_draft + extra.now(), gen - (int) out.size()), floor,
+                             drafts, confs, err, n_draft, sure)) {
+                    std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+                    return 1;
+                }
+                while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
+                lk_round = lk.take(nl, true, true, drafts, k);
             }
             t_draft += now() - ta;
-            int k = 0;
-            while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
             std::vector<int> win(1, tok);
             win.insert(win.end(), drafts.begin(), drafts.begin() + k);
             const double tb = now();
@@ -1916,13 +2062,19 @@ int main(int argc, char** argv) {
             for (; i < k; ++i) {
                 if (top_of(lw.data() + (size_t) i * m.vocab(), i) != drafts[(size_t) i]) break;
                 out.push_back(drafts[(size_t) i]);
+                lk.add(drafts[(size_t) i]);
                 ++acc;
                 ++pos;
-                if (drafts[(size_t) i] == m.eos() || (int) out.size() >= gen) break;
+                if (drafts[(size_t) i] == m.eos() || (int) out.size() >= gen) {
+                    ++i;   // (kept)
+                    break;
+                }
             }
-            extra.seen(k, i, n_draft);
+            if (lk_round) lk.seen(k, std::min(i, k));
+            else extra.seen(k, std::min(i, k), n_draft);
             if (out.back() == m.eos() || (int) out.size() >= gen) break;
             tok = top_of(lw.data() + (size_t) i * m.vocab(), i);
+            lk.judge(nl, drafts.data(), i, tok);
         }
         const double t2 = now();
         for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
@@ -1936,6 +2088,8 @@ int main(int argc, char** argv) {
                      "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms\n", out.size(), t2 - t1,
                      out.size() / (t2 - t1), rounds, m.has_dfly2() ? "DFly2" : "MTP", acc, off, rounds ? (double) out.size() / rounds : 0.0,
                      rounds ? 1e3 * t_draft / rounds : 0.0, rounds ? 1e3 * t_verify / rounds : 0.0);
+        if (lk.rounds > 0)
+            std::fprintf(stderr, "decode: the copy's drafts: %lld of %lld kept in %lld windows\n", lk.acc, lk.off, lk.rounds);
         return 0;
     }
     for (int i = 0; i < gen; ++i) {

@@ -160,10 +160,12 @@ void router(const float* logits, int T, int n_exp, const float* bias, int n_used
 /// (eptr, the GPU fetch's: each expert's blob wherever it lies - a VRAM slot, a staging slot, pinned RAM - 0 for none
 ///  of this GPU's; who [T][n_used], when given: 1 for an entry the CPU lane computes - left out, its weight zeroed -
 ///  so one expert may run here for one token and on the lane for another; slot is not read then)
-void group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
+/// cap > 0: no group of more than cap entries (an expert with more: several groups) -> true where that holds (false:
+/// the groups as before, up to T entries each)
+bool group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
                    unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups, cudaStream_t s,
                    const int* slot = nullptr, float* w = nullptr, const unsigned long long* eptr = nullptr,
-                   const int* who = nullptr);
+                   const int* who = nullptr, int cap = 0);
 /// ... a token's alone (ds4_iq's plan form): plan[j] = base + ids[j] * stride
 void plan_experts(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
                   cudaStream_t s, const int* slot = nullptr, float* w = nullptr,

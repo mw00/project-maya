@@ -1016,7 +1016,7 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
       endif()
       target_include_directories(maya-hy4 PRIVATE ${_maya_gpu_include_directories} include src/hy4 src/mm3
                                                   third_party/ggml)
-      target_link_libraries(maya-hy4 PRIVATE maya_kernels_cpu ${_maya_gpu_runtime_target} ${_maya_gpu_blas_target}
+      target_link_libraries(maya-hy4 PRIVATE maya_kernels_cpu maya_spec ${_maya_gpu_runtime_target} ${_maya_gpu_blas_target}
                                              Threads::Threads)
       # (DS4_IQ_MIN_FORMS: on AMD the K-quants' minimum term rounded one way in the token and the window kernels -
       #  ds4_iq.cu's kMinG ..; a verify window's rows are then the rows the tokens get one at a time)

@@ -5428,16 +5428,18 @@ struct Model::Impl {
             if (lat_made) {
             } else if (f8) k::q8_rows_dup(gp.lat, lat, T, lat, gp.x2q, gp.x2d, s);   // (q8_rows and the copy: one launch)
             else k::dup_rows_q8(gp.xq, gp.xd, T, lat, gp.x2q, gp.x2d, s);
-            k::group_experts(gp.ids, T, nu, g.n_expert, l.experts, l.blob, gp.grp_ptr, gp.grp_start, gp.grp_ent,
-                             gp.n_groups, s, slot, gp.rw, eptr, who);
+            // (a window of more than 8 tokens: no group of more than 8 entries - the 8-entry kernels then, where the
+            //  16-entry ones took a window of 10 tokens 25 ms against one of 8's 18)
+            const bool capped = k::group_experts(gp.ids, T, nu, g.n_expert, l.experts, l.blob, gp.grp_ptr, gp.grp_start,
+                                                 gp.grp_ent, gp.n_groups, s, slot, gp.rw, eptr, who, 8);
             a.grp_ptr = gp.grp_ptr;
             a.grp_start = gp.grp_start;
             a.grp_ent = gp.grp_ent;
             a.n_groups = gp.n_groups;
             a.xq = gp.x2q;
             a.xd = gp.x2d;
-            groups = std::min(nu * T, g.n_expert);
-            ne_max = T;
+            groups = std::min(nu * T, g.n_expert + (capped ? nu * T / 9 : 0));
+            ne_max = capped ? 8 : T;
         }
         ok = ok && iq::gate_up(a, groups, ne_max, s);
         if (gp.s5 != nullptr && l.tpm >= 0 && T > 2 && (pf_bits & 2) != 0) pf_queue(gp, {&l.rup, &l.sh_down});
@@ -9394,6 +9396,16 @@ bool Model::load(const Options& o, std::string& err) {
     m->hot.quiet = true;   // (HY4_HOT: the warm-up's routes not counted)
     m->pf_probe();         // (the members' caches, before a window reads the experts the probe times)
     bool ok = forward(ids.data(), T, 0, 1, lg.data(), err) && forward(ids.data(), 4, T, 4, lg.data(), err);
+    // (the other window sizes a decode takes - 1 to 3 and 5 with the drafter's drafts, up to 16 with the copy's: each
+    //  size's kernels are their own instances, loaded at their first launch - a request's first window of a size waited
+    //  for them, tenths of a second on nine GPUs.  HY4_WARM_WINDOWS=0: the window of 4 alone, as before)
+    int wpos = T + 4;
+    if (!(std::getenv("HY4_WARM_WINDOWS") && std::atoi(std::getenv("HY4_WARM_WINDOWS")) == 0))
+        for (int t : {1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
+            if (!ok || (int64_t) wpos + t + 8 >= m->o.max_ctx || t > hy4::k::kMaxWin) break;
+            ok = forward(ids.data(), t, wpos, t, lg.data(), err);
+            wpos += t;
+        }
     m->hot.quiet = false;
     if (ok) {   // (NaN logits: every answer wrong and a draft without a top token - #1084 - said at the start instead)
         size_t nan = 0;
@@ -9409,7 +9421,7 @@ bool Model::load(const Options& o, std::string& err) {
         std::vector<int> d;
         std::vector<float> c;
         const int bad0 = m->n_bad_drafts;
-        ok = draft(ids[0], T + 4, 3, 0.0f, d, c, err);
+        ok = draft(ids[0], wpos, 3, 0.0f, d, c, err);
         if (ok && m->n_bad_drafts > bad0)
             m->info.push_back("NOTE the warm-up's draft had no top token (its logits not finite): drafts stop at such a step");
     }

@@ -2236,8 +2236,39 @@ static bool mv_heads_reg_launch(const MvJob& b, int H, size_t ws, size_t xs, siz
     return false;
 }
 #endif
+// (a window of 9 to 16 columns in two launches - the first 8, then the rest - where one launch would be the 16-column
+//  kernel's: a row a warp, every column's activations read again for each row, a window of 10 tokens 28 ms where one
+//  of 8 is 18.5 on eight RTX 5060 Ti.  A column's sums are its own, whatever goes beside it: the same bits.
+//  MAYA_IQ_MV_SPLIT16=0: one launch, as before)
+static bool mv_split16() {
+    static const bool on = !(std::getenv("MAYA_IQ_MV_SPLIT16") && std::getenv("MAYA_IQ_MV_SPLIT16")[0] == '0');
+    return on;
+}
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wide = false) {
+#if !defined(MAYA_USE_HIP)
+    if constexpr (T == kQ8_0)
+        if (wide && max_c > 8 && max_c <= 16 && mv_reg_on() && mv_split16()) {
+            Jobs A = J, B{};
+            int nb = 0, nb_n = 0, nb_c = 0;
+            for (int i = 0; i < nj; ++i) {
+                A.j[i].ncol = std::min(8, J.j[i].ncol);
+                if (J.j[i].ncol > 8) {
+                    MvJob b = J.j[i];
+                    b.xq += (size_t) 8 * b.k;
+                    b.xd += (size_t) 8 * (b.k / 32);
+                    b.y += (size_t) 8 * b.ycs;
+                    b.ncol -= 8;
+                    nb_n = std::max(nb_n, b.n);
+                    nb_c = std::max(nb_c, b.ncol);
+                    B.j[nb++] = b;
+                }
+            }
+            mv_nc<T>(A, nj, max_n, 8, s, wide);
+            if (nb > 0) mv_nc<T>(B, nb, nb_n, nb_c, s, wide);
+            return;
+        }
+#endif
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
 #if !defined(MAYA_USE_HIP)
     if constexpr (T == kQ8_0)
@@ -2306,6 +2337,20 @@ void mv_heads_rows_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, si
 }
 template <int T>
 void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s, bool wide = false) {
+#if !defined(MAYA_USE_HIP)
+    if constexpr (T == kQ8_0 || T == kQ6_K)
+        if (b.ncol > 8 && b.ncol <= 16 && mv_reg_on() && mv_split16()) {   // (mv_nc's two launches: the same bits)
+            MvJob a = b, c = b;
+            a.ncol = 8;
+            c.xq += (size_t) 8 * b.k;
+            c.xd += (size_t) 8 * (b.k / 32);   // (the activations' scales: one a 32 values, whatever the weights' type)
+            c.y += (size_t) 8 * b.ycs;
+            c.ncol = b.ncol - 8;
+            mv_heads_nc<T>(a, H, ws, xs, ds, ys, s, wide);
+            mv_heads_nc<T>(c, H, ws, xs, ds, ys, s, wide);
+            return;
+        }
+#endif
     if constexpr (kMvRows<T>) {
         const int nsb = b.k / 32;
         if (nsb <= 8 && b.n % 4 == 0 && mv_rows()) return mv_heads_rows_nc<T, 4>(b, H, ws, xs, ds, ys, s);

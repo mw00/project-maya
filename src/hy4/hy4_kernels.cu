@@ -1625,7 +1625,10 @@ __global__ void __launch_bounds__(1024) group_par2_kernel(const int* __restrict_
                                                           int* n_groups, const int* __restrict__ slot,
                                                           float* __restrict__ w,
                                                           const unsigned long long* __restrict__ eptr,
-                                                          const int* __restrict__ who) {
+                                                          const int* __restrict__ who, int cap) {
+    // (cap > 0: an expert with more than cap entries - a window of more than cap tokens that route to it - is as many
+    //  groups of at most cap, its entries in their order: the kernels that take the groups then need no more than cap
+    //  entries an expert, and an entry's sums are its own whatever group it is in)
     __shared__ int ent[16 * 16];
     __shared__ int sc[1024];
     __shared__ int wt[32], wf[32], wo[32], wg[32];
@@ -1643,7 +1646,8 @@ __global__ void __launch_bounds__(1024) group_par2_kernel(const int* __restrict_
     if (mine >= 0) atomicAdd(&sc[mine], 1);
     __syncthreads();
     const int c = e < n_exp ? sc[e] : 0;
-    int v = c, f = c > 0 ? 1 : 0;   // (inclusive scans over the warp's lanes)
+    const int ng = c <= 0 ? 0 : cap > 0 ? (c + cap - 1) / cap : 1;   // (this expert's groups)
+    int v = c, f = ng;   // (inclusive scans over the warp's lanes)
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
         const int a = __shfl_up_sync(0xffffffffu, v, o), b = __shfl_up_sync(0xffffffffu, f, o);
@@ -1673,10 +1677,13 @@ __global__ void __launch_bounds__(1024) group_par2_kernel(const int* __restrict_
     }
     __syncthreads();
     const int Sc = v + wo[warp], Sg = f + wg[warp];
-    const int off = Sc - c, gi = Sg - (c > 0 ? 1 : 0);
+    const int off = Sc - c, gi = Sg - ng;
     if (e < n_exp && c > 0) {
-        grp_ptr[gi] = eptr ? eptr[e] : (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
-        grp_start[gi] = off;
+        const unsigned long long wp = eptr ? eptr[e] : (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
+        for (int q = 0; q < ng; ++q) {
+            grp_ptr[gi + q] = wp;
+            grp_start[gi + q] = off + q * cap;   // (ng 1: off)
+        }
         int k = off;
         for (int i = 0; i < n_ent; ++i)
             if (ent[i] == e) grp_ent[k++] = (i / n_used) * 16 + i % n_used;
@@ -2787,21 +2794,28 @@ void router(const float* logits, int T, int n_exp, const float* bias, int n_used
         router_kernel<<<(unsigned) T, 1024, 0, s>>>(logits, n_exp, bias, n_used, norm ? 1 : 0, scale, ids, w);
     check("router");
 }
-void group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
+bool group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
                    unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups, cudaStream_t s,
-                   const int* slot, float* w, const unsigned long long* eptr, const int* who) {
+                   const int* slot, float* w, const unsigned long long* eptr, const int* who, int cap) {
     static const bool serial = std::getenv("HY4_GROUP_SERIAL") != nullptr;   // (the earlier one-thread sort)
     static const bool par2 = !(std::getenv("HY4_GROUP_PAR2") && std::getenv("HY4_GROUP_PAR2")[0] == '0');   // (=0: group_par_kernel)
-    if (!serial && par2 && n_exp <= 1024 && T * n_used <= 16 * 16)
+    // (HY4_GROUP_CAP=0: no group split - a window of more than 8 tokens by the 16-entry kernels, as before)
+    static const bool cap_on = !(std::getenv("HY4_GROUP_CAP") && std::getenv("HY4_GROUP_CAP")[0] == '0');
+    if (!serial && par2 && n_exp <= 1024 && T * n_used <= 16 * 16) {
+        const int cp = cap_on && cap > 0 && T > cap ? cap : 0;
         group_par2_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups,
-                                             slot, w, eptr, who);
-    else if (!serial && n_exp <= 1024)
+                                             slot, w, eptr, who, cp);
+        check("group_experts");
+        return cp > 0;
+    }
+    if (!serial && n_exp <= 1024)
         group_par_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups,
                                             slot, w, eptr, who);
     else
         group_kernel<<<1, 256, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups, slot, w,
                                        eptr, who);
     check("group_experts");
+    return false;
 }
 void plan_experts(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
                   cudaStream_t s, const int* slot, float* w, const unsigned long long* eptr, const int* who) {
