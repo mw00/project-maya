@@ -3068,11 +3068,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                g.idx_heads * g.idx_key, tn, 1.0f);
                 S->mark("dsa_proj", s);
                 const int max_vis = (pt + tn) / kp;
-                if (max_vis > g.top_pools_max())
-                    gb::dsa_score(B.iq, state_ + dsa_pool_[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
-                                  max_vis, B.score, B.score_ld, s);
-                gb::dsa_select(B.score, B.score_ld, pt, kp, g.top_pools_max(), g.idx_select_tail, tn, g.n_sel_max(),
-                               B.cells, B.n_sel, s);
+                // dsa_score + dsa_select in one pass where it runs (MAYA_GLM_PROMPT_DSA): the same cells
+                if (!gb::dsa_indexer(B.iq, state_ + dsa_pool_[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
+                                     max_vis, B.score, B.score_ld, g.top_pools_max(), g.idx_select_tail, g.n_sel_max(),
+                                     B.cells, B.n_sel, s)) {
+                    if (max_vis > g.top_pools_max())
+                        gb::dsa_score(B.iq, state_ + dsa_pool_[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
+                                      max_vis, B.score, B.score_ld, s);
+                    gb::dsa_select(B.score, B.score_ld, pt, kp, g.top_pools_max(), g.idx_select_tail, tn,
+                                   g.n_sel_max(), B.cells, B.n_sel, s);
+                }
                 S->mark("dsa_index", s);
                 // q_abs[t][h] = wk_b[h] (kv_lora x qk_nope) . q[t][h]
 #if defined(MAYA_USE_HIP)
