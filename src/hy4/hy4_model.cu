@@ -7096,7 +7096,7 @@ struct Model::Impl {
                 l.grow_k = want;
                 grow_back += d;
                 CK(cudaMemcpyAsync(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice, gp.s));
-            } else if (want > l.grow_k && h_stage != nullptr) {   // (the lane's most routed ones into new lowest slots)
+            } else if (want > l.grow_k && sh[0].h_stage != nullptr) {   // (the lane's most routed ones into new lowest slots)
                 const float* sc = hot.score.size() >= (size_t) (l.il + 1) * g.n_expert
                                       ? hot.score.data() + (size_t) l.il * g.n_expert : nullptr;
                 std::vector<int> cand;
@@ -7112,7 +7112,7 @@ struct Model::Impl {
                     auto gather = [&](int it) {
                         const int i = it / 3, role = it % 3;
                         const size_t e = (size_t) cand[(size_t) (b0 + i)];
-                        uint8_t* dst = h_stage + (size_t) i * stage_blob + l.tr[role];
+                        uint8_t* dst = sh[0].h_stage + (size_t) i * stage_blob + l.tr[role];
                         const uint8_t* src = role == 0 ? l.cex.G(e) : role == 1 ? l.cex.U(e) : l.cex.D(e);
                         std::memcpy(dst, src, role == 2 ? l.cex.d_stride : l.cex.g_stride);
                     };
@@ -7120,7 +7120,7 @@ struct Model::Impl {
                     else
                         for (int it = 0; it < nb * 3; ++it) gather(it);
                     for (int i = 0; i < nb; ++i)
-                        CK(cudaMemcpyAsync(base + (size_t) (b0 + i) * l.blob, h_stage + (size_t) i * stage_blob,
+                        CK(cudaMemcpyAsync(base + (size_t) (b0 + i) * l.blob, sh[0].h_stage + (size_t) i * stage_blob,
                                            l.tr[2] + l.cex.d_stride, cudaMemcpyHostToDevice, gp.s));
                     CK(cudaStreamSynchronize(gp.s));   // (the staging blobs taken before they are reused)
                 }
