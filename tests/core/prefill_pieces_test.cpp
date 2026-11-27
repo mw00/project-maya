@@ -110,6 +110,47 @@ bool pipeline(int np, int nc, long long gaps, int* n_gaps) {
 
 int main() {
     using maya::core::prefill_piece_end;
+    {
+        using maya::core::prefill_pool_fit;
+        using maya::core::prefill_pool_loan;
+        static constexpr size_t MiB = size_t{1} << 20;
+        // #1184: the non-ring layout needs 1499 MiB at 1280 and 1292 MiB at 1024. The measured pool lends
+        // three 484-MiB rows, keeping 13 of its 16 slots per layer. Model the intervening grid points by row cost.
+        const auto nonring = [](int64_t t) { return (size_t) (464 + 207 * (t / 256)) * MiB; };
+        const size_t loan = prefill_pool_loan(16, 13, 484 * MiB, 90, SIZE_MAX);
+        expect(loan == 3 * 484 * MiB, "keep the slot floor on every layer");
+        expect(prefill_pool_loan(100, 13, MiB, 20, SIZE_MAX) == 20 * MiB &&
+                   prefill_pool_loan(100, 13, MiB, 90, SIZE_MAX) == 87 * MiB &&
+                   prefill_pool_loan(100, 13, MiB, 85, SIZE_MAX) == 85 * MiB,
+               "both the configured percentage and the later 85% use the measured row count");
+        expect(prefill_pool_loan(100, 13, MiB, 20, 40 * MiB) == 40 * MiB &&
+                   prefill_pool_loan(100, 13, MiB, 20, 120 * MiB) == 87 * MiB,
+               "an explicit MiB cap overrides the percentage and still preserves the pool floor");
+        const auto fit = prefill_pool_fit(1280, 20, 16 * MiB, loan, true, nonring);
+        expect(fit.chunk == 1024 && fit.prestage == 0 && fit.bytes == 1292 * MiB,
+               "measured expert pool: 1280 -> 1024 on Auto's grid");
+        expect(prefill_pool_fit(1280, 20, 16 * MiB, loan, false, nonring).chunk == 0,
+               "a fixed chunk does not retry a different length");
+        const auto trim = prefill_pool_fit(1280, 20, 16 * MiB, nonring(1280) + 17 * 16 * MiB, false, nonring);
+        expect(trim.chunk == 1280 && trim.prestage == 17 && trim.bytes == nonring(1280) + 17 * 16 * MiB,
+               "trim the ring at the original chunk when that is enough");
+        const auto enough = prefill_pool_fit(1280, 20, 16 * MiB, nonring(1280) + 24 * 16 * MiB, true, nonring);
+        expect(enough.chunk == 1280 && enough.prestage == 20, "never grow the ring beyond its allocated events");
+
+        // A resident KV cache can leave exactly the 512-token loan priced by the split search. 1024 costs
+        // 1092 MiB in the second report; other sizes here are a synthetic layout with fixed and per-token costs.
+        const auto resident = [](int64_t t) { return (size_t) (508 + 146 * (t / 256)) * MiB; };
+        const auto small = prefill_pool_fit(1024, 32, MiB, resident(512), true, resident);
+        expect(small.chunk == 512 && small.prestage == 0 && small.bytes == resident(512),
+               "use the 512-token chunk priced for resident KV even when Auto prepared 1024");
+        expect(prefill_pool_fit(1024, 0, MiB, resident(256), true, resident).chunk == 256 &&
+                   prefill_pool_fit(1024, 0, MiB, resident(256) - 1, true, resident).chunk == 0 &&
+                   prefill_pool_fit(1024, 0, MiB, 0, true, resident).chunk == 0,
+               "exactly the minimum chunk fits; one byte less or no tail selects the token path");
+        const auto aligned = prefill_pool_fit(1024, 20, 272, 1024 + 17 * 272, true, [](int64_t) { return size_t{1024}; });
+        expect(aligned.prestage == 16 && aligned.bytes == 1024 + 16 * 272,
+               "a partial 256-byte carve block cannot hold another prestage slot");
+    }
     // off: the whole segment
     expect(prefill_piece_end(0, 10000, 0) == 10000, "off: one call");
     expect(prefill_piece_end(100, 1000, 2048) == 1000, "shorter than a piece: one call");

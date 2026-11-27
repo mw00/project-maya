@@ -276,6 +276,10 @@ what you changed there):
 | `--prefill auto` | the largest chunk, in steps of 256 tokens, whose buffers each card's expert pool can lend - at most 90% of its slots (85% when under 90% of the experts' bytes are in VRAM or the pinned RAM tier), always keeping a route's experts and the spares - up to 32768 tokens on one GPU and 8192 on a split - each the faster there (one V100, 26K-token prompts: 559 tok/s at 32768, 367 at 8192; two V100s: 709 at 8192, 551 at 32768). On a split every card reads the same chunks, so the smallest card's sets it, and the log names a card that holds it below the first card's |
 | `--prefill N` | chunks of N tokens (`32768`, say), halved until each card's pool can lend them - only a route's experts and the spares must stay; `0` = token by token. On a split with 96 GB of RAM or more the setup points to `32768` |
 
+If the initial Auto chunk would leave too few expert slots in the measured pool, Maya trims the prestage buffer and
+tries a smaller chunk before falling back to one token at a time. For a fast GLM engine, `GET /metrics` reports
+`engine.prefill_batched` as `1` when all parts can read prompts in batches or `0` for the token path.
+
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
 
@@ -995,7 +999,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 
 - `DS4_FLOW_COPY_DMA=1`: a streamed expert whose RAM copy is pinned is DMA'd to the GPU from that copy - from one part,
   or, where the copies are split across the CPU sockets' memory (2 NUMA parts), each matrix's rows from the part that
-  holds them (a layer on one GPU; tensor-parallel members keep the staging).
+  holds them (a layer on one GPU; tensor-parallel members keep the staging). One GPU too: see the table.
   Without it only MXFP4 experts went that way; the GGUF low-bit experts (IQ2_XXS, IQ3_S, ...) were first copied by a
   reader thread into the pinned staging, about 2.7 GB/s a GPU on PCIe 3.0, which the four GPUs waited on. The same bytes.
   Two sockets (two Xeon E5-2697 v2 + 2x RTX 3090 on PCIe 3.0 x16, Maya-S, a layer split): fresh prompts of 326 / 602 /
@@ -1012,7 +1016,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 
 | Setting | Default | |
 | --- | --- | --- |
-| `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy is DMA'd from that copy, any format - one part, or each matrix's rows from its NUMA part where the copies are split across sockets (a layer on one GPU) (the same bytes) |
+| `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy is DMA'd from that copy, any format - one part, or each matrix's rows from its NUMA part where the copies are split across sockets (a layer on one GPU) (the same bytes); unset or `0`: the readers copy it into the pinned staging first. Worth turning on with AMD: one RX 7900 XTX beside 128 GB of dual-channel DDR4-3200 (Maya-XS, 94 GB of CPU-lane experts copied and pinned) read prompts of 16 / 64 / 256 / 1,024 / 4,096 new tokens 42-49% faster (4K: 28%): the staging's memcpy took 75-82% of the engine's CPU time while a prompt read, and the RAM's own counters gave ~1,350 GB of traffic for the reads against ~455 GB without it. The logits are the same bit for bit |
 | `DS4_YOCO_FLOW` | off (0) | `1`: the YOCO prompt skip also on a layer split whose groups are on the flow (changes the answers slightly) |
 | `DS4_CHUNK_GFX11` | `4096` on RDNA 3 / 3.5 (gfx11) GPUs | the largest prompt chunk, in tokens, on gfx11 GPUs. Integrated ones (Strix / Gorgon Halo) read a long prompt faster in 4K chunks (experts resident); a discrete card that streams its experts from RAM can read faster in the default's larger chunks (one RX 7900 XTX: +15-45% prompt speed with `0`). `N`: this cap; `0`: the default chunk (changes the answers slightly) |
 | `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work (changes the answers slightly) |

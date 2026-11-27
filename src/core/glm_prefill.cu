@@ -133,6 +133,17 @@ struct Carve {
     }
 };
 
+// The device layout prefill_carve binds before the optional prestage ring.
+size_t prefill_layout_bytes(size_t arena, size_t w16, size_t w32, size_t ws, size_t gbuf) {
+    Carve c;
+    c.take<uint8_t>(arena);
+    c.take<uint16_t>(w16);
+    c.take<float>(w32);
+    c.take<uint8_t>(ws);
+    c.take<uint8_t>(gbuf);
+    return c.off;
+}
+
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
 constexpr int kMinPrefillChunk = 256;   // the smallest chunk the prompt path is read in (the layout's floor)
 constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
@@ -141,7 +152,7 @@ constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
 constexpr size_t kMmqSlab = (size_t) 16 << 20;
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
-constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
+constexpr int kPreSlots = 160, kPreMinRows = 4;
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
 // MMQ (MAYA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
 constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) / 3;
@@ -668,7 +679,8 @@ struct Glm5Model::PrefillState {
     int T = 0;                       // tokens per chunk
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
     // whether the measured pinned share may still lower it (prefill_settle), and how it reads in the log
-    std::function<std::pair<int64_t, int>(int64_t)> choose;
+    std::function<PrefillPoolFit(int64_t)> choose;
+    int measured_per = -1;           // the final pool's slots/layer once the first choice needed resizing
     int64_t lend_pct = 90;
     bool lend_pct_fixed = false;
     std::string mode;
@@ -683,7 +695,6 @@ struct Glm5Model::PrefillState {
 #endif
     std::unique_ptr<mmq::Context> mq;
     uint8_t* arena = nullptr;
-    size_t arena_bytes = 0;
     // every device buffer lives in the pool's lendable tail (prefill_bind): valid only while lent
     size_t borrow_bytes = 0, ws_bytes = 0, gbuf_bytes = 0;
     bool lent = false;
@@ -1155,15 +1166,16 @@ void Glm5Model::prefill_settle(double pinned_share) {
     const auto pick = S->choose(S->lend_pct);
     std::fprintf(stderr, "glm prefill: CUDA%d %.0f%% of the experts' bytes are held pinned: the pool lends at most 85%% "
                          "of its slots\n", dev_, 100.0 * pinned_share);
-    if (pick.first == 0) {
+    if (pick.chunk == 0) {
         std::fprintf(stderr, "glm prefill: CUDA%d the expert pool can lend no prompt chunk - token by token\n", dev_);
         prefill_destroy();
         return;
     }
-    if (pick.first >= S->T) return;
-    S->NP = std::min(S->NP, pick.second);
+    if (S->measured_per < 0 && pick.chunk >= S->T) return;
+    S->NP = std::min(S->NP, pick.prestage);
     S->pbuf_bytes = (size_t) S->NP * S->gstride;
-    prefill_cap((int) pick.first, "--prefill auto at 85%");
+    if (S->measured_per >= 0) S->borrow_bytes = pick.bytes;
+    prefill_cap(pick.chunk, "--prefill auto at 85%");
 }
 
 // the weight scratch the prompt path keeps beside a chunk's rows: {BF16 elements, F32 elements}
@@ -1337,6 +1349,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
     const char* pct_env = getenv("MAYA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("MAYA_GLM_PREFILL_MB");
+    const size_t fixed_bytes = mb_env ? (size_t) (std::atof(mb_env) * 1048576.0) : SIZE_MAX;
     const size_t gbuf = has_moe ? glmd::mmq_group_ring_bytes(PrefillState::NG, PrefillState::GE, gstride) : 0;   // glm-dsa B15.2: a 512-B tail a group
     // the prestage buffer (the ring): one GPU (a split's parts hold most of their experts); MAYA_GLM_PRESTAGE=<slots>
     int ring_max = has_moe && (n_parts_ == 1 || glmpfs::split_prestage(g.arch == GlmArch::GlmDsa, n_parts_)) ? kPreSlots : 0;   // glm-dsa B9.9: a glm-dsa split's parts too
@@ -1367,11 +1380,19 @@ bool Glm5Model::prefill_setup(std::string& err) {
             ring_max = 0;
         }
     }
-    // the chunk and its prestage slots for a lend cap of `pct`% of the pool's slots ({0, 0}: no chunk fits)
-    S->choose = [=, this](int64_t pct) -> std::pair<int64_t, int> {
+    // the chunk and its prestage slots for a lend cap of `pct`% of the pool's slots (chunk 0: none fits)
+    S->choose = [=, this](int64_t pct) -> PrefillPoolFit {
+        const auto nonring = [&](int64_t T) {
+            const auto pu = prefill_bytes_for((size_t) T);
+            return prefill_layout_bytes(pu.first + pu.second, w16_elems, w32_elems, ws_bytes, gbuf);
+        };
+        if (S->measured_per >= 0) {
+            const size_t loan = prefill_pool_loan(S->measured_per, keep, stride_sum, is_auto ? pct : 100, fixed_bytes);
+            return prefill_pool_fit(S->T, S->NP, gstride, loan, is_auto, nonring);
+        }
         size_t lendable = 0;   // the bytes the pool can lend the prompt path
         if (mb_env != nullptr) {
-            lendable = (size_t) (std::atof(mb_env) * 1048576.0);
+            lendable = fixed_bytes;
         } else if (stride_sum == 0) {
             lendable = avail;
         } else {
@@ -1379,17 +1400,6 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (is_auto) k = std::min<int64_t>(k, pct * per / 100);
             lendable = (size_t) k * stride_sum;
         }
-        const auto nonring = [&](int64_t T) -> size_t {
-            const auto pu = prefill_bytes_for((size_t) T);
-            Carve c;
-            c.take<uint8_t>(pu.first + pu.second);
-            c.take<uint16_t>((size_t) w16_elems);
-            c.take<float>((size_t) w32_elems);
-            c.take<uint8_t>(ws_bytes);
-            c.take<uint8_t>(gbuf);
-            return c.off;
-        };
-        constexpr int kRingMin = 16;   // a prestage buffer below this is none (prefill_trim_prestage)
         // the prestage slots chunk T leaves beside its buffers (at most ring_max), -1 when T does not fit at all
         const auto room = [&](int64_t T) -> int64_t {
             const size_t nr = nonring(T);
@@ -1403,29 +1413,21 @@ bool Glm5Model::prefill_setup(std::string& err) {
         // beside a 1024-token chunk got 768-token chunks with no ring at all instead of the largest chunk with a part
         // of it (#673: a 20 GB card, Maya-S24 at 256K: 768 where 10240 fit, half the prompt speed)
         const auto biggest = [&](int64_t floor) -> int64_t {
-            int64_t lo = floor > 0 && gstride > 0 ? kPreMinT / 256 : 1, hi = ceiling / 256, best = 0;
-            while (lo <= hi) {
-                const int64_t mid = lo + (hi - lo) / 2;
-                if (room(mid * 256) >= floor) {
-                    best = mid * 256;
-                    lo = mid + 1;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            return best;
+            return prefill_grid_chunk(floor > 0 && gstride > 0 ? kPreMinT : 256, ceiling,
+                                      [&](int64_t t) { return room(t) >= floor; });
         };
         int64_t T = 0;
         if (is_auto) {
             // glm-dsa L1-2, one GPU: the card holds ~18 of a layer's 256 experts, so every chunk streams nearly the
             // whole model (~110 GB on a V100, a fifth of it from the disk) - the fewest chunks win over a full
-            // prestage buffer: the largest chunk that keeps kRingMin slots, the buffer whatever room is left
+            // prestage buffer: the largest chunk that keeps 16 slots, the buffer whatever room is left
             // (UD-IQ2_M, 1x V100, 17K context: chunks of 1,792 tokens beside 160 slots -> 12,288 beside 17; a 2K
             // prompt 40.9 -> 15.9 s, 8K 98.1 -> 33.6 s, 16K 201.6 -> 68.0 s).  An explicit MAYA_GLM_PRESTAGE=<n>
             // keeps the rule before: the largest chunk beside all n slots (=160: L1-1's chunks)
-            if (g_.arch == GlmArch::GlmDsa && n_parts_ == 1 && !ring_set && ring_max > kRingMin) T = biggest(kRingMin);
+            if (g_.arch == GlmArch::GlmDsa && n_parts_ == 1 && !ring_set && ring_max > kPreMinSlots)
+                T = biggest(kPreMinSlots);
             if (T == 0) T = biggest(ring_max);
-            if (T == 0 && ring_max > kRingMin) T = biggest(kRingMin);
+            if (T == 0 && ring_max > kPreMinSlots) T = biggest(kPreMinSlots);
             if (T == 0) T = biggest(0);
         } else {
             for (int64_t c = ceiling; c >= 256; c /= 2)
@@ -1435,14 +1437,18 @@ bool Glm5Model::prefill_setup(std::string& err) {
                 }
             if (T == 0 && ceiling > 0 && ceiling < 256 && room(ceiling) >= 0) T = ceiling;
         }
-        const int64_t r = T > 0 ? room(T) : 0;
-        return {T, T >= kPreMinT && r >= kRingMin ? (int) r : 0};
+        if (T == 0) return {};
+        const int64_t r = room(T);
+        const int np = T >= kPreMinT && r >= kPreMinSlots ? (int) r : 0;
+        Carve c{nullptr, nonring(T)};
+        c.take<uint8_t>((size_t) np * gstride);
+        return {(int) T, np, c.off, lendable};
     };
     S->lend_pct = pct_env != nullptr ? (int64_t) std::atoi(pct_env) : 90;
     S->lend_pct_fixed = pct_env != nullptr || mb_env != nullptr || !is_auto;
     S->mode = is_auto ? "auto, up to " + std::to_string(auto_max) : mode;
     const auto pick = S->choose(S->lend_pct);
-    const int64_t T = pick.first;
+    const int64_t T = pick.chunk;
     if (T == 0) {
         std::fprintf(stderr, "glm prefill: CUDA%d the expert pool (%lld slots a layer) can lend no prompt chunk "
                              "(--prefill %s) - token by token\n", dev_, (long long) per, mode.c_str());
@@ -1454,23 +1460,14 @@ bool Glm5Model::prefill_setup(std::string& err) {
                              "pool\n", dev_, (long long) ceiling, (long long) T);
     S->T = (int) T;
     const auto pu = prefill_bytes_for((size_t) T);
-    S->arena_bytes = pu.first + pu.second;
+    const size_t arena_bytes = pu.first + pu.second;
     S->w16_elems = w16_elems;
     S->w32_elems = w32_elems;
     S->ws_bytes = ws_bytes;
     S->gbuf_bytes = gbuf;
-    S->NP = pick.second;
-    S->pbuf_bytes = (size_t) pick.second * gstride;
-    {
-        Carve c;
-        c.take<uint8_t>(S->arena_bytes);
-        c.take<uint16_t>((size_t) w16_elems);
-        c.take<float>((size_t) w32_elems);
-        c.take<uint8_t>(ws_bytes);
-        c.take<uint8_t>(S->gbuf_bytes);
-        c.take<uint8_t>(S->pbuf_bytes);
-        S->borrow_bytes = c.off;
-    }
+    S->NP = pick.prestage;
+    S->pbuf_bytes = (size_t) S->NP * gstride;
+    S->borrow_bytes = pick.bytes;
     if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_counts, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_base, 4096 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
@@ -1608,7 +1605,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
                          "staging %.0f, prestage %.0f: %d experts); disk landing ring %d experts (%.0f MB pinned)\n",
                  dev_, S->T, S->mode.c_str(),
                  mixer_sub((size_t) S->T, g, has_kda, has_dsa, has_dense, has_moe, S->max_pools, S->sub_env),
-                 (double) S->borrow_bytes / 1048576.0, (double) S->arena_bytes / 1048576.0,
+                 (double) S->borrow_bytes / 1048576.0, (double) arena_bytes / 1048576.0,
                  (double) (w16_elems * 2 + w32_elems * 4) / 1048576.0, (double) S->gbuf_bytes / 1048576.0,
                  (double) S->pbuf_bytes / 1048576.0, S->NP, S->nland, (double) S->nland * (double) gstride / 1048576.0);
     return true;
@@ -1616,19 +1613,31 @@ bool Glm5Model::prefill_setup(std::string& err) {
 
 size_t Glm5Model::prefill_borrow_bytes() const { return pf_ ? pf_->borrow_bytes : 0; }
 
-// a pool that cannot lend the whole borrow: the prestage buffer shrinks to what it can (none below 16 slots)
-size_t Glm5Model::prefill_trim_prestage(size_t max_borrow) {
+// The real pool is sized after pinned staging and cuBLAS warm-up. Reprice the chunk before its device buffers bind.
+size_t Glm5Model::prefill_fit_pool(int per) {
     PrefillState* S = pf_;
-    if (S == nullptr) return 0;
-    if (S->borrow_bytes <= max_borrow || S->pbuf_bytes == 0) return S->borrow_bytes;
-    const size_t base = S->borrow_bytes - ((S->pbuf_bytes + 255u) & ~(size_t) 255u);
-    int np = base < max_borrow ? (int) ((max_borrow - base) / std::max<size_t>(1, S->gstride)) : 0;
-    if (np < 16) np = 0;
-    std::fprintf(stderr, "glm prefill: CUDA%d prestage buffer %d -> %d experts (what the pool can lend)\n", dev_, S->NP, np);
-    S->NP = np;
-    S->pbuf_bytes = (size_t) np * S->gstride;
-    S->borrow_bytes = base + ((S->pbuf_bytes + 255u) & ~(size_t) 255u);
-    return S->borrow_bytes;
+    S->measured_per = per;   // prefill_settle's 85% cap must use this same pool
+    const auto fit = S->choose(S->lend_pct);
+    if (fit.chunk == 0) {
+        std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) can lend %zu MiB, --prefill %s needs "
+                             "at least %zu MiB - token by token\n", dev_, per, fit.loan >> 20,
+                     S->mode.c_str(), fit.bytes >> 20);
+        prefill_destroy();
+        return 0;
+    }
+    if (fit.chunk < S->T) {
+        const std::string why = "--prefill auto, " + std::to_string(S->T) + " exceeded the measured pool loan, " +
+                                std::to_string(fit.bytes >> 20) + " of " + std::to_string(fit.loan >> 20) + " MiB";
+        prefill_cap(fit.chunk, why.c_str());   // resize the pinned embedding and inter-part staging too
+        if (pf_ == nullptr) return 0;          // pinning failed: prefill_cap already destroyed the prompt path
+    }
+    if (fit.prestage != S->NP)
+        std::fprintf(stderr, "glm prefill: CUDA%d prestage buffer %d -> %d experts (what the pool can lend)\n",
+                     dev_, S->NP, fit.prestage);
+    S->NP = fit.prestage;
+    S->pbuf_bytes = (size_t) S->NP * S->gstride;
+    S->borrow_bytes = fit.bytes;
+    return fit.bytes;
 }
 
 bool Glm5Model::prefill_bind(uint8_t* region, size_t bytes, std::string& err) {
@@ -1708,13 +1717,9 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
     if (const char* v = getenv("MAYA_GLM_PREFILL_SUB")) sub_env = std::clamp(std::atoi(v), 16, 8192);
     const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp, kv_stage);
     const auto ws = weight_scratch(g, has_dsa);
-    Carve c;
-    c.take<uint8_t>(pu.first + pu.second);
-    c.take<uint16_t>((size_t) ws.first);
-    c.take<float>((size_t) ws.second);
-    c.take<uint8_t>(kPfWorkspace);
-    c.take<uint8_t>(has_moe ? glmd::mmq_group_ring_bytes(Glm5Model::PrefillState::NG, Glm5Model::PrefillState::GE, gstride) : 0);   // glm-dsa B15.2
-    return c.off;
+    const size_t gbuf = has_moe ? glmd::mmq_group_ring_bytes(Glm5Model::PrefillState::NG, Glm5Model::PrefillState::GE,
+                                                            gstride) : 0;
+    return prefill_layout_bytes(pu.first + pu.second, ws.first, ws.second, kPfWorkspace, gbuf);
 }
 
 // the prompt path's device buffers for chunks of T tokens, carved from the start of the lendable region; returns the

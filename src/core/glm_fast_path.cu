@@ -1636,15 +1636,16 @@ bool Glm5Model::fast_setup(std::string& err) {
                                  "token by token\n", dev_);
         if (pf_ != nullptr) {
             k_extra = tail_slots(prefill_borrow_bytes());
-            // (the prestage buffer is the part that can shrink: to what the pool can lend, else none)
+            // First trim prestage; Auto can also take a smaller chunk on this part before the split settles its size.
             const int k_keep = pool_keep(g.n_exp_used);
             const int k_max = per - k_keep;
-            if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
+            if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_fit_pool(per));
             // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
             // slots need little more than one route's experts and the spares)
             if (!no_pool && per - k_extra < k_keep)
-                std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
-                             dev_, per, prefill_borrow_bytes() >> 20);
+                std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer, %d kept) cannot lend %zu MiB "
+                                     "(%zu MiB available) - token by token\n", dev_, per, k_keep,
+                             prefill_borrow_bytes() >> 20, ((size_t) std::max(0, k_max) * stride_sum) >> 20);
             if (no_pool || per - k_extra < k_keep) {
                 prefill_destroy();
                 k_extra = 0;
