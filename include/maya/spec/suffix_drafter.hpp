@@ -26,6 +26,12 @@ public:
     /// Add tokens to the history (the prompt, then every accepted token).
     void append(const int32_t* tokens, size_t n);
     void append(int32_t token) { append(&token, 1); }
+    /// The history becomes `tokens`: when they start with the whole current history only the tokens after it are
+    /// appended (the index of a history is built by appending its tokens in order, so the kept index is the one a
+    /// reset() and an append of them all would build); otherwise reset() and append. Returns the tokens kept.
+    size_t restart(const int32_t* tokens, size_t n);
+    /// The same history and the same index (tests).
+    bool same(const SuffixDrafter& o) const;
 
     /// Write up to `max_k` proposed next tokens to `out`; returns how many (0 = no match of at least min_match).
     int propose(int max_k, int32_t* out);

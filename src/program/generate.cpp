@@ -49,6 +49,7 @@
 #include "maya/prefill/prefill.hpp"
 #include "maya/prefill/failure.hpp"
 #include "maya/core/native_dense.hpp"
+#include "maya/core/glm_lookup.hpp"
 #include "maya/core/glm_model.hpp"
 #include "maya/core/mtp_rows.hpp"
 #include "maya/core/split_groups.hpp"
@@ -2319,6 +2320,16 @@ static int glm_pack_generate(const Options& o) {
         if (prep_prompt(prompt, reuse, finish, t0) != 0) return 1;
         std::vector<float> lg;
         if (stop_req.load()) finish = "cancel";
+        // MAYA_GLM_LOOKUP=1 (off unless set; glm_lookup.hpp): the prompt lookup for the DFlash decode's rounds - its
+        // index takes this prompt (kept from the last request where the prompt starts with all it holds: that prompt
+        // and its answer in the ids the model wrote; a picture's positions as marks), decode_dflash the tokens written
+        static maya::core::GlmLookup* const lookup = maya::core::GlmLookup::from_env((size_t) o.max_context);
+        if (lookup != nullptr && model.fast() && model.dflash_ready()) {
+            std::vector<int32_t> hist;
+            maya::core::GlmLookup::history(prompt, cur_img_pos, hist);
+            lookup->begin(hist);
+            model.dflash_lookup_ = lookup;
+        }
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
         const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;   // (the drafts this request so far: STAT, DONE)
