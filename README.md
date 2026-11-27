@@ -447,8 +447,7 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines (Apache 2.0); Maya's
   quant is made from Thinking Machines' released weights and keeps its license; the vision file and drafter GGUF are
   [unsloth's](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF).
-  [Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air) by inclusionAI (MIT); its engine, `maya-ling`, was
-  contributed by @alesha-pro (with split GGUF loading and the CUDA 13 build by @Ajay9o9); Maya's quants and the vision
+  [Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air) by inclusionAI (MIT); Maya's quants and the vision
   file are made from inclusionAI's released weights and keep its license.
   [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) by DeepSeek (MIT); Maya's
   quant, its Engram tables and the drafter are made from DeepSeek's released weights and keep its license; the vision
