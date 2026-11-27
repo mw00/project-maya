@@ -981,9 +981,11 @@ struct Slots {
             f.s.used = ++clock;
             list.push_back(std::move(f.s));
         }
-        char b[320];
-        std::snprintf(b, sizeof b, "on - %d in RAM (%.1f GB at most), the rest in %s (%.0f GB at most), %lld ring rows a "
-                      "conversation; %zu kept from earlier runs%s", cap, ram_gb, dir.c_str(), dir_gb,
+        char b[320], rb[48];
+        if (ram_gb > 0) std::snprintf(rb, sizeof rb, "%.1f GB at most", ram_gb);
+        else std::snprintf(rb, sizeof rb, "no byte cap");
+        std::snprintf(b, sizeof b, "on - %d in RAM (%s), the rest in %s (%.0f GB at most), %lld ring rows a "
+                      "conversation; %zu kept from earlier runs%s", cap, rb, dir.c_str(), dir_gb,
                       (long long) ring_keep, list.size(), removed ? (", " + std::to_string(removed) + " removed").c_str() : "");
         note(b);
         trim("");
