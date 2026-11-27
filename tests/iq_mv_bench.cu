@@ -19,10 +19,15 @@ int main() {
     } shapes[] = {{"Q6_K attn_gate 3072-8192", iq::kQ6_K, 3072, 8192}, {"Q6_K attn_output 8192-3072", iq::kQ6_K, 8192, 3072},
                   {"Q6_K attn_q_b 1024-8192", iq::kQ6_K, 1024, 8192}, {"Q8_0 dfly o_proj 8192-3072", iq::kQ8_0, 8192, 3072},
                   {"Q8_0 dfly gate 3072-9216", iq::kQ8_0, 3072, 9216}, {"Q8_0 dfly down 9216-3072", iq::kQ8_0, 9216, 3072},
-                  {"Q8_0 shexp gate 3072-1536", iq::kQ8_0, 3072, 1536}};
+                  {"Q8_0 shexp gate 3072-1536", iq::kQ8_0, 3072, 1536},
+                  {"Q6_K attn_gate 3072-16384", iq::kQ6_K, 3072, 16384}, {"Q6_K attn_output 16384-3072", iq::kQ6_K, 16384, 3072},
+                  {"Q6_K attn_q_b 1024-16384", iq::kQ6_K, 1024, 16384}, {"Q6_K attn_q_a 3072-1024", iq::kQ6_K, 3072, 1024},
+                  {"Q6_K attn_kv_a 3072-576", iq::kQ6_K, 3072, 576}};
     std::mt19937 rng(1);
     const int reps = 200, kMaxC = 8;
+    const bool q6only = std::getenv("BENCH_Q6") != nullptr;
     for (const Shape& sh : shapes) {
+        if (q6only && sh.type != iq::kQ6_K) continue;
         const bool q6 = sh.type == iq::kQ6_K;
         const size_t ld = q6 ? (size_t) sh.k / 256 * 210 : (size_t) sh.k / 32 * 34, bytes = ld * sh.n;
         std::vector<uint8_t> h(bytes);
@@ -50,7 +55,7 @@ int main() {
         cudaEvent_t e0, e1;
         cudaEventCreate(&e0);
         cudaEventCreate(&e1);
-        for (int nc : {1, 2, 4, 6, 8}) {
+        for (int nc : {1, 2, 3, 4, 5, 6, 8}) {
             iq::MvJob j;
             j.ld = ld;
             j.type = sh.type;

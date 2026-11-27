@@ -1373,12 +1373,12 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
 // every SM 8 warps, else mv_kernel)
 // (a V100 - every variant the same bits: Q6_K's kernel of 2-4 columns kept to 3 blocks an SM (its registers 102 -> 85
 //  at 4 columns: the weights' loads are latency-bound, 3 sub-blocks a lane on Hy4's 3072-wide rows - attn_output
-//  8192 -> 3072, 4 columns 55 -> 44 us), and at 8 columns the rows' sub-blocks held and each column's activations
-//  loaded beside its dots, not all 8 columns' at once (Q8_0 8192 -> 3072: 83 -> 72 us))
-template <int T, int NC>
-constexpr bool kMvrSubs = NC >= 8 && (T == kQ6_K || T == kQ8_0);
-template <int T, int NC, int R, bool WIDE = false>
-__global__ void __launch_bounds__(kThreads, T == kQ6_K && NC <= 4 ? 3 : 1) mv_rows_kernel(const Jobs J) {
+//  8192 -> 3072, 4 columns 55 -> 44 us).  HOLD (8 columns; Q6_K 5-6 columns where every job's rows are over 4096 or at
+//  most 1024 wide): the rows' sub-blocks decoded first and each column's activations loaded beside its dots, not all
+//  the columns' at once - Q6_K 3 blocks an SM with it (attn_output 16384 -> 3072, 5 columns 110 -> 94 us; attn_q_b
+//  1024 -> 16384 51 -> 43 us; Q8_0 8192 -> 3072, 8 columns 83 -> 72 us).  3072-wide rows of 5-6 columns: as before)
+template <int T, int NC, int R, bool WIDE = false, bool HOLD = (NC >= 8)>
+__global__ void __launch_bounds__(kThreads, T == kQ6_K && (NC <= 4 || HOLD) ? 3 : 1) mv_rows_kernel(const Jobs J) {
     pdl_wait();
     pdl_trigger();
     const MvJob& b = J.j[blockIdx.y];
@@ -1391,7 +1391,7 @@ __global__ void __launch_bounds__(kThreads, T == kQ6_K && NC <= 4 ? 3 : 1) mv_ro
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
-    if constexpr (kMvrSubs<T, NC>) {
+    if constexpr (HOLD) {
     // (the R rows' sub-blocks decoded first, then each column's activations loaded and dotted with them - R Subs held,
     //  not NC columns' activations: fewer registers.  Each acc[r][c] still takes one fmaf a sub-block: the same bits)
     for (int kb = lane; kb < nsb; kb += 32) {
@@ -2353,9 +2353,15 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
     if constexpr (T == kQ6_K || T == kQ8_0) {   // (R rows a warp: mv_rows_kernel - mv_kernel's columns, sums and order)
         const int R = rows_a_warp(max_n, max_c);
         const bool wd = T == kQ8_0 && wide;
+        bool hold56 = !(std::getenv("MAYA_IQ_MV_HOLD") && std::getenv("MAYA_IQ_MV_HOLD")[0] == '0');
+        for (int i = 0; hold56 && i < nj; ++i) hold56 = J.j[i].k > 4096 || J.j[i].k <= 1024;
 #define MR_(NC)                                                                                                         \
     {                                                                                                                   \
         const dim3 g2((unsigned) ((max_n + kWarps * R - 1) / (kWarps * R)), (unsigned) nj);                             \
+        if (R == 2 && T == kQ6_K && (NC == 5 || NC == 6) && hold56) {                                                 \
+            pdl_launch(mv_rows_kernel<T, NC, 2, false, true>, g2, kThreads, 0, s, J);                                  \
+            return;                                                                                                     \
+        }                                                                                                               \
         if (R == 4) {                                                                                                   \
             if (wd) pdl_launch(mv_rows_kernel<T, NC, 4, true>, g2, kThreads, 0, s, J);                                 \
             else pdl_launch(mv_rows_kernel<T, NC, 4>, g2, kThreads, 0, s, J);                                          \
