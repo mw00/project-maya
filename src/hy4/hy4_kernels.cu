@@ -3203,7 +3203,7 @@ bool attn_tc_on() {
 #if defined(MAYA_USE_HIP)
     return false;
 #else
-    static const bool off = std::getenv("HY4_ATTN_TC") != nullptr && std::atoi(std::getenv("HY4_ATTN_TC")) == 0;
+    static const bool off = !(std::getenv("HY4_ATTN_TC") != nullptr && std::atoi(std::getenv("HY4_ATTN_TC")) != 0);
     static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
     if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
@@ -3272,7 +3272,7 @@ bool attn_flash(const float* q, int T, int H, int kv_lora, int n_rot, const uint
     (void) nk, (void) pos, (void) window, (void) scale, (void) sinks, (void) out, (void) s, (void) q8;
     return false;
 #else
-    static const bool off = std::getenv("HY4_ATTN_FLASH") && std::getenv("HY4_ATTN_FLASH")[0] == '0';
+    static const bool off = !(std::getenv("HY4_ATTN_FLASH") && std::atoi(std::getenv("HY4_ATTN_FLASH")) != 0);
     if (off || T <= 0 || kv_lora != 512 || n_rot != 64 || H % 32 != 0) return false;
     static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
@@ -3651,7 +3651,7 @@ void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, con
                   cudaStream_t s, int nv) {
     if (T <= 0) return;
     if (nv < 0) nv = nkr;
-    static const bool warp_off = std::getenv("HY4_SOFTMAX_WARP") && std::getenv("HY4_SOFTMAX_WARP")[0] == '0';
+    static const bool warp_off = !(std::getenv("HY4_SOFTMAX_WARP") && std::atoi(std::getenv("HY4_SOFTMAX_WARP")) != 0);
     const int R = T * H;
     const dim3 gw((unsigned) ((R + 7) / 8));
 #define SW_(N) attn_softmax_warp_kernel<N><<<gw, 256, 0, s>>>(S, ldS, R, H, nkr, k0, pos, window, mask, ldm, scale, sinks, \

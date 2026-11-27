@@ -5129,13 +5129,13 @@ struct Model::Impl {
 #if defined(MAYA_USE_HIP)
         return false;
 #else
-        static const bool on = !(std::getenv("HY4_ATTN_FLASH") && std::getenv("HY4_ATTN_FLASH")[0] == '0');
+        static const bool on = std::getenv("HY4_ATTN_FLASH") && std::atoi(std::getenv("HY4_ATTN_FLASH")) != 0;
         return on;
 #endif
     }
     // (attn_prompt / attn_sparse: the keys padded to a multiple of 8 - HY4_ATTN_PAD8=0: as before)
     static bool pad8() {
-        static const bool on = !(std::getenv("HY4_ATTN_PAD8") && std::getenv("HY4_ATTN_PAD8")[0] == '0');
+        static const bool on = std::getenv("HY4_ATTN_PAD8") && std::atoi(std::getenv("HY4_ATTN_PAD8")) != 0;
         return on;
     }
     bool attn_prompt(Layer& l, Gpu& gp, int t0, int ts, int64_t p0, bool all, float scale, Deq& dq) {
@@ -7066,7 +7066,7 @@ struct Model::Impl {
     int grow_said = 0;
     bool grow_wanted() const {
         const char* e = std::getenv("HY4_KV_GROW");
-        return !(e && *e && std::atoi(e) == 0) && G.size() == 1 && tp <= 1 && kv_res() == 0 && !o.trial;
+        return (e && *e && std::atoi(e) != 0) && G.size() == 1 && tp <= 1 && kv_res() == 0 && !o.trial;
     }
     bool grow_any() const {
         for (const Layer& l : L)
@@ -7459,7 +7459,7 @@ struct Model::Impl {
     }
 
     static int fat_rows() {
-        static const int n = std::getenv("HY4_FAT_ROWS") ? std::max(0, std::atoi(std::getenv("HY4_FAT_ROWS"))) : 256;
+        static const int n = std::getenv("HY4_FAT_ROWS") ? std::max(0, std::atoi(std::getenv("HY4_FAT_ROWS"))) : 0;
         return n;
     }
     // one busy expert of a set (slot e: its rows r0 .. r0 + n of the sorted ones) as FP16 GEMMs in the weight band:
@@ -7575,7 +7575,7 @@ struct Model::Impl {
     // (ev_used).  The same passes' sets, the same sums (each expert's rows in one pass either way: its slot is all
     // that differs).  One pass at a time a V100 streamed at ~4 GB/s, the copies, the bus and the sets one after another.
     bool stream_pipe() const {
-        static const bool on = !(std::getenv("HY4_STREAM_PIPE") && std::getenv("HY4_STREAM_PIPE")[0] == '0');
+        static const bool on = std::getenv("HY4_STREAM_PIPE") && std::atoi(std::getenv("HY4_STREAM_PIPE")) != 0;
         return on;
     }
     bool streamed_pipe(Layer& l, Gpu& gp, int T, const std::vector<int>& u, std::string& err) {
