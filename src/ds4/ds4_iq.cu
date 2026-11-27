@@ -1371,8 +1371,14 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
 // sub-blocks, decode (WIDE: decode_q8_wide), sub_dot and fmaf order, then warp_sum - are mv_kernel's: the same bits.
 // MAYA_IQ_MV_ROWS=1: mv_kernel, as before; 2 / 4: rows a warp (default: 2 for two columns or more where the rows give
 // every SM 8 warps, else mv_kernel)
+// (a V100 - every variant the same bits: Q6_K's kernel of 2-4 columns kept to 3 blocks an SM (its registers 102 -> 85
+//  at 4 columns: the weights' loads are latency-bound, 3 sub-blocks a lane on Hy4's 3072-wide rows - attn_output
+//  8192 -> 3072, 4 columns 55 -> 44 us), and at 8 columns the rows' sub-blocks held and each column's activations
+//  loaded beside its dots, not all 8 columns' at once (Q8_0 8192 -> 3072: 83 -> 72 us))
+template <int T, int NC>
+constexpr bool kMvrSubs = NC >= 8 && (T == kQ6_K || T == kQ8_0);
 template <int T, int NC, int R, bool WIDE = false>
-__global__ void __launch_bounds__(kThreads) mv_rows_kernel(const Jobs J) {
+__global__ void __launch_bounds__(kThreads, T == kQ6_K && NC <= 4 ? 3 : 1) mv_rows_kernel(const Jobs J) {
     pdl_wait();
     pdl_trigger();
     const MvJob& b = J.j[blockIdx.y];
@@ -1385,6 +1391,30 @@ __global__ void __launch_bounds__(kThreads) mv_rows_kernel(const Jobs J) {
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    if constexpr (kMvrSubs<T, NC>) {
+    // (the R rows' sub-blocks decoded first, then each column's activations loaded and dotted with them - R Subs held,
+    //  not NC columns' activations: fewer registers.  Each acc[r][c] still takes one fmaf a sub-block: the same bits)
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub sr[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            if (r < nr) {
+                const uint8_t* w = b.w + (size_t) (row0 + r) * b.ld;
+                if constexpr (WIDE) decode_q8_wide(w, kb, sr[r]);
+                else decode<T>(w, kb, nullptr, sr[r]);
+            }
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                const int4 xa = xp[0], xb = xp[1];
+                const float xd = b.xd[(size_t) c * nsb + kb];
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                    if (r < nr) acc[r][c] = fmaf(xd, sub_dot<T, kMinMV>(sr[r], xa, xb), acc[r][c]);
+            }
+    }
+    } else {
     for (int kb = lane; kb < nsb; kb += 32) {
         int4 xa[NC], xb[NC];
         float xd[NC];
@@ -1407,6 +1437,7 @@ __global__ void __launch_bounds__(kThreads) mv_rows_kernel(const Jobs J) {
                 for (int c = 0; c < NC; ++c)
                     if (c < b.ncol) acc[r][c] = fmaf(xd[c], sub_dot<T, kMinMV>(s, xa[c], xb[c]), acc[r][c]);
             }
+    }
     }
 #pragma unroll
     for (int r = 0; r < R; ++r)
