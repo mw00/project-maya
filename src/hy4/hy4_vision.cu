@@ -418,7 +418,7 @@ struct Vision::Impl {
             cudaDeviceProp pr{};
             const char* fv = std::getenv("HY4_VISION_FP16");
             bool need_fp16 = false;
-#if defined(STRATA_USE_HIP)
+#if defined(MAYA_USE_HIP)
             if (cudaGetDeviceProperties(&pr, dev) == cudaSuccess) {
                 need_fp16 = std::strstr(pr.gcnArchName, "gfx906") != nullptr ||
                             std::strstr(pr.gcnArchName, "gfx10") != nullptr;
