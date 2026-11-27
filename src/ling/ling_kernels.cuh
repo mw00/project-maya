@@ -85,6 +85,8 @@ void mla_init_state(float* m, float* l, float* o_acc, int H, int T, int v_head, 
 /// Online causal softmax over pre-scaled scores S [H][BQ][BK] -> P16 [H][BQ][BK], rescaling o_acc [H][T][v_head].
 void mla_online_softmax(const float* S, int H, int T, int q0, int BQ, int k0, int BK, int pos0, float* m, float* l,
                         float* o_acc, int v_head, uint16_t* P16, cudaStream_t s);
+/// Tests: true reads each score row twice (the previous kernel; the same bits as the default one read).
+void mla_online_softmax_two_reads(bool on);
 
 /// Finalize tiled MLA output: out16 [T][H][v_head] = FP16((o_acc[h][t][d] / l[h][t]) * sigmoid(gate[t][h])).
 void mla_o_finalize_gate(const float* o_acc, const float* l, const float* gate, int T, int H, int v_head,

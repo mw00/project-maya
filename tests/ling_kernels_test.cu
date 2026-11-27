@@ -363,6 +363,52 @@ static void test_mla_dec_head_groups_same_bits() {
 #endif
 }
 
+// Test 3c: the prompt's online softmax reading each score row once gives the same bits as reading it twice
+static void test_mla_softmax_one_read_same_bits() {
+    constexpr int H = 4, T = 8, VH = 128;
+    std::mt19937 rng(555);
+    std::uniform_real_distribution<float> u(-8.0f, 8.0f);
+    int cases = 0;
+    for (int BK : {1024, 700, 37})
+        for (int k0 : {0, 900, 2000}) {
+            const int pos0 = 1000;   // queries at 1000..1007: tiles fully visible, cut by the diagonal, or masked
+            std::vector<float> S((size_t) H * T * BK), m0((size_t) H * T), l0((size_t) H * T), o0((size_t) H * T * VH);
+            for (auto& x : S) x = u(rng);
+            for (size_t i = 0; i < m0.size(); ++i) { m0[i] = (i % 3 == 0) ? -INFINITY : u(rng); l0[i] = i % 3 == 0 ? 0.0f : 2.0f; }
+            for (auto& x : o0) x = u(rng);
+            float *dS, *dm, *dl, *dO;
+            uint16_t* dP;
+            CHECK_CUDA(cudaMalloc(&dS, S.size() * 4));
+            CHECK_CUDA(cudaMalloc(&dm, m0.size() * 4));
+            CHECK_CUDA(cudaMalloc(&dl, l0.size() * 4));
+            CHECK_CUDA(cudaMalloc(&dO, o0.size() * 4));
+            CHECK_CUDA(cudaMalloc(&dP, S.size() * 2));
+            CHECK_CUDA(cudaMemcpy(dS, S.data(), S.size() * 4, cudaMemcpyHostToDevice));
+            std::vector<uint8_t> out[2];
+            for (int pass = 0; pass < 2; ++pass) {
+                CHECK_CUDA(cudaMemcpy(dm, m0.data(), m0.size() * 4, cudaMemcpyHostToDevice));
+                CHECK_CUDA(cudaMemcpy(dl, l0.data(), l0.size() * 4, cudaMemcpyHostToDevice));
+                CHECK_CUDA(cudaMemcpy(dO, o0.data(), o0.size() * 4, cudaMemcpyHostToDevice));
+                CHECK_CUDA(cudaMemset(dP, 0xff, S.size() * 2));
+                ling::k::mla_online_softmax_two_reads(pass == 0);
+                ling::k::mla_online_softmax(dS, H, T, 0, T, k0, BK, pos0, dm, dl, dO, VH, dP, 0);
+                CHECK_CUDA(cudaDeviceSynchronize());
+                std::vector<uint8_t>& o = out[pass];
+                o.resize(S.size() * 2 + (m0.size() + l0.size() + o0.size()) * 4);
+                uint8_t* p = o.data();
+                CHECK_CUDA(cudaMemcpy(p, dP, S.size() * 2, cudaMemcpyDeviceToHost)); p += S.size() * 2;
+                CHECK_CUDA(cudaMemcpy(p, dm, m0.size() * 4, cudaMemcpyDeviceToHost)); p += m0.size() * 4;
+                CHECK_CUDA(cudaMemcpy(p, dl, l0.size() * 4, cudaMemcpyDeviceToHost)); p += l0.size() * 4;
+                CHECK_CUDA(cudaMemcpy(p, dO, o0.size() * 4, cudaMemcpyDeviceToHost));
+            }
+            ling::k::mla_online_softmax_two_reads(false);
+            EXPECT(out[0] == out[1], "softmax one read differs (BK=%d k0=%d)", BK, k0);
+            ++cases;
+            cudaFree(dS); cudaFree(dm); cudaFree(dl); cudaFree(dO); cudaFree(dP);
+        }
+    std::printf("PASS test_mla_softmax_one_read_same_bits (%d cases bit-identical)\n", cases);
+}
+
 // Test 4: Grouped router + argmax_rows_f32 + top1_prob_f32
 static void test_router_and_argmax() {
     constexpr int T = 4, NE = 512, NU = 8, NG = 8, NGU = 4;
@@ -511,6 +557,7 @@ int main() {
     test_mrope_3d();
     test_mla_dec_wmma();
     test_mla_dec_head_groups_same_bits();
+    test_mla_softmax_one_read_same_bits();
     test_router_and_argmax();
     test_router_nan_guard_and_fused_selfcheck();
     if (g_fail > 0) {

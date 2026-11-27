@@ -884,7 +884,7 @@ __global__ void __launch_bounds__(256)
 __global__ void __launch_bounds__(256)
     mla_online_softmax_kernel(const float* __restrict__ S, int H, int T, int q0, int BQ, int k0, int BK, int pos0,
                               float* __restrict__ m, float* __restrict__ l, float* __restrict__ o_acc, int v_head,
-                              uint16_t* __restrict__ P16) {
+                              uint16_t* __restrict__ P16, int allow_regs) {
     __shared__ float smax[8];
     __shared__ float ssum[8];
     const int q = blockIdx.x;
@@ -905,7 +905,7 @@ __global__ void __launch_bounds__(256)
     // A row of up to 4 x 256 scores is read from memory once (kept in registers for the exp pass); the arithmetic and
     // each thread's order are those of a second read
     constexpr int kRegCols = 4;
-    const bool in_regs = BK <= kRegCols * 256 && blockDim.x == 256;
+    const bool in_regs = allow_regs != 0 && BK <= kRegCols * 256 && blockDim.x == 256;
     float sv[kRegCols];
     float rmax = -INFINITY;
     if (in_regs) {
@@ -2505,6 +2505,8 @@ void lat_q8_to_f16(const void* lat, int k0, int BK, int kv_lora, uint16_t* out16
     lat_q8_to_f16_kernel<<<(unsigned) BK, 256, 0, s>>>((const uint8_t*) lat, k0, kv_lora, out16);
 }
 
+static bool g_softmax_two_reads = false;   // tests: the row read twice, as before (the same bits)
+
 void mla_init_state(float* m, float* l, float* o_acc, int H, int T, int v_head, cudaStream_t s) {
     const int64_t HT = (int64_t) H * T;
     if (HT <= 0) return;
@@ -2516,8 +2518,10 @@ void mla_online_softmax(const float* S, int H, int T, int q0, int BQ, int k0, in
                         float* o_acc, int v_head, uint16_t* P16, cudaStream_t s) {
     if (BQ <= 0 || BK <= 0) return;
     mla_online_softmax_kernel<<<dim3((unsigned) BQ, (unsigned) H), 256, 0, s>>>(
-        S, H, T, q0, BQ, k0, BK, pos0, m, l, o_acc, v_head, P16);
+        S, H, T, q0, BQ, k0, BK, pos0, m, l, o_acc, v_head, P16, g_softmax_two_reads ? 0 : 1);
 }
+
+void mla_online_softmax_two_reads(bool on) { g_softmax_two_reads = on; }
 
 void mla_o_finalize_gate(const float* o_acc, const float* l, const float* gate, int T, int H, int v_head,
                          uint16_t* out16, cudaStream_t s) {
