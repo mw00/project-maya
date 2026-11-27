@@ -210,7 +210,14 @@ std::string gguf_name(const std::string& n, bool verbatim) {
         {"self_attn.v_proj_ctx.weight", "attn_v_ctx.weight"},
         {"mlp.gate_proj.weight", "ffn_gate.weight"},
         {"mlp.up_proj.weight", "ffn_up.weight"},
-        {"mlp.down_proj.weight", "ffn_down.weight"}};
+        {"mlp.down_proj.weight", "ffn_down.weight"},
+        {"self_attn.conv_base", "attn_conv_base"},
+        {"self_attn.conv_proj.weight", "attn_conv_proj.weight"},
+        {"mlp.conv_base", "ffn_conv_base"},
+        {"mlp.conv_proj.weight", "ffn_conv_proj.weight"}};
+    if (n == "selector_predecessor.weight" || n == "selector_successor.weight" ||
+        n == "fc.weight" || n == "enc.output_norm.weight" || n == "output_norm.weight" ||
+        n == "selector_hidden.weight") return n;
     if (const auto it = top.find(n); it != top.end()) return it->second;
     if (n.rfind("layers.", 0) == 0) {
         const size_t dot = n.find('.', 7);
@@ -334,10 +341,11 @@ void check_gguf(const maya::GgufFile& g, int C, int layers, int H, int KV, int F
             if (t.type != 30) throw std::runtime_error("drafter: " + t.name + " is " + t.type_name() + " (an inkling2-mtp GGUF is read as BF16)");
         return;
     }
-    if (!arch || arch->s != "dflash") throw std::runtime_error("drafter: the GGUF is not a DSpark drafter (architecture " +
+    if (!arch || arch->s != "dflash") throw std::runtime_error("drafter: the GGUF is not a DSpark/DFlash2 drafter (architecture " +
                                                                (arch ? arch->s : std::string("?")) + ", dflash expected)");
-    if (!g.find("dspark_hidden_out.weight"))
-        throw std::runtime_error("drafter: the GGUF is not Inkling 2's DSpark (no dspark_hidden_out)");
+    const bool is_ds2 = g.find("fc.weight") && g.find("selector_hidden.weight");
+    if (!is_ds2 && !g.find("dspark_hidden_out.weight"))
+        throw std::runtime_error("drafter: the GGUF is not Inkling 2's DSpark/DFlash2");
     auto want = [&](const char* key, double v) {
         if (num(key) != v)
             throw std::runtime_error(std::string("drafter: the GGUF's ") + key + " is " + std::to_string(num(key)) +
@@ -350,8 +358,8 @@ void check_gguf(const maya::GgufFile& g, int C, int layers, int H, int KV, int F
     want("dflash.attention.head_count_kv", KV);
     want("dflash.feed_forward_length", F);
     want("dflash.attention.key_length", 128);
-    want("dflash.attention.sliding_window", 1024);
-    want("dflash.rope.freq_base", 1e6);
+    if (!is_ds2) want("dflash.attention.sliding_window", 1024);
+    want("dflash.rope.freq_base", is_ds2 ? 1e4 : 1e6);
     if (std::fabs(num("dflash.attention.layer_norm_rms_epsilon") - 1e-6) > 1e-9)
         throw std::runtime_error("drafter: the GGUF's RMS epsilon is not 1e-6");
     const auto* tl = g.get("dflash.target_layers");
@@ -363,10 +371,12 @@ void check_gguf(const maya::GgufFile& g, int C, int layers, int H, int KV, int F
     bool ok = tl && tl->items.size() == expect.size();
     for (size_t i = 0; ok && i < expect.size(); ++i) ok = tl->items[i].u == expect[i];
     if (!ok) throw std::runtime_error("drafter: the GGUF's dflash.target_layers are not the taps this engine gives");
-    const auto* pat = g.get("dflash.attention.sliding_window_pattern");
-    ok = pat && pat->items.size() == local.size();
-    for (size_t i = 0; ok && i < local.size(); ++i) ok = (pat->items[i].u != 0) == local[i];
-    if (!ok) throw std::runtime_error("drafter: the GGUF's sliding window pattern is not this drafter's");
+    if (!is_ds2) {
+        const auto* pat = g.get("dflash.attention.sliding_window_pattern");
+        ok = pat && pat->items.size() == local.size();
+        for (size_t i = 0; ok && i < local.size(); ++i) ok = (pat->items[i].u != 0) == local[i];
+        if (!ok) throw std::runtime_error("drafter: the GGUF's sliding window pattern is not this drafter's");
+    }
 }
 
 }  // namespace
@@ -383,6 +393,8 @@ struct DLayer {
     bool local = false;
     float *in_norm, *post_norm, *dflare, *q_norm, *k_norm, *k_norm_ctx;
     DMat wq, wk, wv, wo, wkc, wvc, wgu, wd;
+    float *attn_conv_base = nullptr, *ffn_conv_base = nullptr;
+    DMat attn_conv_proj, ffn_conv_proj;
     float *kc = nullptr, *vc = nullptr;                    // the context caches, F32 [cap][KV * 128] (a window's
     uint16_t *kc16 = nullptr, *vc16 = nullptr;             //  layer) or FP16 (the layer that sees the whole context)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;                //  ... or FP8 E4M3 (load's kv8), times k_scale / v_scale
@@ -395,6 +407,14 @@ struct Drafter {
     float* ctx_tmp = nullptr;   // write_context's K and V rows before an FP16 cache, [2][kMixRows][KV * 128]
     float eps = 1e-6f, theta = 1e6f;
     bool q8 = false;   // the layers' matrices Q8_0 (a GGUF's): their inputs FP16, else BF16
+    bool is_dflash2 = false;   // DFlash2DraftModel (5 layers, convs, top-16 selector)
+    DMat fc_w, sel_hidden;
+    float* enc_norm = nullptr;
+    uint16_t *sel_pred_bf = nullptr, *sel_succ_bf = nullptr;
+    float *taps_cat = nullptr, *ds2_conv_dyn = nullptr, *ds2_gate = nullptr;
+    int32_t *ds2_pidx = nullptr, *ds2_idx = nullptr;
+    float *ds2_pval = nullptr, *ds2_val = nullptr;
+    int* ds2_out_tok = nullptr;
     bool kv8 = false;  // the layer without a window's context rows FP8 E4M3, K times k_scale, V times v_scale
     // (K is RMS-normed a head - |k| <= sqrt(128) x its norm's weight, 12.4 at most measured - V not: 17.7 at most
     //  measured; 448 is E4M3's largest value - powers of two, so the scaling itself rounds nothing)
@@ -693,19 +713,26 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
     d->cap = context_rows(ctx);
     const bool mini = C == 2304;
-    if (mini) {
+    const bool is_ds2 = f.g && f.g->find("fc.weight") && f.g->find("selector_hidden.weight");
+    d->is_dflash2 = is_ds2;
+    if (is_ds2) {
+        d->H = 32;
+        d->F = 6912;
+        d->taps = 4;
+        d->theta = 10000.0f;
+    } else if (mini) {
         d->H = 24;
         d->F = 9216;
         d->taps = 4;
     } else if (C != 4608) {
         throw std::runtime_error("drafter: unsupported target width");
     }
-    const int layers = mini ? 3 : 5;
+    const int layers = (mini && !is_ds2) ? 3 : 5;
     const int64_t H = d->H, KV = d->KV, F = d->F, R = d->R;
     const int local_ids[] = {0, 1, 3, 4};
     std::vector<bool> local(layers);
     for (int i = 0; i < layers; ++i)
-        local[i] = mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
+        local[i] = is_ds2 ? true : (mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids));
     if (f.g) {
         const auto* arch = f.g->get("general.architecture");
         f.verbatim = arch && arch->s == "inkling2-mtp";
@@ -717,9 +744,31 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
             if (t.name.rfind("blk.", 0) == 0 && t.shape.size() == 2) all_q8 = all_q8 && t.type == 8;
         d->q8 = all_q8 && !f.verbatim && k::arch_class() >= 75;
     }
-    d->V = (int) src_dim0(f, "markov_head.markov_w1.weight");
+    if (is_ds2) {
+        const auto* sp_t = f.g->find("selector_predecessor.weight");
+        if (!sp_t || sp_t->shape.size() != 2 || (int) sp_t->shape[0] != R)
+            throw std::runtime_error("drafter: selector_predecessor.weight: unexpected shape");
+        d->V = (int) sp_t->shape[1];
+        d->fc_w = load_mat(d, f, {"fc.weight"}, {C}, 4 * C);
+        auto upf = [&](const char* name) {
+            auto v = src_f32(f, name, {C});
+            float* p = dalloc<float>(C);
+            cu(cudaMemcpy(p, v.data(), (size_t) C * 4, cudaMemcpyHostToDevice), name);
+            return p;
+        };
+        d->enc_norm = upf("enc.output_norm.weight");
+        d->R = R;
+        d->sel_hidden.bf = up16(d, src_bf16(f, "selector_hidden.weight", {R, C}));
+        d->sel_pred_bf = up16(d, src_bf16(f, "selector_predecessor.weight", {d->V, R}));
+        d->sel_succ_bf = up16(d, src_bf16(f, "selector_successor.weight", {d->V, R}));
+        d->norm = upf("output_norm.weight");
+        d->mask = dalloc<float>(C);
+        cu(cudaMemset(d->mask, 0, (size_t) C * 4), "mask");
+    } else {
+        d->V = (int) src_dim0(f, "markov_head.markov_w1.weight");
+    }
     // fuse_weight [layers + 1][taps] -> softmax over each row
-    {
+    if (!is_ds2) {
         const auto fw = src_f32(f, "fuse_weight", {layers + 1, d->taps});
         std::vector<float> a(fw.size());
         for (int r = 0; r <= layers; ++r) {
@@ -739,16 +788,32 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         l.local = local[i];
         l.in_norm = vec(b + "input_layernorm.weight", C);
         l.post_norm = vec(b + "post_attention_layernorm.weight", C);
-        l.dflare = vec(b + "dflare_norm.weight", C);
+        if (!is_ds2) l.dflare = vec(b + "dflare_norm.weight", C);
         l.q_norm = vec(b + "self_attn.q_norm.weight", 128);
         l.k_norm = vec(b + "self_attn.k_norm.weight", 128);
-        l.k_norm_ctx = vec(b + "self_attn.k_norm_ctx.weight", 128);
+        if (!is_ds2) l.k_norm_ctx = vec(b + "self_attn.k_norm_ctx.weight", 128);
         l.wq = load_mat(d, f, {b + "self_attn.q_proj.weight"}, {H * 128}, C);
         l.wk = load_mat(d, f, {b + "self_attn.k_proj.weight"}, {KV * 128}, C);
         l.wv = load_mat(d, f, {b + "self_attn.v_proj.weight"}, {KV * 128}, C);
         l.wo = load_mat(d, f, {b + "self_attn.o_proj.weight"}, {C}, H * 128);
-        l.wkc = load_mat(d, f, {b + "self_attn.k_proj_ctx.weight"}, {KV * 128}, C);
-        l.wvc = load_mat(d, f, {b + "self_attn.v_proj_ctx.weight"}, {KV * 128}, C);
+        if (!is_ds2) {
+            l.wkc = load_mat(d, f, {b + "self_attn.k_proj_ctx.weight"}, {KV * 128}, C);
+            l.wvc = load_mat(d, f, {b + "self_attn.v_proj_ctx.weight"}, {KV * 128}, C);
+        } else {
+            auto up_cb = [&](const std::string& nm) -> float* {
+                const auto* t = f.g->find(gguf_name(nm, f.verbatim));
+                if (!t) throw std::runtime_error("drafter: no tensor " + nm);
+                std::vector<int64_t> sh(t->shape.rbegin(), t->shape.rend());
+                auto v = src_f32(f, nm, sh);
+                float* dp = dalloc<float>(v.size());
+                cu(cudaMemcpy(dp, v.data(), v.size() * 4, cudaMemcpyHostToDevice), nm.c_str());
+                return dp;
+            };
+            l.attn_conv_base = up_cb(b + "self_attn.conv_base");
+            l.attn_conv_proj.bf = up16(d, src_bf16(f, b + "self_attn.conv_proj.weight", {576, C}));
+            l.ffn_conv_base = up_cb(b + "mlp.conv_base");
+            l.ffn_conv_proj.bf = up16(d, src_bf16(f, b + "mlp.conv_proj.weight", {576, C}));
+        }
         l.wgu = load_mat(d, f, {b + "mlp.gate_proj.weight", b + "mlp.up_proj.weight"}, {F, F}, C);   // gate's, up's
         l.wd = load_mat(d, f, {b + "mlp.down_proj.weight"}, {C}, F);
         if (l.local) {   // (a window of 1024: a ring of 2048 rows, F32)
@@ -768,14 +833,26 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
             d->vram += (size_t) l.cap * KV * 128 * 4;
         }
     }
-    d->norm = vec("norm.weight", C);
-    d->mask = vec("mask_embed", C);
-    d->mk_dflare = vec("markov_head.dflare_norm.weight", C);
-    d->w1 = up16(d, src_bf16(f, "markov_head.markov_w1.weight", {d->V, R}));
-    d->rnn_w = up16(d, src_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
-    d->rnn_b = vec("markov_head.rnn_proj.bias", 3 * R);
-    d->hout_w = src_bf16(f, "markov_head.hidden_out.weight", {C, R});
-    d->hout_b = src_f32(f, "markov_head.hidden_out.bias", {C});
+    if (!is_ds2) {
+        d->norm = vec("norm.weight", C);
+        d->mask = vec("mask_embed", C);
+        d->mk_dflare = vec("markov_head.dflare_norm.weight", C);
+        d->w1 = up16(d, src_bf16(f, "markov_head.markov_w1.weight", {d->V, R}));
+        d->rnn_w = up16(d, src_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
+        d->rnn_b = vec("markov_head.rnn_proj.bias", 3 * R);
+        d->hout_w = src_bf16(f, "markov_head.hidden_out.weight", {C, R});
+        d->hout_b = src_f32(f, "markov_head.hidden_out.bias", {C});
+    } else {
+        d->taps_cat = dalloc<float>((size_t) kMixRows * 4 * C);
+        d->ds2_conv_dyn = dalloc<float>((size_t) kBlock * 576);
+        d->ds2_gate = dalloc<float>((size_t) (kBlock - 1) * R);
+        d->ds2_pidx = dalloc<int32_t>((size_t) (kBlock - 1) * 32 * 16);
+        d->ds2_pval = dalloc<float>((size_t) (kBlock - 1) * 32 * 16);
+        d->ds2_idx = dalloc<int32_t>((size_t) (kBlock - 1) * 16);
+        d->ds2_val = dalloc<float>((size_t) (kBlock - 1) * 16);
+        d->ds2_out_tok = dalloc<int>(kBlock - 1);
+        d->base = dalloc<float>((size_t) (kBlock - 1) * 204800);
+    }
     // work buffers
     const size_t T = kBlock;
     d->x = dalloc<float>(T * C), d->res = dalloc<float>(T * C), d->h = dalloc<float>(T * C);
@@ -803,6 +880,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
 namespace {
 // the fold, the head's rows a chunk at a time as F32 from lm_f16 (FP16 [n_rows][C]) or from planar Q8_0 (q8, q8d)
 void fold_impl(Drafter* d, const uint16_t* lm_f16, const int8_t* q8, const uint16_t* q8d, int n_rows) {
+    if (d->is_dflash2) return;
     const int C = d->C, R = d->R;
     d->n_rows = n_rows;
     if (getenv("IK2_DRAFT_SHORTLIST") && atoi(getenv("IK2_DRAFT_SHORTLIST"))) {
@@ -892,8 +970,196 @@ void fold_impl(Drafter* d, const uint16_t* lm_f16, const int8_t* q8, const uint1
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) { fold_impl(d, lm_f16, nullptr, nullptr, n_rows); }
 void fold_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d, int n_rows) { fold_impl(d, nullptr, q8, q8d, n_rows); }
 
+constexpr int kD2TopK = 16;
+constexpr int kD2TopKSplits = 32;
+constexpr int kD2MaxRank = 256;
+
+__device__ __forceinline__ float d2_bf16(uint16_t b) {
+    uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+__global__ void ds2_cat_kernel(const float* __restrict__ tap, size_t stride, int n, float* __restrict__ out) {
+    const int t = blockIdx.x, k = blockIdx.y;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        out[((size_t) t * 4 + k) * n + i] = tap[(size_t) k * stride + (size_t) t * n + i];
+}
+
+__global__ void ds2_conv_kernel(const float* __restrict__ hidden, const float* __restrict__ dyn, int dyn_row,
+                                const float* __restrict__ base, int side, int taps, int group, int n,
+                                const float* acc, float* out) {
+    const int t = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const int g = c / group, groups = n / group;
+    float sum = acc ? acc[(size_t) t * n + c] : 0.0f;
+    for (int j = 0; j < taps && j <= t; ++j) {
+        const float w = base[((size_t) side * taps + j) * n + c] +
+                        dyn[(size_t) t * dyn_row + (side * taps + j) * groups + g];
+        sum = fmaf(w, hidden[(size_t) (t - j) * n + c], sum);
+    }
+    out[(size_t) t * n + c] = sum;
+}
+
+__device__ __forceinline__ void d2_top16_range(const float* row, int lo, int hi, int32_t* out_i, float* out_v) {
+    __shared__ float sv[256][kD2TopK + 1];
+    __shared__ int si[256][kD2TopK + 1];
+    __shared__ float wv[8];
+    __shared__ int wi[8], wt[8];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float lv[kD2TopK];
+    int li[kD2TopK];
+#pragma unroll
+    for (int j = 0; j < kD2TopK; ++j) lv[j] = -INFINITY, li[j] = 0x7fffffff;
+    for (int i = lo + tid; i < hi; i += 256) {
+        float v = row[i];
+        int id = i;
+        if (!(v > lv[kD2TopK - 1])) continue;
+#pragma unroll
+        for (int j = 0; j < kD2TopK; ++j) {
+            if (v > lv[j]) {
+                const float tv = lv[j];
+                const int ti = li[j];
+                lv[j] = v, li[j] = id;
+                v = tv, id = ti;
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kD2TopK; ++j) sv[tid][j] = lv[j], si[tid][j] = li[j];
+    sv[tid][kD2TopK] = -INFINITY, si[tid][kD2TopK] = 0x7fffffff;
+    __syncthreads();
+    int head = 0;
+    for (int k = 0; k < kD2TopK; ++k) {
+        float bv = sv[tid][head];
+        int bi = si[tid][head];
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffff, bv, off);
+            const int oi = __shfl_down_sync(0xffffffff, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+        }
+        if (lane == 0) wv[warp] = bv, wi[warp] = bi;
+        __syncthreads();
+        if (tid == 0) {
+            float gv = wv[0];
+            int gi = wi[0], gw = 0;
+            for (int w = 1; w < 8; ++w)
+                if (wv[w] > gv || (wv[w] == gv && wi[w] < gi)) gv = wv[w], gi = wi[w], gw = w;
+            out_v[k] = gv, out_i[k] = gi;
+            wt[0] = gi;
+        }
+        __syncthreads();
+        if (bi == wt[0] && head < kD2TopK && si[tid][head] == wt[0]) ++head;
+        __syncthreads();
+    }
+}
+
+__global__ void __launch_bounds__(256) ds2_topk_part_kernel(const float* __restrict__ logits, size_t stride,
+                                                             int n_valid, int32_t* __restrict__ pidx,
+                                                             float* __restrict__ pval) {
+    const int r = blockIdx.x, sp = blockIdx.y;
+    const int chunk = (n_valid + kD2TopKSplits - 1) / kD2TopKSplits;
+    const int lo = sp * chunk, hi = min(n_valid, lo + chunk);
+    d2_top16_range(logits + (size_t) r * stride, lo, hi,
+                   pidx + ((size_t) r * kD2TopKSplits + sp) * kD2TopK,
+                   pval + ((size_t) r * kD2TopKSplits + sp) * kD2TopK);
+}
+
+__global__ void __launch_bounds__(256) ds2_topk_merge_kernel(const int32_t* __restrict__ pidx,
+                                                              const float* __restrict__ pval,
+                                                              int32_t* __restrict__ idx,
+                                                              float* __restrict__ val) {
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const int base = r * kD2TopKSplits * kD2TopK;
+    __shared__ float sv[kD2TopKSplits * kD2TopK];
+    __shared__ int32_t si[kD2TopKSplits * kD2TopK];
+    for (int i = tid; i < kD2TopKSplits * kD2TopK; i += 256) {
+        sv[i] = pval[base + i];
+        si[i] = pidx[base + i];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (int k = 0; k < kD2TopK; ++k) {
+            int best = k;
+            for (int j = k + 1; j < kD2TopKSplits * kD2TopK; ++j)
+                if (sv[j] > sv[best] || (sv[j] == sv[best] && si[j] < si[best])) best = j;
+            const float tv = sv[k]; sv[k] = sv[best]; sv[best] = tv;
+            const int32_t ti = si[k]; si[k] = si[best]; si[best] = ti;
+            idx[r * kD2TopK + k] = si[k];
+            val[r * kD2TopK + k] = sv[k];
+        }
+    }
+}
+
+__global__ void __launch_bounds__(512) ds2_select_kernel(const int32_t* __restrict__ idx, const float* __restrict__ val,
+                                                         const float* __restrict__ gate, int rank,
+                                                         const uint16_t* __restrict__ prev_cb,
+                                                         const uint16_t* __restrict__ succ_cb, int steps,
+                                                         int anchor, float cap, int* __restrict__ out_tok) {
+    __shared__ float pred[kD2MaxRank];
+    __shared__ float score[kD2TopK];
+    __shared__ int prev;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    if (tid == 0) prev = anchor;
+    __syncthreads();
+    for (int s = 0; s < steps; ++s) {
+        for (int r = tid; r < rank; r += 512)
+            pred[r] = d2_bf16(prev_cb[(size_t) prev * rank + r]) * gate[(size_t) s * rank + r];
+        __syncthreads();
+        const int cand = idx[s * kD2TopK + warp];
+        float dot = 0.0f;
+        for (int r = lane; r < rank; r += 32) dot = fmaf(pred[r], d2_bf16(succ_cb[(size_t) cand * rank + r]), dot);
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffff, dot, off);
+        if (lane == 0) {
+            const float x = val[s * kD2TopK + warp] + dot;
+            score[warp] = cap > 0.0f ? cap * tanhf(x / cap) : x;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int best = 0;
+            for (int k = 1; k < kD2TopK; ++k)
+                if (score[k] > score[best] ||
+                    (score[k] == score[best] && idx[s * kD2TopK + k] < idx[s * kD2TopK + best]))
+                    best = k;
+            out_tok[s] = idx[s * kD2TopK + best];
+            prev = out_tok[s];
+        }
+        __syncthreads();
+    }
+}
+
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
     const int C = d->C, KD = d->KV * 128;
+    if (d->is_dflash2) {
+        for (int a = 0; a < m;) {
+            const int n = std::min(kMixRows, m - a);
+            iota_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, d->s>>>(d->ctx_pos, pos0 + a, n);
+            ds2_cat_kernel<<<dim3((unsigned) n, 4), 256, 0, d->s>>>(taps + (size_t) (r0 + a) * C, (size_t) ld * C, C, d->taps_cat);
+            act(d, d->taps_cat, (size_t) n * 4 * C, d->hb2);
+            gemm(d, d->fc_w, C, 4 * C, d->hb2, n, d->mix, C);
+            k::rms(d->mix, d->enc_norm, n, C, d->eps, d->mix, d->s);
+            act(d, d->mix, (size_t) n * C, d->hb);
+            for (auto& l : d->L) {
+                const int at = (pos0 + a) % l.cap;
+                const int n1 = std::min(n, l.cap - at);
+                gemm(d, l.wk, KD, C, d->hb, n1, l.kc + (size_t) at * KD, KD);
+                gemm(d, l.wv, KD, C, d->hb, n1, l.vc + (size_t) at * KD, KD);
+                k::rms(l.kc + (size_t) at * KD, l.k_norm, n1 * d->KV, 128, d->eps, l.kc + (size_t) at * KD, d->s);
+                k::rope_neox(l.kc + (size_t) at * KD, n1, d->KV, d->ctx_pos, d->theta, d->s);
+                if (n1 < n) {
+                    const int n2 = n - n1;
+                    gemm(d, l.wk, KD, C, d->hb + (size_t) n1 * C, n2, l.kc, KD);
+                    gemm(d, l.wv, KD, C, d->hb + (size_t) n1 * C, n2, l.vc, KD);
+                    k::rms(l.kc, l.k_norm, n2 * d->KV, 128, d->eps, l.kc, d->s);
+                    k::rope_neox(l.kc, n2, d->KV, d->ctx_pos + n1, d->theta, d->s);
+                }
+            }
+            a += n;
+        }
+        return;
+    }
     for (auto& l : d->L) {
         const int li = (int) (&l - d->L.data());
         for (int a = 0; a < m;) {
@@ -923,6 +1189,7 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
 }
 
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
+    if (d->is_dflash2) return;
     k::mix_rms(taps + (size_t) row * d->C, d->taps, (size_t) ld * d->C, 1, d->C, d->alpha + d->L.size() * d->taps, d->mk_dflare,
                d->eps, d->f_rnn, d->s);
 }
@@ -952,9 +1219,23 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
         if (i > 0) k::add(d->x, d->res, TC, d->res, d->s);
         k::rms(d->res, l.in_norm, T, C, d->eps, d->h, d->s);
         layer_attn(d, l, P, d->x, dyn);
+        if (d->is_dflash2 && l.attn_conv_proj.bf) {
+            const int dyn_r = 2 * 4 * (C / 32);
+            k::to_bf16(d->h, (size_t) T * C, (uint16_t*) d->x16, d->s);
+            gemm_bf(d, l.attn_conv_proj.bf, dyn_r, C, (const uint16_t*) d->x16, T, d->ds2_conv_dyn, dyn_r);
+            ds2_conv_kernel<<<dim3((C + 255) / 256, T), 256, 0, d->s>>>(
+                d->h, d->ds2_conv_dyn, dyn_r, l.attn_conv_base, 0, 4, 32, C, d->x, d->x);
+        }
         k::add(d->x, d->res, TC, d->res, d->s);
         k::rms(d->res, l.post_norm, T, C, d->eps, d->h, d->s);
         layer_mlp(d, l, d->x);
+        if (d->is_dflash2 && l.ffn_conv_proj.bf) {
+            const int dyn_r = 2 * 4 * (C / 32);
+            k::to_bf16(d->h, (size_t) T * C, (uint16_t*) d->x16, d->s);
+            gemm_bf(d, l.ffn_conv_proj.bf, dyn_r, C, (const uint16_t*) d->x16, T, d->ds2_conv_dyn, dyn_r);
+            ds2_conv_kernel<<<dim3((C + 255) / 256, T), 256, 0, d->s>>>(
+                d->h, d->ds2_conv_dyn, dyn_r, l.ffn_conv_base, 0, 4, 32, C, d->x, d->x);
+        }
     }
     k::add(d->x, d->res, TC, d->res, d->s);
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
@@ -966,6 +1247,17 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
         k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
     else
         gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
+    if (d->is_dflash2) {
+        ds2_topk_part_kernel<<<dim3(proposals, 32), 256, 0, d->s>>>(d->base, n_rows, n_vocab, d->ds2_pidx, d->ds2_pval);
+        ds2_topk_merge_kernel<<<proposals, 256, 0, d->s>>>(d->ds2_pidx, d->ds2_pval, d->ds2_idx, d->ds2_val);
+        k::to_bf16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
+        gemm_bf(d, d->sel_hidden.bf, d->R, C, (const uint16_t*) d->x16, proposals, d->ds2_gate, d->R);
+        ds2_select_kernel<<<1, 512, 0, d->s>>>(
+            d->ds2_idx, d->ds2_val, d->ds2_gate, d->R, d->sel_pred_bf, d->sel_succ_bf, proposals, anchor, d->noise_cap,
+            d->ds2_out_tok);
+        cu(cudaMemcpyAsync(d->h_out, d->ds2_out_tok, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
+        return;
+    }
     const int shortlist_n = (n_vocab + 31) / 32;
     if (d->shortlist)
         draft_shortlist<<<dim3((n_vocab + 127) / 128, proposals), 128, 0, d->s>>>(
