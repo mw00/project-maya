@@ -151,8 +151,8 @@
     // (the lead, in place of helper_select) the helper takes every expert of a trunk layer this GPU's VRAM leaves over
     bool rh_lead_select(std::string& err) {
         if (!rh_map(false, err)) return false;
-        helper_flags = (unsigned*) (rh_base + rh_off_flags);
-        helper_res = (float*) (rh_base + rh_off_res);
+        hlp[0].flags = (unsigned*) (rh_base + rh_off_flags);
+        hlp[0].res = (float*) (rh_base + rh_off_res);
         unsigned long long left = 0;
         if (rh_hot) return rh_lead_hot(err);
         for (Layer& l : L) {
@@ -220,8 +220,8 @@
         return on && rh_hot;
     }
     bool rh_help_in(int slot, unsigned sq, int T, cudaStream_t s, std::string& err) {
-        wait_seq(helper_flags + kRing + slot, sq, s);
-        const float* y = helper_res + (size_t) slot * kWin * (size_t) g.dim;
+        wait_seq(hlp[0].flags + kRing + slot, sq, s);
+        const float* y = hlp[0].res + (size_t) slot * kWin * (size_t) g.dim;
         CK(cudaMemcpy2DAsync(&rh_dresp->part[0][0], kMaxDim * 4, y, (size_t) g.dim * 4, (size_t) g.dim * 4, (size_t) T,
                              cudaMemcpyHostToDevice, s));
         return true;
@@ -231,12 +231,12 @@
     void rh_fallback_flag(const Resp& rp, int slot, unsigned seq, int T) {
         const size_t D = (size_t) g.dim;
         for (int t = 0; t < T; ++t) {
-            float* y = helper_res + ((size_t) slot * kWin + (size_t) t) * D;
+            float* y = hlp[0].res + ((size_t) slot * kWin + (size_t) t) * D;
             if (rp.cpu[t]) std::memcpy(y, rp.part[t], D * 4);
             else std::memset(y, 0, D * 4);
         }
         std::atomic_thread_fence(std::memory_order_release);
-        *(volatile unsigned*) (helper_flags + kRing + slot) = seq;
+        *(volatile unsigned*) (hlp[0].flags + kRing + slot) = seq;
     }
     bool rh_lead_hot(std::string& err) {   // (DS4_RHELPER_HOT) the helper's VRAM experts, left to it in decode
         const double t0 = now_ms();
@@ -574,7 +574,7 @@
                                  "waited %.1f ms for it (%lld chunks its sums came after this GPU's own)\n", rh_pjobs,
                          rh_pall > 0 ? 100.0 * (double) rh_prows / (double) rh_pall : 0.0, rh_pwait_ms, rh_plate);
         rh_hdr->quit = 1;
-        if (helper_flags != nullptr) *(volatile unsigned*) (helper_flags + 2 * kRing) = 1u;
+        if (hlp[0].flags != nullptr) *(volatile unsigned*) (hlp[0].flags + 2 * kRing) = 1u;
     }
 
     // (the helper engine, DS4_RHELPER_TIME) its GPU's time a job: after the take (the request in), after the sums
@@ -584,11 +584,11 @@
     long long rh_timed = 0;
     void rh_mark(int) {
         if (rh_ev.empty() || rh_evn + 1 >= rh_ev.size()) return;   // (full: the rest of this window untimed)
-        cudaEventRecord(rh_ev[rh_evn++], helper_st);
+        cudaEventRecord(rh_ev[rh_evn++], hlp[0].st);
     }
     void rh_ev_sum() {   // (idle: the window's events read)
         if (rh_evn >= 2) {
-            cudaStreamSynchronize(helper_st);
+            cudaStreamSynchronize(hlp[0].st);
             for (size_t i = 0; i + 1 < rh_evn; i += 2) {
                 float ms = 0;
                 if (cudaEventElapsedTime(&ms, rh_ev[i], rh_ev[i + 1]) == cudaSuccess) rh_comp_ms += ms, ++rh_timed;
@@ -605,35 +605,35 @@
         }
         cudaSetDevice(devs[0].id);
         if (!rh_map(true, err)) return false;
-        helper_id = devs[0].id;
-        bool ok = cudaStreamCreateWithFlags(&helper_st, cudaStreamNonBlocking) == cudaSuccess &&
-                  (pk.gguf ? gg::prepare(helper_st) : x3::prepare(helper_st));
+        hlp[0].id = devs[0].id;
+        bool ok = cudaStreamCreateWithFlags(&hlp[0].st, cudaStreamNonBlocking) == cudaSuccess &&
+                  (pk.gguf ? gg::prepare(hlp[0].st) : x3::prepare(hlp[0].st));
         auto dev = [&](size_t b) -> void* {
             void* p = nullptr;
             if (!ok || cudaMalloc(&p, align256(b)) != cudaSuccess) {
                 ok = false;
                 return nullptr;
             }
-            helper_allocs.push_back(p);
+            hlp[0].allocs.push_back(p);
             return p;
         };
         const size_t D = (size_t) g.dim, FF = (size_t) g.ff, WE = (size_t) kWin * kPicks;
-        helper_plan = (unsigned long long*) dev(WE * 8);
-        helper_w = (float*) dev(WE * 4);
-        helper_x = (float*) dev((size_t) kWin * D * 4);
-        helper_h = (float*) dev((size_t) kPicks * FF * 4);
-        ok = ok && cudaMemset(helper_h, 0, (size_t) kPicks * FF * 4) == cudaSuccess;
-        helper_hw = (float*) dev(WE * FF * 4);
-        helper_part = (float*) dev(WE * D * 4);
-        helper_grp_ptr = (unsigned long long*) dev(WE * 8);
-        helper_grp_start = (int*) dev((WE + 1) * 4);
-        helper_grp_ent = (int*) dev(WE * 4);
-        helper_n_groups = (int*) dev(4);
+        hlp[0].plan = (unsigned long long*) dev(WE * 8);
+        hlp[0].w = (float*) dev(WE * 4);
+        hlp[0].x = (float*) dev((size_t) kWin * D * 4);
+        hlp[0].h = (float*) dev((size_t) kPicks * FF * 4);
+        ok = ok && cudaMemset(hlp[0].h, 0, (size_t) kPicks * FF * 4) == cudaSuccess;
+        hlp[0].hw = (float*) dev(WE * FF * 4);
+        hlp[0].part = (float*) dev(WE * D * 4);
+        hlp[0].grp_ptr = (unsigned long long*) dev(WE * 8);
+        hlp[0].grp_start = (int*) dev((WE + 1) * 4);
+        hlp[0].grp_ent = (int*) dev(WE * 4);
+        hlp[0].n_groups = (int*) dev(4);
         // (its kernels go by the block's device addresses)
         reqs = rh_dev<Req>(rh_off_reqs);
-        helper_flags = rh_dev<unsigned>(rh_off_flags);
-        helper_res = rh_dev<float>(rh_off_res);
-        if (!ok || reqs == nullptr || helper_flags == nullptr || helper_res == nullptr) {
+        hlp[0].flags = rh_dev<unsigned>(rh_off_flags);
+        hlp[0].res = rh_dev<float>(rh_off_res);
+        if (!ok || reqs == nullptr || hlp[0].flags == nullptr || hlp[0].res == nullptr) {
             err = "DS4_RHELPER_SERVE: its scratch or the block's device addresses";
             rh_hdr->dead = 1;
             return false;
@@ -730,7 +730,7 @@
                     ++pjobs;
                     continue;
                 }
-                helper_enqueue(L[(size_t) j.il], (int) (j.seq % kRing), j.seq, j.T);
+                helper_enqueue(hlp[0], L[(size_t) j.il], (int) (j.seq % kRing), j.seq, j.T);
                 ++jobs;
             }
             rh_hdr->tail = t;
@@ -747,7 +747,7 @@
             std::fprintf(stderr, "ds4: helper engine: a job %.3f ms on its GPU (the sums), %.3f ms between jobs (the next "
                                  "request's wait and take), %lld timed\n", rh_comp_ms / rh_timed, rh_gap_ms / rh_timed,
                          rh_timed);
-        cudaStreamSynchronize(helper_st);
+        cudaStreamSynchronize(hlp[0].st);
 #ifndef _WIN32
         ::shm_unlink(rh_name.c_str());
 #endif

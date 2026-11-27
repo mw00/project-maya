@@ -1766,8 +1766,8 @@ lead's requests take them and each pick's sum joins the lead's CPU part once, be
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_HELPER` | off | the helper's visible GPU index (outside `--gpus` unless shared mode is enabled); with `MAYA_DS4_HELPER_GB`. Linux only (tested); Windows + AMD untested |
-| `MAYA_DS4_HELPER_GB` | - | its experts' pool, GB |
+| `MAYA_DS4_HELPER` | off | the helper's visible GPU index (or comma-separated indices, up to 8, outside `--gpus` unless shared mode is enabled); with `MAYA_DS4_HELPER_GB`. Multiple helpers split experts across pools by routing share and cannot be combined with `MAYA_DS4_HELPER_SHARED`, `MAYA_DS4_FLOW_HELPER`, `MAYA_DS4_FLOW_HELPER_CHECK`, `MAYA_DS4_HELPER_RECENT*`, or `MAYA_DS4_RHELPER`. Linux only (tested); Windows + AMD untested |
+| `MAYA_DS4_HELPER_GB` | - | its experts' pool, GB (or comma-separated GB list matching `MAYA_DS4_HELPER`) |
 | `MAYA_DS4_WARM_CAP_GB` | - | required with the helper: the load's experts in host RAM, GB, beside the pool (an integrated GPU's pool is host RAM too); ignored under `DS4_REQUIRE_ALL_RAM=1` (every expert in RAM) |
 | `MAYA_DS4_HELPER_CHECK` | off | `1`: at load, two tokens per expert format through the helper against the CPU lane, and its grouped window path against its per-token one, bit for bit |
 
