@@ -501,8 +501,8 @@ other work costs this order more than the old one.
 measured by the setup). Elsewhere `maya-ik2` stops at the start with one line saying why (under
 `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
 tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 7 GiB of VRAM,
-`--gpus 3` or more, AMD on Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU
-modes (`IK2_EP=1` or `IK2_TP=1`, section 6) - untested here.
+`--gpus 3` or more. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU modes (`IK2_EP=1`
+or `IK2_TP=1`, section 6) - untested here.
 
 **Two NVIDIA GPUs** (`--gpus 2`, Linux; the setup offers it where two cards can be used, the larger first): where the
 first card holds every expert it runs alone (the resident path - faster there than the split: 2x V100 32 GB, one card
@@ -525,7 +525,46 @@ second card's experts from RAM, so they run at the offload path's speed. On Wind
 are untested there). CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list (`-DMAYA_IK2_WINDOWS=OFF`:
 not on Windows).
 
-**AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
+**Long prompts on Turing and two cards (opt-in settings; the defaults and their answers are unchanged).** On an RTX 20 card the fused
+prompt attention was off (it wants `cp.async` and more shared memory than a Turing SM has) and the prompt's attention ran through cuBLAS with the
+whole logits matrix in memory, so a 100K prompt was attention-bound (79% of the time). `IK2_FLASH_TURING=1` runs the Ampere flash kernel on sm_75
+with a Turing layout (32-key tiles, K then V in one 19 KB tile, three blocks an SM; `IK2_FLASH_TV=0`: 64-key tiles, one block an SM); FP16 cache
+only (an FP8 cache keeps the old path). Same FP32 accumulation, a different order: most answers are the same tokens, some differ in their wording
+after the first lines. `IK2_PF_GPU1=1` (two-card split): the prompt's experts that GPU 0's tier lacks run on GPU 1, which holds them, instead of
+streaming from RAM (`IK2_PF_PEER=1`: the rows between the cards by peer copies when the pair has NVLink - checked at load both ways - else through
+pinned host memory; `IK2_PF_HOST=1` forces that). `--chunk 8192` reads prompts faster than the default 2048 on these cards (the experts' weights are
+decoded once a chunk). `IK2_DRAFT_GPU=1` runs the drafter on GPU 1 (frees GPU 0's expert tier of the drafter's VRAM). **A peer copy between two
+RTX 2080 Ti on NVLink that is issued on the DESTINATION card's stream arrives partly wrong for sizes from about 256 KB to 3 MB (measured; one on the
+SOURCE card's stream is right at every size, 47 GB/s), so the load-time test above, which issues them on the destination's stream, refuses peer copies there
+and the engine stays on host staging; the settings above issue theirs on the source's stream.** `IK2_PROF=1` prints a request's time by phase.
+Measured on RTX 2080 Ti 22 GB cards (modded, turing-unlock active, 250 W, PCIe 3.0 x16 each; two NVLink links on the pair), Xeon E5-2699 v4,
+52 GB RAM, driver 615.71, CUDA 13.4: unsloth's UD-Q4_K_XL (17.6 GB: the experts of layers 0-19 NVFP4, layers 20-23 and the dense weights Q8_0;
+other quants not measured), 262,144 context, drafting off, greedy, one request, prompts of 3,887 / 33,707 / 115,237 tokens; the "no bridge"
+row is the same cards with the peer copies switched off (`IK2_PF_HOST=1 IK2_HOST_STAGE=1`):
+
+| Cards | Cache | Settings | Prompts 4K / 32K / 100K (tok/s) | Answers short / 32K / 100K (tok/s) |
+| --- | --- | --- | ---: | ---: |
+| 1 | FP16 | none (defaults) | 1407 / 986 / 342 | 62 / 54 / 38 |
+| 1 | FP16 | `IK2_FLASH_TURING=1 --chunk 8192` | 1900 / 2286 / 1994 | 62 / 53 / 39 |
+| 2, `--gpus 2` | FP16 | none (defaults) | 1399 / 980 / 342 | 82 / 69 / 52 |
+| 2, no bridge | FP16 | + `IK2_PF_GPU1=1` | 2206 / 2372 / 2012 | 82 / 70 / 52 |
+| 2, NVLink | FP16 | + `IK2_PF_PEER=1` | 2403 / 2744 / 2289 | 82 / 69 / 52 |
+| 1 | FP8 | none (the setup's default `IK2_KV=fp8`) | 1643 / 1052 / 313 | 90 / 80 / 64 |
+| 2, `--gpus 2` | FP8 | none | 1647 / 1051 / 313 | 82 / 73 / 59 |
+| 2, NVLink | FP8 | `IK2_PF_GPU1=1 IK2_PF_PEER=1 --chunk 8192` | 2018 / 1226 / 343 | 83 / 75 / 61 |
+
+An FP8 cache keeps the old prompt attention (the flash kernel is FP16's), so its 32K and 100K prompts gain little; it keeps one card's
+experts resident (decode 90 against 62). A second card helps decode only where the cache and the experts do not fit one (82 against 62, FP16).
+The same pair of cards without a bridge on another PC (Xeon E5-2680 v4, 125 GB RAM) read 4K / 32K / 100K at 2190 / 2284 / 1901 with the
+no-bridge row's settings and the first kernel layout (`IK2_FLASH_TV=0`). `--drafting auto` on top: code 123 tok/s against 82 (+50%), prose about equal, 32K +8%.
+
+To reproduce the table and to check that the settings do not change what the model says: `python tools/ik2_check.py run one one-tuned two
+two-nobridge two-nvlink` (stdlib only; it writes your config's rows over a copy of it, one engine start a row, and prints each row's speed,
+7 greedy answers' hashes and 3 long-prompt retrievals; `compare A.json B.json` says which answers are the same tokens and where the others
+part, `table` prints the rows as the markdown above, `list` the rows' settings). `tests/ik2_p2p_stream.cu` (one `nvcc` line in its header)
+shows which way a pair of cards' peer copies behave; `tests/ik2_kernels_test.cu` covers the flash kernel's layouts against a double reference.
+
+**AMD (HIP, Linux and Windows).** A HIP build has `maya-ik2` for every arch of its list. The kernels
 written for `mma.sync` / `ldmatrix` / `cp.async` run through AMD versions that keep their fragment layouts; the prompt's
 hot paths have kernels of their own on RDNA 3 / 3.5 / 4's matrix cores (`src/ik2/ik2_rdna.inc`): a layer's routed
 experts in three launches straight from their blocks (`IK2_RDNA_MOE=0`: off) and the fused attention in 24 KB of shared
@@ -539,6 +578,12 @@ system has available, less max(8 GiB, 10%), as the GPU's room, and keeps every e
 time): mode A only by default - the resident path's expert kernels, so the same greedy answers as with every expert in
 VRAM; lane parity (`IK2_LANE=1`) sums in other bits there and is a test option. Run on a Radeon 8065S (Ubuntu, ROCm
 7.1), also set as a 12 and a 16 GB card (`IK2_VRAM_GB`: on an APU the free figures are capped, no ballast).
+Under Windows a user ran it on a Radeon AI PRO R9700 (`gfx1201`, 32 GB, Windows 10, AMD's ROCm 7.14.1 SDK wheels):
+`ik2_kernels_test` passes, and greedy decode after a 4,025-token prompt ran at 86 tok/s, after 65,450 tokens at 70 (FP8
+cache, the CLI). On Windows the engine is built with ROCm's clang as the other HIP engines there;
+`tools\hip\build_ik2_windows.bat` builds it alone (and copies the SDK's HIP runtime next to it - Windows would otherwise
+load the driver's from System32 first). The setup does not offer Inkling 2 on AMD under Windows yet (tools/ik2_fit.py):
+a config of one's own runs it, with `"lib_dirs"` naming the SDK's `bin`.
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`
@@ -583,3 +628,34 @@ start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; refused where the co
 through host memory); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches
 as a graph (2-3 ms a step now).
+
+## 9. A checkpoint of the same family as an inkling2 GGUF (a converter, not a model we ship)
+
+`tools/ik2/checkpoint_gguf.py` converts a checkpoint in the original vendor format (the
+`Inkling2LoopForConditionalGeneration` safetensors, modelopt NVFP4 / MXFP8 experts) - Inkling-2-Mini itself, or a
+modified checkpoint of the same family - into the looped `inkling2` GGUF `maya-ik2` reads: the layout unsloth's
+`Inkling-2-Mini-GGUF` UD-Q4_K_XL ships. Maya's setup and model list do not offer such conversions; answers from a
+modified checkpoint are its makers', not the model's.
+
+    python tools/ik2/checkpoint_gguf.py --src <checkpoint folder> --out <out.gguf> \
+        --vocab-from <unsloth Inkling-2-Mini-UD-Q4_K_XL.gguf> [--name NAME]
+
+The checkpoint's per-physical-layer tensors map straight onto the GGUF's (24 layers, the loop's
+48 visits scheduled by `inkling2.num_loops` / `loop.core_start` / `loop.core_end`): the attention and
+router matrices requantized Q8_0, the sink projection and the full layers' dynamic tap projections
+BF16, the norms, clips, residual queries, short convs, loop gates and router F32, the experts of
+layers 0-19 NVFP4 (the original bits; the checkpoint's interleaved gate/up rows de-interleaved into
+master's gate-rows-first under one per-expert `.scale` = amax / outer-scale-denominator), the experts
+of layers 20-23 MXFP8 (exact in BF16) requantized Q8_0, unsloth's choice. The vision tower and the
+drafter are not written - unsloth's `mmproj` covers pictures, the engine takes `mtp.safetensors` by
+`--draft`. `--name` sets the GGUF's `general.name` (default: the checkpoint folder's name).
+
+`tools/ik2/checkpoint_gguf_validate.py` checks a conversion against the checkpoint and unsloth's file:
+the tensor plan (names, dims, types - 734/734 for Inkling-2-Mini), the NVFP4 experts bit-exact against
+unsloth's (which keeps the checkpoint's original bits), every F32 tensor bit-exact against the
+checkpoint, every requantized tensor within the Q8_0 bound (amax / 254 per block; a few values on
+rounding boundaries - torch rounds half to even, ggml's `roundf` half away - are harmless).
+
+Needs a python with torch, numpy and safetensors (the ref's venv) and the project's gguf-py on
+`PYTHONPATH` (`build/_deps/strata_llamacpp-src/gguf-py`); the tokenizer export is `tools/strata_tokenizer.py`
+with `tools/ik2/chat_template.jinja` (see section 8's run instructions).

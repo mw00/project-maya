@@ -2769,7 +2769,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_VISION_LEND` | on | `0`: a picture's room is not lent by the prompt buffers - it is kept free on the main GPU between pictures and allocated for each (the earlier behaviour; for comparisons) |
 | `HY4_KV_MORE` | off | `--kv-streaming auto`: `1` streams also where the context fits but the freed VRAM gives every layer more routed experts (opt-in: a long prompt read ~1% slower on a V100) |
 | `HY4_KV_SPILL_RES`, `HY4_KV_SPILL_SLOTS`, `HY4_KV_SPILL_MIN_MBS` | by the RAM; 32768; 10 | KV spill: the newest positions whose rows stay in RAM; the rows a layer's read may bring from the drive at once; the slowest drive (MB/s in 4 KB reads) auto takes |
-| `HY4_PSTREAM` | off | a PC whose GPU holds only some of a layer's routed experts: the others (the CPU lane's) copied into pinned RAM at the start (the start's log says how much and how long); a prompt chunk of `HY4_PSTREAM_MIN_T` tokens (1024) or more streams them to the GPU in passes through two staging buffers, each pass's copy beside the pass before it, and the CPU lane reads the copies instead of the model's file. One GPU, no tensor parallel, not with `HY4_FETCH`; off by itself where the RAM is short (`HY4_PSTREAM_HEAD_GB`: more RAM kept free, 10% of the total or 4 GB at least). The prompt chunks' answers may differ from the other route's in the last places, as between the two routes of `HY4_ROUTE`. `HY4_PSTREAM_VERIFY=1`: the copies checked against the file at the engine's end |
+| `HY4_PSTREAM` | on | a PC whose GPU holds only some of a layer's routed experts: the others (the CPU lane's) copied into pinned RAM at the start (the start's log says how much and how long); a prompt chunk of `HY4_PSTREAM_MIN_T` tokens (1024) or more streams them to the GPU in passes through two staging buffers, each pass's copy beside the pass before it, and the CPU lane reads the copies instead of the model's file. One GPU, no tensor parallel, not with `HY4_FETCH`; off by itself where the RAM is short (`HY4_PSTREAM_HEAD_GB`: more RAM kept free, 10% of the total or 4 GB at least). The prompt chunks' answers may differ from the other route's in the last places, as between the two routes of `HY4_ROUTE`. `HY4_PSTREAM_VERIFY=1`: the copies checked against the file at the engine's end. `0`: off |
 | `HY4_ROUTE` | by the rates measured once on this PC | a PC whose routed experts are not all in VRAM: where a prompt chunk's other experts are computed - streamed to the GPU or on the CPU lane. The two routes sum a token's experts in another order, so the engine does not pick by the moment's timings: it picks per layer and chunk by two rates this PC measured once (the lane's time an expert-token, each GPU's streaming time a MB) - the same prompt takes the same routes and gives the same tokens from start to start. Not yet measured: the first start's prompt chunks take the two routes in turns, timed once the lane's experts are warm, until two windows agree (its log says `prompt route: ...`); the rates are remembered per PC, GPUs and driver, model, layout (each layer's VRAM experts, the chunk) and lane kernels in `data/hy4-prompt-route.txt` (`HY4_ROUTE_FILE` names another file; without one: beside `HY4_Q4X_FILE`, else beside `--profile`); a new layout or new lane kernels are measured again, and `--speed-calibration` measures again (`HY4_ROUTE_MEASURE=1`). `stream` or `lane` pins the route (runs and builds compare token for token) |
 | `HY4_MEASURE`, `HY4_MEASURE_IDS`, `HY4_MEASURE_S` | on, with the server's text, 300 | the first start on a PC: what `HY4_Q4X` and `HY4_ROUTE` would measure while the first answers read their prompts (2.5-3x slower then) is measured before the engine says READY - on `HY4_MEASURE_IDS`, a file of token ids (the server writes this install's `docs/SETTINGS.md` and `README.md` in the model's tokens into `data/hy4-measure-ids-<tokenizer>.txt` once), with the same timing code: a prompt chunk and 64 tokens give the routing counts the 4-bit copies are made by, then the text goes on a token at a time until the copies' turns decide, then it is read in chunks of the prompt's size until the route's windows agree. The log says `measuring this PC once ...` and `measured this PC once in N s ...`; both results are remembered as before, so the starts after skip it, and the first answer then reads its prompt by the rates the later starts use (the same tokens as theirs). Only where the results are remembered (a data folder named); `HY4_MEASURE=0`, no file, or not decided within `HY4_MEASURE_S` seconds: the answers measure the rest, as before |
 | `HY4_LAST_ALONE` | on | `--serve`: a prompt's last token is read alone on the token path after the rest, as a repeat of the request (its prompt in the caches) reads it - the first answer and every repeat begin from the same row (one extra step a new prompt), on every layout. `0`: off |
@@ -2786,7 +2786,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_EG_RANDOM` | on (Linux) | the Engram table's mapping is marked random access, so a lookup's page fault reads only its own page instead of the kernel's read-around (which pushed the CPU lane's experts out of RAM). The same rows, the same tokens. `0`: the kernel's default |
 | `HY4_EG_WILLNEED` | on (Linux) | the Engram rows a token window or a prompt chunk will read have their pages asked for first, all at once, so a cold table is read side by side instead of one page after another. The same rows, the same tokens. `0`: as before |
 | `HY4_ATTN_TC`, `HY4_ATTN_FLASH`, `HY4_SOFTMAX_WARP`, `HY4_ATTN_PAD8` | off | NVIDIA Volta and newer: the attention on the tensor cores - a token window's (`HY4_ATTN_TC`), a prompt's in one pass (`HY4_ATTN_FLASH`), a warp a row softmax (`HY4_SOFTMAX_WARP`) and the keys padded to a multiple of 8 (`HY4_ATTN_PAD8`). Faster prompts and decode on a V100; the answers can differ in the last bits. `1`: on |
-| `HY4_STREAM_PIPE` | off | prompts with experts streamed from RAM: the streamed experts go in two halves in flight, so the copy from RAM, the bus and the GPU's sets overlap. The answers can differ in the last bits. `1`: on |
+| `HY4_STREAM_PIPE` | on | prompts with experts streamed from the model's file (where `HY4_PSTREAM` is not taken: two GPUs, RAM short, `HY4_FETCH`): the streamed experts go in two halves in flight, so the copy from RAM, the bus and the GPU's sets overlap. The answers can differ in the last bits from one pass at a time. `0`: off, one pass at a time |
 | `HY4_FAT_ROWS` | 0 (off) | prompts: an expert routed to at least this many rows of a chunk runs as cuBLAS FP16 GEMMs (e.g. `256`). The answers can differ in the last bits. `HY4_ATTN_SUB=N` (off by default) reads a prompt's attention in sub-chunks of N rows, with the layer's dense matrices decoded to F16 once for its sub-chunks (`HY4_WCACHE=0`: decoded a GEMM at a time) |
 | `HY4_HOT`, `HY4_HOT_SWAPS`, `HY4_HOT_FILE`, `HY4_HOT_LEARN` | on (tensor parallel: off) | on a PC whose GPU holds only some of a layer's experts, the experts in VRAM follow the ones the answers use - between requests the cold ones trade places with hotter CPU-lane ones (`_SWAPS`: at most that many a time; all by default), an answer runs on one placement, so drafting on or off gives the same answers - and a start places each layer's most-used first (faster decoding where it acts; the wording can differ from `HY4_HOT=0`, measured no further from the full model). The start's scores are kept in `_FILE` (the server: `data/hy4-expert-hot-<model>.bin`; the engine alone: `<pack>/expert-hot.bin`): the first start learns them from its answers and writes them, the starts after read them as they are - so every start begins the same and the same requests give the same tokens; `--speed-calibration` (or `_LEARN=1`) learns them again. Where no layer has experts both in VRAM and on the CPU lane it does nothing. `HY4_HOT=0` turns it off, `HY4_HOT=1` asks for it with tensor parallel (its start placement only); `HY4_HOT_LOG=1` logs the swaps |
 | `HY4_LT` | on (AMD) | AMD: the prompt path's FP16 matrix products run through hipBLASLt with the fastest kernel measured for each shape on the PC; `0`: hipBLAS as before (the sums are in another order, so wording can differ slightly) |
@@ -2832,6 +2832,54 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_PROF` | off | debugging: each forward's GPU time by part |
 | `HY4_DUMP` | off | debugging: each layer's sums |
 | `HY4_INJECT`, `HY4_INJECT_FROM`, `HY4_SAVE` | off | debugging: a layer's inputs taken from a reference dump to compare one layer at a time |
+| `HY4_VISION_FP16` | on on HIP `gfx906`/`gfx10`, else off | `1`: run `maya-hy4` vision tower GEMMs in IEEE FP16 (`CUDA_R_16F` with NaN-preserving `[-65504, 65504]` clamp and GPU-side BF16->FP16 stage conversion) where hardware BF16 BLAS is unavailable; `0`: keep BF16 (`CUDA_R_16BF`) |
+
+### Hy4-Flash: conversations kept (an agent's parent and workers on one model)
+
+Hy4-Flash's engine holds one conversation, like DeepSeek's before its [conversations kept](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model):
+a prompt that continues it reads only its new tokens, any other starts over - and at Hy4-Flash's prompt speed (~400
+tok/s on two RTX 5090s with most experts on the CPU lane) an agent's worker of 16K tokens is ~40 s read again, a 100K
+one ~4 min, on every switch between the parent and its workers. With `MAYA_HY4_SLOT_KEEP=1` the conversation in the
+model is set aside when another one takes its place, and a prompt that continues a kept one takes it back: a
+12K-token conversation back in 0.03 s from RAM (its next turn in ~1.2 s instead of ~12 s), from the folder after a
+restart in a few seconds. The design and the settings are DeepSeek's (#356), under `MAYA_HY4_`.
+
+What a conversation keeps: every indexed layer's and the MTP block's cache row of each position (the latent row and
+the indexer's pooled keys: ~16 KB a position with F16 rows, ~9 KB with `--kv q8`), the last `MAYA_HY4_SLOT_RING`
+positions' rows of every ring - the sliding-window layers' latent rows, the indexer's value and gate, the trunk's
+final states the MTP block reads (~60 KB a position) - and its tokens. The Engram keeps nothing: its rows depend on
+the tokens alone. A 12K-token conversation is ~0.45 GB, a 100K-token one ~1.9 GB. A kept conversation is taken back
+whole, or at any position its rings reach back to (`MAYA_HY4_SLOT_RING` less the 512-position window: a history whose
+last answer was rendered again). A picture is kept as its place and fingerprint, and the conversation comes back
+only for a prompt with the same pictures at the same places. The state is saved by position, so a start with another
+ring size (another `--chunk` or context) reads it; under tensor parallel one copy is saved and every member's is
+written back.
+
+Taken back, a conversation gives the answers it gives continued in place, token for token - `tools/hy4/slot_keep_test.py`
+checks it (greedy, with `HY4_HOT=0` and `HY4_ROUTE=lane`): A, B, A's next turn and B's cut-back turn each against the
+same turns with no switch; a turn sent again after a switch, its conversation back from a slot, against its first
+answer in the same process (the layer split and tensor parallel, `--tp 2`: a tensor-parallel start's plan can move the
+last bits between processes, so there the check within one process is the one claimed); a restart from the folder,
+and the folder's cap. With KV streaming and KV spill too (`--kv-streaming on --kv-resident 4096`, and
+`--kv-spill on` with `HY4_KV_SPILL_RES=65536` at a 128K context and an 80K-token conversation): a slot's rows are by
+position, so a save reads them from pinned memory and the drive and a load writes them back to both - the VRAM ring
+gets the newest, the RAM tier the newest it holds, the drive the rest - and a slot saved under one layout loads under
+another. An 80K-token conversation with spill: 1.58 GB, set aside in 1.1-1.8 s, back from RAM in 0.16 s. With
+streaming the experts a start leaves in VRAM can differ by a few between starts (the VRAM it finds free), which moves
+the last bits of every answer, slots on or off: the test says so and claims the check within one process then.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_HY4_SLOT_KEEP` | off | `1`: keep the conversation when another one takes the model, and across runs in the folder |
+| `MAYA_HY4_SLOT_CAP` | 4 | the conversations kept in RAM; past it (or past `MAYA_HY4_SLOT_RAM_GB`) the least recently used is written to the folder; `0` = none kept |
+| `MAYA_HY4_SLOT_RAM_GB` | 0 | their RAM at most (GB; one is always kept, even alone over it); `0` = the count alone (as DeepSeek). A Hy4-Flash conversation is large and the RAM also holds the CPU lane's experts, so a PC short of RAM can set a cap |
+| `MAYA_HY4_SLOT_GB` | 16 | the folder's conversations' total size (GB): the least recently used removed past it, never the one just written |
+| `MAYA_HY4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its rows) and a `.meta` (the identity, its tokens, its rings' rows, its pictures), each written under a temporary name first; less than 8 GB free beside one: not written |
+| `MAYA_HY4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens) |
+| `MAYA_HY4_SLOT_RING` | 4096 | the ring rows a conversation keeps (positions before its end): how far back before its end it can be taken (less 512); each 4096 costs ~0.25 GB a conversation |
+| `MAYA_HY4_SLOT_DAYS` | 7 | a slot unused for this many days is removed at start, and so is any file not this model's or this engine version's, or incomplete; QUIT writes the conversations in RAM to the folder (the server gives it `MAYA_ENGINE_QUIT_S`) |
+
+The log says what happened (`hy4 slots: saved / took back / wrote ...`, the server's `[maya] sessions: ...`).
 
 ## Inkling-2-Small
 
@@ -2853,7 +2901,7 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | --- | --- | --- |
 | `IK2_KV` | `f16` | `fp8`: the KV cache in FP8 E4M3, half the bytes (the full layers' 32 KB a token -> 16 KB); against the reference it changed 5 of 48 top-1 tokens where FP16 changed none (docs/INKLING2.md 6.1) |
 | `IK2_WARM` | off | a profile of how often each expert is picked (written by `IK2_POP_OUT=FILE` over some prompts): the cache filled with the most picked at load, and the prompts' prefetch seeded with the counts. The first requests then do not start from an empty cache (a 600-token first request 7.0 -> 4.2 s on an H200) |
-| `IK2_UNSUPPORTED` | off | `1`: `maya-ik2` runs outside the hardware it is supported on where it can run at all - the older two-GPU modes, AMD on Windows (untested). Off, the engine stops at the start with one line saying why (docs/INKLING2.md 8). A GPU older than sm_80 never runs it |
+| `IK2_UNSUPPORTED` | off | `1`: `maya-ik2` runs outside the hardware it is supported on where it can run at all - the older two-GPU modes (untested). Off, the engine stops at the start with one line saying why (docs/INKLING2.md 8). A GPU older than sm_80 never runs it |
 | `IK2_EP` | off | `1` with `--gpus 2` (and `IK2_UNSUPPORTED=1`): expert parallel - each layer's experts dealt to both GPUs by how often they are picked, each GPU its own cache and link; attention and the KV cache on GPU 0. Decode 22 -> 42 tok/s on two RTX PRO 6000s. Off, `--gpus 2` is the two-GPU split (docs/INKLING2.md 8) |
 | `IK2_EP_SPLIT` | `0.55` | GPU 1's share of the picks under `IK2_EP` (GPU 0 also holds the dense weights and the cache of the KV) |
 | `IK2_TP` | off | `1` with `--gpus 2` (and `IK2_UNSUPPORTED=1`): the experts tensor parallel instead (each GPU half of every expert): decode 42.8 vs EP's 41.3 tok/s, prompts slower |
@@ -2911,6 +2959,7 @@ every level ([the model's page](GLM53.md#its-defaults)). Its own:
 | Setting | Default | What it does |
 |---|---|---|
 | `MAYA_GLM_KV_INT8` | on (1) | its latent cache in INT8: 64,352 bytes a token; `0` (or `--kv fp16`): FP16, 102,272 bytes a token |
+| `--kv-streaming on`, `--kv-resident N` | off (the setup) | opt-in on GLM-5.3: the latent and k_pe caches (53,088 bytes a token) in pinned RAM with N positions of each layer in VRAM (20,480 at least); the indexer's keys (11,264 bytes a token) stay in VRAM. `on` without a window streams only when the whole cache does not fit beside the expert pools. The Models page takes both, and a setup again keeps them ([the model's page](GLM53.md#context-and-memory)) |
 | `MAYA_GLM_IDX_FP16` | off | `1`: the indexer's keys in FP16 instead of F32 (58,720 bytes a token with the INT8 latent); the indexer picks from FP16 scores, so the answers can differ |
 | `MAYA_GLM_DSA_GRAPHS` | off | `1`: a token's attention steps run as GPU graphs (fewer launches a token). A request can turn them off for itself (`"graphs": false`, below) |
 | `MAYA_GLM_LANE_ROW4` | on | `0`: off. On, the CPU lane computes four rows of an expert's matrix at once (x86-64 CPUs with AVX2, FMA and F16C; other CPUs ignore it), with the same results bit for bit; a request can switch it (`lane_row4`) |

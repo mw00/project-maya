@@ -3759,8 +3759,9 @@ int main() {
     test_fp8_kv();
     test_round6();
     if (!k::attn_flash_available()) std::printf("skip attn_flash: not built for this GPU\n");
-    else if (k::arch_class() >= 80) test_attn_flash();   // (last: its random data leaves the others' as they were)
-    else std::printf("--   attn_flash: Ampere's kernel (sm_%d class here)\n", k::arch_class());
+    else if (k::arch_class() >= 75) test_attn_flash();   // (last: its random data leaves the others' as they were; Turing: its one-tile
+                                                          //  layouts - IK2_FLASH_TV=0 the 64-key one, run the test again with it)
+    else std::printf("--   attn_flash: Ampere's and Turing's kernel (sm_%d class here)\n", k::arch_class());
     test_attn_decode_mma();
     test_cand_topk();
     test_token_path();

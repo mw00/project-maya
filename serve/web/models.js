@@ -345,11 +345,12 @@ function withAblate(tabs, m, d) {
 function fieldsOf(m, d) {
   const s = m.settings, ch = (...ks) => ks.some((k) => !same(d[k], s[k])), glm = m.family === "glm";
   const per = Math.max(1, Number(d.parallel) || 1);   // (several answers at once: a cache each)
-  // (a model the server sends its own cache size for - GLM-5.3 (744B): m.kv_bytes; m.choices.kv_streaming false: its
-  //  engine keeps the whole cache in VRAM)
+  // (a model the server sends its own cache size for - GLM-5.3 (744B): m.kv_bytes, of which m.kv_index_bytes - the
+  //  indexer's keys - stay in VRAM under KV streaming; m.choices.kv_streaming false: the whole cache in VRAM)
   const kvb = m.kv_bytes || GLM_KV_BYTES, streams = d.kv_streaming && m.choices.kv_streaming !== false;
+  const kvk = m.kv_index_bytes || 0;
   const context = contextRow(m, d, ch, !glm ? {} : streams
-    ? {win: Number(d.kv_resident) || 32768, whole: true, ram: kvb * per} : {vram: kvb * per},
+    ? {win: Number(d.kv_resident) || 32768, whole: true, ram: (kvb - kvk) * per, keys: kvk * per} : {vram: kvb * per},
     ["kv_streaming", "kv_resident", "parallel"]);
   const images = html`<${Row} label="Images" flag=${glm ? "vision" : "--vision"} changed=${ch("images")}
     hint=${m.choices.images ? "Reads images in chats. Off leaves its memory to the experts."
@@ -400,9 +401,10 @@ function fieldsOf(m, d) {
         html`<${Row} label="Prompt chunk" flag="--prefill" changed=${ch("prefill")}
           hint="Auto takes the largest chunk the expert pool can lend, up to 8,192 tokens."
           below=${pf.below} warn=${whole(d.prefill) ? null : "A whole number, or Auto."}>${pf.ctl}<//>`,
-        m.choices.kv_streaming === false ? null :      // (GLM-5.3 (744B): not served by its engine yet)
+        m.choices.kv_streaming === false ? null :      // (GLM-5.3 (744B) with its gate closed: glm_dsa_product)
         html`<${Row} label="KV streaming" flag="--kv-streaming" changed=${ch("kv_streaming", "kv_resident")}
-          hint="The attention cache lives in RAM, 12 KB a token, with a window of it in VRAM. Off: all of it in VRAM."
+          hint=${kvk ? `The attention cache's latent rows live in RAM, ${fmt((kvb - kvk) / 1024)} KB a token, with a window of them in VRAM; the indexer's keys stay in VRAM. Without a window the engine streams only when the whole cache does not fit. Off: all of it in VRAM.`
+            : "The attention cache lives in RAM, 12 KB a token, with a window of it in VRAM. Off: all of it in VRAM."}
           below=${d.kv_streaming ? html`<div class="mdl-sub"><span>Positions each layer keeps in VRAM (--kv-resident)</span>
             <${Num} label="Positions each layer keeps in VRAM" value=${d.kv_resident} ph="32768" unit="tokens" on=${(v) => setDraft({kv_resident: v})}/></div>` : null}
           warn=${whole(d.kv_resident) ? null : "A whole number, or empty for 32,768."}>

@@ -89,7 +89,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -732,7 +735,409 @@ struct Extra {
     }
 };
 
-int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need) {
+// a picture in the caches: its first image token's position and its pixels' hash
+struct Held {
+    long long start;
+    uint64_t hash;
+};
+
+// Conversations kept aside (DeepSeek's #356, ported - maya-ds4's slot keep): when a request does not continue the
+// conversation in the caches, that one is set aside (Model::slot_save) and the kept one this prompt continues the
+// furthest is taken back (Model::slot_load), so agents taking turns on one model - an agent's parent and its workers,
+// chats - read only their new tokens.  The newest MAYA_HY4_SLOT_CAP (4) in RAM (at most MAYA_HY4_SLOT_RAM_GB of them,
+// 0: no byte cap, the count alone), the older ones in MAYA_HY4_SLOT_DIR (<pack>/slots: a .bin and a .meta a conversation, kept
+// across runs; MAYA_HY4_SLOT_GB 16 at most, unused MAYA_HY4_SLOT_DAYS 7 removed at a start), conversations of
+// MAYA_HY4_SLOT_MIN (1024) tokens on.  A slot keeps its rings' rows of its last MAYA_HY4_SLOT_RING (4096) positions:
+// it is taken back whole, or at a position that far back less the window (a history whose last answer was
+// rendered again).  MAYA_HY4_SLOT_KEEP=1 turns it on.
+struct Slots {
+    struct Slot {
+        std::vector<int> tokens;
+        std::string path;                            // (empty: in RAM)
+        uint64_t bytes = 0, used = 0;                // (its size; the clock it was last used at)
+        int64_t keep = 0;                            // (its rings' rows: positions [n - keep, n))
+        std::shared_ptr<std::vector<uint8_t>> data;  // (RAM; null: the file)
+        std::vector<Held> pics;
+    };
+    static constexpr uint64_t kMeta = 0x3154454d34594855ull;   // "UHY4MET1"
+    hy4::Model& m;
+    bool on = false;
+    int cap = 4;
+    size_t min_tokens = 1024;
+    int64_t ring_keep = 4096;
+    double ram_gb = 8, dir_gb = 64, days = 7;
+    std::string dir;
+    std::vector<Slot> list;
+    uint64_t clock = 0, seq = 0;
+    std::string id;   // (the model's slot identity, once)
+
+    explicit Slots(hy4::Model& model) : m(model) {}
+
+    static double env_num(const char* name, double dflt) {
+        const char* e = std::getenv(name);
+        if (!e || !*e) return dflt;
+        char* end = nullptr;
+        const double v = std::strtod(e, &end);
+        if (end == e || !std::isfinite(v) || v < 0) {
+            std::fprintf(stderr, "hy4 slots: %s=%s is not a number - %g taken\n", name, e, dflt);
+            return dflt;
+        }
+        return v;
+    }
+    void note(const std::string& s) const {
+        std::fprintf(stderr, "hy4 slots: %s\n", s.c_str());
+        std::printf("NOTE sessions: %s\n", s.c_str());
+        std::fflush(stdout);
+    }
+    size_t ram_n() const {
+        size_t n = 0;
+        for (const Slot& s : list) n += s.path.empty();
+        return n;
+    }
+    uint64_t ram_bytes() const {
+        uint64_t b = 0;
+        for (const Slot& s : list) b += s.path.empty() ? s.bytes : 0;
+        return b;
+    }
+    uint64_t dir_bytes() const {
+        uint64_t b = 0;
+        for (const Slot& s : list) b += s.path.empty() ? 0 : s.bytes;
+        return b;
+    }
+    void drop(size_t i) {
+        if (!list[i].path.empty()) {
+            std::remove(list[i].path.c_str());
+            std::remove((list[i].path.substr(0, list[i].path.size() - 4) + ".meta").c_str());
+        }
+        list.erase(list.begin() + (long) i);
+    }
+
+    // the .meta beside a .bin: what choosing a slot needs (its tokens, its rings' rows, its pictures) without its rows
+    bool meta_write(const std::string& path, const Slot& s) const {
+        std::vector<uint8_t> b;
+        auto put = [&](uint64_t v) { b.insert(b.end(), (uint8_t*) &v, (uint8_t*) &v + 8); };
+        put(kMeta);
+        put(id.size());
+        b.insert(b.end(), id.begin(), id.end());
+        put(s.bytes);
+        put(s.tokens.size());
+        b.insert(b.end(), (const uint8_t*) s.tokens.data(), (const uint8_t*) (s.tokens.data() + s.tokens.size()));
+        put((uint64_t) s.keep);
+        put(s.pics.size());
+        for (const Held& h : s.pics) {
+            put((uint64_t) h.start);
+            put(h.hash);
+        }
+        put(kMeta);
+        const std::string tmp = path + ".tmp";
+        std::ofstream f(tmp, std::ios::binary);
+        f.write((const char*) b.data(), (std::streamsize) b.size());
+        f.close();
+        if (!f || std::rename(tmp.c_str(), path.c_str()) != 0) {
+            std::remove(tmp.c_str());
+            return false;
+        }
+        return true;
+    }
+    bool meta_read(const std::string& path, Slot& s) const {
+        std::ifstream f(path, std::ios::binary);
+        std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        size_t off = 0;
+        auto get = [&](uint64_t& v) {
+            if (off + 8 > b.size()) return false;
+            std::memcpy(&v, b.data() + off, 8);
+            off += 8;
+            return true;
+        };
+        uint64_t magic = 0, idn = 0, nt = 0, kp = 0, np = 0;
+        if (!get(magic) || magic != kMeta || !get(idn) || off + idn > b.size() ||
+            std::string((const char*) b.data() + off, (size_t) idn) != id)
+            return false;
+        off += (size_t) idn;
+        if (!get(s.bytes) || !get(nt) || nt == 0 || (int64_t) nt > m.max_ctx() || off + 4 * nt > b.size()) return false;
+        s.tokens.assign((size_t) nt, 0);
+        std::memcpy(s.tokens.data(), b.data() + off, 4 * (size_t) nt);
+        off += 4 * (size_t) nt;
+        if (!get(kp) || kp == 0 || kp > nt || !get(np) || np > 4096) return false;
+        s.keep = (int64_t) kp;
+        s.pics.clear();
+        for (uint64_t i = 0; i < np; ++i) {
+            uint64_t st = 0, h = 0;
+            if (!get(st) || !get(h) || st >= nt || (!s.pics.empty() && (long long) st <= s.pics.back().start)) return false;
+            s.pics.push_back({(long long) st, h});
+        }
+        return get(magic) && magic == kMeta && off == b.size();
+    }
+
+    // a RAM slot to the folder (.bin, then .meta, each through a .tmp): it is a file slot after
+    bool write_file(Slot& s) {
+        std::error_code ec;
+        const auto sp = std::filesystem::space(dir, ec);
+        if (ec || sp.available < s.bytes + (8ull << 30)) {
+            note("not written to " + dir + ": less than 8 GB would be free beside it");
+            return false;
+        }
+        const long long ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string base = dir + "/slot-" + std::to_string(ms) + "-" + std::to_string(++seq);
+        const std::string bin = base + ".bin", tmp = bin + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            f.write((const char*) s.data->data(), (std::streamsize) s.data->size());
+            f.close();
+            if (!f || std::rename(tmp.c_str(), bin.c_str()) != 0) {
+                std::remove(tmp.c_str());
+                note("a conversation could not be written to " + dir);
+                return false;
+            }
+        }
+        if (!meta_write(base + ".meta", s)) {
+            std::remove(bin.c_str());
+            note("a conversation's .meta could not be written to " + dir);
+            return false;
+        }
+        s.path = bin;
+        s.data.reset();
+        trim(bin);
+        return true;
+    }
+    // the folder within MAYA_HY4_SLOT_GB: its least recently used file slots dropped (never the one just written)
+    void trim(const std::string& keep_path) {
+        const uint64_t cap = (uint64_t) (dir_gb * 1e9);
+        while (dir_bytes() > cap) {
+            size_t v = list.size();
+            for (size_t i = 0; i < list.size(); ++i)
+                if (!list[i].path.empty() && list[i].path != keep_path && (v == list.size() || list[i].used < list[v].used))
+                    v = i;
+            if (v == list.size()) break;
+            drop(v);
+        }
+    }
+
+    // at the start: MAYA_HY4_SLOT_*, the folder's slots from earlier runs (what does not check out removed)
+    void start(const std::string& pack) {
+        on = env_num("MAYA_HY4_SLOT_KEEP", 0) != 0;
+        cap = (int) env_num("MAYA_HY4_SLOT_CAP", 4);
+        if (!on || cap <= 0) {
+            on = false;
+            return;
+        }
+        min_tokens = (size_t) env_num("MAYA_HY4_SLOT_MIN", 1024);
+        ring_keep = (int64_t) env_num("MAYA_HY4_SLOT_RING", 4096);
+        ram_gb = env_num("MAYA_HY4_SLOT_RAM_GB", 0);
+        dir_gb = env_num("MAYA_HY4_SLOT_GB", 16);
+        days = env_num("MAYA_HY4_SLOT_DAYS", 7);
+        const char* d = std::getenv("MAYA_HY4_SLOT_DIR");
+        dir = d && *d ? d : pack + "/slots";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (!std::filesystem::is_directory(dir, ec)) {
+            on = false;
+            note("the folder " + dir + " cannot be made: conversations are not kept");
+            return;
+        }
+        id = m.slot_identity();
+        struct Found {
+            std::filesystem::file_time_type t;
+            Slot s;
+        };
+        std::vector<Found> found;
+        int removed = 0;
+        const auto now_t = std::filesystem::file_time_type::clock::now();
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            const std::string name = e.path().filename().string(), p = e.path().string();
+            if (name.rfind("slot-", 0) != 0) continue;
+            const bool is_meta = name.size() > 5 && name.compare(name.size() - 5, 5, ".meta") == 0;
+            const bool is_bin = name.size() > 4 && name.compare(name.size() - 4, 4, ".bin") == 0;
+            if (!is_meta && !is_bin) {   // (a write cut off: its .tmp)
+                std::filesystem::remove(e.path(), ec);
+                ++removed;
+                continue;
+            }
+            if (!is_meta) {
+                if (!std::filesystem::exists(p.substr(0, p.size() - 4) + ".meta", ec)) {
+                    std::filesystem::remove(e.path(), ec);
+                    ++removed;
+                }
+                continue;
+            }
+            Slot s;
+            const std::string bin = p.substr(0, p.size() - 5) + ".bin";
+            const auto t = std::filesystem::last_write_time(e.path(), ec);
+            const double age = std::chrono::duration<double>(now_t - t).count() / 86400.0;
+            const bool good = meta_read(p, s) && std::filesystem::exists(bin, ec) &&
+                              std::filesystem::file_size(bin, ec) == s.bytes && s.bytes > 0 && age <= days;
+            if (!good) {
+                std::filesystem::remove(e.path(), ec);
+                std::filesystem::remove(bin, ec);
+                ++removed;
+                continue;
+            }
+            s.path = bin;
+            found.push_back({t, std::move(s)});
+        }
+        std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t < b.t; });
+        for (Found& f : found) {
+            f.s.used = ++clock;
+            list.push_back(std::move(f.s));
+        }
+        char b[320], rb[48];
+        if (ram_gb > 0) std::snprintf(rb, sizeof rb, "%.1f GB at most", ram_gb);
+        else std::snprintf(rb, sizeof rb, "no byte cap");
+        std::snprintf(b, sizeof b, "on - %d in RAM (%s), the rest in %s (%.0f GB at most), %lld ring rows a "
+                      "conversation; %zu kept from earlier runs%s", cap, rb, dir.c_str(), dir_gb,
+                      (long long) ring_keep, list.size(), removed ? (", " + std::to_string(removed) + " removed").c_str() : "");
+        note(b);
+        trim("");
+#if defined(SIGTERM)
+        std::signal(SIGTERM, SIG_IGN);   // (a write is never cut off: the server ends the engine with QUIT)
+#endif
+#if defined(SIGINT)
+        std::signal(SIGINT, SIG_IGN);
+#endif
+    }
+
+    // the conversation in the caches set aside (it is a new state: changed since it was taken or saved)
+    void put(const std::vector<int>& state, const std::vector<Held>& held, bool& dirty, const char* why = "") {
+        if (!on || !dirty || state.size() < min_tokens) return;
+        const double t0 = now();
+        auto buf = std::make_shared<std::vector<uint8_t>>();
+        std::string e;
+        const uint64_t b = m.slot_save(state, ring_keep, *buf, e);
+        if (!b) {
+            note("not saved (" + e + ")");
+            return;
+        }
+        uint64_t idn = 0, kp = 0;
+        std::memcpy(&idn, buf->data() + 8, 8);
+        std::memcpy(&kp, buf->data() + 16 + idn + 8, 8);
+        for (size_t i = list.size(); i-- > 0;)   // (the older states this one continues: superseded)
+            if (list[i].tokens.size() <= state.size() &&
+                std::equal(list[i].tokens.begin(), list[i].tokens.end(), state.begin()))
+                drop(i);
+        Slot s;
+        s.tokens = state;
+        s.bytes = b;
+        s.used = ++clock;
+        s.keep = (int64_t) kp;
+        s.data = buf;
+        for (const Held& h : held)
+            if (h.start < (long long) state.size()) s.pics.push_back(h);
+        list.push_back(std::move(s));
+        dirty = false;
+        const uint64_t budget = (uint64_t) (ram_gb * 1e9);
+        while (ram_n() > (size_t) cap || (budget > 0 && ram_n() > 1 && ram_bytes() > budget)) {
+            size_t v = list.size();
+            for (size_t i = 0; i < list.size(); ++i)
+                if (list[i].path.empty() && (v == list.size() || list[i].used < list[v].used)) v = i;
+            if (v == list.size() || !write_file(list[v])) {
+                if (v < list.size()) drop(v);
+            }
+        }
+        char nb[240];
+        std::snprintf(nb, sizeof nb, "saved a %zu-token conversation%s (%.2f GB, %.2f s); %zu in RAM, %zu in %s",
+                      state.size(), why, b / 1e9, now() - t0, ram_n(), list.size() - ram_n(), dir.c_str());
+        note(nb);
+    }
+
+    // the kept conversation this prompt continues the furthest - past `floor` (what the caches' own conversation gives
+    // it) - into the caches: its usable length (state and held then its own; 0: none taken, the caches as they were;
+    // lost: a load that failed and left the caches empty)
+    size_t take(const std::vector<int>& ids, const std::vector<Held>& want, size_t floor, std::vector<int>& state,
+                std::vector<Held>& held, bool& dirty, bool& lost) {
+        lost = false;
+        if (!on || ids.size() < 2) return 0;
+        const int64_t back = 511;   // (the window a forward reads before it: Model::resumable's)
+        size_t best = list.size(), len = floor;
+        for (size_t i = 0; i < list.size(); ++i) {
+            const Slot& s = list[i];
+            const size_t n = s.tokens.size(), lim = std::min(n, ids.size() - 1);
+            size_t c = 0;
+            while (c < lim && s.tokens[c] == ids[c]) ++c;
+            // (a picture before c in either must be in both, at the same place)
+            for (const Held& q : s.pics)
+                if (q.start < (long long) c && std::none_of(want.begin(), want.end(), [&](const Held& x) {
+                        return x.start == q.start && x.hash == q.hash; }))
+                    c = (size_t) q.start;
+            for (const Held& x : want)
+                if (x.start < (long long) c && std::none_of(s.pics.begin(), s.pics.end(), [&](const Held& q) {
+                        return x.start == q.start && x.hash == q.hash; }))
+                    c = (size_t) x.start;
+            const bool whole = c == n;
+            if (!whole && std::max<int64_t>(0, (int64_t) c - back) < (int64_t) n - s.keep) continue;   // (its rings)
+            if (c == 0 || c <= len) continue;
+            best = i;
+            len = c;
+        }
+        if (best == list.size()) return 0;
+        Slot& s = list[best];
+        const double t0 = now();
+        std::vector<uint8_t> file;
+        const uint8_t* p = nullptr;
+        size_t bytes = 0;
+        if (s.path.empty()) {
+            p = s.data->data();
+            bytes = s.data->size();
+        } else {
+            std::ifstream f(s.path, std::ios::binary);
+            file.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            p = file.data();
+            bytes = file.size();
+        }
+        std::vector<int> toks;
+        int64_t keep = 0;
+        std::string e;
+        const bool from_ram = s.path.empty();
+        if (bytes != s.bytes || !m.slot_load(p, bytes, toks, keep, e) || toks != s.tokens) {
+            note("a kept conversation did not load (" + (e.empty() ? std::string("its file") : e) + "): dropped");
+            drop(best);
+            if (m.end() == 0) {   // (the caches' conversation is gone too)
+                state.clear();
+                held.clear();
+                lost = true;
+            }
+            return 0;
+        }
+        state = toks;
+        held = s.pics;
+        dirty = false;
+        if (!m.resumable((int64_t) len)) {   // (never: take() checked its rings - but the caches hold the slot now)
+            note("a kept conversation's rings did not reach its shared start: read again from the start");
+            state.clear();
+            held.clear();
+            lost = true;
+            return 0;
+        }
+        s.used = ++clock;
+        if (!s.path.empty()) {
+            std::error_code ec;
+            std::filesystem::last_write_time(s.path.substr(0, s.path.size() - 4) + ".meta",
+                                             std::filesystem::file_time_type::clock::now(), ec);
+        }
+        char nb[240];
+        std::snprintf(nb, sizeof nb, "took back a %zu-token conversation%s from %s (%.2f s); %zu new tokens to read",
+                      s.tokens.size(), len < s.tokens.size() ? (" at token " + std::to_string(len)).c_str() : "",
+                      from_ram ? "RAM" : "the folder", now() - t0, ids.size() - len);
+        note(nb);
+        return len;
+    }
+
+    // the engine's end: the conversation in the caches, then every RAM slot, to the folder
+    void finish(const std::vector<int>& state, const std::vector<Held>& held, bool& dirty) {
+        if (!on) return;
+        put(state, held, dirty, " as the engine ended");
+        int n = 0;
+        for (size_t i = list.size(); i-- > 0;)
+            if (list[i].path.empty()) {
+                if (write_file(list[i])) ++n;
+                else drop(i);
+            }
+        note("wrote " + std::to_string(n) + " conversation(s) to " + dir);
+    }
+};
+
+int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need,
+          const std::string& pack) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
     std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
@@ -756,6 +1161,8 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
     // (#1026: a start that came out short of its VRAM reserve - the server starts the engine once more, which keeps
     //  what this one measured free beside it)
     if (const int short_mib = m.late_check(true); short_mib > 0) std::printf("INFO reserve_short=%d\n", short_mib);
+    Slots slots(m);
+    slots.start(pack);   // (MAYA_HY4_SLOT_KEEP: off unless set - its notes before READY)
     std::printf("READY %lld stop\n", (long long) m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, WRAP, "
@@ -768,10 +1175,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
     Lines& in = *new Lines;
     in.start();
     std::vector<int> state;   // the tokens in the caches, positions 0 ..
-    struct Held {
-        long long start;
-        uint64_t hash;
-    };
+    bool dirty = false;       // (the caches' conversation changed since it was taken back or set aside: Slots::put)
     std::vector<Held> held;   // the pictures in the caches (their first image token's position, their pixels' hash)
     struct Unpin {   // (a pinned buffer unpinned before its vector frees it)
         void* p;
@@ -830,6 +1234,11 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             if (x.start < (long long) from &&
                 std::none_of(held.begin(), held.end(), [&](const Held& q) { return x.start == q.start && x.hash == q.hash; }))
                 from = (size_t) x.start;
+        // (MAYA_HY4_SLOT_KEEP: a prompt that does not continue the caches' conversation sets it aside - before a restore
+        //  point changes the rings -, and the kept one it continues the furthest - further than the caches' own or the
+        //  restore point - is taken back: only its new tokens are read)
+        const bool slot_switch = slots.on && !(!state.empty() && from == state.size() && state.size() < r.ids.size());
+        if (slot_switch) slots.put(state, held, dirty);
         if (from > 0 && !m.resumable((int64_t) from)) {   // (the windows before it gone: a restore point, else from 0)
             const size_t shared = from;
             const int64_t at = m.restore(r.ids.data(), (int64_t) from, err);
@@ -840,6 +1249,14 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 std::fprintf(stderr, "maya hy4 serve: restore point: %s - read from 0\n", err.c_str());
                 err.clear();
             }
+        }
+        if (slot_switch) {
+            std::vector<Held> want;
+            for (const Pic& x : pics) want.push_back({x.start, x.hash});
+            bool lost = false;
+            const size_t back = slots.take(r.ids, want, from, state, held, dirty, lost);
+            if (back > 0) from = back;
+            else if (lost) from = 0;
         }
         state.resize(from);
         held.clear();
@@ -893,6 +1310,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 break;
             }
         }
+        dirty = true;   // (the caches' conversation is a new one now)
         const double t1 = now() * 1e3;
         if (!ok) {
             std::printf("ERR %s\n", err.c_str());
@@ -1087,6 +1505,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                      t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0);
     }
+    slots.finish(state, held, dirty);   // (QUIT: the kept conversations to the folder before the engine ends)
     return 0;
 }
 
@@ -1849,7 +2268,7 @@ int main(int argc, char** argv) {
     // (--draft-more: the MTP block's drafts - the DFly2 drafter's round is one pass of its own count; a step's window,
     //  the token and its drafts, is kMaxWin positions at most: the added drafts within it)
     n_more = m.has_dfly2() ? 0 : std::min(n_more, std::max(0, hy4::k::kMaxWin - 1 - n_draft));
-    if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need);
+    if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need, o.pack);
     if (kld.rfind("topk:", 0) == 0) return run_kld_topk(m, kld.substr(5), chunks, kld_save);
     if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);
