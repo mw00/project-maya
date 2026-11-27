@@ -961,8 +961,8 @@ class BodylessRequests(unittest.TestCase):
         and the real /api/chat still answering 200 to a request with no message - which is where Ollama's preload
         and unload live, the reason `nonempty` is off by default at all.  The requests are the one that matters:
         put a `nonempty=True` on _mapi_chat's own call and every checker assertion here still passes, while
-        /api/chat answers 400 and an agent's model never loads.  Nothing else in the repository sends /api/chat
-        with no message, so nothing else would notice.  Model management is what lets the request through (without
+        /api/chat answers 400 and an agent's model never loads.  No other test asks what an empty one answers (the
+        only other /api/chat that sends no message checks the API key, and stops at the 401 before the route).  Model management is what lets the request through (without
         it _mapi_gate answers 404 first), and the fixture belongs to the class, so what these requests write -
         keep_alive_s, the running engine - is put back."""
         from serve.frontend import check_messages
