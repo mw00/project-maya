@@ -25,6 +25,8 @@
 #include "maya/core/layer.hpp"
 #include "maya/core/layout.hpp"
 #include "maya/core/session.hpp"
+#include "maya/core/glp.hpp"
+#include <optional>
 #include "maya/core/weights.hpp"
 #include "maya/kernels/cpu/expert.hpp"
 #include "maya/kernels/cpu/pool.hpp"
@@ -938,6 +940,55 @@ bool load_control_vectors(const Options& o, const maya::core::ModelGeometry& g, 
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
+    // A GLP file (glp.* metadata) is loaded through the spec reader: the file's own mode, alpha and
+    // layer list are the contract, and a project vector cannot be summed with another (two projections
+    // do not compose).  A file with no glp.* metadata is a legacy llama.cpp additive vector: the path
+    // below, unchanged.  Spec: https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md.
+    std::optional<maya::core::glp::Vector> glp_vector;
+    bool any_glp = false;
+    for (const auto& [path, scale] : o.cvec_files) {
+        try {
+            const bool is_glp = maya::core::glp::has_glp_metadata(path);
+            if (!is_glp) continue;
+            any_glp = true;
+            if (o.cvec_files.size() > 1) {
+                err = path + ": a GLP project vector cannot be summed with another control vector "
+                      "(two projections do not compose into a projection along the sum)";
+                return false;
+            }
+            if (o.cvec_mode == 1) {
+                err = path + ": glp.mode=project with --cvec-mode add would apply a projective direction "
+                      "additively; the mode travels with the data and the file says project";
+                return false;
+            }
+            if (o.cvec_single >= 0 || o.cvec_first != 0 || o.cvec_last != 0) {
+                err = path + ": --cvec-dir / --control-vector-layer-range override the file's own layer list; "
+                      "a GLP vector names its layers, re-export it if you need a different span";
+                return false;
+            }
+            maya::core::glp::LoadOptions lo;
+            lo.alpha = scale >= 0.0f ? scale : -1.0f;   // FILE:SCALE becomes the alpha override
+            std::vector<std::string> warnings;
+            maya::core::glp::Vector v;
+            if (!maya::core::glp::load(path, (int64_t) g.n_embd, (int64_t) g.n_layers, lo, v, err, warnings)) return false;
+            for (const std::string& w : warnings) std::fprintf(stderr, "maya generate: control vector: %s\n", w.c_str());
+            glp_vector = std::move(v);
+        } catch (const std::exception& e) {
+            err = path + ": " + e.what();
+            return false;
+        }
+    }
+    if (any_glp) {
+        const maya::core::glp::Vector& v = *glp_vector;
+        int first = (int) v.n_layers, last = -1;
+        for (int l : v.layers) { first = std::min(first, l); last = std::max(last, l); }
+        if (!maya::kernels::cvec_upload(v.dir, v.s, 0 /* project: the kernel's per-copy formula */, first, last,
+                                        (int64_t) v.n_embd, g.hc, err)) return false;
+        summary = "glp:project:" + std::to_string(first) + "-" + std::to_string(last) + ":alpha" + std::to_string(v.alpha);
+        std::fprintf(stderr, "maya generate: GLP vector mode = project, layers %d..%d (%zu steered), alpha %g\n",
+                     first, last, v.layers.size(), (double) v.alpha);
+        return true;
+    }
     for (const auto& [path, scale] : o.cvec_files) {
         try {
             maya::GgufFile f(path);
@@ -1135,7 +1186,26 @@ static int glm_pack_generate(const Options& o) {
     // --ablate: the direction on every part (src/core/glm_ablate.hpp), each conversation by --ablate-default until a
     // request says otherwise
     if (!o.ablate.empty()) {
-        if (!model.ablate_load(o.ablate, o.ablate_layer, o.ablate_scale, o.ablate_default, err)) {
+        // A GLP file (glp.* metadata) carries its own layers and dose: --ablate-layer is
+        // refused (the file names them); --ablate-scale's 0-means-file maps to glp.alpha_default.
+        bool is_glp = false;
+        try {
+            is_glp = maya::core::glp::has_glp_metadata(o.ablate);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "maya generate: --ablate: %s\n", e.what());
+            return 1;
+        }
+        if (is_glp) {
+            if (o.ablate_layer != 0) {
+                std::fprintf(stderr, "maya generate: --ablate-layer overrides the GLP file's own layer list; "
+                                    "a GLP vector names its layers\n");
+                return 1;
+            }
+            if (!model.ablate_load_glp(o.ablate, o.ablate_scale, o.ablate_default, err)) {
+                std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+                return 1;
+            }
+        } else if (!model.ablate_load(o.ablate, o.ablate_layer, o.ablate_scale, o.ablate_default, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }

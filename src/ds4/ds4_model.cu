@@ -15,6 +15,7 @@
 #include "ds4_cache_swap.hpp"
 #include "ds4_cpu_exl3.hpp"
 #include "ds4_ablate.hpp"
+#include "maya/core/glp.hpp"   // a GLP file (glp.*): the per-layer reader contract
 #include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
 #include "ds4_engram_io.hpp"
 #include "ds4_draft_placement.hpp"
@@ -669,6 +670,8 @@ struct Dev {
     float* d_proj_norm = nullptr;
     cudaEvent_t ev_seed = nullptr;
     float* abl_r = nullptr;   // abliteration: the direction (unit, [dim]) every write of this device loses (or null)
+    float* abl_glp_r = nullptr;   // a GLP file's per-layer direction rows, [n_layers+1][dim] (null: none loaded)
+    float* abl_glp_s = nullptr;   // and its steered-scales table, [n_layers+1] (0 = the layer is not steered)
     // threads / tensor parallelism: its group and its index in it, the group's all-reduces it took part in, xfer_put's
     // block counter, the hand-off to the next group (host-mapped: h | pre | topk | cand, then its flag), the window
     // MoE's grouping scratch
@@ -1117,6 +1120,11 @@ struct Model::Impl {
     std::vector<float> abl_dir;
     float abl_scale = 0.0f;
     std::string abl_what;
+    // a GLP file's per-layer dense tables (glp.hpp): the direction rows [n_layers+1][dim] and the
+    // steered scales [n_layers+1] (0 = the layer is not steered). Empty: the single-direction path.
+    std::vector<float> abl_glp_dir;
+    std::vector<float> abl_glp_s;
+    int abl_glp_spec = 0;   // 0: no GLP file; 1: residual_stream_post_layer; 3: hc_fold_pre_engram (the fold + writer pair)
     // ... per conversation whether its passes project it out (set_ablate; [0] alone without --parallel), and the
     // conversation seq_point pointed the layers at last (a pass of one conversation goes by its setting)
     std::vector<uint8_t> abl_on;
@@ -2563,18 +2571,30 @@ struct Model::Impl {
     // their own - a run of rows of one setting at a time; the kernel is a block a row, so a row comes out the same
     // whatever else the launch holds, and a row left out is not touched
     void ablate(const Dev& d, float* y, int T, const WinPlan& wp, cudaStream_t s) const {
-        if (d.abl_r == nullptr || abl_on.empty()) return;
+        ablate(d, y, T, wp, s, -1);
+    }
+    // The GLP path passes the layer id (l.il): the projection uses the layer's own direction row
+    // and its steered scale (a v3 file steers per layer, both halves the same alpha - GLP.md,
+    // "The companion writer is part of the site").  -1: the single-direction legacy path.
+    void ablate(const Dev& d, float* y, int T, const WinPlan& wp, cudaStream_t s, int layer) const {
+        if (abl_on.empty()) return;
+        if (layer >= 0) {
+            if (d.abl_glp_r == nullptr) return;
+            if (layer >= (int) abl_glp_s.size() || abl_glp_s[(size_t) layer] == 0.0f) return;   // (the layer is not steered)
+        } else if (d.abl_r == nullptr) return;
+        const float* dir = layer >= 0 ? d.abl_glp_r + (size_t) layer * (size_t) g.dim : d.abl_r;
+        const float scale = layer >= 0 ? abl_glp_s[(size_t) layer] : abl_scale;
         if (wp.nrow <= 0 || wp.nrow != T) {
             if (!abl_on[(size_t) abl_seq()]) return;
             if (maya::ablcap::on()) return maya::ablcap::put(y, T, g.dim, s);   // (a fitting run: read out)
-            project_out(y, d.abl_r, abl_scale, g.dim, T, s);
+            project_out(y, dir, scale, g.dim, T, s);
             return;
         }
         for (int t = 0; t < T;) {
             const bool on = abl_row(wp.rseq[t]);
             int u = t + 1;
             while (u < T && abl_row(wp.rseq[u]) == on) ++u;
-            if (on) project_out(y + (size_t) t * g.dim, d.abl_r, abl_scale, g.dim, u - t, s);
+            if (on) project_out(y + (size_t) t * g.dim, dir, scale, g.dim, u - t, s);
             t = u;
         }
     }
@@ -3723,19 +3743,65 @@ struct Model::Impl {
         late_read();   // (#1026: what this PC's start and requests took after the plan before - kept free beside it)
         // abliteration: the direction read once, a copy on every device (projected out at each hc_post: ablate())
         if (!o.ablate.empty() && !o.vision_only) {
-            abl_scale = o.ablate_scale;
-            if (!ablate::load_direction(o.ablate, o.ablate_layer, g.nl, abl_scale, abl_dir, abl_what, err)) return false;
-            if ((int) abl_dir.size() != g.dim) {
-                err = o.ablate + ": direction of " + std::to_string(abl_dir.size()) + " values, the model's dim is " +
-                      std::to_string(g.dim);
+            // A GLP file (glp.* metadata) routes through the spec reader: per-layer directions,
+            // the file's own alpha and layers.  Version 3 (hc_fold_pre_engram) applies at the
+            // fold consuming the FFN write AND the attention output writer - this engine's two
+            // ablate() sites are exactly those halves, so v3 is servable here.  Version 1 names
+            // the plain post-layer residual, which this engine does not have: refused.
+            bool is_glp = false;
+            try {
+                is_glp = maya::core::glp::has_glp_metadata(o.ablate);
+            } catch (const std::exception& e) {
+                err = o.ablate + ": " + e.what();
                 return false;
             }
-            for (Dev& d : devs) {
-                if (!dalloc(d, d.abl_r, abl_dir.size(), err)) return false;
-                CK(cudaSetDevice(d.id));
-                CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * sizeof(float), cudaMemcpyHostToDevice));
+            if (is_glp) {
+                if (o.ablate_layer != 0) {
+                    err = o.ablate + ": --ablate-layer overrides the GLP file's own layer list";
+                    return false;
+                }
+                maya::core::glp::LoadOptions lo;
+                lo.alpha = o.ablate_scale > 0.0f ? o.ablate_scale : -1.0f;
+                std::vector<std::string> warnings;
+                maya::core::glp::Vector vec;
+                if (!maya::core::glp::load(o.ablate, g.dim, g.nl, lo, vec, err, warnings)) return false;
+                for (const std::string& w : warnings) std::fprintf(stderr, "maya-ds4: %s\n", w.c_str());
+                if (vec.spec == 1) {
+                    err = o.ablate + ": glp.spec_version=1 names residual_stream_post_layer, which this engine's "
+                          "hyper-connection streams do not have; a v3 file (hc_fold_pre_engram, the fold + "
+                          "companion writer pair) is what applies here";
+                    return false;
+                }
+                abl_glp_dir = std::move(vec.dir);
+                abl_glp_s = std::move(vec.s);
+                abl_glp_spec = vec.spec;
+                abl_scale = vec.alpha;
+                for (Dev& d : devs) {
+                    if (!dalloc(d, d.abl_glp_r, abl_glp_dir.size(), err)) return false;
+                    if (!dalloc(d, d.abl_glp_s, abl_glp_s.size(), err)) return false;
+                    CK(cudaSetDevice(d.id));
+                    CK(cudaMemcpy(d.abl_glp_r, abl_glp_dir.data(), abl_glp_dir.size() * sizeof(float), cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(d.abl_glp_s, abl_glp_s.data(), abl_glp_s.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
+                abl_what = "glp v3 project: fold + attention writer, layers " +
+                           std::to_string(vec.layers.front()) + ".." + std::to_string(vec.layers.back()) +
+                           " (" + std::to_string(vec.layers.size()) + " steered), alpha " + std::to_string(vec.alpha);
+                abl_on.assign((size_t) std::max(1, o.seqs), o.ablate_default ? 1 : 0);
+            } else {
+                abl_scale = o.ablate_scale;
+                if (!ablate::load_direction(o.ablate, o.ablate_layer, g.nl, abl_scale, abl_dir, abl_what, err)) return false;
+                if ((int) abl_dir.size() != g.dim) {
+                    err = o.ablate + ": direction of " + std::to_string(abl_dir.size()) + " values, the model's dim is " +
+                          std::to_string(g.dim);
+                    return false;
+                }
+                for (Dev& d : devs) {
+                    if (!dalloc(d, d.abl_r, abl_dir.size(), err)) return false;
+                    CK(cudaSetDevice(d.id));
+                    CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
+                abl_on.assign((size_t) std::max(1, o.seqs), o.ablate_default ? 1 : 0);
             }
-            abl_on.assign((size_t) std::max(1, o.seqs), o.ablate_default ? 1 : 0);
         }
         // (MAYA_DS4_Q8_BATCH / _SHARE: their lines now, at load; MAYA_DS4_Q8_CHECK=1: the batched rounding with sharing
         //  checked on every device first)
@@ -18842,7 +18908,7 @@ struct Model::Impl {
             CK(cudaStreamWaitEvent(s, c.ar_done, 0));
         } else if (nm > 1)
             chunk_allreduce(d, c, ab, mi, T * D, s);
-        ablate(d, c.acc, T, wp, s);
+        ablate(d, c.acc, T, wp, s, l.il);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         prof_mark(d, 1);
         kick(s);   // (the attention submitted while the host queues the routing)
@@ -18943,7 +19009,7 @@ struct Model::Impl {
                 if (flow_ar_dma && nm > 2) chunk_allreduce(d, c, ab, mi, T * D, s);
                 else allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
             }
-            ablate(d, c.acc, T, wp, s);
+            ablate(d, c.acc, T, wp, s, l.il);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 3);
@@ -18986,7 +19052,7 @@ struct Model::Impl {
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
         if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
-        ablate(d, c.acc, T, wp, s);
+        ablate(d, c.acc, T, wp, s, l.il);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         if (acc_dump != nullptr) {
             std::vector<float> av((size_t) T * (size_t) D);
@@ -22772,7 +22838,7 @@ struct Model::Impl {
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-        ablate(d, d.ao, T, wp, s);
+        ablate(d, d.ao, T, wp, s, l.il);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
@@ -23004,7 +23070,7 @@ struct Model::Impl {
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-            ablate(d, d.moe_out, T, wp, s);
+            ablate(d, d.moe_out, T, wp, s, l.il);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             if (acc_dump != nullptr) {
@@ -23138,7 +23204,7 @@ struct Model::Impl {
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-        ablate(d, d.moe_out, T, wp, s);
+        ablate(d, d.moe_out, T, wp, s, l.il);
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (acc_dump != nullptr) {

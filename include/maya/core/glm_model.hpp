@@ -944,6 +944,13 @@ public:
     }
     void ablate(float* y, int T, cudaStream_t s) const;
     void ablate_runs(float* y, const int* seqs, int n, cudaStream_t s) const;
+    /// A GLP file (--ablate with glp.* metadata): one direction a steered layer, applied at the
+    /// same two writes as the single-direction --ablate, the layer's own row. Null tables: the
+    /// legacy single-direction path above.
+    bool ablate_load_glp(const std::string& path, float alpha, bool on, std::string& err);
+    void ablate_layer(float* y, int64_t layer, int T, cudaStream_t s) const;
+    float* abl_glp_r_ = nullptr;       // this part's copies of the per-layer directions, n_layers * n_embd (unit rows)
+    std::vector<float> abl_glp_s_host_;  // the same table host-side: ablate_layer checks it without a device read
     float* abl_r_ = nullptr;          // this part's copy of the direction (unit, n_embd) - null: no --ablate
     float abl_scale_ = 0.0f;
     std::vector<uint8_t> abl_on_;     // per conversation (seq_count()): projects or not

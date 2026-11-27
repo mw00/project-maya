@@ -3,6 +3,7 @@
 #include "glm_ablate.hpp"
 
 #include "maya/core/glm_model.hpp"
+#include "maya/core/glp.hpp"
 
 #include "ablate_capture.hpp"         // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
 #include "../mm3/mm3_ablate.hpp"   // (the control vector loader maya-mm3 uses: the same direction files)
@@ -98,3 +99,50 @@ void Glm5Model::ablate_runs(float* y, const int* seqs, int n, cudaStream_t s) co
 }
 
 }  // namespace maya::core
+
+// --ablate with a GLP file (glp.* metadata): the reader's per-layer directions on every part,
+// the same per-conversation on/off as the single-direction path.  ablate_layer() applies the
+// layer's own row at the same two writes (glm_model.cu).
+bool Glm5Model::ablate_load_glp(const std::string& path, float alpha, bool on, std::string& err) {
+    maya::core::glp::Vector v;
+    std::vector<std::string> warnings;
+    maya::core::glp::LoadOptions lo;
+    lo.alpha = alpha > 0.0f ? alpha : -1.0f;   // --ablate-scale 0 = the file's glp.alpha_default (LoadOptions < 0)
+    if (!maya::core::glp::load(path, g_.n_embd, g_.n_layers, lo, v, err, warnings)) return false;
+    for (const std::string& w : warnings) std::fprintf(stderr, "maya generate: --ablate: %s\n", w.c_str());
+    int dev0 = 0;
+    cudaGetDevice(&dev0);
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {   // a copy on every part's card
+        cudaSetDevice(m->dev_);
+        const size_t bytes = v.dir.size() * sizeof(float);
+        if (m->abl_glp_r_ == nullptr && cudaMalloc(&m->abl_glp_r_, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            m->abl_glp_r_ = nullptr;
+            cudaSetDevice(dev0);
+            err = "--ablate: the GLP direction table (" + std::to_string(bytes) + " bytes) did not fit on CUDA" +
+                  std::to_string(m->dev_);
+            return false;
+        }
+        if (cudaMemcpy(m->abl_glp_r_, v.dir.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaSetDevice(dev0);
+            err = "--ablate: the GLP direction table's copy to CUDA" + std::to_string(m->dev_) + " failed";
+            return false;
+        }
+        m->abl_scale_ = v.alpha;
+        m->abl_glp_s_host_ = v.s;
+        m->abl_on_.assign((size_t) std::max(1, m->seq_count()), on ? 1 : 0);
+    }
+    cudaSetDevice(dev0);
+    abl_what_ = "glm: glp project, layers " + std::to_string(v.layers.front()) + ".." +
+                std::to_string(v.layers.back()) + " (" + std::to_string(v.layers.size()) + " steered), alpha " +
+                std::to_string(v.alpha);
+    return true;
+}
+
+// The layer's own GLP row on T rows (y -= scale * d (d . y) with the layer's unit row), or nothing
+// when the file does not steer the layer.  The single-direction ablate() and this share abl_on_.
+void Glm5Model::ablate_layer(float* y, int64_t layer, int T, cudaStream_t s) const {
+    if (T <= 0 || !abl_seq_on(cur_seq_) || abl_glp_r_ == nullptr || layer < 0 || layer > g_.n_layers) return;
+    if (layer >= (int64_t) abl_glp_s_host_.size() || abl_glp_s_host_[(size_t) layer] == 0.0f) return;
+    glmabl::project_out(y, abl_glp_r_ + (size_t) layer * (size_t) g_.n_embd, abl_scale_, (int) g_.n_embd, T, s);
+}
