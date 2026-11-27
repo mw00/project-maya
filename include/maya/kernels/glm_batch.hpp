@@ -93,6 +93,11 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 /// tail cells - cells[t][0 .. n_sel[t]), -1 = masked; rows of n_sel_max.
 void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_pools_max, int tail, int T,
                 int n_sel_max, int* cells, int* n_sel, cudaStream_t s);
+/// dsa_score + dsa_select in one pass (src/kernels/cuda/glm_prompt_dsa.cuh): the same scores, cells and n_sel.
+/// false: not taken (MAYA_GLM_PROMPT_DSA=0, before sm_80, HIP, another shape, no VRAM for its plan) - call the pair.
+bool dsa_indexer(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int p0, int kpool,
+                 int T, int max_vis, float* score, int score_ld, int top_pools_max, int tail, int n_sel_max,
+                 int* cells, int* n_sel, cudaStream_t s);
 #if defined(MAYA_USE_HIP)
 /// The same attention with Q in FP16 ([T][n_head][512]) on the WMMA units (rocWMMA, RDNA3/RDNA4): FP16 operands, F32
 /// accumulation and softmax.  n_head % 16 == 0, kv_lora 512.

@@ -53,6 +53,10 @@
 #include <cstring>
 #include <vector>
 
+#if !defined(MAYA_USE_HIP)
+#include "glm_prompt_dsa.cuh"   // dsa_indexer below
+#endif
+
 namespace maya::kernels::glmb {
 namespace {
 
@@ -2449,6 +2453,15 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
     dsa_select_kernel<<<T, 1024, 0, s>>>(score, score_ld, p0, kpool, top_pools_max, tail, n_sel_max, cells, n_sel);
     check("dsa_select");
 }
+
+#if !defined(MAYA_USE_HIP)
+#include "glm_prompt_dsa_engine.cuh"   // dsa_indexer
+#else
+bool dsa_indexer(const float*, const float*, const float*, int, int, int, int, int, int, float*, int, int, int, int,
+                 int*, int*, cudaStream_t) {
+    return false;
+}
+#endif
 
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
                     float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
