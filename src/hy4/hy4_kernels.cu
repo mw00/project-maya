@@ -655,6 +655,84 @@ __global__ void __launch_bounds__(512) hc_fin_kernel(const float* __restrict__ x
                                                      float neps, const Q8Out q8) {
     hc_fin_body<HEAD, 8>(blockIdx.x, x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, mix_out, nw, neps, q8);
 }
+// hc_fin over more of the GPU (HY4_HC_SPLIT, on by default): a token's 512-thread block was one SM's work, 4 blocks for
+// a 4-token window.  Pass a: grid (4, T) of 4 warps, warp w of the 16 doing hc_fin's warp w - its thread's values,
+// d = 32 w + lane + 512 q, their squares summed in hc_fin's order and warp_sum'd - the mixes made again in each block
+// (the same products); the un-normed values to cur, each warp's sum to wsum.  Pass b: the 16 sums warp_sum'd as
+// block_sum's second step (lane l the l-th warp's, 0 past them), then the row normed and rounded to int8 as hc_fin's
+// end.  The same products and sums in the same order: the same bits.
+constexpr int kFinSplitW = 4;   // (warps a block of pass a)
+__global__ void __launch_bounds__(128) hc_fin_a_kernel(const float* __restrict__ x, int hc, int E,
+                                                       const float* __restrict__ part, const float* __restrict__ scale,
+                                                       const float* __restrict__ base, float eps, float hc_eps,
+                                                       float mag, float* __restrict__ cur, float* __restrict__ post,
+                                                       float* __restrict__ mix_out, float* __restrict__ wsum) {
+    constexpr int kPer = 8, kBd = 512;
+    const int t = blockIdx.y, w = blockIdx.x * kFinSplitW + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int vt = w * 32 + lane;   // (hc_fin's thread)
+    __shared__ float s_mix[kMaxM + 1], s_pre[8];
+    __shared__ float s_part[kHcBlocks * (kMaxM + 1)];
+    __shared__ float sh[kFinSplitW][kMaxM + 1];
+    (void) sh;
+    const int nm = 2 * hc, HE = hc * E;
+    const float* xt = x + (size_t) t * HE;
+    float xa[kPer][8];
+#pragma unroll
+    for (int q = 0; q < kPer; ++q) {
+        const int d = vt + q * kBd;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) xa[q][j] = d < E && j < hc ? xt[(size_t) j * E + d] : 0.0f;
+    }
+    constexpr int kNp = kHcBlocks * (kMaxM + 1);
+    for (int i = threadIdx.x; i < kNp; i += blockDim.x) s_part[i] = maya::kernels::ld_l2(part + (size_t) t * kNp + i);
+    __syncthreads();
+    if ((int) threadIdx.x <= kMaxM) {
+        float v = 0.0f;
+        for (int b = 0; b < kHcBlocks; ++b) v += s_part[b * (kMaxM + 1) + threadIdx.x];
+        s_mix[threadIdx.x] = v;
+    }
+    __syncthreads();
+    if ((int) threadIdx.x < hc) {
+        const int j = threadIdx.x;
+        const float r = 1.0f / sqrtf(s_mix[kMaxM] / (float) HE + eps);
+        const float m0 = s_mix[j] * r;
+        s_pre[j] = sigmoidf_(m0 * scale[0] + base[j]) + hc_eps;
+        if (blockIdx.x == 0) {
+            if (mix_out) mix_out[(size_t) t * nm + j] = m0;
+            const float m1 = s_mix[hc + j] * r;
+            if (mix_out) mix_out[(size_t) t * nm + hc + j] = m1;
+            post[(size_t) t * hc + j] = sigmoidf_(m1 * scale[1] + base[hc + j]) * mag + hc_eps;
+        }
+    }
+    __syncthreads();
+    float ss = 0.0f, pre[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) pre[j] = j < hc ? s_pre[j] : 0.0f;
+#pragma unroll
+    for (int q = 0; q < kPer; ++q) {
+        float v = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v = fmaf(pre[j], xa[q][j], v);
+        ss += v * v;
+        const int d = vt + q * kBd;
+        if (d < E) cur[(size_t) t * E + d] = v;
+    }
+    ss = warp_sum(ss);
+    if (lane == 0) wsum[(size_t) t * 16 + w] = ss;
+}
+__global__ void __launch_bounds__(256) hc_fin_b_kernel(float* __restrict__ cur, int E, const float* __restrict__ wsum,
+                                                       const float* __restrict__ nw, float neps, const Q8Out q8) {
+    const int t = blockIdx.y, lane = threadIdx.x & 31;
+    float r = lane < 16 ? wsum[(size_t) t * 16 + lane] : 0.0f;
+    r = warp_sum(r);
+    r = 1.0f / sqrtf(r / (float) E + neps);
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d < E) {   // (E a multiple of 32 with q8: a warp's lanes together)
+        const float o = cur[(size_t) t * E + d] * r * nw[d];
+        cur[(size_t) t * E + d] = o;
+        if (q8.q != nullptr) q8_put(o, (size_t) t * E + d, q8);
+    }
+}
 // ... in one launch: the slices' blocks as hc_part, the last of a token's to finish its hc_fin (a counter a token)
 __global__ void __launch_bounds__(256) hc_pre1_kernel(const float* __restrict__ x, int hc, int E,
                                                       const float* __restrict__ fn, float* __restrict__ part,
@@ -3107,6 +3185,24 @@ bool hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* 
     } else {
         if (fn_by_element) hc_part_kernel<true><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
         else hc_part_kernel<false><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
+        static const bool split = !(std::getenv("HY4_HC_SPLIT") && std::getenv("HY4_HC_SPLIT")[0] == '0');
+        if (split && norm_w != nullptr && E <= 512 * 8 && E % 32 == 0 && T <= 4096) {
+            static float* wsum = nullptr;
+            static int wsum_T = 0;
+            if (T > wsum_T) {
+                if (wsum) cudaFree(wsum);
+                wsum_T = std::max(T, 1024);
+                if (cudaMalloc(&wsum, sizeof(float) * 16 * (size_t) wsum_T) != cudaSuccess) wsum = nullptr, wsum_T = 0;
+            }
+            if (wsum) {
+                hc_fin_a_kernel<<<dim3(16 / kFinSplitW, (unsigned) T), 32 * kFinSplitW, 0, s>>>(
+                    x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, g_mix_out, wsum);
+                hc_fin_b_kernel<<<dim3((unsigned) ((E + 255) / 256), (unsigned) T), 256, 0, s>>>(cur, E, wsum, norm_w,
+                                                                                               norm_eps, q8);
+                check("hc_pre");
+                return q8.q != nullptr;
+            }
+        }
         hc_fin_kernel<false><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, g_mix_out,
                                                norm_w, norm_eps, q8);
         check("hc_pre");
