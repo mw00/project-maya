@@ -1427,7 +1427,7 @@ __global__ void __launch_bounds__(kThreads, T == kQ6_K && (NC <= 4 || HOLD) ? 3 
                 if (lane == 0) b.y[c * b.ycs + row0 + r] = b.alpha * v + (b.bias != nullptr ? b.bias[row0 + r] : 0.0f);
             }
 }
-static int rows_a_warp(int max_n, int max_c) {
+static int rows_a_warp(int max_n, int max_c, bool q6 = false) {
     static const int env = std::getenv("MAYA_IQ_MV_ROWS") ? std::atoi(std::getenv("MAYA_IQ_MV_ROWS")) : 0;
     if (env == 1 || env == 2 || env == 4) return env;
     static const int sms = [] {
@@ -1440,6 +1440,9 @@ static int rows_a_warp(int max_n, int max_c) {
     }();
     // (a V100, Hy4's attn_gate / attn_output / attn_q_b: 2 rows a warp 1.4-1.8x faster at 2-4 columns, the same at one,
     //  4 rows slower than 2 - fewer warps to hide the loads with)
+    //  Q6_K of one column too where the rows number 8192 or more (mv_rows_kernel's 3 blocks an SM: attn_q_b 1024 -> 16384
+    //  27.3 -> 23.7 us, attn_output 16384 -> 3072 71 -> 67 us; fewer rows: mv_kernel's warps a row are faster)
+    if (q6 && max_c == 1 && sms > 0 && max_n >= 8192) return 2;
     return max_c >= 2 && sms > 0 && max_n / 2 >= 8 * sms ? 2 : 1;
 }
 
@@ -2320,7 +2323,7 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
         }
 #endif
     if constexpr (T == kQ6_K || T == kQ8_0) {   // (R rows a warp: mv_rows_kernel - mv_kernel's columns, sums and order)
-        const int R = rows_a_warp(max_n, max_c);
+        const int R = rows_a_warp(max_n, max_c, T == kQ6_K);
         const bool wd = T == kQ8_0 && wide;
         bool hold56 = !(std::getenv("MAYA_IQ_MV_HOLD") && std::getenv("MAYA_IQ_MV_HOLD")[0] == '0');
         for (int i = 0; hold56 && i < nj; ++i) hold56 = J.j[i].k > 4096 || J.j[i].k <= 1024;
