@@ -7155,43 +7155,47 @@ struct Model::Impl {
     // side by side and returns), then looked up: a row whose page is not in the page cache was one read from the disk
     // after another - on an NVMe ~5 ms a window of 3 tokens once the table's pages had gone cold (a V100 + 62 GB box,
     // Hy4-Flash: a decode round's largest wait).  The same rows: the same bits.  HY4_EG_WILLNEED=0: as before
-    void engram_willneed(int T, int64_t p0) {
-#if !defined(_WIN32)
+    static bool eg_willneed_on() {
         static const bool off = std::getenv("HY4_EG_WILLNEED") && std::getenv("HY4_EG_WILLNEED")[0] == '0';
-        if (off || eg_table == nullptr) return;
+        return !off;
+    }
+    // (module e's rows of token t of the window at p0: their pages asked for)
+    void engram_willneed_one(int e, int t, int64_t p0) {
+#if !defined(_WIN32)
         const Engram& eg = pk.eg;
         const int n = eg.ngram, hd = eg.head_dim;
-        auto cid = [&](int t) -> int64_t {
-            return t < 0 || t >= eg.vocab ? -1 : (int64_t) eg.token_map[(size_t) t];
+        auto cid = [&](int tk) -> int64_t {
+            return tk < 0 || tk >= eg.vocab ? -1 : (int64_t) eg.token_map[(size_t) tk];
         };
-        for (int e = 0; e < eg.modules; ++e) {
-            const uint64_t* mult = eg.mult.data() + (size_t) e * n;
-            const uint64_t* primes = eg.primes.data() + (size_t) e * eg.cols();
-            const uint64_t* offs = eg.offsets.data() + (size_t) e * eg.cols();
-            for (int t = 0; t < T; ++t) {
-                const int64_t p = p0 + t;
-                uint64_t toks[8];
-                const int64_t c0 = cid(tokens[(size_t) p]);
-                toks[0] = (uint64_t) (c0 < 0 ? eg.pad : c0);
-                for (int sft = 1; sft < n; ++sft) {
-                    const int64_t c = p - sft < 0 ? -1 : cid(tokens[(size_t) (p - sft)]);
-                    toks[sft] = (uint64_t) (c < 0 ? eg.pad : c);
-                }
-                uint64_t rolling = toks[0] * mult[0];
-                for (int oo = 1; oo < n; ++oo) {
-                    rolling ^= toks[oo] * mult[oo];
-                    for (int h = 0; h < eg.heads; ++h) {
-                        const int col = (oo - 1) * eg.heads + h;
-                        const uint64_t row = rolling % primes[col] + offs[col];
-                        const uintptr_t a = (uintptr_t) (eg_table + row * (uint64_t) hd), b = a & ~(uintptr_t) 4095;
-                        (void) madvise((void*) b, (a - b) + (size_t) hd, MADV_WILLNEED);
-                    }
-                }
+        const uint64_t* mult = eg.mult.data() + (size_t) e * n;
+        const uint64_t* primes = eg.primes.data() + (size_t) e * eg.cols();
+        const uint64_t* offs = eg.offsets.data() + (size_t) e * eg.cols();
+        const int64_t p = p0 + t;
+        uint64_t toks[8];
+        const int64_t c0 = cid(tokens[(size_t) p]);
+        toks[0] = (uint64_t) (c0 < 0 ? eg.pad : c0);
+        for (int sft = 1; sft < n; ++sft) {
+            const int64_t c = p - sft < 0 ? -1 : cid(tokens[(size_t) (p - sft)]);
+            toks[sft] = (uint64_t) (c < 0 ? eg.pad : c);
+        }
+        uint64_t rolling = toks[0] * mult[0];
+        for (int oo = 1; oo < n; ++oo) {
+            rolling ^= toks[oo] * mult[oo];
+            for (int h = 0; h < eg.heads; ++h) {
+                const int col = (oo - 1) * eg.heads + h;
+                const uint64_t row = rolling % primes[col] + offs[col];
+                const uintptr_t a = (uintptr_t) (eg_table + row * (uint64_t) hd), b = a & ~(uintptr_t) 4095;
+                (void) madvise((void*) b, (a - b) + (size_t) hd, MADV_WILLNEED);
             }
         }
 #else
-        (void) T, (void) p0;
+        (void) e, (void) t, (void) p0;
 #endif
+    }
+    void engram_willneed(int T, int64_t p0) {
+        if (!eg_willneed_on() || eg_table == nullptr) return;
+        for (int e = 0; e < pk.eg.modules; ++e)
+            for (int t = 0; t < T; ++t) engram_willneed_one(e, t, p0);
     }
     std::unique_ptr<Crew> eg_crew;   // (the Engram lookups' threads)
     // A token window's Engram rows with tensor parallel: looked up on a thread of their own while the members queue
@@ -8176,6 +8180,14 @@ struct Model::Impl {
             if (n_look >= 8 && T > W && !std::getenv("HY4_EG_SERIAL")) {
                 if (!eg_crew) eg_crew = std::make_unique<Crew>(8);
                 const int nt = eg_crew->size();
+                // (a prompt chunk's rows' pages asked for first, by every lookup thread its share - the reads side by
+                //  side, not 8 at a time: a 22K prompt with the table's pages cold 695 -> 9xx tok/s on a V100 + NVMe)
+                if (eg_willneed_on() && eg_table != nullptr) {
+                    eg_crew->start([&](int w) {
+                        for (int i = w; i < n_look; i += nt) engram_willneed_one(i / T, i % T, p0);
+                    });
+                    eg_crew->wait();
+                }
                 eg_crew->start([&](int w) {
                     for (int i = w; i < n_look; i += nt) engram_row(i / T, i % T, p0);
                 });
