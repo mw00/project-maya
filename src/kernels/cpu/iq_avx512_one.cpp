@@ -16,6 +16,8 @@
 // rows: ~1.26x).
 #include "maya/kernels/cpu/iq_avx512_one.hpp"
 #include "maya/kernels/cpu/expert_layout.hpp"
+#include "maya/kernels/cpu/iq2v_rows.hpp"
+#include "maya/kernels/cpu/iq3v_rows.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -29,6 +31,7 @@
 #endif
 
 #include <cstring>
+#include <cstdlib>
 
 #if defined(_MSC_VER)
 #define MAYA_ALWAYS_INLINE __forceinline
@@ -109,6 +112,120 @@ bool cpu_bmi2_ok() {
     return (r[1] >> 8) & 1u;
 }
 
+// The additional one-token forms use AVX-512 DQ, VBMI, BITALG and VNNI.
+// cpu_avx512_ok() supplies the OS-state and F/BW/VL/VBMI/VNNI checks; keep
+// the remaining CPUID bits local so a partial AVX-512 implementation never
+// reaches an instruction it cannot execute.
+bool cpu_nt1_iq512_ok() {
+    if (!cpu_avx512_ok() || !cpu_avx2_ok() || !cpu_bmi2_ok()) return false;
+    unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuidex(x, 1, 0);
+    if (((unsigned) x[2] & (1u << 29)) == 0) return false;   // F16C
+    __cpuidex(x, 0, 0);
+    if (x[0] < 7) return false;
+    __cpuidex(x, 7, 0);
+    for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+    __cpuid_count(1, 0, r[0], r[1], r[2], r[3]);
+    if ((r[2] & (1u << 29)) == 0) return false;   // F16C
+    if (__get_cpuid_max(0, nullptr) < 7) return false;
+    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+#endif
+    constexpr unsigned kAvx512Dq = 1u << 17;
+    constexpr unsigned kAvx512Vnni = 1u << 11;
+    constexpr unsigned kAvx512Bitalg = 1u << 12;
+    return (r[1] & kAvx512Dq) != 0 && (r[2] & kAvx512Vnni) != 0 && (r[2] & kAvx512Bitalg) != 0;
+}
+
+struct Codes3S {
+    alignas(64) uint16_t c[512];
+    alignas(64) uint16_t pidx[2][32];
+    bool ok = true;
+    Codes3S() {
+        static constexpr int levels[8] = {1, 3, 5, 7, 9, 11, 13, 15};
+        for (int i = 0; i < 512; ++i) {
+            int v = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int b = (int) ((iq3s_grid[i] >> (8 * k)) & 255u);
+                int level = -1;
+                for (int j = 0; j < 8; ++j)
+                    if (levels[j] == b) level = j;
+                if (level < 0) ok = false;
+                v |= (level < 0 ? 0 : level) << (3 * k);
+            }
+            c[i] = (uint16_t) v;
+        }
+        for (int half = 0; half < 2; ++half)
+            for (int m = 0; m < 8; ++m) {
+                pidx[half][4 * m] = pidx[half][4 * m + 1] = (uint16_t) (16 * half + 2 * m);
+                pidx[half][4 * m + 2] = pidx[half][4 * m + 3] = (uint16_t) (16 * half + 2 * m + 1);
+            }
+    }
+};
+
+const Codes3S& codes3s() {
+    static const Codes3S table;
+    return table;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define MAYA_NT1_IQ512_ATTR __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512bitalg,avx512vnni,bmi2,avx2,fma,f16c")))
+#else
+#define MAYA_NT1_IQ512_ATTR
+#endif
+
+MAYA_NT1_IQ512_ATTR MAYA_ALWAYS_INLINE uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
+MAYA_NT1_IQ512_ATTR MAYA_ALWAYS_INLINE __m512i lookup8(const __m512i* table, __m512i idx) {
+    __m512i r[8];
+    for (int j = 0; j < 8; ++j) r[j] = _mm512_permutex2var_epi16(table[2 * j], idx, table[2 * j + 1]);
+    const __mmask32 m6 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(64));
+    const __mmask32 m7 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(128));
+    const __mmask32 m8 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(256));
+    const __m512i a = _mm512_mask_blend_epi16(m7, _mm512_mask_blend_epi16(m6, r[0], r[1]), _mm512_mask_blend_epi16(m6, r[2], r[3]));
+    const __m512i b = _mm512_mask_blend_epi16(m7, _mm512_mask_blend_epi16(m6, r[4], r[5]), _mm512_mask_blend_epi16(m6, r[6], r[7]));
+    return _mm512_mask_blend_epi16(m8, a, b);
+}
+
+MAYA_NT1_IQ512_ATTR void rows_iq3s_512(const uint8_t* w, size_t rb, int n, const void* const* act,
+                                         float* const* out, int r0, int r1) {
+    const Codes3S& c = codes3s();
+    const int nb = n / QK_K;
+    __m512i table[16];
+    for (int k = 0; k < 16; ++k) table[k] = _mm512_load_si512((const void*) (c.c + 32 * k));
+    const __m512i lut = _mm512_set4_epi32(0, 0, 0x0F0D0B09, 0x07050301);
+    const __m512i ctl = _mm512_set1_epi64(0x2926232009060300LL);
+    const __m512i seven = _mm512_set1_epi8(7), zero = _mm512_setzero_si512(), hi = _mm512_set1_epi16(256);
+    const __m512i pidx0 = _mm512_load_si512(c.pidx[0]), pidx1 = _mm512_load_si512(c.pidx[1]);
+    const block_q8_K* y = (const block_q8_K*) act[0];
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * rb;
+        __m256 accf = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = row + (size_t) i * sizeof(block_iq3_s);
+            const uint8_t* qh = blk + 2 + QK_K / 4;
+            const __m512i a = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*) (blk + 2)));
+            const __m512i b = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*) (blk + 34)));
+            const __m512i c0 = lookup8(table, _mm512_or_si512(a, _mm512_maskz_mov_epi16((__mmask32) u32(qh), hi)));
+            const __m512i c1 = lookup8(table, _mm512_or_si512(b, _mm512_maskz_mov_epi16((__mmask32) u32(qh + 4), hi)));
+            __m512i acc = _mm512_setzero_si512();
+            for (int p = 0; p < 4; ++p) {
+                const __m512i rep = _mm512_permutexvar_epi16(p & 1 ? pidx1 : pidx0, p >> 1 ? c1 : c0);
+                const __m512i g = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_multishift_epi64_epi8(ctl, rep), seven));
+                const __mmask64 neg = _cvtu64_mask64(u64(blk + 74 + 8 * p));
+                const int sc = blk[106 + p];
+                const __m512i s = scales4(2 * (sc & 15) + 1, 2 * (sc & 15) + 1, 2 * (sc >> 4) + 1, 2 * (sc >> 4) + 1);
+                const __m512i q8 = _mm512_loadu_si512((const void*) (y[i].qs + 64 * p));
+                const __m512i d = _mm512_maddubs_epi16(g, _mm512_mask_sub_epi8(q8, neg, zero, q8));
+                acc = _mm512_dpwssd_epi32(acc, d, s);
+            }
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(h2f(u16(blk)) * y[i].d), _mm256_cvtepi32_ps(fold(acc)), accf);
+        }
+        out[0][r - r0] = hsum_ggml(accf);
+    }
+}
+
 MAYA_ALWAYS_INLINE float row_iq2xxs(const uint8_t* row, int nblocks, const block_q8_K* y, const __m512i* T,
                                       const __m512i* pidx) {
     const __m512i lut = _mm512_set4_epi32(0, 0, 0, 0x002b1908);   // code -> grid byte, in every 128-bit lane
@@ -151,11 +268,48 @@ MAYA_ALWAYS_INLINE float row_iq2xxs(const uint8_t* row, int nblocks, const block
 
 bool iq512_one_supported(int type) noexcept {
     static const bool ok = cpu_avx512_ok() && cpu_bmi2_ok() && build_codes();
-    return ok && type == 16;
+    static const bool extra_on = [] {
+        const char* v = std::getenv("MAYA_GLM_CPU512_1T");
+        return v != nullptr && std::atoi(v) != 0 && cpu_nt1_iq512_ok() && codes3s().ok;
+    }();
+    return (ok && type == 16) || (extra_on && (type == 18 || type == 21 || type == 22));
 }
 
 void iq512_one_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                     float* const* out, int r0, int r1) {
+    if (r1 <= r0) return;
+    if (type == 22 || type == 18 || type == 21) {
+        // This entry point permits nt > 1, but these additions are intentionally
+        // one-token kernels. iq2v/iq3v stream adjacent blocks and write a range
+        // at output offset zero. Keep that fast path for packed matrices; a padded
+        // source must be submitted one logical row at a time.
+        const size_t packed_row_bytes = (size_t) (n / QK_K) *
+                                        (type == 22 ? sizeof(block_iq2_s) : type == 18 ? sizeof(block_iq3_xxs) : 0);
+        for (int t = 0; t < nt; ++t) {
+            const void* one_act[1] = {act[t]};
+            float* one_out[1] = {out[t] + r0};
+            if (type == 22) {
+                if (row_bytes == packed_row_bytes)
+                    iq2v::rows(13, w + (size_t) r0 * row_bytes, row_bytes, n, one_act, 1, one_out, 0, r1 - r0);
+                else
+                    for (int r = r0; r < r1; ++r) {
+                        float* row_out[1] = {out[t] + r};
+                        iq2v::rows(13, w + (size_t) r * row_bytes, row_bytes, n, one_act, 1, row_out, 0, 1);
+                    }
+            } else if (type == 18) {
+                if (row_bytes == packed_row_bytes)
+                    iq3v::rows_iq3xxs(5, w + (size_t) r0 * row_bytes, row_bytes, n, one_act, 1, one_out, 0, r1 - r0);
+                else
+                    for (int r = r0; r < r1; ++r) {
+                        float* row_out[1] = {out[t] + r};
+                        iq3v::rows_iq3xxs(5, w + (size_t) r * row_bytes, row_bytes, n, one_act, 1, row_out, 0, 1);
+                    }
+            } else {
+                rows_iq3s_512(w, row_bytes, n, one_act, one_out, r0, r1);
+            }
+        }
+        return;
+    }
     if (type != 16) return;
     __m512i T[8], pidx[4];
     for (int k = 0; k < 8; ++k) T[k] = _mm512_load_si512((const void*) (g_code16 + 32 * k));
