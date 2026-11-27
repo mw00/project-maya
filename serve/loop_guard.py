@@ -301,6 +301,7 @@ TOOL_WINDOW = 12        # the last this many tool calls since the user's last me
 TOOL_REPS = 3           # ... hold the last one (name, arguments and result the same) this many times: a loop
 TOOL_NUDGES = 3         # notes (tool_note) before the server stops running it: then the call itself is blocked
 TOOL_BLOCK = TOOL_REPS + TOOL_NUDGES - 1   # (made this many times: TOOL_NUDGES notes went by, unheeded)
+CYCLE_MAX = 100         # a loop of more than TOOL_WINDOW calls: whole rounds of up to this many calls, TOOL_REPS times over
 BLOCK_HEAT = 0.15       # each blocked attempt in one answer after the first: the temperature this much higher ...
 BLOCK_HEAT_MAX = 1.5    # ... up to this (off its track: the same call again and again is the model's surest path)
 
@@ -392,6 +393,21 @@ def _times(window: list[tuple], c: tuple) -> int:
     return max(exact, run)
 
 
+def _cycle(calls: list[tuple]) -> tuple[int, int]:
+    """(reps, p): how many times in a row the last round of a longer loop has run, and its length: the last p calls (p from TOOL_WINDOW + 1 to
+    CYCLE_MAX, the shortest that fits), name, arguments and result all the same, one round after another back to
+    the turn's start.  (0, 0) where there is none.  A round of up to TOOL_WINDOW calls is _times' business, and calls that
+    differ anywhere in a round never make a loop: only whole rounds repeated exactly count."""
+    n = len(calls)
+    for p in range(TOOL_WINDOW + 1, min(CYCLE_MAX, n // TOOL_REPS) + 1):
+        reps = 1
+        while (reps + 1) * p <= n and calls[n - (reps + 1) * p:n - reps * p] == calls[n - p:]:
+            reps += 1
+        if reps >= TOOL_REPS:
+            return reps, p
+    return 0, 0
+
+
 def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
     """The template messages (frontend.openai_to_messages / anthropic_to_messages) of a request that ends with tool
     results: is the last call one the model made TOOL_REPS times among its last TOOL_WINDOW since the user's last
@@ -403,6 +419,8 @@ def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
     if not calls:
         return None
     times = _times(calls[-TOOL_WINDOW:], calls[-1])
+    if times < TOOL_REPS:
+        times = _cycle(calls)[0]                # (a round of more than TOOL_WINDOW calls, repeated whole)
     return ToolRepeat(str(calls[-1][0]), times) if times >= TOOL_REPS else None
 
 
@@ -410,12 +428,18 @@ def tool_blocked(messages: list[dict]) -> dict[tuple[str, str], ToolRepeat]:
     """The calls this request's answer may not make again, by (name, args_key(arguments)): each made TOOL_BLOCK times
     among the last TOOL_WINDOW since the user's last message with the same arguments and result (_times) - the notes
     after TOOL_REPS of them did not stop it.  The model may still run anything else, these too with other arguments."""
-    window = _tool_calls(messages)[-TOOL_WINDOW:]
+    calls = _tool_calls(messages)
+    window = calls[-TOOL_WINDOW:]
     out = {}
     for c in window:
         t = _times(window, c)
         if t >= TOOL_BLOCK and t > out.get(c[:2], ToolRepeat("", 0)).times:
             out[c[:2]] = ToolRepeat(str(c[0]), t)
+    reps, p = _cycle(calls)
+    if reps >= TOOL_BLOCK:                      # a round of more than TOOL_WINDOW calls, run TOOL_BLOCK times whole
+        for c in calls[-p:]:
+            if reps > out.get(c[:2], ToolRepeat("", 0)).times:
+                out[c[:2]] = ToolRepeat(str(c[0]), reps)
     return {(str(k[0]), k[1]): v for k, v in out.items()}
 
 

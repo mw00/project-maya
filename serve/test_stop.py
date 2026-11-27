@@ -76,6 +76,13 @@ def hup_default() -> None:
     signal.signal(signal.SIGHUP, signal.SIG_DFL)
 
 
+def signals_default() -> None:
+    """(a child's preexec_fn) SIGINT and SIGHUP at their defaults: a suite run in the background (`&`, nohup) inherits
+    them ignored, and the server keeps an ignored signal ignored (by design)."""
+    for name in ("SIGINT", "SIGHUP"):
+        signal.signal(getattr(signal, name), signal.SIG_DFL)
+
+
 class Proc:
     """A process with its output read line by line (until() waits for a line)."""
 
@@ -86,7 +93,8 @@ class Proc:
                                   encoding="utf-8", errors="replace", bufsize=1, **kw)
         self.lines: queue.Queue = queue.Queue()
         self.seen: list = []
-        threading.Thread(target=self._pump, daemon=True).start()
+        self.pump = threading.Thread(target=self._pump, daemon=True)
+        self.pump.start()
 
     def _pump(self):
         for line in self.p.stdout:
@@ -111,7 +119,11 @@ class Proc:
         if self.p.poll() is None:
             self.p.kill()
         self.p.wait(timeout=30)
-        for f in (self.p.stdin, self.p.stdout):
+        # (the output pipe is closed only once its reader is done: a process the server left behind keeps the pipe
+        #  open, the reader then never sees its end, and close() on a pipe a thread still reads waits for that thread
+        #  without end - the suite hung there, intermittently, on a test that had already failed)
+        self.pump.join(timeout=5)
+        for f in (self.p.stdin, None if self.pump.is_alive() else self.p.stdout):
             if f is not None:
                 try:
                     f.close()
@@ -297,6 +309,63 @@ class ServerStops(unittest.TestCase):
         self.assertIsNone(p.p.poll())
         p.p.send_signal(signal.SIGTERM)
         self.ended(p, "SIGTERM")
+
+
+TREE_SCRIPT = """import subprocess, sys, time
+if len(sys.argv) > 1:
+    time.sleep(90)
+g = subprocess.Popen([sys.executable, __file__, 'leaf'])
+print(g.pid, flush=True)
+time.sleep(90)
+"""
+
+
+@unittest.skipUnless(psutil is not None, "psutil")
+class StopWhileLoading(unittest.TestCase):
+    """#1181: a stop signal while the engine still loads ends the server and the engine - none is left holding the GPUs."""
+
+    def run_case(self, sig):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = fake_config(Path(tmp.name))
+        env = dict(os.environ, FAKE_ENGINE_LOAD_S="120")        # (a load that takes two minutes)
+        kw = {} if WIN else {"preexec_fn": signals_default}
+        p = Proc(server_cmd(cfg, free_port()), stdin=subprocess.DEVNULL, env=env, **kw)
+        self.addCleanup(p.close)
+        self.assertTrue(p.until("loading the model", 60), p.seen)
+        end = time.monotonic() + 30
+        tree = []
+        while len(tree) < 1 and time.monotonic() < end:         # (the engine, and on Windows the .bat's python)
+            time.sleep(0.2)
+            tree = descendants(p.p.pid)
+        self.assertTrue(tree, "the engine did not start")
+        self.addCleanup(lambda: kill_all(tree))
+        p.p.send_signal(sig)
+        p.p.wait(timeout=60)
+        self.assertEqual(gone(tree, 20), [], "the engine outlived the server")
+
+    @unittest.skipIf(WIN or not FAKE_ENGINE, "POSIX signals; the tokenizer's regex module")
+    def test_sigterm_during_load(self):
+        self.run_case(signal.SIGTERM)
+
+    @unittest.skipIf(WIN or not FAKE_ENGINE, "POSIX signals; the tokenizer's regex module")
+    def test_sigint_during_load(self):
+        self.run_case(signal.SIGINT)
+
+    def test_end_spawned_ends_the_tree(self):
+        """The exit hook (every path out of main(): an exception, sys.exit): the registered program and what it started
+        end - on Windows with taskkill /T, elsewhere SIGTERM then kill."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "tree.py"
+        script.write_text(TREE_SCRIPT, encoding="utf-8")
+        c = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+        grand = int(c.stdout.readline())
+        self.addCleanup(lambda: kill_all([c.pid, grand]))
+        SV._SPAWNED.append(c)
+        SV.end_spawned(2)
+        self.assertIsNotNone(c.poll())
+        self.assertEqual(gone([grand], 10), [])
 
 
 DRIVER = """

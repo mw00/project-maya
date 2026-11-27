@@ -10,7 +10,7 @@
 //     up to 16384 tokens, so each pass streams every expert it misses once, the next layer's prefetched while this one
 //     runs; a scan-resistant eviction keeps a pass from flushing the cache.  IK2_WARM fills the cache at load with the
 //     experts tokens pick most (a profile written with IK2_POP_OUT).
-//   * Decode a token at a time; with IK2_CPU=1 a missing expert is computed on the CPU (AVX-512) when that is sooner
+//   * Decode a token at a time; with IK2_CPU=1 a missing expert is computed on the CPU (AVX-512 or AVX2) when that is sooner
 //     than its copy.  Two GPUs (--gpus 2): IK2_EP=1 deals each layer's experts to both (expert parallel - each with its
 //     own cache and PCIe link), else the layers are split between them.
 //
@@ -27,10 +27,13 @@
 #include "ik2_kernels.cuh"
 #include "ik2_lane.hpp"
 #include "ik2_off.cuh"
+#include "ik2_tier.hpp"
 #include "mm3_link.cuh"   // (two GPUs: the copies between them, peer only where tested)
 #include "maya/artifact/gguf_reader.hpp"
 #include "maya/spec/suffix_drafter.hpp"
 #include "../ds4/ds4_watchdog.hpp"   // (--serve's heartbeat rule, maya-ds4's)
+#include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: tools/ablate_fit.py's read-out)
+#include "../mm3/mm3_ablate.hpp"   // (--ablate's direction file: the control vector's loader)
 #ifdef MAYA_USE_HIP
 #include "ds4_lt.hpp"   // (AMD: the prompt's FP16 GEMMs on hipBLASLt, the kernel a shape measured and kept)
 #endif
@@ -47,6 +50,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
+#include <process.h>
 #define O_RDONLY (_O_RDONLY | _O_BINARY)
 #define open _open
 #define close _close
@@ -66,6 +70,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -95,18 +100,28 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
 
 namespace k = ik2::k;
+// A fatal error ends the engine at once: stdout and stderr are flushed, then out WITHOUT std::exit - its flush of every
+// stdio stream takes stdin's lock, which the --serve reader thread holds while it waits for input, and its static
+// destructors may wait on the GPU while our threads still use it (#1136).
+[[noreturn]] inline void fatal_exit() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
 
 #define CU(x)                                                                                              \
     do {                                                                                                   \
         cudaError_t e_ = (x);                                                                              \
         if (e_ != cudaSuccess) {                                                                           \
             std::fprintf(stderr, "maya-ik2: %s: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                   \
         }                                                                                                  \
     } while (0)
 #define CB(x)                                                                                              \
@@ -114,13 +129,13 @@ namespace k = ik2::k;
         cublasStatus_t e_ = (x);                                                                           \
         if (e_ != CUBLAS_STATUS_SUCCESS) {                                                                 \
             std::fprintf(stderr, "maya-ik2: %s: cuBLAS status %d (line %d)\n", #x, (int) e_, __LINE__);    \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                   \
         }                                                                                                  \
     } while (0)
 
 [[noreturn]] void die(const std::string& m) {
     std::fprintf(stderr, "maya-ik2: %s\n", m.c_str());
-    std::exit(1);
+    fatal_exit();
 }
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -296,10 +311,10 @@ cudaStream_t g_s;
 cudaStream_t g_cs;          // the experts' copies of the token path, beside the compute stream
 cudaEvent_t g_ev;
 bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, before the experts
-// The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
+// The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory on hy4::Lane while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
-ik2::cpu::Pool* g_pool = nullptr;
-double g_t_cpu = 0.5e-3, g_t_up = 0.36e-3;   // seconds an expert: the pool's (measured as it runs), the link's
+std::unique_ptr<ik2::cpu::Lane> g_cpu;
+double g_t_cpu = 0.5e-3, g_t_up = 0.36e-3;   // seconds an expert: the lane's (measured as it runs), the link's
 uint64_t g_n_cpu = 0, g_n_wait = 0;
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
 constexpr int kRing = 256;
@@ -934,8 +949,11 @@ struct ExpertCache {
         die("expert cache: no slot free");
     }
 
+    // order (the offload path's tier, given): the experts' keys in the order the pools take them (ik2_tier.hpp's
+    // layer_order) instead of by picks a byte; alloc false: the pools only sized (what v1.1.82's tier would hold)
     void init(const std::vector<Layer>& L, int dev, int n_layers_in, int E_in, size_t budget,
-              const std::vector<double>* value = nullptr) {
+              const std::vector<double>* value = nullptr, const std::vector<int>* order = nullptr,
+              bool alloc = true) {
         n_layers = n_layers_in;
         E = E_in;
         layer_pool.assign(n_layers, -1);
@@ -1005,7 +1023,14 @@ struct ExpertCache {
             pools[p].n_slots = std::clamp((int) std::floor(pools[p].n_layers * lo), pmin[p], pmax[p]);
             used += (size_t) pools[p].n_slots * pools[p].slot_bytes;
         }
-        if (value && value->size() == (size_t) n_layers * E) {
+        if (value && value->size() == (size_t) n_layers * E && order && order->size() == (size_t) n_layers * E) {
+            std::vector<size_t> psb(pools.size());
+            std::vector<int> ns;
+            for (size_t p = 0; p < pools.size(); ++p) psb[p] = pools[p].slot_bytes;
+            const size_t left = ik2::tier::size_pools(*order, layer_pool, E, psb, pmin, pmax, budget, ns);
+            for (size_t p = 0; p < pools.size(); ++p) pools[p].n_slots = ns[p];
+            used = budget - left;
+        } else if (value && value->size() == (size_t) n_layers * E) {
             // (the offload path's tier: the pools sized by what their experts are worth a byte - a profile's picks
             //  over the slot's bytes, the most first - each pool at least its minimum, the prompt path's)
             std::vector<std::pair<double, int>> ord;   // (picks a byte, pool)
@@ -1043,6 +1068,8 @@ struct ExpertCache {
         for (size_t p = 0; p < pools.size(); ++p) {
             Pool& P = pools[p];
             P.prob_cap = std::max(1, P.n_slots / 5);
+            P.n_active = P.n_slots;
+            if (!alloc) continue;
             P.data = dalloc<uint8_t>((size_t) P.n_slots * P.slot_bytes);
             P.owner.assign(P.n_slots, -1);
             P.used.assign(P.n_slots, 0);
@@ -1295,6 +1322,59 @@ void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, in
     CU(cudaMemcpyAsync(Ly.rec_x[which], x, (size_t) T * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
 }
 
+// ---- refusal ablation (--ablate FILE, docs/SETTINGS.md "Refusal ablation per request"): a unit direction r [C]
+// projected out of every residual write of every layer VISIT - the attention's (the short conv's output, before it
+// joins the stream or starts a block) and the MoE's - y <- y - scale * r (r . y), so a looped core's three passes each
+// project their own writes.  Per conversation (GEN ablate=0|1; a --parallel slot each): a conversation that does not
+// ask runs the launches it always did.  The drafter only proposes, the main layers check every draft.
+int g_slot_cur = 0;   // (--parallel: the conversation bound to the visits)
+int g_cur = -1;       // (the GPU in use: use_dev)
+namespace abl {
+constexpr int kSlots = 16;
+bool loaded = false;                 // a direction is loaded (INFO ablate=1)
+bool on[kSlots] = {};                // per conversation slot: its forwards project it out
+bool dflt = true;                    // --ablate-default (the server starts the engine with off)
+float scale = 1.0f;
+std::vector<float> dir;
+std::vector<float*> dev;             // a copy on each GPU
+std::string what;
+std::string path;                    // --ablate FILE (empty: none)
+int layer = 0;                       // --ablate-layer N (0: the file's only direction)
+float want_scale = 0.0f;             // --ablate-scale F (0: the file's)
+inline bool cur() { return loaded && on[g_slot_cur]; }
+inline bool row(int slot) { return loaded && slot >= 0 && slot < kSlots && on[slot]; }
+}  // namespace abl
+inline const float* abl_r() { return abl::dev.empty() ? nullptr : abl::dev[(size_t) std::max(0, g_cur)]; }
+// y [T][C] is a residual write (the conv's output, res not added): project it (or, in a fitting run, read it out and
+// add res alone - the plain model's answer), then add res (null: none).  In place.
+void abl_write(float* y, const float* res, int T, int C, bool ablating = true) {
+    if (!ablating) {
+        if (res != nullptr) k::project_res(y, abl_r(), 0.0f, res, T, C, g_s);
+        return;
+    }
+    if (maya::ablcap::on()) {
+        maya::ablcap::put(y, T, C, g_s);
+        k::project_res(y, abl_r(), 0.0f, res, T, C, g_s);
+        return;
+    }
+    k::project_res(y, abl_r(), abl::scale, res, T, C, g_s);
+}
+// the short conv with its residual (res null: none) into out [T][C]; ablating: the conv alone, projected, then the
+// residual added (the fused kernel's sum split in two where the write must be seen)
+void conv_write(const float* x, float* hist, const float* w, int T, int C, const float* res, float* out) {
+    if (!abl::cur()) {
+        k::conv4_res(x, hist, w, nullptr, 0, T, C, res, out, g_s);
+        return;
+    }
+    k::conv4_res(x, hist, w, nullptr, 0, T, C, nullptr, out, g_s);
+    abl_write(out, res, T, C);
+}
+// one token's MoE write: the combine and the conv after it (W.y32 -> W.h, the stream W.r added), `ablating` as above
+void combine_write(const Work& W, const Layer& Ly, int K, int C, bool ablating) {
+    k::moe_combine_conv(W.y32, W.inv, W.wt, K, C, Ly.h_mlp, Ly.sc_mlp, ablating ? nullptr : W.r, W.h, g_s);
+    if (ablating) abl_write(W.h, W.r, 1, C);
+}
+
 // The pictures of the request running (GENI): the image encoder's rows (maya-vision's SVE1 records, [n][C] F32), each
 // in place of one image token of the prompt - the model reads them as they are, without the embedding's norm.
 struct Pictures {
@@ -1370,7 +1450,6 @@ struct DevCtx {
     ExpertCache EC;
 };
 std::vector<DevCtx> g_dev;
-int g_cur = -1;
 Work& dev_work(int d) { return g_dev[d].W; }
 ExpertCache& dev_cache(int d) { return g_dev[d].EC; }
 void use_dev(int d) {
@@ -1825,9 +1904,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
-        k::conv4(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, r_out, g_s);
+        conv_write(W.tmp, Ly.h_attn, Ly.sc_attn, T, C, nullptr, r_out);
     } else {
-        k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
+        conv_write(W.tmp, Ly.h_attn, Ly.sc_attn, T, C, h_in, r_out);
     }
 }
 
@@ -1871,6 +1950,12 @@ struct OffState {
 };
 OffState g_offs;
 bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at load)
+// The VRAM tier's order (ik2_tier.hpp, set at load; IK2_TIER_ORDER=layers / picks: tests): each expert key's place
+// in the whole-layer order where the tier was filled that way, empty for picks a byte (v1.1.82's order) - the KV
+// lending and GPU 1's share then take the same order.  g_tier_h_picks: the share of the profile's picks v1.1.82's
+// tier holds (the decode mode's estimate, whatever the order; -1: not worked out)
+std::vector<int> g_tier_rank;
+double g_tier_h_picks = -1;
 // Drafting on the offload path (a long context on a card that then keeps a tier of the experts): the verify window
 // takes the token path's mode A arithmetic - the resident kernels over the tier's or staging's bytes - so it runs
 // where mode A decodes (not lane parity, whose sums are ik2_exact.h's), with the whole cache in VRAM, on one GPU.
@@ -2057,6 +2142,51 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         CU(cudaMemcpyAsync(X.sg, sg, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+
+        // an expert's gate / up ([n][2 F] F32 from n FP16 rows of C) and down ([n][C] from n rows of F)
+        auto gate_up = [&](int e, const uint16_t* x16, int n, float* gu) {
+            const uint8_t* sl = X.slot_ptrs[e];
+            if (Ly.ty[0] == Ly.ty[1]) {
+                k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
+            } else {
+                k::decode_f16(Ly.ty[0], sl, (size_t) F * C, X.w16, g_s);
+                k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, X.w16 + (size_t) F * C, g_s);
+            }
+            gemm16(X.w16, 2 * F, C, x16, n, gu, 2 * F);
+        };
+        auto down = [&](int e, const uint16_t* h16, int n, float* y) {
+            k::decode_f16(Ly.ty[2], X.slot_ptrs[e] + Ly.eb[0] + Ly.eb[1], (size_t) C * F, X.w16, g_s);
+            gemm16(X.w16, C, F, h16, n, y, C);
+        };
+        // IK2_BATCH_PREFILL=1 (one GPU, every pick's expert in VRAM, a chunk of 64 tokens or more, the scratch big
+        // enough): the chunk's picks gathered once, grouped by expert; each expert's gate / up and down over its rows;
+        // one SwiGLU over all of them; then each token's picks summed in expert order (moe_rows_combine: the order
+        // run_exp adds them in, the same bits) - a gather, a SwiGLU and an add a chunk instead of one each an expert.
+        // The rows live in lg (the attention's scratch, free until the next visit) and gu32.
+        // (alesha-pro/maya-inkling-mini; AMD: its matrix-core path below)
+#ifndef MAYA_USE_HIP
+        static const bool batch_prefill = getenv("IK2_BATCH_PREFILL") && std::atoi(getenv("IK2_BATCH_PREFILL"));
+        if (batch_prefill && d < 0 && !g_off && n_miss == 0 && T >= 64 && c.K <= 16 && C % 4 == 0 &&
+            (size_t) S * (2 * std::max(C, F) + 4 * C) <= X.lg_cap * 4 && (size_t) S * 2 * F * 4 <= X.gu32_bytes) {
+            if (X.pf_layers[l % Work::kPfRing] == l) {   // (the prefetches these experts are in, waited for)
+                int b = -1;
+                for (int e = 0; e < c.E; ++e)
+                    if (W.cnt[e]) b = std::max(b, X.pf_bs[l % Work::kPfRing][e]);
+                if (b >= 0) CU(cudaStreamWaitEvent(g_s, X.pf_evs[l % Work::kPfRing][b], 0));
+            }
+            uint16_t* rows16 = (uint16_t*) X.lg;                                      // [S][max(C, F)]: x, then h
+            float* rows32 = (float*) (rows16 + (size_t) S * std::max(C, F));          // [S][C]: down's
+            gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, rows16);
+            for (int e : X.hit_exps)
+                gate_up(e, rows16 + (size_t) W.start[e] * C, W.cnt[e], X.gu32 + (size_t) W.start[e] * 2 * F);
+            k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, rows16, g_s);
+            for (int e : X.hit_exps)
+                down(e, rows16 + (size_t) W.start[e] * F, W.cnt[e], rows32 + (size_t) W.start[e] * C);
+            k::moe_rows_combine(rows32, X.inv, X.wtr, T, c.K, C, X.tmp, g_s);
+            X.pf_layers[l % Work::kPfRing] = -1;
+            return;
+        }
+#endif
         CU(cudaMemsetAsync(X.tmp, 0, (size_t) T * C * 4, g_s));
 
         // Each expert: its tokens gathered, gate/up, SwiGLU, down, then added into tmp with their weights. The experts run
@@ -2064,18 +2194,10 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         // depend on the cache. Only [T][C] of scratch: no [T * K][C] copies of the inputs or the outputs.
         auto run_exp = [&](int e) {
             const int cnt_e = W.cnt[e], st_e = W.start[e];
-            const uint8_t* sl = X.slot_ptrs[e];
             gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
-            if (Ly.ty[0] == Ly.ty[1]) {
-                k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
-            } else {
-                k::decode_f16(Ly.ty[0], sl, (size_t) F * C, X.w16, g_s);
-                k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, X.w16 + (size_t) F * C, g_s);
-            }
-            gemm16(X.w16, 2 * F, C, X.ex16, cnt_e, X.gu32, 2 * F);
+            gate_up(e, X.ex16, cnt_e, X.gu32);
             k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
-            k::decode_f16(Ly.ty[2], sl + Ly.eb[0] + Ly.eb[1], (size_t) C * F, X.w16, g_s);
-            gemm16(X.w16, C, F, X.h16, cnt_e, X.y32, C);
+            down(e, X.h16, cnt_e, X.y32);
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
         };
         if (g_off) {
@@ -2336,7 +2458,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     g_pf.lap(g_pf.experts);
     t_exp += now() - te0;
     conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-    k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
+    conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, r_in, h_out);
 }
 
 void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
@@ -2401,6 +2523,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // embedding and its logits: no routing round trip a layer, no table upload.  The position is read on the device too
 // (W.pos), so a token's launches do not change from one token to the next and are replayed as one CUDA graph.  The
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
+uint16_t* g_draft_head16 = nullptr;   // (the drafter's FP16 copy of a head kept as blocks other than Q8_0; else null)
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
@@ -2413,7 +2536,28 @@ struct FastGraph {
     cudaGraphExec_t exec = nullptr;
 };
 FastGraph g_fgraph[4];      // by OutMode
-int g_slot_cur = 0, g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits, the one g_fgraph holds)
+bool g_graph_full = false;  // the card has no device memory left for one more graph: no new ones, the launches go one by one
+// G's capture has ended: its graph instantiated.  False when the card has no device memory left for it (a graph's
+// executable holds device memory, and --parallel records one a set of conversations): then G stays empty, no graph is
+// recorded after it, and the caller launches its kernels itself - the same kernels, one by one
+bool graph_exec(FastGraph& G) {
+    size_t fr = 0, tot = 0;
+    const bool low = cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < ((size_t) 256 << 20);
+    if (!low) {
+        const cudaError_t e = cudaGraphInstantiate(&G.exec, G.graph, 0);
+        if (e == cudaSuccess) return true;
+        if (e != cudaErrorMemoryAllocation) CU(e);
+        (void) cudaGetLastError();
+    }
+    cudaGraphDestroy(G.graph);
+    G.graph = nullptr, G.exec = nullptr;
+    if (!g_graph_full)
+        std::fprintf(stderr, "maya-ik2: no device memory left for more CUDA graphs: the other steps run one by one\n");
+    g_graph_full = true;
+    return false;
+}
+int g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits (g_slot_cur above), the one g_fgraph holds)
+bool g_fgraph_abl = false, g_bgraph_abl = false;   // (--ablate: the projection the graphs were recorded with)
 
 // ---- two GPUs (--gpus 2, the split): GPU 0 runs the offload path (the dense weights, the K / V cache, every prompt,
 // its tier of the experts, the misses fetched from host memory); GPU 1 holds the next experts by the profile's picks a
@@ -2442,6 +2586,17 @@ struct TwoGpu {
     uint16_t* wlimbs = nullptr;
     int *wroute = nullptr, *wn = nullptr, *wtok = nullptr, *wrow = nullptr;
     const uint8_t** wblob = nullptr;
+    // (IK2_PEER_DIRECT_SIGNAL=1: the hand-off through host memory both map - a ring of k::MailLayout slots and the visits'
+    //  numbers in its words; two_send_mail.  CUDA, NVIDIA sm_70 and newer.)
+    bool mail = false;
+    unsigned char* mail_h = nullptr;   // the ring: pinned host memory
+    unsigned char* mail_d0 = nullptr;  // its bytes as GPU 0 addresses them
+    unsigned char* mail_d1 = nullptr;  // ... as GPU 1 does
+    float* rcv = nullptr;              // on GPU 1: a visit's x and logits, copied in from the slot
+    k::MailLayout ml;
+    unsigned long long visits = 0;    // the visits handed over; their numbers are the low 32 bits (T.n)
+    unsigned n = 0;                    // the last visit's number: a slot's words are compared with it
+    cudaEvent_t ev_mail = nullptr;     // GPU 0's stream, after a visit's message: GPU 1's stream waits it
     gpulink::Links link;
     int n_exp = 0;
     size_t bytes = 0;
@@ -2495,6 +2650,73 @@ void two_take(const Model& M, Work& W) {
     else if (!T.link.copy(1, T.s, T.y32, 0, g_s, T.y_in, (size_t) c.K * c.C * 4, g_s, err)) die(err);
     CU(cudaSetDevice(0));
     k::two_take_rows(W.blob, T.y_in, c.K, c.C, W.y32, g_s);
+}
+
+#if !defined(MAYA_USE_HIP)
+// (IK2_PEER_DIRECT_SIGNAL=1: the same visit, its hand-off through host memory both map, without a copy - k::mail_send,
+// mail_recv, mail_publish, two_take_rows_mail.  GPU 0 writes x and the logits into the ring's slot; GPU 1's stream,
+// woken by an event once they are, copies the bytes in, routes and runs its picks as above and writes their rows into
+// the slot; GPU 0 takes the rows only where it has a pick of GPU 1's - a visit without one (most: GPU 1 holds the
+// experts the profile picks rarely) waits for nothing at all.)
+void two_send_mail(const Model& M, int l, Work& W, bool exp_tc) {
+    const Config& c = M.c;
+    const Layer& Ly = M.L[l];
+    TwoGpu& T = g_two;
+    const int C = c.C;
+    int* rtop = T.route_d;
+    float* rw = (float*) (T.route_d + c.K);
+    // (the numbers are the visits' low 32 bits, so they wrap: the visit that used the slot last is then visits - kMailSlots
+    //  as well - 0 only on the first turn)
+    const unsigned long long v = ++T.visits;
+    const unsigned n = T.n = (unsigned) v;
+    const size_t off = (n % k::kMailSlots) * T.ml.slot;
+    unsigned char* d0 = T.mail_d0 + off;
+    unsigned char* d1 = T.mail_d1 + off;
+    k::mail_send(W.xq, W.rlog, C, c.E, (float*) (d0 + T.ml.x), (const unsigned*) (d0 + T.ml.freed),
+                 n, v > (unsigned long long) k::kMailSlots ? (unsigned) (v - k::kMailSlots) : 0u,
+                 (unsigned*) (T.mail_d0 + T.ml.err), g_s);
+    CU(cudaEventRecord(T.ev_mail, g_s));   // (GPU 1's stream after the message: woken by the event, not polling for it)
+    CU(cudaSetDevice(T.dev));
+    CU(cudaStreamWaitEvent(T.s, T.ev_mail, 0));
+    float* const xq = T.rcv;
+    float* const rlog = T.rcv + C;
+    k::mail_recv((const float*) (d1 + T.ml.x), C, c.E, xq, rlog, (unsigned*) (d1 + T.ml.freed), n, T.s);
+    k::route_token(rlog, T.bias[l], c.E, c.K, c.route_scale, T.tab[l], T.sc[0][l], T.sc[1][l], T.sc[2][l], rtop, rw, T.blob,
+                   T.tok, T.inv, T.sg, T.su, T.wt, T.s, xq, C, exp_tc ? (uint16_t*) T.gu32 : nullptr);
+    if (exp_tc) {
+        k::experts_gate_up_swiglu_mma(T.blob, c.K, Ly.eb[0], (const uint16_t*) T.gu32, C, c.F, T.sg, T.su, c.gate_cap, c.up_cap,
+                                      T.h16, T.s);
+        k::experts_down_mma(T.blob, c.K, Ly.eb[0] + Ly.eb[1], T.h16, C, c.F, T.y32, T.s);
+    } else {
+        k::experts_gate_up_swiglu(T.blob, T.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], xq, C, c.F, T.sg, T.su, c.gate_cap, c.up_cap,
+                                  T.h16, T.s);
+        k::experts_down(T.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], T.h16, C, c.F, T.y32, T.s);
+    }
+    k::mail_publish(T.blob, T.y32, c.K, C, (float*) (d1 + T.ml.rows), (unsigned*) (d1 + T.ml.rows_word), n, T.s);
+#if defined(_WIN32)
+    (void) cudaStreamQuery(T.s);
+#endif
+    CU(cudaSetDevice(0));
+}
+void two_take_mail(const Model& M, Work& W) {
+    const Config& c = M.c;
+    TwoGpu& T = g_two;
+    unsigned char* d0 = T.mail_d0 + (T.n % k::kMailSlots) * T.ml.slot;
+    k::two_take_rows_mail(W.blob, (const float*) (d0 + T.ml.rows), (const unsigned*) (d0 + T.ml.rows_word), T.n, c.K, c.C, W.y32,
+                          (unsigned*) (T.mail_d0 + T.ml.err), g_s);
+}
+#endif
+// (IK2_PEER_DIRECT_SIGNAL=1: a hand-off's wait that ran out of time is seen once the token's work is done - never an answer from
+// rows that are not there)
+void two_mail_check() {
+#if !defined(MAYA_USE_HIP)
+    if (!g_two.mail) return;
+    const unsigned n = *reinterpret_cast<volatile unsigned*>(g_two.mail_h + g_two.ml.err);
+    if (n)
+        die("two GPUs, the hand-off through host memory (IK2_PEER_DIRECT_SIGNAL=1): visit " + std::to_string(n) +
+            " waited more than " + std::to_string(k::kMailWaitNs / 1000000) + " ms for the other GPU - its work stopped or"
+            " failed; the answers would not be its rows");
+#endif
 }
 
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
@@ -2715,7 +2937,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         // stream joins the blocks and starts again)
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
-        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
+        const bool ab = abl::cur();   // (--ablate: the conv's output alone, projected, then the stream added)
+        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first || ab ? nullptr : W.h, W.r});
+        if (ab) abl_write(W.r, first ? nullptr : W.h, 1, C);
         if (first) ++nb;
         // the MoE: its input, the router and the picks' tables on the device, the experts
         {
@@ -2743,7 +2967,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
 #endif
         const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
-        if (g_two.on) two_send(M, l, W, exp_tc);   // (two GPUs: GPU 1's picks there, beside GPU 0's)
+        if (g_two.on) {   // (two GPUs: GPU 1's picks there, beside GPU 0's - through the ring when IK2_PEER_DIRECT_SIGNAL=1)
+#if !defined(MAYA_USE_HIP)   // (the ring is NVIDIA's: g_two.mail stays false in a HIP build)
+            if (g_two.mail) two_send_mail(M, l, W, exp_tc);
+            else
+#endif
+            two_send(M, l, W, exp_tc);
+        }
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                        exp_tc ? (uint16_t*) W.gu32 : nullptr);
@@ -2758,7 +2988,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                  c.up_cap, g_offs.hx, g_s);
                 k::off_down_x(W.blob, g_offs.cls, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], g_offs.hx, C, c.F, W.y32, g_s);
                 k::off_lane_wait(g_offs.ls, g_offs.done_d, C, W.y32, g_s);
-                k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+                combine_write(W, Ly, c.K, C, abl::cur());
                 continue;
             }
             k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
@@ -2774,8 +3004,14 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                       c.gate_cap, c.up_cap, W.h16, g_s);
             k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
-        if (g_two.on) two_take(M, W);
-        k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+        if (g_two.on) {
+#if !defined(MAYA_USE_HIP)
+            if (g_two.mail) two_take_mail(M, W);
+            else
+#endif
+            two_take(M, W);
+        }
+        combine_write(W, Ly, c.K, C, abl::cur());
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head
@@ -2894,9 +3130,12 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
     for (int i = 0; i < nE; ++i)
         if (!tier[i]) cand.push_back(i);
     auto val = [&](int i) { return value.empty() ? 1.0 : value[(size_t) i] + 1.0; };
-    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
-        return val(a) / (double) M.L[a / E].slot_bytes > val(b) / (double) M.L[b / E].slot_bytes;
-    });
+    if (g_tier_rank.size() == (size_t) nE)   // (the tier's whole-layer order: GPU 1 takes the next in it)
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return g_tier_rank[a] < g_tier_rank[b]; });
+    else
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
+            return val(a) / (double) M.L[a / E].slot_bytes > val(b) / (double) M.L[b / E].slot_bytes;
+        });
     T.own.assign(nE, 0);
     std::vector<int> per(c.n_layer, 0);
     size_t used = 0;
@@ -2961,6 +3200,25 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
                       hs && std::atoi(hs), hp && std::atoi(hp), yb, yb, "IK2_HOST_STAGE", err))
         die(err);
     CU(cudaSetDevice(0));
+#ifndef MAYA_USE_HIP
+    // (IK2_PEER_DIRECT_SIGNAL=1: the ring in host memory both cards map, its words at 0 - two_send_mail)
+    if (const char* m = getenv("IK2_PEER_DIRECT_SIGNAL"); m && std::atoi(m)) {
+        T.ml = k::mail_layout(C, c.E, K, kTwoWin);
+        if (cudaHostAlloc((void**) &T.mail_h, T.ml.ring + 128, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+            (void) cudaGetLastError();
+            die("IK2_PEER_DIRECT_SIGNAL=1: the ring's host memory (" + std::to_string(T.ml.ring >> 10) + " KiB, pinned and mapped) did not come");
+        }
+        std::memset(T.mail_h, 0, T.ml.ring + 128);
+        CU(cudaSetDevice(0));
+        CU(cudaHostGetDevicePointer((void**) &T.mail_d0, T.mail_h, 0));
+        CU(cudaEventCreateWithFlags(&T.ev_mail, cudaEventDisableTiming));
+        CU(cudaSetDevice(T.dev));
+        CU(cudaHostGetDevicePointer((void**) &T.mail_d1, T.mail_h, 0));
+        T.rcv = dalloc<float>((size_t) kTwoWin * C + std::max(c.E, 2 * kTwoWin * K));
+        T.mail = true;
+        CU(cudaSetDevice(0));   // (the caller left GPU 0 current: back there)
+    }
+#endif
     T.on = true;
     g_offs.tick = ~0ull;   // (GPU 0's tables again: GPU 1's experts marked)
     off_tables(M);
@@ -2970,7 +3228,9 @@ bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
                 "a token's experts on both GPUs, every prompt on GPU 0",
                 cls0 == cls1 ? "one kind (one GPU's answers)" : "two kinds (each GPU's own kernels; the split kept "
                                                                 "in whole GiB, so it repeats from start to start)",
-                T.link.say.c_str());
+                (T.mail ? "through host memory both map (IK2_PEER_DIRECT_SIGNAL=1: a ring of " + std::to_string(k::kMailSlots) +
+                                                                " slots)"
+                                          : T.link.say).c_str());
     std::fflush(stdout);
     return true;
 }
@@ -3094,9 +3354,12 @@ void lend_grow(Model& M, int end) {
     std::vector<int> cand;
     for (int key = 0; key < c.n_layer * c.E; ++key)
         if (EC.loc[key] < 0 && !g_lend.placed[key]) cand.push_back(key);
-    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
-        return val[a] / M.L[a / c.E].slot_bytes > val[b] / M.L[b / c.E].slot_bytes;
-    });
+    if (g_tier_rank.size() == (size_t) c.n_layer * c.E)   // (the tier's whole-layer order: the next in it first)
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return g_tier_rank[a] < g_tier_rank[b]; });
+    else
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
+            return val[a] / M.L[a / c.E].slot_bytes > val[b] / M.L[b / c.E].slot_bytes;
+        });
     const double t0 = now();
     int n = 0;
     for (int key : cand) {
@@ -3145,6 +3408,58 @@ inline void lend_check(Model& M, int end, bool token = false) {
 // The lane-parity mode (IK2_LANE=1, =fetch / =cpu: every miss to one side - tests): the CPU lane started and the
 // split's figures measured here (an expert on the lane, over the bus, on the GPU).  False: the layers' experts are
 // not in formats the exact lane has (NVFP4 / Q8_0, gate and up of one type) - the offload path goes on without it.
+// (whether the exact lane has every layer's expert formats - lane_init's own test, also asked before the tier's plan)
+bool lane_formats(const Model& M) {
+    const Config& c = M.c;
+    auto fmt_ok = [](int t) { return t == k::kNVFP4 || t == k::kQ8_0; };
+    if (c.F % 32 || c.C % 64 || c.K > k::kOffMaxK) return false;
+    for (int l = 0; l < c.n_layer; ++l) {
+        const Layer& Ly = M.L[l];
+        if (!fmt_ok(Ly.ty[0]) || Ly.ty[1] != Ly.ty[0] || !fmt_ok(Ly.ty[2])) return false;
+    }
+    return true;
+}
+
+// The per-PC calibration's file (IK2_CALIB: its file, default ~/.maya/ik2-offload-calib.txt; "0" or empty: none)
+// and this GPU's, CPU's and lane's key in it; lane_calib_read: the key's last line (false: none kept yet)
+std::string lane_calib_path() {
+    const char* ce = getenv("IK2_CALIB");
+    std::string cal_path = ce && *ce ? ce : "";
+    if (cal_path.empty()) {
+        const char* home = getenv("HOME") ? getenv("HOME") : getenv("USERPROFILE");
+        if (home) cal_path = std::string(home) + "/.maya/ik2-offload-calib.txt";
+    }
+    return cal_path;
+}
+std::string lane_calib_key(const Config& c, int threads) {
+    cudaDeviceProp p{};
+    CU(cudaGetDeviceProperties(&p, 0));
+    size_t fr = 0, tot = 0;
+    CU(mem_info(&fr, &tot));
+    char kb[256];
+    std::snprintf(kb, sizeof kb, "%s|%zu MiB|%u logical|%zu physical|%s|lane %d|C %d F %d", p.name, tot >> 20,
+                  std::thread::hardware_concurrency(), maya::kernels::cpu::physical_cores(false).size(),
+                  ik2::lane::rows_form(), threads, c.C, c.F);
+    std::string key = kb;
+    for (char& ch : key) ch = ch == ' ' ? '_' : ch;
+    return key;
+}
+bool lane_calib_read(const std::string& cal_path, const std::string& key, k::LaneCost& cal, int& cal_thr) {
+    bool have = false;
+    if (!cal_path.empty() && cal_path != "0")
+        if (std::ifstream in(cal_path); in)
+            for (std::string ln; std::getline(in, ln);) {
+                std::istringstream is(ln);
+                std::string kk;
+                k::LaneCost t{};
+                int th = 0;
+                if ((is >> kk >> th >> t.cpu[0] >> t.cpu[1] >> t.fetch[0] >> t.fetch[1] >> t.gpu[0] >> t.gpu[1] >> t.lat) &&
+                    kk == key && th > 0)
+                    cal = t, cal_thr = th, have = true;   // (the last line of the key wins)
+            }
+    return have;
+}
+
 bool lane_init(Model& M, const std::string& want, int threads) {
     const Config& c = M.c;
     const int C = c.C, F = c.F, K = c.K;
@@ -3195,39 +3510,10 @@ bool lane_init(Model& M, const std::string& want, int threads) {
     // The per-PC calibration (IK2_CALIB: its file, default ~/.maya/ik2-offload-calib.txt; 0: measured every start,
     // not kept): the lane's size and the split's figures measured once for this GPU, CPU and layer formats, kept
     // under that key and read back on the next start (the decode re-times the lane as it goes either way).
-    const char* ce = getenv("IK2_CALIB");
-    std::string cal_path = ce && *ce ? ce : "";
-    if (cal_path.empty()) {
-        const char* home = getenv("HOME") ? getenv("HOME") : getenv("USERPROFILE");
-        if (home) cal_path = std::string(home) + "/.maya/ik2-offload-calib.txt";
-    }
-    std::string key;
-    {
-        cudaDeviceProp p{};
-        CU(cudaGetDeviceProperties(&p, 0));
-        size_t fr = 0, tot = 0;
-        CU(mem_info(&fr, &tot));
-        char kb[256];
-        std::snprintf(kb, sizeof kb, "%s|%zu MiB|%u logical|%zu physical|%s|lane %d|C %d F %d", p.name, tot >> 20,
-                      std::thread::hardware_concurrency(), maya::kernels::cpu::physical_cores(false).size(),
-                      ik2::lane::rows_form(), threads, C, F);
-        key = kb;
-        for (char& ch : key) ch = ch == ' ' ? '_' : ch;
-    }
+    const std::string cal_path = lane_calib_path(), key = lane_calib_key(c, threads);
     k::LaneCost cal{};
     int cal_thr = 0;
-    bool have = false;
-    if (!cal_path.empty() && cal_path != "0")
-        if (std::ifstream in(cal_path); in)
-            for (std::string ln; std::getline(in, ln);) {
-                std::istringstream is(ln);
-                std::string kk;
-                k::LaneCost t{};
-                int th = 0;
-                if ((is >> kk >> th >> t.cpu[0] >> t.cpu[1] >> t.fetch[0] >> t.fetch[1] >> t.gpu[0] >> t.gpu[1] >> t.lat) &&
-                    kk == key && th > 0)
-                    cal = t, cal_thr = th, have = true;   // (the last line of the key wins)
-            }
+    const bool have = lane_calib_read(cal_path, key, cal, cal_thr);
     if (have) g_offs.lane->set_threads(cal_thr - 1);
     if (threads < 0 && !have) {   // the lane's size: counts below the CPU's cores timed on experts read from memory, the
                          // fastest kept (a smaller one within 5%) - a lane as wide as the CPU loses on a busy PC
@@ -3361,24 +3647,26 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     kv_swing(M, false, pos);
-    if (g_graph && g_fgraph_slot != g_slot_cur) {   // (--parallel: the graphs hold a conversation's state pointers)
-        for (auto& G : g_fgraph)
+    if (g_graph && (g_fgraph_slot != g_slot_cur || g_fgraph_abl != abl::cur())) {   // (--parallel: the graphs hold a
+        for (auto& G : g_fgraph)                                  //  conversation's state pointers; --ablate: its launches)
             if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
-        g_fgraph_slot = g_slot_cur;
+        g_fgraph_slot = g_slot_cur, g_fgraph_abl = abl::cur();
     }
     if (!g_graph || g_kv_streaming) {   // (streamed visits: the copies follow the position - launched as they go)
         fast_token_launches(M, W, out_mode);
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
-        if (!G.exec) {   // the first token of this kind: its launches recorded
+        if (!G.exec && !g_graph_full) {   // the first token of this kind: its launches recorded
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_token_launches(M, W, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else fast_token_launches(M, W, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
+    two_mail_check();
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(1, W.argmax_h[0]);
     } else if (out_mode == OutMode::kLogits) {
@@ -3465,7 +3753,13 @@ void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, fl
         k::mv_q8p_cols(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x, x_ld, T, y, ldy, g_s);
         return;
     }
-    const Mat part = mat_rows(m, r0, n);   // (not planar Q8_0: mv1 a token at a time)
+    const Mat part = mat_rows(m, r0, n);   // (not planar Q8_0: mv1's row dots for each token, its blocks read once;
+                                           //  IK2_BLOCK_ROWS=0: mv1 a token at a time)
+    static const bool rows = !(getenv("IK2_BLOCK_ROWS") && !std::atoi(getenv("IK2_BLOCK_ROWS")));
+    if (rows && T > 1) {
+        k::mv_blocks_rows(part.type, part.raw, part.N, part.K, x, x_ld, T, y, ldy, g_s);
+        return;
+    }
     for (int t = 0; t < T; ++t) mv1(part, x + (size_t) t * x_ld, y + (size_t) t * ldy);
 }
 
@@ -3475,6 +3769,18 @@ void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, fl
 // k::kHeldElsewhere.  Every member's row is the window kernels' - the token path's to the bit - wherever its expert
 // sits: drafting on two GPUs gives plain decoding's answers there.
 static_assert(kTwoWin == kBlockMax, "the two-GPU window's buffers");
+static void two_run_win_experts(const Layer& Ly, const Config& c, TwoGpu& G, int T, int S, bool tc) {
+    if (tc) {
+        k::f16_limbs_rows(G.wx, T, c.C, G.wlimbs, G.s);
+        k::experts_block_gu(G.wblob, G.wn, G.wtok, G.wrow, S, T, Ly.eb[0], c.C, c.F, G.wlimbs, G.sg, G.su, c.gate_cap,
+                            c.up_cap, G.h16, G.s);
+        k::experts_block_down(G.wblob, G.wn, G.wrow, S, Ly.eb[0] + Ly.eb[1], c.C, c.F, G.h16, G.y32, G.s);
+    } else {
+        k::experts_gate_up_swiglu_mem(G.wblob, G.wn, G.wtok, G.wrow, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], G.wx, c.C, c.F,
+                                      G.sg, G.su, c.gate_cap, c.up_cap, G.h16, G.s);
+        k::experts_down_mem(G.wblob, G.wn, G.wrow, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], G.h16, c.C, c.F, G.y32, G.s);
+    }
+}
 void two_send_win(const Model& M, int l, Work& W, int T, bool tc) {
     const Config& c = M.c;
     const Layer& Ly = M.L[l];
@@ -3493,16 +3799,7 @@ void two_send_win(const Model& M, int l, Work& W, int T, bool tc) {
     }
     k::group_route(G.wroute, (const float*) (G.wroute + S), S, c.K, G.tab[l], G.sc[0][l], G.sc[1][l], G.sc[2][l], G.wblob,
                    G.wn, G.wtok, G.wrow, G.sg, G.su, G.wt, G.inv, G.s);
-    if (tc) {
-        k::f16_limbs_rows(G.wx, T, C, G.wlimbs, G.s);
-        k::experts_block_gu(G.wblob, G.wn, G.wtok, G.wrow, S, T, Ly.eb[0], C, c.F, G.wlimbs, G.sg, G.su, c.gate_cap,
-                            c.up_cap, G.h16, G.s);
-        k::experts_block_down(G.wblob, G.wn, G.wrow, S, Ly.eb[0] + Ly.eb[1], C, c.F, G.h16, G.y32, G.s);
-    } else {
-        k::experts_gate_up_swiglu_mem(G.wblob, G.wn, G.wtok, G.wrow, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], G.wx, C, c.F, G.sg,
-                                      G.su, c.gate_cap, c.up_cap, G.h16, G.s);
-        k::experts_down_mem(G.wblob, G.wn, G.wrow, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], G.h16, C, c.F, G.y32, G.s);
-    }
+    two_run_win_experts(Ly, c, G, T, S, tc);
     CU(cudaEventRecord(G.ev_y, G.s));
 #if defined(_WIN32)
     if (!g_graph) (void) cudaStreamQuery(G.s);   // (Windows + AMD start queued work only at a host wait)
@@ -3520,6 +3817,46 @@ void two_take_win(const Model& M, Work& W, int T) {
     CU(cudaSetDevice(0));
     k::two_take_rows_g(g_blk.blob, g_blk.n, g_blk.row, G.y_in, S, c.C, W.y32, g_s);
 }
+#if !defined(MAYA_USE_HIP)
+void two_send_win_mail(const Model& M, int l, Work& W, int T, bool tc) {
+    const Config& c = M.c;
+    const Layer& Ly = M.L[l];
+    TwoGpu& G = g_two;
+    const int C = c.C, S = T * c.K;
+    const unsigned long long v = ++G.visits;
+    const unsigned n = G.n = (unsigned) v;
+    const size_t off = (n % k::kMailSlots) * G.ml.slot;
+    unsigned char* d0 = G.mail_d0 + off;
+    unsigned char* d1 = G.mail_d1 + off;
+    k::mail_send(W.xq, (const float*) W.route_d, T * C, 2 * S, (float*) (d0 + G.ml.x),
+                 (const unsigned*) (d0 + G.ml.freed), n,
+                 v > (unsigned long long) k::kMailSlots ? (unsigned) (v - k::kMailSlots) : 0u,
+                 (unsigned*) (G.mail_d0 + G.ml.err), g_s);
+    CU(cudaEventRecord(G.ev_mail, g_s));
+    CU(cudaSetDevice(G.dev));
+    CU(cudaStreamWaitEvent(G.s, G.ev_mail, 0));
+    k::mail_recv((const float*) (d1 + G.ml.x), T * C, 2 * S, G.wx, (float*) G.wroute,
+                 (unsigned*) (d1 + G.ml.freed), n, G.s);
+    k::group_route(G.wroute, (const float*) (G.wroute + S), S, c.K, G.tab[l], G.sc[0][l], G.sc[1][l], G.sc[2][l], G.wblob,
+                   G.wn, G.wtok, G.wrow, G.sg, G.su, G.wt, G.inv, G.s);
+    two_run_win_experts(Ly, c, G, T, S, tc);
+    k::mail_publish_g(G.wblob, G.wn, G.wrow, G.y32, S, C, (float*) (d1 + G.ml.rows),
+                      (unsigned*) (d1 + G.ml.rows_word), n, G.s);
+#if defined(_WIN32)
+    (void) cudaStreamQuery(G.s);
+#endif
+    CU(cudaSetDevice(0));
+}
+void two_take_win_mail(const Model& M, Work& W, int T) {
+    const Config& c = M.c;
+    TwoGpu& G = g_two;
+    const int S = T * c.K;
+    unsigned char* d0 = G.mail_d0 + (G.n % k::kMailSlots) * G.ml.slot;
+    k::two_take_rows_mail_g(g_blk.blob, g_blk.n, g_blk.row, (const float*) (d0 + G.ml.rows),
+                            (const unsigned*) (d0 + G.ml.rows_word), G.n, S, c.C, W.y32,
+                            (unsigned*) (G.mail_d0 + G.ml.err), g_s);
+}
+#endif
 
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
     const Config& c = M.c;
@@ -3740,8 +4077,10 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         if (ex) exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
         else tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
-        k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
+        bool ab = abl::cur();   // (--ablate: as the token path's - the conv alone, projected, the stream added)
+        k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first || ab ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
+        if (ab) abl_write(W.r, first ? nullptr : W.h, T, C);
         if (first) ++nb;
         // the MoE: its input, the router, the picks grouped by expert on the device, the experts
         {
@@ -3779,7 +4118,14 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
 #endif
         // (two GPUs: GPU 1's groups there with the same kernels, beside GPU 0's - the exact window only: spec_path)
-        if (g_two.on) two_send_win(M, l, W, T, exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F));
+        if (g_two.on) {
+            const bool use_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+#if !defined(MAYA_USE_HIP)
+            if (g_two.mail) two_send_win_mail(M, l, W, T, use_tc);
+            else
+#endif
+            two_send_win(M, l, W, T, use_tc);
+        }
         if (ex && !(exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F))) {
             k::experts_gate_up_swiglu_mem(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0],
                                           W.xq, C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
@@ -3803,12 +4149,20 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
-        if (g_two.on) two_take_win(M, W, T);
+        if (g_two.on) {
+#if !defined(MAYA_USE_HIP)
+            if (g_two.mail) two_take_win_mail(M, W, T);
+            else
+#endif
+            two_take_win(M, W, T);
+        }
         // (the experts' combine and the conv after it stay two launches: as one - a thread a channel, walking the
         //  tokens' picks - it took 9.4 us where the two take 7)
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
-        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
-                      g_s);
+        ab = abl::cur();   // (the MoE write, as the attention write above)
+        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, ab ? nullptr : W.r, C, W.h, C, Ly.rec_old[3],
+                      Ly.rec_x[3], g_s);
+        if (ab) abl_write(W.h, W.r, T, C);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits
@@ -3859,16 +4213,24 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     if (!g_graph || g_kv_streaming) {   // (the swing visit's rows move between RAM and VRAM: no recorded pointers)
         fast_block_launches(M, W, T, out_mode);
     } else {
+        if (g_bgraph_abl != abl::cur()) {   // (--ablate: the windows' graphs hold the launches of one setting)
+            for (auto& row : g_bgraph)
+                for (auto& G : row)
+                    if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
+            g_bgraph_abl = abl::cur();
+        }
         FastGraph& G = g_bgraph[T][(int) out_mode];
-        if (!G.exec) {
+        if (!G.exec && !g_graph_full) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_block_launches(M, W, T, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else fast_block_launches(M, W, T, out_mode);
     }
     CU(cudaStreamSynchronize(g_s));
+    two_mail_check();
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(W.argmax_h, W.argmax_h + T);
     } else if (out_mode == OutMode::kLogits) {
@@ -4160,9 +4522,12 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
-        for (int t = 0; t < T; ++t)
+        for (int t = 0; t < T; ++t) {
+            const bool ab = abl::row(sl[t]);   // (--ablate: this row's conversation asks)
             k::conv_block(W.tmp + (size_t) t * C, C, g_slots[sl[t]][vis].h_attn, Ly.sc_attn, nullptr, 0, 0, 1, C,
-                          first ? nullptr : W.h + (size_t) t * C, C, W.r + (size_t) t * C, C, nullptr, nullptr, g_s);
+                          first || ab ? nullptr : W.h + (size_t) t * C, C, W.r + (size_t) t * C, C, nullptr, nullptr, g_s);
+            if (ab) abl_write(W.r + (size_t) t * C, first ? nullptr : W.h + (size_t) t * C, 1, C);
+        }
         if (first) ++nb;
         // the MoE: its input and the router for all rows, then each row's experts as the one-token path's
         {
@@ -4198,8 +4563,10 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
                                           c.gate_cap, c.up_cap, W.h16, g_s);
                 k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             }
-            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, g_slots[sl[t]][vis].h_mlp, Ly.sc_mlp, W.r + (size_t) t * C,
-                                W.h + (size_t) t * C, g_s);
+            const bool ab = abl::row(sl[t]);
+            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, g_slots[sl[t]][vis].h_mlp, Ly.sc_mlp,
+                                ab ? nullptr : W.r + (size_t) t * C, W.h + (size_t) t * C, g_s);
+            if (ab) abl_write(W.h + (size_t) t * C, W.r + (size_t) t * C, 1, C);
         }
     }
     {   // the head: every row's argmax (on the raw logits, as the token path's), and with cand its candidates
@@ -4236,18 +4603,20 @@ void par_step(Model& M, int T, const int* tok, const int* pos, const int* sl, bo
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_parb.emb_h + (size_t) t * c.C);
         g_parb.pos_h[t] = pos[t];
         key |= 2 << sl[t];
+        if (abl::row(sl[t])) key |= 1 << (12 + sl[t]);   // (--ablate: the rows that project - their launches)
     }
     if (!g_graph) {
         par_launches(M, W, T, sl, cand);
     } else {
         FastGraph& G = g_pgraph[key];
-        if (!G.exec) {
+        if (!G.exec && !g_graph_full) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             par_launches(M, W, T, sl, cand);
             CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            graph_exec(G);
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) CU(cudaGraphLaunch(G.exec, g_s));
+        else par_launches(M, W, T, sl, cand);
     }
     CU(cudaStreamSynchronize(g_s));
     for (int t = 0; t < T; ++t) am[t] = W.argmax_h[t];
@@ -4274,6 +4643,150 @@ bool par_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) {
 // ---- speculative decoding on the resident path: the drafter's tokens verified as one window (fast_block)
 
 void embed_row(Model& M, int t, float* raw, float* out);
+
+// GEN's starts=<ids>;<ids>;..: the answer opens with one of these token sequences - the server's required tool call
+// on Inkling's form (serve/server.py's Service.prepare), a call to any tool: its name comes first, so the prompt can
+// open only the model's message and the sequences are each tool's name and the call's segment.  While more than one
+// still matches, a token is the model's pick among the ones they go on with; with one left, its tokens follow
+// (`alive`: the sequences still matching, `sd`: the tokens of them written)
+struct Starts {
+    std::vector<std::vector<int>> seqs;
+    std::vector<int> alive;
+    int sd = 0;
+    void parse(const std::string& v, int vocab) {   // "1,2,3;4,5" (a sequence with a token outside 0..vocab-1 is dropped)
+        seqs.clear();
+        for (size_t a = 0; a <= v.size();) {
+            size_t b = v.find(';', a);
+            if (b == std::string::npos) b = v.size();
+            std::vector<int> q;
+            bool ok = true;
+            for (size_t x = a; x < b;) {
+                const long tk = std::strtol(v.c_str() + x, nullptr, 10);
+                if (tk < 0 || tk >= vocab) ok = false;
+                q.push_back((int) tk);
+                while (x < b && v[x] != ',') ++x;
+                ++x;
+            }
+            if (ok && !q.empty()) seqs.push_back(q);
+            a = b + 1;
+        }
+        alive.clear(), sd = 0;
+        for (int j = 0; j < (int) seqs.size(); ++j) alive.push_back(j);
+    }
+    bool on() const { return !alive.empty(); }
+    std::vector<int> opts() const {   // the tokens the matching sequences go on with
+        std::vector<int> o;
+        for (int j : alive)
+            if (std::find(o.begin(), o.end(), seqs[j][sd]) == o.end()) o.push_back(seqs[j][sd]);
+        return o;
+    }
+    void took(int t) {   // a token written: the sequences it matches; once one is whole, the answer goes on freely
+        if (alive.empty()) return;
+        std::vector<int> keep;
+        for (int j : alive)
+            if (seqs[j][sd] == t) keep.push_back(j);
+        alive.swap(keep), ++sd;
+        for (int j : alive)
+            if ((int) seqs[j].size() == sd) {
+                alive.clear();
+                break;
+            }
+    }
+};
+// GEN's think_open=<id> think_end=<id> think_soft=<n> think_hard=<n> think_stop=<ids> think_weak=<ids> think_dig=<ids>
+// think_after=<ids>;<ids>..: the thinking budget.  Inkling's reasoning is a segment (think_open, the model's
+// <|content_thinking|>, to think_end, its <|end_message|>), its tokens counted from the request's start: past
+// think_soft the first token that ends a sentence or line (think_stop; think_weak: a bare . ! ? that does not follow a
+// token ending in a digit or a dot, think_dig), at think_hard whatever the token, closes the segment IN THE DECODE - the
+// tokens that follow are forced through Starts: think_end, then one of think_after (the next message's opening: its
+// text segment, or a call to one of the request's tools - the model's pick among them) - and the thinking is closed
+// once (`done`).  The state is never cut: no stop and restart, which this engine could not take back past a
+// token or two.  A window of drafts is cut short of think_soft and single steps follow, so a close lands on its token.
+struct ThinkCut {
+    int open = -1, end = -1, soft = 0, hard = 0, prev = -1;
+    std::unordered_set<int> stop, weak, dig;
+    std::vector<std::vector<int>> after;
+    bool in = false, done = false;
+    int n = 0;
+    bool on() const { return soft > 0 && open >= 0 && end >= 0 && !after.empty() && !done; }
+    void parse_set(std::unordered_set<int>& o, const std::string& v, int vocab) {
+        o.clear();
+        for (size_t a = 0; a < v.size();) {
+            const long t = std::strtol(v.c_str() + a, nullptr, 10);
+            if (t >= 0 && t < vocab) o.insert((int) t);
+            const size_t b = v.find(',', a);
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+    }
+    // a token written (every one, in order): true when the segment must close now
+    bool saw(int t) {
+        if (!on()) return false;
+        const int before = prev;
+        prev = t;
+        if (!in) {
+            in = t == open;
+            return false;
+        }
+        if (t == end) {
+            in = false;
+            return false;
+        }
+        ++n;
+        if (n >= hard || (n >= soft && (stop.count(t) || (weak.count(t) && !dig.count(before))))) {
+            done = true, in = false;
+            return true;
+        }
+        return false;
+    }
+    // the room a window of drafts may take: none may carry the count to think_soft (a close lands on a single step)
+    int room(int r) const {
+        if (!on() || !in) return r;
+        return std::min(r, std::max(1, soft - n - 1));
+    }
+    void close(Starts& st) const {   // the forced close: think_end, then the next message's opening
+        st.seqs.clear(), st.alive.clear(), st.sd = 0;
+        for (const auto& a : after) {
+            std::vector<int> q{end};
+            q.insert(q.end(), a.begin(), a.end());
+            st.alive.push_back((int) st.seqs.size());
+            st.seqs.push_back(q);
+        }
+    }
+};
+// one GEN key of the thinking budget into tc: true when it is one
+inline bool think_key(ThinkCut& tc, const std::string& k, const std::string& v, int vocab) {
+    if (k == "think_open") tc.open = std::atoi(v.c_str());
+    else if (k == "think_end") tc.end = std::atoi(v.c_str());
+    else if (k == "think_soft") tc.soft = std::atoi(v.c_str());
+    else if (k == "think_hard") tc.hard = std::atoi(v.c_str());
+    else if (k == "think_stop") tc.parse_set(tc.stop, v, vocab);
+    else if (k == "think_weak") tc.parse_set(tc.weak, v, vocab);
+    else if (k == "think_dig") tc.parse_set(tc.dig, v, vocab);
+    else if (k == "think_after") {
+        Starts st;
+        st.parse(v, vocab);
+        tc.after = st.seqs;
+    } else return false;
+    if (tc.hard < tc.soft) tc.hard = tc.soft;
+    return true;
+}
+// the pick among opts o from (logit, token) candidates: greedy the largest (ties: the lower token), else `sample` of
+// them; a token missing from cd (outside the candidates a step keeps) is none of it, and with none there, o's first
+template <class F>
+int pick_among(const std::vector<int>& o, const std::vector<std::pair<float, int>>& cd, double temp, F sample) {
+    if (o.size() == 1) return o[0];
+    std::vector<std::pair<float, int>> in;
+    for (const auto& e : cd)
+        if (std::find(o.begin(), o.end(), e.second) != o.end()) in.push_back(e);
+    if (in.empty()) return o[0];
+    if (temp <= 0)
+        return std::min_element(in.begin(), in.end(),
+                                [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                                })->second;
+    return sample(in);
+}
 
 struct SampleCfg {   // temp <= 0: greedy
     double temp = 0, top_p = 1;
@@ -4578,7 +5091,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         //  IK2_DRAFT_COUPLE_T, so that its draws stay on the model's token there - any draft leaves the model's draw exact)
         static const double couple_t = getenv("IK2_DRAFT_COUPLE_T") ? std::atof(getenv("IK2_DRAFT_COUPLE_T")) : 1.0;
         nz.salt = sc.salt, nz.inv_temp = sc.temp > 0 ? (float) (1.0 / (sc.temp * couple_t)) : 0.0f, nz.cap = c.logit_cap;
-        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1,
+        ik2::draft::propose(drafter, anchor, anchor_h, P, g_draft_head16, c.n_rows, c.n_vocab, dr, B - 1,
                             sc.temp > 0 && g_draft_couple ? &nz : nullptr);
         if (t_draft) *t_draft += now() - t0;
         g_sp_draft += now() - t0;
@@ -4722,6 +5235,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 CU(cudaMemcpyPeer(Tn.blocks + (size_t) i * Tn.blk_ld * C, Ly.dev, F.blocks + (size_t) i * F.blk_ld * C,
                                   from, TC * 4));
             CU(cudaMemcpyPeer(Tn.pos, Ly.dev, F.pos, from, (size_t) T * 4));
+            // A hop inside a looped core's later pass: the layers over there read their messages from the pass before's
+            // bank, filled on this GPU - it goes along too (#1107). (lp_pre is written and read at core0 only.)
+            if (c.n_pass > 1 && M.V[vis].pass > 0 && n_bank > 0)
+                CU(cudaMemcpyPeer(Tn.lp_bank, Ly.dev, F.lp_bank, from, (size_t) n_bank * TC * 4));
             use_dev(Ly.dev);
             Wp = &dev_work(g_cur);
             ECp = &dev_cache(g_cur);
@@ -4788,7 +5305,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
-        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
+        const bool cpu_lane = g_cpu && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
                               Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
         if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
         CU(cudaStreamSynchronize(g_s));
@@ -4907,7 +5424,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -4997,7 +5514,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -5063,12 +5580,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_mv && S <= 64) {
+        if (g_mv && S <= 64 && !g_off) {
             const double te0 = now();
             // the token path: each slot (token t's pick i) its expert's blob straight from the cache
             // The slots already in VRAM first, then the ones copied in now: the first group's experts run while the
@@ -5153,7 +5670,6 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             int ph = 0, pm = nh, pc = nh + nw;
             ik2::cpu::ExpertJob jobs[64];
             const int n_jobs = S - nh - nw;
-            const double tc0 = now();
             for (int i = 0; i < S; ++i) {
                 const int e = top[i], p = late[i] == 2 ? pc++ : late[i] ? pm++ : ph++;
                 blob[p] = where[i];
@@ -5170,7 +5686,6 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     J.x = W.x_h + (size_t) (i / c.K) * C;
                     J.sg = sg[p], J.su = su[p];
                     J.y = yh + (size_t) (p - nh - nw) * C;
-                    ik2::cpu::post_expert(*g_pool, &J, C, c.F, c.gate_cap, c.up_cap);
                 }
             }
             g_n_cpu += n_jobs, g_n_wait += nw;
@@ -5251,8 +5766,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                 W.y32 + (size_t) p0 * C, g_s);
             }
             if (n_jobs > 0) {
-                g_pool->wait();
-                g_t_cpu = 0.9 * g_t_cpu + 0.1 * (now() - tc0) / n_jobs;
+                const double tc0 = now();
+                g_cpu->run(jobs, n_jobs, C, c.F, c.gate_cap, c.up_cap);
+                const double dt = (now() - tc0) / n_jobs;
+                g_t_cpu = 0.9 * g_t_cpu + 0.1 * std::min(dt, std::max(2.0e-3, 3.0 * g_t_cpu));
                 CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) n_jobs * C * 4, cudaMemcpyHostToDevice,
                                    g_s));
             }
@@ -5260,7 +5777,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_write(W.tmp, Ly.h_mlp, Ly.sc_mlp, T, C, W.r, W.h);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -5551,7 +6068,7 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 
 }  // namespace
 
-// The Inkling 2 preview: Linux, one NVIDIA GPU of 24 GB, Ampere (sm_80) or newer.  Outside it the engine stops with one
+// Hardware check: what Inkling 2 is supported on is listed in docs/INKLING2.md.  Outside it the engine stops with one
 // line saying why; IK2_UNSUPPORTED=1 runs it anyway where it can run at all (two GPUs, smaller cards with the experts
 // streamed from RAM, Windows: untested).
 // Greedy decode on the resident path from `anchor` (chosen, not run yet) at position P until out holds gen tokens
@@ -5674,6 +6191,122 @@ void draft_remember(const std::string& key, const double* tps, int c) {
     std::remove(f);
     std::rename(tmp.c_str(), f);
 }
+// the fastest of the four figures (-1: not measured); a drafter within `tie` of no drafting: no drafting
+int draft_best(const double* tps, double tie) {
+    int best = 0;
+    for (int m = 1; m < 4; ++m)
+        if (tps[m] > tps[best]) best = m;
+    if (best && tps[best] < tps[0] * (1.0 + tie)) best = 0;   // (no clear gain: no drafting)
+    return best;
+}
+
+// The first start where the experts wait in host memory (the offload path): the drafter's room comes out of the
+// experts' VRAM tier, so plain decoding and drafting are two layouts - each is timed on its own, in a short run of
+// this program before this process takes any VRAM (IK2_DRAFT_PART=draft: the drafting layout's sources;
+// plain: --drafting off's layout), a line each in IK2_DRAFT_FILE.part ("<part>\t<key>\t<4 figures>", "skip": nothing
+// to split here), their start lines in IK2_DRAFT_FILE.measure.log.  The start itself then finds the remembered
+// choice, as every later start does - its layout, its tokens, its speed.
+int g_part = 0;   // (1: the drafting layout's run, 2: plain decoding's)
+FILE* g_part_out = nullptr;   // (a part run: the start's own output)
+FILE* part_dup_stdout() {
+#ifdef _WIN32
+    return _fdopen(_dup(_fileno(stdout)), "w");
+#else
+    return fdopen(dup(fileno(stdout)), "w");
+#endif
+}
+std::string draft_part_file() {
+    const char* f = getenv("IK2_DRAFT_FILE");
+    return f && *f ? std::string(f) + ".part" : std::string();
+}
+[[noreturn]] void draft_part_done(const char* part, const std::string& key, const double* tps) {
+    const std::string f = draft_part_file();
+    if (!f.empty()) {
+        if (FILE* out = std::fopen(f.c_str(), "a")) {
+            std::fprintf(out, "%s\t%s\t%.3f %.3f %.3f %.3f\n", part, key.c_str(), tps ? tps[0] : -1.0,
+                         tps ? tps[1] : -1.0, tps ? tps[2] : -1.0, tps ? tps[3] : -1.0);
+            std::fclose(out);
+        }
+    }
+    std::printf("measurement run (%s): done\n", part);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);   // (the driver frees this run's VRAM; nothing of it is kept)
+}
+// the part's line: true with its key and figures
+bool draft_part_read(const char* part, std::string& key, double* tps) {
+    std::ifstream in(draft_part_file());
+    std::string line;
+    bool ok = false;
+    while (std::getline(in, line)) {
+        const size_t t1 = line.find('\t'), t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+        if (t2 == std::string::npos || line.compare(0, t1, part) != 0) continue;
+        double v[4];
+        if (std::sscanf(line.c_str() + t2 + 1, "%lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3]) != 4) continue;
+        key = line.substr(t1 + 1, t2 - t1 - 1);
+        for (int i = 0; i < 4; ++i) tps[i] = v[i];
+        ok = true;
+    }
+    return ok;
+}
+void env_set(const char* k, const char* v) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    if (*v) setenv(k, v, 1);
+    else unsetenv(k);
+#endif
+}
+// this program again with the same arguments and IK2_DRAFT_PART=part, waited for; its exit code (-1: not started)
+int draft_part_run(int argc, char** argv, const char* part) {
+    env_set("IK2_DRAFT_PART", part);
+    int rc = -1;
+#ifdef _WIN32
+    char exe[MAX_PATH + 1] = "";
+    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        auto quote = [](const std::string& a) {   // (the C runtime's rules: \" a quote, the backslashes before one doubled)
+            if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
+            std::string q = "\"";
+            size_t bs = 0;
+            for (char ch : a) {
+                if (ch == '\\') {
+                    ++bs;
+                } else if (ch == '"') {
+                    q.append(bs + 1, '\\');
+                    bs = 0;
+                } else {
+                    bs = 0;
+                }
+                q.push_back(ch);
+            }
+            q.append(bs, '\\');
+            return q + "\"";
+        };
+        std::vector<std::string> qs;
+        qs.push_back(quote(exe));
+        for (int i = 1; i < argc; ++i) qs.push_back(quote(argv[i]));
+        std::vector<const char*> av;
+        for (const auto& s : qs) av.push_back(s.c_str());
+        av.push_back(nullptr);
+        rc = (int) _spawnv(_P_WAIT, exe, av.data());
+    }
+#else
+    std::vector<char*> av(argv, argv + argc);
+    av.push_back(nullptr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execv("/proc/self/exe", av.data());
+        _exit(127);
+    }
+    if (pid > 0) {
+        int st = 0;
+        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st)) rc = WEXITSTATUS(st);
+    }
+#endif
+    env_set("IK2_DRAFT_PART", "");
+    return rc;
+}
 
 // --check-sampling (no GPU, no model): sampled drafting keeps the distribution - a drafted position's pick (spec_pick:
 // the draft with the model's probability of it, else the distribution without it) against the plain pick
@@ -5753,7 +6386,7 @@ int check_sampling() {
     return fails ? 1 : 0;
 }
 
-void check_preview(int n_gpu, bool serve) {
+void check_hardware(int n_gpu, bool serve) {
     auto refuse = [&](const std::string& m) {   // (--serve: the server prints a NOTE line)
         if (serve) std::printf("NOTE maya-ik2: %s\n", m.c_str()), std::fflush(stdout);
         die(m);
@@ -5761,7 +6394,7 @@ void check_preview(int n_gpu, bool serve) {
     const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
     const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
 #if defined(_WIN32) && defined(MAYA_USE_HIP)
-    if (!force) refuse("Inkling 2 on AMD runs on Linux only, Windows is outside it" + run_anyway);
+    if (!force) refuse("Inkling 2 on AMD is supported on Linux only, not on Windows" + run_anyway);
 #endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
@@ -5772,15 +6405,15 @@ void check_preview(int n_gpu, bool serve) {
 #endif
     if (e != cudaSuccess || nd < 1)
         refuse(std::string("no ") + vendor + " GPU visible (" + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
-            "): the Inkling 2 preview runs on one " + vendor + " GPU");
+            "): Inkling 2 needs one " + vendor + " GPU");
     if (n_gpu < 1 || n_gpu > 2)
-        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more are not in it yet)");
+        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more GPUs are not supported)");
     const bool old_two = (getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) || (getenv("IK2_TP") && std::atoi(getenv("IK2_TP")));
     if (n_gpu == 2 && old_two && !force)
-        refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are outside the preview (without them: "
+        refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are not supported (without them: "
                "the two-GPU split)" + run_anyway);
 #ifdef MAYA_USE_HIP   // (the split runs GPU 0 on the offload path, not checked on AMD yet)
-    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not in the Inkling 2 preview yet" + run_anyway);
+    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not supported yet" + run_anyway);
 #endif
     if (n_gpu == 2 && nd < 2)
         refuse("--gpus 2: " + std::to_string(nd) + " GPU visible");
@@ -5818,14 +6451,14 @@ void check_preview(int n_gpu, bool serve) {
         if (p.totalGlobalMem < ((p.integrated ? 22ull : 11ull) << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs " +
+            refuse(gpu + " has " + m + ", Inkling 2 needs " +
                    (p.integrated ? "24 GB of the APU's memory" : "an AMD card of 12 GB or more") + run_anyway);
         }
 #else
         if (p.totalGlobalMem < (7ull << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs a card of 8 GB or more" + run_anyway);
+            refuse(gpu + " has " + m + ", Inkling 2 needs a card of 8 GB or more" + run_anyway);
         }
 #endif
     }
@@ -5838,6 +6471,7 @@ int main(int argc, char** argv) {
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
     double cache_gb = 60;
+    bool cache_set = false;
     int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -5858,7 +6492,7 @@ int main(int argc, char** argv) {
         else if (a == "--gen") gen = std::atoi(next().c_str());
         else if (a == "--chunk") chunk = std::atoi(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
-        else if (a == "--cache-gb") cache_gb = std::atof(next().c_str());
+        else if (a == "--cache-gb") cache_gb = std::atof(next().c_str()), cache_set = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
         else if (a == "--draft") draft_path = next();
@@ -5883,6 +6517,24 @@ int main(int argc, char** argv) {
         else if (a == "--kv-resident") g_kv_resident = std::max(0, std::atoi(next().c_str()));
         else if (a == "--parallel") g_par = std::clamp(std::atoi(next().c_str()), 1, kParMax);
         else if (a == "--dump") dump = next();
+        else if (a == "--ablate") {   // (a control vector: the refusal direction, projected out per conversation)
+            abl::path = next();
+            if (abl::path.empty()) die("--ablate needs a file (a control vector GGUF)");
+        }
+        else if (a == "--ablate-layer") {
+            abl::layer = std::atoi(next().c_str());
+            if (abl::layer < 1 || abl::layer > 4096) die("--ablate-layer takes 1..4096");
+        }
+        else if (a == "--ablate-scale") {
+            const double v = std::atof(next().c_str());
+            if (!(v >= 1e-6 && v <= 1e6)) die("--ablate-scale takes 1e-6..1e6");
+            abl::want_scale = (float) v;
+        }
+        else if (a == "--ablate-default") {   // on (every conversation, as a startup flag) | off (GEN ablate=1 turns it on)
+            const std::string v = next();
+            if (v != "on" && v != "off" && v != "1" && v != "0") die("--ablate-default: on or off");
+            abl::dflt = v == "on" || v == "1";
+        }
         else if (a == "--drafting") {   // (auto: measured once on this PC; on: the drafter and the prompt lookup; off)
             drafting = next();
             if (drafting != "auto" && drafting != "on" && drafting != "off") die("--drafting: auto, on or off");
@@ -5890,6 +6542,17 @@ int main(int argc, char** argv) {
         else die("unknown argument " + a);
     }
     g_depth = getenv("IK2_DEPTH") ? std::max(0, std::atoi(getenv("IK2_DEPTH"))) : 0;   // (tests: a long context's speed without its prompt)
+    if (const char* pt = getenv("IK2_DRAFT_PART"); pt && *pt && serve) {   // (a first start's measurement run)
+        g_part = std::string(pt) == "draft" ? 1 : std::string(pt) == "plain" ? 2 : 0;
+        const std::string pf = draft_part_file();
+        if (!g_part || pf.empty()) die("IK2_DRAFT_PART: draft or plain, with IK2_DRAFT_FILE");
+        std::fflush(stdout);
+        g_part_out = part_dup_stdout();   // (the start's own output: one line of the draft run)
+        const std::string lf = pf.substr(0, pf.size() - 5) + ".measure.log";
+        if (!std::freopen(lf.c_str(), "a", stdout)) die("cannot write " + lf);
+        std::printf("--- measurement run: %s ---\n", pt);
+        if (g_part == 2) drafting = "off";   // (plain decoding's own layout: nothing of the drafter's planned)
+    }
     if (drafting.empty()) drafting = draft_path.empty() ? "off" : "on";   // (--draft alone: as before, drafting on)
     if (drafting == "off") draft_path.clear();
     g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
@@ -5927,7 +6590,7 @@ int main(int argc, char** argv) {
         while (*p && *p != ',') ++p;
         if (*p == ',') ++p;
     }
-    check_preview(n_gpu, serve);
+    check_hardware(n_gpu, serve);
     // --gpus 2: the split (TwoGpu) - the engine runs as on one GPU (GPU 0), GPU 1 added to the token path at load;
     // IK2_EP=1 / IK2_TP=1: the older two-GPU modes on the cache path instead (IK2_UNSUPPORTED)
     if (n_gpu == 2 && !(getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) &&
@@ -5943,6 +6606,56 @@ int main(int argc, char** argv) {
         maya::ds4::lt::set_store(ls != nullptr ? ls : (dir + "/lt-picks.txt").c_str(), "IK2_LT_STORE");
     }
 #endif
+    // --drafting auto, nothing remembered for this PC yet: where the experts wait in host memory, plain decoding and
+    // drafting are timed each on its own layout, in two runs of this program before this one takes any VRAM (the
+    // drafting run says "skip" at once where there is nothing to split: every expert in VRAM, no room for a drafter).
+    // (NVIDIA; IK2_DRAFT_SPLIT=1: on AMD too, =0: off - then, and when a run fails, the one-load measurement below)
+    {
+#ifdef MAYA_USE_HIP
+        const bool split_def = false;
+#else
+        const bool split_def = true;
+#endif
+        const char* sp = getenv("IK2_DRAFT_SPLIT");
+        const char* idf = getenv("IK2_DRAFT_IDS");
+        if (serve && !g_part && drafting == "auto" && (!draft_path.empty() || g_lookup) && !g_two.want && n_gpu == 1 &&
+            (sp && *sp ? std::atoi(sp) != 0 : split_def) && !draft_part_file().empty() && idf && *idf) {
+            const std::string key = draft_key(model, draft_path, ctx);
+            double tp[4] = {-1, -1, -1, -1}, td[4] = {-1, -1, -1, -1};
+            std::string date, k1, k2;
+            if (draft_remembered(key, tp, date) < 0) {
+                const std::string pf = draft_part_file();
+                std::remove(pf.c_str());
+                std::remove((pf.substr(0, pf.size() - 5) + ".measure.log").c_str());
+                std::fflush(stdout);
+                const double tm0 = now();
+                const int r1 = draft_part_run(argc, argv, "draft");
+                if (r1 == 0 && draft_part_read("draft", k1, td)) {
+                    const int r2 = draft_part_run(argc, argv, "plain");
+                    if (r2 == 0 && draft_part_read("plain", k2, tp) && tp[0] > 0) {
+                        const double tie = getenv("IK2_DRAFT_TIE") ? std::atof(getenv("IK2_DRAFT_TIE")) : 0.03;
+                        const double tps[4] = {tp[0], td[1], td[2], td[3]};
+                        const int best = draft_best(tps, tie);
+                        draft_remember(k1, tps, best);
+                        env_set("IK2_DRAFT_MEASURE", "0");   // (measured now: the start below takes it)
+                        std::printf("NOTE maya-ik2: measured this PC once in %.0f s: drafting - %s (no drafting %.1f, "
+                                    "the prompt lookup %.1f, the drafter %.1f, both %.1f tokens/s); plain decoding and "
+                                    "drafting were timed each on its own layout - this start and every later one run "
+                                    "on the faster one's\n", now() - tm0, kDraftNames[best], tps[0], tps[1], tps[2],
+                                    tps[3]);
+                    } else {
+                        std::printf("NOTE maya-ik2: plain decoding's measurement run did not finish (exit %d) - "
+                                    "measured in this start instead\n", r2);
+                    }
+                } else if (r1 != 0 || !draft_part_read("skip", k1, td)) {
+                    std::printf("NOTE maya-ik2: the drafting measurement run did not finish (exit %d) - measured in "
+                                "this start instead\n", r1);
+                }
+                std::remove(pf.c_str());
+                std::fflush(stdout);
+            }
+        }
+    }
     // IK2_VRAM_GB=N (tests): the first GPU as a card of N GiB - the rest of its memory taken now and kept, so every
     // figure the engine reads (cudaMemGetInfo) is a smaller card's
     // (two GPUs: each of them; IK2_VRAM_GB1: GPU 1's own)
@@ -6086,6 +6799,25 @@ int main(int argc, char** argv) {
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
+    if (abl::path.empty() && (abl::layer != 0 || abl::want_scale != 0.0f))
+        die(std::string(abl::layer != 0 ? "--ablate-layer" : "--ablate-scale") + " without --ablate FILE: nothing to project out");
+    if (!abl::path.empty() && dual()) {   // (the expert-parallel / tensor-parallel modes sum the residual on the other GPU)
+        std::fprintf(stderr, "NOTE: IK2_EP / IK2_TP: no --ablate (those modes do not project; the layer split does)\n");
+    } else if (!abl::path.empty()) {   // (the direction read once, a copy on every GPU)
+        abl::scale = abl::want_scale;
+        std::string err;
+        if (!::mm3::ablate::load(abl::path, abl::layer, c.C, abl::scale, abl::dir, abl::what, err, "maya-ik2")) die(err);
+        abl::dev.assign((size_t) n_gpu, nullptr);
+        for (int d = 0; d < n_gpu; ++d) {
+            CU(cudaSetDevice(d));
+            CU(cudaMalloc(&abl::dev[(size_t) d], abl::dir.size() * 4));
+            CU(cudaMemcpy(abl::dev[(size_t) d], abl::dir.data(), abl::dir.size() * 4, cudaMemcpyHostToDevice));
+        }
+        CU(cudaSetDevice(0));
+        abl::loaded = true;
+        for (bool& o : abl::on) o = abl::dflt;
+        std::fprintf(stderr, "%s (default %s)\n", abl::what.c_str(), abl::dflt ? "on" : "off");
+    }
     if (dual()) {
         // (their copies are the runtime's peer copies: peer access only where mm3_link.cuh's test copy passes, and
         //  not at all where the IOMMU translates - those modes have no host-memory hand-off: refused there)
@@ -6126,7 +6858,7 @@ int main(int argc, char** argv) {
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
     if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available() && threads > 1 && n_gpu == 1)
-        g_pool = new ik2::cpu::Pool(threads - 1);
+        g_cpu = std::make_unique<ik2::cpu::Lane>(ik2::cpu::recommended_workers(threads));
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
     if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
@@ -6153,7 +6885,7 @@ int main(int argc, char** argv) {
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
-    g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+    g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH"))) && !maya::ablcap::on();   // (a fitting run reads each write out on the host)
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_block_exact = !(getenv("IK2_BLOCK_EXACT") && !std::atoi(getenv("IK2_BLOCK_EXACT")));
     g_window_check = getenv("IK2_WINDOW_CHECK") ? std::atoi(getenv("IK2_WINDOW_CHECK")) : 0;
@@ -6165,6 +6897,11 @@ int main(int argc, char** argv) {
     }
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
+    if (getenv("IK2_ATTN_S8")) k::attn_decode_mma_set_s8(std::atoi(getenv("IK2_ATTN_S8")) != 0);   // (AMD: 0 = h4)
+    if (getenv("IK2_ATTN_RDNA")) k::attn_decode_rdna_set(std::atoi(getenv("IK2_ATTN_RDNA")));   // (AMD RDNA 3 / 4: 1 = on)
+    std::fprintf(stderr, "maya-ik2: one-token attention %d blocks a K/V head, FP8 dequant %s, RDNA kernel %d\n",
+                 g_mma_split, k::attn_decode_mma_s8() ? "s8" : "h4",
+                 k::attn_decode_rdna_mode() && k::attn_decode_rdna_available() ? 1 : 0);
     // Older NVIDIA (docs/INKLING2.md 8): Volta (sm_70) and Turing (sm_75) take their own attention and expert kernels
     // (k::arch_class); a prompt's attention goes through cuBLAS there (the fused kernel is Ampere's: cp.async, and more
     // shared memory than a Turing SM has).  Drafting needs a verify window with the token path's own arithmetic: the
@@ -6186,7 +6923,7 @@ int main(int argc, char** argv) {
             g_block = false;
         }
     }
-    if (n_gpu == 1 && !g_pool) {
+    if (n_gpu == 1 && !g_cpu) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         std::map<std::string, size_t> exp_layer;   // (a layer's experts: "blk.N" -> bytes)
         for (const auto& kv : S.by_name) {
@@ -6226,7 +6963,11 @@ int main(int argc, char** argv) {
         }
 #endif
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
-        bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        // (an APU: the host copy of the cache path is the same RAM again, so where every expert fits they all stay
+        //  whatever their size - --cache-gb given: its cap as everywhere)
+        bool fits = exp_b + dense_b + kv_b + reserve <= fr0 &&
+                    (exp_b <= (size_t) (cache_gb * 1073741824.0) || (g_apu && !cache_set));
+        if (fits && g_apu && !cache_set) cache_gb = std::max(cache_gb, exp_b / 1073741824.0 * 1.02 + 1.0);
         // KV streaming (g_kv_stream): auto takes it only where the cache alone does not fit beside the dense weights
         // and a half-GiB tier of experts (the offload layout, below), and only where the RAM holds the rows beside its
         // experts; where the offload path does not run, where the cache does not fit beside every expert.  The rows
@@ -6323,7 +7064,7 @@ int main(int argc, char** argv) {
         // the resident path's launches with a tier of the experts in VRAM and the others fetched by the GPU from
         // host memory (ik2_off.cuh).  IK2_OFF=0: the cache path instead (forward() a visit at a time); IK2_OFF=1:
         // the offload path even where every expert fits (tests).  Not with two GPUs or the CPU lane (n_gpu == 1,
-        // !g_pool here).
+        // !g_cpu here).
         const char* off_env = getenv("IK2_OFF");
         int off_set = off_env && *off_env ? std::atoi(off_env) : -1;
         // Two GPUs: where GPU 0 holds every expert, the resident path there alone (one GPU's speed, v1.1.73's path;
@@ -6351,18 +7092,17 @@ int main(int argc, char** argv) {
                     : g_off_want ? "the experts in host memory, a tier of them in VRAM, the rest fetched by the GPU"
                                  : "the experts in host memory, a cache of them in VRAM");
         // Drafting never changes the context, the cache or the pictures' room of this plan.  Where every expert stays
-        // in VRAM (the resident path) a loaded drafter takes room only where everything above stays as it is: its
-        // room - the drafter's, or the prompt lookup's window records alone - beside the model at this context, and
-        // not the room the pictures' encoder would have had on the GPU (IK2_VISION_GIB, the server's: the encoder
-        // starts on the GPU when the free VRAM holds it).  Where the experts already left VRAM for the cache (the
-        // offload path: a long context) the drafter's room is the experts' too - the tier gives it, at most half of
-        // what it had, with the verify window's staging; the drafter's context rows FP16, else FP8, else FP8 rows of
+        // in VRAM (the resident path) a loaded drafter takes room only where everything above stays as it is: its room
+        // - the drafter's, or the prompt lookup's window records alone - beside the model at this context.  The
+        // pictures' encoder has no room in this plan and takes none from the drafter: the server starts it when a
+        // picture arrives, on the GPU only while the VRAM then free holds it beside the model and the drafter, else on
+        // the CPU (the plan is the same with pictures on or off).  Where the experts already left VRAM for the cache
+        // (the offload path: a long context) the drafter's room is the experts' too - the tier gives it, at most half
+        // of what it had, with the verify window's staging; the drafter's context rows FP16, else FP8, else FP8 rows of
         // the last positions only (half the context, a quarter .. 65,536: its drafts read less far back, the model
-        // checks every token as ever).  The window there is mode A's (the resident kernels over the tier's bytes):
-        // one GPU, the whole cache in VRAM, no lane parity.  Else it is left out, said why.
+        // checks every token as ever).  The window there is mode A's (the resident kernels over the tier's bytes): one
+        // GPU, the whole cache in VRAM, no lane parity.  Else it is left out, said why.
         const size_t used = exp_b + dense_b + kv_b + reserve;
-        const double vis = getenv("IK2_VISION_GIB") ? std::atof(getenv("IK2_VISION_GIB")) * 1073741824.0 : 0.0;
-        const double left = fr0 > used ? (double) (fr0 - used) : 0.0;
         const bool off_layout = g_off_want && !g_fast_want;
         std::string off_why;
         size_t tier_room = 0, stage_b = 0;
@@ -6397,8 +7137,6 @@ int main(int argc, char** argv) {
                 else if (need + stage_b > tier_room / 2) why = "its room does not fit beside the model at this context";
             } else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
             else if (used + need > fr0) why = "its room does not fit beside the model at this context";
-            else if (vis > 0 && left >= vis && left - (double) need < vis)
-                why = "its room would move the pictures' encoder from the GPU to the CPU";
             return why.empty();
         };
         for (int pass = 0; pass < 2; ++pass) {   // (the drafter, else the prompt lookup alone)
@@ -6406,10 +7144,23 @@ int main(int argc, char** argv) {
             if (model_drafter ? draft_path.empty() : !g_lookup) continue;
             const auto* head = S.info("output.weight");
             const int head_rows = head ? (int) (head->elements() / c.C) : 201024;
+            // (the fold reads an FP16 head or a planar Q8_0 one: on the layout that keeps the dense weights as their blocks,
+            //  a head of another type - UD-IQ3_XXS's is Q5_K, a 150 GB Inkling-2-Small's Q6_K - gets an FP16 copy for
+            //  the drafter where every expert stays in VRAM and it has the room (head_f16_b, counted below); the
+            //  model's own logits still come from the blocks, so its answers are the same with the drafter and without)
+            const bool head_q8 = head && (int) head->type == k::kQ8_0 && c.C % 128 == 0;
+            const size_t head_f16_b = model_drafter && g_dense_q8 && !head_q8 ? (size_t) head_rows * c.C * 2 : 0;
+            if (head_f16_b && !(head && g_fast_want && k::block_values((int) head->type))) {
+                std::printf("NOTE maya-ik2: the drafter left out: the output head is %s, and the fold reads an FP16 or a "
+                            "planar Q8_0 one\n",
+                            head ? head->type_name() : "missing");
+                draft_path.clear();
+                continue;
+            }
             // (the drafter: its context rows in FP16, else in FP8 - IK2_DRAFT_KV takes one; the load below measures)
             const char* kv_env = getenv("IK2_DRAFT_KV");
             const bool only16 = kv_env && std::string(kv_env) == "f16", only8 = kv_env && std::string(kv_env) == "fp8";
-            size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8);
+            size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8) + head_f16_b;
             std::string why;
             if (off_layout && model_drafter && off_why.empty()) {
                 std::vector<std::pair<int, bool>> tries;   // (rows, FP8)
@@ -6432,7 +7183,7 @@ int main(int argc, char** argv) {
                 if (!ok) ik2::draft::plan_context_rows(0);
             } else if (model_drafter && !only8 && !only16 && !room_ok(need, why)) {
                 why.clear();
-                need = draft_room(draft_path, ctx, chunk, c, head_rows, true);
+                need = draft_room(draft_path, ctx, chunk, c, head_rows, true) + head_f16_b;
             }
             why.clear();
             if (room_ok(need, why)) {
@@ -6462,6 +7213,13 @@ int main(int argc, char** argv) {
     } else if (!draft_path.empty() || g_lookup) {
         std::printf("NOTE maya-ik2: drafting off - it runs on one GPU with every expert in VRAM, not here\n");
         draft_path.clear(), g_lookup = false;
+    }
+    if (g_part == 1) {
+        if (!(g_off_draft && drafting == "auto" && draft_choice < 0)) draft_part_done("skip", draft_key_s, nullptr);
+        std::fprintf(g_part_out, "NOTE maya-ik2: measuring this PC once, before the first answer: drafting and plain "
+                                 "decoding, each on its own layout (two short runs of the engine before the start "
+                                 "itself); remembered, the next starts skip it\n");
+        std::fflush(g_part_out);
     }
 
     // the dense weights
@@ -6622,7 +7380,9 @@ int main(int argc, char** argv) {
             const int nr = (int) pr.second.size();
             if (ti->elements() != (uint64_t) c.E * c.F * C * nr) die(n + ": shape");
             if (!k::block_values((int) ti->type)) die(n + ": type " + ti->type_name() + " not decoded here");
-            if (C % k::block_values((int) ti->type) || c.F % k::block_values((int) ti->type))
+            // (a row: C values of gate / up and of a fused gate_up, F of down - the width this tensor is read with)
+            const int row_w = pr.first == "down" ? c.F : C;
+            if (row_w % k::block_values((int) ti->type))
                 die(n + ": a row is not whole " + ti->type_name() + " blocks");
             const size_t per = tensor_bytes(*ti) / c.E;
             std::vector<float> sc;
@@ -6764,6 +7524,7 @@ int main(int argc, char** argv) {
     // mapped, then the rest read and pinned (below the warm) - an 8 GB card's tier is RAM a 16 GB PC does not need.
     // Linux, where the GPU reads a registered range at its own address; IK2_PIN_ALL=1: every expert pinned here.
     bool pin_later = false;
+    bool res_stage = false;   // (the resident path's experts read a layer at a time, not from the files' mapping)
 #ifndef _WIN32
     if (!host_mmap && g_off_want && !(getenv("IK2_PIN_ALL") && std::atoi(getenv("IK2_PIN_ALL"))) &&
         !(getenv("IK2_TIER_MIN") && std::atoi(getenv("IK2_TIER_MIN"))) &&
@@ -6782,18 +7543,36 @@ int main(int argc, char** argv) {
         pin_later = g_offs.tab = true;
 #endif
     if (host_mmap) {
-        if (g_pool) die("IK2_HOST=mmap with the CPU lane");
+        if (g_cpu) die("IK2_HOST=mmap with the CPU lane");
         if (g_off_want) die("IK2_HOST=mmap with the offload path (it reads pinned host memory: IK2_OFF=0)");
+#ifdef __linux__
+        // (the files and the experts' VRAM do not fit the RAM together - a 150 GB model on an APU, whose VRAM is the
+        //  RAM: reading the whole files ahead fills the RAM the slots need, and the load crawls at a page fault at a
+        //  time.  There the resident path reads a layer at a time into a pinned block, with the reads' threads.)
+        if (g_fast_want)
+            if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+                char line[256];
+                unsigned long long av_kb = 0;
+                while (std::fgets(line, sizeof line, mi)) std::sscanf(line, "MemAvailable: %llu kB", &av_kb);
+                std::fclose(mi);
+                cudaDeviceProp dp{};
+                CU(cudaGetDeviceProperties(&dp, 0));
+                // (an integrated GPU's slots come out of the same RAM as the page cache)
+                const size_t need = host_total + (dp.integrated ? host_total : 0);
+                res_stage = av_kb && (size_t) av_kb * 1024 < need + ((size_t) 4 << 30);
+            }
+#endif
         for (const auto& J : exp_jobs) {
             Layer& Ly = M.L[J.l];
             const uint8_t* p = S.data(J.name);
             for (size_t i = 0; i < J.roles.size(); ++i) Ly.host[J.roles[i]] = p + i * Ly.eb[J.roles[i]];
-            {   // (read ahead: a cold file otherwise comes in a page fault at a time)
+            if (!res_stage) {   // (read ahead: a cold file otherwise comes in a page fault at a time)
                 const size_t pg = 4096, a0 = (size_t) p & ~(pg - 1);
                 ::madvise((void*) a0, (size_t) p - a0 + tensor_bytes(*S.info(J.name)), MADV_WILLNEED);
             }
         }
-        std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
+        std::printf(res_stage ? "experts: read a layer at a time into VRAM (the RAM does not hold the files beside them)\n"
+                              : "experts: read where the files are mapped (IK2_HOST=mmap)\n");
         std::fflush(stdout);
     } else if (pin_later) {
         pin.blocks.resize(c.n_layer);
@@ -6992,6 +7771,14 @@ int main(int argc, char** argv) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
         // (a Q8_0 head: the fold reads its blocks a chunk at a time and the base logits are products with them - no
         //  FP16 copy of it, 0.9 GiB for Inkling 2's, which at a long context's start had no room beside the cache)
+        if (!draft_head && !M.out_w.q8 && M.out_w.raw && k::block_values(M.out_w.type)) {
+            // (a head kept as other blocks - Q6_K, Q5_K: an FP16 copy of it for the drafter's fold and base logits)
+            draft_head = g_draft_head16 = dalloc<uint16_t>((size_t) c.n_rows * c.C);
+            k::decode_f16(M.out_w.type, M.out_w.raw, (size_t) c.n_rows * c.C, draft_head, g_s);
+            CU(cudaStreamSynchronize(g_s));
+            std::printf("drafter: an FP16 copy of the %.2f GiB output head for it (the model's own logits: from its "
+                        "blocks, as without the drafter)\n", (size_t) c.n_rows * c.C * 2 / 1073741824.0);
+        }
         if (!draft_head && !M.out_w.q8) die("--draft: the output head is neither FP16 nor planar Q8_0");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
@@ -7065,7 +7852,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < Work::kPackRing; ++i) {
         CU(cudaHostAlloc(&W.pack_h[i], 8192, cudaHostAllocPortable));
         W.pack_d[i] = dalloc<uint8_t>(8192);
-        if (g_pool) CU(cudaHostAlloc(&W.y_h[i], (size_t) 64 * C * 4, cudaHostAllocPortable));
+        if (g_cpu) CU(cudaHostAlloc(&W.y_h[i], (size_t) 64 * C * 4, cudaHostAllocPortable));
     }
     W.T_host = (int) std::max<size_t>(T_buf, W.T_sup > 0 ? (size_t) ctx : 0);   // (a lent scratch can take up to ctx)
     const size_t S_host = (size_t) W.T_host * c.K;
@@ -7279,7 +8066,69 @@ int main(int argc, char** argv) {
                     off_value.assign(cnt.begin(), cnt.end());
                 std::fclose(in);
             }
-    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, off_value.empty() ? nullptr : &off_value);
+    // The tier's order (ik2_tier.hpp; owner, v1.1.83): on a looped model's offload path where the decode will be lane
+    // parity, whole layers by visits a byte (the looped layers first), inside a layer by picks - fewer layer visits a
+    // token then wait for an expert from RAM; elsewhere picks a byte, v1.1.82's order (mode A: until it is measured
+    // per PC).  IK2_TIER_ORDER=layers / picks: either one (tests).  The decode mode is chosen as v1.1.82 chose it:
+    // from the share of the profile's picks v1.1.82's tier holds (worked out here, or after the warm below).
+    std::vector<int> tier_order, tier_rank;
+    bool tier_guess = false;   // (lane parity assumed: no calibration of this PC kept yet - its first start)
+    auto picks_share = [&]() {   // (v1.1.82's tier - the pools sized by picks a byte, each the most picked - its share)
+        ExpertCache T;
+        T.tp = EC.tp, T.tier_only = EC.tier_only;
+        T.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, &off_value, nullptr, false);
+        std::vector<char> held((size_t) c.n_layer * c.E, 0);
+        for (size_t p = 0; p < T.pools.size(); ++p) {
+            std::vector<int> idx;
+            for (int l = 0; l < c.n_layer; ++l)
+                if (T.layer_pool[l] == (int) p)
+                    for (int e = 0; e < c.E; ++e)
+                        if (!g_ep || ep_owner(l, e) == d) idx.push_back(l * c.E + e);
+            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return off_value[a] > off_value[b]; });
+            for (int i = 0; i < std::min((int) idx.size(), T.pools[p].n_active); ++i) held[(size_t) idx[i]] = 1;
+        }
+        double hit = 0, all = 0;   // (summed as the decode mode's estimate sums them)
+        for (int i = 0; i < c.n_layer * c.E; ++i) all += off_value[(size_t) i], hit += held[(size_t) i] ? off_value[(size_t) i] : 0.0;
+        return all > 0 ? hit / all : 0.0;
+    };
+    if (g_off_want && d == 0 && !off_value.empty()) {
+        int want = ik2::tier::forced_order(getenv("IK2_TIER_ORDER"));
+        if (want < 0) {   // (the decode mode the load below will choose - its own rules)
+            const char* le = getenv("IK2_LANE");
+#ifdef MAYA_USE_HIP
+            const char* lane_def = "0";
+#else
+            const char* lane_def = "auto";
+#endif
+            const bool meas = g_off_measure && g_off_draft && !g_two.want && !g_kv_streaming;
+            const std::string lw = g_two.want || g_kv_streaming || (g_off_draft && !meas) ? "0"
+                                   : le && *le ? le : lane_def;
+            want = 0;
+            if (c.n_pass > 1 && lw != "0" && lane_formats(M)) {
+                k::LaneCost cal{};
+                int th = 0;
+                const int thr = getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1;
+                if (lw != "auto") want = 1;
+                else if (lane_calib_read(lane_calib_path(), lane_calib_key(c, thr), cal, th)) {
+                    g_tier_h_picks = picks_share();
+                    want = ik2::tier::lane_estimate(g_tier_h_picks, c.K, cal.lat, cal.cpu[0], cal.fetch[0], cal.gpu[0]).lane;
+                } else
+                    want = 1, tier_guess = true;
+            }
+        }
+        if (want == 1) {
+            std::vector<int> visits(c.n_layer, 0);
+            for (const auto& Vi : M.V) ++visits[Vi.l];
+            std::vector<size_t> sb(c.n_layer);
+            for (int l = 0; l < c.n_layer; ++l) sb[l] = M.L[l].slot_bytes;
+            tier_order = ik2::tier::layer_order(visits, sb, off_value, c.E);
+            tier_rank = ik2::tier::ranks(tier_order);
+            if (g_tier_h_picks < 0) g_tier_h_picks = picks_share();
+        }
+        g_tier_rank = tier_rank;
+    }
+    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, off_value.empty() ? nullptr : &off_value,
+            tier_order.empty() ? nullptr : &tier_order);
     if (g_off_want && d == 0) g_lend.value = off_value;
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
                 EC.pools.size(), EC.total_bytes() / 1073741824.0, now() - t_start);
@@ -7312,7 +8161,11 @@ int main(int argc, char** argv) {
                             if (!g_ep || ep_owner(l, e) == d) idx.push_back(l * c.E + e);
                 // the most picked first; the chosen ones then go in least picked first, so that the evictions that
                 // start from the oldest take the least picked
-                std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
+                // (the tier's whole-layer order, where it was filled so: the first in it, as the pools were sized)
+                if (!tier_rank.empty())
+                    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return tier_rank[a] < tier_rank[b]; });
+                else
+                    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
                 const int k = std::min((int) idx.size(), EC.pools[p].n_active);
                 for (int i = k - 1; i >= 0; --i) {
                     const int l = idx[i] / c.E, e = idx[i] % c.E;
@@ -7508,31 +8361,44 @@ int main(int argc, char** argv) {
             // a visit's expected misses from the tier's share of the profile's picks (all picks' share of the bytes
             // when there is no profile), then mode A's time (copies, then the experts; the resident kernels taken
             // as twice as fast as the exact ones) against lane parity's best split of them
-            double hit = 0, all = 0;
-            for (int i = 0; i < c.n_layer * c.E; ++i) {
-                const double v = off_value.empty() ? 1.0 : off_value[(size_t) i];
-                all += v, hit += EC.loc[(size_t) i] >= 0 ? v : 0.0;
+            // (the profile's own counts and v1.1.82's tier - picks a byte - whatever order the tier was filled in, so
+            //  the mode is the one v1.1.82 chose: ik2_tier.hpp's lane_estimate)
+            double h = g_tier_h_picks;
+            if (h < 0) {
+                double hit = 0, all = 0;
+                for (int i = 0; i < c.n_layer * c.E; ++i) {
+                    const double v = off_value.empty() ? 1.0 : off_value[(size_t) i];
+                    all += v, hit += EC.loc[(size_t) i] >= 0 ? v : 0.0;
+                }
+                h = all > 0 ? hit / all : 0.0;
             }
-            const double h = all > 0 ? hit / all : 0.0, nm = c.K * (1.0 - h);
             const k::LaneCost& cs = g_offs.cost_h;
-            const double t_a = nm * cs.fetch[0] + 0.5 * c.K * cs.gpu[0];
-            double t_b = 1e30;
-            for (int n = 0; n <= (int) std::ceil(nm); ++n) {
-                const double nn = std::min<double>(n, nm);
-                t_b = std::min(t_b, std::max(nn > 0 ? cs.lat + nn * cs.cpu[0] : 0.0,
-                                             (nm - nn) * cs.fetch[0] + c.K * cs.gpu[0]));
-            }
-            const bool faster = t_b < 0.95 * t_a;
+            const auto est = ik2::tier::lane_estimate(h, c.K, cs.lat, cs.cpu[0], cs.fetch[0], cs.gpu[0]);
+            const bool faster = est.lane;
             std::printf("decode mode: %s (a visit ~%.0f us with the lane, ~%.0f us without; tier %.0f%% of the "
-                        "profile's picks)\n", faster ? "lane parity" : "A (the lane is not faster here)", t_b, t_a,
-                        100.0 * h);
+                        "profile's picks)\n", faster ? "lane parity" : "A (the lane is not faster here)", est.t_b,
+                        est.t_a, 100.0 * h);
             if (!faster) g_lane = false, g_offs.lane.reset();
+            if (!faster && tier_guess)
+                std::printf("NOTE maya-ik2: the VRAM tier was filled for lane parity (whole layers, the looped ones "
+                            "first: no calibration of this PC kept yet); once it is kept (the next start) the tier is "
+                            "filled for mode A (picks a byte). The answers are mode A's either way.\n");
+        }
+        if (!tier_rank.empty()) {   // (the tier's order and what it holds of the profile's picks)
+            double hit = 0, all = 0;
+            for (int i = 0; i < c.n_layer * c.E; ++i)
+                all += off_value[(size_t) i], hit += EC.loc[(size_t) i] >= 0 ? off_value[(size_t) i] : 0.0;
+            const std::string core = c.n_pass > 1 ? " (looped layers " + std::to_string(c.core0) + " .. " +
+                                                        std::to_string(c.core1 - 1) + " first)" : "";
+            std::printf("vram tier: whole layers, the most layer visits a byte first%s, inside a layer by picks: %.0f%% "
+                        "of the profile's picks (by picks a byte it would be %.0f%%)\n", core.c_str(),
+                        all > 0 ? 100.0 * hit / all : 0.0, 100.0 * g_tier_h_picks);
         }
         g_off_measure = g_off_measure && g_lane;   // (mode A is this PC's plain decoding anyway: measured as everywhere)
         // two GPUs: GPU 1's experts - a token's launches on both devices one by one (2x V100, 2x 12 GB: 78.7 tok/s,
         // against 73.1 as one CUDA graph across them; IK2_TWO_GRAPH=1: the graph, where every copy is a peer one)
         if (g_two.want && two_setup(M, EC, off_value))
-            g_graph = g_graph && g_two.link.all_peer && getenv("IK2_TWO_GRAPH") && std::atoi(getenv("IK2_TWO_GRAPH"));
+            g_graph = g_graph && !g_two.mail && g_two.link.all_peer && getenv("IK2_TWO_GRAPH") && std::atoi(getenv("IK2_TWO_GRAPH"));
         int n_tier = 0;
         for (int i = 0; i < c.n_layer * c.E; ++i) n_tier += EC.loc[i] >= 0;
         size_t st_b = 0;
@@ -7552,10 +8418,52 @@ int main(int argc, char** argv) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
             int n = 0;
-            for (int l = 0; l < c.n_layer; ++l)
+            uint8_t* stage = nullptr;   // (res_stage: a layer's experts, slot by slot, pinned)
+            if (res_stage) {
+                size_t mx = 0;
+                for (const auto& Ly : M.L) mx = std::max(mx, (size_t) c.E * (Ly.eb[0] + Ly.eb[1] + Ly.eb[2]));
+                CU(cudaHostAlloc((void**) &stage, mx, cudaHostAllocPortable));
+            }
+            for (int l = 0; l < c.n_layer; ++l) {
+                Layer& Ly = M.L[l];
+                const bool keep_contig = Ly.host_contig;
+                const size_t keep_slot = Ly.slot_bytes, keep_stride[3] = {Ly.stride[0], Ly.stride[1], Ly.stride[2]};
+                const uint8_t* keep_host[3] = {Ly.host[0], Ly.host[1], Ly.host[2]};
+                if (stage) {
+                    const size_t sb = Ly.eb[0] + Ly.eb[1] + Ly.eb[2];
+                    std::vector<std::thread> th;
+                    const int per_job = std::max(1, threads / 3);
+                    for (const auto& J : exp_jobs) {
+                        if (J.l != l) continue;
+                        // (a tensor's parts of an expert, one after the other in the slot from its first role on)
+                        const size_t role_off = J.roles[0] == 0 ? 0 : (J.roles[0] == 1 ? Ly.eb[0] : Ly.eb[0] + Ly.eb[1]);
+                        const size_t exp_bytes = tensor_bytes(*S.info(J.name)) / c.E;
+                        const ExpJob* Jp = &J;
+                        for (int t = 0; t < per_job; ++t) {
+                            const int e0 = (int) ((long long) c.E * t / per_job), e1 = (int) ((long long) c.E * (t + 1) / per_job);
+                            if (e1 > e0)
+                                th.emplace_back([&S, Jp, stage, e0, e1, role_off, exp_bytes, sb]() {
+                                    read_into_strided(S.paths[S.file_of(Jp->name)],
+                                                      S.file_offset(Jp->name) + (uint64_t) e0 * exp_bytes, e1 - e0,
+                                                      exp_bytes, sb, stage + (size_t) e0 * sb + role_off);
+                                });
+                        }
+                    }
+                    for (auto& t : th) t.join();
+                    Ly.host_contig = true, Ly.slot_bytes = sb;
+                    Ly.host[0] = stage, Ly.host[1] = stage + Ly.eb[0], Ly.host[2] = stage + Ly.eb[0] + Ly.eb[1];
+                    Ly.stride[0] = Ly.stride[1] = Ly.stride[2] = sb;
+                }
                 for (int e = 0; e < c.E; ++e)
-                    if (!EC.has(l, e)) EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true), ++n;
+                    if (!EC.has(l, e)) EC.get(Ly, l, e, EC.tick, g_cs, nullptr, true, true), ++n;
+                if (stage) {   // (the block is the next layer's: this one's copies done first)
+                    CU(cudaStreamSynchronize(g_cs));
+                    Ly.host_contig = keep_contig, Ly.slot_bytes = keep_slot;
+                    for (int r = 0; r < 3; ++r) Ly.host[r] = keep_host[r], Ly.stride[r] = keep_stride[r];
+                }
+            }
             CU(cudaStreamSynchronize(g_cs));
+            if (stage) CU(cudaFreeHost(stage));
             ++EC.tick;
             for (int l = 0; l < c.n_layer; ++l) {
                 Layer& Ly = M.L[l];
@@ -7678,6 +8586,153 @@ int main(int argc, char** argv) {
             hist_sig.clear();
             last.clear();
         };
+        // The session cache (IK2_SESSION_CACHE_GB, 0 / unset: off): the state at the latest snapshot of a session
+        // that is about to be replaced - another session's request, or one that shares too little to continue it -
+        // put aside in host RAM (the full layers' KV rows before it, the snapshot itself, the drafter's context
+        // rows), and taken up again by a request that starts with that session's tokens.  Agents that take turns on
+        // one engine (a coding agent and its subagents, two chats) then each read only their new tokens.  Least
+        // recently used goes first past the budget; a session shorter than IK2_SESSION_CACHE_MIN (1024) is not kept.
+        struct Stash {
+            std::vector<int> tok;                           // the session's tokens up to its snapshot (pos)
+            std::vector<uint64_t> sig;
+            int pos = 0;
+            std::vector<std::vector<float>> h;              // [visit * 4 + conv]
+            std::vector<std::vector<uint8_t>> kv_k, kv_v;   // [visit]: a full layer's rows 0 .. pos - 1, a window's Snap copy
+            std::vector<uint8_t> draft;
+            size_t bytes = 0;
+            uint64_t used = 0;
+        };
+        std::list<Stash> stash;
+        size_t sc_budget = getenv("IK2_SESSION_CACHE_GB")
+                               ? (size_t) (std::max(0.0, std::atof(getenv("IK2_SESSION_CACHE_GB"))) * 1073741824.0)
+                               : 0;
+        const int sc_min = getenv("IK2_SESSION_CACHE_MIN") ? std::max(1, std::atoi(getenv("IK2_SESSION_CACHE_MIN"))) : 1024;
+        size_t sc_bytes = 0;
+        uint64_t sc_clock = 0;
+        // (off with --parallel: its own loop keeps each conversation in a slot; off with KV streaming: a full visit's
+        //  K / V in host RAM or swinging between the two, where the copies below expect them in VRAM)
+        if (sc_budget && (g_par > 1 || g_kv_streaming || g_kv_swing >= 0)) {
+            std::fprintf(stderr, "session cache: off (%s)\n",
+                         g_par > 1 ? "--parallel" : "the K / V cache streamed from RAM");
+            sc_budget = 0;
+        }
+        if (sc_budget)
+            std::fprintf(stderr, "session cache: up to %.1f GiB of host RAM, sessions of %d tokens or more\n",
+                         sc_budget / 1073741824.0, sc_min);
+        auto full_kv = [&](const Layer& Ly) { return !(Ly.sliding && Ly.kv_cap < ctx); };
+        // the session on the GPU (its latest snapshot) into the cache; `keep`: an entry not to evict or replace
+        auto stash_put = [&](std::list<Stash>::iterator keep) {
+            if (!sc_budget) return;
+            int b = -1;
+            for (int i = 0; i < (int) snaps.size(); ++i)
+                if (snaps[i].pos >= 0 && (b < 0 || snaps[i].pos > snaps[b].pos)) b = i;
+            if (b < 0 || snaps[b].pos < sc_min || snaps[b].pos > (int) hist.size()) return;
+            const Snap& sn = snaps[b];
+            const int pos = sn.pos;
+            auto sig_at = [&](const std::vector<uint64_t>& s, int i) { return i < (int) s.size() ? s[i] : (uint64_t) 0; };
+            // (an entry of this session at an earlier turn: a prefix of it, superseded)
+            for (auto it = stash.begin(); it != stash.end();) {
+                bool prefix = it != keep && it->pos <= pos;
+                for (int i = 0; prefix && i < it->pos; ++i)
+                    prefix = it->tok[i] == hist[i] && sig_at(it->sig, i) == sig_at(hist_sig, i);
+                if (prefix) sc_bytes -= it->bytes, it = stash.erase(it);
+                else ++it;
+            }
+            const double ts = now();
+            Stash s;
+            s.pos = pos;
+            s.tok.assign(hist.begin(), hist.begin() + pos);
+            s.sig.assign(hist_sig.begin(), hist_sig.begin() + std::min((size_t) pos, hist_sig.size()));
+            const size_t cc[4] = {KD, KD, C, C};
+            const size_t row_b = (size_t) KD * kv_elem_b;
+            s.h.resize(M.V.size() * 4), s.kv_k.resize(M.V.size()), s.kv_v.resize(M.V.size());
+            for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
+                Layer& Ly = bind_visit(M, (int) l);
+                use_dev(Ly.dev);
+                for (int i = 0; i < 4; ++i) {
+                    s.h[l * 4 + i].resize(3 * cc[i]);
+                    CU(cudaMemcpyAsync(s.h[l * 4 + i].data(), sn.h[l * 4 + i], 3 * cc[i] * 4, cudaMemcpyDeviceToHost, g_s));
+                }
+                if (!full_kv(Ly)) {
+                    s.kv_k[l] = sn.kv_k[l], s.kv_v[l] = sn.kv_v[l];
+                } else {
+                    s.kv_k[l].resize((size_t) pos * row_b), s.kv_v[l].resize((size_t) pos * row_b);
+                    CU(cudaMemcpyAsync(s.kv_k[l].data(), g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc, (size_t) pos * row_b,
+                                       cudaMemcpyDeviceToHost, g_s));
+                    CU(cudaMemcpyAsync(s.kv_v[l].data(), g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc, (size_t) pos * row_b,
+                                       cudaMemcpyDeviceToHost, g_s));
+                }
+            }
+            for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+            if (drafter) ik2::draft::save_context(drafter, pos, s.draft);
+            s.bytes = s.tok.size() * 4 + s.sig.size() * 8 + s.draft.size();
+            for (auto& v : s.h) s.bytes += v.size() * 4;
+            for (size_t l = 0; l < s.kv_k.size(); ++l) s.bytes += s.kv_k[l].size() + s.kv_v[l].size();
+            if (s.bytes > sc_budget) return;
+            while (sc_bytes + s.bytes > sc_budget) {   // (the least recently used first)
+                auto lru = stash.end();
+                for (auto it = stash.begin(); it != stash.end(); ++it)
+                    if (it != keep && (lru == stash.end() || it->used < lru->used)) lru = it;
+                if (lru == stash.end()) return;
+                sc_bytes -= lru->bytes;
+                stash.erase(lru);
+            }
+            s.used = ++sc_clock;
+            sc_bytes += s.bytes;
+            std::fprintf(stderr, "session cache: put aside %d tokens (%.0f MiB) in %.0f ms; %zu sessions, %.1f GiB\n", pos,
+                         s.bytes / 1048576.0, (now() - ts) * 1e3, stash.size() + 1, sc_bytes / 1073741824.0);
+            stash.push_back(std::move(s));
+        };
+        // the cached session a request starts with (its tokens, then at least one more): the longest
+        auto stash_find = [&](const std::vector<int>& ids, const std::vector<uint64_t>& sig) {
+            auto best = stash.end();
+            for (auto it = stash.begin(); it != stash.end(); ++it) {
+                if (it->pos >= (int) ids.size() || (best != stash.end() && it->pos <= best->pos)) continue;
+                bool match = true;
+                for (int i = 0; match && i < it->pos; ++i)
+                    match = it->tok[i] == ids[i] && (i < (int) it->sig.size() ? it->sig[i] : (uint64_t) 0) == sig[i];
+                if (match) best = it;
+            }
+            return best;
+        };
+        // a cached session back on the GPU, as the session there (it leaves the cache)
+        auto stash_take = [&](std::list<Stash>::iterator it) {
+            const double ts = now();
+            Stash& s = *it;
+            lend_check(M, s.pos);   // (experts lent the K / V rows it writes given back first)
+            Snap& sn = snaps[snap_next];
+            snap_next = (snap_next + 1) % (int) snaps.size();
+            const size_t cc[4] = {KD, KD, C, C};
+            const size_t row_b = (size_t) KD * kv_elem_b;
+            for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
+                Layer& Ly = bind_visit(M, (int) l);
+                use_dev(Ly.dev);
+                for (int i = 0; i < 4; ++i)
+                    CU(cudaMemcpyAsync(sn.h[l * 4 + i], s.h[l * 4 + i].data(), 3 * cc[i] * 4, cudaMemcpyHostToDevice, g_s));
+                if (!full_kv(Ly)) {
+                    sn.kv_k[l] = std::move(s.kv_k[l]), sn.kv_v[l] = std::move(s.kv_v[l]);
+                } else {
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc, s.kv_k[l].data(), (size_t) s.pos * row_b,
+                                       cudaMemcpyHostToDevice, g_s));
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc, s.kv_v[l].data(), (size_t) s.pos * row_b,
+                                       cudaMemcpyHostToDevice, g_s));
+                }
+            }
+            for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+            for (auto& o : snaps) o.pos = -1;
+            sn.pos = s.pos;
+            snap_copy(sn, false);   // (the convs' histories and the windows, as a snapshot of this session's)
+            if (drafter) ik2::draft::load_context(drafter, s.pos, s.draft);
+            hist = std::move(s.tok);
+            hist_sig = std::move(s.sig);
+            last.clear();
+            const int pos = sn.pos;
+            sc_bytes -= s.bytes;
+            stash.erase(it);
+            std::fprintf(stderr, "session cache: took up %d tokens in %.0f ms; %zu sessions, %.1f GiB left\n", pos,
+                         (now() - ts) * 1e3, stash.size(), sc_bytes / 1073741824.0);
+            return pos;
+        };
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
             for (const char* p = t.c_str(); *p;) {
@@ -7710,7 +8765,9 @@ int main(int argc, char** argv) {
                 if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
             g_lane = on;
         };
-        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && (spec_path() || lane_meas)) {
+        const bool meas = drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && (spec_path() || lane_meas);
+        if (g_part == 1 && !(meas && g_off && g_off_draft)) draft_part_done("skip", draft_key_s, nullptr);
+        if (meas || g_part == 2) {
             std::vector<std::vector<int>> reqs;
             if (const char* f = getenv("IK2_DRAFT_IDS")) {
                 std::ifstream in(f);
@@ -7721,6 +8778,7 @@ int main(int argc, char** argv) {
                         if (!v.empty() && (int) v.size() + 256 < ctx) reqs.push_back(std::move(v));
                     }
             }
+            if (reqs.empty() && g_part) draft_part_done("skip", draft_key_s, nullptr);
             if (reqs.empty() && lane_meas) {
                 std::printf("NOTE maya-ik2: drafting off, not measured against plain decoding here (no requests to time "
                             "it on: IK2_DRAFT_IDS) - lane parity, as without a drafter; --drafting on drafts (mode A)\n");
@@ -7730,7 +8788,8 @@ int main(int argc, char** argv) {
             } else {
                 const int gen_n = getenv("IK2_DRAFT_TOKENS") ? std::max(16, std::atoi(getenv("IK2_DRAFT_TOKENS"))) : 128;
                 const double tie = getenv("IK2_DRAFT_TIE") ? std::atof(getenv("IK2_DRAFT_TIE")) : 0.03;
-                const bool have[4] = {true, g_lookup, drafter != nullptr, drafter && g_lookup};
+                // (a part run: the drafting layout's sources, or plain decoding alone on its own)
+                const bool have[4] = {g_part != 1, g_lookup, drafter != nullptr, drafter && g_lookup};
                 std::printf("NOTE maya-ik2: measuring this PC once, before the first answer: drafting (%zu requests, %d "
                             "tokens each, a source at a time); remembered, the next starts skip it\n", reqs.size(), gen_n);
                 std::fflush(stdout);
@@ -7772,13 +8831,11 @@ int main(int argc, char** argv) {
                     return made / std::max(1e-9, secs);
                 };
                 double warm = 0, tps[4] = {-1, -1, -1, -1};
-                trial(have[3] ? 3 : have[2] ? 2 : 1, 24, warm);   // (the windows' graphs made once, untimed)
+                trial(have[3] ? 3 : have[2] ? 2 : have[1] ? 1 : 0, 24, warm);   // (the windows' graphs made once, untimed)
                 for (int m = 0; m < 4; ++m)
                     if (have[m]) tps[m] = trial(m, gen_n, warm);
-                int best = 0;
-                for (int m = 1; m < 4; ++m)
-                    if (tps[m] > tps[best]) best = m;
-                if (best && tps[best] < tps[0] * (1.0 + tie)) best = 0;   // (no clear gain: no drafting)
+                if (g_part) draft_part_done(g_part == 1 ? "draft" : "plain", draft_key_s, tps);
+                const int best = draft_best(tps, tie);
                 draft_choice = best;
                 draft_remember(draft_key_s, tps, best);
                 if (lane_meas) {
@@ -7821,8 +8878,10 @@ int main(int argc, char** argv) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
             const bool sp = (drafter || g_lookup) && spec_path();
             const char* wd = getenv("IK2_WATCHDOG_S");
+            // (starts=1: GEN's starts= is read - the server's required tool call, Service.prepare)
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
-                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx,
+                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s starts=1 think=1\n",
+                        g_kv_fp8 ? "fp8" : "f16", ctx,
                         g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0, drafting.c_str(),
                         c.n_layer * c.E, g_par, wd && *wd ? std::max(0, std::atoi(wd)) : 600,
                         g_fast ? "resident" : g_off ? "offload" : "cache");
@@ -7845,6 +8904,8 @@ int main(int argc, char** argv) {
                             g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes());
             }
             use_dev(0);
+            if (abl::loaded)   // (--ablate: GEN ablate=0|1 turns its projection off / on for a request)
+                std::printf("INFO ablate=1 ablate_default=%d\n", abl::dflt ? 1 : 0);
             // (the split's GPU 1 was made current above without use_dev: back to GPU 0 - else the first request's
             //  launches met GPU 1's context, "invalid resource handle": two GPUs through the server since v1.1.74)
             if (g_two.on) CU(cudaSetDevice(0));
@@ -7950,10 +9011,13 @@ int main(int argc, char** argv) {
                 double temp = 0, top_p = 1;
                 std::mt19937_64 rng;
                 int slot = -1, phase = 0;   // 1: reading its prompt, 2: writing
+                bool abl = false;           // --ablate: this request projects the direction out (GEN ablate=, else the default)
                 size_t p0 = 0;
                 int cached = 0, n_out = 0, tok = -1;
                 double t0 = 0, t1 = 0;
                 bool cancel = false;
+                Starts starts;   // (GEN's starts=: the answer's opening)
+                ThinkCut tc;     // (GEN's think_*: the thinking budget)
             };
             struct SlotH {
                 std::vector<int> hist;
@@ -7961,6 +9025,7 @@ int main(int argc, char** argv) {
                 std::vector<float> last;
                 double used = 0;
                 bool busy = false;
+                bool abl = false;   // (--ablate: the setting its kept state was read with)
             };
             std::vector<SlotH> sh(g_par);
             std::deque<Req> waiting;
@@ -8035,7 +9100,17 @@ int main(int argc, char** argv) {
                 }
                 r.t1 = now();
                 r.phase = 2;
-                r.tok = pick_last(r, S.last);
+                if (r.starts.on()) {   // (an opening: the first token among its sequences')
+                    const std::vector<int> o = r.starts.opts();
+                    std::vector<std::pair<float, int>> cd;
+                    if (o.size() > 1)
+                        for (int t : o) cd.push_back({S.last[t], t});
+                    r.tok = pick_among(o, cd, r.temp,
+                                       [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
+                } else {
+                    r.tok = pick_last(r, S.last);
+                }
+                r.starts.took(r.tok);
             };
             auto admit = [&](Req&& rq) {
                 int s = -1;
@@ -8044,8 +9119,8 @@ int main(int argc, char** argv) {
                     if (sh[i].busy) continue;
                     size_t L = 0;
                     const auto& H = sh[i].hist;
-                    while (L < H.size() && L < rq.ids.size() && H[L] == rq.ids[L] &&
-                           (L < sh[i].sig.size() ? sh[i].sig[L] : 0) == rq.sig[L])
+                    while (sh[i].abl == rq.abl && L < H.size() && L < rq.ids.size() && H[L] == rq.ids[L] &&
+                           (L < sh[i].sig.size() ? sh[i].sig[L] : 0) == rq.sig[L])   // (another setting's cache: no prefix)
                         ++L;
                     if (s < 0 || L > bestL || (L == bestL && sh[i].used < sh[s].used)) s = i, bestL = L;
                 }
@@ -8055,6 +9130,7 @@ int main(int argc, char** argv) {
                 sh[s].busy = true;
                 bind_slot(M, s);
                 SlotH& S = sh[s];
+                if (abl::loaded) abl::on[s] = r.abl, S.abl = r.abl;   // (the slot's conversation from here on)
                 size_t L = bestL;
                 if (L < S.hist.size() || L == r.ids.size()) {
                     int best = -1;
@@ -8106,6 +9182,7 @@ int main(int argc, char** argv) {
                 const bool geni = cmd == "GENI";
                 if (cmd != "GEN" && !geni) return;
                 Req r;
+                r.abl = abl::loaded && abl::dflt;   // (--ablate: GEN ablate= overrides)
                 std::string w, ids_s, emb_path;
                 long long seed = -1;
                 in >> r.max_new;
@@ -8124,6 +9201,9 @@ int main(int argc, char** argv) {
                     else if (k == "top_k") r.top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "rid") r.rid = std::atoi(v.c_str());
+                    else if (k == "starts") r.starts.parse(v, c.n_vocab);
+                    else if (think_key(r.tc, k, v, c.n_vocab)) {}
+                    else if (k == "ablate") r.abl = abl::loaded && std::atoi(v.c_str()) != 0;
                 }
                 r.ids = parse_ints(ids_s);
                 r.rng.seed(seed >= 0 ? (uint64_t) seed : rng_g());
@@ -8145,6 +9225,8 @@ int main(int argc, char** argv) {
                 }
                 waiting.push_back(std::move(r));
             };
+            const int par_decode_pct = getenv("IK2_PAR_DECODE_PCT")
+                ? std::clamp(std::atoi(getenv("IK2_PAR_DECODE_PCT")), 0, 90) : 0;
             uint64_t steps = 0;
             int stat_tok = 0;
             double stat_t = now();
@@ -8187,6 +9269,8 @@ int main(int argc, char** argv) {
                     }
                 }
                 // one prompt pass: the earliest reader's (act is in arrival order)
+                bool did_prefill = false;
+                double prefill_s = 0.0;
                 for (auto& r : act) {
                     if (r.phase != 1) continue;
                     bind_slot(M, r.slot);
@@ -8194,10 +9278,13 @@ int main(int argc, char** argv) {
                     const bool last_c = r.p0 + n == r.ids.size();
                     std::vector<float> lo;
                     beat("a prompt pass (--parallel)");
+                    const double pf_t0 = now();
                     std::swap(g_img, r.img);
                     forward(M, r.ids.data() + r.p0, n, (int) r.p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
                             std::string(), lo, nullptr, t_exp);
                     std::swap(g_img, r.img);
+                    prefill_s = now() - pf_t0;
+                    did_prefill = true;
                     if (last_c) sh[r.slot].last = std::move(lo);
                     r.p0 += n;
                     const double ms = (now() - r.t0) * 1e3;
@@ -8206,66 +9293,106 @@ int main(int argc, char** argv) {
                     if (last_c) prompt_done(r);
                     break;
                 }
-                // the writers: each one's token out, then the next of those going on in one step
-                std::vector<Req*> rows;
-                for (auto& r : act)
-                    if (r.phase == 2) rows.push_back(&r);
-                std::sort(rows.begin(), rows.end(), [](const Req* a, const Req* b) { return a->slot < b->slot; });
-                std::vector<Req*> go;
-                for (Req* r : rows) {
-                    if (r->cancel || r->max_new <= 0) {
-                        done_line(*r, r->cancel ? "cancel" : "length");
-                        r->phase = 3;
-                        continue;
-                    }
-                    ++r->n_out;
-                    std::printf("T %d %d\n", r->rid, r->tok);
-                    if (std::find(eos_ids.begin(), eos_ids.end(), r->tok) != eos_ids.end()) {
-                        done_line(*r, "stop");
-                        r->phase = 3;
-                    } else if (r->n_out >= r->max_new) {
-                        done_line(*r, "length");
-                        r->phase = 3;
-                    } else {
-                        go.push_back(r);
-                    }
+                bool still_reading = false;
+                if (did_prefill) {
+                    for (const auto& r : act)
+                        if (r.phase == 1) {
+                            still_reading = true;
+                            break;
+                        }
                 }
-                if (!go.empty()) {
-                    const int T = (int) go.size();
-                    int tk[kParMax], ps[kParMax], sl[kParMax], am[kParMax];
-                    bool cand = false;
-                    for (int t = 0; t < T; ++t) {
-                        tk[t] = go[t]->tok, ps[t] = (int) sh[go[t]->slot].hist.size(), sl[t] = go[t]->slot;
-                        cand = cand || go[t]->temp > 0;
-                    }
-                    beat("a decode step (--parallel, the conversations' tokens together)");
-                    par_step(M, T, tk, ps, sl, cand, am);
-                    for (int t = 0; t < T; ++t) {
-                        Req& r = *go[t];
-                        sh[r.slot].hist.push_back(r.tok);
-                        if (r.temp <= 0) {
-                            r.tok = am[t];
+                // IK2_PAR_DECODE_PCT: give the active writers a time-budgeted share of the GPU after each prompt pass
+                // so a long prompt read does not starve decoding to 1 token per pass (0: one step per pass, as before)
+                const double decode_budget = (did_prefill && par_decode_pct > 0 && still_reading)
+                    ? prefill_s * (double) par_decode_pct / (double) (100 - par_decode_pct)
+                    : 0.0;
+                const double decode_t0 = now();
+                // the writers: each one's token out, then the next of those going on in one step
+                for (;;) {
+                    std::vector<Req*> rows;
+                    for (auto& r : act)
+                        if (r.phase == 2) rows.push_back(&r);
+                    std::sort(rows.begin(), rows.end(), [](const Req* a, const Req* b) { return a->slot < b->slot; });
+                    std::vector<Req*> go;
+                    for (Req* r : rows) {
+                        if (r->cancel || r->max_new <= 0) {
+                            done_line(*r, r->cancel ? "cancel" : "length");
+                            r->phase = 3;
+                            continue;
+                        }
+                        ++r->n_out;
+                        std::printf("T %d %d\n", r->rid, r->tok);
+                        if (r->tc.saw(r->tok)) r->tc.close(r->starts);   // (the thinking budget: forced on from here)
+                        if (std::find(eos_ids.begin(), eos_ids.end(), r->tok) != eos_ids.end()) {
+                            done_line(*r, "stop");
+                            r->phase = 3;
+                        } else if (r->n_out >= r->max_new) {
+                            done_line(*r, "length");
+                            r->phase = 3;
                         } else {
-                            std::vector<std::pair<float, int>> cd;
-                            par_cands(M, t, cd);
-                            r.tok = sample(r, cd);
+                            go.push_back(r);
                         }
                     }
-                    stat_tok += T;
-                    if (++steps % 16 == 0) {
-                        long long held = 0;
-                        for (const auto& S : sh) held += (long long) S.hist.size();
-                        const double tn = now();
-                        std::printf("STAT tok_s=%.1f ms_tok=%.2f active=%d %s\n", stat_tok / std::max(1e-9, tn - stat_t),
-                                    stat_tok ? (tn - stat_t) * 1e3 / stat_tok * T : 0.0, T,
-                                    tier_kv(stat_tok, held).c_str());
-                        stat_tok = 0, stat_t = tn;
+                    if (!go.empty()) {
+                        const int T = (int) go.size();
+                        int tk[kParMax], ps[kParMax], sl[kParMax], am[kParMax];
+                        bool cand = false;
+                        for (int t = 0; t < T; ++t) {
+                            tk[t] = go[t]->tok, ps[t] = (int) sh[go[t]->slot].hist.size(), sl[t] = go[t]->slot;
+                            cand = cand || go[t]->temp > 0 || (go[t]->starts.on() && go[t]->starts.opts().size() > 1);
+                        }
+                        beat("a decode step (--parallel, the conversations' tokens together)");
+                        par_step(M, T, tk, ps, sl, cand, am);
+                        for (int t = 0; t < T; ++t) {
+                            Req& r = *go[t];
+                            sh[r.slot].hist.push_back(r.tok);
+                            if (r.starts.on()) {   // (an opening: among its tokens, from this step's candidates)
+                                const std::vector<int> o = r.starts.opts();
+                                std::vector<std::pair<float, int>> cd;
+                                if (o.size() > 1) par_cands(M, t, cd);
+                                r.tok = pick_among(o, cd, r.temp,
+                                                   [&](std::vector<std::pair<float, int>>& x) { return sample(r, x); });
+                            } else if (r.temp <= 0) {
+                                r.tok = am[t];
+                            } else {
+                                std::vector<std::pair<float, int>> cd;
+                                par_cands(M, t, cd);
+                                r.tok = sample(r, cd);
+                            }
+                            r.starts.took(r.tok);
+                        }
+                        stat_tok += T;
+                        if (++steps % 16 == 0) {
+                            long long held = 0;
+                            for (const auto& S : sh) held += (long long) S.hist.size();
+                            const double tn = now();
+                            std::printf("STAT tok_s=%.1f ms_tok=%.2f active=%d %s\n", stat_tok / std::max(1e-9, tn - stat_t),
+                                        stat_tok ? (tn - stat_t) * 1e3 / stat_tok * T : 0.0, T,
+                                        tier_kv(stat_tok, held).c_str());
+                            stat_tok = 0, stat_t = tn;
+                        }
+                    }
+                    act.remove_if([](const Req& r) { return r.phase == 3; });
+                    std::fflush(stdout);
+                    if (decode_budget <= 0.0 || go.empty() || now() - decode_t0 >= decode_budget) break;
+                    {
+                        std::unique_lock<std::mutex> lk(in_m);
+                        if (!in_q.empty()) {
+                            std::vector<std::string> got(in_q.begin(), in_q.end());
+                            in_q.clear();
+                            lk.unlock();
+                            for (const auto& l : got)
+                                if (!quit) take(l);
+                        }
+                    }
+                    if (quit) {
+                        pop_dump();
+                        break;
                     }
                 }
-                act.remove_if([](const Req& r) { return r.phase == 3; });
                 g_wd_busy = !act.empty();
-                std::fflush(stdout);
             }
+            g_cpu.reset();
             g_offs.lane.reset();
             std::fflush(stdout);
             std::_Exit(0);   // (QUIT: out at once - the OS frees the pinned runs and the driver's state; a full teardown took >30 s)
@@ -8283,7 +9410,7 @@ int main(int argc, char** argv) {
         while (next_line(line)) {
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
-            int max_new = 0, top_k = 0, spec_key = 0;
+            int max_new = 0, top_k = 0, spec_key = 0, abl_key = -1;   // (abl_key: GEN ablate=0|1, -1 as started)
             double temp = 0, top_p = 1;
             long long seed = -1;
             in >> cmd;
@@ -8302,6 +9429,8 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::vector<int> stops;
+            Starts starts;   // (GEN's starts=: the answer's opening, one of these sequences)
+            ThinkCut tc;     // (GEN's think_*: the thinking budget, closed in the decode)
             if (serve_maya) {
                 in >> max_new;
                 std::string w;
@@ -8320,6 +9449,9 @@ int main(int argc, char** argv) {
                     else if (k == "top_k") top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
                     else if (k == "spec") spec_key = std::atoi(v.c_str());   // (1: no drafting; 2 .. 8: the widest window)
+                    else if (k == "starts") starts.parse(v, c.n_vocab);
+                    else if (think_key(tc, k, v, c.n_vocab)) {}
+                    else if (k == "ablate") abl_key = std::atoi(v.c_str()) != 0 ? 1 : 0;   // (--ablate: this request's)
                 }
                 stops = eos_ids;
             } else {
@@ -8386,8 +9518,30 @@ int main(int argc, char** argv) {
                 stat_n = made, stat_t = t_now;
             };
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
+            if (abl::loaded) {   // (--ablate: the conversation's setting; the state kept was read with one - the other starts over)
+                const bool want = abl_key >= 0 ? abl_key != 0 : abl::dflt;
+                if (want != abl::on[g_slot_cur]) reset();
+                abl::on[g_slot_cur] = want;
+            }
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
+            if (sc_budget && !stash.empty()) {
+                // what the session on the GPU gives this request (a continuation, or a snapshot to go back to)
+                // against the cached session it starts with: the longer one goes on
+                size_t here = 0;
+                if (L == hist.size()) {
+                    here = L;
+                } else {
+                    for (const auto& sn : snaps)
+                        if (sn.pos >= 0 && sn.pos <= (int) L && sn.pos < (int) ids.size()) here = std::max(here, (size_t) sn.pos);
+                }
+                auto it = stash_find(ids, sig);
+                if (it != stash.end() && (size_t) it->pos > here) {
+                    it->used = ++sc_clock;
+                    stash_put(it);   // (the session on the GPU first: this request replaces it)
+                    L = (size_t) stash_take(it);
+                }
+            }
             if (L < hist.size() || L == ids.size()) {
                 // back to the latest snapshot at or before L that leaves a token to run (one past it is dropped:
                 // its position's state follows from a prefix the request does not share)
@@ -8408,6 +9562,7 @@ int main(int argc, char** argv) {
                     last.clear();
                     L = sp;
                 } else {
+                    stash_put(stash.end());   // (another session, or too little shared: the one there is kept aside)
                     reset(), L = 0;
                 }
             }
@@ -8461,10 +9616,18 @@ int main(int argc, char** argv) {
                             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                         }
+                        if (serve_maya) {   // (read, total, ms, tok/s, reused: the page's live bar and prompt speed;
+                                            //  the layer-major path above and --parallel print theirs, this path none)
+                            const double ms = (now() - t0) * 1e3;
+                            std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,
+                                        (p0 + n - L) / std::max(1e-3, ms / 1e3), (int) L);
+                            std::fflush(stdout);
+                        }
                     }
                 }
             }
             if (cancelled) {
+                stash_put(stash.end());   // (its snapshots are still good: the prompt ran only past them)
                 reset();
                 if (serve_maya) std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d 0 0\n", ids.size(), (now() - t0) * 1e3, cached);
                 else std::printf("@END cancelled %zu %d %.3f %.3f\n", ids.size(), cached, now() - t0, 0.0);
@@ -8541,7 +9704,16 @@ int main(int argc, char** argv) {
             int pending_sample = -1;   // (a speculative window's last token, sampled already)
             const char* reason = "length";
             int n_out = 0;
-            int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
+            // (starts=: a token among the opening's - from the logits of the step before it, asked for below - and
+            //  no drafts until the opening is written)
+            auto among = [&](const float* r) -> int {
+                const std::vector<int> o = starts.opts();
+                std::vector<std::pair<float, int>> cd;
+                if (o.size() > 1)
+                    for (int t : o) cd.push_back({r[t], t});
+                return pick_among(o, cd, temp, [&](std::vector<std::pair<float, int>>& x) { return pick_top(x); });
+            };
+            int greedy_tok = temp <= 0 && !last.empty() ? (starts.on() ? among(last.data()) : pick(last.data())) : -1;
             stat_t = t1;
             unsigned long long ph0 = 0, pn0 = 0;
             pick_counts(0, ph0, pn0);
@@ -8554,9 +9726,14 @@ int main(int argc, char** argv) {
                 if (serve_maya && !req_spec && n_out && n_out % 32 == 0) stat_line(n_out, now());
                 const int tok = temp <= 0             ? greedy_tok
                                 : pending_sample >= 0 ? pending_sample
+                                : starts.on()         ? among(last.data())
                                 : cand                ? pick_cand()
                                                       : pick(last.data());
                 pending_sample = -1;
+                starts.took(tok);
+                if (tc.saw(tok)) tc.close(starts);   // (the thinking budget: the segment ends here, forced on)
+                // the next token is a choice among the opening's: this step gives the whole logits
+                const bool choice = starts.on() && starts.opts().size() > 1;
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
@@ -8569,8 +9746,8 @@ int main(int argc, char** argv) {
                 // (the step: a plain token, or a window of the drafter's or the prompt lookup's drafts)
                 int B = 1, src = 0;
                 int32_t ld[kBlockMax];
-                if (req_spec) {
-                    const int room = std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax});
+                if (req_spec && !starts.on()) {
+                    const int room = tc.room(std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax}));
                     const int k = g_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
                     src = sctl.pick(room, k, B);
                     if (src == 1 && !drafter) src = 0, B = 1;
@@ -8592,6 +9769,7 @@ int main(int argc, char** argv) {
                     hist.push_back(tok);
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
                         std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
+                        tc.saw(next[j]);   // (a window stops short of the budget: this never closes)
                         hist.push_back(next[j]);
                         lk.append(next[j]);
                     }
@@ -8610,11 +9788,17 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const double tp0 = now();
-                if (temp <= 0) {
+                if (choice) {
+                    std::vector<float> lo;
+                    forward(M, &tok, 1, (int) hist.size(), false, OutMode::kLogits, std::string(), lo, nullptr, t_exp);
+                    last = std::move(lo);
+                    cand = false;
+                    if (temp <= 0) greedy_tok = among(last.data());
+                } else if (temp <= 0) {
                     std::vector<float> lo;
                     std::vector<int> ag;
                     forward(M, &tok, 1, (int) hist.size(), false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
-                    greedy_tok = ag[0];
+                    greedy_tok = starts.on() ? starts.opts()[0] : ag[0];   // (one way on: its token)
                     last.clear();
                 } else {
                     std::vector<float> lo;
@@ -8654,6 +9838,7 @@ int main(int argc, char** argv) {
             busy = false;
             g_wd_busy = false;
         }
+        g_cpu.reset();
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         std::fflush(stdout);
         std::_Exit(0);   // (QUIT / end of input: out at once, as maya-hy4 - the OS frees the pinned runs and the driver's state)
@@ -9009,9 +10194,9 @@ int main(int argc, char** argv) {
         for (int j = 0; j < ik2::draft::kBlock; ++j) std::printf("%d%s", acc_hist[j], j + 1 < ik2::draft::kBlock ? " " : "");
         std::printf("); drafting %.1f ms a step, verifying %.1f ms\n", t_draft * 1e3 / n_steps, t_verify * 1e3 / n_steps);
     }
-    if (g_pool)
+    if (g_cpu)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
-                    g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
+                    g_cpu->threads(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
@@ -9043,6 +10228,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     if (g_trace) std::fclose(g_trace);
     pop_dump();
+    g_cpu.reset();
     g_offs.lane.reset();
     return 0;
 }

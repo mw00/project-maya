@@ -150,9 +150,9 @@ most (a profile written with `IK2_POP_OUT`). The attention is one fused kernel (
 and clips; FP16 MMA, and wgmma on Hopper).
 
 **Decode** is bound by the PCIe link (~47 expert misses a token on the H200). `IK2_CPU=1` computes a missing
-expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512).
+expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512 or AVX2).
 
-**Two GPUs** (`--gpus 2`, outside the preview of section 8: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
+**Two GPUs** (`--gpus 2`, outside the hardware section 8 lists: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
 (`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
 Without it the layers are split between the GPUs.
 
@@ -167,8 +167,13 @@ Without it the layers are split between the GPUs.
 - The model writes typed segments rather than tags - `<|content_thinking|>`, `<|content_text|>`, a call as
   `<|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}<|end_message|>`.
   `InklingRewriter` turns them, as they stream, into what `OutputParser` reads (DeepSeek's and MiniMax's path).
-- A required tool call (`tool_choice`) opens in its own form; a picture is refused in plain words when the config
-  has no image encoder (section 8: pictures).
+- A required tool call (`tool_choice`) opens in its own form: a named one as
+  `<|message_model|>NAME<|content_invoke_tool_json|>`. `required` (any tool) can open only `<|message_model|>`, since
+  the name comes first, and the model may go on from there in words; `maya-ik2` reads `GEN ... starts=<ids>;<ids>`
+  (and says so in its `INFO` line), each tool's name and the call's segment, and opens the answer with one of them:
+  a token among the ones the matching names go on with, the model's pick from its logits, no drafts until one is
+  whole. A later engine call of the same answer (a fair slice) goes on after it. A picture is refused in plain words
+  when the config has no image encoder (section 8: pictures).
 - `tools/strata_tokenizer.py` reads the tokenizer under both names unsloth's files give its pre-tokenizer (`gpt-4o`,
   `inkling`): 442 strings against the model's own `tokenizer.json`, all equal, with both files.
 
@@ -214,7 +219,7 @@ as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 co
 ## 7. Next
 
 1. Setup in `maya.py` (download, the RAM / VRAM check, the run config), as Hy4-Flash has - done for Inkling-2-Mini as
-   an experimental preview (`maya.py --setup --model inkling-2-mini`: docs/MODELS.md); Inkling-2-Small by hand still.
+   supported (`maya.py --setup --model inkling-2-mini`: docs/MODELS.md); Inkling-2-Small by hand still.
 2. Several requests at once; the vision tower inside the engine (pictures work through `maya-vision`: section 8).
 3. A Maya quant of the experts in the shape of DeepSeek XS (section 5), for 160 GB of host memory.
 
@@ -235,7 +240,15 @@ histories are a visit's. `ref/inkling2.py` and `maya-ik2` keep a list of visits;
 **The file.** unsloth's Mini GGUFs are in the layout llama.cpp master reads (other tensor and key names, the convs
 not folded, gate and up merged into `ffn_gate_up_exps`); the reference and the engine read both layouts.
 UD-Q4_K_XL (17.6 GB) holds the experts of layers 0-19 in NVFP4 - their original bits - and those of layers 20-23
-and the dense weights in Q8_0. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
+and the dense weights in Q8_0. Maya's Maya-L (17.6 GB, the setup's file from v1.1.82) has the same layout and types,
+written from the original model's files. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
+UD-IQ3_XXS (11.7 GB) holds gate and up in IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS, down in NVFP4 (IQ4_NL in layers 20-23),
+its embedding and three `attn_q` in Q4_K: read since the IQ2 / IQ3_S / IQ4_NL / Q4_K blocks joined the decoded ones
+(their 32-value sub-blocks against the inputs, as IQ3_XXS's and IQ4_XS's). On an RTX 5080 (16 GB, Windows, FP8 cache,
+32,768 context) every expert stays in VRAM (9.6 GiB) and a token goes at 63 tok/s: its dense weights are of mixed
+types, so the fused projections are not kept as blocks and the token takes the cache path (the resident one stays
+off, #1173). Its head in Q5_K gives the drafter's fold no rows to read, so `--drafting auto` leaves the drafter out
+with a NOTE and keeps the prompt lookup.
 Against llama.cpp (b12590 with the Inkling 2 PRs) the reference agrees on 47 of 47 top-1 tokens, KL 2.5e-3; the
 engine against the reference on 45-46 of 47, KL 6e-3..7e-3 - near ties of the router, as section 6.1 found; with
 the messages left out the KL is 0.56.
@@ -360,8 +373,9 @@ drafter and both answers fastest (a chat, a code and a tool-call request, `IK2_D
 `data/ik2-drafting.txt` (per GPU, driver, model files, context and cache; `maya --speed-calibration` measures again);
 **on** drafts with the drafter and the prompt lookup, the controller choosing each step; **off** loads neither. A
 request's `spec=1` asks for no drafting. The drafter takes room only where the start plan stays as it is without it
-(every expert in VRAM, the same context and cache, and not the free VRAM the pictures' encoder would start in on the
-GPU - `IK2_VISION_GIB`, the server's), else it is left out with a NOTE. It is loaded last before the expert cache and
+(every expert in VRAM, the same context and cache), else it is left out with a NOTE. Pictures take nothing from it:
+the plan is the same with images on or off, and the image encoder runs on the CPU whenever the VRAM free beside the
+model and the drafter does not hold it. It is loaded last before the expert cache and
 what is left is measured: where the context rows of its layer without a window do not fit in FP16 (4 KiB a
 position) they are kept in FP8 (2 KiB; `IK2_DRAFT_KV=f16|fp8` decides instead), so a 24 GB card keeps the drafter at
 262,144 tokens with the FP8 cache (1.0 GiB; `tools/ik2_fit.py` `draft_gib`: 0.86 GiB + 4 KiB a token for FP16
@@ -384,7 +398,12 @@ PC as everywhere. On one NVIDIA card, where plain
 decoding on the offload path is lane parity wherever that is the faster mode, the measurement times plain decoding in
 that mode against drafting in mode A and keeps the faster; the choice is remembered with the drafting calibration, so
 every start decodes in the same mode (the start line says which, and the figures), and `--drafting on` / `off` still
-decide by hand (mode A with drafting / plain decoding).
+decide by hand (mode A with drafting / plain decoding). Because the drafter's room is the tier's, the two are two
+layouts, and the first start times each on its own: two short runs of the engine before the start itself (the
+drafting layout's sources, then plain decoding on the full tier - their start lines in
+`data/ik2-drafting.txt.measure.log`), the faster one remembered, and the start then loads like every later one - so
+the first session has the chosen layout, and "no drafting" is timed at its real speed (`IK2_DRAFT_SPLIT=0`: one load
+measures them all on the drafting layout, as before; on AMD that is still the default, `IK2_DRAFT_SPLIT=1` there).
 
 Deep in a long context a window can cost more than the plain tokens it gives. The controller times an answer's
 drafting rounds against its plain tokens at the depth the answer is at, and where the rounds give fewer tokens a
@@ -422,8 +441,25 @@ To run it (one GPU):
     EOF
     python serve/server.py --engine maya --config ik2-mini.json
 
+Thinking budget: the config's `"thinking_budget"` (none by default: Inkling thinks as long as it needs unless you set one; Settings > Chat defaults > Thinking budget, 256 to 262144, or 0 for none, changes it without a restart) caps the reasoning segment like it does for the other models. Inkling has no `</think>`, so maya-ik2 does it in its own decode (GEN's `think_open= think_end= think_soft= think_hard= think_stop= think_after=`): past the budget the first token that ends a sentence or line (at most 512 tokens later, whatever the token) is followed by `<|end_message|><|message_model|>` and the model's pick between its text segment and a call to one of the request's tools (no tools: the text segment), so the answer starts in the same decode with the state kept and the next turn continues from the cache. Drafting windows stop short of the budget and single steps close it; the forced tokens are never drafted. A request whose `max_tokens` is 1024 or less lowers the budget (a quarter or more of the limit is kept for the answer); a larger limit leaves it alone.
+
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
+
+**Several conversations: the session cache.** One conversation stays on the GPU. Without the session cache, a request
+that does not continue it (and shares none of its snapshots) drops it and reads its own prompt from the start, so two
+conversations taking turns each read their whole prompt every turn. With `IK2_SESSION_CACHE_GB=N`, the conversation
+being dropped is first put aside in up to N GiB of host RAM: its latest snapshot's short-convolution states and
+sliding windows, the full layers' K / V rows before its position, and the drafter's context. A later request whose
+tokens start with an entry's tokens (and the same picture signatures) is taken up from there and reads only what is
+new. Entries are evicted least recently used first; conversations shorter than `IK2_SESSION_CACHE_MIN` tokens (1024)
+are not kept. The cache is off with `--parallel`, where each conversation keeps its own slot, and where the K / V
+cache is streamed from RAM. Measured on an RTX 3090 under Windows (FP8 K / V, the drafter): three conversations of
+30K, 12K and 20K tokens taking turns read 12.5, 5.2 and 8.1 s on their first turn and 0.4-0.8 s on each turn after it.
+Putting a conversation aside or taking it up takes 0.03-0.5 s, and a 20K-token conversation holds 0.4-0.5 GiB of RAM.
+A conversation taken up gives the same tokens as one that never left: 200 greedy tokens compared with the drafter on
+the 24 GB card, and without it on `IK2_VRAM_GB=8`'s offload path, where the K / V rows lent to experts are given back
+first.
 
 **Smaller cards: the offload path.** Where the experts do not all fit (an 8, 12 or 16 GB card, or a 24 GB one past
 its context), tokens still take the resident path's launches, one CUDA graph a token, with a tier of the experts in
@@ -441,7 +477,25 @@ the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not
 24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting stays off on
 the offload path (its window runs only where every expert is in VRAM; a NOTE says so).
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux or Windows, one NVIDIA GPU of 8 GB or more, sm_70
+**Which experts the tier holds (v1.1.83).** Layers 6 .. 17 run three times a token on the same weights, so one VRAM
+copy of their experts serves 36 of the 48 layer visits. Filling the tier by picks a byte (v1.1.82) left a few experts
+of almost every layer in RAM, and each visit with one miss waits for the CPU lane or a copy before it can sum: the
+cost is a visit that waits, not the bytes. Where the decode is lane parity the tier is now filled with whole layers,
+the most layer visits a byte first - the looped layers, then the other NVFP4 layers, then the Q8_0 ones (20 .. 23) -
+inside a layer by picks (`src/ik2/ik2_tier.hpp`, `tests/ik2_tier_test.cpp`); the KV lending and GPU 1's share take
+the next experts in the same order. Mode A (two GPUs, AMD, drafting on the offload path, a PC whose CPU lane is not
+the faster) keeps v1.1.82's order until it is measured per PC. The decode mode is chosen as before, from the share
+of the profile's picks v1.1.82's tier holds, and the prompts' prefetch keeps the profile's counts. Only where the
+experts sit changes, so the answers are those of the same decode mode. `IK2_TIER_ORDER=layers` / `picks` forces one
+(tests). Measured on a V100 (PCIe 3, 40-core Xeon CPU lane) set to act as an 8 / 12 / 16 GB card, `--bench`
+against v1.1.82 at 32K (FP8 cache, lane parity chosen by both, the same greedy tokens): decode 24.1 -> 37.0 /
+28.8 -> 51.2 / 41.0 -> 60.9 tok/s, and the speed no longer swings with the question (12 GB: 50.8 - 52.0 against
+22.9 - 40.2). Prompts read 6-10% slower (2K: 975 -> 874 / 1208 -> 1131 / 1393 -> 1293 tok/s), most likely because a
+prompt pass uses nearly every expert, and with whole layers the ones not in VRAM sit together in a few layers whose
+copies have little of that layer's work to hide behind (not yet measured apart). The lane carries more of a token's misses this way, so a CPU busy with
+other work costs this order more than the old one.
+
+**What it runs on.** Inkling-2-Mini is a supported model: Linux or Windows, one NVIDIA GPU of 8 GB or more, sm_70
 (Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
 (sm_100 / sm_120) compile-checked only; Windows run on an RTX 3050 8 GB (@cobra91's MSVC port, its VRAM as CUDA gets it
 measured by the setup). Elsewhere `maya-ik2` stops at the start with one line saying why (under
@@ -460,7 +514,11 @@ those picks' places before the sum - so every row and the sum's order are one ca
 on which card holds an expert (two cards of one kind: the one-card offload path's answers, checked on the CLI and the
 server's answers, tool calls, pictures and loop guard). Copies between the cards: peer to peer only where the driver
 offers it, the IOMMU translates neither card and a test copy at load arrives intact, else through pinned host memory
-(`IK2_HOST_STAGE=1` forces that; the same answers). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
+(`IK2_HOST_STAGE=1` forces that; the same answers). `IK2_PEER_DIRECT_SIGNAL=1` takes the copies out of a visit altogether: a ring of four slots in host memory both cards map -
+GPU 0 writes x and the router's logits into one, GPU 1 (woken by an event) copies them in and writes its rows back with
+the visit's number, and GPU 0 takes the rows only where it has a pick of GPU 1's, which most visits do not. With the
+copies the first card is busy 55 percent of a token (it waits for the round trip of each of the 48 visits); with the ring
+77: 67.4 -> 84.4 tok/s (Q4_K_XL, a 302-token prompt, the same tokens; a verify window of drafting keeps the copies). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
 rows sent back - the split's plain answers; `--drafting auto` measures it). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
 tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
 second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers one card (two
@@ -486,16 +544,41 @@ VRAM; lane parity (`IK2_LANE=1`) sums in other bits there and is a test option. 
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`
 0.2, `medium` 0.7, `high` 0.9 (the template's default), `xhigh` and `max` 0.99.
 
-**Files** (Apache 2.0, the model and unsloth's GGUF alike):
+**Refusal ablation** (`--ablate FILE --ablate-default off`, a request's `"ablate": true`; docs/SETTINGS.md "Refusal
+ablation per request"). The setup downloads `Inkling-2-Mini-refusal-direction.gguf` (a few KB, a control vector of the
+model's hidden size, `refusal-directions/` of Maya's repo) and loads it off by default; the Models page's **Refusal
+ablation** switch and each request's `ablate` field turn it on, as on every other model. The engine projects the unit
+direction r out of every residual write of every layer visit, y <- y - s r (r . y): the short conv's output after the
+attention and the one after the MoE, before either joins the stream (a block's first write starts the stream again).
+The looped core's three passes each project their own writes (48 visits, 96 writes a token). The same `project_res`
+launch does it on every path (the token path and its graph, the verify windows, the prompt chunks, `--parallel`'s
+rows, two GPUs, the offload path); a conversation that does not ask runs the launches it always did, so the answers
+and the speed with the option off are the release's. The drafter only proposes and the main layers check every draft,
+so drafting stays exact with the direction on. A conversation's kept state was read with one setting: a request with
+the other one starts it over. `IK2_EP` / `IK2_TP` (the experts split over two cards, the residual summed on the other
+one) do not project: the engine says so and loads no direction there. Fitting a direction: `MAYA_ABLATE_CAPTURE=<file>`
+makes the engine read out each visit's two writes (the last prompt token's row, as on the other engines) instead of
+projecting, and `tools/ablate_fit.py` takes it from there; the visit index plays the layer's part.
+
+The direction in Maya's repo was fitted on UD-Q4_K_XL at visit 38 (the third pass of layer 14; hidden size 2,304,
+strength 1): `tools/ablate_fit.py eval` on 50 held-out harmful prompts (thinking off, 96 tokens, greedy): 49 refused with
+ablation off, 5 with it on (0.98 -> 0.10); of 50 harmless prompts none refused in either mode; the 16 everyday prompts
+(384 tokens) had no loop and no empty answer either way, and the loop test (5 answers, 1,024 tokens) found 0 loops.
+Cost, Radeon 8065S (gfx1151), plain decoding, the engine's own CLI, 192 tokens, three alternated pairs: 39.6 tokens/s
+with the direction loaded and a request not asking, 38.4 with it projecting (about 3%: 96 small launches a token);
+`--bench` with the direction loaded and off: the same as without one (decode +0.0%, prompts +0.2% / +0.0%, exact).
+
+**Files** (Apache 2.0, the model, Maya's GGUF and unsloth's alike):
 
 | File | Repository | sha256 |
 |---|---|---|
-| `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
+| `Inkling-2-Mini-Maya-L-NVFP4.gguf` (17.6 GB, the model: what the setup fetches) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`Maya-L/`) | `1945d7b212601f429ef9dc4f6b8208062f3b9f22a1ebbdc1665373f412ebf54a` |
+| `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB, the setup's file before v1.1.82: an install of it is kept) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
 | `mmproj-Inkling-2-Mini-BF16.gguf` (0.6 GB, pictures; unsloth's `mmproj-BF16.gguf` byte for byte, an existing copy is kept) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`vision/`) | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
 | `dspark-Inkling-2-Mini-Q8_0.gguf` (0.4 GB, the drafter as a GGUF, Q8_0: the setup fetches it, on NVIDIA and on AMD, not with `--drafting off`; unsloth's file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773` |
 | `mtp.safetensors` (0.6 GB, the same drafter as published, BF16: what earlier setups fetched, still read where it is; thinkingmachines' file byte for byte) | [peasantsmith/Inkling-2-Mini-Maya-GGUF](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`drafter/`) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
-Outside the preview, the older two-GPU mode with a loop runs as expert parallel (`IK2_EP=1`, its caches filled at the
+Outside the hardware section 8 lists, the older two-GPU mode with a loop runs as expert parallel (`IK2_EP=1`, its caches filled at the
 start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; refused where the copies between the cards would have to go
 through host memory); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches

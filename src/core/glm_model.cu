@@ -1148,9 +1148,44 @@ void Glm5Model::pen_free() {   // (on this part's device)
     pen_w_ = 0;
 }
 
+void Glm5Model::dump_logits(const float* logits, int T, cudaStream_t s) {
+    // MAYA_GLM_DUMP_LOGITS=<file> (a test, off unless set): every logit row a token is picked from (sampled picks and the greedy argmax sites), in call order - int32
+    // n_vocab, int32 0, then the rows as float32 (harness/glm/oracle.sh hashes them: GLM's logit-level check, the
+    // counterpart of maya-ds4's --dump-logits).  The rows are read back before the pick: slow, a test's.
+    {
+        const int V = (int) g_.n_vocab;
+        static std::FILE* const dump = [] {
+            const char* f = std::getenv("MAYA_GLM_DUMP_LOGITS");
+            std::FILE* x = f != nullptr && f[0] != '\0' ? std::fopen(f, "wb") : nullptr;
+            if (f != nullptr && x == nullptr) std::fprintf(stderr, "glm: MAYA_GLM_DUMP_LOGITS=%s: cannot write it\n", f);
+            return x;
+        }();
+        if (dump != nullptr && T > 0) {
+            static std::mutex mu;
+            static bool head = false;
+            std::lock_guard<std::mutex> lk(mu);
+            std::vector<float> rows((size_t) T * (size_t) V);
+            if (cudaStreamSynchronize(s) == cudaSuccess &&
+                cudaMemcpy(rows.data(), logits, rows.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                if (!head) {
+                    const int32_t h[2] = {V, 0};
+                    std::fwrite(h, sizeof h, 1, dump);
+                    head = true;
+                }
+                std::fwrite(rows.data(), sizeof(float), rows.size(), dump);
+                std::fflush(dump);
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "glm: MAYA_GLM_DUMP_LOGITS: a row could not be read back\n");
+            }
+        }
+    }
+}
+
 void Glm5Model::pick_tokens(const float* logits, int T, const maya::kernels::SamplerParams& sp, const int32_t* win,
                             int n0, int* out, cudaStream_t s) {
     const int V = (int) g_.n_vocab;
+    dump_logits(logits, T, s);
     if (sp.penalty_last_n <= 0) {   // no penalties: the call every site made before, nothing else
         maya::kernels::sample_tokens(logits, T, V, nullptr, 0, sp, out, s);
         return;
@@ -2990,6 +3025,26 @@ void maya::core::Glm5Model::pack_release_views() {
             UnmapViewOfFile(s.base);
             s.base = nullptr;
         }
+#else
+    // Linux (#1182): the load's reads left every page of the shards mapped, and they stay charged to the process's
+    // memory cgroup for the engine's life (13 GiB for the full GLM-5.3).  The fast path reads experts with pread
+    // (fd_direct, else fd), so the mappings go as on Windows; token_embd moves to the heap first.
+    const char* km = getenv("MAYA_GLM_KEEP_MAP");
+    if (km != nullptr && std::atoi(km) != 0) return;
+    for (const Shard& s : pack_shards_)
+        if (s.base != nullptr && s.fd < 0) return;
+    for (const Shard& s : pack_shards_)
+        if (s.base != nullptr && pack_emb_src_ != nullptr && pack_emb_src_ >= s.base && pack_emb_src_ < s.base + s.size) {
+            const size_t bytes = (size_t) g_.n_vocab * ggml_row_size((ggml_type) pack_emb_type_, g_.n_embd);
+            pack_emb_copy_.assign(pack_emb_src_, pack_emb_src_ + bytes);
+            pack_emb_src_ = pack_emb_copy_.data();
+            break;
+        }
+    for (Shard& s : pack_shards_)
+        if (s.base != nullptr) {
+            munmap((void*) s.base, (size_t) s.size);
+            s.base = nullptr;
+        }
 #endif
 }
 
@@ -3305,7 +3360,28 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
                  // a draft's head rows (GlmDflash::split_head)
                  al((uint64_t) kWinMax * g_.n_embd * 4) + al((uint64_t) kWinMax * nc * 4) + al(kHdCandBytes) + al(4);
     }
-    { cudaError_t e_ = cudaMalloc(&w_arena_, bytes); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    {
+        cudaError_t e_ = cudaMalloc(&w_arena_, bytes);
+        if (e_ != cudaSuccess) {
+            // (#1169: say plainly that this GPU's memory is what ran out - the model's dense weights, which always go to
+            // VRAM - and by how much, not only the CUDA error)
+            w_arena_ = nullptr;
+            (void) cudaGetLastError();
+            size_t fr = 0, tot = 0;
+            const bool have = cudaMemGetInfo(&fr, &tot) == cudaSuccess;
+            char b[320];
+            if (e_ == cudaErrorMemoryAllocation && have)
+                std::snprintf(b, sizeof b, "pack: out of memory: CUDA%d cannot hold this model's dense weights (%.2f GB "
+                              "needed, %.2f GB of its %.2f GB free) - they always go to the GPU, so this model needs a "
+                              "GPU with more memory free, or more GPUs", dev_, (double) bytes / 1073741824.0,
+                              (double) fr / 1073741824.0, (double) tot / 1073741824.0);
+            else
+                std::snprintf(b, sizeof b, "pack: %s (CUDA%d, the model's dense weights: %.2f GB)", cudaGetErrorString(e_),
+                              dev_, (double) bytes / 1073741824.0);
+            err = b;
+            return false;
+        }
+    }
     w_arena_bytes_ = bytes;
     std::ifstream dense(pack_dir + "/dense.bin", std::ios::binary);
     if (!dense) {

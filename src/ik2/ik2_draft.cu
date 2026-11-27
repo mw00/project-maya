@@ -171,6 +171,7 @@ uint16_t f2bf_host(float f) {   // (round to nearest even: exact for a value tha
 struct Src {
     StFile st;                              // mtp.safetensors
     std::unique_ptr<maya::GgufFile> g;    // or the GGUF
+    bool verbatim = false;                  // (a GGUF that keeps the safetensors names, under "mtp.": arch inkling2-mtp)
 };
 
 bool is_gguf(const std::string& path) {
@@ -182,7 +183,8 @@ bool is_gguf(const std::string& path) {
     return yes;
 }
 
-std::string gguf_name(const std::string& n) {
+std::string gguf_name(const std::string& n, bool verbatim) {
+    if (verbatim) return "mtp." + n;
     static const std::map<std::string, std::string> top = {
         {"fuse_weight", "dspark_fuse.weight"},
         {"mask_embed", "mask_embd.weight"},
@@ -221,7 +223,7 @@ std::string gguf_name(const std::string& n) {
 
 // the GGUF tensor of a safetensors name, its shape checked (GGUF dims run the other way: [in, out])
 const maya::TensorInfo& g_tensor(const Src& s, const std::string& n, const std::vector<int64_t>& shape) {
-    const std::string gn = gguf_name(n);
+    const std::string gn = gguf_name(n, s.verbatim);
     const maya::TensorInfo* t = s.g->find(gn);
     if (!t) throw std::runtime_error("drafter: no tensor " + gn + " in the GGUF");
     bool same = t->shape.size() == shape.size();
@@ -233,8 +235,8 @@ const maya::TensorInfo& g_tensor(const Src& s, const std::string& n, const std::
 // the first dimension (safetensors order) of a tensor
 int64_t src_dim0(const Src& s, const std::string& n) {
     if (s.g) {
-        const maya::TensorInfo* t = s.g->find(gguf_name(n));
-        if (!t || t->shape.size() != 2) throw std::runtime_error("drafter: no 2-D " + gguf_name(n));
+        const maya::TensorInfo* t = s.g->find(gguf_name(n, s.verbatim));
+        if (!t || t->shape.size() != 2) throw std::runtime_error("drafter: no 2-D " + gguf_name(n, s.verbatim));
         return (int64_t) t->shape[1];
     }
     const auto it = s.st.t.find(n);
@@ -295,6 +297,43 @@ void check_gguf(const maya::GgufFile& g, int C, int layers, int H, int KV, int F
         return v->num();
     };
     const auto* arch = g.get("general.architecture");
+    if (arch && arch->s == "inkling2-mtp") {   // (the original's config under its own names, the tensors BF16)
+        auto want = [&](const char* key, double v) {
+            if (num(key) != v)
+                throw std::runtime_error(std::string("drafter: the GGUF's ") + key + " is " + std::to_string(num(key)) +
+                                         ", this model's drafter has " + std::to_string(v));
+        };
+        want("inkling2-mtp.block_size", kBlock);
+        want("inkling2-mtp.hidden_size", C);
+        want("inkling2-mtp.num_hidden_layers", layers);
+        want("inkling2-mtp.num_attention_heads", H);
+        want("inkling2-mtp.num_key_value_heads", KV);
+        want("inkling2-mtp.intermediate_size", F);
+        want("inkling2-mtp.head_dim", 128);
+        want("inkling2-mtp.sliding_window_size", 1024);
+        want("inkling2-mtp.rope_theta", 1e6);
+        want("inkling2-mtp.markov_rank", 256);
+        if (std::fabs(num("inkling2-mtp.rms_norm_eps") - 1e-6) > 1e-9)
+            throw std::runtime_error("drafter: the GGUF's RMS epsilon is not 1e-6");
+        std::vector<uint64_t> expect;
+        if (taps == 4) expect = {5, 23, 41, 48};
+        else for (int l : {5, 11, 17, 23, 29, 35, 41, 48}) expect.push_back((uint64_t) l);
+        const auto* tl = g.get("inkling2-mtp.target_layer_ids");
+        bool ok = tl && tl->items.size() == expect.size();
+        for (size_t i = 0; ok && i < expect.size(); ++i) ok = tl->items[i].u == expect[i];
+        if (!ok) throw std::runtime_error("drafter: the GGUF's target_layer_ids are not the taps this engine gives");
+        const auto* loc = g.get("inkling2-mtp.local_layer_ids");
+        std::vector<bool> is_local(local.size(), false);
+        ok = loc != nullptr;
+        for (size_t i = 0; ok && i < loc->items.size(); ++i) {
+            ok = loc->items[i].u < local.size();
+            if (ok) is_local[loc->items[i].u] = true;
+        }
+        if (!ok || is_local != local) throw std::runtime_error("drafter: the GGUF's local_layer_ids are not this drafter's");
+        for (const auto& t : g.tensors())
+            if (t.type != 30) throw std::runtime_error("drafter: " + t.name + " is " + t.type_name() + " (an inkling2-mtp GGUF is read as BF16)");
+        return;
+    }
     if (!arch || arch->s != "dflash") throw std::runtime_error("drafter: the GGUF is not a DSpark drafter (architecture " +
                                                                (arch ? arch->s : std::string("?")) + ", dflash expected)");
     if (!g.find("dspark_hidden_out.weight"))
@@ -501,6 +540,9 @@ void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int
        "gemm_bf");
 }
 void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, float* Y, int ldy) {
+#ifdef MAYA_USE_HIP   // (AMD: no FP16-in F32-out product in the BLAS - the kernel of gemm_bf, reading FP16; drafts only)
+    if (k::gemm_f16_cols(W, N, K, (const uint16_t*) X, T, Y, ldy, d->s)) return;
+#endif
     const float one = 1.0f, zero = 0.0f;
     cb(cublasGemmEx(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, CUDA_R_16F, K, X, CUDA_R_16F, K, &zero, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
@@ -665,13 +707,15 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     for (int i = 0; i < layers; ++i)
         local[i] = mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
     if (f.g) {
+        const auto* arch = f.g->get("general.architecture");
+        f.verbatim = arch && arch->s == "inkling2-mtp";
         check_gguf(*f.g, C, layers, d->H, d->KV, d->F, d->taps, local);
         // (the layers' matrices on the tensor cores straight from their Q8_0 blocks - q8_tile, sm_75 on; else their
         //  values in BF16, as mtp.safetensors' are read)
         bool all_q8 = true;
         for (const auto& t : f.g->tensors())
             if (t.name.rfind("blk.", 0) == 0 && t.shape.size() == 2) all_q8 = all_q8 && t.type == 8;
-        d->q8 = all_q8 && k::arch_class() >= 75;
+        d->q8 = all_q8 && !f.verbatim && k::arch_class() >= 75;
     }
     d->V = (int) src_dim0(f, "markov_head.markov_w1.weight");
     // fuse_weight [layers + 1][taps] -> softmax over each row
@@ -1019,6 +1063,50 @@ void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) {
 #else
     d->head_tiles = major >= 8;   // (no mma.sync m16n8k16 before Ampere)
 #endif
+}
+
+namespace {
+// save_context / load_context: each layer's K then V rows of positions pos - w .. pos - 1 (w = min(pos, cap)), in
+// ring order from the oldest - the two pieces either side of the ring's end
+template <class F>
+void ctx_rows(const Drafter* d, int pos, F&& copy) {
+    const size_t KD = (size_t) d->KV * 128;
+    for (const auto& l : d->L) {
+        const int w = std::min(pos, l.cap);
+        if (w <= 0) continue;
+        const int s0 = (pos - w) % l.cap, n1 = std::min(w, l.cap - s0), n2 = w - n1;
+        // (rows FP8, FP16 or F32: load's kv8, the whole-context layer's FP16, a window's F32)
+        const size_t row = KD * (l.kc8 ? 1 : l.kc16 ? 2 : 4);
+        uint8_t* kc = l.kc8 ? l.kc8 : l.kc16 ? (uint8_t*) l.kc16 : (uint8_t*) l.kc;
+        uint8_t* vc = l.kc8 ? l.vc8 : l.kc16 ? (uint8_t*) l.vc16 : (uint8_t*) l.vc;
+        for (uint8_t* c : {kc, vc}) {
+            copy(c + (size_t) s0 * row, (size_t) n1 * row);
+            if (n2 > 0) copy(c, (size_t) n2 * row);
+        }
+    }
+}
+}  // namespace
+
+void save_context(const Drafter* d, int pos, std::vector<uint8_t>& out) {
+    size_t n = 0;
+    ctx_rows(d, pos, [&](uint8_t*, size_t b) { n += b; });
+    out.resize(n);
+    size_t at = 0;
+    ctx_rows(d, pos, [&](uint8_t* dev, size_t b) {
+        cu(cudaMemcpyAsync(out.data() + at, dev, b, cudaMemcpyDeviceToHost, d->s), "save_context");
+        at += b;
+    });
+    cu(cudaStreamSynchronize(d->s), "save_context");
+}
+
+void load_context(Drafter* d, int pos, const std::vector<uint8_t>& in) {
+    size_t at = 0;
+    ctx_rows(d, pos, [&](uint8_t* dev, size_t b) {
+        if (at + b > in.size()) return;   // (not this drafter's rows: what is there stays, the drafts only worse)
+        cu(cudaMemcpyAsync(dev, in.data() + at, b, cudaMemcpyHostToDevice, d->s), "load_context");
+        at += b;
+    });
+    cu(cudaStreamSynchronize(d->s), "load_context");
 }
 
 }  // namespace ik2::draft

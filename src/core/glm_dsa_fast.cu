@@ -221,6 +221,10 @@ void Glm5Model::fast_bind_dsa(int il, std::string& missing) {
     Ly.recr = false;
     Ly.moe = il >= g.dense_lead;
     Ly.mtp = is_mtp;
+    // v1.1.75's shared MoE / dense code sizes its launches from these (glm_fast_path.cu sets them for Flash)
+    Ly.ff = g.n_ff_exp;
+    Ly.ffd = g.n_ff_dense;
+    Ly.f0 = 0;
     if (is_mtp) {
         Ly.eh = mvw("nextn.eh_proj.weight", 2 * E, E);
         Ly.enorm = f32("nextn.enorm.weight");
@@ -301,6 +305,15 @@ void Glm5Model::fast_bind_dsa(int il, std::string& missing) {
         Ly.ffn_up = mvw("ffn_up.weight", E, g.n_ff_dense);
         Ly.ffn_down = mvw("ffn_down.weight", g.n_ff_dense, E);
     }
+}
+
+bool Glm5Model::fast_ffn_width(int il, int& ff, int& ffd, int& f0) const {
+    if (fast_ == nullptr || il < l0_ || il >= lt_ || il >= (int) fast_->L.size()) return false;
+    const FastState::Layer& Ly = fast_->L[(size_t) il];
+    ff = Ly.ff;
+    ffd = Ly.ffd;
+    f0 = Ly.f0;
+    return true;
 }
 
 // ---------------------------------------------------------------- the glm-dsa arena (after the shared one)

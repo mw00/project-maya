@@ -225,11 +225,13 @@ class Bridge:
         self._note("answer", f"  {question} {pick + 1}) {options[pick][0]}")
         return pick
 
-    def run(self, cmd, cwd=None, env=None, keep=True, parent_pipe=False):
+    def run(self, cmd, cwd=None, env=None, keep=True, parent_pipe=False, sink=None):
         """The command with its output on the screen as it comes (stdin closed: nothing can wait for a key).  keep:
         its output also into the log and the summary (not the server's: it runs for days - "live" on the screen).
         parent_pipe: Maya's server - its stdin a pipe from here instead (--parent-pipe: it stops when this process
-        ends, however it ends), and on Windows in a job object that ends it with this process (setup.end_with_me)."""
+        ends, however it ends), and on Windows in a job object that ends it with this process (setup.end_with_me).
+        sink: a compile step - each line goes to it (setup.BuildLog: a log file and one progress line), not to the
+        screen."""
         if not self._here():
             return None
         self.events.put(("run", cmd))
@@ -250,9 +252,15 @@ class Bridge:
                 parts = re.split(rb"(\r\n|\n|\r)", rest[:cut])
                 rest = parts.pop() + rest[cut:]
                 for text, end in zip(parts[::2], parts[1::2]):
-                    self._output(output_text(text), end == b"\r", keep)
+                    if sink is not None:
+                        sink(output_text(text))
+                    else:
+                        self._output(output_text(text), end == b"\r", keep)
             if rest.strip(b"\r\n"):
-                self._output(output_text(rest).rstrip("\r\n"), False, keep)
+                if sink is not None:
+                    sink(output_text(rest).rstrip("\r\n"))
+                else:
+                    self._output(output_text(rest).rstrip("\r\n"), False, keep)
         self.proc = None
         self.events.put(("ran", p.returncode))
         if self.stopped.is_set():

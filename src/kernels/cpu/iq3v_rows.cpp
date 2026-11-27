@@ -1,8 +1,9 @@
 // src/kernels/cpu/iq3v_rows.cpp - the CPU lane's IQ3_XXS and IQ4_XS rows, second generation, and the rows of its 4-bit
 // IQ2_XXS copies (Q4X): ggml-cpu's dot to the bit, faster.  ds4_iq_cpu.cpp checks each form against ggml-cpu's dot and
 // takes the fastest this CPU runs (own(): g_iq3v / g_iq4v; iq_cpu_q4x_ok: g_q4xv).  Built for the baseline x86-64
-// with each function's instruction set its own (GCC / Clang target attributes; MSVC: /arch:AVX2 on this file), so a
-// form runs only where the caller found the CPU takes it.
+// with each function's instruction set its own (GCC / Clang target attributes; MSVC: /arch:AVX2 on this file, and the
+// AVX-512 forms in iq3v_rows_z.cpp under /arch:AVX512 - IQ3V_PART below), so a form runs only where the caller found
+// the CPU takes it.
 //
 // The arithmetic is ggml's: per block the same exact int32 lanes (lane l: every 32-value chunk's values 4 l .. 4 l + 3
 // times the chunk's scale), then fma(d_x d_y, lanes, acc) block by block and hsum_float_8 times the format's constant
@@ -50,6 +51,16 @@
     (defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) || \
      (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11))
 #define IQ3V_AVXVNNI 1
+#endif
+// MSVC's /arch is a file's (#1235), as in iq2v_rows.cpp: on MSVC (CMake: MAYA_IQV_SPLIT) this file holds the AVX2 forms
+// and the dispatch (part 1), and iq3v_rows_z.cpp compiles the AVX-512 forms alone under /arch:AVX512 (part 2, pass_z).
+// GCC / Clang: one file, each function's own target attribute (part 0) - the same code as before.
+#if !defined(IQ3V_PART)
+#if defined(MAYA_IQV_SPLIT)
+#define IQ3V_PART 1
+#else
+#define IQ3V_PART 0
+#endif
 #endif
 #if defined(_MSC_VER)
 #define IQ3V_FI __forceinline
@@ -156,6 +167,7 @@ const Codes& codes() {
     return c;
 }
 
+#if IQ3V_PART != 2
 #define IQ3A_NS a2
 #define IQ3A_ATTR IQX_TARGET("avx2,fma")
 #define IQ3A_VNNI 0
@@ -166,8 +178,10 @@ const Codes& codes() {
 #define IQ3A_VNNI 1
 #include "iq3v_avx2.inc"
 #endif
+#endif
 
 // ---- the AVX-512 forms
+#if IQ3V_PART != 1
 #define IQ3V_Z IQX_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512bitalg,avx512vnni,avx2,fma")
 IQ3V_Z IQ3V_FI __m512i lookup4(const __m512i* T, __m512i idx) {   // the codes of 32 word indices (0 .. 255)
     __m512i r[4];
@@ -336,13 +350,44 @@ IQ3V_Z void rowsqz(const uint8_t* w, size_t rb, int nb, const block_q8_K* const*
     }
 }
 #undef IQ3V_Z
+#endif  // IQ3V_PART != 1
+
+#if IQ3V_PART == 2
+}  // namespace
+template <int NT>
+void pass_zt(int f, const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* o, int r0, int r1) {
+    if (f == 0) rows3z<NT>(w, rb, nb, y, o, r0, r1);
+    else if (f == 1) rows4z<NT>(w, rb, nb, y, o, r0, r1);
+    else rowsqz<NT>(w, rb, nb, y, o, r0, r1);
+}
+// the AVX-512 forms' rows for part 1's pass (format f: 0 IQ3_XXS form 5, 1 IQ4_XS form 3, 2 Q4X form 3), nt 1-4 tokens
+void pass_z(int f, int nt, const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* o, int r0,
+            int r1) {
+    switch (nt) {
+        case 1: pass_zt<1>(f, w, rb, nb, y, o, r0, r1); break;
+        case 2: pass_zt<2>(f, w, rb, nb, y, o, r0, r1); break;
+        case 3: pass_zt<3>(f, w, rb, nb, y, o, r0, r1); break;
+        default: pass_zt<4>(f, w, rb, nb, y, o, r0, r1); break;
+    }
+}
+}  // namespace maya::kernels::cpu::iq3v
+#else
+#if IQ3V_PART == 1
+}  // namespace
+void pass_z(int f, int nt, const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* o, int r0,
+            int r1);   // (iq3v_rows_z.cpp)
+namespace {
+#define IQ3V_ZROWS(fn) pass_z(f, NT, w, rb, nb, y, o, r0, r1)
+#else
+#define IQ3V_ZROWS(fn) fn<NT>(w, rb, nb, y, o, r0, r1)
+#endif
 
 // rows [r0, r1) of format f (0 IQ3_XXS, 1 IQ4_XS, 2 Q4X), form v, NT tokens
 template <int NT>
 void pass(int f, int v, const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* o, int r0, int r1) {
     if (f == 0) {
         switch (v) {
-            case 5: return rows3z<NT>(w, rb, nb, y, o, r0, r1);
+            case 5: return IQ3V_ZROWS(rows3z);
 #if defined(IQ3V_AVXVNNI)
             case 2: return a2v::rows3g<NT>(w, rb, nb, y, o, r0, r1);
             case 4: return a2v::rows3b<NT>(w, rb, nb, y, o, r0, r1);
@@ -352,13 +397,13 @@ void pass(int f, int v, const uint8_t* w, size_t rb, int nb, const block_q8_K* c
         }
     }
     if (f == 1) {
-        if (v == 3) return rows4z<NT>(w, rb, nb, y, o, r0, r1);
+        if (v == 3) return IQ3V_ZROWS(rows4z);
 #if defined(IQ3V_AVXVNNI)
         if (v == 2) return a2v::rows4<NT>(w, rb, nb, y, o, r0, r1);
 #endif
         return a2::rows4<NT>(w, rb, nb, y, o, r0, r1);
     }
-    if (v == 3) return rowsqz<NT>(w, rb, nb, y, o, r0, r1);
+    if (v == 3) return IQ3V_ZROWS(rowsqz);
 #if defined(IQ3V_AVXVNNI)
     if (v == 2) return a2v::rowsq<NT>(w, rb, nb, y, o, r0, r1);
 #endif
@@ -407,6 +452,8 @@ bool vnni_form() {
 }
 
 }  // namespace maya::kernels::cpu::iq3v
+#undef IQ3V_ZROWS
+#endif  // IQ3V_PART == 2
 
 #else   // not x86-64: no forms (the caller never asks)
 namespace maya::kernels::cpu::iq3v {

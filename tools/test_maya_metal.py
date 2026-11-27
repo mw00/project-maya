@@ -205,6 +205,24 @@ class MetalSetupTests(unittest.TestCase):
         self.assertIsNotNone(env)                      # (the shell's environment, not a Visual Studio .bat)
         self.assertEqual(maya.read_json(vb / "MAYA-BUILD.json")["src"], "abc")
 
+    # v1.1.78: maya-vision compiles only what Maya's pictures use (tools/vision/lean.cmake); a toolchain on which
+    # that short build stops gets all of llama.cpp's image library, as before
+    def test_vision_falls_back_to_the_full_build(self):
+        steps = []
+        vb = self.root / "build-vision"
+        vb.mkdir()
+        with patch.object(maya, "VBUILD", vb), patch.object(maya, "VEXE", vb / "bin" / "maya-vision"), \
+             patch.object(maya, "VSTAMP", vb / "MAYA-BUILD.json"), patch.object(maya, "run"), \
+             patch.object(maya, "venv_tool", return_value="/usr/bin/ninja"), \
+             patch.object(maya, "cmake_steps",
+                          side_effect=lambda *x, **k: steps.append(x) or ("compiling" if len(steps) == 1 else None)), \
+             patch.object(maya, "say"):
+            maya.compile_vision(maya.check_pc(self.a), {}, self.root / "llama.cpp", "abc")
+        self.assertEqual(len(steps), 2)
+        self.assertNotIn("-DMAYA_VISION_FULL=ON", steps[0][0])
+        self.assertIn("-DMAYA_VISION_FULL=ON", steps[1][0])
+        self.assertEqual(maya.read_json(vb / "MAYA-BUILD.json")["src"], "abc")
+
     def test_no_tuning_for_metal(self):
         self.assertIsNone(maya.saved_calibration({"backend": "metal"}, any_context=True))
         cfg = self.root / "maya-metal.json"

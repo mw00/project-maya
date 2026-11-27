@@ -1,6 +1,7 @@
 // src/ds4/ds4_gguf.cu - a GGUF's BF16 matrices and MXFP4 experts on the device (see ds4_gguf.cuh).
 #include "ds4_gguf.cuh"
 #include "ds4_pdl.cuh"
+#include "maya/kernels/lane_xor.hpp"   // warp sums in registers on RDNA
 
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
@@ -52,9 +53,12 @@ __device__ __forceinline__ float warp_sum(float v) {
     v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));
     v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false));
     return v;
-#else
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+#else   // (the shuffle's xor order 16, 8, 4, 2, 1; maya_lane_xor: in registers on RDNA, the same bits)
+    v += maya_lane_xor<16>(v);
+    v += maya_lane_xor<8>(v);
+    v += maya_lane_xor<4>(v);
+    v += maya_lane_xor<2>(v);
+    v += maya_lane_xor<1>(v);
     return v;
 #endif
 }

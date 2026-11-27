@@ -42,6 +42,8 @@ class RebuildAll(unittest.TestCase):
                     patch.object(maya, "DS4_EXE", self.build / "maya-ds4"),
                     patch.object(maya, "MM3_EXE", self.build / "maya-mm3"),
                     patch.object(maya, "HY4_EXE", self.build / "maya-hy4"),
+                    patch.object(maya, "IK2_EXE", self.build / "maya-ik2"),
+                    patch.object(maya, "LING_EXE", self.build / "maya-ling"),
                     patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "step"),
                     patch.object(maya, "warn", side_effect=lambda m, *x: self.warned.append(m)),
                     patch.object(maya.S, "source_hash", return_value="new"),
@@ -227,6 +229,7 @@ class RebuildAll(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0)
         with patch.object(maya, "cmake_steps", REAL_CMAKE_STEPS), patch.object(maya, "WIN", True), \
                 patch.object(maya.S, "find_vcvars", return_value=Path(r"C:\VS\vcvars64.bat")), \
+                patch.object(maya.S, "full_build_output", return_value=True), \
                 patch.object(maya, "run", side_effect=fake_run), patch.object(maya, "mem_gb", return_value=(64, 60)):
             self.updated_pc()
             maya.build_step(self.a(True), self.pc, self.llama, "maya")

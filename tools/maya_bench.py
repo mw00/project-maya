@@ -13,6 +13,7 @@ engine dependency: tools/test_bench.py tests them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -27,9 +28,13 @@ PROMPT_SIZES = (2048, 8192)
 DECODE_TOKENS = 256
 REPEATS = 3
 WARM_TOKENS = 32
+SMOKE_ANSWERS = 2        # --bench-smoke: this many short answers and no 2K / 8K prompts - "does it still answer, and the
+SMOKE_TOKENS = 64        # same": minutes on a model too large for its box to run the standard (never a speed number)
 MIN_ANSWER = 64          # an answer shorter than this (the model stopped early) is listed, not in the decode median
 RESULTS_FILE = "maya-bench-results.txt"
 LEARNED_MAX = 64 << 20   # a learned file named in the config (an expert profile ...): at most this; a model is larger
+GOLDEN_DIR = "golden"    # data/golden/<machine>/: this PC's saved answers (tools/maya_golden.py), never a learned file
+HEAD_TOKENS = 48         # --bench-tokens: the first tokens of each answer kept as text too (for a person to read)
 # the GPU-lock folders a test box keeps (a file a GPU: gpu0, gpu1 ... or radeon / v100) and the "too hot" flags;
 # MAYA_GPU_LOCKS / MAYA_HOT_FLAG add one each
 LOCK_DIRS = ("~/.maya/locks", "~/hy4/locks")
@@ -115,6 +120,9 @@ def decode_samples(answers) -> list:
 
 
 DRAFT_LINE = re.compile(r"^(?:INFO )?drafting: (.+?)(?: - |, \d|$)")
+# a first start's measurement: what it chose (said after the engine's plan line, which names every source it loaded)
+MEASURED_LINE = re.compile(r"measured this PC once in \d+ s: drafting - (.+?)(?: \(|;|$)")
+MEASURING_LINE = re.compile(r"measuring this PC once, before the first answer: drafting")
 
 
 def drafting_choice(args, env: dict, engine_lines, answers, family: str = "") -> str:
@@ -125,6 +133,11 @@ def drafting_choice(args, env: dict, engine_lines, answers, family: str = "") ->
         m = DRAFT_LINE.match(x.strip())
         if m:
             said = m.group(1).strip()
+        m = MEASURED_LINE.search(x)
+        if m:                                # (the choice, not the plan line before the measurement)
+            said = m.group(1).strip()
+        elif MEASURING_LINE.search(x):       # (no result line after it: still not the plan line's sources)
+            said = "measuring"
     a = [str(x) for x in args or []]
     flag = lambda k: a[a.index(k) + 1] if k in a[:-1] else None   # noqa: E731
     if not said:
@@ -327,7 +340,13 @@ def on_windows() -> bool:
     return os.name == "nt"
 
 
-def machine_quiet(backend: str, gpus, lock_note="") -> list:
+def lock_ok_asked(flag: bool = False) -> bool:
+    """--bench-lock-ok, or MAYA_BENCH_LOCK_OK=1: a GPU lock that is already held (taken by hand for this run) is
+    accepted - the run neither takes nor releases it.  Default: strict, a held lock stops the benchmark."""
+    return bool(flag) or os.environ.get("MAYA_BENCH_LOCK_OK", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def machine_quiet(backend: str, gpus, lock_note="", lock_ok: bool = False) -> list:
     if backend == "hip":
         busy = []
         txt = _out(["rocm-smi", "--showuse", "--json"])
@@ -359,15 +378,16 @@ def machine_quiet(backend: str, gpus, lock_note="") -> list:
     load = cpu_load_now()
     hot = [p for p in list(HOT_FLAGS) + ([os.environ["MAYA_HOT_FLAG"]] if os.environ.get("MAYA_HOT_FLAG") else [])
            if Path(p).expanduser().exists()]
-    return quiet_reasons(busy, held_locks(lock_names(backend, gpus), lock_note), load, hot)
+    locks = [] if lock_ok else held_locks(lock_names(backend, gpus), lock_note)
+    return quiet_reasons(busy, locks, load, hot)
 
 
-def wait_quiet(backend, gpus, wait_min: float, say, lock_note="") -> list:
+def wait_quiet(backend, gpus, wait_min: float, say, lock_note="", lock_ok: bool = False) -> list:
     """Wait (up to wait_min minutes) for a quiet machine; [] when quiet, else the reasons it still is not."""
     t_end = time.time() + wait_min * 60
     told = None
     while True:
-        why = machine_quiet(backend, gpus, lock_note)
+        why = machine_quiet(backend, gpus, lock_note, lock_ok)
         if not why or time.time() >= t_end:
             return why
         kind = [re.sub(r"[\d.]+", "#", x) for x in why]     # (said again when the reasons change, not their numbers)
@@ -377,14 +397,29 @@ def wait_quiet(backend, gpus, wait_min: float, say, lock_note="") -> list:
         time.sleep(15)
 
 
-def take_locks(backend, gpus, note) -> list:
-    taken = []
+def take_locks(backend, gpus, note, held_ok: bool = False) -> list:
+    """Create our lock files, each in one step and only if nobody has it: of two runs that found the machine quiet
+    in the same second, one gets the file.  The run that lost one gives back what it took and raises RuntimeError
+    (it must not start beside the other).  held_ok (--bench-lock-ok: a lock taken by hand for this run): a lock
+    that is already there is left as it is and is not a loss.  Returns the files taken."""
+    taken, lost = [], []
     for d in lock_dirs():
         for n in lock_names(backend, gpus):
             p = d / n
-            if not p.exists():
-                p.write_text(note + "\n")
+            try:
+                with open(p, "x", encoding="utf-8") as f:
+                    f.write(note + "\n")
                 taken.append(p)
+            except FileExistsError:              # (somebody's already)
+                if held_ok:
+                    continue
+                who = p.read_text(errors="replace").strip().splitlines()[:1] if p.is_file() else []
+                lost.append(f"{p} ({who[0] if who else 'no note'})")
+            except OSError:                      # (a folder we cannot write: no lock there, as before)
+                pass
+    if lost:
+        release_locks(taken, note)
+        raise RuntimeError("another run took " + ", ".join(lost) + " first")
     return taken
 
 
@@ -442,6 +477,8 @@ class Session:
                 self.multi = any(w.startswith("multi=") for w in line.split())
                 break
             self.lines.append(line.rstrip())
+            self.log.write(line if line.endswith("\n") else line + "\n")   # (the start lines: stdout's, kept too)
+            self.log.flush()
         self.load_s = time.time() - self.t0
 
     def gen(self, ids, n_new):
@@ -494,7 +531,135 @@ def plan_prompts(doc, ctx: int, sizes=PROMPT_SIZES, repeats=REPEATS):
     return out, warm
 
 
-def run_session(start, chats, prompts, warm, label, say) -> dict:
+def prompt_text_files(names) -> list:
+    """Of a commit's file names, the ones --bench cuts its prompts from, in order: README.md, docs/*.md,
+    bench/results/*.md (each folder's own files, sorted by name)."""
+    pick = lambda d: sorted(n for n in names if n.startswith(d) and n.endswith(".md") and "/" not in n[len(d):])  # noqa
+    return [n for n in names if n == "README.md"] + pick("docs/") + pick("bench/results/")
+
+
+def input_hashes(chats, prompts, warm) -> dict:
+    """{request name (run_session's): a hash of its input tokens} - two runs asked the same thing when these are
+    equal (the 2K / 8K prompts are cut from the docs, which change)."""
+    h = lambda ids: hashlib.sha256(",".join(map(str, ids)).encode()).hexdigest()[:16]  # noqa: E731
+    out = {"warm-up": h(warm)}
+    out.update({f"decode {i + 1}": h(ids) for i, ids in enumerate(chats)})
+    out.update({f"prompt {n // 1024}K #{k + 1}": h(ids) for n, slices in prompts.items()
+                for k, ids in enumerate(slices)})
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ layout fingerprint
+KEEP_DIR = ".bench-logs"      # each round's engine log: <side>-r<N>.log - only this run's, emptied at the next run
+_DEV = r"((?:CUDA|HIP)\d+)"
+_INFO_KEYS = ("engine_kind", "vram_slots", "ram_slots", "mtp", "dflash")
+
+
+def layout_facts(lines, drafting: str = "") -> dict:
+    """{fact: text} - what an engine log states that decides placement and speed: the GPUs used, the layer split, the
+    expert slots a layer, the RAM tier, the CPU lane (its mode, where its times come from, what it takes), what was
+    loaded and the VRAM left, the drafting.  Times of the start itself (warm-up seconds ...) are not in it."""
+    f, gpus = {}, set()
+    pool, tier, free, warm, lane = {}, {}, {}, {}, {}
+    for x in lines:
+        x = x.strip()
+        m = re.match(r"glm split(?: auto)?: (layers .+?)(?: - | \(|$)", x)
+        if m:
+            f["split"] = m.group(1).removeprefix("layers ")
+            gpus.update(re.findall(_DEV, x))
+        m = re.match(r"layer split across GPUs (.+)$", x) or re.match(r"\[maya\] layer split across GPUs (.+)$", x)
+        if m:
+            f.setdefault("split", m.group(1))
+        m = re.match(r"glm fast: " + _DEV + r" layers \[(\d+),(\d+)\) expert pool [\d.]+ GB, ([\d-]+) slots/layer", x)
+        if m:
+            pool[m.group(1)] = f"{m.group(4)}"
+            gpus.add(m.group(1))
+        m = re.match(r"glm fast: " + _DEV + r" RAM tier [\d.]+ GB pinned, (\d+) slots", x)
+        if m:
+            tier[m.group(1)] = m.group(2)
+        m = re.match(r"glm fast: " + _DEV + r" tiers warm: (\d+) experts", x)
+        if m:
+            warm[m.group(1)] = m.group(2)
+        m = re.match(r"(?:maya serve|glm fast): " + _DEV + r": (\d+) MiB of VRAM free", x)
+        if m:
+            free[m.group(1)] = m.group(2)
+        m = re.match(r"glm fast: " + _DEV + r" CPU lane off: (.+)$", x)
+        if m:
+            lane[m.group(1)] = "off"
+        m = re.match(r"glm fast: " + _DEV + r" CPU lane: (\d+) threads.*takes ([\d ]+)$", x)
+        if m:
+            lane[m.group(1)] = f"{m.group(2)} threads, takes {m.group(3).strip()}"
+        m = re.match(r"glm fast: " + _DEV + r" CPU lane: those times from .*\((not timed|timed[^)]*)\)", x)
+        if m:
+            f["lane times"] = "read from the saved file" if "not" in m.group(2) else "timed at this start"
+        m = re.match(r"glm tier: " + _DEV + r" CPU lane pool mode: (.+?) \(", x)
+        if m:
+            f["lane pool"] = m.group(2)
+        if x.startswith("INFO ") and "engine_kind=" in x:
+            kv = dict(re.findall(r"(\w+)=(\S+)", x))
+            f["engine"] = " ".join(f"{k}={kv[k]}" for k in _INFO_KEYS if k in kv)
+        m = re.match(r"VRAM dev=(\d+) ", x)
+        if m:
+            gpus.add("dev" + m.group(1))
+    gpus = {g for g in gpus if not (g.startswith("dev") and any(h[-1] == g[3:] for h in gpus if h != g))}
+    if gpus:
+        f = {"GPUs": ",".join(sorted(gpus))} | f
+    for k, d in (("slots a layer", pool), ("RAM-tier slots", tier), ("warmed experts", warm), ("lane", lane),
+                 ("VRAM free MiB", free)):
+        if d:
+            f[k] = " / ".join(f"{a} {b}" for a, b in sorted(d.items()))
+    if drafting:
+        f["drafting"] = drafting
+    return f
+
+
+def layout_line(f: dict) -> str:
+    """The one short line a start prints: its facts, in order."""
+    return " | ".join(f"{k}: {v}" for k, v in f.items()) if f else "no placement facts in the engine log"
+
+
+def layout_diff(a: dict, b: dict) -> list:
+    """Which facts differ between two starts (both sides' text), in the order of a's keys."""
+    out = []
+    for k in list(a) + [k for k in b if k not in a]:
+        if a.get(k) != b.get(k):
+            out.append(f"{k}: {a.get(k, '-')} -> {b.get(k, '-')}")
+    return out
+
+
+def layout_report(runs: dict) -> list:
+    """Lines for --compare when tokens differ: round 1 against each later round of a build, and the two builds' round 1,
+    naming the facts that differ (or saying they are the same, so the cause is not placement)."""
+    out = []
+    pairs = [(f"{s} build, round 1 vs round {i + 1}", r[0], r[i]) for s, r in runs.items() for i in range(1, len(r))]
+    if runs.get("this") and runs.get("other"):
+        pairs.append(("this vs other build, round 1", runs["this"][0], runs["other"][0]))
+    for name, a, b in pairs:
+        d = layout_diff(a.get("facts", {}), b.get("facts", {}))
+        out.append(f"  layout, {name}: " + ("; ".join(d) if d else "same facts") +
+                   (f" (logs: {a['log_kept']}, {b['log_kept']})" if a.get("log_kept") and b.get("log_kept") else ""))
+    return out
+
+
+def keep_log(src: Path, keep: Path | None):
+    """Copies a round's engine log to its own file (the next round overwrites `src`)."""
+    if keep is None:
+        return None
+    try:
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, keep)
+        return str(keep)
+    except OSError:
+        return None
+
+
+def clean_kept_logs(root: Path):
+    """The kept logs of the run before - only the current run's stay."""
+    shutil.rmtree(root / KEEP_DIR, ignore_errors=True)
+
+
+def run_session(start, chats, prompts, warm, label, say, decode_tokens: int = DECODE_TOKENS, keep: Path | None = None,
+                drafting_info=None) -> dict:
     """Everything one round measures, in one engine session: the warm-up answer, the decode answers and the prompts.
     Returns the samples, the greedy tokens of every request (exactness) and the wall time of each phase."""
     ph = {}
@@ -508,7 +673,7 @@ def run_session(start, chats, prompts, warm, label, say) -> dict:
         answers, toks = [], {"warm-up": wtok}
         t = time.time()
         for i, ids in enumerate(chats):
-            d, tk = s.gen(ids, DECODE_TOKENS)
+            d, tk = s.gen(ids, decode_tokens)
             answers.append(d)
             toks[f"decode {i + 1}"] = tk
             say(f"  {label}decode  {decode_speed(d):6.1f} tokens/s  ({d['produced']} tokens)")
@@ -527,16 +692,22 @@ def run_session(start, chats, prompts, warm, label, say) -> dict:
     finally:
         ph["stop"] = s.close()
     lines = lines + s.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    kept = keep_log(s.log_path, keep)
+    facts = layout_facts(lines, drafting_choice(drafting_info[0], drafting_info[1], lines, [], drafting_info[2])
+                         if drafting_info else "")
+    say(f"  {label}layout: {layout_line(facts)}" + (f"  (engine log kept: {kept})" if kept else ""))
     return {"answers": answers, "reads": reads, "tokens": toks, "phases": ph, "engine_lines": lines,
-            "reused": reused}
+            "reused": reused, "facts": facts, "log_kept": kept}
 
 
 # ------------------------------------------------------------------------------------------------ learned files
 def learned_files(root: Path, cfg: dict) -> list:
     """The files an engine start reads and may rewrite (expert profiles, drafting and route choices, hot-expert
     scores): this build's data folder, and the files the config names that are small enough not to be a model."""
-    out = [p for p in (root / "data").rglob("*") if p.is_file()] if (root / "data").is_dir() else []
-    vals = [str(x) for x in cfg.get("args") or []] + [str(v) for v in (cfg.get("env") or {}).values()]
+    gold = root / "data" / GOLDEN_DIR            # (the saved answers, tools/maya_golden.py: no engine reads them)
+    out = [p for p in (root / "data").rglob("*") if p.is_file() and gold not in p.parents] \
+        if (root / "data").is_dir() else []
+    vals =[str(x) for x in cfg.get("args") or []] + [str(v) for v in (cfg.get("env") or {}).values()]
     for v in vals:
         try:
             p = Path(v)
@@ -547,9 +718,68 @@ def learned_files(root: Path, cfg: dict) -> list:
     return out
 
 
+def choice_files(root: Path, cfg: dict) -> dict:
+    """{file: a hash of its bytes} of the saved per-PC choices an engine start reads (what greedy answers may
+    legitimately depend on): the learned files, without the test fixtures git tracks in data/'s sub-folders."""
+    tracked = {(root / x).resolve() for x in _out(["git", "-C", str(root), "ls-files", "data"]).splitlines()}
+    out = {}
+    for p in learned_files(root, cfg):
+        if p.parent != root / "data" and p.resolve() in tracked:
+            continue
+        try:
+            name = p.relative_to(root).as_posix() if LearnedState._under(p, root) else str(p)
+            out[name] = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        except OSError:
+            pass
+    return dict(sorted(out.items()))
+
+
 def learned_listing(root: Path, cfg: dict) -> list:
     """The learned files that exist now (a file a first start writes shows up as new between two listings)."""
     return sorted(str(p) for p in learned_files(root, cfg))
+
+
+CAL_FILE = "glm-cpu-cal.txt"     # GLM's kept CPU-lane timing: one line a build (its key starts with the build's own stamp)
+
+
+def _cal_split(line: str):
+    """(key's part after the build stamp, key, values) of a cal line, or None."""
+    key, tab, vals = line.rstrip("\n").rpartition("\t")
+    if not tab:
+        return None
+    return key.partition(" | ")[2], key, vals
+
+
+def share_timing(this_file: Path, other_file: Path) -> int:
+    """Both builds run on one CPU and card: the other build's kept timing takes the values this build's priming start
+    measured (each build keys its line by its own compile stamp, so two builds time separately - and a timing a few
+    percent apart moves experts between the CPU lane and PCIe: other bits, other greedy answers).  Returns the lines set."""
+    if not (this_file.is_file() and other_file.is_file()):
+        return 0
+    mine = {}
+    for ln in this_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        sp = _cal_split(ln)
+        if sp:
+            mine[sp[0]] = sp[2]
+    out, n = [], 0
+    for ln in other_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        sp = _cal_split(ln)
+        if sp and sp[0] in mine and sp[2] != mine[sp[0]]:
+            ln, n = sp[1] + "\t" + mine[sp[0]], n + 1
+        out.append(ln)
+    other_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return n
+
+
+def prime_session(start, warm, say, label):
+    """One throw-away engine start: it writes what it keeps on its first start (GLM's CPU-lane timing ...), so every
+    round after it - this build's and the other's - starts from that kept state, not from a first start's."""
+    s = Session(*start)
+    say(f"  {label}priming start: loaded in {s.load_s:.0f} s")
+    try:
+        s.gen(warm, WARM_TOKENS)
+    finally:
+        s.close()
 
 
 class LearnedState:
@@ -567,6 +797,7 @@ class LearnedState:
             shutil.copy2(p, dst)
             self.saved[p] = dst
         self.others = {}                     # {other root: ({its data files at the start}, {file: bytes or None})}
+        self.kept = {}                       # {build root: {file: its copy after the priming start}} (prime_keep)
 
     @staticmethod
     def _put(src: Path, dst: Path):
@@ -576,7 +807,10 @@ class LearnedState:
 
     @staticmethod
     def _files(d: Path) -> set:
-        return {p for p in d.rglob("*") if p.is_file()} if d.is_dir() else set()
+        """A data folder's files - never the saved answers (data/golden): a restore must not sweep them away as
+        'written by the run'."""
+        return {p for p in d.rglob("*") if p.is_file() and GOLDEN_DIR not in p.relative_to(d).parts[:1]} \
+            if d.is_dir() else set()
 
     def _drop_new(self, d: Path, keep: set):
         """A file a run wrote that was not there at the start (a first start's measurement) goes too."""
@@ -591,7 +825,10 @@ class LearnedState:
         copies into that build's data folder."""
         for p, s in self.saved.items():
             self._put(s, p)
-        self._drop_new(self.root / "data", set(self.saved))
+        mine_kept = self.kept.get(self.root, {})
+        for p, s in mine_kept.items():
+            self._put(s, p)
+        self._drop_new(self.root / "data", set(self.saved) | set(mine_kept))
         if other is None:
             return
         start, backup = self.others.setdefault(other, (self._files(other / "data"), {}))
@@ -603,7 +840,24 @@ class LearnedState:
                     backup[q] = q.read_bytes() if q.exists() else None
                 self._put(s, q)
                 mine.add(q)
+        for q, s in self.kept.get(other, {}).items():     # (what the other build's own priming start left)
+            if q not in backup:
+                backup[q] = q.read_bytes() if q.exists() else None
+            self._put(s, q)
+            mine.add(q)
         self._drop_new(other / "data", start | mine)
+
+    def prime_keep(self, root: Path):
+        """After a priming start of the build at `root`: the files its data folder holds now are that build's start state
+        for every round (restore puts them back), as a user's second start finds them."""
+        got = self.kept.setdefault(root, {})
+        for i, p in enumerate(sorted(self._files(root / "data"))):
+            if p.stat().st_size > LEARNED_MAX:
+                continue
+            dst = self.snap / f"kept-{len(self.kept)}-{i}-{p.name}"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+            got[p] = dst
 
     def adopt(self, cfg: dict):
         """Files the first round learned that the snapshot did not have (a first start's measurements) join it: no
@@ -701,10 +955,11 @@ def map_cfg(cfg: dict, here: Path, there: Path) -> dict:
 
 def start_command(root: Path, cfg: dict, cfg_file: Path):
     """[cmd, env] the build in `root` starts this config's engine with - its own serve/server.py (engine_args,
-    child_env), run as a separate Python so its modules never mix with this build's."""
+    engine_environment), run as a separate Python so its modules never mix with this build's."""
     code = ("import json,sys; sys.path[:0]=[sys.argv[1], sys.argv[1]+'/tools']; import serve.server as SV; "
             "c=json.load(open(sys.argv[2])); print(json.dumps([[c['exe'],'--serve']+SV.engine_args(c),"
-            "SV.child_env(c)]))")
+            "(SV.engine_environment(c, __import__('pathlib').Path(sys.argv[2]).resolve().with_name('vision-memory.json')) "
+            "if hasattr(SV, 'engine_environment') else SV.child_env(c))]))")   # (an older build: child_env alone)
     r = subprocess.run([sys.executable, "-c", code, str(root), str(cfg_file)], capture_output=True, text=True,
                        cwd=str(root))
     if r.returncode:

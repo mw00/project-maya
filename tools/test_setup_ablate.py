@@ -106,7 +106,7 @@ class AblateStep(unittest.TestCase):
         self.assertEqual(json.loads(self.cfg.read_text())["ablate"], {"file": str(self.good)})
 
     def test_every_model_has_its_own_repo_and_name(self):
-        self.assertEqual(set(maya.ABLATE_DIRECTIONS), {"glm", "glm-dsa", "deepseek", "minimax"})
+        self.assertEqual(set(maya.ABLATE_DIRECTIONS), {"glm", "glm-dsa", "deepseek", "minimax", "ik2"})
         for model, repo in maya.ABLATE_DIRECTIONS.values():
             self.assertTrue(repo.startswith("peasantsmith/") and repo.endswith("-Maya-GGUF"), repo)
             self.assertTrue(repo.split("/")[1].startswith(model), (model, repo))

@@ -36,6 +36,9 @@ struct Options {
     int cpu_threads = 0;
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
     bool profile_readonly = false;    // (--profile-readonly) the profile is read, never written back
+    // read at the load in place of `profile` while that file does not exist yet (a pack set up by hand or mounted
+    // read-only has none): the shipped data/expert-profile-ds4.bin.  What the run learns is still written to `profile`
+    std::string profile_seed;
     // (--profile-out) where save_profile() also writes what this run routed alone: the counts read at the load taken off
     std::string profile_out;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
@@ -148,6 +151,8 @@ struct Stats {
     double store_wait_ms = 0.0;
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
+    double prof_dev_ms[2][6] = {};   // (the same by CUDA0 / CUDA1 apart) and the profiled steps' rows in all
+    int64_t prof_rows = 0;
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
     // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
     // read from the files, of them prefetched early; experts prefetched early

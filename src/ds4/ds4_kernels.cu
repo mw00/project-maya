@@ -882,6 +882,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    unsigned nf = 0u;   // (thread 0's: the picks that found no finite score)
     for (int r = 0; r < k; ++r) {
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
@@ -899,6 +900,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix >= n) ix = 0, nf |= 1u << r;   // (no finite score left in the row: a pick in bounds, no weight)
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
@@ -906,10 +908,10 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
     }
     if (threadIdx.x == 0) {
         float s = 0.0f;
-        for (int r = 0; r < k; ++r) s += sc[pick[r]];
+        for (int r = 0; r < k; ++r) s += ((nf >> r) & 1u) ? 0.0f : sc[pick[r]];
         for (int r = 0; r < k; ++r) {
             idx[(size_t) t * kPicks + r] = pick[r];
-            w[(size_t) t * kPicks + r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
+            w[(size_t) t * kPicks + r] = ((nf >> r) & 1u) ? 0.0f : sc[pick[r]] / (s + 1e-20f) * route_scale;
         }
     }
 }
@@ -2999,6 +3001,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    unsigned nf = 0u;   // (thread 0's: the picks that found no finite score)
     for (int r = 0; r < k; ++r) {
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
@@ -3016,6 +3019,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix >= n) ix = 0, nf |= 1u << r;   // (no finite score left in the row: a pick in bounds, no weight)
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
@@ -3023,10 +3027,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     }
     if (threadIdx.x == 0) {
         float s = 0.0f;
-        for (int r = 0; r < k; ++r) s += sc[pick[r]];
+        for (int r = 0; r < k; ++r) s += ((nf >> r) & 1u) ? 0.0f : sc[pick[r]];
         int cpu = 0;
         float sk;
-        const unsigned keep = route_keep(sc, pick, k, s, rs_w, rs_k, sk);
+        const unsigned keep = route_keep(sc, pick, k, s, rs_w, rs_k, sk) & ~nf;   // (a pick with no score: dropped)
         for (int r = 0; r < k; ++r) {
             const bool kept = (keep >> r) & 1u;   // (a dropped pick: no weight, off the device, not on the CPU lane)
             const float wv = kept ? sc[pick[r]] / (sk + 1e-20f) * route_scale : 0.0f;
@@ -3116,6 +3120,7 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
         }
         __syncthreads();
         const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+        unsigned nf = 0u;   // (thread 0's: the picks that found no finite score)
         for (int r = 0; r < k; ++r) {
             float best = -FLT_MAX;
             int bix = 0x7fffffff;
@@ -3133,6 +3138,7 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
                 int ix = 0x7fffffff;
                 for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                     if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+                if (ix >= n) ix = 0, nf |= 1u << r;   // (no finite score left in the row: a pick in bounds, no weight)
                 pick[r] = ix;
                 bs[ix] = -FLT_MAX;
             }
@@ -3140,10 +3146,10 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
         }
         if (threadIdx.x == 0) {
             float s = 0.0f;
-            for (int r = 0; r < k; ++r) s += sc[pick[r]];
+            for (int r = 0; r < k; ++r) s += ((nf >> r) & 1u) ? 0.0f : sc[pick[r]];
             int cpu = 0;
             float sk;
-            const unsigned keep = route_keep(sc, pick, k, s, a.rs_w, a.rs_k, sk);
+            const unsigned keep = route_keep(sc, pick, k, s, a.rs_w, a.rs_k, sk) & ~nf;   // (a pick with no score: dropped)
             for (int r = 0; r < k; ++r) {
                 const bool kept = (keep >> r) & 1u;
                 const float wv = kept ? sc[pick[r]] / (sk + 1e-20f) * a.route_scale : 0.0f;

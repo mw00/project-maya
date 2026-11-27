@@ -133,6 +133,16 @@ int main(int argc, char** argv) {
         gguf_context* gg = gguf_init_from_file(mmproj.c_str(), gp);
         const int64_t k = gg ? gguf_find_key(gg, "clip.vision.projection_dim") : -1;
         if (k >= 0) n_embd = (int) gguf_get_val_u32(gg, k);
+#ifdef MAYA_VISION_LEAN
+        // this build has no kernels for quantized weights (tools/vision/lean.cmake): said here, not mid-picture
+        for (int64_t i = 0; gg && i < gguf_get_n_tensors(gg); ++i) {
+            if (!ggml_is_quantized(gguf_get_tensor_type(gg, i))) continue;
+            std::printf("ERR the vision encoder %s has quantized weights (%s): this maya-vision is built for F32/F16 "
+                        "ones (-DMAYA_VISION_FULL=ON builds the others)\n", mmproj.c_str(), gguf_get_tensor_name(gg, i));
+            std::fflush(stdout);
+            return 1;
+        }
+#endif
         if (gg) gguf_free(gg);
     }
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }

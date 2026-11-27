@@ -416,6 +416,75 @@ class Sampler(unittest.TestCase):
             with mock.patch.object(T, "CPU_SENSOR_ROOT", sim), mock.patch.object(T, "SYSFS", real):
                 self.assertEqual(T.cpu_temp(), 42.0)
 
+    def test_no_cpu_sensor_reads_no_other_chip(self):
+        """A Linux box whose sysfs has no CPU sensor (a CI runner, a VM) - only an NVMe drive's: None, without reading
+        the drive's temperature and without psutil's scan of every chip (each second, in every server's sampler: the
+        drive reads queued up in the kernel and a test server ended minutes after SIGTERM - v1.1.82's CI)."""
+        import builtins
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            chip = Path(d) / "class/hwmon/hwmon0"
+            chip.mkdir(parents=True)
+            (chip / "name").write_text("nvme\n", encoding="utf-8")
+            (chip / "temp1_input").write_text("41000\n", encoding="utf-8")
+            zone = Path(d) / "class/thermal/thermal_zone0"
+            zone.mkdir(parents=True)
+            (zone / "type").write_text("iwlwifi_1\n", encoding="utf-8")
+            (zone / "temp").write_text("39000\n", encoding="utf-8")
+            read = []
+            real_open = builtins.open
+
+            def spy(path, *a, **kw):
+                read.append(str(path))
+                return real_open(path, *a, **kw)
+            scan = mock.Mock(side_effect=AssertionError("psutil.sensors_temperatures() was called"))
+            with mock.patch("builtins.open", spy), \
+                    mock.patch.dict(sys.modules, {"psutil": mock.Mock(sensors_temperatures=scan)}):
+                self.assertIsNone(T.cpu_temp([d]))
+            scan.assert_not_called()
+            self.assertEqual([p for p in read if p.endswith(("temp1_input", os.sep + "temp"))], [])
+
+    def test_cpu_temperature_from_the_acpi_zone_or_a_device_folder(self):
+        """What psutil's scan found before (it is no longer used on Linux): a board with only an ACPI thermal zone, and
+        an older kernel's chip whose files are in hwmonN/device/."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for zone, kind, value in (("thermal_zone0", "acpitz", "51000"), ("thermal_zone1", "iwlwifi_1", "70000")):
+                (Path(d) / "class/thermal" / zone).mkdir(parents=True)
+                (Path(d) / "class/thermal" / zone / "type").write_text(kind + "\n", encoding="utf-8")
+                (Path(d) / "class/thermal" / zone / "temp").write_text(value + "\n", encoding="utf-8")
+            self.assertEqual(T.cpu_temp([d]), 51.0)
+        with tempfile.TemporaryDirectory() as d:
+            dev = Path(d) / "class/hwmon/hwmon0/device"
+            dev.mkdir(parents=True)
+            (dev / "name").write_text("coretemp\n", encoding="utf-8")
+            (dev / "temp1_input").write_text("63000\n", encoding="utf-8")
+            self.assertEqual(T.cpu_temp([d]), 63.0)
+
+    def test_without_sysfs_psutil_answers(self):
+        """No /sys at all (another OS): psutil's sensors, as before."""
+        import tempfile
+        row = mock.Mock(current=47.0)
+        ps = mock.Mock(sensors_temperatures=mock.Mock(return_value={"coretemp": [row]}))
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(sys.modules, {"psutil": ps}):
+            self.assertEqual(T.cpu_temp([d]), 47.0)
+
+    def test_stop_ends_the_sampler_thread(self):
+        """stop(): the sampler's thread ends within its pause (a closed server's sampler no longer reads each second)."""
+        import threading
+        import time
+        r = T._Reader()
+        self.addCleanup(r._stop)
+        before = set(threading.enumerate())
+        t = T.Telemetry(gpu_index=0, reader=r)
+        mine = [th for th in threading.enumerate() if th not in before and th.name != "nvml-reader"
+                and th.name != "nvml-reader-err"]
+        t.stop()
+        end = time.monotonic() + 10
+        while any(th.is_alive() for th in mine) and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertEqual([th for th in mine if th.is_alive()], [])
+
     def test_this_machine(self):
         """The real reader on this machine (NVML or none): it answers or says there is nothing - never raises."""
         r = T._Reader()

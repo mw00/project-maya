@@ -101,7 +101,7 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
         case GGML_TYPE_IQ1_S:  // GLM-5.3-Flash's IQ1_S experts
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
-            return true;   // (the Maya quants' candidates, docs/QUANT-PLAN.md; IQ1_M has no MMQ)
+            return true;   // (the Maya quants' candidates; IQ1_M has no MMQ)
         default:
             return false;
     }
@@ -264,7 +264,84 @@ void iota(int32_t* dst, int64_t n, void* stream) {
 
 bool to_f16_supported(int t) { return ggml_get_to_fp16_cuda((ggml_type) t) != nullptr; }
 
+#if !defined(GGML_USE_HIP)
+namespace {
+
+// IQ2_XXS / IQ2_S -> FP16 for the prompt's FP16 expert path (MAYA_GLM_PREFILL_BLAS): ggml's dequantize_iq2_xxs /
+// dequantize_iq2_s arithmetic value for value (bit-identical output), as 256-thread blocks with one 16-byte store a
+// thread, the grid table in shared memory and a grid-stride loop that loads it once a block. ggml's 32-thread blocks
+// of 2-byte stores move ~425 GB/s on a CMP 170HX; these ~930. Opt-in, MAYA_PREFILL_FAST_DEQUANT=1 (unset or 0:
+// ggml's) until a same-tokens check on every card family has passed (a V100 run gave other tokens). HIP keeps ggml's.
+__global__ void __launch_bounds__(256) iq2_xxs_f16_kernel(const block_iq2_xxs* __restrict__ x, half* __restrict__ y,
+                                                          int64_t nsb) {
+    __shared__ uint64_t g[256];
+    g[threadIdx.x] = iq2xxs_grid[threadIdx.x];
+    __syncthreads();
+    // 32 threads a superblock; thread gi writes values [8 gi, 8 gi + 8): ggml's ib = gi / 4, il = gi % 4
+    for (int64_t t = blockIdx.x * 256LL + threadIdx.x; (t >> 5) < nsb; t += (int64_t) gridDim.x * 256) {
+        const int64_t sb = t >> 5;
+        const int gi = (int) (t & 31), ib = gi >> 2, il = gi & 3;
+        const uint16_t* q2 = x[sb].qs + 4 * ib;
+        const uint8_t idx = ((const uint8_t*) q2)[il];
+        const uint32_t aux32 = q2[2] | ((uint32_t) q2[3] << 16);
+        const float d = (float) x[sb].d * (0.5f + (aux32 >> 28)) * 0.25f;
+        const uint32_t s7 = (aux32 >> (7 * il)) & 127;
+        const uint32_t signs = s7 | ((__popc(s7) & 1u) << 7);   // = ksigns_iq2xs[s7]
+        const uint8_t* gr = (const uint8_t*) &g[idx];
+        __align__(16) half v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = __float2half(d * gr[j] * (signs & (1u << j) ? -1.f : 1.f));
+        *(uint4*) (y + sb * QK_K + 8 * gi) = *(const uint4*) v;
+    }
+}
+
+__global__ void __launch_bounds__(256) iq2_s_f16_kernel(const block_iq2_s* __restrict__ x, half* __restrict__ y,
+                                                        int64_t nsb) {
+    __shared__ uint64_t g[1024];
+    for (int i = threadIdx.x; i < 1024; i += 256) g[i] = iq2s_grid[i];
+    __syncthreads();
+    for (int64_t t = blockIdx.x * 256LL + threadIdx.x; (t >> 5) < nsb; t += (int64_t) gridDim.x * 256) {
+        const int64_t sb = t >> 5;
+        const int gi = (int) (t & 31), ib = gi >> 2, il = gi & 3;
+        const block_iq2_s* b = x + sb;
+        const int idx = b->qs[4 * ib + il] | ((b->qh[ib] << (8 - 2 * il)) & 0x300);
+        const float d = (float) b->d * (0.5f + ((b->scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        const uint8_t signs = b->qs[QK_K / 8 + 4 * ib + il];
+        const uint8_t* gr = (const uint8_t*) &g[idx];
+        __align__(16) half v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = __float2half(d * gr[j] * (signs & (1u << j) ? -1.f : 1.f));
+        *(uint4*) (y + sb * QK_K + 8 * gi) = *(const uint4*) v;
+    }
+}
+
+bool iq2_to_f16(int t, const void* w, half* dst, int64_t n, cudaStream_t s) {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_PREFILL_FAST_DEQUANT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!on || (t != GGML_TYPE_IQ2_XXS && t != GGML_TYPE_IQ2_S) || n % QK_K != 0) return false;
+    static int sms[GGML_CUDA_MAX_DEVICES] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return false;
+    if (sms[dev] == 0 && cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return false;
+    const int64_t nsb = n / QK_K;
+    const unsigned blocks = (unsigned) std::min<int64_t>((nsb * 32 + 255) / 256, (int64_t) sms[dev] * 8);
+    if (t == GGML_TYPE_IQ2_XXS) iq2_xxs_f16_kernel<<<blocks, 256, 0, s>>>((const block_iq2_xxs*) w, dst, nsb);
+    else iq2_s_f16_kernel<<<blocks, 256, 0, s>>>((const block_iq2_s*) w, dst, nsb);
+    return true;
+}
+
+}  // namespace
+#endif
+
 bool to_f16(int t, const void* w, uint16_t* dst, int64_t n, void* stream) {
+#if !defined(GGML_USE_HIP)
+    if (iq2_to_f16(t, w, (half*) dst, n, (cudaStream_t) stream)) {
+        ck(cudaGetLastError(), "to_f16");
+        return true;
+    }
+#endif
     const to_fp16_cuda_t f = ggml_get_to_fp16_cuda((ggml_type) t);
     if (f == nullptr) return false;
     f(w, (half*) dst, n, (cudaStream_t) stream);

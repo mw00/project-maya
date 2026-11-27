@@ -1,0 +1,64 @@
+{
+ "_": "Ling-3.2-air (inclusionAI/Ling-3.2-air, bailingmoe3) on maya-ling. \"quants\": Project Maya's quants of it (GGUF), named as every Maya quant (tools/maya_quants.py): one repo for the model. This table is the one switch: a size is offered by the setup and the Models page once \"revision\" names the repo's commit and the size has \"files\" with their sizes and sha256 (until then: --model ling-3.2-air-maya-s --model-dir <folder with the file>, checked against the size and sha256 here). A size with empty \"files\" is not offered and cannot be set up by its name: to switch one on, fill its \"files\" and \"about\" and move \"revision\" to the commit that has them. A file's name carries its quant type (IQ2_XXS, IQ2_S, IQ3_S): Hugging Face reads a repo's sizes from the names. Any other GGUF of the model: --model ling-3.2-air --model-dir <folder with the .gguf>.",
+ "name": "Ling-3.2-air",
+ "repo": "peasantsmith/Ling-3.2-air-Maya-GGUF",
+ "revision": "eb1c04217e13453bf509f2c62d6688eb1757d844",
+ "license": "MIT",
+ "default_kv": "f16",
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20
+ },
+ "reasoning_effort": "high",
+ "vision": {
+  "_": "Ling-3.2-air vision projector (mmproj-BF16, built with tools/ling/convert_mmproj.py) from Maya's own repo (folder vision/ at the table's commit), by size and sha256; the setup downloads it beside the model unless --no-vision, and an mmproj already beside the model is used as it is. 0 permanent VRAM: lent from the expert pool tail while encoding.",
+  "repo": "peasantsmith/Ling-3.2-air-Maya-GGUF",
+  "revision": "eb1c04217e13453bf509f2c62d6688eb1757d844",
+  "folder": "vision",
+  "files": {
+   "Ling-3.2-air-mmproj-BF16.gguf": [
+    869332480,
+    "4a6c6063070714617b62093baba9dfb040e4bee1f9019be6c81b6a16880117bb"
+   ]
+  },
+  "legacy_names": [
+   "mmproj-BF16.gguf",
+   "mmproj-Ling-3.2-air-BF16.gguf"
+  ]
+ },
+ "quants": {
+  "Ling-3.2-air-Maya-S": {
+   "about": "IQ2_XXS",
+   "files": {
+    "Ling-3.2-air-Maya-S-IQ2_XXS.gguf": [
+     36912008640,
+     "9fed99fc3beff053b96f8ef1cc40bb1b1cf926e201a121803d38f7927f60dd74"
+    ]
+   }
+  },
+  "Ling-3.2-air-Maya-M": {
+   "about": "IQ2_S",
+   "files": {
+    "Ling-3.2-air-Maya-M-IQ2_S.gguf": [
+     45971705280,
+     "1b43c9956d6ac3706744b0f043113a9b4d9269d51f77a56fb506d1332c9f4a88"
+    ]
+   }
+  },
+  "Ling-3.2-air-Maya-L": {
+   "about": "IQ3_S",
+   "files": {
+    "Ling-3.2-air-Maya-L-IQ3_S-00001-of-00002.gguf": [
+     49602151040,
+     "aeed7796e48c713c6b1d5efd8c0db8c231fb8a0908542be881da6f0cea330def"
+    ],
+    "Ling-3.2-air-Maya-L-IQ3_S-00002-of-00002.gguf": [
+     9581612064,
+     "799e308aa227dc1faaa52a414d67c87b0d9adccd387c1c265b8eeb2b7a4842c8"
+    ]
+   }
+  }
+ },
+ "folder": ""
+}

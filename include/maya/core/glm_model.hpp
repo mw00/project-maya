@@ -271,6 +271,8 @@ public:
     /// window's tokens, nullptr for a lone pick; n0: the drafts before row 0, a pipelined window's token).  So a draft
     /// stands only where it is the penalized pick: drafting counts exactly the history plain decode counts.  Without
     /// penalties it is exactly the sample_tokens call the sites made before.
+    /// MAYA_GLM_DUMP_LOGITS (a test): the rows a pick is about to read, appended to the dump
+    void dump_logits(const float* logits, int T, cudaStream_t s);
     void pick_tokens(const float* logits, int T, const maya::kernels::SamplerParams& sp, const int32_t* win, int n0,
                      int* out, cudaStream_t s);
     /// Zeroes R, every KDA state and every DSA cache: the next `forward` starts a fresh sequence.
@@ -772,6 +774,9 @@ public:
     KvStreamStats kv_stream_stats() const;
     const GlmStateLayout& state_layout() const { return lay_; }   // glm-dsa B4.1: this part's state arena layout
     int dsa_n_sel_last() const;   // glm-dsa B4.6: cells the last glm-dsa full layer attended (-1: no glm-dsa mixer)
+    /// The FFN widths layer `il`'s fast path sizes its launches from (the routed experts' and the shared expert's per
+    /// expert, the dense FFN's) and the slice's first row; false when this part's fast path does not hold the layer.
+    bool fast_ffn_width(int il, int& ff, int& ffd, int& f0) const;
     /// Images (the vision path): rows of n_embd floats that stand in for the token embeddings at these absolute
     /// positions - the prompt's <|image|> tokens, in order; an empty call clears them.  Read wherever a token is
     /// embedded (the prompt path - the NextN block's cache fill included - and the token path).

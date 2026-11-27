@@ -1,5 +1,5 @@
 """tools/test_bench.py - --bench (maya.py, tools/maya_bench.py): the engine binary on HIP, the requests, and the
-speed-test standard's parsing, medians, result line, quiet check and A/B parts. No GPU, no network, no engine process.
+speed-test standard's parsing, medians, result line, quiet check and A/B parts. No GPU, no network, no engine process (a few lines of Python stand in for one).
 
     python -m unittest tools.test_bench -v
 """
@@ -234,6 +234,66 @@ class BenchStandard(unittest.TestCase):
         self.assertEqual(MB.drafting_choice([], {}, ["dspark: x"], [], "ik2"), "no drafting")
         self.assertEqual(MB.drafting_choice([], {}, ["dspark: 3 drafts"], [], "deepseek"), "DSpark")
 
+    def test_drafting_choice_of_a_first_start(self):
+        # (the plan line names every source the engine loaded; the measurement's line says what was kept)
+        plan = "drafting: the drafter and the prompt lookup, 1.54 GiB of VRAM from the experts' tier with the window's"
+        going = "NOTE maya-ik2: measuring this PC once, before the first answer: drafting (3 requests, 128 tokens each)"
+        done = ("NOTE maya-ik2: measured this PC once in 41 s: drafting - no drafting (no drafting 21.4, the prompt "
+                "lookup 7.5, the drafter 8.0, both 7.9 tokens/s); plain decoding was timed in lane parity")
+        self.assertEqual(MB.drafting_choice(["--drafting", "auto"], {}, [plan, going, done], []), "no drafting")
+        self.assertEqual(MB.drafting_choice([], {}, [plan, going, done.replace("- no drafting (", "- the drafter (")],
+                                            []), "the drafter")
+        self.assertEqual(MB.drafting_choice([], {}, [plan, going], []), "measuring")
+        # (the two-run measurement: the start's own line comes last and is the choice)
+        kept = "drafting: no drafting - the fastest on this PC (measured 2026-11-23: no drafting 21.4, ...)"
+        self.assertEqual(MB.drafting_choice([], {}, [going, done, kept], []), "no drafting")
+        self.assertEqual(MB.drafting_choice([], {}, [plan], []), "the drafter and the prompt lookup")
+
+    def test_the_log_keeps_the_start_lines(self):
+        # (a stand-in engine that writes its start lines to stdout only, as maya-ik2 does on Windows)
+        code = ("import sys\n"
+                "print('expert cache, GPU 0: 590 slots', flush=True)\n"
+                "print('drafting: no drafting - the fastest on this PC', flush=True)\n"
+                "print('a note on stderr', file=sys.stderr, flush=True)\n"
+                "print('READY', flush=True)\n"
+                "sys.stdin.readline()\n")
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "maya-bench.log"
+            sess = MB.Session([sys.executable, "-c", code], None, td, log)
+            self.assertEqual(sess.lines, ["expert cache, GPU 0: 590 slots",
+                                          "drafting: no drafting - the fastest on this PC"])
+            sess.close()
+            sess.p.stdin.close(), sess.p.stdout.close()
+            text = log.read_text(encoding="utf-8")
+            for want in sess.lines + ["a note on stderr"]:
+                self.assertIn(want, text)
+            self.assertNotIn("READY", text)
+
+    def test_a_lock_taken_by_hand(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(MB, "LOCK_DIRS", (td,)), \
+                patch.object(MB, "_out", return_value=""), patch.object(MB, "cpu_load_now", return_value=None), \
+                patch.object(MB, "HOT_FLAGS", ()), patch.dict(MB.os.environ, {"MAYA_HOT_FLAG": "", "MAYA_GPU_LOCKS": "",
+                                                                              "MAYA_BENCH_LOCK_OK": ""}):
+            lock = Path(td) / "gpu0"
+            lock.write_text("mine, by hand\n")
+            why = MB.machine_quiet("cuda", [0])                       # (the default: strict)
+            self.assertEqual(why, [f"GPU lock {lock} is held: mine, by hand"])
+            self.assertEqual(MB.machine_quiet("cuda", [0], lock_ok=True), [])
+            self.assertEqual(MB.wait_quiet("cuda", [0], 0, lambda *a: None, lock_ok=True), [])
+            self.assertFalse(MB.lock_ok_asked())
+            self.assertTrue(MB.lock_ok_asked(True))
+            with patch.dict(MB.os.environ, {"MAYA_BENCH_LOCK_OK": "1"}):
+                self.assertTrue(MB.lock_ok_asked())
+            with patch.dict(MB.os.environ, {"MAYA_BENCH_LOCK_OK": "0"}):
+                self.assertFalse(MB.lock_ok_asked())
+            # (the run takes no lock that is there and releases only its own: the hand-made one stays)
+            taken = MB.take_locks("cuda", [0, 1], "bench note", held_ok=True)
+            self.assertRaises(RuntimeError, MB.take_locks, "cuda", [0, 1], "bench note")   # (without it: a loss)
+            self.assertEqual([p.name for p in taken], ["gpu1"])
+            MB.release_locks(taken + [lock], "bench note")
+            self.assertEqual(sorted(p.name for p in Path(td).iterdir()), ["gpu0"])
+            self.assertEqual(lock.read_text(), "mine, by hand\n")
+
     def test_exactness(self):
         self.assertIsNone(MB.first_difference([1, 2, 3], [1, 2, 3]))
         self.assertEqual(MB.first_difference([1, 2, 3], [1, 5, 3]), 1)
@@ -295,6 +355,136 @@ class BenchStandard(unittest.TestCase):
         here, there = Path("/m/a").resolve(), Path("/m/b").resolve()
         c = MB.map_cfg({"exe": str(here / "build" / "maya"), "cwd": str(here), "args": []}, here, there)
         self.assertEqual((Path(c["exe"]), Path(c["cwd"])), (there / "build" / "maya", there))
+
+
+class SharedCpuTiming(unittest.TestCase):
+    def test_other_build_takes_this_builds_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b = Path(d) / "a.txt", Path(d) / "b.txt"
+            rest = " | /m/pack | layer 3 | 7536640 B | 0000:15:00.0 Tesla V100 | 36 threads | 4"
+            a.write_text("0.1.27 Nov 23 2026 23:41:47" + rest + "\t0.2520 0.6175 0.6148 0.2305\n" +
+                         "0.1.27 Nov 24 2026 03:00:00" + rest + "\t0.1250 0.5780 0.5800 0.1300\n")
+            b.write_text("0.1.27 Nov 24 2026 02:00:00" + rest + "\t0.2380 0.5770 0.5790 0.2400\n")
+            self.assertEqual(MB.share_timing(a, b), 1)
+            self.assertEqual(b.read_text(), "0.1.27 Nov 24 2026 02:00:00" + rest + "\t0.1250 0.5780 0.5800 0.1300\n")
+            self.assertEqual(MB.share_timing(a, Path(d) / "none.txt"), 0)
+
+
+class EngineStartMatchesServer(unittest.TestCase):
+    """The bench starts the engine from the server's own start code.  v1.1.77: the server gave maya-ik2 a pictures
+    figure (images on) that the bench never did, so the bench showed full speed while served answers were slow."""
+
+    EXES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2")
+
+    def cfg(self, exe, tmp):
+        return {"exe": exe, "gpu": [0], "args": [], "vision": {"exe": "maya-vision", "mmproj": str(Path(tmp) / "m.gguf"),
+                                                               "gpu": True}}
+
+    def test_bench_env_has_every_key_the_server_sets(self):
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as d, patch.object(SV, "vision_footprint", return_value=(4096, 2 << 30)):
+            cache = Path(d) / "vision-memory.json"
+            for exe in self.EXES:
+                for images in (True, False):
+                    c = self.cfg(exe, d)
+                    if not images:
+                        c.pop("vision")
+                    served = SV.vision_plan(c, SV.child_env(c), cache)[4]   # what serve/server.py starts the engine with
+                    bench = SV.engine_environment(c, cache)                 # what the bench's start_command reads
+                    self.assertEqual(sorted(set(served) - set(bench)), [], f"{exe} images={images}")
+                    self.assertEqual(sorted(set(bench) - set(served)), [], f"{exe} images={images}")
+
+    def test_bench_start_command_reads_the_servers_environment_function(self):
+        import inspect
+        src = inspect.getsource(MB.start_command)
+        self.assertIn("SV.engine_environment", src)
+        self.assertIn("SV.engine_args", src)
+
+
+GLM_LOG = """glm split auto: layers [0, 17) on CUDA0, [17, 31) on CUDA1, [31, 45) on CUDA2 - a token 10.9 ms predicted (CUDA0 4.0 ms)
+glm fast: CUDA0 layers [0,17) expert pool 27.20 GB, 291-291 slots/layer (4074 total)
+glm fast: CUDA2 layers [31,45) expert pool 27.58 GB, 252-280 slots/layer, the draft layer 270 (4058 total)
+glm fast: CUDA0 RAM tier 2.46 GB pinned, 368 slots
+glm fast: CUDA0 warming the expert tiers 10% (2.9 of 28.9 GB, 1 s)
+glm fast: CUDA0 tiers warm: 4032 experts (28.9 GB) in 23 s (1262.1 MB/s; slot order, parallel reads)
+glm fast: CUDA0 CPU lane off: the RAM tier holds no expert
+glm tier: CUDA2 CPU lane pool mode: one shared pool (MAYA_GLM_CPU_SHARED=unset, 3 part(s), 2 NUMA node(s))
+glm fast: CUDA2 CPU lane: 36 threads (one pool, shared), an expert 0.224 ms on the CPU vs 0.576 ms over PCIe -> of 0..8 RAM-tier experts the CPU takes 0 1 2 2 3 4 4 5 6
+glm fast: CUDA2 CPU lane: those times from /x/data/glm-cpu-cal.txt (not timed)
+INFO context=32768 kv=int8 engine_kind=glm-fast experts=12096 vram_slots=12206 ram_slots=1405 mtp=1 dflash=0 v
+maya serve: CUDA0: 1088 MiB of VRAM free with everything loaded
+glm mtp: 97 rounds
+"""
+
+
+class LayoutFingerprint(unittest.TestCase):
+    def test_facts_from_a_glm_log(self):
+        f = MB.layout_facts(GLM_LOG.splitlines(), "MTP")
+        self.assertEqual(f["GPUs"], "CUDA0,CUDA1,CUDA2")  # (the split line names all three)
+        self.assertEqual(f["split"], "[0, 17) on CUDA0, [17, 31) on CUDA1, [31, 45) on CUDA2")
+        self.assertEqual(f["slots a layer"], "CUDA0 291-291 / CUDA2 252-280")
+        self.assertEqual(f["RAM-tier slots"], "CUDA0 368")
+        self.assertEqual(f["warmed experts"], "CUDA0 4032")
+        self.assertIn("CUDA0 off", f["lane"])
+        self.assertIn("CUDA2 36 threads, takes 0 1 2 2 3 4 4 5 6", f["lane"])
+        self.assertEqual(f["lane times"], "read from the saved file")
+        self.assertEqual(f["lane pool"], "one shared pool")
+        self.assertEqual(f["VRAM free MiB"], "CUDA0 1088")
+        self.assertIn("vram_slots=12206", f["engine"])
+        self.assertEqual(f["drafting"], "MTP")
+
+    def test_seconds_of_the_start_are_not_facts(self):
+        a = MB.layout_facts(GLM_LOG.splitlines())
+        b = MB.layout_facts(GLM_LOG.replace("in 23 s", "in 31 s").replace("1 s)", "2 s)").splitlines())
+        self.assertEqual(MB.layout_diff(a, b), [])
+
+    def test_diff_names_the_fact(self):
+        a = MB.layout_facts(GLM_LOG.splitlines())
+        b = MB.layout_facts(GLM_LOG.replace("368 slots", "300 slots").replace("1088 MiB", "900 MiB").splitlines())
+        d = MB.layout_diff(a, b)
+        self.assertEqual(len(d), 2)
+        self.assertTrue(any(x.startswith("RAM-tier slots: CUDA0 368 -> CUDA0 300") for x in d))
+
+    def test_no_facts_is_said(self):
+        self.assertEqual(MB.layout_facts(["hello"]), {})
+        self.assertIn("no placement facts", MB.layout_line({}))
+
+    def test_report_for_differing_rounds(self):
+        a = {"facts": MB.layout_facts(GLM_LOG.splitlines()), "log_kept": "x/this-r1.log"}
+        b = {"facts": MB.layout_facts(GLM_LOG.replace("368 slots", "300 slots").splitlines()),
+             "log_kept": "x/this-r2.log"}
+        out = MB.layout_report({"this": [a, b], "other": [a]})
+        self.assertEqual(len(out), 2)
+        self.assertIn("this build, round 1 vs round 2: RAM-tier slots", out[0])
+        self.assertIn("x/this-r2.log", out[0])
+        self.assertIn("same facts", out[1])
+
+    def test_logs_are_kept_per_round_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "maya-bench.log"
+            src.write_text("one\n", encoding="utf-8")
+            k1 = MB.keep_log(src, root / MB.KEEP_DIR / "this-r1.log")
+            src.write_text("two\n", encoding="utf-8")
+            k2 = MB.keep_log(src, root / MB.KEEP_DIR / "this-r2.log")
+            self.assertEqual(Path(k1).read_text(encoding="utf-8"), "one\n")
+            self.assertEqual(Path(k2).read_text(encoding="utf-8"), "two\n")
+            self.assertIsNone(MB.keep_log(src, None))
+            MB.clean_kept_logs(root)
+            self.assertFalse((root / MB.KEEP_DIR).exists())
+
+
+
+class SetupWording(unittest.TestCase):
+    def test_picture_reader_time_is_an_honest_range(self):
+        self.assertIn("up to about 10 minutes", maya.VISION_BUILD_TIME)
+        self.assertNotIn("a few", maya.VISION_BUILD_TIME)
+        src = Path(maya.__file__).read_text(encoding="utf-8")
+        self.assertIn('" kernels: " + VISION_BUILD_TIME', src)
+        self.assertNotIn('"CUDA") + " kernels: a few minutes"', src)
+        setup = (Path(maya.__file__).parent / "docs" / "SETUP.md").read_text(encoding="utf-8")
+        self.assertIn("compiles the image encoder (1 to 6 minutes, up to about 10 minutes on a small PC; once)", setup)
+        self.assertIn("compiles the engine for your GPU(s) (a few minutes, once)", setup)   # (the engine's text stays)
 
 
 if __name__ == "__main__":

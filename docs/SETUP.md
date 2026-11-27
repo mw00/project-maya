@@ -90,7 +90,7 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
    drafts: the model's MTP block (the default) or a [DFlash2 drafter](SETTINGS.md#drafting-with-dflash2) (NVIDIA RTX
    30 / A100 and newer, and one AMD Ryzen AI Max APU);
 3. installs its Python packages into `.venv` and gets llama.cpp's source at a pinned commit (it lists both and asks);
-4. compiles the engine for your GPU(s) (10-30 minutes, once);
+4. compiles the engine for your GPU(s) (a few minutes, once);
 5. **the model**: it shows the source, the size (Maya-S: 96.5 GB) and the exact `curl` commands, and downloads only
    when you answer `y`; every file is checked against its published sha256. You can run the commands yourself
    instead, or use files you already have: `./maya.sh --gguf-dir DIR` - other quants than these four are
@@ -99,12 +99,18 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 6. builds the *pack* - the engine's index of the model files, about 1 GB, written into the model folder. A Maya
    model's files that were already there are checked against their sha256 first (once each); the pack records the
    files, and a start refuses it if they change afterwards (`--repack` builds it again);
-7. **pictures**: compiles the image encoder (10-20 minutes, once) and fetches its files (1.1 GB, shown and asked
+7. **pictures**: compiles the image encoder (1 to 6 minutes, up to about 10 minutes on a small PC; once) and fetches its files (1.1 GB, shown and asked
    first); `--no-vision` skips it;
 8. writes `maya-<model>.json` and `run-maya-<model>.sh`; with DFlash2 it runs the
    [speed calibration](SETTINGS.md#the-speed-calibration) (5-20 minutes: DFlash2 stays only if it is faster on your
    PC); then the settings [tuned for this PC](SETTINGS.md) earlier, or it offers the tuning (about 10-15 minutes;
    `./maya.sh --calibrate` any time) - and starts the dashboard.
+
+When you rerun setup for GLM-5.3-Flash on CUDA with the same native pack and GPUs in the same order, it keeps your
+layer split, expert RAM-resident flag and RAM headroom. It also keeps `--spec` and `--spec-min-p` when you use the same
+drafter (including MTP). If you explicitly pinned the expert CPU pool, the old lane count is reused with the same CPU
+mask. A saved calibration or a new `--env MAYA_GLM_CPU_LANE=...` takes priority. A normal restart reads the existing
+configuration directly.
 
 > **The start takes a few minutes**: the engine pins most of the free RAM (all but about 6 GB) for its expert tier
 > and warms its caches. Other programs get little RAM while Maya runs.
@@ -209,6 +215,7 @@ WantedBy=multi-user.target
 | `--env KEY=VALUE` | an engine setting kept in the config (see [Tuning](SETTINGS.md)) |
 | `--host-compiler g++-12` | when your g++ is newer than your CUDA accepts ("unsupported GNU version") |
 | `--rebuild`, `--repack` | compile the engine / build the pack again |
+| `--full-build-output` | every line of the compilers on the screen. Without it each compile step shows one progress line and writes the compilers' output to `build-engine.log` / `build-vision.log` in the install folder (its last lines are shown when a step stops). `MAYA_BUILD_OUTPUT=full` does the same |
 | `--calibrate` | tune the engine for this PC (see [Tuning](SETTINGS.md)): GLM's CPU lane, DeepSeek's `--tp` and CPU threads, MiniMax's [prefill calibration](SETTINGS.md#minimax-m31-flash) (the chunk and the matrix products' library a prompt is read with); then start; with `--no-start` only tune |
 | `--speed-calibration` | measure again whether the drafter (DFlash2, or DeepSeek's or MiniMax's DSpark) decodes faster on this PC ([how](SETTINGS.md#the-speed-calibration); 5-30 minutes, with Maya stopped) and keep the faster, then start; with `--no-start` only measure |
 | `--drafting measure\|on\|off` | the drafter without the question: `measure` = the speed calibration (the default with `--yes`), `on` = draft with it, `off` = no drafting - both skip the measuring |
@@ -264,6 +271,11 @@ prompt tokens reused after an unload). `0` (the default): never. A new `--setup`
 
 ## If the build fails
 
+- **Visual Studio Build Tools are installed but not found (Windows):** Maya checks the Installer's
+  `%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe` first. If that copy is missing, it also
+  looks for `vswhere.exe` on `PATH`. A [standalone copy](https://github.com/microsoft/vswhere/releases) can locate
+  Build Tools in a custom installation directory; put its folder on `PATH` and restart Maya. The C++ component
+  and CUDA-compatible Visual Studio version checks still apply.
 - **"nvcc ... cannot build for these GPUs":** Volta needs CUDA 12.x, Blackwell 12.8 or newer. The setup takes the
   newest installed toolkit that fits.
 - **"unsupported GNU version":** `./maya.sh --setup --host-compiler g++-12` (install `g++-12` first).

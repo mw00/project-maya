@@ -115,6 +115,29 @@ class Api(Served):
         self.assertIn("hello", b["response"])
         self.assertEqual(self.req("POST", "/api/chat", {"model": "nope", "messages": [{"role": "user", "content": "x"}]})[0], 404)
 
+    def test_messages_of_the_wrong_shape_are_a_400(self):
+        """A `messages` list with an item that is no object (or no list at all): a 400 in plain words on the OpenAI
+        path, the Anthropic one, the Responses one and Maya's model API - no AttributeError, no dropped connection."""
+        import contextlib
+        import io
+        good = {"role": "user", "content": "hi"}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for path, key in (("/v1/chat/completions", "messages"), ("/v1/messages", "messages"),
+                              ("/v1/responses", "input"), ("/api/chat", "messages")):
+                for bad, word in (([good, 7], f"`{key}[1]` must be an object"), (["hi"], f"`{key}[0]` must be an object"),
+                                  ([None], "not null"), ({"role": "user"}, f"`{key}` must be a list")):
+                    body = {"model": self.run_name, "max_tokens": 8, "stream": False, key: bad}
+                    s, text, _ = self.raw("POST", path, body)
+                    self.assertEqual(s, 400, (path, bad, text))
+                    e = json.loads(text)["error"]
+                    msg = e if isinstance(e, str) else e["message"]
+                    self.assertIn(word, msg, (path, bad))
+                    self.assertNotIn("AttributeError", msg)
+        self.assertNotIn("Traceback", err.getvalue())
+        s, b = self.req("POST", "/api/chat", {"model": self.run_name, "stream": False, "messages": [good]})
+        self.assertEqual((s, b["done"]), (200, True))   # (the server answers on)
+
     def test_think_false_turns_thinking_off(self):
         """"think": false reaches the template as enable_thinking False, also over the web app's shared thinking level;
         true or no "think" leave thinking on (v1.1.56 dropped the false: thinking stayed on)."""
@@ -402,38 +425,61 @@ class OtherQuantsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_pull.Puller(self.root, lambda i, c: []).start("deepseek-gguf-q4", None)
 
-    def test_inkling_2_mini_preview(self):
-        """Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
-        said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux or Windows (never AMD or
-        a Mac); its setup id on the command line; the size the setup's manifest says."""
+    def test_inkling_2_mini_note(self):
+        """Inkling-2-Mini (maya-ik2): Maya's Maya-L among Maya's, unsloth's UD-Q4_K_XL (the setup's file before
+        v1.1.82) under "Other quants" by unsloth; each offered only where the setup runs it - NVIDIA V100 / RTX 20 on,
+        Linux or Windows (never AMD or a Mac); its setup id on the command line; the size the setup's manifest says."""
+        mine, old = "inkling-2-mini-maya-l", "inkling-2-mini-ud-q4_k_xl"
         with mock.patch.object(model_pull.sys, "platform", "linux"):
             c = {m["id"]: m for m in self.cat()}
-            ik = c["inkling-2-mini"]
+            self.assertNotIn("inkling-2-mini", c)                              # (the model's id: no row of its own)
+            ik = c[mine]
+            self.assertEqual((ik["family"], ik["group"], ik["by"]), ("ik2", "maya", "Maya"))
+            self.assertEqual(ik["name"], "Inkling 2 Mini · Maya-L")
+            ik = c[old]
             self.assertEqual((ik["family"], ik["group"], ik["by"]), ("ik2", "other", "unsloth"))
             self.assertEqual(ik["name"], "Inkling 2 Mini · unsloth UD-Q4_K_XL")
-            self.assertIn("experimental preview", ik["note"])
-            self.assertIn("24 GB", ik["note"])
-            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70, 89))})
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=())})       # (not read: the setup says)
-            for backend in ("hip", "metal"):
-                self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(backend, ())})
+            for ident in (mine, old):
+                self.assertIn("an NVIDIA GPU of 8 GB or more", c[ident]["note"])
+                self.assertNotIn(ident, {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
+                self.assertIn(ident, {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
+                self.assertIn(ident, {m["id"] for m in self.cat(ccs=(70, 89))})
+                self.assertIn(ident, {m["id"] for m in self.cat(ccs=())})       # (not read: the setup says)
+                for backend in ("hip", "metal"):
+                    self.assertNotIn(ident, {m["id"] for m in self.cat(backend, ())})
         with mock.patch.object(model_pull.sys, "platform", "win32"):   # (Windows + NVIDIA: as on Linux)
-            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat()})
-            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat("hip", ())})
+            self.assertTrue({mine, old} <= {m["id"] for m in self.cat()})
+            self.assertFalse({mine, old} & {m["id"] for m in self.cat("hip", ())})
         with mock.patch.object(model_pull.sys, "platform", "darwin"):
-            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat()})
-        cmd = model_pull.setup_command("inkling-2-mini", {"installer": {"models_dir": "/m"}})
-        self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "inkling-2-mini"])
+            self.assertFalse({mine, old} & {m["id"] for m in self.cat()})
+        for ident in (mine, old):
+            cmd = model_pull.setup_command(ident, {"installer": {"models_dir": "/m"}})
+            self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", ident])
         sys.path.insert(0, str(model_pull.ROOT))
         import maya
         self.assertEqual(model_pull.IK2_MIN_CC, maya.IK2_MIN_CC)
         model_pull._other_gb.clear()
         try:
-            self.assertAlmostEqual(model_pull._other_sizes()["inkling-2-mini"], 18.7, places=1)   # (the GGUF + mmproj + drafter)
+            sizes = model_pull._other_sizes()
+            self.assertAlmostEqual(sizes[mine], 18.7, places=1)                 # (the GGUF + mmproj + drafter)
+            self.assertAlmostEqual(sizes[old], 18.7, places=1)
         finally:
             model_pull._other_gb.clear()
+
+    def test_inkling_2_mini_installed(self):
+        """An install of unsloth's file shows as installed on its own row (not Maya's); one of Maya's on Maya's."""
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(model_pull.sys, "platform", "linux"):
+            root = Path(t)
+            cfg = {"exe": "/b/maya-ik2", "args": [], "installer": {"family": "ik2", "ik2_quant": "ud-q4_k_xl"}}
+            (root / "maya-inkling-2-mini.json").write_text(json.dumps(cfg), encoding="utf-8")
+            c = {m["id"]: m for m in model_pull.catalog(root, glm_sizes={}, ccs=(80,), other_sizes={})}
+            self.assertEqual((c["inkling-2-mini-ud-q4_k_xl"]["installed"], c["inkling-2-mini-maya-l"]["installed"]),
+                             (True, False))
+            cfg["installer"]["ik2_quant"] = "maya-l"
+            (root / "maya-inkling-2-mini.json").write_text(json.dumps(cfg), encoding="utf-8")
+            c = {m["id"]: m for m in model_pull.catalog(root, glm_sizes={}, ccs=(80,), other_sizes={})}
+            self.assertEqual((c["inkling-2-mini-ud-q4_k_xl"]["installed"], c["inkling-2-mini-maya-l"]["installed"]),
+                             (False, True))
 
     def test_qwen_unsloth_ud_iq2_xs(self):
         """unsloth's Qwen3.8-Flash-Next GGUFs: UD-IQ2_XS only, under "Other quants" by unsloth (CYBER-FROST stays
