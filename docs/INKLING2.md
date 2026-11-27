@@ -239,6 +239,11 @@ histories are a visit's. `ref/inkling2.py` and `maya-ik2` keep a list of visits;
 
 **The file.** unsloth's Mini GGUFs are in the layout llama.cpp master reads (other tensor and key names, the convs
 not folded, gate and up merged into `ffn_gate_up_exps`); the reference and the engine read both layouts.
+Since 2026-11-23 the repo writes its Mini files as llama.cpp master does (`general.architecture inkling2_loop`:
+24 layers and `loop.count` where PR #32187's layout counts a token's 48 layer visits, the core's controllers
+`loop_{q,k,v,ffn}_ctrl_*`, a layer's `loop_msg_query`; the earlier files are in its `Old_Support` folder). The
+weights are the same under other names - checked value for value against UD-Q4_K_XL - and the engine reads these
+too: UD-IQ3_XXS gives the same tokens from both files, at the same speed.
 UD-Q4_K_XL (17.6 GB) holds the experts of layers 0-19 in NVFP4 - their original bits - and those of layers 20-23
 and the dense weights in Q8_0. Maya's Maya-L (17.6 GB, the setup's file from v1.1.82) has the same layout and types,
 written from the original model's files. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
