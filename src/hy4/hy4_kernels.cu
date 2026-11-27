@@ -475,6 +475,43 @@ __global__ void rms_kernel(const float* __restrict__ x, size_t ldx, int n, const
     }
 }
 
+// rms_kernel over more of the GPU for a few rows (HY4_RMS_SPLIT, on by default, rows <= 32): a row's 256-thread block
+// was one SM's work.  Pass a: grid (4, rows) of 2 warps, warp w of the 8 doing rms_kernel's warp w - its threads'
+// squares (i = 32 w + lane + 256 j) summed in rms_kernel's order and warp_sum'd - each warp's sum aside.  Pass b: the
+// 8 sums warp_sum'd as block_sum's second step, then the row scaled and rounded as before (grid (n / 256, rows): the
+// same element a thread as rms_kernel's, so in place works).  The same sums in the same order: the same bits.
+__global__ void __launch_bounds__(64) rms_a_kernel(const float* __restrict__ x, size_t ldx, int n,
+                                                   float* __restrict__ wsum) {
+    const int w = blockIdx.x * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31, vt = w * 32 + lane;
+    const float* xr = x + (size_t) blockIdx.y * ldx;
+    float v[kRmsPer];
+#pragma unroll
+    for (int j = 0; j < kRmsPer; ++j) {
+        const int i = vt + j * 256;
+        v[j] = i < n ? xr[i] : 0.0f;
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kRmsPer; ++j)
+        if (vt + j * 256 < n) ss += v[j] * v[j];
+    ss = warp_sum(ss);
+    if (lane == 0) wsum[(size_t) blockIdx.y * 8 + w] = ss;
+}
+__global__ void __launch_bounds__(256) rms_b_kernel(const float* __restrict__ x, size_t ldx, int n,
+                                                    const float* __restrict__ w, float eps, float* __restrict__ y,
+                                                    size_t ldy, const float* __restrict__ wsum, const Q8Out q8) {
+    const int lane = threadIdx.x & 31;
+    float r = lane < 8 ? wsum[(size_t) blockIdx.y * 8 + lane] : 0.0f;
+    r = warp_sum(r);
+    r = 1.0f / sqrtf(r / (float) n + eps);
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {   // (n a multiple of 32 with q8: a warp's lanes together)
+        const float o = x[(size_t) blockIdx.y * ldx + i] * r * (w ? w[i] : 1.0f);
+        y[(size_t) blockIdx.y * ldy + i] = o;
+        if (q8.q != nullptr) q8_put(o, (size_t) blockIdx.y * n + i, q8);
+    }
+}
+
 // ---------------------------------------------------------------- hyper-connections
 // a block a token: rmsnorm of the hc E values, the 2 hc (head: hc) mixes, pre / post, cur
 // Two passes so a token's 12288 values are read by many blocks: hc_part (grid (kHcBlocks, T)) - each block a slice's
@@ -2552,6 +2589,18 @@ bool rmsnorm(const float* x, size_t ldx, int rows, int n, const float* w, float 
     if (rows <= 0) return false;
     if (n % 32 != 0) q8 = Q8Out{};
     static const int ahead = !(std::getenv("HY4_RMS_AHEAD") && std::atoi(std::getenv("HY4_RMS_AHEAD")) == 0);   // (=0: as before)
+    static const bool split = !(std::getenv("HY4_RMS_SPLIT") && std::getenv("HY4_RMS_SPLIT")[0] == '0');
+    if (split && ahead && rows <= 32 && n <= kRmsPer * 256 && n >= 1024) {
+        static float* wsum = nullptr;   // (8 sums a row; one device)
+        if (wsum == nullptr && cudaMalloc(&wsum, sizeof(float) * 8 * 32) != cudaSuccess) wsum = nullptr;
+        if (wsum != nullptr) {
+            rms_a_kernel<<<dim3(4, (unsigned) rows), 64, 0, s>>>(x, ldx, n, wsum);
+            rms_b_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) rows), 256, 0, s>>>(x, ldx, n, w, eps, y, ldy,
+                                                                                            wsum, q8);
+            check("rmsnorm");
+            return q8.q != nullptr;
+        }
+    }
     rms_kernel<<<rows, 256, 0, s>>>(x, ldx, n, w, eps, y, ldy, q8, ahead);
     check("rmsnorm");
     return q8.q != nullptr;
