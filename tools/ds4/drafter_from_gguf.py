@@ -4,10 +4,14 @@
     python tools/ds4/pack_gguf.py --model <model-ggufs> --drafter <dspark.json>
 
 The JSON has the same ``tensors`` and ``config`` entries as drafter_pack.py's output. Its sibling .bin is a
-relative symlink to the GGUF (or a copy on Windows when symlinks are unavailable); tensor offsets point into that
+relative symlink to the GGUF (on Windows, a hard link or a copy if links are unavailable); tensor offsets point into that
 file, past its GGUF header. The GGUF must hold the
 three-block, single-pass DeepSeek-V4.1-Flash drafter in F32, BF16 and MXFP4.
 The output path cannot contain whitespace because tensors.txt uses whitespace-separated file paths.
+Keep the source in place while a symlink pack is used. On Windows, keep the output on the model's drive.
+Re-running accepts the same file or a regular copy with the recorded size and header hash. The packer checks
+these fields before using the drafter; this detects changed layout/size, not changes confined to the weight payload.
+The workflow is CPU-only; native Windows execution needs separate validation.
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ import secrets
 import shutil
 import sys
 
-from pack_gguf import Gguf, LAYER, TYPES
+from pack_gguf import Gguf, LAYER, TYPES, verify_existing_gguf
 
 
 SPECIAL = {
@@ -145,7 +149,7 @@ def manifest(source: Path) -> dict:
 
 
 def convert(source: Path, out: Path) -> dict:
-    """Write metadata and a link, or copy on Windows if symlinks are unavailable."""
+    """Write metadata and a symlink; on Windows, try a hard link before copying."""
     source = source.expanduser().resolve(strict=True)
     payload = manifest(source)
     out = out.expanduser()
@@ -160,14 +164,27 @@ def convert(source: Path, out: Path) -> dict:
     binary = output.with_suffix(".bin")
     if source in (output, binary):
         raise SystemExit("Refusing to overwrite the source GGUF")
+    binary_mode = "symlink"
     if binary.exists() or binary.is_symlink():
-        if not binary.is_symlink() or binary.resolve() != source:
+        try:
+            same_source = os.path.samefile(binary, source)
+        except OSError:
+            same_source = False
+        if same_source:
+            binary_mode = "symlink" if binary.is_symlink() else "hardlink"
+        elif binary.is_file() and not binary.is_symlink():
+            try:
+                verify_existing_gguf(binary, payload)
+            except SystemExit as exc:
+                raise SystemExit(f"Refusing to replace {binary}: {exc}") from exc
+            binary_mode = "copy"
+        else:
             raise SystemExit(f"Refusing to replace {binary}")
         new_binary = False
     else:
         new_binary = True
     created_binary = False
-    binary_mode = "symlink"
+    payload_bytes_written = 0
     temporary = None
     temporary_binary = None
     try:
@@ -188,15 +205,23 @@ def convert(source: Path, out: Path) -> dict:
             except (OSError, ValueError):  # Windows can also report a different source drive.
                 if not WINDOWS:
                     raise
-                temporary_binary = binary.with_name(f".{binary.name}.{secrets.token_hex(12)}.part")
-                with source.open("rb") as src, temporary_binary.open("xb") as dst:
-                    shutil.copyfileobj(src, dst, 1024 * 1024)
-                    dst.flush()
-                    os.fsync(dst.fileno())
-                if binary.exists() or binary.is_symlink():
-                    raise SystemExit(f"Refusing to replace {binary}")
-                temporary_binary.replace(binary)
-                binary_mode = "copy"
+                try:
+                    os.link(source, binary)
+                    binary_mode = "hardlink"
+                except OSError:
+                    if binary.exists() or binary.is_symlink():
+                        raise SystemExit(f"Refusing to replace {binary}")
+                    print(f"Copying {payload['source_size']} bytes from {source} to {binary}", file=sys.stderr, flush=True)
+                    temporary_binary = binary.with_name(f".{binary.name}.{secrets.token_hex(12)}.part")
+                    with source.open("rb") as src, temporary_binary.open("xb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                    if binary.exists() or binary.is_symlink():
+                        raise SystemExit(f"Refusing to replace {binary}")
+                    temporary_binary.replace(binary)
+                    binary_mode = "copy"
+                    payload_bytes_written = payload["source_size"]
             created_binary = True
         temporary.replace(output)
     except BaseException:
@@ -210,14 +235,14 @@ def convert(source: Path, out: Path) -> dict:
             temporary_binary.unlink(missing_ok=True)
     return {"json": str(output), "binary": str(binary), "binary_mode": binary_mode,
             "source_tensors": len(payload["source_tensors"]), "mapped_entries": len(payload["tensors"]),
-            "config": payload["config"], "payload_bytes_written": source.stat().st_size if binary_mode == "copy" else 0}
+            "config": payload["config"], "payload_bytes_written": payload_bytes_written}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", type=Path, required=True, help="the existing DSpark GGUF")
     ap.add_argument("--out", type=Path, required=True,
-                    help="output JSON; sibling .bin links to the GGUF (Windows: copies if links are unavailable)")
+                    help="output JSON; sibling .bin links to the GGUF (Windows: hard link before copy fallback)")
     args = ap.parse_args()
     print(json.dumps(convert(args.gguf, args.out)))
     return 0

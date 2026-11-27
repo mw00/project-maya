@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -157,7 +158,8 @@ class ExistingDrafterGguf(unittest.TestCase):
     def test_windows_copy_fallback_when_symlink_is_unavailable(self):
         synthetic_gguf(self.source, tensors())
         output = self.root / "draft" / "dspark.json"
-        with patch.object(DG, "WINDOWS", True), patch.object(Path, "symlink_to", side_effect=OSError("no privilege")):
+        with patch.object(DG, "WINDOWS", True), patch.object(Path, "symlink_to", side_effect=OSError("no privilege")), \
+                patch.object(DG.os, "link", side_effect=OSError("different drives")):
             result = DG.convert(self.source, output)
         binary = output.with_suffix(".bin")
         self.assertFalse(binary.is_symlink())
@@ -170,12 +172,134 @@ class ExistingDrafterGguf(unittest.TestCase):
         synthetic_gguf(self.source, tensors())
         output = self.root / "draft" / "dspark.json"
         with patch.object(DG, "WINDOWS", True), patch.object(Path, "symlink_to", side_effect=OSError("no privilege")), \
+                patch.object(DG.os, "link", side_effect=OSError("different drives")), \
                 patch.object(DG.shutil, "copyfileobj", side_effect=OSError("disk full")):
             with self.assertRaisesRegex(OSError, "disk full"):
                 DG.convert(self.source, output)
         self.assertFalse(output.exists())
         self.assertFalse(output.with_suffix(".bin").exists())
         self.assertEqual(list(output.parent.glob("*.part")), [])
+
+    def test_windows_hardlink_before_copy_and_repeat_without_payload_writes(self):
+        synthetic_gguf(self.source, tensors())
+        output = self.root / "draft" / "dspark.json"
+        with patch.object(DG, "WINDOWS", True), patch.object(Path, "symlink_to", side_effect=OSError("no privilege")), \
+                patch.object(DG.shutil, "copyfileobj") as copy:
+            result = DG.convert(self.source, output)
+            again = DG.convert(self.source, output)
+        self.assertTrue(os.path.samefile(output.with_suffix(".bin"), self.source))
+        self.assertFalse(output.with_suffix(".bin").is_symlink())
+        self.assertEqual((result["binary_mode"], again["binary_mode"]), ("hardlink", "hardlink"))
+        self.assertEqual((result["payload_bytes_written"], again["payload_bytes_written"]), (0, 0))
+        copy.assert_not_called()
+
+    def test_copy_warning_precedes_copy_and_repeat_preserves_binary(self):
+        synthetic_gguf(self.source, tensors())
+        output = self.root / "draft" / "dspark.json"
+        warning = io.StringIO()
+        copyfileobj = DG.shutil.copyfileobj
+
+        def copy_after_warning(src, dst, length):
+            self.assertIn(f"Copying {self.source.stat().st_size} bytes", warning.getvalue())
+            return copyfileobj(src, dst, length)
+
+        with patch.object(DG, "WINDOWS", True), patch.object(Path, "symlink_to", side_effect=OSError("no privilege")), \
+                patch.object(DG.os, "link", side_effect=OSError("different drives")), \
+                patch.object(sys, "stderr", warning), patch.object(DG.shutil, "copyfileobj", side_effect=copy_after_warning):
+            DG.convert(self.source, output)
+        binary = output.with_suffix(".bin")
+        before = binary.stat()
+        with patch.object(DG.shutil, "copyfileobj") as copy:
+            result = DG.convert(self.source, output)
+        self.assertEqual(result["binary_mode"], "copy")
+        self.assertEqual(result["payload_bytes_written"], 0)
+        self.assertEqual((binary.stat().st_ino, binary.stat().st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+        copy.assert_not_called()
+
+    def test_existing_copy_with_changed_header_is_not_replaced(self):
+        synthetic_gguf(self.source, tensors())
+        output = self.root / "draft" / "dspark.json"
+        output.parent.mkdir()
+        binary = output.with_suffix(".bin")
+        synthetic_gguf(binary, tensors(), metadata={"tokenizer.ggml.mask_token_id": (4, 128800)})
+        before = binary.read_bytes()
+        self.assertEqual(len(before), self.source.stat().st_size)
+        with self.assertRaisesRegex(SystemExit, "Refusing to replace.*header hash changed"):
+            DG.convert(self.source, output)
+        self.assertEqual(binary.read_bytes(), before)
+        self.assertFalse(output.exists())
+
+    def test_existing_dangling_binary_symlink_is_refused(self):
+        synthetic_gguf(self.source, tensors())
+        output = self.root / "draft" / "dspark.json"
+        output.parent.mkdir()
+        binary = output.with_suffix(".bin")
+        binary.symlink_to(self.root / "missing.gguf")
+        with self.assertRaisesRegex(SystemExit, "Refusing to replace"):
+            DG.convert(self.source, output)
+        self.assertTrue(binary.is_symlink())
+
+    def test_pack_rejects_changed_source_before_writing_pack(self):
+        synthetic_gguf(self.source, tensors())
+        draft_json = self.root / "draft" / "dspark.json"
+        DG.convert(self.source, draft_json)
+        manifest = json.loads(draft_json.read_text())
+        model_dir = self.root / "model"
+        model_dir.mkdir()
+        synthetic_gguf(model_dir / "model.gguf", [("token_embd.weight", 30, [4, 8])], metadata={
+            "general.architecture": (8, "deepseek41"),
+            "deepseek41.attention.output_group_count": (4, 2),
+            "tokenizer.ggml.tokens": (9, (8, [f"token_{i}" for i in range(8)])),
+        })
+        original = self.source.read_bytes()
+        for change, message in [("size", "source size changed"), ("header", "header hash changed"),
+                                ("manifest", "missing or invalid recorded")]:
+            with self.subTest(change=change):
+                self.source.write_bytes(original)
+                draft_json.write_text(json.dumps(manifest))
+                if change == "size":
+                    with self.source.open("ab") as f:
+                        f.write(b"x")
+                elif change == "header":
+                    synthetic_gguf(self.source, tensors(), metadata={"tokenizer.ggml.mask_token_id": (4, 128800)})
+                else:
+                    broken = dict(manifest)
+                    del broken["source_header_sha256"]
+                    draft_json.write_text(json.dumps(broken))
+                out = self.root / f"rejected-pack-{change}"
+                with patch.object(sys, "argv", ["pack_gguf.py", "--model", str(model_dir), "--out", str(out),
+                                                "--drafter", str(draft_json)]):
+                    with self.assertRaisesRegex(SystemExit, message):
+                        PG.main()
+                self.assertFalse(out.exists())
+
+    def test_verifier_keeps_legacy_binary_format_and_does_not_read_weight_payload(self):
+        synthetic_gguf(self.source, tensors())
+        info = DG.manifest(self.source)
+        header_bytes = PG.Gguf(self.source).data_start
+        original_open = Path.open
+
+        class HeaderReader:
+            def __init__(self, handle):
+                self.handle = handle
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.handle.close()
+            def tell(self):
+                return self.handle.tell()
+            def read(self, size=-1):
+                if size < 0 or self.tell() + size > header_bytes:
+                    raise AssertionError("verification read weight payload")
+                return self.handle.read(size)
+
+        def header_only_open(path, *args, **kwargs):
+            handle = original_open(path, *args, **kwargs)
+            return HeaderReader(handle) if path == self.source else handle
+
+        with patch.object(Path, "open", header_only_open):
+            PG.verify_existing_gguf(self.source, info)
+        PG.verify_existing_gguf(self.root / "non-gguf.bin", {"config": {}, "tensors": []})
 
     def test_rejects_whitespace_output_path_before_writing(self):
         synthetic_gguf(self.source, tensors())

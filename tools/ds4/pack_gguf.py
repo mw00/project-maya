@@ -26,6 +26,7 @@ v1.1.17 put it) when it is whole.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -110,6 +111,27 @@ class Gguf:
                 return list(struct.unpack("<%d%s" % (n, fmt[at]), self.f.read(n * n_b)))
             return [self._val(at) for _ in range(n)]
         raise SystemExit("%s: metadata type %d" % (self.path, t))
+
+
+def verify_existing_gguf(source: pathlib.Path, info: dict) -> None:
+    """Check an existing-GGUF drafter's recorded size and header, never its weight payload."""
+    if info.get("format") != "existing-gguf-byte-ranges":
+        return  # drafter_pack.py's ordinary .bin format has no GGUF header.
+    size, digest = info.get("source_size"), info.get("source_header_sha256")
+    if type(size) is not int or size <= 0 or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SystemExit(f"{source}: missing or invalid recorded GGUF source size/header hash; regenerate the drafter manifest")
+    try:
+        if source.stat().st_size != size:
+            raise SystemExit(f"{source}: GGUF source size changed; regenerate the drafter manifest")
+        header_bytes = Gguf(source).data_start
+        if header_bytes > size:
+            raise SystemExit(f"{source}: GGUF header extends beyond the file")
+        with source.open("rb") as handle:
+            actual = hashlib.sha256(handle.read(header_bytes)).hexdigest()
+    except (OSError, ValueError, struct.error) as exc:
+        raise SystemExit(f"{source}: cannot verify the GGUF source header: {exc}") from exc
+    if actual != digest:
+        raise SystemExit(f"{source}: GGUF source header hash changed; regenerate the drafter manifest")
 
 
 # GGUF name (blk.N. stripped) -> the checkpoint's name under layers.N. (pack.py / the engine)
@@ -574,6 +596,7 @@ def main() -> int:
     geo = geometry(kv, vocab)
     dinfo = json.loads(drafter.read_text()) if drafter_in else {}
     if drafter_in:   # (its geometry: the GGUF's, else filled in - a drafter without it never drafts: left out, said so)
+        verify_existing_gguf(drafter.with_suffix(".bin"), dinfo)
         fill, src = dspark_fill(geo, dinfo, vocab)
         if fill is None:
             print("WARNING: the DSpark drafter %s is left out of the pack: the GGUF has no %s for it (and this is not "
