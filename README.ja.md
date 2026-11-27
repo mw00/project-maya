@@ -4,7 +4,7 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B)、Hy4-Flash (220 B)、Inkling 2 Mini (26 B) を自分の GPU で</b><br>
+<p align="center"><b>GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B)、Hy4-Flash (220 B)、Ling-3.2-air (128 B)、Inkling 2 Mini (26 B) を自分の GPU で</b><br>
 プライベートで高速 · NVIDIA GPU 1 枚から最大 16 枚まで · AMD と Windows · チャット、画像、OpenAI / Anthropic 互換 API · 複数リクエストの同時処理</p>
 
 <p align="center">
@@ -15,6 +15,7 @@
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/inkling.svg" alt="Inkling 2 Mini Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/ling.svg" alt="Ling-3.2-air Maya downloads"></a>
 </p>
 
 <p align="center">作成・主導: <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>)、共同メンテナー: <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
@@ -24,7 +25,7 @@
 <sub>Project Maya は無料です。お使いの PC で快適に動くなら、スポンサーになっていただくと、テスト用ハードウェアと開発の費用になります。</sub></p>
 
 この規模のモデルは、普通ならデータセンターが必要です。Maya は、すでにお持ちのハードウェアでその 5 つを動かします。
-**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017**、**MiniMax-M3.1-Flash**、**Hy4-Flash**、そしてより小さな **Inkling 2 Mini** です。モデルごとに専用のエンジンがあります。会話でよく使われるエキスパートを
+**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017**、**MiniMax-M3.1-Flash**、**Hy4-Flash**、**Ling-3.2-air**、そしてより小さな **Inkling 2 Mini** です。モデルごとに専用のエンジンがあります。会話でよく使われるエキスパートを
 GPU に、次に使われるものを RAM に、残りを NVMe SSD に置き、チャットの進行に合わせて入れ替えます。GPU、CPU、RAM、SSD を測定して自動でチューニングします。
 データがお使いのマシンの外に出ることはありません。
 
@@ -65,7 +66,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>それぞれ + 共通の n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB (Maya-XS、8 GB 以上のカード)、68-80 GB (Maya-S)、80-96 GB (Maya-M)、104-128 GB (Maya-L) の PC。Maya-S、Maya-M、Maya-L は 12 GB 以上のカード。n-gram テーブルは SSD に置いたまま |
 | **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、Linux 上の AMD</sub> | [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) GGUF · `inkling-2-mini` | 17.6 GB | 8 GB 以上のカード: 収まらないエキスパートは RAM に置かれます。24 GB 以上ではモデル全体が VRAM に収まります |
-| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 1 層 512 エキスパート、1 トークン 8 個 · 最大 262,144 コンテキスト · 画像対応 · Linux 上の NVIDIA</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | VRAM + RAM にファイルが収まる PC (セットアップは収まる最大のサイズを選びます。VRAM に収まらない分は CPU で計算); 思考のオン/オフ、ツール呼び出し、モデル自身の MTP ブロックによるドラフト |
+| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 128 B · 1 層 512 エキスパート、1 トークン 8 個 · 最大 262,144 コンテキスト · 画像対応 · Linux 上の NVIDIA</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | VRAM + RAM にファイルが収まる PC (セットアップは収まる最大のサイズを選びます。VRAM に収まらない分は CPU で計算); 思考のオン/オフ、ツール呼び出し、モデル自身の MTP ブロックによるドラフト |
 
 **どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 

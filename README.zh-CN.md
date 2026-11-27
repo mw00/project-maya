@@ -4,7 +4,7 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>在你自己的 GPU 上运行 GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B)、Hy4-Flash (220 B) 和 Inkling 2 Mini (26 B)</b><br>
+<p align="center"><b>在你自己的 GPU 上运行 GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B)、Hy4-Flash (220 B)、Ling-3.2-air (128 B) 和 Inkling 2 Mini (26 B)</b><br>
 私密且快速 · 1 块到最多 16 块 NVIDIA GPU · 支持 AMD 和 Windows · 聊天、图片、兼容 OpenAI 和 Anthropic 的 API · 同时处理多个请求</p>
 
 <p align="center">
@@ -15,6 +15,7 @@
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/inkling.svg" alt="Inkling 2 Mini Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/ling.svg" alt="Ling-3.2-air Maya downloads"></a>
 </p>
 
 <p align="center">由 <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>) 创建并主导，与 <b><a href="https://github.com/needmorevram">@needmorevram</a></b> 共同维护</p>
@@ -24,7 +25,7 @@
 <sub>Project Maya 是免费的。如果它在你的电脑上运行良好，欢迎赞助，用于购买测试硬件和支持开发。</sub></p>
 
 这么大的模型通常需要数据中心。Maya 让你用手头现有的硬件运行其中五个：
-**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017**、**MiniMax-M3.1-Flash** 和 **Hy4-Flash**，以及更小的 **Inkling 2 Mini**。每个模型都有专门为它打造的引擎。引擎把你的对话最常用的专家 (experts) 放在 GPU 上，接下来会用到的放在内存里，其余的放在 NVMe 固态硬盘上，并随着聊天不断调整。它会测量你的 GPU、CPU、内存和固态硬盘并自动调优。数据不会离开你的机器。
+**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017**、**MiniMax-M3.1-Flash**、**Hy4-Flash** 和 **Ling-3.2-air**，以及更小的 **Inkling 2 Mini**。每个模型都有专门为它打造的引擎。引擎把你的对话最常用的专家 (experts) 放在 GPU 上，接下来会用到的放在内存里，其余的放在 NVMe 固态硬盘上，并随着聊天不断调整。它会测量你的 GPU、CPU、内存和固态硬盘并自动调优。数据不会离开你的机器。
 
 - **快：** 两块 RTX 5090 加一块 RTX 4090 最高 149 tokens/s，两块 H100 为 124，四块 RTX 4090 为 118，一块 RTX PRO 6000 为 81，单块 RTX 5090 也能达到 30 以上。[真实用户的实测数据](#how-fast-is-it)。
 - **接近原版：** Maya 自己的 GLM-5.3-Flash 量化版本保留了 FP8 模型零样本准确率的 97.7-99.2%；DeepSeek V4.1 · Maya-S 与原版选择相同下一个 token 的概率为 92.6%，MiniMax M3.1 · Maya-S 为 87.6% (各类别平均值)。
@@ -63,7 +64,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>腾讯 · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最长 1M 上下文 · 支持图片 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>各加一个共用的 63.4 GB n-gram 表 | 内存与显存合计约 56-64 GB (Maya-XS，8 GB 及以上的显卡)、68-80 GB (Maya-S)、80-96 GB (Maya-M) 或 104-128 GB (Maya-L) 的电脑；Maya-S、Maya-M 和 Maya-L 需要 12 GB 及以上的显卡；n-gram 表留在固态硬盘上 |
 | **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · 最高 1M 上下文 · 可读图片 · NVIDIA、Linux 上的 AMD</sub> | [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) GGUF · `inkling-2-mini` | 17.6 GB | 8 GB 及以上的显卡：放不下的专家留在内存中；24 GB 及以上时整个模型都在显存中 |
-| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 每层 512 个专家，每个 token 用 8 个 · 最高 262,144 上下文 · 可读图片 · Linux 上的 NVIDIA</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | 显存 + 内存放得下文件的电脑 (安装程序选能放下的最大一档；显存放不下的部分在 CPU 上计算)；思考开/关、工具调用、用模型自带 MTP 块的草稿 |
+| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 128 B · 每层 512 个专家，每个 token 用 8 个 · 最高 262,144 上下文 · 可读图片 · Linux 上的 NVIDIA</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | 显存 + 内存放得下文件的电脑 (安装程序选能放下的最大一档；显存放不下的部分在 CPU 上计算)；思考开/关、工具调用、用模型自带 MTP 块的草稿 |
 
 **哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 

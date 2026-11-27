@@ -4,7 +4,7 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B), MiniMax-M3.1-Flash (428 B), Hy4-Flash (220 B) e Inkling 2 Mini (26 B) na sua própria GPU</b><br>
+<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B), MiniMax-M3.1-Flash (428 B), Hy4-Flash (220 B), Ling-3.2-air (128 B) e Inkling 2 Mini (26 B) na sua própria GPU</b><br>
 privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, API compatível com OpenAI e Anthropic · várias requisições ao mesmo tempo</p>
 
 <p align="center">
@@ -15,6 +15,7 @@ privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, 
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/inkling.svg" alt="Inkling 2 Mini Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/ling.svg" alt="Ling-3.2-air Maya downloads"></a>
 </p>
 
 <p align="center">Criado e liderado por <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>), com a manutenção compartilhada de <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
@@ -24,7 +25,7 @@ privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, 
 <sub>O Project Maya é gratuito. Se ele roda bem no seu PC, patrocinar ajuda a pagar o hardware de testes e o trabalho no projeto.</sub></p>
 
 Modelos desse tamanho costumam precisar de um datacenter. O Maya roda cinco deles no hardware que você já tem:
-**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017**, **MiniMax-M3.1-Flash** e **Hy4-Flash** - e o menor **Inkling 2 Mini**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
+**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017**, **MiniMax-M3.1-Flash**, **Hy4-Flash** e **Ling-3.2-air** - e o menor **Inkling 2 Mini**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
 
 - **Rápido:** até 149 tokens/s com duas RTX 5090 e uma RTX 4090, 124 com duas H100, 118 com quatro RTX 4090, 81 com uma RTX PRO 6000, mais de 30 com uma única RTX 5090. [Números reais de usuários reais](#how-fast-is-it).
 - **Perto do original:** as quantizações próprias do Maya do GLM-5.3-Flash mantêm 97,7-99,2% da precisão zero-shot do modelo FP8; o DeepSeek V4.1 · Maya-S escolhe o mesmo próximo token que o original em 92,6% das vezes, e o MiniMax M3.1 · Maya-S em 87,6% (a média das suas categorias).
@@ -63,7 +64,7 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · até 1M de contexto · lê imagens · NVIDIA, AMD no Linux</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44,8 GB<br>53,0 GB<br>68,4 GB<br>89,5 GB<br>cada um + uma tabela n-gram de 63,4 GB em comum | PCs com cerca de 56-64 GB (Maya-XS; placas a partir de 8 GB), 68-80 GB (Maya-S), 80-96 GB (Maya-M) ou 104-128 GB (Maya-L) de RAM + VRAM; Maya-S, Maya-M e Maya-L em placas a partir de 12 GB; a tabela n-gram fica no SSD |
 | **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · até 1M de contexto · lê imagens · NVIDIA, AMD no Linux</sub> | GGUF [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) · `inkling-2-mini` | 17.6 GB | placas a partir de 8 GB: os especialistas que não cabem ficam na RAM; o modelo inteiro na VRAM a partir de 24 GB |
-| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 512 especialistas por camada, 8 por token · até 262.144 de contexto · lê imagens · NVIDIA no Linux</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | PCs cuja VRAM + RAM comportam o arquivo (a instalação escolhe o maior que cabe; o que a VRAM não guarda é calculado na CPU); raciocínio ligado ou desligado, chamadas de ferramentas, drafting MTP com o bloco do próprio modelo |
+| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 128 B · 512 especialistas por camada, 8 por token · até 262.144 de contexto · lê imagens · NVIDIA no Linux</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | PCs cuja VRAM + RAM comportam o arquivo (a instalação escolhe o maior que cabe; o que a VRAM não guarda é calculado na CPU); raciocínio ligado ou desligado, chamadas de ferramentas, drafting MTP com o bloco do próprio modelo |
 
 **Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
