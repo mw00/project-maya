@@ -293,6 +293,76 @@ static void test_mla_dec_wmma() {
     std::printf("PASS test_mla_dec_wmma (T=%d causal, max_err=%.2e)\n", T, max_err);
 }
 
+// Test 3b: the head-group decode kernel gives the same bits as the one-block kernel (FP16 and INT8 caches, short and
+// long caches, one row and a drafting window)
+static void test_mla_dec_head_groups_same_bits() {
+#if defined(MAYA_USE_HIP)
+    std::printf("PASS test_mla_dec_head_groups_same_bits (HIP: not offered)\n");
+    return;
+#else
+    constexpr int H = 32, KL = 512, R = 64, QH = 192, QN = 128, TMAX = 5, NMAX = 20011;
+    const float scale = 1.0f / std::sqrt((float) QH);
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> u(-0.5f, 0.5f);
+    std::vector<float> h_qabs(TMAX * H * KL), h_qm(TMAX * H * QH);
+    std::vector<__half> h_lat16((size_t) NMAX * KL), h_kpe16((size_t) NMAX * R);
+    std::vector<uint8_t> h_lat8((size_t) NMAX * 544);
+    for (auto& x : h_qabs) x = u(rng);
+    for (auto& x : h_qm) x = u(rng);
+    for (auto& x : h_lat16) x = __float2half_rn(u(rng));
+    for (auto& x : h_kpe16) x = __float2half_rn(u(rng));
+    for (size_t i = 0; i < h_lat8.size(); ++i) h_lat8[i] = (uint8_t) (rng() & 0xffu);
+    for (int k = 0; k < NMAX; ++k)   // sane FP16 scales in the INT8 records
+        for (int g = 0; g < 16; ++g) {
+            const __half sc = __float2half_rn(0.002f + 0.0001f * (float) g);
+            std::memcpy(&h_lat8[(size_t) k * 544 + 512 + g * 2], &sc, 2);
+        }
+    ling::k::mla_dec_wmma_init();
+    float *d_qabs, *d_qm, *d_part, *d_ctx;
+    void *d_lat16, *d_lat8;
+    __half* d_kpe;
+    int* d_nkv;
+    CHECK_CUDA(cudaMalloc(&d_qabs, h_qabs.size() * 4));
+    CHECK_CUDA(cudaMalloc(&d_qm, h_qm.size() * 4));
+    CHECK_CUDA(cudaMalloc(&d_lat16, h_lat16.size() * 2));
+    CHECK_CUDA(cudaMalloc(&d_lat8, h_lat8.size()));
+    CHECK_CUDA(cudaMalloc(&d_kpe, h_kpe16.size() * 2));
+    CHECK_CUDA(cudaMalloc(&d_part, ling::k::mla_dec_wmma_part_bytes(H, TMAX)));
+    CHECK_CUDA(cudaMalloc(&d_ctx, TMAX * H * KL * 4));
+    CHECK_CUDA(cudaMalloc(&d_nkv, 4));
+    CHECK_CUDA(cudaMemcpy(d_qabs, h_qabs.data(), h_qabs.size() * 4, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_qm, h_qm.data(), h_qm.size() * 4, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_lat16, h_lat16.data(), h_lat16.size() * 2, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_lat8, h_lat8.data(), h_lat8.size(), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_kpe, h_kpe16.data(), h_kpe16.size() * 2, cudaMemcpyHostToDevice));
+    int cases = 0;
+    for (int q8 = 0; q8 < 2; ++q8)
+        for (int n : {7, 33, 1000, 4099, NMAX})
+            for (int T : {1, 3, TMAX}) {
+                CHECK_CUDA(cudaMemcpy(d_nkv, &n, 4, cudaMemcpyHostToDevice));
+                std::vector<float> a(T * H * KL), b(T * H * KL);
+                const void* lat = q8 != 0 ? d_lat8 : d_lat16;
+                ling::k::mla_dec_wmma_one_block(true);
+                bool ok = ling::k::mla_dec_wmma(d_qabs, d_qm, QH, QN, lat, q8, (const uint16_t*) d_kpe, NMAX, d_nkv,
+                                                T, H, KL, R, scale, d_part, d_ctx, 0);
+                CHECK_CUDA(cudaDeviceSynchronize());
+                CHECK_CUDA(cudaMemcpy(a.data(), d_ctx, a.size() * 4, cudaMemcpyDeviceToHost));
+                ling::k::mla_dec_wmma_one_block(false);
+                ok = ok && ling::k::mla_dec_wmma(d_qabs, d_qm, QH, QN, lat, q8, (const uint16_t*) d_kpe, NMAX, d_nkv,
+                                                 T, H, KL, R, scale, d_part, d_ctx, 0);
+                CHECK_CUDA(cudaDeviceSynchronize());
+                CHECK_CUDA(cudaMemcpy(b.data(), d_ctx, b.size() * 4, cudaMemcpyDeviceToHost));
+                EXPECT(ok, "mla_dec_wmma refused (q8=%d n=%d T=%d)", q8, n, T);
+                EXPECT(std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "head groups differ (q8=%d n=%d T=%d)",
+                       q8, n, T);
+                ++cases;
+            }
+    cudaFree(d_qabs); cudaFree(d_qm); cudaFree(d_lat16); cudaFree(d_lat8); cudaFree(d_kpe); cudaFree(d_part);
+    cudaFree(d_ctx); cudaFree(d_nkv);
+    std::printf("PASS test_mla_dec_head_groups_same_bits (%d cases bit-identical)\n", cases);
+#endif
+}
+
 // Test 4: Grouped router + argmax_rows_f32 + top1_prob_f32
 static void test_router_and_argmax() {
     constexpr int T = 4, NE = 512, NU = 8, NG = 8, NGU = 4;
@@ -440,6 +510,7 @@ int main() {
     test_kda_window_and_rollback();
     test_mrope_3d();
     test_mla_dec_wmma();
+    test_mla_dec_head_groups_same_bits();
     test_router_and_argmax();
     test_router_nan_guard_and_fused_selfcheck();
     if (g_fail > 0) {

@@ -121,6 +121,8 @@ void pack_route_cpu(const int* ids, const float* w, const int* who, int n_used, 
 /// Vectorized coalesced KV loads + register-accumulated WMMA (TILE=32 on sm_80+, TILE=16 on sm_70/75).
 size_t mla_dec_wmma_part_bytes(int n_head, int max_T = 1);
 void mla_dec_wmma_init();
+/// Tests / A-B: true runs the one-block-for-all-heads kernel (the same context bits as the default head-group one).
+void mla_dec_wmma_one_block(bool on);
 bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off, const void* lat, int lat_q8,
                   const uint16_t* k_pe, int n_sel_cap, const int* n_sel_dev, int T, int n_head, int kv_lora,
                   int qk_rope, float scale, float* part, float* ctx, cudaStream_t s);
