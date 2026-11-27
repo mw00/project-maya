@@ -191,8 +191,10 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 | **2x NVIDIA A40 48 GB** (PCIe 4.0 x16), 2x Xeon Gold 6330, 256 GB RAM, Windows Server 2022 | Maya-S, 256K context | 48.9 tokens/s (tuned) | ~660 tokens/s (3K) | v1.1.28 | @yjyz1011 (#508) |
 | **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 48.6 tokens/s | 650 tokens/s (8K) | v1.1.56 | @pepuscz (#905) |
 | **2x RTX PRO 6000 Blackwell 96 GB** (tensor parallel 2, PCIe 5.0), Core Ultra 7 270K Plus, 188 GB DDR5 | UD-Q8_K_XL, 1M context, DSpark | 48.3 tokens/s | 1245 tokens/s (3360 at 48K) | v1.1.51 | @markrussi (#819) |
+| **RTX 5090 32 GB** (600 W, PCIe 5.0 x16) + **2x RTX 3090 24 GB** (about 297 W each, flat 787 mV curve), Threadripper PRO 9965WX (overclocked, 5.4 GHz on all cores), 255 GB DDR5-6400, Windows 11 | UD-Q3_K_XL, 384K context, DSpark | 47.2 tokens/s | 566 tokens/s (8K) | v1.1.76 | @kyle-see (#1242) |
 | **RTX 4090 24 GB** (PCIe 4.0 x8), Ryzen 9 9950X3D, 192 GB DDR5 | Maya-XS, 64K context | 44.1 tokens/s | 539 tokens/s | v1.1.27 | @naeq (#503) |
 | **4x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2630 v4, 504 GB RAM | Maya-S / UD-Q4_K_XL / UD-Q8_K_XL, 64K context | 44.0 / 28.6 / 29.7 tokens/s | 592 / 236 / 233 tokens/s | v1.1.49 | @HansStrupat (#785) |
+| **2x RTX 4090 D 48 GB** (300 W each, PCIe 4.0 x16), EPYC 7452, 512 GB RAM | EXL3 2.9 bpw, 256K context, DSpark | 43.7 tokens/s | 1236 tokens/s (669 at 2K) | v1.1.76 | @handmade0octopus (#1006) |
 | **RX 7900 XTX 24 GB** (PCIe 4.0 x4) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 43.3 tokens/s | 371 tokens/s (8K) | v1.1.56 | @pepuscz (#908) |
 | **1x L40S 48 GB** (vGPU), Xeon Platinum 8580 (a VM, 32 vCPUs), 504 GB RAM | UD-Q8_K_XL, 256K context | 43.2 tokens/s | 1862 tokens/s (174K) | v1.1.32 | @talisp (#577) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | orcarouter abliterated Mix-128G, 256K context, DSpark | 43.2 tokens/s | 453 tokens/s | v1.1.37 | @tobitege (#663) |
