@@ -1,4 +1,4 @@
-"""tools/ik2_fit.py - Inkling-2-Mini on maya-ik2 (an experimental preview): what fits on one card, for the setup
+"""tools/ik2_fit.py - Inkling-2-Mini on maya-ik2 : what fits on one card, for the setup
 (maya.py) and the Models page (serve/models.py) alike.
 
 maya-ik2 keeps every expert of Inkling-2-Mini in VRAM where they fit (the resident token path, docs/INKLING2.md 8);
@@ -36,9 +36,9 @@ STREAM_HOST_GIB = 4.0                              # the RAM the engine leaves t
 OFF_TIER_MIN_GIB = 0.5                              # an offload layout streams only where its cache leaves the tier less
                                                     # (the engine: else its cache in VRAM, as in v1.1.73)
 DEFAULT_KV = "fp8"
-MIN_VRAM_GB = 7.0                                   # the engine's own floor (check_preview: 7 GiB - an "8 GB" card)
-AMD_MIN_VRAM_GB = 11.0                              # AMD, a discrete card (check_preview: 11 GiB - a "12 GB" card)
-AMD_APU_MIN_GB = 22.0                               # an AMD APU: every expert in its memory (check_preview: 22 GiB)
+MIN_VRAM_GB = 7.0                                   # the engine's own floor (check_hardware: 7 GiB - an "8 GB" card)
+AMD_MIN_VRAM_GB = 11.0                              # AMD, a discrete card (check_hardware: 11 GiB - a "12 GB" card)
+AMD_APU_MIN_GB = 22.0                               # an AMD APU: every expert in its memory (check_hardware: 22 GiB)
 MIN_TOTAL_GB = 24.0                                 # RAM + VRAM that hold the model, as the refusal says it (no SSD
                                                     # tier): the floor itself is the RAM a card leaves (ram_gib)
 MIN_CC = 70                                         # the engine's kernels: Volta on (V100: mma.m8n8k4; RTX 20, Ampere on)
@@ -141,6 +141,7 @@ DRAFT_TOKEN_BYTES = 4096                            # its 2 rings, its attention
 PLAN_DENSE_GIB = 1.1                                # the engine's own sum for the drafter's room (maya-ik2's fit block):
 PLAN_RESERVE_GIB = 1.5                              # the experts, the dense weights as blocks, the cache and its
                                                     # reserve (work buffers, room) - less than BASE_GIB's measured use
+DRAFT_KEEP_GIB = 0.28125                            # + what the engine keeps free beside every expert at the drafter (256 + 32 MiB)
 OFF_WIN_STAGE_GIB = 0.7                             # the offload path's verify window: 64 staging slots a slot size
 DRAFT_MIN_ROWS = 65536                              # the fewest context rows the engine plans for the drafter there
 
@@ -160,7 +161,12 @@ def draft_fits(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> bool:
         return True
     p = plan(vram_gb, ctx, kv)
     if p["resident"]:    # (its context rows FP16, else FP8: half of them)
-        used = EXPERTS_GIB + PLAN_DENSE_GIB + ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB + PLAN_RESERVE_GIB
+        # (the engine measures the free VRAM after its work buffers and the drafter: the attention's scratch grows with
+        #  the context beyond the fixed reserve - SCRATCH_TOKEN_BYTES a token - and it keeps DRAFT_KEEP_GIB of room
+        #  beside every expert: 256 MiB of the cache's and 32 MiB of slack.  Without both the tool said "fits" where
+        #  the engine left the drafter out: 32 GB at 720,896 tokens, 0.03 GiB short.)
+        used = (EXPERTS_GIB + PLAN_DENSE_GIB + ctx * KV_BYTES.get(kv, KV_BYTES["f16"]) / GIB + PLAN_RESERVE_GIB
+                + ctx * SCRATCH_TOKEN_BYTES / GIB + DRAFT_KEEP_GIB)
         return float(vram_gb) - MARGIN_GIB >= used + draft_gib(ctx) - ctx * DRAFT_TOKEN_BYTES / GIB / 2
     # the offload path with the whole cache in VRAM: the tier gives the drafter's room, at most half of its own - the
     # verify window's staging and at least DRAFT_MIN_ROWS of FP8 context rows (the last positions) with it
@@ -267,13 +273,13 @@ def too_small_line(ram_gb: float, vram_gb: float, need: float | None = None) -> 
 
 
 def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_gb: float = 0.0) -> str | None:
-    """Why this PC cannot run the preview, in one plain line, or None (said before anything is built or downloaded;
-    the engine's own check_preview says the same at its start).  backend: cuda / hip / metal; gpus_asked: how many GPUs
+    """Why this PC cannot run Inkling 2, in one plain line, or None (said before anything is built or downloaded;
+    the engine's own check_hardware says the same at its start).  backend: cuda / hip / metal; gpus_asked: how many GPUs
     --gpu / --gpus named (0: none named); cards: the GPUs the model would pick from (NVIDIA: {"arch", "vram_gb"},
     nvidia-smi's; AMD: amd_unsupported's) - empty when they are not read yet; ram_gb: the PC's RAM (0: not read yet;
     the offload path's)."""
     if backend == "metal":
-        return ("Inkling 2 Mini is an experimental preview that runs on NVIDIA and AMD GPUs only for now (no Mac "
+        return ("Inkling 2 Mini runs on NVIDIA and AMD GPUs only for now (no Mac "
                 "engine yet)")
     if backend == "hip":
         if windows:
@@ -286,7 +292,7 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
     if windows and gpus_asked > 1:
         return "Inkling 2 Mini on Windows runs on one GPU for now (two are Linux only): pick one (--gpu N)"
     if gpus_asked > 2:
-        return ("Inkling 2 Mini runs on one or two NVIDIA GPUs for now (three or more are not in it yet): pick one or "
+        return ("Inkling 2 Mini runs on one or two NVIDIA GPUs for now (three or more GPUs are not supported): pick one or "
                 "two (--gpu N, --gpus N,M)")
     if cards:
         new = [g for g in cards if int(g.get("arch") or 0) >= MIN_CC]

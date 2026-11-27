@@ -579,8 +579,10 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         const int pool_done = (int) ((p + 1) / g.idx_kpool);
         const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
         if (pool_done > 0 && !all)
+            // (token = true: MAYA_GLM_DSA_SCORE2's kernel for a window's tokens as for the single-token path - the same
+            //  bits; without it the switch did nothing in a DFlash decode, where every token is a window token)
             gf::dsa_score(iq, state_ + dsa_pool_[(size_t) il], W.iw + (size_t) t * g.idx_heads, g.idx_key, g.idx_heads,
-                          pool_done, F->score, s);
+                          pool_done, F->score, s, true);
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
         int* const sel = rows ? W.cells + (size_t) (t - t0) * nsm : F->cells;
@@ -1313,6 +1315,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         // penalties, the history it would count: tokens[1..t] after what came before)
         tail->pick_tokens(WT.logits, T, *sp, tokens, 0, WT.tok, FT->cs);
     } else {
+        tail->dump_logits(WT.logits, T, FT->cs);
         for (int t = 0; t < T; ++t) gf::argmax(WT.logits + (size_t) t * g.n_vocab, g.n_vocab, WT.tok + t, FT->cs);
     }
     cudaMemcpyAsync(WT.tok_h, WT.tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
@@ -1571,6 +1574,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
             // (penalties: this window's tokens 1..t before it - pick_tok, written before token t was queued)
             m->pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
         } else {
+            m->dump_logits(lg, 1, F->cs);
             gf::argmax(lg, g.n_vocab, W.tok + sl, F->cs);
         }
     }

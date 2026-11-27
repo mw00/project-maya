@@ -56,7 +56,17 @@ static void set_env(const char* name, const char* value) {
   if (*value) setenv(name, value, 1); else unsetenv(name);
 #endif
 }
-namespace maya { namespace core {
+namespace maya {
+namespace glmenv {
+inline bool no_reuse_env() {
+  const char* v = std::getenv("MAYA_GLM_NO_REUSE");
+  if (!v || !*v) return false;
+  std::string s(v);
+  for (char& c : s) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+  return s != "0" && s != "false" && s != "off" && s != "no";
+}
+}
+namespace core {
 inline bool is_system_prefix(const std::vector<int32_t>&, int) { return false; }
 namespace glmpc { template<class T> bool engine_on(const T&) { return false; } }
 }}

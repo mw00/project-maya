@@ -107,8 +107,8 @@ export async function setTurbo(on) {
 export function TurboButton() {
   const t = S.turbo;
   if (t.unavailable || t.hidden) return null;   // (hidden: GLM-5.3 (744B), until Turbo's values are measured on it)
-  // (Hy4-Flash, Inkling 2: their engines have no expert skipping or Turbo drafting - Turbo is the request's half alone)
-  const tip = t.on ? `Turbo ON: trades quality for maximum speed (greedy decoding, no thinking${["hy4", "ik2"].includes(familyOf()) ? "" : ", expert skipping, aggressive drafting"}). Click to put your settings back.`
+  // (Hy4-Flash, Inkling 2, Ling-3.2-air: their engines have no expert skipping or Turbo drafting - Turbo is the request's half alone)
+  const tip = t.on ? `Turbo ON: trades quality for maximum speed (greedy decoding, no thinking${["hy4", "ik2", "ling"].includes(familyOf()) ? "" : ", expert skipping, aggressive drafting"}). Click to put your settings back.`
                    : "Turbo: trades quality for maximum speed, for benchmarks and playing with the engine. Your own settings come back when you switch it off.";
   return html`<button type="button" class=${`turbo${t.on ? " turbo--on" : ""}${t.busy ? " turbo--busy" : ""}`} aria-pressed=${t.on ? "true" : "false"}
       title=${tip} disabled=${t.busy} onClick=${() => setTurbo(!t.on)}>

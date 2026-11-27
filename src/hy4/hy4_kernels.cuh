@@ -130,6 +130,13 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys);
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
                float* out, cudaStream_t s, bool q8 = false, Q8Out q8o = {});
+/// A prompt's attention in one pass on NVIDIA's tensor cores (attn_flash_kernel): out[t][h] (512 values) for T tokens
+/// at positions pos[t], each over its window (keys null: the `window` positions up to its own; window 0: every one
+/// from 0) or its list keys[t][0 .. nk[t]) (positions); the cache's rows `ring` (0: a row a position), Q8 or F16; the
+/// heads' sinks.  false: not taken here (AMD, HY4_ATTN_FLASH=0, a shape it does not take) - the caller's path instead
+bool attn_flash(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
+                int ldk, const int* nk, const int* pos, int window, float scale, const float* sinks, float* out,
+                cudaStream_t s, bool q8);
 /// The same over keys[t][0 .. nk[t]) on an RDNA GPU's matrix cores (gfx11; HY4_ATTN_WMMA=0 off, =1 also gfx12): a
 /// prompt's tokens past the dense span - within rounding of attention's sums (F16 products of a split query and
 /// split probabilities, in another order), so never a token window's.  false: not taken (another GPU, H not a
@@ -246,15 +253,20 @@ void ix_pack(const int* keys, int ldk, int T, const int* pos, int kpool, int top
              cudaStream_t s);
 void ix_unpack(const uint16_t* wire, int ldw, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
                cudaStream_t s);
+/// DFly2 drafter's per-layer key lists built directly on the GPU from snap[i][row][0..snap_nk[i][row]):
+/// each row j < T gets the picks in [0, pos) in order followed by pos .. pos + j, into keys[i][j][0..ldk) and nk[i][j].
+void dfly_expand_keys(const int* snap, const int* snap_nk, int n_layers, int W, int row, int maxk, int pos, int T,
+                      int* keys, int ldk, int* nk, cudaStream_t s);
 
 /// The prompt path's attention as two GEMMs (the model's cuBLAS calls) and this between them: S [T H][nkr] (rows ldS
 /// apart) the scores of tokens t (positions pos[t]) and heads h against the keys at positions k0 .. k0 + nkr - 1 ->
 /// P (F16, ldP) = softmax(scale S, the head's sink) over the keys the token sees: window > 0 the last `window`
 /// positions up to its own, else mask[t][j] == 0 (the indexer's picks, dsa_mask); 0 elsewhere
 /// (window < 0: the mask alone - the keys a list, not the positions from k0: dsa_mask_list's)
+/// (nv >= 0: only the first nv columns are keys - the rest the callers' padding to a multiple of 8, P 0 there)
 void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, const int* pos, int window,
                   const float* mask, size_t ldm, float scale, const float* sinks, uint16_t* P, size_t ldP,
-                  cudaStream_t s);
+                  cudaStream_t s, int nv = -1);
 /// mask[t][j] = 0 for every key position k0 + j among keys[t][0 .. nk[t]), -inf for the others
 void dsa_mask(const int* keys, int ldk, const int* nk, int T, int k0, int nkr, float* mask, size_t ldm, cudaStream_t s);
 /// dst[j] = the latent cache row of position k0 + j (row p % ring), j < n: a ring's rows in position order
@@ -275,6 +287,11 @@ void dsa_mask_list(const int* keys, int ldk, const int* nk, int T, const int* co
                    size_t ldm, cudaStream_t s);
 /// The prompt path.  dst[r][i] = F16(src[r * lds + i]), i < n
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s);
+/// (the busy experts' FP16 GEMMs, hy4_model.cu's experts_fat) dst[j][0 .. k) = F16 of x[idx[j]][0 .. k), n rows
+void gather_f16(const float* x, size_t ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s);
+/// ... h[j * ldh + c] = F16 of silu(min(g, limit)) clamp(u, -limit, limit) (limit 0: none), g = gu[j][c] and u =
+/// gu[j][ff + c] (F16, the gate | up GEMM's rows) - ds4_iq's swiglu on those values
+void swiglu_gu16(const uint16_t* gu, int n, int ff, float limit, uint16_t* h, size_t ldh, cudaStream_t s);
 /// dst[i] = the F32 of BF16 src[i] (exact), n values
 void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s);
 /// A chunk's expert entries sorted by expert for ds4_iq's sets: entry e = t n_used + j of ids; bounds[x .. x + 1] the

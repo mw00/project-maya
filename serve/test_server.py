@@ -839,6 +839,144 @@ class RequestChecks(unittest.TestCase):
             svc.check_request({"ignore_eos": True, "max_tokens": 8})
 
 
+class SamplerEnds(unittest.TestCase):
+    def test_a_closed_server_stops_its_sampler(self):
+        """server_close(): the hardware sampler behind /metrics ends with the server. Every test server's sampler
+        used to read the sensors each second for the rest of the suite (50 of them by the stop tests, v1.1.82's CI)."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        tel = svc.telemetry
+        self.assertFalse(tel._stopped.is_set())
+        httpd.shutdown()
+        self.assertIs(svc.telemetry, tel)               # (main()'s stop: the stall watchdog still reads it)
+        httpd.server_close()
+        self.assertTrue(tel._stopped.is_set())
+        self.assertIsNone(svc.telemetry)
+        again = serve(svc, port=0)                      # (the same service served again: a sampler of its own)
+        self.addCleanup(lambda: (again.shutdown(), again.server_close()))
+        self.assertIsNotNone(svc.telemetry)
+        self.assertIsNot(svc.telemetry, tel)
+
+
+class BodylessRequests(unittest.TestCase):
+    """A POST with no usable `messages` is a 400 on every route, never a connection closed with no answer.
+
+    A client that probes which protocols a server speaks (M3 Code asks each path `POST {}` and reads only the status
+    code: 400/422/2xx means the route exists, 404/405 means it does not, anything else - a closed socket included -
+    means the server does not serve it at all) took the dropped connection for "no Chat Completions here" and refused
+    to link any agent.  /v1/responses already answered a bodyless POST with its own 400 (serve/responses.py); Chat
+    Completions and Anthropic's messages ran on to the chat template, which refused the empty list with a jinja2
+    TemplateError - no ValueError, so it escaped do_POST's except clauses and socketserver closed the socket."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        # (the closing marker comes first: the template opens a thinking segment, and an answer that never leaves it
+        # is replaced by the loop guard's stop note)
+        cls.engine = MockEngine(tok, "</think>\n\nthe answer", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.port = cls.httpd.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def raw(self, path, body):
+        """-> (status, body text).  A connection the server closed without answering is what these requests used to
+        do, so it fails here by name rather than as an opaque URLError from a client that hides it."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
+            r = conn.getresponse()
+            return r.status, r.read().decode("utf-8", "replace")
+        except (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionError) as e:
+            self.fail(f"{path} closed the connection with no answer for {body!r} "
+                      f"({type(e).__name__}: {e})")
+        finally:
+            conn.close()
+
+    def refused(self, path, body, word=None):
+        """The request is a 400 with OpenAI's error shape; returns its message.  (The handler logs the refused
+        request's traceback, which is not what these tests are about.)"""
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            s, text = self.raw(path, body)
+        self.assertEqual(s, 400, (path, body, text))
+        err = json.loads(text)["error"]
+        self.assertEqual(err["type"], "invalid_request_error", text)
+        self.assertTrue(err["message"].strip(), text)
+        if word:
+            self.assertIn(word, err["message"], text)
+        return err["message"]
+
+    def test_bodyless_chat_completions_are_a_400(self):
+        # what M3 Code's protocolServed() asks, and the two shapes between it and a real request
+        for body in ({}, {"model": "m"}, {"messages": []}, {"model": "m", "messages": []},
+                     {"model": "m", "messages": [], "stream": True}, {"model": "m", "messages": [], "max_tokens": 8}):
+            self.refused("/v1/chat/completions", body, "nonempty array")
+
+    def test_bodyless_anthropic_is_a_400(self):
+        for body in ({}, {"model": "m"}, {"model": "m", "messages": []},
+                     {"model": "m", "messages": [], "max_tokens": 8}):
+            self.refused("/v1/messages", body, "nonempty array")
+
+    def test_responses_and_unserved_routes_unchanged(self):
+        # /v1/responses keeps its own wording (serve/responses.py), and a route Maya does not serve stays a 404 -
+        # a probe must still be able to tell the two apart
+        self.refused("/v1/responses", {}, "input must be a string or a nonempty array of input items")
+        self.assertEqual(self.raw("/v1/completions", {})[0], 404)
+        self.assertEqual(self.raw("/v1/completions", {"model": "m", "prompt": "hi"})[0], 404)
+
+    def test_the_template_refusing_is_a_400_too(self):
+        """The same hole one layer down: what the chat template itself refuses (serve/chat_template.jinja's
+        raise_exception) is jinja2's exception, no ValueError, and escaped the except clauses the same way."""
+        for msgs in ([{"role": "bogus", "content": "x"}], [{"content": "x"}]):
+            self.refused("/v1/chat/completions", {"model": "m", "messages": msgs}, "Unexpected message role")
+            # (Anthropic's adapter reads the role first, so its own wording comes back; what matters is the 400)
+            self.refused("/v1/messages", {"model": "m", "messages": msgs, "max_tokens": 8})
+
+    def test_a_whole_request_still_answers(self):
+        # the fix answers nothing it answered before: the same 200 on both APIs, streamed and not
+        s, text = self.raw("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, text)
+        self.assertEqual(json.loads(text)["choices"][0]["message"]["content"], "the answer")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            conn.request("POST", "/v1/chat/completions",
+                         body=json.dumps({"model": "m", "stream": True,
+                                          "messages": [{"role": "user", "content": "hi"}]}),
+                         headers={"Content-Type": "application/json"})
+            r = conn.getresponse()
+            stream = r.read().decode()
+            self.assertEqual(r.status, 200)
+            # the answer, put back from the deltas: streaming is unchanged by the 400s above
+            text = "".join(json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
+                           for line in stream.splitlines() if line.startswith("data: ") and "[DONE]" not in line)
+            self.assertEqual(text, "the answer", stream)
+            self.assertTrue(stream.rstrip().endswith("data: [DONE]"), stream[-200:])
+        finally:
+            conn.close()
+        s, text = self.raw("/v1/messages", {"model": "m", "max_tokens": 32,
+                                            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, text)
+        self.assertEqual(json.loads(text)["content"][0]["text"], "the answer")
+
+    def test_model_api_empty_messages_is_still_a_load(self):
+        """/api/chat keeps Maya's model API's preload: an empty `messages` list there is a call of its own that answers 200
+        (load / unload), not a 400 - only the completion routes ask for a message."""
+        from serve.frontend import check_messages
+        check_messages({})                                    # no `messages`: fine, /api/chat reads it as a load
+        check_messages({"messages": []})
+        check_messages({"input": []}, "input")                 # /v1/responses checks its own `input` itself
+        for bad, key in (({"messages": [[]]}, "messages"), ({"messages": "hi"}, "messages"), ({"input": 7}, "input")):
+            with self.assertRaises(ValueError, msg=bad):
+                check_messages(bad, key)
+
+
 class PrometheusMetrics(unittest.TestCase):
     """GET /metrics/prometheus: llama-server's metric names in Prometheus' text format, behind the API key."""
 
@@ -1583,6 +1721,39 @@ class LiveRate(unittest.TestCase):
         list(gen)
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
+
+    def test_ik2_chunk_path_lines_reach_the_page(self):
+        """maya-ik2's prompt read in chunks (resident, offload, 2 GPUs, drafting) prints `PP read total ms tok/s reused`
+        per chunk with a cached prefix, then DONE: the Monitor's live bar and prompt speed come from these.  The
+        engine source prints PP on every serve prompt path (the chunk path printed none: no bar, no prompt speed)."""
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO())
+        engine.lines = queue.Queue()
+        engine.can_stop = False
+        engine.max_context = 262144
+        for ln in ("PP 6144 10000 2000 1024.0 4096", "PP 10000 10000 3800 1500.0 4096",
+                   "DONE 5 10000 3800 50 stop 0 0 4096"):
+            engine.lines.put(ln)
+        gen = engine.generate([1], 5, {}, threading.Event())
+        self.assertIsNone(next(gen))
+        self.assertEqual(engine.progress, (6144, 10000, 4096, 2000.0))
+        self.svc.engine = engine
+        self.svc.status.update(busy=True)
+        self.svc.latest_request = RequestStat()
+        live = self.metrics()["live"]
+        self.assertEqual((live["state"], live["prompt_read"], live["prompt_total"], live["prompt_reused"],
+                          live["prefill_tok_s_mean"]), ("reading", 6144, 10000, 4096, 1024.0))
+        self.assertIsNone(next(gen))
+        self.assertEqual(list(gen), [])
+        t = request_timings(10000, 5, engine.last)
+        self.assertEqual((t["cache_n"], t["prompt_n"], t["prompt_per_second"]), (4096, 5904, 1553.7))
+        self.svc.status["busy"] = False
+        src = (ROOT / "src/ik2/ik2_main.cu").read_text(encoding="utf-8")
+        body = src[src.index("const int cached = (int) L;"):src.index("if (cancelled) {", src.index("const int cached = (int) L;"))]
+        self.assertEqual(body.count('std::printf("PP '), 2)       # the layer-major pass and the chunk loop
 
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
@@ -2425,6 +2596,14 @@ class VisionRoomOnDemand(unittest.TestCase):
             v._start()
         return v, proc, popen.call_args
 
+    def test_pictures_reserve_nothing_in_the_engine(self):
+        """(the start plan - context, cache, drafter - is the same with pictures on or off: the server hands maya-ik2
+        no room figure for the encoder, and the engine's drafter check reads none; a 24 GB card at 262,144 lost its
+        drafter to that figure)"""
+        root = Path(__file__).resolve().parent.parent
+        for f in ("serve/server.py", "src/ik2/ik2_main.cu"):
+            self.assertNotIn("IK2_VISION_GIB", (root / f).read_text(encoding="utf-8"), f)
+
     def test_on_the_gpu_when_it_has_room(self):
         v, proc, call = self.start(True)
         self.assertEqual(call[0][0], ["maya-vision", "--mmproj", "mmproj-BF16.gguf", "--gpu", "--max-tokens", "1024",
@@ -3235,6 +3414,28 @@ class EngineEndTests(unittest.TestCase):
         self.assertIn("a hang it caught", self.note("maya ds4 serve: no progress for 600 s during a request - stopping "
                                                     "the engine so the server starts it again (issue #29, #539)\n"))
         self.assertIn("running out of RAM", self.note("ds4: something else\n", returncode=-9))
+
+
+class Ds4OneGpuSwitchNote(unittest.TestCase):
+    """#1120: DS4_STREAM_WIN / DS4_LAND set by hand for DeepSeek on one AMD GPU: the start says they do not apply."""
+
+    CFG = {"exe": "/x/maya-ds4", "backend": "hip", "gpu": "0", "args": ["--pack", "/m"]}
+
+    def test_set_on_one_amd_gpu(self):
+        from serve.server import ds4_one_gpu_switch_note as note
+        msg = note(self.CFG, {"DS4_STREAM_WIN": "1", "DS4_LAND": "1"})
+        self.assertIn("DS4_STREAM_WIN and DS4_LAND are set", msg)
+        self.assertIn("does not apply", msg)
+        self.assertIn("DS4_LAND is set", note(self.CFG, {"DS4_LAND": "1", "DS4_STREAM_WIN": "0"}))
+
+    def test_silent_everywhere_else(self):
+        from serve.server import ds4_one_gpu_switch_note as note
+        env = {"DS4_STREAM_WIN": "1", "DS4_LAND": "1"}
+        self.assertIsNone(note(self.CFG, {}))
+        self.assertIsNone(note(self.CFG, {"DS4_LAND": "0"}))
+        self.assertIsNone(note({**self.CFG, "backend": "cuda"}, env))                 # NVIDIA: the path they belong to
+        self.assertIsNone(note({**self.CFG, "gpu": "0,1"}, env))                      # two GPUs
+        self.assertIsNone(note({**self.CFG, "exe": "/x/maya-mm3"}, env))             # another model
 
 
 if __name__ == "__main__":

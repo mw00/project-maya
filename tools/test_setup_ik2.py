@@ -1,5 +1,5 @@
-"""tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2, an experimental preview) in the setup: its names and setup ids,
-its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
+"""tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2) in the setup: its names and setup ids,
+its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts Inkling 2
 does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 24 GB), the
 one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
 config it writes (its pictures too) and a start of it.  No GPU, no network.
@@ -54,10 +54,14 @@ def refusal(fn):
 
 class Names(unittest.TestCase):
     def test_shown_and_ids(self):
-        self.assertEqual(Q.shown("ik2", Q.IK2_QUANT, 18.27), "Inkling 2 Mini · unsloth UD-Q4_K_XL (18 GB)")
+        self.assertEqual(Q.shown("ik2", Q.IK2_QUANT, 17.63), "Inkling 2 Mini · Maya-L (18 GB)")
+        self.assertEqual(Q.shown("ik2", Q.IK2_UNSLOTH, 17.63), "Inkling 2 Mini · unsloth UD-Q4_K_XL (18 GB)")
         self.assertEqual(Q.config_stem("ik2", Q.IK2_QUANT), "maya-inkling-2-mini")
-        for name in ("inkling-2-mini", "Inkling-2-Mini", "inkling-2-mini-ud-q4_k_xl", "ik2-mini", "INKLING2-MINI"):
-            self.assertEqual(Q.resolve(name), ("ik2", Q.IK2_QUANT), name)
+        self.assertEqual(Q.config_stem("ik2", Q.IK2_UNSLOTH), "maya-inkling-2-mini")   # (one config, either file)
+        for name in ("inkling-2-mini", "Inkling-2-Mini", "ik2-mini", "INKLING2-MINI"):   # (the model: files then picked)
+            self.assertEqual(Q.resolve(name), ("ik2", None), name)
+        self.assertEqual(Q.resolve("Inkling-2-Mini-Maya-L"), ("ik2", Q.IK2_QUANT))
+        self.assertEqual(Q.resolve("inkling-2-mini-ud-q4_k_xl"), ("ik2", Q.IK2_UNSLOTH))
         self.assertIsNone(Q.resolve("inkling-2-small"))   # (Inkling-2-Small: by hand, no setup)
         self.assertEqual((maya.IK2, maya.IK2_SHOWN, maya.IK2_MODEL_NAME),
                          ("Inkling-2-Mini", "Inkling 2 Mini", "inkling-2-mini"))
@@ -68,7 +72,12 @@ class Names(unittest.TestCase):
         a = args(model="inkling-2-mini")
         self.assertIsNone(maya.model_option(a))
         self.assertEqual(a.model, maya.IK2)
+        self.assertIsNone(getattr(a, "ik2_quant", None))                   # (the files: ik2_quant_pick's)
         self.assertEqual(maya.choose_family(a, {}), "ik2")
+        for name, key in (("inkling-2-mini-maya-l", Q.IK2_QUANT), ("inkling-2-mini-ud-q4_k_xl", Q.IK2_UNSLOTH)):
+            a = args(model=name)
+            self.assertIsNone(maya.model_option(a))
+            self.assertEqual((a.model, a.ik2_quant), (maya.IK2, key), name)
 
     def test_its_own_defaults(self):
         """Inkling-2-Mini has its own entry, its author's values (not Inkling-2-Small's): temperature 1.0, top-p 1.0,
@@ -83,25 +92,56 @@ class Names(unittest.TestCase):
         small = {"exe": "build/maya-ik2", "model_name": "inkling-2-small",
                  "args": ["--model", "Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf"]}
         self.assertEqual((Q.model_key(small), Q.model_defaults(small)[1]), ("ik2", "auto"))
+        # (thinkingmachines/Inkling-2-Small names no sampling: plain, and its own entry - not Inkling-2-Mini's)
+        self.assertEqual(Q.model_defaults(small)[0], {"temperature": 1.0, "top_p": 1.0})
+        self.assertIsNot(Q.MODEL_DEFAULTS["ik2"], Q.MODEL_DEFAULTS["ik2-mini"])
 
     def test_label(self):
         cfg = {"exe": "/b/maya-ik2", "installer": {"family": "ik2", "ik2_quant": Q.IK2_QUANT}}
-        self.assertEqual(Q.config_label(cfg), "Inkling 2 Mini · unsloth UD-Q4_K_XL")
+        self.assertEqual(Q.config_label(cfg), "Inkling 2 Mini · Maya-L")
         self.assertEqual(Q.config_key(cfg), Q.IK2_QUANT)
+        old = {"exe": "/b/maya-ik2", "installer": {"family": "ik2", "quant": "unsloth UD-Q4_K_XL", "ik2_quant": "ud-q4_k_xl"}}
+        self.assertEqual(Q.config_label(old), "Inkling 2 Mini · unsloth UD-Q4_K_XL")   # (a setup before v1.1.82's)
+        self.assertEqual(Q.config_key(old), Q.IK2_UNSLOTH)
+        self.assertEqual(Q.config_key({"exe": "/b/maya-ik2", "installer": {"family": "ik2"}}), Q.IK2_UNSLOTH)
 
 
 class Manifest(unittest.TestCase):
     def test_pinned(self):
         man = json.loads(maya.IK2_MANIFEST.read_text(encoding="utf-8"))
         self.assertRegex(man["revision"], r"^[0-9a-f]{40}$")
-        self.assertEqual(man["repo"], "unsloth/Inkling-2-Mini-GGUF")
-        self.assertEqual(man["gguf"], "Inkling-2-Mini-UD-Q4_K_XL.gguf")      # (the repo's top: the looped layout)
-        for name, (size, sha) in man["files"].items():
-            self.assertGreater(size, 100 << 20, name)
-            self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
-        self.assertEqual(list(man["files"]), [man["gguf"]])                  # (the drafter: its own entry)
-        self.assertEqual(man["files"][man["gguf"]][1],
-                         "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")   # (the author's)
+        # (a new setup's: Maya's own GGUF, Maya-L - its size and sha256 as the repo's Maya-L/SHA256SUMS says them)
+        self.assertEqual((man["repo"], man["folder"], man["quant"]),
+                         ("peasantsmith/Inkling-2-Mini-Maya-GGUF", "Maya-L", Q.IK2_QUANT))
+        self.assertEqual(man["revision"], "f5bef914e8098c2f9920f59050c80ea3f17a54a4")
+        self.assertEqual(man["gguf"], "Inkling-2-Mini-Maya-L-NVFP4.gguf")
+        self.assertEqual(man["files"], {man["gguf"]: [
+            17629759680, "1945d7b212601f429ef9dc4f6b8208062f3b9f22a1ebbdc1665373f412ebf54a"]})
+        # (unsloth's UD-Q4_K_XL, the setup's file before: still pinned, so an install of it is checked and kept)
+        old = man["earlier"][Q.IK2_UNSLOTH]
+        self.assertEqual((old["repo"], old["revision"], old["folder"]),
+                         ("unsloth/Inkling-2-Mini-GGUF", "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f", ""))
+        self.assertEqual(old["gguf"], "Inkling-2-Mini-UD-Q4_K_XL.gguf")      # (the repo's top: the looped layout)
+        self.assertEqual(old["files"], {old["gguf"]: [
+            17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"]})   # (the author's)
+
+    def test_ablate_direction_entry(self):
+        """The refusal direction: Maya's repo, folder refusal-directions/; its revision and sha256 stay PLACEHOLDERs until
+        the file is uploaded (then the setup reads main and checks the file's shape), a real pin is used as pinned."""
+        man = json.loads(maya.IK2_MANIFEST.read_text(encoding="utf-8"))["ablate"]
+        name = "Inkling-2-Mini-refusal-direction.gguf"
+        self.assertEqual((man["repo"], man["folder"]), ("peasantsmith/Inkling-2-Mini-Maya-GGUF", "refusal-directions"))
+        self.assertEqual(list(man["files"]), [name])
+        self.assertEqual(maya.ABLATE_DIRECTIONS["ik2"], ("Inkling-2-Mini", man["repo"]))
+        if man["revision"] == "PLACEHOLDER":
+            self.assertIsNone(maya.ablate_pin("ik2", name))
+        pinned = {"ablate": {"revision": "a" * 40, "files": {name: [9760, "b" * 64]}}}
+        with patch.object(maya, "read_json", lambda p: pinned):
+            self.assertEqual(maya.ablate_pin("ik2", name), ("a" * 40, 9760, "b" * 64))
+            self.assertIsNone(maya.ablate_pin("glm", name))
+        pinned["ablate"]["files"][name][1] = "PLACEHOLDER"
+        with patch.object(maya, "read_json", lambda p: pinned):
+            self.assertIsNone(maya.ablate_pin("ik2", name))
 
     def test_drafter_pinned(self):
         """Drafting: the model's own drafter from Maya's own repo at a pinned revision, folder drafter/, by size and
@@ -142,14 +182,57 @@ class Manifest(unittest.TestCase):
     def test_entry_and_urls(self):
         m = maya.ik2_entry()
         self.assertAlmostEqual(m["download_gb"], 17.63, places=1)
+        self.assertEqual(maya.file_url(m, m["gguf"]),
+                         "https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF/resolve/"
+                         "f5bef914e8098c2f9920f59050c80ea3f17a54a4/Maya-L/Inkling-2-Mini-Maya-L-NVFP4.gguf")
+        self.assertEqual(maya.ik2_entry(Q.IK2_QUANT), m)
+        m = maya.ik2_entry(Q.IK2_UNSLOTH)
         gguf = maya.file_url(m, m["gguf"])
         self.assertTrue(gguf.startswith("https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/"), gguf)
         self.assertTrue(gguf.endswith("/Inkling-2-Mini-UD-Q4_K_XL.gguf"), gguf)
         self.assertNotIn("Mainline_Support", gguf)
 
+    def test_which_files(self):
+        """Maya's Maya-L for a new setup; an install of unsloth's UD-Q4_K_XL (its config, or its whole file in the
+        model's folder) keeps it - nothing downloaded again; --model names one by its id."""
+        mine, old = maya.ik2_entry(), maya.ik2_entry(Q.IK2_UNSLOTH)
+        d, whole = Path("/models/Inkling-2-Mini"), set()   # (the files here that are whole, by their published size)
+
+        def pick(prev=None, **kw):
+            with patch.object(maya, "ik2_whole", lambda m, at: at / m["gguf"] in whole):
+                return maya.ik2_quant_pick(args(**kw), d, prev or {})
+        self.assertEqual(pick(), Q.IK2_QUANT)                                  # (nothing here: Maya's)
+        was = {"exe": "/b/maya-ik2", "args": ["--model", str(d / old["gguf"])],
+               "installer": {"family": "ik2", "quant": "unsloth UD-Q4_K_XL", "ik2_quant": "ud-q4_k_xl"}}
+        self.assertEqual(pick(was), Q.IK2_UNSLOTH)                             # (a setup again: the file it ran)
+        whole.add(d / old["gguf"])                                             # (unsloth's whole file, no config)
+        self.assertEqual(pick(), Q.IK2_UNSLOTH)
+        self.assertEqual(pick(ik2_quant=Q.IK2_QUANT), Q.IK2_QUANT)             # (--model inkling-2-mini-maya-l)
+        whole.add(d / mine["gguf"])                                            # (Maya's too: Maya's)
+        self.assertEqual(pick(), Q.IK2_QUANT)
+        self.assertEqual(pick(was, ik2_quant=Q.IK2_QUANT), Q.IK2_QUANT)
+        whole.clear()                                                          # (a part of unsloth's: Maya's)
+        self.assertEqual(pick(), Q.IK2_QUANT)
+
+    def test_unsloth_install_kept(self):
+        """A setup again of an install of unsloth's file: its file checked as before, no download offered."""
+        old = maya.ik2_entry(Q.IK2_UNSLOTH)
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            (d / old["gguf"]).write_bytes(b"x" * 1000)
+            a = args(ik2_quant=Q.IK2_UNSLOTH)
+            seen = []
+            with patch.object(maya, "offer_download", side_effect=AssertionError("nothing to download")), \
+                    patch.object(maya, "file_incomplete", lambda m, f: seen.append((m["repo"], f.name))), \
+                    patch.object(maya, "sha256_checked", lambda f, sha: seen.append(sha) or True), \
+                    patch.object(maya, "step", lambda *x: None), patch.object(maya, "ok", lambda *x: None), \
+                    patch.object(maya, "rotational", return_value=False):
+                self.assertEqual(maya.ik2_model_step(a, d, d), d / old["gguf"])
+            self.assertEqual(seen, [("unsloth/Inkling-2-Mini-GGUF", old["gguf"]), old["sha256"][old["gguf"]]])
+
 
 class Refusals(unittest.TestCase):
-    """One plain line, before anything is built or downloaded, wherever the preview does not run."""
+    """One plain line, before anything is built or downloaded, wherever Inkling 2 does not run."""
 
     def test_the_lines(self):
         ok = [card(24)]
@@ -355,9 +438,9 @@ class Picker(unittest.TestCase):
             return len(opts) - 1
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             fam = maya.choose_family(args(model=None, model_dir=None, gguf_dir=None, draft=None), {})
-        self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini (experimental)", "ik2"))
-        about = got["about"]["Inkling 2 Mini (experimental)"]
-        for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
+        self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini", "ik2"))
+        about = got["about"]["Inkling 2 Mini"]
+        for part in ("thinkingmachines' Inkling-2-Mini", "Maya's GGUF, Maya-L", "18 GB",
                      "V100 / RTX 20", "Linux", "8 GB or more", "Halo / APU with 24 GB", "pictures"):
             self.assertIn(part, about)
 
@@ -531,6 +614,12 @@ class Steps(unittest.TestCase):
         self.assertFalse(F.draft_fits(16, 1048576, "fp8"))        # (the cache streams)
         self.assertTrue(F.draft_fits(32, 262144, "fp8"))
         self.assertTrue(F.draft_fits(0, 262144, "fp8"))          # (not known: the engine measures)
+        # (the engine's measured room: the scratch of 1152 B a token and its 288 MiB beside every expert - 32 GB at
+        #  720,896 tokens: "the drafter left out ... 0.03 GiB short"; the tool said it fits)
+        self.assertFalse(F.draft_fits(32, 720896, "fp8"))
+        self.assertFalse(F.draft_fits(31.73, 720896, "fp8"))
+        self.assertTrue(F.draft_fits(32, 524288, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("70", 32, 262144, "fp8"))
         self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4096 / 2**30, places=6)
 
     def test_drafting_off_reason(self):
@@ -565,7 +654,7 @@ class Steps(unittest.TestCase):
                                lambda *a, **k: seen.update(amd=a[-1]) or seen.setdefault("drafter", d / "mtp.safetensors"))
         cfg = patch.object(maya, "write_config_ik2", lambda a, *r: seen.update(drafting=a.drafting, drafter=r[-1]))
         said = []
-        with patch.object(maya, "check_pc", return_value=pc), patch.object(maya, "mem_gb", return_value=(ram, 10.0)),                 patch.object(maya, "choose_context", lambda a, prev, opts, rec: 65536),                 stub("ik2_dir", d), stub("tools_step", d), stub("build_step", {}), stub("ik2_model_step", gguf),                 stub("ik2_tokenizer_step", d), stub("ik2_vision_step", None), drafter, cfg,                 patch.object(maya.IK2_EXE.__class__, "exists", lambda self: True),                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", lambda *a: None),                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "hip_unified_memory", lambda g: False), patch.object(maya, "WIN", False):
+        with patch.object(maya, "check_pc", return_value=pc), patch.object(maya, "mem_gb", return_value=(ram, 10.0)),                 patch.object(maya, "choose_context", lambda a, prev, opts, rec: 65536),                 stub("ik2_dir", d), stub("tools_step", d), stub("build_step", {}), stub("ik2_model_step", gguf),                 stub("ik2_tokenizer_step", d), stub("ik2_vision_step", None), stub("ablate_step", None), drafter, cfg,                 patch.object(maya.IK2_EXE.__class__, "exists", lambda self: True),                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", lambda *a: None),                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "hip_unified_memory", lambda g: False), patch.object(maya, "WIN", False):
             maya.set_up_ik2(self.va(**kw), {})
         return seen, " ".join(said)
 
@@ -693,7 +782,7 @@ class Steps(unittest.TestCase):
                 patch.dict(os.environ, {"INVOCATION_ID": "x"}):
             cmd, env, info = maya.server_command(path, a)
         self.assertIn("serve", " ".join(cmd))
-        self.assertEqual((info["model"], info["label"]), ("inkling-2-mini", "Inkling 2 Mini · unsloth UD-Q4_K_XL"))
+        self.assertEqual((info["model"], info["label"]), ("inkling-2-mini", "Inkling 2 Mini · Maya-L"))
         gguf.unlink()                                          # (its GGUF gone: said, not started)
         out = refusal(lambda: maya.server_command(path, a))
         self.assertIn("the model's GGUF file is missing", out)

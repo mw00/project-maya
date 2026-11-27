@@ -1,15 +1,12 @@
 # Maya-S v1 against the FP8 model (2026-10-07, the 1x V100 PC)
 
-`GLM-5.3-Flash-Maya-S-IQ2_XXS` (90.1 GB, 2 shards): IQ2_XXS experts (gate/up with error-feedback rounding), IQ2_S down
-in MoE layers 3-6 and 41-44, Q6_K attention / shared experts / dense layers / embeddings / output, Q8_0 small KDA
-projections and the DSA indexer, F32 router and mixing weights, NextN layer included (Q2_K/Q3_K experts).
-Recipe: `tools/maya_quant/recipes/maya-s-v1.json`. Made in 280 min on the 1x V100 PC (1x V100, 6 cores) from the FP8 release.
+`GLM-5.3-Flash-Maya-S-IQ2_XXS` (90.1 GB, 2 shards), made from the FP8 release on the 1x V100 PC (1x V100, 6 cores).
 
 ## Distribution match on held-out text
 
 The FP8 model's own top-64 log-probabilities (calib.py's reference: its forward in PyTorch, `hc_head` = the mean of
 the four streams as in the official modelling code) against Maya-S run through the engine's one-token decode path
-(`MAYA_GLM_SCORE_TOPK`, `tools/maya_quant/kl_eval.py`): 8 eval sequences never used for calibration, positions
+(`MAYA_GLM_SCORE_TOPK`, Maya's scoring tools): 8 eval sequences never used for calibration, positions
 64-1022, 7,672 tokens. KL is KL(FP8 || Maya-S) over the top 64 plus one bucket for the rest (the top 64 hold 98-99% of
 FP8's probability). FP8's perplexity counts a token outside its top 64 at the 64th log-prob (a lower bound).
 
@@ -34,7 +31,7 @@ expert kernels, about 1.5% per expert), not only the quantization.
 
 ## Loops
 
-`tools/maya_quant/loop_test.py`, 5 prompts (a three.js scene, a canvas animation, an explanation, a study plan in
+Maya's loop test, 5 prompts (a three.js scene, a canvas animation, an explanation, a study plan in
 Portuguese, a proof) at temperature 1.0 and greedy, Max thinking (no effort line - the template's default), 6,000 new
 tokens: 10 of 10 answers without a repeated 64-token passage or a back-to-back repeat. None had closed its reasoning
 by 6,000 tokens at Max effort; the tails read as coherent planning (orbital mechanics for the scene, colour and
@@ -47,7 +44,7 @@ prompts is the model's habit at High; a thinking budget in the server would boun
 
 ## Context fill
 
-`tools/maya_quant/ctx_fill_test.py` on the 1x V100 PC (1x V100 32 GB, 64 GB RAM): the project's documents as the context, a
+Maya's long-context test on the 1x V100 PC (1x V100 32 GB, 64 GB RAM): the project's documents as the context, a
 fact planted at its very start, the question at its end (thinking Low, greedy).
 
 | Prompt | Found the fact | Ended by itself | Loops | Decode | Prompt |
@@ -80,9 +77,3 @@ with it on demand, as shipped.  The context-fill numbers above (the 1x V100 PC) 
 Long creative prompts at High effort planned past 14,000 tokens (above).  The server now caps a reasoning block at
 32,768 tokens by default (`thinking_budget` in the config; 0 = none): the engine emits `</think>` in place of the next
 sampled token and the answer follows in the same decode, nothing read again.
-
-## What v2 targets
-
-- Tool-call formats and memorized knowledge: more tool-call calibration, Q8_0 attention and shared experts.
-- Per-layer sensitivity for the down projections (IQ2_S / IQ3_XXS where it pays), and per-expert bits in the Maya pack.
-- Output-matching refinement of the quantized scales (the plan's scale-refinement step).

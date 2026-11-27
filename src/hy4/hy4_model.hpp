@@ -41,6 +41,10 @@ struct Options {
     bool mtp = false;             // load the MTP block (the GGUF's nextn layer, its BF16 rounded to Q8_0) for drafts
     bool dfly2 = false;           // load the DFly2 drafter (the pack's model.dfly_layers.* tensors) for drafts: a few
                                   // dense layers over the trunk's own caches, several tokens a pass (not with mtp)
+    int snap_every = 0;           // restore points (hy4_snap.hpp): every snap_every positions (a multiple of the
+                                  // indexer's pool, at least the window) the sliding-window rings' rows before it kept
+                                  // in pinned host memory, so a prompt that leaves the sequence where the rings no
+                                  // longer reach reads from the last point before the split instead of from 0 (0: none)
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: fill each GPU in turn)
     int kv = -1;                  // the latent cache's rows: 0 F16, 1 8-bit (the latent int8 in blocks of 32 with F16
                                   // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
@@ -149,6 +153,9 @@ public:
     static void unpin(void* p);
     /// Whether a forward may start at pos (the sliding-window rings still hold the window before it)
     bool resumable(int64_t pos) const;
+    /// (Options::snap_every) The latest restore point at or before upto whose sequence is ids' start, put back
+    /// in the rings and the sequence cut there: its position (a forward may start there); 0: none (err: a CUDA error)
+    int64_t restore(const int* ids, int64_t upto, std::string& err);
     /// The positions processed so far (the next forward's pos0 when continuing)
     int64_t end() const;
 
@@ -161,6 +168,9 @@ public:
     /// the most tokens a forward reads at once (the prompt path's chunk): a prompt in calls of this many reports its
     /// progress between them
     int chunk() const;
+    /// (HY4_PP) whether a forward of n prompt tokens now would take HY4_PP's pipelined path (its gates, side-effect
+    /// free; false with HY4_PP unset) - the server reads such a prompt in one forward instead of a chunk a call
+    bool pipelines(int n) const;
     /// the GPUs a layer is split over (tensor parallel: 2 or more; 1: the layer split or one GPU)
     int tensor_parallel() const;
     int eos() const;

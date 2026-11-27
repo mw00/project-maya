@@ -14,6 +14,8 @@
 #include <cuda_runtime.h>
 
 #include "../src/hy4/hy4_kernels.cuh"
+#include "../src/hy4/hy4_plan.hpp"
+#include "../src/hy4/hy4_plan.hpp"
 
 namespace {
 
@@ -995,6 +997,64 @@ void test_kv_streaming() {
         cudaFree(d);
 }
 
+// dfly_expand_keys: the GPU kernel matches hy4::dfly_keys on the host bit-for-bit across layers, rows, and edge cases.
+void test_dfly_expand_keys() {
+    const int n_layers = 4, W = 8, row = 3, maxk = 200, ldk = 256, T = 5;
+    std::vector<int> snap_nk((size_t) n_layers * W, 0);
+    std::vector<int> snap((size_t) n_layers * W * maxk, -1);
+    const int picks_per_layer[4] = {180, 0, 5, 195};
+    std::uniform_int_distribution<int> pick(0, 50000);
+    for (int l = 0; l < n_layers; ++l) {
+        const int np = picks_per_layer[l];
+        snap_nk[(size_t) l * W + row] = np;
+        std::vector<int> v((size_t) np);
+        for (int& x : v) x = pick(rng);
+        // Include a few positions near typical pos values to exercise overlap with the recent tail [pos-7, pos+T-1]
+        if (np >= 5) {
+            v[0] = 0;
+            v[1] = 4;
+            v[2] = 998;
+            v[3] = 1000;
+            v[4] = 1002;
+        }
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        snap_nk[(size_t) l * W + row] = (int) v.size();
+        for (size_t i = 0; i < v.size(); ++i)
+            snap[((size_t) l * W + row) * maxk + i] = v[i];
+    }
+    int *dsnap = dev(snap), *dsnap_nk = dev(snap_nk), *dkeys = nullptr, *dnk = nullptr;
+    cudaMalloc(&dkeys, sizeof(int) * n_layers * W * ldk);
+    cudaMalloc(&dnk, sizeof(int) * n_layers * W);
+    int bad = 0;
+    for (int pos : {0, 1, 7, 8, 9, 1000, 12345}) {
+        cudaMemset(dkeys, 0xaa, sizeof(int) * n_layers * W * ldk);
+        cudaMemset(dnk, 0xaa, sizeof(int) * n_layers * W);
+        hy4::k::dfly_expand_keys(dsnap, dsnap_nk, n_layers, W, row, maxk, pos, T, dkeys, ldk, dnk, 0);
+        const std::vector<int> gk = host(dkeys, (size_t) n_layers * W * ldk);
+        const std::vector<int> gn = host(dnk, (size_t) n_layers * W);
+        for (int l = 0; l < n_layers; ++l) {
+            const int np = snap_nk[(size_t) l * W + row];
+            std::vector<int> rk((size_t) W * ldk, -1), rn((size_t) W, 0);
+            const int ok = hy4::dfly_keys(snap.data() + ((size_t) l * W + row) * maxk, np, pos, T, rk.data(), ldk,
+                                          rn.data());
+            CHECK(ok != 0);
+            for (int r = 0; r < T; ++r) {
+                const int gn_r = gn[(size_t) l * W + r];
+                if (gn_r != rn[(size_t) r]) {
+                    ++bad;
+                    continue;
+                }
+                for (int i = 0; i < gn_r; ++i)
+                    bad += gk[((size_t) l * W + r) * ldk + i] != rk[(size_t) r * ldk + i];
+            }
+        }
+    }
+    std::printf("  dfly_expand_keys: %d mismatches across %d positions x %d layers x %d rows\n", bad, 7, n_layers, T);
+    CHECK(bad == 0);
+    for (int* p : {dsnap, dsnap_nk, dkeys, dnk}) cudaFree(p);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1008,6 +1068,7 @@ int main() {
     test_indexer();
     test_engram();
     test_row_top();
+    test_dfly_expand_keys();
     CHECK(hy4::k::errors() == 0);
     std::printf("hy4_kernels_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

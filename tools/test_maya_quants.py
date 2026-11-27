@@ -44,6 +44,10 @@ IDS = {
     "hy4-flash-maya-s": ("hy4", "maya-s", "Hy4-Flash · Maya-S"),
     "hy4-flash-maya-m": ("hy4", "maya-m", "Hy4-Flash · Maya-M"),
     "hy4-flash-maya-l": ("hy4", "maya-l", "Hy4-Flash · Maya-L"),
+    # (Ling-3.2-air: Maya-M and Maya-L are named here and offered once their files exist - tools/test_setup_ling.py)
+    "ling-3.2-air-maya-s": ("ling", "maya-s", "Ling-3.2-air · Maya-S"),
+    "ling-3.2-air-maya-m": ("ling", "maya-m", "Ling-3.2-air · Maya-M"),
+    "ling-3.2-air-maya-l": ("ling", "maya-l", "Ling-3.2-air · Maya-L"),
 }
 
 

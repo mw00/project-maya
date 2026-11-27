@@ -152,6 +152,19 @@ class _IsolatedSplits:
 # Inkling 2's pre-tokenizer under the names its GGUFs carry: "gpt-4o" (the conversion as unsloth's UD-Q4_K_XL was
 # made), "inkling" (as their UD-Q3_K_XL was, later) and "inkling2" (llama.cpp master's: Inkling-2-Mini's files) - the
 # same split, the same vocabulary and merges
+# Ling-3.2-air ("bailingmoe2") pre-tokenizer regex: transcribed from inclusionAI/Ling-3.2-air's
+# tokenizer.json (Copyright (c) inclusionAI / Ant Group, MIT License; also carried in
+# ggml-org/llama.cpp src/llama-vocab.cpp under LLAMA_VOCAB_PRE_TYPE_BAILINGMOE, MIT License).
+BAILINGMOE2_PATTERN = (
+    r"'(?i:[sdmt]|ll|ve|re)"
+    r"|[^\r\n\p{L}\p{N}]?+\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]++[\r\n]*"
+    r"|\s*[\r\n]"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 O200K = ("gpt-4o", "inkling", "inkling2")
 
 
@@ -162,7 +175,7 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4") + O200K:
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4", "bailingmoe2") + O200K:
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
                              "hy_v4, gpt-4o, inkling, inkling2" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece.  `gpt-4o` (Inkling 2's: its
@@ -188,6 +201,7 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(PRE_ISOLATED[pre]) if pre in PRE_ISOLATED else
+                    regex.compile(BAILINGMOE2_PATTERN) if pre == "bailingmoe2" else
                     regex.compile(MINIMAX_PATTERN) if pre in ("minimax",) + O200K else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"

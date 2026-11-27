@@ -495,6 +495,21 @@ class GlmDraftLength(unittest.TestCase):
         c.update(kw)
         return c
 
+    def test_speed_calibration_marks_the_lane_timing_to_be_taken_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "cal.txt"
+            old = "0.1.27 Nov 23 2026 13:23:53 | /m/pack | layer 31 | 4\t0.1321 0.5769 0.5730 0.2156"
+            f.write_text(old + "\ncal1 cpu X x72 | /m/pack | layer 31 | 4\t0.1321 0.5769 0.5730 0.2156\n",
+                         encoding="utf-8")
+            c = self.cfg(env={"MAYA_GLM_CPU_CAL": str(f)})
+            with patch.object(maya, "ok"):
+                self.assertEqual(maya.glm_lane_timing_again(c), 1)
+                self.assertEqual(maya.glm_lane_timing_again(c), 0)          # (marked once)
+            lines = f.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], old)                                  # (an earlier version's line: untouched)
+            self.assertTrue(lines[1].endswith("\t0.1321 0.5769 0.5730 0.2156 redo"))
+            self.assertEqual(maya.glm_lane_timing_again(self.cfg(env={"MAYA_GLM_CPU_CAL": str(f) + ".none"})), 0)
+
     def test_pick_keeps_the_shorter_unless_clearly_faster(self):
         self.assertEqual(maya.glm_length_pick({2: 60.0, 3: 61.0, 4: 60.5}), 2)     # within 3%: 2
         self.assertEqual(maya.glm_length_pick({2: 60.0, 3: 64.0, 4: 62.0}), 3)

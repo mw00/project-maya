@@ -16,12 +16,14 @@ import hashlib
 import json
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from serve import server
 from serve.frontend import ChatTemplate, InklingRewriter, OutputParser, effort_kwargs, inkling_messages, \
     openai_to_messages
-from serve.server import ByteTokenizer, Service
+from serve.server import ByteTokenizer, Service, StrataEngine
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC = ROOT / "tools" / "ik2" / "chat_template.jinja"
@@ -112,7 +114,7 @@ class Template(unittest.TestCase):
     def test_levels(self):
         # its own names reach it as they are; thinking off is its "none" (0); none named: its default, 0.9
         t = public()
-        for word, num in (("none", "0"), (False, "0"), ("off", "0"), ("minimal", "0"), ("low", "0.2"),
+        for word, num in (("none", "0"), (False, "0"), ("off", "0"), ("minimal", "0.1"), ("low", "0.2"),
                           ("medium", "0.7"), ("high", "0.9"), ("xhigh", "0.99"), ("max", "0.99"), ("auto", "0.9"),
                           (None, "0.9")):
             with self.subTest(word=word):
@@ -183,10 +185,96 @@ class Parser(unittest.TestCase):
                     with self.subTest(name=name, thinking=thinking, step=step):
                         self.assertEqual(self.feed(text, thinking, step), (reasoning, content, calls))
 
-    def test_unfinished_call_is_text(self):
+    # A call streams once its name and the opening of "args" are there (see InklingRewriter), so a call that breaks after
+    # that point can no longer become text: what a client has been sent stays a call, ended where the model's JSON stops
+    # - the way OutputParser ends a streamed call of any model.  Before streaming these were text.
+    def test_streamed_call_ends_where_its_json_stops(self):
+        for body, args in (('{"name":"get_weather","args":{"city":"Paris"}} and more', {"city": "Paris"}),
+                           ('{"name":"get_weather","args":{"ci', {})):
+            for step in (1, 5, 1000):
+                with self.subTest(body=body, step=step):
+                    self.assertEqual(self.feed(MODEL + "get_weather" + CALL + body + END, False, step),
+                                     ("", "", [("get_weather", args)]))
+        # cut off by the end of the answer (max_tokens): a streaming client has the call's pieces - its JSON closed by
+        # OutputParser.finish as for any model (that final event carries no parsed arguments: OutputParser's own way)
+        for step in (1, 5, 1000):
+            p, events = OutputParser(thinking=False, stream_tools=True, inkling=True), []
+            text = MODEL + "get_weather" + CALL + '{"name":"get_weather","args":{"city":"Pa'
+            for i in range(0, len(text), step):
+                events += p.feed(text[i:i + step])
+            events += p.finish()
+            self.assertEqual(json.loads("".join(e.text for e in events if e.kind == "tool_args")), {"city": "Pa"})
+            self.assertEqual([e.call.name for e in events if e.kind == "tool_call"], ["get_weather"])
+
+    def test_unfinished_call_is_left_open(self):
+        # the answer cut off inside a streamed call (max_tokens): the rewriter leaves it open, OutputParser.finish ends it
         r = InklingRewriter(thinking=False)
         out = r.feed(MODEL + "get_weather" + CALL + '{"name":"get_weather","args":{"ci') + r.finish()
-        self.assertEqual(out, '{"name":"get_weather","args":{"ci')
+        self.assertEqual(out, "<tool_call>get_weather")
+
+    def test_other_shapes_as_before(self):
+        # a body the stream does not start on goes out whole at its end, as before streaming: a call where it is JSON,
+        # its text where it is not (here the comma before "args" left out, or no JSON at all)
+        for body in ('{"name":"get_weather"args":{"city":"Paris"}}', 'not json at all', '{"name":"get_wea'):
+            with self.subTest(body=body):
+                r = InklingRewriter(thinking=False)
+                out = r.feed(MODEL + "get_weather" + CALL + body + END) + r.finish()
+                self.assertEqual(out, body)
+                self.assertEqual(r.streamed_calls, 0)
+        r = InklingRewriter(thinking=False)
+        out = r.feed(MODEL + "get_weather" + CALL + '{"args":{"city":"Rome"},"name":"get_weather"}' + END) + r.finish()
+        self.assertEqual(out, "<tool_call>get_weather<arg_key>city</arg_key><arg_value>\"Rome\"</arg_value></tool_call>")
+
+
+class Streaming(unittest.TestCase):
+    """A call goes out as it is written: tool_start and tool_args pieces long before its end, the pieces one JSON object
+    equal to the call's arguments, the same call however the output is cut."""
+
+    BODIES = (
+        {},
+        {"city": "Paris"},
+        {"city": "a <b> \"c\" </arg_value></tool_call> <|x|>?", "days": -3, "x": 1.5e3, "t": True, "n": None},
+        {"path": "C:\\dir\\f.txt", "content": "line1\nline2\t\u00e9\u2603 \U0001f600 \\\" end"},
+        {"opts": {"x": [1, 2, {"y": "<z>"}], "s": "}{][,"}, "list": ["a", "b<", {}], "e": ""},
+        {"k\u00e9y \"q\"": "v", "<tag>": "<tag>"},
+    )
+
+    @staticmethod
+    def run_out(text, step):
+        p, events, first = OutputParser(thinking=True, stream_tools=True, inkling=True), [], None
+        for i in range(0, len(text), step):
+            got = p.feed(text[i:i + step])
+            if first is None and any(e.kind in ("tool_start", "tool_args") for e in got):
+                first = i + step
+            events += got
+        events += p.finish()
+        return events, first
+
+    def check(self, body_text, args, step):
+        text = MODEL + THINK + "Plan." + END + MODEL + "write" + CALL + body_text + END + EOS
+        events, first = self.run_out(text, step)
+        calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual([(c.call.name, c.call.arguments) for c in calls], [("write", args)])
+        pieces = "".join(e.text for e in events if e.kind == "tool_args")
+        # (a call with no arguments has no pieces: it goes out as its one final event, as it always did)
+        self.assertEqual(sum(e.kind == "tool_start" for e in events), 1 if args else 0)
+        if args:
+            self.assertEqual(json.loads(pieces), args)
+        return text, first
+
+    def test_bodies_however_cut(self):
+        for args in self.BODIES:
+            for body_text in (json.dumps({"name": "write", "args": args}),
+                              json.dumps({"name": "write", "args": args}, ensure_ascii=False, indent=2)):
+                for step in (1, 2, 3, 5, 13, 1000):
+                    with self.subTest(body=body_text[:60], step=step):
+                        self.check(body_text, args, step)
+
+    def test_a_long_write_streams(self):
+        content = "<html>\n" + "\n".join(f'<p class="x">line {i} \u00e9 "q" \\ </p>' for i in range(2000)) + "\n</html>"
+        args = {"path": "pelican.html", "content": content}
+        text, first = self.check(json.dumps({"name": "write", "args": args}), args, 7)
+        self.assertLess(first, len(text) // 20)        # the first pieces within the first 5% of the output
 
 
 class Serving(unittest.TestCase):
@@ -226,6 +314,49 @@ class Serving(unittest.TestCase):
         self.assertIn(EFFORT + "0" + END, tok.decode(eng.prompts[0]))   # (thinking off for a required call)
         self.assertEqual(got["calls"], [("get_weather", {"city": "Rome"})])
 
+    def test_any_required_call_opens_with_a_tools_name(self):
+        # tool_choice "required" names no tool, and Inkling's call opens with the tool's name: the prompt can open the
+        # model's message only.  Where the engine reads starts=, the message must go on with one of the tools' names and
+        # the call's segment (the model's pick among them), not with words
+        svc, eng, tok = service("get_weather" + CALL + '{"name":"get_weather","args":{"city":"Rome"}}' + END)
+        eng.info["starts"] = 1
+        tools = TOOLS + [{"type": "function", "function": {"name": "get_time", "parameters": {"type": "object"}}}]
+        msgs, tools, kw = openai_to_messages({"messages": ASK, "tools": tools, "tool_choice": "required"})
+        ids, _, _ = svc.prepare(msgs, tools, kw, 500)
+        self.assertEqual(tok.decode(ids[-1:]), MODEL)
+        seg = tok.special_tokens[CALL]
+        self.assertEqual(sorted(kw["_starts"]),
+                         sorted([tok.encode("get_weather") + [seg], tok.encode("get_time") + [seg]]))
+        self.assertIn(EFFORT + "0" + END, tok.decode(ids))   # (thinking off, as for a named call)
+
+    def test_openings_only_where_needed_and_read(self):
+        for choice, info in (("required", {}),                                       # (an engine without it)
+                             ({"type": "function", "function": {"name": "get_weather"}}, {"starts": 1}),
+                             ("auto", {"starts": 1})):
+            svc, eng, _ = service("x")
+            eng.info.update(info)
+            msgs, tools, kw = openai_to_messages({"messages": ASK, "tools": TOOLS, "tool_choice": choice})
+            svc.prepare(msgs, tools, kw, 500)
+            self.assertIsNone(kw["_starts"], choice)
+
+    def test_openings_go_to_the_engine_for_the_answers_start(self):
+        self.assertIn("starts=3,7;9", StrataEngine.sampling_keys({"_starts": [[3, 7], [9]]}).split())
+        self.assertIn("starts=3", StrataEngine.sampling_keys({"_starts": [[3]], "temperature": 0}).split())
+        self.assertNotIn("starts", StrataEngine.sampling_keys({"_starts": None, "temperature": 0.7}))
+        # a later call for the same answer goes on after what was written: cut inside the opening, with what the
+        # sequences it matches have left; once one is whole (or none matches), freely
+        self.assertEqual(server.openings_left([[1, 2, 3], [1, 4], [5]], [1]), [[2, 3], [4]])
+        self.assertEqual(server.openings_left([[1, 2, 3], [1, 4], [5]], [1, 2]), [[3]])
+        self.assertIsNone(server.openings_left([[1, 2, 3], [1, 4]], [1, 4, 9]))
+        self.assertIsNone(server.openings_left([[1, 2, 3]], [7]))
+        # (through _sliced: the thinking budget's close at a sentence's end stops the first call after "Hi.", the
+        # next goes on - the opening was written whole)
+        svc, eng, tok = service("Hi. There.")
+        hi = tok.encode("Hi.")
+        smp = {"_starts": [hi, [2]], "_think_soft": 1, "_think_end": tok.special_tokens[END]}
+        list(svc._sliced(tok.encode("Q"), 50, smp, threading.Event(), None, [True, True], {}))
+        self.assertEqual([x.get("_starts") for x in eng.sampling], [[hi, [2]], None])
+
     def test_pictures_are_refused_in_plain_words(self):
         svc, eng, _ = service("x")
         msgs, tools, kw = openai_to_messages({"messages": [PICTURE]})
@@ -255,6 +386,54 @@ class Defaults(unittest.TestCase):
         cfg = server.checked_config_effort(dict(self.CFG), public(), True)
         self.assertEqual(cfg["reasoning_effort"], "auto")
 
+
+
+class Http(unittest.TestCase):
+    """A required call through each API: the openings reach the engine with the request (OpenAI's chat, Anthropic's
+    messages, Responses)."""
+
+    def setUp(self):
+        self.svc, self.eng, self.tok = service("get_weather" + CALL + '{"name":"get_weather","args":{"city":"Rome"}}'
+                                               + END)
+        self.eng.info["starts"] = 1
+        self.httpd = server.serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    def check(self, path, body):
+        code, out = self.post(path, body)
+        self.assertEqual(code, 200, out)
+        self.assertEqual(self.eng.sampling[0].get("_starts"),
+                         [self.tok.encode("get_weather") + [self.tok.special_tokens[CALL]]])
+        return out
+
+    def test_chat(self):
+        out = self.check("/v1/chat/completions", {"model": "x", "messages": ASK, "tools": TOOLS,
+                                                  "tool_choice": "required"})
+        self.assertEqual(out["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather")
+
+    def test_messages(self):
+        tools = [{"name": "get_weather", "description": "Weather.", "input_schema": TOOLS[0]["function"]["parameters"]}]
+        out = self.check("/v1/messages", {"model": "x", "max_tokens": 100, "messages": ASK, "tools": tools,
+                                          "tool_choice": {"type": "any"}})
+        self.assertEqual([b["name"] for b in out["content"] if b["type"] == "tool_use"], ["get_weather"])
+
+    def test_responses(self):
+        out = self.check("/v1/responses", {"model": "x", "input": "Weather in Paris?", "tool_choice": "required",
+                                           "tools": [{"type": "function", **TOOLS[0]["function"]}]})
+        self.assertEqual([o["name"] for o in out["output"] if o["type"] == "function_call"], ["get_weather"])
 
 if __name__ == "__main__":
     unittest.main()

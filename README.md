@@ -4,7 +4,7 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B), MiniMax-M3.1-Flash (428 B) and Hy4-Flash (220 B) on your own GPU</b><br>
+<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B), MiniMax-M3.1-Flash (428 B), Hy4-Flash (220 B), Ling-3.2-air (128 B) and Inkling 2 Mini (26 B) on your own GPU</b><br>
 private and fast · one NVIDIA GPU or up to 16 · AMD and Windows · chat, pictures, OpenAI- and
 Anthropic-compatible API · several requests at once</p>
 
@@ -15,6 +15,8 @@ Anthropic-compatible API · several requests at once</p>
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/inkling.svg" alt="Inkling 2 Mini Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/ling.svg" alt="Ling-3.2-air Maya downloads"></a>
 </p>
 
 <p align="center">Created and led by <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>), co-maintained
@@ -25,7 +27,7 @@ with <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
 <sub>Project Maya is free. If it runs well on your PC, sponsoring it pays for the test hardware and the work on it.</sub></p>
 
 Models this size usually need a datacenter. Maya runs five of them on the hardware you already have:
-**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017**, **MiniMax-M3.1-Flash** and **Hy4-Flash**. Each model has an engine built for it. It
+**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017**, **MiniMax-M3.1-Flash**, **Hy4-Flash** and **Ling-3.2-air** - and the smaller **Inkling 2 Mini**. Each model has an engine built for it. It
 keeps the experts your conversation uses most on the GPU, the next ones in RAM and the rest on your NVMe SSD, and moves
 them as you chat. It measures your GPUs, CPU, RAM and SSD and tunes itself to them. Nothing leaves your machine.
 
@@ -62,7 +64,7 @@ recommends one for your PC; to pick one yourself, give its setup id: `./setup.sh
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**<br><sub>zai-org · MIT · 321 B, 18 B active · up to 1M context</sub> | **Maya-S** (default) · `glm-maya-s` | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) |
 | | Maya-S24 · `glm-maya-s24` | 94.7 GB | cards of 24 GB or less: ~1.5 GB more of the card for experts, decode +14% |
 | | Maya-XS · `glm-maya-xs` | 73.4 GB | PCs with 64 GB of RAM and a 24 GB card, at 128K context |
-| | Maya-M · `glm-maya-m` | 116 GB | a bigger memory pool; calibrated toward tool calls and front-end code |
+| | Maya-M · `glm-maya-m` | 116 GB | a bigger memory pool; aimed at tool calls and front-end code |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals; experimental |
 | | Maya-L · `glm-maya-l` | 156.3 GB | the biggest memory pools; the closest to the original |
 | **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [its own license](https://huggingface.co/zai-org/GLM-5.3) · 744 B, 40 B active · up to 1M context · text only</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170.0 GB | the whole model in a 192 GB memory pool (VRAM and RAM together); NVIDIA from the V100 on and AMD ([details](docs/GLM53.md)) |
@@ -72,6 +74,8 @@ recommends one for your PC; to pick one yourself, give its setup id: `./setup.sh
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B active · up to 1M context</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | the whole model in a 128 GB PC's memory |
 | | Maya-S · `minimax-maya-s` | 122 GB | closer to the original |
 | **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · up to 1M context · reads pictures · NVIDIA, AMD on Linux</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>each + one 63.4 GB n-gram table | PCs with about 56-64 GB (Maya-XS; cards from 8 GB), 68-80 GB (Maya-S), 80-96 GB (Maya-M) or 104-128 GB (Maya-L) of RAM + VRAM; Maya-S, Maya-M and Maya-L on cards from 12 GB; the n-gram table stays on the SSD |
+| **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**<br><sub>Thinking Machines · Apache 2.0 · 26 B · up to 1M context · reads pictures · NVIDIA, AMD on Linux</sub> | [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) GGUF · `inkling-2-mini` | 17.6 GB | cards from 8 GB: the experts that don't fit stay in RAM; the whole model in VRAM from 24 GB |
+| **[Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air)**<br><sub>inclusionAI · MIT · 128 B · 512 experts a layer, 8 a token · up to 262,144 context · reads pictures · NVIDIA (Linux and Windows), AMD on Linux</sub> | [Maya-S](https://huggingface.co/peasantsmith/Ling-3.2-air-Maya-GGUF) · `ling-3.2-air-maya-s`<br>Maya-M · `ling-3.2-air-maya-m`<br>Maya-L · `ling-3.2-air-maya-l` | 36.9 GB<br>46.0 GB<br>59.2 GB | PCs whose VRAM + RAM hold the file (the setup picks the largest that fits; what VRAM doesn't hold is computed on the CPU); thinking on or off, tool calls, MTP drafting with the model's own block |
 
 **Which model fits your PC?** See [docs/MEMORY.md](docs/MEMORY.md) for each model's recommended memory (VRAM + RAM together).
 
@@ -82,10 +86,10 @@ turboderp's EXL3 quants of GLM, Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M 
 itself as unsloth's UD-IQ2_XS GGUF, both with pictures
 ([its settings](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)), and Tencent's own Q4_K_M of Hy4-flash (AngelSlim's GGUF)
 with MTP drafting (run on NVIDIA RTX 30 / A100 and newer, Linux; with pictures: `./maya.sh --setup --model hy4-flash-q4_k_m`;
-[its settings](docs/SETTINGS.md#hy4-flash)), and Inkling 2 Mini (26 B) as an experimental preview on its own engine:
+[its settings](docs/SETTINGS.md#hy4-flash)), and Inkling 2 Mini (26 B) on its own engine:
 unsloth's UD-Q4_K_XL GGUF on NVIDIA V100 / RTX 20 and newer from 8 GB, Linux and Windows (the experts that don't fit
 stay in RAM; one or two GPUs; up to 1M context), or AMD Radeon from 12 GB and Halo on Linux, with pictures
-(`./maya.sh --setup --model inkling-2-mini`; [docs/INKLING2.md](docs/INKLING2.md)). **Each model's files, drafters, pictures and options:
+(`./maya.sh --setup --model inkling-2-mini`; [docs/INKLING2.md](docs/INKLING2.md)). Ling-3.2-air runs on NVIDIA from the V100 / RTX 20 on, on Linux and Windows, and on one AMD RDNA 3 / 3.5 / 4 GPU or Ryzen AI Max APU under Linux (`./maya.sh --setup --model ling-3.2-air-maya-s`; [docs/LING.md](docs/LING.md)). **Each model's files, drafters, pictures and options:
 [docs/MODELS.md](docs/MODELS.md).**
 
 ## Quality
@@ -99,6 +103,7 @@ Maya's quants are made from each model's released weights and measured against t
 - **MiniMax M3.1 · Maya-S** picks it 87.6% of the time (the average over its categories).
 - **Hy4-Flash · Maya quants** pick it 88.5% (Maya-XS) to 96.6% (Maya-L) of the time, with a KL divergence of 0.16
   down to 0.012 - charts against Tencent's own GGUFs on the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
+- **Ling-3.2-air · Maya quants** pick it 88.1% (Maya-S), 91.1% (Maya-M) and 93.8% (Maya-L) of the time.
 
 More on each model's card on [Hugging Face](https://huggingface.co/peasantsmith).
 
@@ -212,8 +217,10 @@ Every row says which Maya release it was measured on.
 | **2x NVIDIA A40 48 GB** (PCIe 4.0 x16), 2x Xeon Gold 6330, 256 GB RAM, Windows Server 2022 | Maya-S, 256K context | 48.9 tokens/s (tuned) | ~660 tokens/s (3K) | v1.1.28 | @yjyz1011 (#508) |
 | **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 48.6 tokens/s | 650 tokens/s (8K) | v1.1.56 | @pepuscz (#905) |
 | **2x RTX PRO 6000 Blackwell 96 GB** (tensor parallel 2, PCIe 5.0), Core Ultra 7 270K Plus, 188 GB DDR5 | UD-Q8_K_XL, 1M context, DSpark | 48.3 tokens/s | 1245 tokens/s (3360 at 48K) | v1.1.51 | @markrussi (#819) |
+| **RTX 5090 32 GB** (600 W, PCIe 5.0 x16) + **2x RTX 3090 24 GB** (about 297 W each, flat 787 mV curve), Threadripper PRO 9965WX (overclocked, 5.4 GHz on all cores), 255 GB DDR5-6400, Windows 11 | UD-Q3_K_XL, 384K context, DSpark | 47.2 tokens/s | 566 tokens/s (8K) | v1.1.76 | @kyle-see (#1242) |
 | **RTX 4090 24 GB** (PCIe 4.0 x8), Ryzen 9 9950X3D, 192 GB DDR5 | Maya-XS, 64K context | 44.1 tokens/s | 539 tokens/s | v1.1.27 | @naeq (#503) |
 | **4x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2630 v4, 504 GB RAM | Maya-S / UD-Q4_K_XL / UD-Q8_K_XL, 64K context | 44.0 / 28.6 / 29.7 tokens/s | 592 / 236 / 233 tokens/s | v1.1.49 | @HansStrupat (#785) |
+| **2x RTX 4090 D 48 GB** (300 W each, PCIe 4.0 x16), EPYC 7452, 512 GB RAM | EXL3 2.9 bpw, 256K context, DSpark | 43.7 tokens/s | 1236 tokens/s (669 at 2K) | v1.1.76 | @handmade0octopus (#1006) |
 | **RX 7900 XTX 24 GB** (PCIe 4.0 x4) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 43.3 tokens/s | 371 tokens/s (8K) | v1.1.56 | @pepuscz (#908) |
 | **1x L40S 48 GB** (vGPU), Xeon Platinum 8580 (a VM, 32 vCPUs), 504 GB RAM | UD-Q8_K_XL, 256K context | 43.2 tokens/s | 1862 tokens/s (174K) | v1.1.32 | @talisp (#577) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | orcarouter abliterated Mix-128G, 256K context, DSpark | 43.2 tokens/s | 453 tokens/s | v1.1.37 | @tobitege (#663) |
@@ -268,11 +275,25 @@ Every row says which Maya release it was measured on.
 
 </details>
 
-<details><summary><b>Inkling 2 Mini (experimental preview) speed benchmarks</b></summary>
+<details><summary><b>Inkling 2 Mini speed benchmarks</b></summary>
 
 | Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | Release | By |
 | --- | --- | ---: | ---: | --- | --- |
 | **RX 7900 XTX 24 GB** (gfx1100), Ryzen 7 7800X3D, 32 GB RAM | unsloth UD-Q4_K_XL, 128K context | 109.1 tokens/s | 2267 tokens/s | v1.1.74 | @lazm0 (#1116) |
+
+</details>
+
+<details><summary><b>Ling-3.2-air speed benchmarks</b></summary>
+
+| Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | Release | By |
+| --- | --- | ---: | ---: | --- | --- |
+| **Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 107.8 tokens/s | 1823 tokens/s (1875 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-S, MTP drafting, FP16 cache | 124.7 tokens/s | 3561 tokens/s (1908 at 2K) | v1.1.82 | maintainer |
+| **2x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 125.5 tokens/s | 2834 tokens/s (1888 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-M, MTP drafting, FP16 cache | 124.1 tokens/s | 3498 tokens/s (1893 at 2K) | v1.1.82 | maintainer |
+| **3x Tesla V100 32 GB** (PCIe 3.0), 2x Xeon Gold 6138 | Maya-L, MTP drafting, FP16 cache | 127.8 tokens/s | 3383 tokens/s (1810 at 2K) | v1.1.82 | maintainer |
+
+On one card part of Maya-S's experts run from RAM.
 
 </details>
 
@@ -395,6 +416,11 @@ Thank you!
 
 <p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="40"></a>
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a></p>
+<p align="center">
+<img src="https://cdn.simpleicons.org/dash/008DE4" alt="Dash" title="Dash" height="20" align="top"> <code>Xqp3JtJhCoRvGt8TXpyvS9qvukFGp5EPqd</code><br>
+<img src="https://cdn.simpleicons.org/bitcoin/F7931A" alt="Bitcoin" title="Bitcoin" height="20" align="top"> <code>3BCPYKcCSm4VdjUiRPbxGatqCP9h3bo61f</code><br>
+<img src="https://cdn.simpleicons.org/ethereum/627EEA" alt="Ethereum" title="Ethereum" height="20" align="top"> <code>0xE083E8e8eAb2E899F84c4488A0B6a8e522841Cc2</code>
+</p>
 
 Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says what helps most.
 
@@ -410,6 +436,8 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
 - **Built on [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License, Copyright (c) 2023-2026 The ggml
   authors): the quantization formats, the CPU dot products and the prompt path's MMQ kernels, built from a pinned
   commit (`third_party/ggml/LICENSE`).
+- **Started from [Strata](https://github.com/Niko1221/Strata)** (MIT License, Copyright (c) 2026 Niko1221 and the Strata
+  contributors).
 - **EXL3 support** follows [exllamav3](https://github.com/turboderp-org/exllamav3)'s format, codebooks, CPU expert
   kernel and tensor-core decoding of a tile (MIT License, Copyright (c) 2025 Turboderp; `third_party/exllamav3/LICENSE`). **The DFlash2 drafter's
   forward** follows [beellama.cpp](https://github.com/Anbeeld/beellama.cpp)'s (MIT License, Copyright (c) 2023-2026
@@ -418,6 +446,11 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   image encoder file are made from zai-org's released weights and keep its license.
   [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) by zai-org (its own license); its GGUF is
   [unsloth's](https://huggingface.co/unsloth/GLM-5.3-GGUF).
+  [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines (Apache 2.0); Maya's
+  quant is made from Thinking Machines' released weights and keeps its license; the vision file and drafter GGUF are
+  [unsloth's](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF).
+  [Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air) by inclusionAI (MIT); Maya's quants and the vision
+  file are made from inclusionAI's released weights and keep its license.
   [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) by DeepSeek (MIT); Maya's
   quant, its Engram tables and the drafter are made from DeepSeek's released weights and keep its license; the vision
   tower comes from DeepSeek's checkpoint, the GGUF option from

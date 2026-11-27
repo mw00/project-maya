@@ -500,11 +500,20 @@ void pick_form() {
     if ((f != nullptr && std::atoi(f) != 0) || !cpu_avx2()) return;
     std::mt19937 rng(0x644u);
     bool same = true;
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only: the k lists live in a vector; every other engine takes the #else)
+    for (int type : {kIQ2_XXS, kIQ2_S, kIQ3_XXS, kIQ3_S, kMXFP4}) {
+        // (MXFP4 too in the band sizes a tensor-parallel member's FFN takes: 32-value blocks, not a multiple of 256 -
+        //  the AVX2 rows' scalar tail there)
+        const std::vector<int> ks = (type == kMXFP4) ? std::vector<int>{256, 1056, 1152, 1248, 2304, 5120}
+                                                     : std::vector<int>{256, 2304, 5120};
+        for (int k : ks) {
+#else
     for (int type : {kIQ2_XXS, kIQ2_S, kIQ3_XXS, kIQ3_S, kMXFP4})
         // (MXFP4 too in the band sizes a tensor-parallel member's FFN takes: 32-value blocks, not a multiple of 256 -
         //  the AVX2 rows' scalar tail there)
         for (int k : type == kMXFP4 ? std::initializer_list<int>{256, 1056, 1152, 1248, 2304, 5120}
                                     : std::initializer_list<int>{256, 2304, 5120}) {
+#endif
             const int n = 5, nt = 3;
             const std::vector<uint8_t> w = rand_rows(type, n, k, rng);
             std::vector<std::vector<uint8_t>> a(nt, std::vector<uint8_t>(act_bytes(k)));
@@ -522,6 +531,9 @@ void pick_form() {
                 for (int r = 0; r < n; ++r) same = same && std::memcmp(s1[r], s2[r], (size_t) nt * 4) == 0;
             }
         }
+#ifdef MAYA_LING_SWIGLU
+    }
+#endif
     if (!same) {
         std::fprintf(stderr, "ds4: lane parity: the AVX2 rows differ from the scalar ones; the scalar rows are used\n");
         return;

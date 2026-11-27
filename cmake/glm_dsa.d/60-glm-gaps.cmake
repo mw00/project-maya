@@ -34,6 +34,18 @@ if((MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP) AND TARGET maya_engine)
   if(DEFINED MAYA_GGML_DIR AND EXISTS "${MAYA_GGML_DIR}/gguf-py")
     set_property(TEST glm_dsa_pack9_slow_test APPEND PROPERTY ENVIRONMENT "PYTHONPATH=${MAYA_GGML_DIR}/gguf-py")
   endif()
+
+  # GPU: the full model's fast path binds every layer with its FFN widths and answers (#1200), on the synthetic pack
+  add_executable(glm_dsa_bind_widths_test tests/glm_dsa/glm_dsa_bind_widths_test.cpp)
+  target_include_directories(glm_dsa_bind_widths_test PRIVATE ${_maya_gpu_include_directories})
+  target_link_libraries(glm_dsa_bind_widths_test PRIVATE ${_maya_gpu_glm_libs} ${_maya_gpu_runtime_target})
+  target_compile_definitions(glm_dsa_bind_widths_test PRIVATE MAYA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME glm_dsa_bind_widths_test COMMAND glm_dsa_bind_widths_test)
+  set_tests_properties(glm_dsa_bind_widths_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 600
+                       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  if(DEFINED MAYA_GGML_DIR AND EXISTS "${MAYA_GGML_DIR}/gguf-py")
+    set_property(TEST glm_dsa_bind_widths_test APPEND PROPERTY ENVIRONMENT "PYTHONPATH=${MAYA_GGML_DIR}/gguf-py")
+  endif()
 endif()
 
 # The Python suites of this wave as CPU ctests (the strata-tools.yml job runs them too)

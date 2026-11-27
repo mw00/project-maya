@@ -113,7 +113,9 @@ export function tierShares(n, eng = {}) {
   const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng.experts) || Math.max(1, vu + ru);
   const disk = Math.max(0, total - vu - ru);
   const gbOf = (x) => (typeof x === "number" && Number.isFinite(x) ? x : null);
-  return {vu, ru, total, disk, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb), diskGb: gbOf(n.disk_gb)};
+  // (maya-ling names the SSD's bytes ssd_gb)
+  return {vu, ru, total, disk, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb),
+          diskGb: gbOf(eng.engine_kind === "ling" ? n.ssd_gb : n.disk_gb)};
 }
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
