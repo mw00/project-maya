@@ -528,6 +528,7 @@ struct Scratch {
     std::vector<float> h, y;          // the entries' h and down outputs
     std::vector<uint8_t> xq, hq;      // the tokens' quantized activations, the entries' quantized h
     std::vector<int> toks, order;     // the tokens that have entries; the entries by expert
+    std::vector<int> t_off, t_cur, t_ent;   // per-token entry index lists for parallel reduction
 };
 
 }  // namespace
@@ -781,12 +782,31 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
             iqc::iq_cpu_down(f, ex.D((size_t) gr.e), hq, gr.c, y, r0, r1);
     }, dn_node.empty() ? nullptr : &dn_node);
     const double tp3 = clk();
-    // each token's weighted sum, in its entries' order
-    for (int i = 0; i < n; ++i) {
-        const CpuEntry& e = entries[(size_t) i];
-        float* o = out + (size_t) e.t * E;
-        const float* y = sc.y.data() + (size_t) i * E;
-        for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
+    // each token's weighted sum, in its entries' order (parallel across tokens when several tokens are present)
+    if (nq >= 4) {
+        sc.t_off.assign((size_t) T + 1, 0);
+        for (int i = 0; i < n; ++i) ++sc.t_off[(size_t) entries[(size_t) i].t + 1];
+        for (int t = 0; t < T; ++t) sc.t_off[(size_t) t + 1] += sc.t_off[(size_t) t];
+        sc.t_cur.assign(sc.t_off.begin(), sc.t_off.begin() + T);
+        sc.t_ent.resize((size_t) n);
+        for (int i = 0; i < n; ++i) sc.t_ent[(size_t) sc.t_cur[(size_t) entries[(size_t) i].t]++] = i;
+        lane.parallel_for(nq, [&](int ti) {
+            const int t = sc.toks[(size_t) ti];
+            float* o = out + (size_t) t * E;
+            for (int p = sc.t_off[(size_t) t]; p < sc.t_off[(size_t) t + 1]; ++p) {
+                const int i = sc.t_ent[(size_t) p];
+                const float w = entries[(size_t) i].w;
+                const float* y = sc.y.data() + (size_t) i * E;
+                for (int d = 0; d < E; ++d) o[d] += w * y[d];
+            }
+        });
+    } else {
+        for (int i = 0; i < n; ++i) {
+            const CpuEntry& e = entries[(size_t) i];
+            float* o = out + (size_t) e.t * E;
+            const float* y = sc.y.data() + (size_t) i * E;
+            for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
+        }
     }
     {
         long long nq = 0;

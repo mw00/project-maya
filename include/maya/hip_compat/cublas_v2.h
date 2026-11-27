@@ -12,6 +12,7 @@
 #endif
 #include <hipblas/hipblas.h>
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
+#define CUBLAS_COMPUTE_16F HIPBLAS_COMPUTE_16F   // (tests/iq_set_bench.cu's F16 GEMM)
 // (F32 products in TF32 where the GPU has it - maya-hy4's vision attention; on AMD plain F32, the same or better)
 #define CUBLAS_COMPUTE_32F_FAST_TF32 HIPBLAS_COMPUTE_32F
 #define CUBLAS_COMPUTE_32F_PEDANTIC HIPBLAS_COMPUTE_32F   // (maya-ik2: FP32 without TF32 - what hipBLAS does anyway)
