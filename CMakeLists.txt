@@ -1194,11 +1194,18 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     endif()
   endif()
   # Ling-3.2-air (llama.cpp's bailingmoe3): its own engine (src/ling) on maya-ds4's ggml block-type GEMVs
-  # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; Linux: NVIDIA sm_70+, and AMD (HIP,
-  # through include/maya/hip_compat as maya-hy4 / maya-ds4; the tensor-core MLA decode kernel is CUDA's only)
+  # (src/ds4/ds4_iq), maya-hy4's small kernels and maya_kernels' GLM KDA pieces; NVIDIA sm_70+ on Linux and Windows,
+  # AMD (HIP, through include/maya/hip_compat as maya-hy4 / maya-ds4; the tensor-core MLA decode kernel is CUDA's
+  # only) on Linux.  Windows + NVIDIA: built by default since v1.1.83 with MSVC + CUDA, as maya-ik2 and maya-hy4 -
+  # MAYA_LING_WINDOWS=OFF leaves it out; its Windows OS layer: src/ling/ling_sys.hpp
+  option(MAYA_LING_WINDOWS "Build maya-ling on Windows with NVIDIA" ON)
+  set(_ling_os OFF)
+  if(NOT WIN32 OR MAYA_LING_WINDOWS)
+    set(_ling_os ON)
+  endif()
   set(_ling_archs "")
   set(_ling_filter OFF)
-  if(MAYA_ENABLE_CUDA AND NOT WIN32 AND _maya_archs)
+  if(MAYA_ENABLE_CUDA AND _ling_os AND _maya_archs)
     set(_ling_filter ON)
     set(_ling_in "${_maya_archs}")
     if(_ling_in STREQUAL "all" AND CMAKE_CUDA_ARCHITECTURES_ALL)
@@ -1221,17 +1228,24 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     if(_ling_filter AND NOT _ling_archs)
       message(STATUS "Maya: maya-ling not built - it needs sm_70 or newer, arch ${_maya_archs}")
     endif()
-  elseif((MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP) AND WIN32)
-    message(STATUS "Maya: maya-ling not built on Windows for now")
+  elseif(MAYA_ENABLE_CUDA AND NOT _ling_os)
+    message(STATUS "Maya: maya-ling not built on Windows (MAYA_LING_WINDOWS=OFF)")
   endif()
-  if(NOT WIN32 AND ((MAYA_ENABLE_CUDA AND (_ling_archs OR NOT _ling_filter)) OR MAYA_ENABLE_HIP))
+  if(MAYA_ENABLE_HIP AND WIN32)
+    message(STATUS "Maya: maya-ling not built for AMD on Windows for now")
+  endif()
+  if(_ling_os AND ((MAYA_ENABLE_CUDA AND (_ling_archs OR NOT _ling_filter)) OR (MAYA_ENABLE_HIP AND NOT WIN32)))
     add_executable(maya-ling src/ling/ling_main.cu src/ling/ling_model.cu src/ling/ling_kernels.cu src/ling/ling_vision.cu
                              src/ling/ling_parity.cpp
                              src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp
                              src/kernels/cuda/glmd_dec.cu src/kernels/cuda/glmd_batch.cu
                              src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_lane_parity.cpp
                              src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_lt.cu)
-    set_source_files_properties(src/ling/ling_parity.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    if(MSVC)   # (no contraction either way: the CPU lane's rows must match the GPU's bit for bit)
+      set_source_files_properties(src/ling/ling_parity.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
+    else()
+      set_source_files_properties(src/ling/ling_parity.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
     target_include_directories(maya-ling PRIVATE ${_maya_gpu_include_directories} include src/ling src/hy4
                                                  src/ds4 src/mm3 src/kernels/cuda third_party/ggml)
     target_link_libraries(maya-ling PRIVATE maya_kernels maya_kernels_cpu ${_maya_gpu_runtime_target}
@@ -1269,9 +1283,9 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
       set_tests_properties(ling_mixed_gu_test PROPERTIES TIMEOUT 600)
     endif()
   endif()
-  if(MAYA_BUILD_TESTS AND NOT WIN32)
+  if(MAYA_BUILD_TESTS AND _ling_os)
     add_executable(ling_unit_test tests/ling_unit_test.cpp)
-    target_include_directories(ling_unit_test PRIVATE src/ling src/ds4)
+    target_include_directories(ling_unit_test PRIVATE include src/ling src/ds4)
     target_link_libraries(ling_unit_test PRIVATE Threads::Threads)
     add_test(NAME ling_unit_test COMMAND ling_unit_test)
   endif()

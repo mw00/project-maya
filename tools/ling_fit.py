@@ -291,10 +291,11 @@ def recommended_context(vram_gbs: list[float] | float, kv: str = DEFAULT_KV, qua
 
 def unsupported(backend: str, win: bool, gpus: list[dict], ram_gb: float = 0.0, avx2: bool = True) -> str | None:
     """Clear refusal message for unsupported machines (None = supported).  AMD (backend "hip"): the setup's amd_gpus
-    entries ({"arch": "gfx1151", "vram_gb", "unified_memory": an APU whose memory is the RAM - no VRAM minimum})."""
+    entries ({"arch": "gfx1151", "vram_gb", "unified_memory": an APU whose memory is the RAM - no VRAM minimum}).
+    Windows: NVIDIA only (maya-ling is not built for AMD there)."""
     if backend == "hip":
         if win:
-            return ("Ling-3.2-air on AMD runs on Linux only for now (its engine is not built for AMD on Windows yet)")
+            return ("Ling-3.2-air on AMD runs on Linux only for now; on Windows maya-ling runs on NVIDIA GPUs only")
         if len(gpus) > 1:
             return "Ling-3.2-air on AMD runs on one GPU for now: pick one (--gpu N)"
         if gpus and not str(gpus[0].get("arch") or "").startswith(AMD_ARCHS):
@@ -308,8 +309,8 @@ def unsupported(backend: str, win: bool, gpus: list[dict], ram_gb: float = 0.0, 
         if not avx2:
             return "This CPU lacks AVX2; maya-ling's CPU expert lane requires AVX2"
         return None
-    if win:
-        return "Ling-3.2-air (maya-ling) is Linux CUDA only for now; Windows support is tracked upstream"
+    if win and backend != "cuda":
+        return "Ling-3.2-air (maya-ling) on Windows runs on NVIDIA GPUs only; on an AMD GPU it needs Linux for now"
     if backend == "metal":
         return "Ling-3.2-air (maya-ling) requires an NVIDIA CUDA GPU (compute capability >= 7.0); Metal is not supported yet"
     if not gpus:

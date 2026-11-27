@@ -222,6 +222,15 @@ void print_mem(const std::vector<int>& gpus) {
         std::fclose(f);
         if (rss_gib > 0.0) std::fprintf(stderr, "Host RAM: %.2f GiB RSS (peak %.2f GiB)\n", rss_gib, hwm_gib);
     }
+#elif defined(_WIN32)
+    {   // (Windows: the working set and its peak - the same line)
+        PROCESS_MEMORY_COUNTERS pm{};
+        pm.cb = sizeof pm;
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pm, pm.cb) && pm.WorkingSetSize > 0)
+            std::fprintf(stderr, "Host RAM: %.2f GiB RSS (peak %.2f GiB)\n",
+                         (double) pm.WorkingSetSize / (double) (1ULL << 30),
+                         (double) pm.PeakWorkingSetSize / (double) (1ULL << 30));
+    }
 #endif
 }
 
