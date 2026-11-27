@@ -329,6 +329,11 @@ struct Layer {
     int n_res = 0;               // (the plan) experts in VRAM; the others on the CPU lane
     std::vector<int> slot_of;    // each expert's slot (-1: the CPU lane's), and on the device
     int* slot_d = nullptr;
+    // (HY4_ARENA_LEND: experts of the CPU lane copied into the idle prompt arena for an answer's token windows - lent[e],
+    //  and every expert's blob address for the kernels' pointer path: VRAM slot, the arena, or 0 for the lane)
+    std::vector<char> lent;
+    int n_lent = 0;
+    unsigned long long* lend_ptr = nullptr;
     CpuExperts cex;              // the CPU lane's view of the layer's experts (the file's tensors)
     // the GPU fetch (Impl::Fetch): its experts' blobs in pinned RAM as the layer's GPU addresses them, each VRAM slot's
     // expert, the experts' scores (and the start's slots and scores, put back after a trial)
@@ -349,9 +354,12 @@ struct Layer {
         return !dense && !mtp && (tpm < 0 ? n_res < (int) slot_of.size() : !lane_e.empty());
     }
     // expert e is the CPU lane's here (a member's slot -1 alone is another member's expert)
-    bool on_lane(int e) const { return tpm < 0 ? slot_of[(size_t) e] < 0 : !lane_e.empty() && lane_e[(size_t) e] != 0; }
+    bool on_lane(int e) const {
+        return tpm < 0 ? slot_of[(size_t) e] < 0 && (n_lent == 0 || !lent[(size_t) e])
+                       : !lane_e.empty() && lane_e[(size_t) e] != 0;
+    }
     int n_lane() const {
-        if (tpm < 0) return (int) slot_of.size() - n_res;
+        if (tpm < 0) return (int) slot_of.size() - n_res - n_lent;
         int n = 0;
         for (char c : lane_e) n += c != 0;
         return n;
@@ -952,6 +960,8 @@ struct Model::Impl {
     int* h_pos = nullptr;                // pinned [3][Tc]: pos, lo, nk
 
     ~Impl() {
+        lend_cancel = true;   // (HY4_ARENA_LEND: a copy under way stopped first)
+        if (lend_thr.joinable()) lend_thr.join();
         if (mtp_crew) mtp_crew->wait();
         mtp_crew.reset();
         if (hm.s) {
@@ -1693,9 +1703,9 @@ struct Model::Impl {
     size_t deq_rows() const { return dense_kbuf_rows((size_t) g.n_swa, (size_t) Tc, (size_t) dense_max, kSub); }
     static constexpr size_t kBand = 32u << 20;   // (values: a dense matrix decoded to F16 this much at a time)
     // (H, ff: the most heads and the widest dense / shared FFN a layer gives the GPU - a tensor-parallel member's share)
-    size_t scratch_floats(size_t& f16, size_t& ints, size_t H = 64, size_t ff = 0) const {
+    size_t scratch_floats(size_t& f16, size_t& ints, size_t H = 64, size_t ff = 0, int rows = 0) const {
         if (ff == 0) ff = (size_t) g.n_ff;
-        const size_t E = g.n_embd, hc = g.hc, maxk = (size_t) g.ix_top_k + g.ix_kpool, T = (size_t) Tc;
+        const size_t E = g.n_embd, hc = g.hc, maxk = (size_t) g.ix_top_k + g.ix_kpool, T = (size_t) (rows > 0 ? rows : Tc);
         const size_t lat = g.n_lat, ffe = g.n_ff_exp, npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
         const size_t egc = (size_t) std::max(1, pk.eg.cols()) * std::max(1, pk.eg.head_dim);
         size_t f = T * hc * E + 6 * T * E + T * hc + 2 * T * g.q_lora + T * H * g.k_mla + T * H * g.kv_row() +
@@ -1712,12 +1722,16 @@ struct Model::Impl {
                16 * W * ffe / 4 + T * egc / 4 + W * E / 4;
         return f;
     }
-    size_t scratch_bytes(size_t H = 64, size_t ff = 0) const {
+    size_t scratch_bytes(size_t H = 64, size_t ff = 0, int rows = 0) const {
         size_t f16 = 0, ints = 0;
-        const size_t f = scratch_floats(f16, ints, H, ff);
+        const size_t f = scratch_floats(f16, ints, H, ff, rows);
         const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
-        return f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * dense_max * 4 + deq_rows() * g.kv_row() * 2 +
-               pick_bytes() + (96u << 20);
+        size_t b = f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * dense_max * 4 + deq_rows() * g.kv_row() * 2 +
+                   pick_bytes() + (96u << 20);
+        // (HY4_ARENA_LEND: the token path's own scratch of W rows too, and the layers' pointer tables)
+        if (rows == 0 && lend_wanted() && Tc > W)
+            b += scratch_bytes(H, ff, W) + (size_t) g.n_layer * g.n_expert * sizeof(unsigned long long);
+        return b;
     }
 
     int main_gi = 0;
@@ -3593,8 +3607,9 @@ struct Model::Impl {
         VPart vpart(kVPrompt);
         if (!only_bytes) CK(cudaSetDevice(gp.dev));
         const size_t E = (size_t) g.n_embd, hc = (size_t) g.hc, H = (size_t) gp.sH, maxk = (size_t) g.ix_top_k + g.ix_kpool;
-        const size_t lat = (size_t) g.n_lat, ff = (size_t) (gp.sFF ? gp.sFF : g.n_ff), ffe = (size_t) g.n_ff_exp,
-                     T = (size_t) Tc;
+        const size_t lat = (size_t) g.n_lat, ff = (size_t) (gp.sFF ? gp.sFF : g.n_ff), ffe = (size_t) g.n_ff_exp;
+        size_t T = (size_t) Tc;
+        const size_t posT = (size_t) Tc;   // (the positions' three arrays are Tc apart, the token path's too)
         const size_t egc = (size_t) std::max(1, pk.eg.cols()) * std::max(1, pk.eg.head_dim);
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
         const size_t npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
@@ -3626,9 +3641,12 @@ struct Model::Impl {
         // the one allocation in the same order
         size_t at = 0;
         bool carve = false;
+        uint8_t* base = nullptr;
+        std::vector<std::pair<void**, size_t>>* rec = nullptr;   // (HY4_ARENA_LEND: each buffer's field and offset)
         auto take = [&](auto*& p, size_t n) {
             const size_t b = (std::max<size_t>(n * sizeof(*p), 256) + 255) & ~(size_t) 255;
-            if (carve) p = (std::remove_reference_t<decltype(p)>) (void*) (gp.arena + at);
+            if (carve) p = (std::remove_reference_t<decltype(p)>) (void*) (base + at);
+            if (rec) rec->push_back({(void**) (void*) &p, at});
             at += b;
             return true;
         };
@@ -3650,7 +3668,7 @@ struct Model::Impl {
                take(gp.grp_start, 16 * W + 2) && take(gp.grp_ent, 16 * W) &&
                take(gp.n_groups, 1) &&
                take(gp.ws, k::attn_ws_floats(kSub, (int) H, g.kv_lora, (int) maxk)) &&
-               take(gp.pos, 3 * T) && take(gp.keys, T * maxk) && take(gp.knk, T) &&
+               take(gp.pos, 3 * posT) && take(gp.keys, T * maxk) && take(gp.knk, T) &&
                take(gp.iq, T * g.ix_heads * g.ix_dim) && take(gp.ik, T * g.ix_dim) &&
                take(gp.ivt, T * 2 * g.ix_dim) && take(gp.wt, T * g.ix_heads) &&
                take(gp.score, (size_t) kSub * npool) && take(gp.eg_rows, T * egc) &&
@@ -3667,8 +3685,40 @@ struct Model::Impl {
         // (the head GPU's: what its buffers lack of the largest picture's room - the plan's vis_keep - at their end)
         const size_t pad_b = !only_bytes && vis_lend_on && !G.empty() && &gp == &G[(size_t) head_gpu] ? (size_t) vis_keep : 0;
         all();
+        // HY4_ARENA_LEND: the token path's own small scratch too (its buffers for W rows, and the layers' pointer
+        // tables), so the prompt arena is idle through an answer's token windows - lend_grant fills it with experts
+        const bool lend_mk = lend_wanted() && Tc > W && (only_bytes || &gp == &G[(size_t) head_gpu]);
+        size_t small_b = 0;
+        const size_t tab_b = (size_t) g.n_layer * g.n_expert * sizeof(unsigned long long);
+        if (lend_mk) {
+            const size_t big = at;
+            const int Tc0 = Tc;
+            const size_t sb0 = stage_b;
+            Tc = W;
+            T = (size_t) W;
+            stage_b = 0;
+            at = 0;
+            all();
+            small_b = (at + 255) / 256 * 256 + tab_b;
+            if (!only_bytes) {
+                if (!gp.alloc(lend_arena, small_b, err)) return false;
+                lend_sm.clear();
+                base = lend_arena;
+                at = 0;
+                carve = true;
+                rec = &lend_sm;
+                all();
+                rec = nullptr;
+                carve = false;
+                lend_tab = (unsigned long long*) (void*) (lend_arena + small_b - tab_b);
+            }
+            Tc = Tc0;
+            T = (size_t) Tc;
+            stage_b = sb0;
+            at = big;
+        }
         if (only_bytes) {
-            *only_bytes = at;
+            *only_bytes = at + small_b;
             return true;
         }
         if (!gp.alloc(gp.arena, at + pad_b, err)) return false;
@@ -3676,10 +3726,22 @@ struct Model::Impl {
         k::hc_reserve(Tc);   // (the hyper-connections' buffers for a chunk's rows: never grown inside a forward)
         at = 0;
         carve = true;
+        base = gp.arena;
+        if (lend_mk) {
+            lend_big.clear();
+            rec = &lend_big;
+        }
         all();
+        rec = nullptr;
         gp.sS_n = att;
         gp.lo = gp.pos + T;
         gp.nk = gp.pos + 2 * T;
+        if (lend_mk) {
+            lend_ready = true;
+            for (Layer& l : L) l.lend_ptr = l.il >= 0 && l.il < g.n_layer ? lend_tab + (size_t) l.il * g.n_expert : nullptr;
+            std::fprintf(stderr, "maya-hy4: HY4_ARENA_LEND: the token path's own scratch %.0f MB; the prompt's %.0f MB "
+                         "lent to experts through an answer's token windows\n", small_b / 1e6, gp.arena_b / 1e6);
+        }
         // (KV streaming: the picked rows' buffer, its starts and the union's slot table - their own allocations, out
         //  of the arena a picture borrows: the starts and the slot table (all -1) must outlive a picture)
         if (kv_res() > 0 && !(gp.alloc(gp.kpick, (size_t) kSub * maxk * kv_rb() / 2, err) &&
@@ -3706,6 +3768,7 @@ struct Model::Impl {
         uint8_t* room = nullptr;
         size_t cap = 0;
         if (vis_lend_on && hg.arena && vis->device() == hg.dev && vis->room_of(width, height) <= hg.arena_b) {
+            lend_revoke();
             mtp_settle();
             CK(cudaSetDevice(hg.dev));
             CK(cudaStreamSynchronize(hg.s));
@@ -6484,6 +6547,206 @@ struct Model::Impl {
         for (int i = 0; i < T * g.n_used; ++i) ++c[h_ids[i]];
     }
 
+    // HY4_ARENA_LEND (HY4_ARENA_LEND=1; one GPU, no tensor parallel, no KV streaming, no GPU fetch, no HY4_PSTREAM):
+    // the prompt arena (scratch's buffers for a chunk of Tc rows, ~3.7 GB at --chunk 8192) is idle while an answer's
+    // token windows run - they work in a small scratch of their own (W rows).  At an answer's first token window the
+    // arena takes the CPU lane's most routed experts (HY4_HOT's scores a byte, over every layer), copied in from the
+    // file's rows, and the token path's expert kernels address every expert through a pointer table (the GPU fetch's
+    // path: a VRAM slot, the arena, or 0 for the lane).  A forward of more than W rows, a picture, the HOT moves and
+    // KV_GROW's moves take the arena back first (the tables only: no copies).  An answer runs on one placement: the
+    // lent experts come in at its first window, before any of its tokens.
+    bool lend_ready = false, lend_small = false, lend_active = false;
+    uint8_t* lend_arena = nullptr;
+    unsigned long long* lend_tab = nullptr;
+    std::vector<std::pair<void**, size_t>> lend_big, lend_sm;
+    int64_t lend_grants = 0, lend_n = 0;
+    double lend_s = 0;
+    bool lend_wanted() const {
+        const char* e = std::getenv("HY4_ARENA_LEND");
+        const char* ps_e = std::getenv("HY4_PSTREAM");
+        return e && std::atoi(e) != 0 && !(ps_e && std::atoi(ps_e) != 0) && G.size() == 1 && tp <= 1 &&
+               kv_res() == 0 && !o.trial;
+    }
+    // the token path's own scratch (small) or the prompt arena's buffers for every scratch pointer
+    bool lend_use(bool small) {
+        if (!lend_ready || lend_small == small) return true;
+        std::string err;
+        Gpu& gp = G[(size_t) head_gpu];
+        CK(cudaSetDevice(gp.dev));
+        CK(cudaDeviceSynchronize());
+        for (auto& [f, off] : lend_big) *f = nullptr;
+        for (auto& [f, off] : small ? lend_sm : lend_big) *f = (small ? lend_arena : gp.arena) + off;
+        gp.lo = gp.pos + Tc;   // (the positions' three arrays: Tc apart in both)
+        gp.nk = gp.pos + 2 * Tc;
+        lend_small = small;
+        return true;
+    }
+    // the lent experts back to the lane (the tables only) and the arena to the prompt's buffers
+    bool lend_revoke() {
+        if (lend_started) {   // (a copy under way: stopped, waited for)
+            lend_cancel = true;
+            if (lend_thr.joinable()) lend_thr.join();
+            lend_started = false;
+        }
+        if (lend_active) {
+            for (Layer& l : L) {
+                if (l.n_lent == 0) continue;
+                std::fill(l.lent.begin(), l.lent.end(), 0);
+                l.n_lent = 0;
+            }
+            lend_active = false;
+        }
+        return lend_use(false);
+    }
+    // a layer's pointer table: every expert's blob - its VRAM slot's, the arena's, or 0 (the lane's)
+    void lend_table(Layer& l, std::vector<unsigned long long>& tab, const std::vector<size_t>& off) {
+        tab.assign((size_t) g.n_expert, 0ull);
+        for (int e = 0; e < g.n_expert; ++e) {
+            const int sl = l.slot_of[(size_t) e];
+            if (sl >= 0) tab[(size_t) e] = (unsigned long long) (l.experts + (size_t) sl * l.blob);
+            else if (l.n_lent > 0 && l.lent[(size_t) e]) tab[(size_t) e] = (unsigned long long) (G[(size_t) head_gpu].arena + off[(size_t) e]);
+        }
+    }
+    // (the lent experts' copy: a thread of its own gathers their blobs from the file's rows into the pinned staging
+    //  slots' two halves and copies them in on a stream of its own, while the token windows run with the lane as
+    //  before; at the answer's lend_at-th token window (HY4_ARENA_LEND_AT, 16) the tables switch - the copy waited
+    //  for there if it is not done - so an answer's placement does not depend on the copy's speed)
+    struct LendPick {
+        float d;
+        int li, e;
+        size_t off;
+    };
+    std::vector<LendPick> lend_pick;
+    std::thread lend_thr;
+    std::atomic<bool> lend_cancel{false};
+    bool lend_started = false, lend_copy_ok = false;
+    int lend_wins = 0;
+    double lend_t0 = 0, lend_copy_s = 0;
+    size_t lend_bytes = 0;
+    cudaStream_t lend_st = nullptr;
+    cudaEvent_t lend_ev[2] = {nullptr, nullptr};
+    int lend_at() const {
+        static const int v = std::getenv("HY4_ARENA_LEND_AT") ? std::max(1, std::atoi(std::getenv("HY4_ARENA_LEND_AT"))) : 16;
+        return v;
+    }
+    bool lend_begin(std::string& err) {
+        if (!lend_ready || lend_started || lend_active || fx.mode != 0 || h_stage == nullptr || !lane) return true;
+        if (hot.score.size() < (size_t) g.n_layer * g.n_expert) return true;
+        mtp_settle();
+        lend_t0 = now_s();
+        if (!lend_use(true)) return false;
+        static const int lend_mode = std::getenv("HY4_ARENA_LEND") ? std::atoi(std::getenv("HY4_ARENA_LEND")) : 0;
+        if (lend_mode == 2) {   // (the small scratch alone: no experts lent)
+            lend_active = true;
+            return true;
+        }
+        Gpu& gp = G[(size_t) head_gpu];
+        std::vector<LendPick> cand;
+        for (int li = 0; li < (int) L.size(); ++li) {
+            const Layer& l = L[(size_t) li];
+            if (!l.partial() || l.tpm >= 0 || l.il < 0 || l.il >= g.n_layer || l.gpu != head_gpu || l.lend_ptr == nullptr)
+                continue;
+            const float* sc = hot.score.data() + (size_t) l.il * g.n_expert;
+            for (int e = 0; e < g.n_expert; ++e)
+                if (l.slot_of[(size_t) e] < 0 && sc[e] > 0.0f) cand.push_back({sc[e] / (float) l.blob, li, e, 0});
+        }
+        std::stable_sort(cand.begin(), cand.end(), [](const LendPick& x, const LendPick& y) { return x.d > y.d; });
+        lend_pick.clear();
+        size_t at = 0;
+        for (LendPick c : cand) {
+            const size_t bb = (L[(size_t) c.li].blob + 255) / 256 * 256;
+            if (at + bb > gp.arena_b) continue;
+            c.off = at;
+            at += bb;
+            lend_pick.push_back(c);
+        }
+        lend_bytes = at;
+        if (lend_pick.empty()) return true;
+        if (!lend_st) {
+            CK(cudaSetDevice(gp.dev));
+            CK(cudaStreamCreateWithFlags(&lend_st, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&lend_ev[0], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&lend_ev[1], cudaEventDisableTiming));
+        }
+        lend_cancel = false;
+        lend_copy_ok = false;
+        lend_wins = 0;
+        lend_started = true;
+        lend_thr = std::thread([this, dev = gp.dev, arena = gp.arena]() {
+            const double t0 = now_s();
+            lower_this_thread();
+            if (cudaSetDevice(dev) != cudaSuccess) return;
+            const int half = kStage / 2;
+            bool used[2] = {false, false};
+            int h = 0;
+            for (size_t b0 = 0; b0 < lend_pick.size(); b0 += (size_t) half, h ^= 1) {
+                if (lend_cancel.load(std::memory_order_relaxed)) break;
+                if (used[h] && cudaEventSynchronize(lend_ev[h]) != cudaSuccess) return;
+                const int nb = (int) std::min<size_t>((size_t) half, lend_pick.size() - b0);
+                uint8_t* stg = h_stage + (size_t) h * half * stage_blob;
+                for (int i = 0; i < nb; ++i) {
+                    const LendPick& c = lend_pick[b0 + (size_t) i];
+                    const Layer& l = L[(size_t) c.li];
+                    const size_t e = (size_t) c.e;
+                    uint8_t* d = stg + (size_t) i * stage_blob;
+                    std::memcpy(d + l.tr[0], l.cex.G(e), l.cex.g_stride);
+                    std::memcpy(d + l.tr[1], l.cex.U(e), l.cex.g_stride);
+                    std::memcpy(d + l.tr[2], l.cex.D(e), l.cex.d_stride);
+                    if (cudaMemcpyAsync(arena + c.off, d, l.tr[2] + l.cex.d_stride, cudaMemcpyHostToDevice, lend_st) !=
+                        cudaSuccess)
+                        return;
+                }
+                if (cudaEventRecord(lend_ev[h], lend_st) != cudaSuccess) return;
+                used[h] = true;
+            }
+            if (cudaStreamSynchronize(lend_st) != cudaSuccess) return;
+            lend_copy_s = now_s() - t0;
+            lend_copy_ok = !lend_cancel.load();
+        });
+        (void) err;
+        return true;
+    }
+    // the copy waited for, the lent experts' tables in
+    bool lend_finish(std::string& err) {
+        if (!lend_started || lend_active) return true;
+        if (lend_thr.joinable()) lend_thr.join();
+        lend_started = false;
+        if (!lend_copy_ok) return true;   // (a copy that failed: the lane keeps them)
+        Gpu& gp = G[(size_t) head_gpu];
+        CK(cudaSetDevice(gp.dev));
+        std::vector<std::vector<size_t>> off(L.size());
+        for (const LendPick& c : lend_pick) {
+            Layer& l = L[(size_t) c.li];
+            if (l.lent.size() != (size_t) g.n_expert) l.lent.assign((size_t) g.n_expert, 0);
+            if (off[(size_t) c.li].empty()) off[(size_t) c.li].assign((size_t) g.n_expert, 0);
+            off[(size_t) c.li][(size_t) c.e] = c.off;
+            l.lent[(size_t) c.e] = 1;
+            ++l.n_lent;
+        }
+        std::vector<unsigned long long> tab;
+        for (size_t li = 0; li < L.size(); ++li) {
+            Layer& l = L[li];
+            if (l.n_lent == 0) continue;
+            lend_table(l, tab, off[li]);
+            CK(cudaMemcpyAsync(l.lend_ptr, tab.data(), sizeof(unsigned long long) * g.n_expert, cudaMemcpyHostToDevice, gp.s));
+        }
+        CK(cudaStreamSynchronize(gp.s));
+        lend_active = true;
+        ++lend_grants;
+        lend_n = (int64_t) lend_pick.size();
+        lend_s += now_s() - lend_t0;
+        if (lend_grants == 1)
+            std::fprintf(stderr, "maya-hy4: HY4_ARENA_LEND: %zu more routed experts in VRAM (%.0f MB of the prompt arena) "
+                         "from the answer's token window %d on, copied in %.0f ms beside the first ones\n",
+                         lend_pick.size(), lend_bytes / 1e6, lend_at(), lend_copy_s * 1e3);
+        return true;
+    }
+
+    // the token path's pointer table for layer l while experts are lent (null: its slots alone)
+    const unsigned long long* lend_eptr(const Layer& l, int T) const {
+        return lend_active && T <= W && l.n_lent > 0 ? l.lend_ptr : nullptr;
+    }
+
     // HY4_HOT (see Hot): its settings and the scores a start begins with - the file's, else the profile's counts
     // as 256 tokens of history, else none.  On unless HY4_HOT=0 (tensor parallel: HY4_HOT=1 only)
     void hot_init() {
@@ -6571,6 +6834,7 @@ struct Model::Impl {
     // a layer's lowest scored VRAM experts with its highest scored CPU-lane ones.  Between requests only (idle()):
     // the copies and the slot tables go on the layer GPU's stream, after what it has queued
     bool hot_rebalance(int max_swaps, std::string& err) {
+        lend_revoke();   // (HY4_ARENA_LEND: the answer's lent experts back - the slots move now)
         if (!hot.on) return true;
         const double t0 = now_s();
         const float decay = (float) std::exp(-(double) hot.win_tokens / hot.horizon);
@@ -7027,7 +7291,7 @@ struct Model::Impl {
                 CK(cudaStreamWaitEvent(s, gp.fx_ev1, 0));
                 ok = ok && routed_token(l, gp, T, nullptr, gp.latout, gp.fxs.eptr, fx.mode == 2 ? gp.fxs.who : nullptr);
             } else {
-                ok = ok && routed_token(l, gp, T, slot, gp.latout, nullptr, nullptr,
+                ok = ok && routed_token(l, gp, T, slot, gp.latout, lend_eptr(l, T), nullptr,
                                         l.tpm >= 0 && model_sum && !lane_on ? &lat_pre : nullptr, forked);
             }
             if (lane_on && !streamed) {   // (the GPU's experts run meanwhile)
@@ -7223,6 +7487,7 @@ struct Model::Impl {
     bool mtp_forward(const int* ids, int T, int64_t p0, int want, std::string& err, const Mat* head = nullptr,
                      Gpu* on = nullptr, bool no_head = false) {
         Gpu& hg = on ? *on : G[(size_t) head_gpu];
+        if (T > W && lend_small && &hg == &G[(size_t) head_gpu]) lend_revoke();   // (HY4_ARENA_LEND: W rows at most)
         const int E = g.n_embd;
         cudaStream_t s = hg.s;
         if (emb_pending) {   // (h_emb free: the queued pass's copy of it done - once, after such a pass)
@@ -8092,6 +8357,14 @@ struct Model::Impl {
     // (HY4_LOGIT_HASH: every window's logits rows hashed, bit by bit, as they come - printed with the reports at the
     //  end; two builds or settings that print the same hash made the same logits for every row)
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
+        if (lend_ready) {   // (HY4_ARENA_LEND: a chunk takes the arena back; a token window lends it)
+            if (T > W) lend_revoke();
+            else if (!lend_started && !lend_active) {
+                if (!lend_begin(err)) return false;
+            } else if (lend_started && ++lend_wins >= lend_at() && !lend_finish(err)) {
+                return false;
+            }
+        }
         if (!window_run(ids, T, p0, want, logits_out, err)) return false;
         if (logit_hash && want > 0 && logits_out != nullptr) {
             const size_t n = (size_t) want * g.n_vocab;
