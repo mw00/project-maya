@@ -472,7 +472,13 @@ the next experts in the same order. Mode A (two GPUs, AMD, drafting on the offlo
 the faster) keeps v1.1.82's order until it is measured per PC. The decode mode is chosen as before, from the share
 of the profile's picks v1.1.82's tier holds, and the prompts' prefetch keeps the profile's counts. Only where the
 experts sit changes, so the answers are those of the same decode mode. `IK2_TIER_ORDER=layers` / `picks` forces one
-(tests). TIER_RESULTS
+(tests). Measured on a V100 (PCIe 3, 40-core Xeon CPU lane) set to act as an 8 / 12 / 16 GB card, `--bench`
+against v1.1.82 at 32K (FP8 cache, lane parity chosen by both, the same greedy tokens): decode 24.1 -> 37.0 /
+28.8 -> 51.2 / 41.0 -> 60.9 tok/s, and the speed no longer swings with the question (12 GB: 50.8 - 52.0 against
+22.9 - 40.2). Prompts read 6-10% slower (2K: 975 -> 874 / 1208 -> 1131 / 1393 -> 1293 tok/s), most likely because a
+prompt pass uses nearly every expert, and with whole layers the ones not in VRAM sit together in a few layers whose
+copies have little of that layer's work to hide behind (not yet measured apart). The lane carries more of a token's misses this way, so a CPU busy with
+other work costs this order more than the old one.
 
 **What it runs on.** Inkling-2-Mini is a supported model: Linux or Windows, one NVIDIA GPU of 8 GB or more, sm_70
 (Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
