@@ -474,7 +474,7 @@ hold are pinned (Linux and Windows - Windows maps each pinned run at a device ad
 finds an expert through a table of them): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
 the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not need (12.1 GiB pinned; 12 GB card
 ~8 GiB, 16 GB ~4 GiB). `IK2_PIN_ALL=1` pins every expert. The PC needs the model in RAM and VRAM together (about
-24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting stays off on
+13 GB of RAM with an 8 GB card at its default 32K context, more at longer ones; no SSD tier): the setup refuses less in one line. Drafting stays off on
 the offload path (its window runs only where every expert is in VRAM; a NOTE says so).
 
 **Which experts the tier holds (v1.1.83).** Layers 6 .. 17 run three times a token on the same weights, so one VRAM

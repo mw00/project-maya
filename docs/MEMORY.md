@@ -42,9 +42,13 @@ adds room for the system and the default context.
 | | Maya-S | 116 ³ | 53, plus 4-8 for the context | **68-80** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
 | | Maya-M | 132 ³ | 68, plus 4-8 for the context | **80-96** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
 | | Maya-L | 153 ³ | 90, plus 4-8 for the context | **104-128** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
+| | Q4_K_M (Tencent's own, AngelSlim) | 168 ³ | ~108 | **192** | NVIDIA; run on RTX 30 / A100 and newer, Linux |
 | **Qwen-3.8-Flash-Next** | UD-IQ2_XS (unsloth) | 80 ² | 47 | **64** | NVIDIA, AMD |
 | | CYBER-FROST Q5_K_M | 113 ² | 84 | **96** | NVIDIA, AMD |
-| | Q4_K_M (Tencent's own, AngelSlim) | 168 ³ | ~108 | **192** | NVIDIA; run on RTX 30 / A100 and newer, Linux |
+| **Ling-3.2-air** | Maya-S | 36.9 | ~38 | **48** (an 8 GB GPU + 40 GB RAM, at its full 262K context) | NVIDIA (V100 and newer; cards from 8 GB), AMD on Linux ⁵ |
+| | Maya-M | 46.0 | ~47 | **56** (an 8 GB GPU + 48 GB RAM, at 262K) | NVIDIA (V100 and newer; cards from 8 GB), AMD on Linux ⁵ |
+| | Maya-L | 59.2 | ~59 | **68** (an 8 GB GPU + 60 GB RAM, at 262K) | NVIDIA (V100 and newer; cards from 8 GB), AMD on Linux ⁵ |
+| **Inkling 2 Mini** | Maya-L | 17.6 | ~24 (at 262K, FP8 cache) | **32** (a 24 GB GPU holds it whole; or an 8 GB GPU + 24 GB RAM) | NVIDIA (V100 / RTX 20 and newer; cards from 8 GB), Linux and Windows; AMD on Linux (cards from 12 GB) |
 
 \* Mac (Apple Silicon) support is experimental, GLM-5.3-Flash's GGUF quants only.
 ¹ DeepSeek's download includes its n-gram (Engram) tables, which always stay on the SSD and never count toward memory.
@@ -53,6 +57,21 @@ adds room for the system and the default context.
 ³ Hy4-Flash's download is the model file (44.8 GB for Maya-XS, 68.4 GB for Maya-M, 89.5 GB for Maya-L) and one n-gram table (63.4 GB) that every size shares; the table
 stays on the SSD, is read page by page and never counts toward memory. About 110 GB of disk in all for Maya-XS. Tencent's own
 Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its experts fit in about 108 GB of VRAM.
+⁵ Ling-3.2-air on AMD: Linux, one GPU, RDNA 3 / 3.5 / 4 (Radeon RX 7000 / 9000, Ryzen AI Max); on Windows it runs on NVIDIA only.
+
+### Ling-3.2-air
+
+- **RAM:** about 39 / 48 / 60 GB for Maya-S / M / L, whatever the GPU: the setup counts every expert in RAM as well,
+  plus 8 GB for the system, unless all of them fit in VRAM. With less RAM, the experts that do not fit are read from the SSD.
+- **VRAM:** 8 GB at least (the model's own parts and the cache); more VRAM keeps more experts on the GPU.
+- **The cache:** 8,064 bytes a token in FP16 (about 2 GB at the full 262K context), 4,704 in 8-bit rows (opt-in).
+
+### Inkling 2 Mini
+
+- **VRAM:** about 22.3 GiB for the whole model at a 262K context with its FP8 cache (16 KiB a token), so a 24 GB card
+  keeps every expert in VRAM. Smaller cards (NVIDIA from 8 GB, AMD from 12 GB) keep the most-used experts in VRAM
+  and the others in RAM: about 13 GB of RAM with an 8 GB card at its default 32K context.
+- **Total:** about 32 GB of VRAM + RAM at 262K; no part is read from the SSD.
 
 ### Hy4-Flash · Maya-XS
 
