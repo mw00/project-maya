@@ -56,9 +56,8 @@ each layer in VRAM (20,480 at least); the indexer's keys (11,264 bytes a token) 
 because the indexer scores every position. `--kv-streaming on` without a window streams only when the whole cache
 does not fit beside the expert pools. Measured on 4x Tesla V100S 32 GB with UD-IQ2_M, one conversation (#975): at a
 1M context a 20,480 window decodes 29.9 tokens/s against 27.1 with the whole cache in VRAM and reads a 26K-token
-prompt at 616 tokens/s against 535, for 4 GB more RAM; at 262K it changes nothing. In a conversation 397K tokens
-deep, long answers come about 5% faster and short answers right after a prompt read about 10% slower (the window
-starts cold after each read). Not measured: AMD (HIP), Windows, several answers at once, the FP16 latent.
+prompt at 616 tokens/s against 535, for 4 GB more RAM; in a conversation 397K tokens deep, long answers came about
+5% faster. Not measured: AMD (HIP), Windows, several answers at once, the FP16 latent.
 
 ## Its defaults
 

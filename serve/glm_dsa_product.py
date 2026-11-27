@@ -24,7 +24,7 @@ _DSA = re.compile(r"#\s*glm-dsa:\s*trunk\s+(\d+),.*?\bmtp\s+(\w+),\s*indexer ful
 
 # What the engine serves on glm-dsa today, for the setup and the Models page (each True once the engine has it):
 # KV streaming (--kv-streaming on / --kv-resident N) as the setup's default - not yet: the setup writes
-# --kv-streaming off for a GLM-5.3 config, which keeps its whole cache in VRAM, and offers the contexts that fit so
+# --kv-streaming off for a GLM-5.3 config, which keeps its whole cache in VRAM, and offers the contexts that fit there
 KV_STREAMING = False
 # KV streaming by hand (opt-in): the fast path takes a resident window on glm-dsa (L1-6: glm_state_carve refuses one
 # only on the SlowF32 reference path).  Measured on CUDA with 4x Tesla V100S 32 GB and UD-IQ2_M (#975): a 1M context
