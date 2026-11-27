@@ -150,7 +150,7 @@ most (a profile written with `IK2_POP_OUT`). The attention is one fused kernel (
 and clips; FP16 MMA, and wgmma on Hopper).
 
 **Decode** is bound by the PCIe link (~47 expert misses a token on the H200). `IK2_CPU=1` computes a missing
-expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512).
+expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512 or AVX2).
 
 **Two GPUs** (`--gpus 2`, outside the hardware section 8 lists: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
 (`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
@@ -446,6 +446,21 @@ Thinking budget: the config's `"thinking_budget"` (none by default: Inkling thin
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
 
+**Several conversations: the session cache.** One conversation stays on the GPU. Without the session cache, a request
+that does not continue it (and shares none of its snapshots) drops it and reads its own prompt from the start, so two
+conversations taking turns each read their whole prompt every turn. With `IK2_SESSION_CACHE_GB=N`, the conversation
+being dropped is first put aside in up to N GiB of host RAM: its latest snapshot's short-convolution states and
+sliding windows, the full layers' K / V rows before its position, and the drafter's context. A later request whose
+tokens start with an entry's tokens (and the same picture signatures) is taken up from there and reads only what is
+new. Entries are evicted least recently used first; conversations shorter than `IK2_SESSION_CACHE_MIN` tokens (1024)
+are not kept. The cache is off with `--parallel`, where each conversation keeps its own slot, and where the K / V
+cache is streamed from RAM. Measured on an RTX 3090 under Windows (FP8 K / V, the drafter): three conversations of
+30K, 12K and 20K tokens taking turns read 12.5, 5.2 and 8.1 s on their first turn and 0.4-0.8 s on each turn after it.
+Putting a conversation aside or taking it up takes 0.03-0.5 s, and a 20K-token conversation holds 0.4-0.5 GiB of RAM.
+A conversation taken up gives the same tokens as one that never left: 200 greedy tokens compared with the drafter on
+the 24 GB card, and without it on `IK2_VRAM_GB=8`'s offload path, where the K / V rows lent to experts are given back
+first.
+
 **Smaller cards: the offload path.** Where the experts do not all fit (an 8, 12 or 16 GB card, or a 24 GB one past
 its context), tokens still take the resident path's launches, one CUDA graph a token, with a tier of the experts in
 VRAM - the ones Maya's profile (`data/expert-profile-ik2mini.bin`, prompts and answers over code, docs and a tool
@@ -481,7 +496,11 @@ those picks' places before the sum - so every row and the sum's order are one ca
 on which card holds an expert (two cards of one kind: the one-card offload path's answers, checked on the CLI and the
 server's answers, tool calls, pictures and loop guard). Copies between the cards: peer to peer only where the driver
 offers it, the IOMMU translates neither card and a test copy at load arrives intact, else through pinned host memory
-(`IK2_HOST_STAGE=1` forces that; the same answers). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
+(`IK2_HOST_STAGE=1` forces that; the same answers). `IK2_PEER_DIRECT_SIGNAL=1` takes the copies out of a visit altogether: a ring of four slots in host memory both cards map -
+GPU 0 writes x and the router's logits into one, GPU 1 (woken by an event) copies them in and writes its rows back with
+the visit's number, and GPU 0 takes the rows only where it has a pick of GPU 1's, which most visits do not. With the
+copies the first card is busy 55 percent of a token (it waits for the round trip of each of the 48 visits); with the ring
+77: 67.4 -> 84.4 tok/s (Q4_K_XL, a 302-token prompt, the same tokens; a verify window of drafting keeps the copies). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
 rows sent back - the split's plain answers; `--drafting auto` measures it). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
 tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
 second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers one card (two

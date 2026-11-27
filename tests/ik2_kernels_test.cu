@@ -1733,11 +1733,60 @@ void test_attn_decode_mma() {
             float* dscr = dev_n<float>(k::attn_decode_mma_scratch(H, c.n_split));
             std::vector<int> pos_h = {c.qpos};
             int* dpos = dev(pos_h);
+            // attn_decode_rdna_kernel (AMD's RDNA 3 / 4, IK2_ATTN_RDNA=1): run twice, and a window of the same token
+            // twice; the checks above it run attn_decode_mma_kernel whatever the mode
+            const bool rdna = fp8 && k::attn_decode_rdna_available();
+            std::vector<float> rd_o[2], rd_t;
+            std::vector<uint16_t> rd_h[2], rd_th;
             if (fp8) {
                 uint8_t *dk = dev(k8), *dv = dev(v8);
+                const int rdna_mode = k::attn_decode_rdna_mode();
+                k::attn_decode_rdna_set(0);
                 k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv, dp,
                                        d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
                 CU(cudaDeviceSynchronize());
+                {   // the other FP8 dequant (e4m3x4_h4 / e4m3x4_h4_s8): the same output to the bit, the FP16 copy too
+                    const auto o1 = host(dout, (size_t) H * D);
+                    const auto h1 = host(dout16, (size_t) H * D);
+                    const bool s8 = k::attn_decode_mma_s8();
+                    k::attn_decode_mma_set_s8(!s8);
+                    k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv,
+                                           dp, d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
+                    CU(cudaDeviceSynchronize());
+                    k::attn_decode_mma_set_s8(s8);
+                    const auto o2 = host(dout, (size_t) H * D);
+                    const auto h2 = host(dout16, (size_t) H * D);
+                    char lb[112];
+                    std::snprintf(lb, sizeof lb, "mma fp8 %s: s8 and h4 dequant the same to the bit", c.name);
+                    expect_true(lb, !std::memcmp(o1.data(), o2.data(), o1.size() * sizeof(o1[0])) &&
+                                        !std::memcmp(h1.data(), h2.data(), h1.size() * sizeof(h1[0])));
+                }
+                if (rdna) {
+                    k::attn_decode_rdna_set(1);
+                    for (int md = 1; md <= 2; ++md) {
+                        k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv,
+                                               v_inv, dp, d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
+                        CU(cudaDeviceSynchronize());
+                        rd_o[md - 1] = host(dout, (size_t) H * D);
+                        rd_h[md - 1] = host(dout16, (size_t) H * D);
+                    }
+                    auto twice = [](auto v) { auto w = v; w.insert(w.end(), v.begin(), v.end()); return w; };
+                    const std::vector<int> pos2 = {c.qpos, c.qpos};
+                    uint16_t* dq2 = dev(twice(q16));
+                    float *dr2 = dev(twice(r)), *ds2 = dev(twice(sink)), *dg2 = dev(twice(gate));
+                    float* dout2 = dev_n<float>((size_t) 2 * H * D);
+                    uint16_t* dout2h = dev_n<uint16_t>((size_t) 2 * H * D);
+                    float* dscr2 = dev_n<float>(2 * k::attn_decode_mma_scratch(H, c.n_split));
+                    int* dpos2 = dev(pos2);
+                    const bool ran = k::attn_decode_mma_toks_fp8(dq2, H * D, dr2, H * d_rel, ds2, dk, dv, c.kv_cap, H, KV,
+                                                                 dpos2, 2, c.n_split, scale * k_inv, v_inv, dp, d_rel,
+                                                                 c.extent, c.window, dscr2, dout2, dg2, H * D, dout2h, 0);
+                    CU(cudaDeviceSynchronize());
+                    if (ran) rd_t = host(dout2, (size_t) 2 * H * D), rd_th = host(dout2h, (size_t) 2 * H * D);
+                    cudaFree(dq2), cudaFree(dout2h), cudaFree(dpos2);
+                    for (float* p : {dr2, ds2, dg2, dout2, dscr2}) cudaFree(p);
+                }
+                k::attn_decode_rdna_set(rdna_mode);
                 cudaFree(dk), cudaFree(dv);
             } else {
                 uint16_t *dk = dev(k16), *dv = dev(v16);
@@ -1787,6 +1836,27 @@ void test_attn_decode_mma() {
                 bool same = true;
                 for (size_t i = 0; i < got.size(); ++i) same &= h16[i] == f2h_host(got[i]);
                 if (!same) expect_true("mma fp8: the FP16 copy is the output rounded", false);
+            }
+            if (rdna) {
+                std::snprintf(label, sizeof label, "rdna fp8 %s", c.name);
+                expect(label, rd_o[0], want, 1e-2, std::max(1e-6, 1e-3 * mag));
+                bool same = true;
+                for (size_t i = 0; i < rd_o[0].size(); ++i) same &= rd_h[0][i] == f2h_host(rd_o[0][i]);
+                if (!same) expect_true("rdna fp8: the FP16 copy is the output rounded", false);
+            }
+            if (rdna) {
+                const size_t n = (size_t) H * D;
+                char lb2[160];
+                std::snprintf(lb2, sizeof lb2, "rdna fp8 %s: two runs the same to the bit", c.name);
+                expect_true(lb2, !std::memcmp(rd_o[0].data(), rd_o[1].data(), n * sizeof(float)) &&
+                                       !std::memcmp(rd_h[0].data(), rd_h[1].data(), n * sizeof(uint16_t)));
+                std::snprintf(lb2, sizeof lb2, "rdna fp8 %s: a window's two tokens the one-token output to the bit",
+                              c.name);
+                expect_true(lb2, rd_t.size() == 2 * n &&
+                                       !std::memcmp(rd_t.data(), rd_o[0].data(), n * sizeof(float)) &&
+                                       !std::memcmp(rd_t.data() + n, rd_o[0].data(), n * sizeof(float)) &&
+                                       !std::memcmp(rd_th.data(), rd_h[0].data(), n * sizeof(uint16_t)) &&
+                                       !std::memcmp(rd_th.data() + n, rd_h[0].data(), n * sizeof(uint16_t)));
             }
             cudaFree(dq), cudaFree(dpos), cudaFree(dout16);
             for (float* p : {dr, dp, ds, dout, dscr, dg}) cudaFree(p);

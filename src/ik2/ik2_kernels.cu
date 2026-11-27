@@ -1582,7 +1582,20 @@ __device__ __forceinline__ bool wa_shared(int pos0, int T, int nw) {
     return wa_per0(pos0, nw) == wa_per0(pos0 + T - 1, nw);
 }
 
-template <class KVT>
+// four E4M3 values as FP16 times 2^-8, lo the first two, hi the other two: a byte's bits are the FP16's (the sign at
+// bit 15, the rest from bit 7), and that FP16 times 2^8 is the E4M3 value, a subnormal too (4 operations for two
+// values, against e4m3x4_h4's dozen - on Volta the attention's FP8 cache waits on these); 0x7F comes out finite
+__device__ __forceinline__ void e4m3x4_h4_s8(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    const uint32_t t0 = __byte_perm(w, 0u, 0x1404u), t1 = __byte_perm(w, 0u, 0x3424u);   // (a byte its half's high one)
+    lo = (t0 & 0x80008000u) | ((t0 >> 1) & 0x3F803F80u);
+    hi = (t1 & 0x80008000u) | ((t1 >> 1) & 0x3F803F80u);
+}
+
+// S8 (an FP8 cache): its K and V as FP16 times 2^-8 (e4m3x4_h4_s8, 4 operations for two values against e4m3x4_h4's
+// dozen), the 2^8 back in the logit scale and in the combine's v_inv.  Every product of the emulated or real MMA is
+// exact in FP32 and a power of two moves through the sums and the rescales unrounded, so the output is S8 = false's
+// to the bit (ik2_kernels_test checks it); only the FP8 decode's own work changes.
+template <class KVT, bool S8 = false>
 __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                        int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
@@ -1625,7 +1638,8 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict
 #pragma unroll
     for (int j = 0; j < kFaD / 16; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
     float ma = -INFINITY, mb = -INFINITY, la = 0.0f, lb = 0.0f;
-    const float sc = qk_scale * kLog2e;
+    float sc = qk_scale * kLog2e;
+    if constexpr (F8 && S8) sc *= 256.0f;   // (K as FP16 times 2^-8; the same rounding of qk_scale kLog2e as without)
     const KVT* kg = kc + (size_t) g * kFaD + tq * 4;    // the lane's values of a K row (+ 16 kk) ...
     const KVT* vg = vc + (size_t) g * kFaD + gr * 16;   // ... and of a V row
     const float* ra = r + (size_t) (g * R + (a_ok ? qa : 0)) * d_rel;   // (the bias: the heads' r)
@@ -1657,8 +1671,13 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict
                 }
 #pragma unroll
                 for (int kk = 0; kk < kFaD / 16; ++kk) {
-                    e4m3x4_h4(w0[kk], ka[kk][0], ka[kk][2]);
-                    e4m3x4_h4(w1[kk], ka[kk][1], ka[kk][3]);
+                    if constexpr (S8) {
+                        e4m3x4_h4_s8(w0[kk], ka[kk][0], ka[kk][2]);
+                        e4m3x4_h4_s8(w1[kk], ka[kk][1], ka[kk][3]);
+                    } else {
+                        e4m3x4_h4(w0[kk], ka[kk][0], ka[kk][2]);
+                        e4m3x4_h4(w1[kk], ka[kk][1], ka[kk][3]);
+                    }
                 }
             } else {
 #pragma unroll
@@ -1738,11 +1757,21 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16_0, const KVT* __restrict
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {   // (four bytes: two dims of two keys)
                     uint32_t a[4];
-                    e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
-                    e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
+                    if constexpr (S8) {
+                        e4m3x4_h4_s8(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
+                        e4m3x4_h4_s8(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
+                    } else {
+                        e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
+                        e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
+                    }
                     mma16816(o[2 * i], a, pb0, pb1);
-                    e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
-                    e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
+                    if constexpr (S8) {
+                        e4m3x4_h4_s8(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
+                        e4m3x4_h4_s8(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
+                    } else {
+                        e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
+                        e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
+                    }
                     mma16816(o[2 * i + 1], a, pb0, pb1);
                 }
             } else {
@@ -1823,14 +1852,6 @@ __global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part_
     if (out16) out16[(size_t) h * kFaD + d] = f2h(res);
 }
 
-// four E4M3 values as FP16 times 2^-8, lo the first two, hi the other two: a byte's bits are the FP16's (the sign at
-// bit 15, the rest from bit 7), and that FP16 times 2^8 is the E4M3 value, a subnormal too (4 operations for two
-// values, against e4m3x4_h4's dozen - on Volta the attention's FP8 cache waits on these); 0x7F comes out finite
-__device__ __forceinline__ void e4m3x4_h4_s8(uint32_t w, uint32_t& lo, uint32_t& hi) {
-    const uint32_t t0 = __byte_perm(w, 0u, 0x1404u), t1 = __byte_perm(w, 0u, 0x3424u);   // (a byte its half's high one)
-    lo = (t0 & 0x80008000u) | ((t0 >> 1) & 0x3F803F80u);
-    hi = (t1 & 0x80008000u) | ((t1 >> 1) & 0x3F803F80u);
-}
 
 // ---- Volta (sm_70): one token's attention on mma.m8n8k4 - attn_decode_mma_kernel's job, its partials and its combine.
 // A warp takes 32 keys a step, a quad pair (mma884) 8 of them:
@@ -7379,8 +7400,43 @@ static void need_class(int cls, const char* what) {
     std::fprintf(stderr, "ik2::k::%s: not on this GPU (sm_%d class; the kernel needs sm_%d)\n", what, arch_class(), cls);
     std::abort();
 }
+static int g_attn_rdna = 0;   // IK2_ATTN_RDNA (AMD's RDNA 3 / 4): 0 attn_decode_mma_kernel (the default), 1 attn_decode_rdna_kernel
+void attn_decode_rdna_set(int mode) { g_attn_rdna = mode; }
+int attn_decode_rdna_mode() { return g_attn_rdna; }
+
+// out [T][C] = sum of a token's picks' wtr[row] y[row], in row order (= expert order); a block a token
+__global__ void moe_rows_combine_kernel(const float* __restrict__ y, const int* __restrict__ inv,
+                                        const float* __restrict__ wtr, int K, int C, float* __restrict__ out) {
+    const int t = blockIdx.x;
+    int r[16];
+    const int kk = K < 16 ? K : 16;
+    for (int k = 0; k < kk; ++k) {   // (insertion sort of a token's few rows)
+        int v = inv[(size_t) t * K + k], j = k;
+        while (j > 0 && r[j - 1] > v) r[j] = r[j - 1], --j;
+        r[j] = v;
+    }
+    for (int c4 = threadIdx.x; c4 < C / 4; c4 += blockDim.x) {
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int k = 0; k < kk; ++k) {
+            const float w = wtr[r[k]];
+            const float4 v = ((const float4*) (y + (size_t) r[k] * C))[c4];
+            a.x = fmaf(w, v.x, a.x), a.y = fmaf(w, v.y, a.y), a.z = fmaf(w, v.z, a.z), a.w = fmaf(w, v.w, a.w);
+        }
+        ((float4*) (out + (size_t) t * C))[c4] = a;
+    }
+}
+void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
+                      cudaStream_t s) {
+    if (T <= 0) return;
+    moe_rows_combine_kernel<<<T, 256, 0, s>>>(y32, inv, wtr, K, C, out);
+    check("moe_rows_combine");
+}
+
 #ifdef MAYA_USE_HIP
 #include "ik2_rdna.inc"   // (AMD: the matrix-core kernels)
+bool attn_decode_rdna_available() { return rdna_wmma_gpu(); }
+#else
+bool attn_decode_rdna_available() { return false; }
 #endif
 
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
@@ -7726,6 +7782,163 @@ void two_take_rows_g(const uint8_t* const* blob, const int* n, const int* row, c
     two_take_rows_g_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) G), 256, 0, s>>>(blob, n, row, other, C, y);
     check("two_take_rows_g");
 }
+
+#ifndef MAYA_USE_HIP
+// ---- the hand-off through host memory both map (two GPUs, IK2_PEER_DIRECT_SIGNAL=1: ik2_kernels.cuh, "Two GPUs, a visit's
+// hand-off").  A word another GPU writes is read with ld.cv (a line kept from a read before counts as stale) and
+// written with st.wt; a wait is one thread's, a short sleep between two reads, bounded on the card's timer.
+namespace {
+
+__device__ __forceinline__ unsigned mail_word(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ float mail_value(const float* p) {
+    float v;
+    asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ void mail_put(unsigned* p, unsigned v) {
+    asm volatile("st.global.wt.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ unsigned long long mail_clock() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+// the block's thread 0 waits for the word to read n (false out of time: err has n); the block is together again
+__device__ __forceinline__ bool mail_wait(const unsigned* p, unsigned n, unsigned* err) {
+    __shared__ bool seen;
+    if (threadIdx.x == 0) {
+        const unsigned long long t0 = mail_clock();
+        seen = true;
+        while (mail_word(p) != n) {
+            if (mail_clock() - t0 > kMailWaitNs) {
+                mail_put(err, n);
+                seen = false;
+                break;
+            }
+            __nanosleep(200);
+        }
+    }
+    __syncthreads();
+    return seen;
+}
+// (the block's writes to the host memory, then its word: a system fence by every thread, the block together, one more)
+__device__ __forceinline__ void mail_signal(unsigned* word, unsigned n) {
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        mail_put(word, n);
+    }
+}
+
+__global__ void mail_send_kernel(const float* x, const float* logits, int C, int E, float* slot_x, const unsigned* freed,
+                                 unsigned n, unsigned free_n, unsigned* err) {
+    if (!mail_wait(freed, free_n, err)) return;
+    for (int i = threadIdx.x; i < C + E; i += blockDim.x) slot_x[i] = i < C ? x[i] : logits[i - C];
+    __threadfence_system();   // (through to the host memory by the end: GPU 1 reads the slot after this kernel's event)
+}
+__global__ void mail_recv_kernel(const float* slot_x, int C, int E, float* x, float* logits, unsigned* freed, unsigned n) {
+    for (int i = threadIdx.x; i < C + E; i += blockDim.x) (i < C ? x[i] : logits[i - C]) = mail_value(slot_x + i);
+    mail_signal(freed, n);   // (the slot's message read: its next one may come)
+}
+__global__ void mail_publish_kernel(const uint8_t* const* blob, const float* y, int K, int C, float* rows,
+                                    unsigned* rows_word, unsigned n) {
+    for (int s = 0; s < K; ++s) {
+        if (!blob[s] || (uintptr_t) blob[s] == kHeldElsewhere) continue;
+        for (int i = threadIdx.x; i < C; i += blockDim.x) rows[(size_t) s * C + i] = y[(size_t) s * C + i];
+    }
+    mail_signal(rows_word, n);
+}
+__global__ void mail_publish_g_kernel(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* y,
+                                      int G, int C, float* rows, unsigned* rows_word, unsigned visit_n) {
+    for (int grp = 0; grp < G; ++grp) {
+        const int n = n_g[grp];
+        if (n <= 0) break;
+        if (!blob[grp] || (uintptr_t) blob[grp] == kHeldElsewhere) continue;
+        for (int m = 0; m < n; ++m) {
+            const size_t s = (size_t) row_g[grp * kGroupMax + m];
+            for (int i = threadIdx.x; i < C; i += blockDim.x) rows[s * C + i] = y[s * C + i];
+        }
+    }
+    mail_signal(rows_word, visit_n);
+}
+__global__ void two_take_rows_mail_kernel(const uint8_t* const* blob, const float* rows, const unsigned* rows_word,
+                                          unsigned n, int C, float* y, unsigned* err) {
+    const int s = blockIdx.y;
+    if ((uintptr_t) blob[s] != kHeldElsewhere) return;   // (a pick GPU 0 ran: nothing to take, nothing to wait for)
+    if (!mail_wait(rows_word, n, err)) return;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
+        y[(size_t) s * C + i] = mail_value(rows + (size_t) s * C + i);
+}
+__global__ void two_take_rows_mail_g_kernel(const uint8_t* const* blob, const int* n_g, const int* row_g,
+                                            const float* rows, const unsigned* rows_word, unsigned visit_n, int C,
+                                            float* y, unsigned* err) {
+    const int grp = blockIdx.y, n = n_g[grp];
+    if (n <= 0 || (uintptr_t) blob[grp] != kHeldElsewhere) return;
+    if (!mail_wait(rows_word, visit_n, err)) return;
+    for (int m = 0; m < n; ++m) {
+        const size_t s = (size_t) row_g[grp * kGroupMax + m];
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
+            y[s * C + i] = mail_value(rows + s * C + i);
+    }
+}
+
+}  // namespace
+
+MailLayout mail_layout(int C, int E, int K, int max_t) {
+    const size_t line = 128;
+    const auto up = [line](size_t b) { return (b + line - 1) / line * line; };
+    MailLayout m;
+    m.logits = (size_t) max_t * C * 4;
+    const size_t msg_b = std::max((size_t) E, (size_t) 2 * max_t * K) * 4;
+    m.rows = up(m.logits + msg_b);
+    m.freed = up(m.rows + (size_t) max_t * K * C * 4);
+    m.rows_word = m.freed + line;
+    m.slot = m.freed + 2 * line;
+    m.ring = m.slot * (size_t) kMailSlots;
+    m.err = m.ring;
+    return m;
+}
+void mail_send(const float* x, const float* logits, int C, int E, float* slot_x, const unsigned* freed, unsigned n,
+               unsigned free_n, unsigned* err, cudaStream_t s) {
+    mail_send_kernel<<<1, 256, 0, s>>>(x, logits, C, E, slot_x, freed, n, free_n, err);
+    check("mail_send");
+}
+void mail_recv(const float* slot_x, int C, int E, float* x, float* logits, unsigned* freed, unsigned n, cudaStream_t s) {
+    mail_recv_kernel<<<1, 256, 0, s>>>(slot_x, C, E, x, logits, freed, n);
+    check("mail_recv");
+}
+void mail_publish(const uint8_t* const* blob, const float* y, int K, int C, float* rows, unsigned* rows_word, unsigned n,
+                  cudaStream_t s) {
+    mail_publish_kernel<<<1, 256, 0, s>>>(blob, y, K, C, rows, rows_word, n);
+    check("mail_publish");
+}
+void mail_publish_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* y, int G, int C,
+                    float* rows, unsigned* rows_word, unsigned visit_n, cudaStream_t s) {
+    if (G <= 0) return;
+    mail_publish_g_kernel<<<1, 256, 0, s>>>(blob, n_g, row_g, y, G, C, rows, rows_word, visit_n);
+    check("mail_publish_g");
+}
+void two_take_rows_mail(const uint8_t* const* blob, const float* rows, const unsigned* rows_word, unsigned n, int S, int C,
+                        float* y, unsigned* err, cudaStream_t s) {
+    if (S <= 0) return;
+    two_take_rows_mail_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S), 256, 0, s>>>(blob, rows, rows_word, n, C, y,
+                                                                                               err);
+    check("two_take_rows_mail");
+}
+void two_take_rows_mail_g(const uint8_t* const* blob, const int* n_g, const int* row_g, const float* rows,
+                          const unsigned* rows_word, unsigned visit_n, int G, int C, float* y, unsigned* err,
+                          cudaStream_t s) {
+    if (G <= 0) return;
+    two_take_rows_mail_g_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) G), 256, 0, s>>>(
+        blob, n_g, row_g, rows, rows_word, visit_n, C, y, err);
+    check("two_take_rows_mail_g");
+}
+#endif  // MAYA_USE_HIP
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s) {
     if (!n) return;
     add_kernel<<<grid(n), kBlk, 0, s>>>(a, b, n, y);
@@ -8570,6 +8783,14 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
     check("attn_decode_fp8_at (combine)");
 }
 
+#if defined(MAYA_USE_HIP)
+static bool g_mma_s8 = true;    // (AMD: the FP8 cache's K and V through e4m3x4_h4_s8 - the same bits, fewer operations)
+void attn_decode_mma_set_s8(bool on) { g_mma_s8 = on; }
+#else
+static const bool g_mma_s8 = false;   // (NVIDIA: e4m3x4_h4 as before - the switch does nothing there)
+void attn_decode_mma_set_s8(bool) {}
+#endif
+bool attn_decode_mma_s8() { return g_mma_s8; }
 int attn_decode_mma_blocks(int Hkv) {
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
@@ -8601,6 +8822,16 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
             attn_decode_v70_kernel<KV><<<dim3((unsigned) Hkv, (unsigned) nblk), kWaNW * 32, 0, s>>>(
                 q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
                 ml_part, blk0);
+#if defined(MAYA_USE_HIP)
+        else if (sizeof(KV) == 1 && attn_decode_rdna_on(H, Hkv))
+            attn_decode_rdna_launch(dim3((unsigned) Hkv, (unsigned) nblk), s, q16, (const uint8_t*) kc,
+                                    (const uint8_t*) vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4,
+                                    extent, window, n_split, o_part, ml_part, blk0, 0, 0, 0);
+        else if (sizeof(KV) == 1 && g_mma_s8)
+            attn_decode_mma_kernel<KV, sizeof(KV) == 1><<<dim3((unsigned) Hkv, (unsigned) nblk), kWaNW * 32, 0, s>>>(
+                q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
+                ml_part, blk0);
+#endif
         else
             attn_decode_mma_kernel<KV><<<dim3((unsigned) Hkv, (unsigned) nblk), kWaNW * 32, 0, s>>>(
                 q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
@@ -8608,13 +8839,19 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         check("attn_decode_mma");
     }
     if (phase == 1) return;
+#if defined(MAYA_USE_HIP)
+    const bool s8 = sizeof(KV) == 1 && (g_mma_s8 || attn_decode_rdna_on(H, Hkv));   // (the RDNA kernel: s8 always)
+#else
+    const bool s8 = sizeof(KV) == 1 && g_mma_s8;
+#endif
     if (arch_class() == 70)
         attn_decode_v70_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
             o_part, ml_part, n_split, H, sink, v_inv * (sizeof(KV) == 1 ? 256.0f : 1.0f), pos, qpos, window, gate, out,
             out16);   // (FP8: its V as FP16 times 2^-8)
     else
     attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
-        o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16);
+        o_part, ml_part, n_split, H, sink, v_inv * (s8 ? 256.0f : 1.0f), pos, qpos, window,
+        gate, out, out16);   // (S8: its V as FP16 times 2^-8)
     check("attn_decode_mma (combine)");
 }
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
@@ -8651,6 +8888,18 @@ static bool attn_decode_mma_toks_impl(const uint16_t* q16, int q_ld, const float
     float* o_part = scratch;
     float2* ml_part = (float2*) (o_part + (size_t) n_split * kWaNW * H * kFaD);
     const bool rel4 = d_rel % 4 == 0 && (((uintptr_t) r | (uintptr_t) proj) & 15) == 0 && r_ld % 4 == 0;
+#if defined(MAYA_USE_HIP)
+    if (sizeof(KV) == 1 && attn_decode_rdna_on(H, Hkv)) {   // (the RDNA kernel: each token its one-token blocks)
+        attn_decode_rdna_launch(dim3((unsigned) Hkv, (unsigned) n_split, (unsigned) T), s, q16, (const uint8_t*) kc,
+                                (const uint8_t*) vc, kv_cap, H, Hkv, pos, 0, qk_scale, r, proj, d_rel, rel4, extent,
+                                window, n_split, o_part, ml_part, 0, q_ld, r_ld, part);
+        attn_decode_mma_combine_kernel<<<dim3((unsigned) H, 1, (unsigned) T), kFaD,
+                                         (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
+            o_part, ml_part, n_split, H, sink, v_inv * 256.0f, pos, 0, window, gate, out, out16, part, gate_ld);
+        check("attn_decode_rdna_toks (combine)");
+        return true;
+    }
+#endif
     // A layer without a sliding window: the tokens' queries on a key's rows read once, where their warps have the
     // same steps (decided on the device from the position: a replayed graph) - and the tokens' own blocks where not,
     // which do nothing otherwise.  IK2_ATTN_SHARE=0: the tokens' own blocks always.
