@@ -1490,6 +1490,19 @@ static int serve_loop(ling::Model& model, int default_spec_k, float default_floo
 
 }  // namespace
 
+// The command line's short form (--help prints it to stdout; a wrong argument prints it to stderr after the reason)
+static void print_usage(FILE* f) {
+    std::fprintf(f,
+                 "maya-ling --gguf MODEL.gguf [--prompt-ids ids.txt | --prompt text [--tokenize-bin PATH]] [--serve]\n"
+                 "          [--n-predict N] [--ctx|--max-context N] [--prefill-chunk N] [--prefill-block N] [--no-ep] [--gpus 0[,1]]\n"
+                 "          [--offload auto|gpu|mix|cpu] [--mix-k-gpu N] [--kv fp16|q8]\n"
+                 "          [--expert-vram-gib F] [--pin-ram-gib F] [--no-graph] [--no-cache-warm]\n"
+                 "          [--temp F] [--top-k N] [--top-p F] [--seed N] [--print-text] [--no-stop]\n"
+                 "          [--mtp] [--mtp-check] [--spec-k 0|1|2|3|auto] [--drafting auto|on|off] [--draft-floor F]\n"
+                 "          [--cpu-threads N] [--mmproj PATH] [--image PATH | --mmi1 PATH] [--vision-dump-emb PATH]\n"
+                 "(docs/LING.md: setting it up and its options)\n");
+}
+
 int main(int argc, char** argv) {
     std::string gguf, ids_file, prompt, tok_bin = "llama-tokenize";
     ling::Options opt;
@@ -1507,8 +1520,15 @@ int main(int argc, char** argv) {
     std::string dump_decode_logits;
     std::string mmi1_file, image_file, vision_dump_emb;
 
+    // (a wrong argument: the reason and the usage, exit code 2 - it used to be thrown outside main's try block, which
+    // ended the program in abort(), 0xC0000409 on Windows)
+    try {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
+        if (a == "--help" || a == "-h") {
+            print_usage(stdout);
+            return 0;
+        }
         auto val = [&](const char* name) -> std::string {
             if (++i >= argc) throw std::runtime_error(std::string(name) + ": a value expected");
             return argv[i];
@@ -1613,6 +1633,11 @@ int main(int argc, char** argv) {
         else if (a == "--no-stop") no_stop = true;
         else throw std::runtime_error("unknown argument " + a);
     }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "maya-ling: %s\n", e.what());
+        print_usage(stderr);
+        return 2;
+    }
 
     if (bench_lane) {
         const bool ok = ling::par::bench_lane_verify(300);
@@ -1620,14 +1645,7 @@ int main(int argc, char** argv) {
     }
     log_env_settings();
     if (gguf.empty() || (!serve_mode && ids_file.empty() && prompt.empty() && vision_dump_emb.empty())) {
-        std::fprintf(stderr,
-                     "maya-ling --gguf MODEL.gguf [--prompt-ids ids.txt | --prompt text [--tokenize-bin PATH]]\n"
-                     "          [--n-predict N] [--ctx|--max-context N] [--prefill-chunk N] [--prefill-block N] [--no-ep] [--gpus 0[,1]]\n"
-                     "          [--offload auto|gpu|mix|cpu] [--mix-k-gpu N] [--kv fp16|q8]\n"
-                     "          [--expert-vram-gib F] [--pin-ram-gib F] [--no-graph] [--no-cache-warm]\n"
-                     "          [--temp F] [--top-k N] [--top-p F] [--seed N] [--print-text] [--no-stop]\n"
-                     "          [--mtp] [--mtp-check] [--spec-k 0|1|2|3|auto] [--draft-floor F] [--cpu-threads N]\n"
-                     "          [--mmproj PATH] [--image PATH | --mmi1 PATH] [--vision-dump-emb PATH]\n");
+        print_usage(stderr);
         return 1;
     }
 
