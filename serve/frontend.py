@@ -713,8 +713,8 @@ def check_messages(req: dict, key: str = "messages", nonempty: bool = False) -> 
     messages): an absent or empty list reaches the chat template, which refuses it with a
     TemplateError ('No messages provided.') that no except clause covered, so the connection simply closed - a client
     probing the route (M3 Code asks every protocol path `POST {}` and reads only the status code) took the missing
-    400 for "this server does not serve Chat Completions".  /api/chat leaves it off: there an empty list is Ollama's
-    preload/unload, a call of its own that answers 200."""
+    400 for "this server does not serve Chat Completions".  /api/chat leaves it off: there an empty list is Maya's model
+    API's preload/unload, a call of its own that answers 200."""
     msgs = req.get(key)
     if key == "input" and isinstance(msgs, str):
         return

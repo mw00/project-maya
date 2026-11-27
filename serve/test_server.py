@@ -946,7 +946,7 @@ class BodylessRequests(unittest.TestCase):
         self.assertEqual(json.loads(text)["content"][0]["text"], "the answer")
 
     def test_model_api_empty_messages_is_still_a_load(self):
-        """/api/chat keeps Ollama's preload: an empty `messages` list there is a call of its own that answers 200
+        """/api/chat keeps Maya's model API's preload: an empty `messages` list there is a call of its own that answers 200
         (load / unload), not a 400 - only the completion routes ask for a message."""
         from serve.frontend import check_messages
         check_messages({})                                    # no `messages`: fine, /api/chat reads it as a load
