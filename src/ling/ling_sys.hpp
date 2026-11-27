@@ -20,9 +20,12 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <winioctl.h>   // (IOCTL_STORAGE_QUERY_PROPERTY: is_rotational_disk; windows.h itself comes with ds4_os.hpp)
+#else
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
@@ -35,10 +38,12 @@
 namespace ling::sys {
 
 // ---- MADV_NOHUGEPAGE anonymous arena (never uses transparent huge pages) ----
+// (Windows: VirtualAlloc's committed pages, as maya-ds4's RAM copies - page-aligned, the alignment
+//  cudaHostRegister pins whole pages of; Windows gives a process large pages only when asked)
 inline void* alloc_nohuge(size_t bytes) {
     if (bytes == 0) return nullptr;
 #if defined(_WIN32)
-    return std::malloc(bytes);
+    return maya::ds4::os::anon_alloc(bytes, -1, 1, false);
 #else
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return nullptr;
@@ -52,16 +57,48 @@ inline void* alloc_nohuge(size_t bytes) {
 inline void free_nohuge(void* p, size_t bytes) {
     if (p == nullptr || bytes == 0) return;
 #if defined(_WIN32)
-    std::free(p);
+    maya::ds4::os::anon_free(p, bytes);
 #else
     ::munmap(p, bytes);
 #endif
 }
 
-// ---- Current RSS in bytes (/proc/self/statm) ----
+// ---- Drop the whole pages of a mapped source range whose bytes were copied out ----
+// Linux: MADV_DONTNEED (the private read-only file mapping's pages go; a later touch reads them from the file again).
+// Windows: VirtualUnlock trims them from the working set, as maya-ds4's release_copied_cache - clean file-backed
+// pages, recoverable by a later fault. Edge pages (shared with a neighbouring tensor) stay. Returns the bytes handed
+// to the OS as a hint (0: none - a short range, or the OS refused).
+inline size_t drop_copied_pages(const void* p, size_t len) {
+    if (p == nullptr) return 0;
+#if defined(_WIN32)
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const size_t ps = (size_t) si.dwPageSize;
+#elif defined(__linux__)
+    const size_t ps = (size_t) ::sysconf(_SC_PAGESIZE);
+#else
+    const size_t ps = 0;
+#endif
+    if (ps == 0 || len < ps * 2) return 0;
+    const uintptr_t a0 = ((uintptr_t) p + ps - 1) & ~(uintptr_t) (ps - 1);
+    const uintptr_t a1 = ((uintptr_t) p + len) & ~(uintptr_t) (ps - 1);
+    if (a1 <= a0) return 0;
+#if defined(_WIN32)
+    SetLastError(ERROR_SUCCESS);
+    const BOOL unlocked = VirtualUnlock((void*) a0, (SIZE_T) (a1 - a0));
+    // (Microsoft's Working Set documentation: unlocked pages are removed even though the call reports NOT_LOCKED)
+    return (unlocked || GetLastError() == ERROR_NOT_LOCKED) ? (size_t) (a1 - a0) : 0;
+#elif defined(__linux__)
+    return ::madvise((void*) a0, (size_t) (a1 - a0), MADV_DONTNEED) == 0 ? (size_t) (a1 - a0) : 0;
+#else
+    return 0;
+#endif
+}
+
+// ---- Current RSS in bytes (/proc/self/statm; Windows: the working set) ----
 inline uint64_t process_rss_bytes() {
 #if defined(_WIN32)
-    return 0;
+    return maya::ds4::os::working_set_bytes();
 #else
     std::FILE* f = std::fopen("/proc/self/statm", "r");
     if (!f) return 0;
@@ -91,11 +128,44 @@ inline bool systemd_oomd_active() {
 #endif
 }
 
+#if defined(_WIN32)
+// ---- Windows: whether a file's disk has a seek penalty (1: a hard drive, 0: no - an SSD, -1: it cannot be asked) ----
+// The file's volume asked through IOCTL_STORAGE_QUERY_PROPERTY's StorageDeviceSeekPenaltyProperty (no administrator
+// rights needed); -1 for a network share, a volume over several disks, a driver that does not answer. mount: the
+// volume's mount path ("C:\").
+inline int seek_penalty(const std::string& path, std::string& mount_name) {
+    mount_name.clear();
+    const std::wstring wp = maya::ds4::os::wide(path);
+    wchar_t mount[MAX_PATH + 1] = {}, vol[MAX_PATH + 1] = {};
+    if (!GetVolumePathNameW(wp.c_str(), mount, MAX_PATH)) return -1;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, mount, -1, nullptr, 0, nullptr, nullptr);
+    if (n > 1) {
+        mount_name.assign((size_t) n - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, mount, -1, &mount_name[0], n, nullptr, nullptr);
+    }
+    if (!GetVolumeNameForVolumeMountPointW(mount, vol, MAX_PATH)) return -1;   // "\\?\Volume{...}\"
+    std::wstring dev(vol);
+    if (!dev.empty() && dev.back() == L'\\') dev.pop_back();                   // (the volume itself, not its root)
+    HANDLE h = CreateFileW(dev.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    STORAGE_PROPERTY_QUERY q{};
+    q.PropertyId = StorageDeviceSeekPenaltyProperty;
+    q.QueryType = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR d{};
+    DWORD got = 0;
+    const BOOL asked = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, &d, sizeof d, &got, nullptr);
+    CloseHandle(h);
+    if (!asked || got < sizeof d) return -1;
+    return d.IncursSeekPenalty ? 1 : 0;
+}
+#endif
+
 // ---- Rotational HDD check for a file path ----
 inline bool is_rotational_disk(const std::string& path, std::string& dev_name) {
     dev_name.clear();
 #if defined(_WIN32)
-    (void) path;
+    if (seek_penalty(path, dev_name) == 1) return true;
+    dev_name.clear();
     return false;
 #else
     struct stat st {};
@@ -153,11 +223,32 @@ inline std::vector<int> parse_cpulist(const std::string& text) {
 inline CpuTopology detect_cpu_topology() {
     CpuTopology top;
 #if defined(_WIN32)
-    top.physical_cores = std::max(1, (int) std::thread::hardware_concurrency() / 2);
+    // (the physical cores the process's affinity allows, as maya-ds4 counts them - GetLogicalProcessorInformationEx,
+    //  processor group 0; a CPU without SMT is not halved. One node: Ling pins threads per NUMA node on Linux only,
+    //  so a multi-node Windows PC is run as one node, as before)
+    const auto nodes = maya::ds4::os::node_core_threads();
+    int cores = 0;
+    std::vector<int> cpus;
+    for (const auto& nd : nodes)
+        for (const auto& core : nd) {
+            ++cores;
+            cpus.insert(cpus.end(), core.cpus.begin(), core.cpus.end());
+        }
+    const int logical = std::max(1, (int) std::thread::hardware_concurrency());
+    if (cores == 0) {   // (the OS did not say: the estimate from before)
+        cores = std::max(1, logical / 2);
+        cpus.resize((size_t) logical);
+        std::iota(cpus.begin(), cpus.end(), 0);
+    }
+    std::sort(cpus.begin(), cpus.end());
+    top.physical_cores = cores;
     top.numa_nodes = 1;
     top.node_ids = {0};
-    top.node_core_counts = {top.physical_cores};
-    top.summary = "1 node, " + std::to_string(top.physical_cores) + " physical cores";
+    top.node_core_counts = {cores};
+    top.node_cpus[0] = std::move(cpus);
+    top.summary = "1 node, " + std::to_string(cores) + " physical core(s)" +
+                  (nodes.size() > 1 ? " (" + std::to_string(nodes.size()) + " NUMA nodes seen; not pinned per node on Windows)"
+                                    : "");
     return top;
 #else
     cpu_set_t mask;
@@ -280,6 +371,9 @@ inline int default_cpu_threads(const CpuTopology& top) {
 }
 
 // ---- NVMe O_DIRECT file reader with automatic buffered fallback & chunk calibration ----
+// (Windows: buffered positional reads (ReadFile with an offset, thread-safe) always - maya-ds4's choice there too:
+//  the GGUF is also mapped by this process, and Windows' unbuffered reads of a mapped file take a slow path;
+//  direct_active() is false and the same bytes come through the system cache)
 class DirectGgufReader {
 public:
     DirectGgufReader() = default;
@@ -402,6 +496,11 @@ private:
             err = "cannot open GGUF for expert I/O: " + path;
             return false;
         }
+#if defined(_WIN32)
+        // (buffered by design there - the class comment: no unbuffered handle, and no "refused" line in every log)
+        (void) want_direct;
+        (void) simulated_direct_errno;
+#else
         if (want_direct) {
             if (simulated_direct_errno != 0) {
                 errno = simulated_direct_errno;
@@ -415,6 +514,7 @@ private:
                              path.c_str(), errno, std::strerror(errno));
             }
         }
+#endif
         return true;
     }
 
@@ -592,6 +692,10 @@ inline void cal_save(const std::string& path, const std::string& key, const std:
 
 inline std::string host_name() {
 #if defined(_WIN32)
+    // (the PC's own name, so two Windows PCs sharing a calibration folder keep their own entries)
+    char buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD n = (DWORD) sizeof buf;
+    if (GetComputerNameA(buf, &n) && n > 0) return std::string(buf, (size_t) n);
     return "windows";
 #else
     char buf[128] = {};

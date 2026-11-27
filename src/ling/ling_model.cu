@@ -1297,18 +1297,10 @@ Model::Model(const std::string& path, const Options& opt) : o_(opt), gguf_path_(
                     std::memcpy(dst + l.tr[1], su + (size_t) e * l.eu_stride, l.eu_stride);
                     std::memcpy(dst + l.tr[2], sd + (size_t) e * l.ed_stride, l.ed_stride);
                 }
-#if defined(__linux__)
-                auto drop_pages = [](const uint8_t* p, size_t len) {
-                    const size_t ps = (size_t) ::sysconf(_SC_PAGESIZE);
-                    if (ps == 0 || len < ps * 2) return;
-                    const uintptr_t a0 = ((uintptr_t) p + ps - 1) & ~(uintptr_t) (ps - 1);
-                    const uintptr_t a1 = ((uintptr_t) (p + len)) & ~(uintptr_t) (ps - 1);
-                    if (a1 > a0) ::madvise((void*) a0, (size_t) (a1 - a0), MADV_DONTNEED);
-                };
-                drop_pages(sg, (size_t) c.n_expert * l.eg_stride);
-                drop_pages(su, (size_t) c.n_expert * l.eu_stride);
-                drop_pages(sd, (size_t) c.n_expert * l.ed_stride);
-#endif
+                // (the copied source pages out of RAM: Linux MADV_DONTNEED, Windows VirtualUnlock - ling_sys.hpp)
+                (void) sys::drop_copied_pages(sg, (size_t) c.n_expert * l.eg_stride);
+                (void) sys::drop_copied_pages(su, (size_t) c.n_expert * l.eu_stride);
+                (void) sys::drop_copied_pages(sd, (size_t) c.n_expert * l.ed_stride);
             }
         };
         std::vector<std::thread> threads;

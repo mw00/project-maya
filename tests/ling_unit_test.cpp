@@ -13,6 +13,8 @@
 #include "ling_restore.hpp"
 #include "ling_sys.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -442,6 +444,107 @@ static void test_direct_reader() {
                 (int) dir_tmp, (int) shm_dir);
 }
 
+// The OS layer's Windows paths (and Linux's, the same checks): the working set, the core count, the host arena,
+// dropping copied pages of a mapped file, the PC's name, the disk check, and buffered reads from several threads.
+static void test_os_layer() {
+    namespace fs = std::filesystem;
+    namespace os = maya::ds4::os;
+#if defined(_WIN32) || defined(__linux__)
+    EXPECT(ling::sys::process_rss_bytes() > 0, "process_rss_bytes() reads this process's resident bytes");
+#endif
+    const auto top = ling::sys::detect_cpu_topology();
+    const int logical = std::max(1, (int) std::thread::hardware_concurrency());
+    EXPECT(top.physical_cores >= 1 && top.physical_cores <= logical, "physical cores %d within 1..%d",
+           top.physical_cores, logical);
+    EXPECT(ling::sys::default_cpu_threads(top) >= 1, "default_cpu_threads >= 1");
+#if defined(_WIN32)
+    EXPECT(top.numa_nodes == 1 && top.node_cpus.count(0) == 1 && !top.node_cpus.at(0).empty(),
+           "Windows: one node with its logical CPUs listed");
+#endif
+    EXPECT(!ling::sys::host_name().empty(), "host_name() not empty");
+
+    {   // the host arena: page-aligned (cudaHostRegister pins whole pages), writable, freed
+        const size_t bytes = (size_t) 3 << 20;
+        auto* a = (uint8_t*) ling::sys::alloc_nohuge(bytes);
+        EXPECT(a != nullptr, "alloc_nohuge(3 MiB)");
+        if (a != nullptr) {
+            EXPECT(((uintptr_t) a & 4095u) == 0, "alloc_nohuge is page-aligned");
+            std::memset(a, 0x5a, bytes);
+            EXPECT(a[0] == 0x5a && a[bytes - 1] == 0x5a, "alloc_nohuge writable end to end");
+            ling::sys::free_nohuge(a, bytes);
+        }
+        EXPECT(ling::sys::alloc_nohuge(0) == nullptr, "alloc_nohuge(0) is nullptr");
+    }
+
+    const fs::path p = fs::temp_directory_path() / ("ling_os_test_" + std::to_string(::getpid()) + ".bin");
+    constexpr size_t N = 4u << 20;
+    std::vector<uint8_t> data(N);
+    for (size_t i = 0; i < N; ++i) data[i] = (uint8_t) ((i * 167 + 11) & 0xFF);
+    {
+        std::ofstream of(p, std::ios::binary);
+        of.write((const char*) data.data(), (std::streamsize) data.size());
+    }
+    {   // the copied pages of a mapped file dropped: the hint taken, the bytes still the file's afterwards
+        const os::fd_t fd = os::open_ro(p.string());
+        EXPECT(fd != os::kBadFd, "open_ro %s", p.string().c_str());
+        const auto* m = fd != os::kBadFd ? (const uint8_t*) os::map_ro(fd, N) : nullptr;
+        EXPECT(m != nullptr, "map_ro the test file");
+        if (m != nullptr) {
+            EXPECT(std::memcmp(m, data.data(), N) == 0, "mapped bytes match before the drop");
+            const size_t dropped = ling::sys::drop_copied_pages(m + 13, N - 26);
+#if defined(_WIN32) || defined(__linux__)
+            EXPECT(dropped > 0 && dropped <= N - 26, "drop_copied_pages took the interior pages (%zu bytes)", dropped);
+#endif
+            EXPECT(ling::sys::drop_copied_pages(m, 100) == 0, "a range under two pages is left alone");
+            EXPECT(ling::sys::drop_copied_pages(nullptr, N) == 0, "nullptr is left alone");
+            EXPECT(std::memcmp(m, data.data(), N) == 0, "mapped bytes still the file's after the drop");
+            os::unmap((void*) m, N);
+        }
+        if (fd != os::kBadFd) os::close_fd(fd);
+    }
+    {   // the disk check answers (an SSD, a hard drive or "cannot tell") without failing
+        std::string dev;
+        const bool rot = ling::sys::is_rotational_disk(p.string(), dev);
+        EXPECT(!rot || !dev.empty(), "a rotational answer names its device");
+#if defined(_WIN32)
+        std::string mount;
+        const int sp = ling::sys::seek_penalty(p.string(), mount);
+        EXPECT(sp >= -1 && sp <= 1 && rot == (sp == 1), "seek_penalty %d agrees with is_rotational_disk", sp);
+        std::printf("  (temp dir disk %s: %s)\n", mount.c_str(),
+                    sp == 1 ? "hard drive" : sp == 0 ? "no seek penalty (SSD)" : "cannot tell");
+#else
+        std::printf("  (temp dir disk: %s %s)\n", rot ? "rotational" : "not rotational / unknown", dev.c_str());
+#endif
+    }
+    {   // buffered reads from four threads at once: each span exact (Windows: ReadFile at an offset)
+        ling::sys::DirectGgufReader r;
+        std::string err;
+        EXPECT(r.open(p.string(), true, err), "open for threaded reads: %s", err.c_str());
+#if defined(_WIN32)
+        EXPECT(!r.direct_active(), "Windows: buffered reads (direct_active false)");
+#endif
+        std::atomic<int> bad{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < 4; ++t)
+            th.emplace_back([&, t] {
+                std::vector<uint8_t> dst;
+                for (int k = 0; k < 64; ++k) {
+                    const uint64_t off = ((uint64_t) (t * 977 + k * 65537) * 31) % (N - 70000);
+                    const size_t len = 1 + (size_t) ((t * 7919 + k * 104729) % 69999);
+                    dst.assign(len, 0);
+                    if (!r.read_span(off, len, dst.data()) || std::memcmp(dst.data(), data.data() + off, len) != 0)
+                        bad.fetch_add(1);
+                }
+            });
+        for (auto& x : th) x.join();
+        EXPECT(bad.load() == 0, "threaded read_span: %d bad span(s)", bad.load());
+    }
+    std::error_code ec;
+    fs::remove(p, ec);
+    std::printf("PASS test_os_layer (%s; rss %.1f MiB)\n", top.summary.c_str(),
+                (double) ling::sys::process_rss_bytes() / (1024.0 * 1024.0));
+}
+
 static void test_split_gguf_fingerprint() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("ling_split_fp_" + std::to_string(::getpid()));
@@ -709,6 +812,7 @@ int main() {
     test_drafting_values();
     test_numa_helpers();
     test_direct_reader();
+    test_os_layer();
     if (g_fail != 0) {
         std::fprintf(stderr, "ling_unit_test: %d failure(s)\n", g_fail);
         return 1;
