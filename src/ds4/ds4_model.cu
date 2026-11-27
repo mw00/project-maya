@@ -44,6 +44,7 @@
 #include "ds4_prefill_stats.hpp"
 #include "ds4_prompt_mem.hpp"
 #include "ds4_ram_slice.hpp"
+#include "ds4_tp_kind.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "maya/kernels/cpu/exl3_cpu.hpp"
@@ -3907,7 +3908,8 @@ struct Model::Impl {
                 tp_uneven = false;
         } else
             tp_uneven = false;
-        // the groups: runs of tp devices of one kind (their memory), a device unlike the next alone
+        // the groups: runs of tp devices of one kind (their memory, within a small share: ds4_tp_kind.hpp, #1276), a
+        // device unlike the next alone
         // - or, tp the number of GPUs, one group of all of them whatever their kind (its tightest member sets the
         // experts' room); threads mode for the windows (decode) where a group is 2 wide or more or --threads on, the
         // prompt path (its own thread a GPU) as asked for - also where the experts' blocks took the groups' width down
@@ -3920,7 +3922,7 @@ struct Model::Impl {
             Group G;
             G.mem.push_back((int) i);
             size_t j = i + 1;
-            while ((int) G.mem.size() < tp && j < devs.size() && (tp_all || devs[j].total == devs[i].total))
+            while ((int) G.mem.size() < tp && j < devs.size() && (tp_all || tp_same_kind(devs[j].total, devs[i].total)))
                 G.mem.push_back((int) j++);
             if ((int) G.mem.size() < tp && G.mem.size() > 1) {   // a short run at the end: devices of their own
                 for (int m : G.mem) {
