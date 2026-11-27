@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,14 @@ struct Options {
     bool reserve_given = false;   // (--reserve-gb given: #1026 keeps what the run allocates after the plan beside it)
     int prefill_chunk = 0;        // a prompt's tokens a forward takes at once (more than k::kMaxWin: the GEMMs); 0: auto -
                                   // 4096, 2048 or 1024, the largest the VRAM holds beside the model and the pictures
+    bool pin_experts = false;     // --pin-experts: the routed experts' mapped pages locked in RAM (the CPU lane's
+                                  // reads then never fault the page out to the disk; RAM held for the run)
+    bool pin_engram = false;      // --pin-engram: the Engram table's mapped pages locked in RAM (same trade)
+    bool lend = false;            // --lend: the prompt-only buffers (sh16, sy, xh16, wband, the staging slots) live in
+                                  // one layer's expert slots a GPU - experts between prompts, buffers while one is read
+    int prefill_pipe = 0;         // a prompt longer than a chunk through the layer groups as stages: chunks in flight
+                                  // (0: off, one group at a time as before; 2 or more: group 0 reads a chunk while
+                                  // group 1 reads the chunk before it - 2 unless asked for 3)
     double vram_experts = 1.0;    // the share of each layer's routed experts kept in VRAM at most (the plan takes less
                                   // when they do not fit; the rest run on the CPU lane)
     int cpu_threads = -1;         // the CPU lane's workers besides the caller (-1: one a physical core but the first)
@@ -161,6 +170,15 @@ public:
     /// the most tokens a forward reads at once (the prompt path's chunk): a prompt in calls of this many reports its
     /// progress between them
     int chunk() const;
+    /// --prefill-pipe: a prompt of several chunks is read in one forward, its chunks through the layer groups as a
+    /// pipeline (the caller feeds the whole prompt's body; the stage chunks are not its calls)
+    bool staged_prefill() const;
+    /// Called as a staged prompt's chunks complete (the position reached, in order, on the head's stage thread): the
+    /// caller's progress.  Set before the forward; null to clear.
+    void set_progress(std::function<void(int64_t)> f);
+    /// A staged prompt's stop: asked between its chunks (the stages end there), null to clear.  A stopped forward
+    /// returns false with "stopped".
+    void set_cancel(std::function<bool()> f);
     /// the GPUs a layer is split over (tensor parallel: 2 or more; 1: the layer split or one GPU)
     int tensor_parallel() const;
     int eos() const;

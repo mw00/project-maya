@@ -859,7 +859,36 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         }();
         const bool alone = r.ids.size() - from > 1 && last_alone;
         const size_t body = alone ? r.ids.size() - 1 : r.ids.size();
-        for (size_t a = from; a < r.ids.size();) {
+        size_t a = from;
+        // (--prefill-pipe: the body in one call - the engine's chunks through the layer groups as a pipeline; each
+        //  chunk's end is a progress line (the last stage's), and a Stop is taken before the body, not inside it)
+        if (m.staged_prefill() && body - from > (size_t) C && !in.stop.load()) {
+            const int T = (int) (body - from);
+            const bool last = body == r.ids.size();
+            m.set_progress([&](int64_t done) {   // (the last stage's thread)
+                const double ms = now() * 1e3 - t0;
+                std::printf("PP %lld %zu %.1f %.1f %zu\n", (long long) done, r.ids.size(), ms,
+                            ms > 0 ? 1000.0 * (double) (done - (int64_t) from) / ms : 0.0, from);
+                std::fflush(stdout);
+            });
+            m.set_cancel([&]() { return in.stop.load(); });   // (between the body's chunks)
+            const bool fok = m.forward(r.ids.data() + from, T, (int64_t) from, last ? 1 : 0,
+                                       last ? lg.data() : nullptr, err);
+            m.set_cancel(nullptr);
+            m.set_progress(nullptr);
+            if (!fok) {
+                if (err == "stopped") {   // (the caches went past the server's record: read the prompt again next time)
+                    state.clear();
+                    cancel = true;
+                } else {
+                    ok = false;
+                }
+            } else {
+                state.insert(state.end(), r.ids.begin() + (long) from, r.ids.begin() + (long) body);
+                a = body;
+            }
+        }
+        for (; ok && a < r.ids.size();) {
             const int T = (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
             const bool last = a + (size_t) T == r.ids.size();
             if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
@@ -1700,6 +1729,10 @@ int main(int argc, char** argv) {
             const std::string v = next();
             o.prefill_chunk = v == "auto" ? 0 : std::atoi(v.c_str());
         }
+        else if (a == "--prefill-pipe") o.prefill_pipe = std::atoi(next().c_str());   // (0: off; chunks in flight)
+        else if (a == "--pin-experts") o.pin_experts = true;   // (the CPU lane's expert pages locked in RAM)
+        else if (a == "--pin-engram") o.pin_engram = true;     // (the Engram table's pages locked in RAM)
+        else if (a == "--lend") o.lend = true;                 // (the prompt buffers in a layer's expert slots)
         else if (a == "--vram-experts") o.vram_experts = std::atof(next().c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next().c_str());
         else if (a == "--gpu-fetch") o.gpu_fetch = next();

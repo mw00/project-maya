@@ -140,6 +140,7 @@ struct Lane::Impl {
     std::vector<int> wnode;   // each worker's node
     int n_nodes = 1, caller_node = 0, caller_core = -1;
     std::mutex mu;
+    std::mutex job_mu;   // (one caller's job at a time: the lane's job state is not reentrant - --prefill-pipe's groups)
     std::condition_variable cv;
     const std::function<void(int)>* f = nullptr;
     int direct_n = 0;                    // >0: single-node fast path (indices 0..direct_n-1, no items[] copy)
@@ -426,6 +427,7 @@ bool Lane::move_to_node(const void* ptr, size_t bytes, int node) {
 
 void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vector<int>* node_of) {
     if (n <= 0) return;
+    std::lock_guard<std::mutex> job(p->job_mu);   // (the lane's job state is one job's: callers take turns)
     if (p->th.empty() || n == 1) {
         for (int i = 0; i < n; ++i) f(i);
         return;
