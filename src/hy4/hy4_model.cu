@@ -1820,11 +1820,10 @@ struct Model::Impl {
     static constexpr int kChunkBase = 1024;
     static constexpr int kChunks[2] = {4096, 2048};
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
+    static constexpr int kPs = 96;       // (HY4_PSTREAM: experts a pass, at most - its second buffer's slots)
     char ps_route[160] = {0};           // (its INFO line about the route)
     bool ps_want = [] { const char* v = std::getenv("HY4_PSTREAM"); return !v || !*v || std::atoi(v) != 0; }();   // (on; =0: off)
-    // the staging slots a GPU with experts outside VRAM keeps: HY4_PSTREAM's two buffers are their two halves (its
-    // passes of kStage / 2 experts at most), so the VRAM experts are the same with it on or off
-    int stage_slots() const { return kStage; }
+    int stage_slots() const { return kStage + (ps_want ? kPs : 0); }
     // tensor parallel with the CPU lane: a prompt chunk of this many rows or more has every member send its share of
     // the experts no member holds to its own GPU (kShareThreads copy a member's pass into its bounce); a shorter one
     // is member 0's alone, the CPU lane or its GPU as on the layer split
@@ -6540,9 +6539,8 @@ struct Model::Impl {
         size_t blob = 0;
         for (Layer* l : ls) blob = std::max(blob, l->blob);
         CK(cudaSetDevice(gp.dev));
-        const int cap = stage_slots() / 2;   // (a pass's experts at most: half the staging slots, a buffer each half)
         ps.buf[0] = gp.stage;
-        ps.buf[1] = gp.stage + (size_t) cap * stage_blob;
+        ps.buf[1] = gp.stage + (size_t) kStage * stage_blob;
         (void) blob;
         for (int b = 0; b < 2; ++b) {
             CK(cudaEventCreateWithFlags(&ps.dma[b], cudaEventDisableTiming));
@@ -6560,7 +6558,7 @@ struct Model::Impl {
                     l.ps_ex.push_back(e);
                 }
             l.ps_m = (int) l.ps_ex.size();
-            const PsPlan pl = ps_plan(l.ps_m, cap);
+            const PsPlan pl = ps_plan(l.ps_m, kPs);
             l.ps_np = pl.passes;
             l.ps_pass = pl.per;
             l.ps_bytes = (size_t) l.ps_m * l.blob;
