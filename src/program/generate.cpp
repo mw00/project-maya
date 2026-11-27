@@ -1948,6 +1948,18 @@ static int glm_pack_generate(const Options& o) {
             if (abl_flip && reuse == 0) snap_tokens.clear();   // (the other setting's snapshot: never restored again)
         }
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
+        // ... and so does the snapshot past `reuse`: a snapshot (like a checkpoint) restores the running state only,
+        // the positional cells below it are this code's to guarantee.  A read that ends before it saves its own - a
+        // cancel in the token path, which reads a fresh prompt shorter than the prompt path's minimum (8 tokens on one
+        // GPU, 32 on a split) - left the previous conversation's snap_tokens standing over cells this prompt had
+        // overwritten, and that conversation's next request restored a stale snapshot over this prompt's tokens: it
+        // read the cancelled prompt as its own start (another client's words in its context).  The conversation itself
+        // was set aside above (slot_put / engine_put) when those are on and comes back from there; without them it is
+        // read again, as after any other conversation.
+        if (snap_tokens.size() > reuse) {
+            snap_tokens.clear();
+            snap_in_slot = false;
+        }
         // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
         // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
         // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
