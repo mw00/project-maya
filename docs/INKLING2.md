@@ -629,17 +629,16 @@ through host memory); the drafter is one GPU's.  Not done: the loop in the layer
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches
 as a graph (2-3 ms a step now).
 
-## 9. A modified checkpoint (a derivative, a derisked finetune) as an inkling2 GGUF
+## 9. A checkpoint of the same family as an inkling2 GGUF (a converter, not a model we ship)
 
-`tools/ik2/derisked_gguf.py` converts a checkpoint in the original vendor format (the
-`Inkling2LoopForConditionalGeneration` safetensors, modelopt NVFP4 / MXFP8 experts) into the looped
-`inkling2` GGUF `maya-ik2` reads - the layout unsloth's `Inkling-2-Mini-GGUF` UD-Q4_K_XL ships. It was
-written for [Blackfrost-AI/Inkling-2-Mini-Derisked](https://huggingface.co/Blackfrost-AI/Inkling-2-Mini-Derisked)
-(a behaviorally modified Inkling-2-Mini that reduces false refusals; its weights differ from upstream
-in a few tensors, its MTP is byte-identical) and works for any checkpoint of the same family.
+`tools/ik2/checkpoint_gguf.py` converts a checkpoint in the original vendor format (the
+`Inkling2LoopForConditionalGeneration` safetensors, modelopt NVFP4 / MXFP8 experts) - Inkling-2-Mini itself, or a
+modified checkpoint of the same family - into the looped `inkling2` GGUF `maya-ik2` reads: the layout unsloth's
+`Inkling-2-Mini-GGUF` UD-Q4_K_XL ships. Maya's setup and model list do not offer such conversions; answers from a
+modified checkpoint are its makers', not the model's.
 
-    python tools/ik2/derisked_gguf.py --src <checkpoint folder> --out <out.gguf> \
-        --vocab-from <unsloth Inkling-2-Mini-UD-Q4_K_XL.gguf>
+    python tools/ik2/checkpoint_gguf.py --src <checkpoint folder> --out <out.gguf> \
+        --vocab-from <unsloth Inkling-2-Mini-UD-Q4_K_XL.gguf> [--name NAME]
 
 The checkpoint's per-physical-layer tensors map straight onto the GGUF's (24 layers, the loop's
 48 visits scheduled by `inkling2.num_loops` / `loop.core_start` / `loop.core_end`): the attention and
@@ -649,17 +648,14 @@ layers 0-19 NVFP4 (the original bits; the checkpoint's interleaved gate/up rows 
 master's gate-rows-first under one per-expert `.scale` = amax / outer-scale-denominator), the experts
 of layers 20-23 MXFP8 (exact in BF16) requantized Q8_0, unsloth's choice. The vision tower and the
 drafter are not written - unsloth's `mmproj` covers pictures, the engine takes `mtp.safetensors` by
-`--draft`.
+`--draft`. `--name` sets the GGUF's `general.name` (default: the checkpoint folder's name).
 
-`tools/ik2/derisked_gguf_validate.py` checks a conversion against the checkpoint and unsloth's file:
+`tools/ik2/checkpoint_gguf_validate.py` checks a conversion against the checkpoint and unsloth's file:
 the tensor plan (names, dims, types - 734/734 for Inkling-2-Mini), the NVFP4 experts bit-exact against
 unsloth's (which keeps the checkpoint's original bits), every F32 tensor bit-exact against the
 checkpoint, every requantized tensor within the Q8_0 bound (amax / 254 per block; a few values on
-rounding boundaries - torch rounds half to even, ggml's `roundf` half away - are harmless). On the
-Derisked conversion all of it passed, and `ref/inkling2.py` over the converted GGUF against unsloth's
-agreed to KL ~1e-2 with the same top-1 tokens except where the checkpoint was modified.
+rounding boundaries - torch rounds half to even, ggml's `roundf` half away - are harmless).
 
 Needs a python with torch, numpy and safetensors (the ref's venv) and the project's gguf-py on
 `PYTHONPATH` (`build/_deps/strata_llamacpp-src/gguf-py`); the tokenizer export is `tools/strata_tokenizer.py`
 with `tools/ik2/chat_template.jinja` (see section 8's run instructions).
-

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""tools/ik2/derisked_gguf.py - a Derisked Inkling-2-Mini checkpoint (thinkingmachines' inkling2_loop,
+"""tools/ik2/checkpoint_gguf.py - an Inkling-2-Mini checkpoint (thinkingmachines' inkling2_loop,
 modelopt NVFP4 / MXFP8 experts) as an inkling2 GGUF in llama.cpp master's looped layout - the one
 unsloth/Inkling-2-Mini-GGUF ships and maya-ik2 reads.
 
-    python tools/ik2/derisked_gguf.py --src <checkpoint dir> --out <out.gguf> \
-        --vocab-from <unsloth Inkling-2-Mini-UD-Q4_K_XL.gguf>
+    python tools/ik2/checkpoint_gguf.py --src <checkpoint dir> --out <out.gguf> \
+        --vocab-from <unsloth Inkling-2-Mini-UD-Q4_K_XL.gguf> [--name NAME]
 
 The mapping (checkpoint -> GGUF), verified against unsloth's UD-Q4_K_XL tensor list:
   - embed/unembed/norm/embed_norm/attn_res.output_query -> token_embd/output/output_norm/token_embd_norm/
@@ -35,7 +35,7 @@ Skipped: the vision tower (model.visual.*, unsloth's mmproj covers pictures) and
 mask_embed, the bare norm.weight - the engine takes mtp.safetensors by --draft).
 
 The tensor shapes were read from the checkpoint's safetensors headers and the target layout from
-unsloth/Inkling-2-Mini-GGUF UD-Q4_K_XL; tools/ik2/derisked_gguf_validate.py checks a conversion against
+unsloth/Inkling-2-Mini-GGUF UD-Q4_K_XL; tools/ik2/checkpoint_gguf_validate.py checks a conversion against
 the checkpoint and unsloth's file (plan, NVFP4 bits, F32/BF16 exactness, Q8_0 bounds, expert scales).
 """
 from __future__ import annotations
@@ -374,7 +374,7 @@ def vocab(w, vocab_from):
 # ---- the plan and the file ---------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", required=True, help="the Derisked checkpoint folder")
+    ap.add_argument("--src", required=True, help="the checkpoint folder")
     ap.add_argument("--out", default="", help="the output GGUF path")
     ap.add_argument("--vocab-from", default="", help="an inkling2 GGUF to copy the tokenizer from")
     ap.add_argument("--gate-up-order", choices=("interleaved", "stacked"), default="interleaved",
@@ -382,6 +382,7 @@ def main():
     ap.add_argument("--split-gb", type=float, default=48.0,
                     help="split the output into shards of this many GB (one file up to it)")
     ap.add_argument("--plan", action="store_true", help="list the tensors (name, GGUF dims, type), write nothing")
+    ap.add_argument("--name", default="", help="general.name of the GGUF (default: the checkpoint folder's name)")
     a = ap.parse_args()
     src = Src(a.src)
     tc = src.cfg["text_config"]
@@ -433,10 +434,14 @@ def main():
                  "q8_down": Q8_0, "scale_gu": F32, "scale_down": F32}
     SIZES = {F32: (1, 4), BF16: (1, 2), Q8_0: (32, 34), NVFP4: (64, 36)}
     w = gguf.GGUFWriter(a.out, ARCH, split_max_size=int(a.split_gb * 1e9))
-    w.add_name("Inkling-2-Mini-Derisked")
-    w.add_string("general.quantized_by",
-                 "tools/ik2/derisked_gguf.py: Blackfrost-AI/Inkling-2-Mini-Derisked, the original weights")
-    w.add_file_type(gguf.LlamaFileType.MOSTLY_BF16)
+    name = a.name or os.path.basename(os.path.normpath(a.src))
+    w.add_name(name)
+    w.add_string("general.quantized_by", "tools/ik2/checkpoint_gguf.py: " + name + ", the original weights")
+    # (general.file_type: the --vocab-from file's - the same per-tensor types; a mixed file has no single one)
+    if a.vocab_from:
+        ft = gguf.GGUFReader(a.vocab_from).fields.get("general.file_type")
+        if ft is not None:
+            w.add_file_type(int(ft.contents()))
     meta(w, tc)
     vocab(w, a.vocab_from)
     for k, name, sh, kind in P:

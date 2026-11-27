@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""tools/ik2/derisked_gguf_validate.py - check a converted Inkling-2-Mini GGUF (tools/ik2/derisked_gguf.py)
+"""tools/ik2/checkpoint_gguf_validate.py - check a converted Inkling-2-Mini GGUF (tools/ik2/checkpoint_gguf.py)
 against the checkpoint it was made from, and against unsloth's UD-Q4_K_XL where the two overlap.
 
-    PYTHONPATH=build/_deps/strata_llamacpp-src/gguf-py python tools/ik2/derisked_gguf_validate.py \\
+    PYTHONPATH=build/_deps/strata_llamacpp-src/gguf-py python tools/ik2/checkpoint_gguf_validate.py \\
         --gguf <converted.gguf> --src <checkpoint dir> [--against <unsloth UD-Q4_K_XL.gguf>] \\
         [--gate-up-order interleaved|stacked]
 
-What it checks (all of it passed for the Derisked conversion this tool was written for):
+What it checks (all of it passed for the modified checkpoint this tool was written for):
   - the tensor plan: names, dims and types against unsloth's file (734/734 for Inkling-2-Mini);
   - the NVFP4 experts (the layers whose weights are U8): the raw ggml blocks of EVERY expert
     bit-exact against unsloth's, which keeps the checkpoint's original bits - so the conversion's
@@ -42,7 +42,7 @@ sys.path.insert(0, str(REPO / "tools" / "ik2"))
 import numpy as np
 import torch
 
-from derisked_gguf import Src, plan_of, mxfp8_bf16, nvfp4_rows
+from checkpoint_gguf import Src, plan_of, mxfp8_bf16, nvfp4_rows
 from load import Gguf, GEOM
 
 SKIP = re.compile(r"model\.visual\.|markov_head\.|^mask_embed$|^norm\.weight$|mlp\.experts\.")
