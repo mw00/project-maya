@@ -3057,6 +3057,20 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const uint32_t sg = b[74 + 4 * ib + il];
         return dl * (float) ((g >> (8 * (jj & 3))) & 0xFFu) * ((sg >> jj) & 1u ? -1.0f : 1.0f);
     }
+    if (type == 30 /* kBF16 */) {
+        const uint16_t* bf = (const uint16_t*) blocks;
+        uint32_t bits = (uint32_t) bf[v] << 16;
+        float f;
+        memcpy(&f, &bits, 4);
+        return f;
+    }
+    if (type == 42 /* kQ2_0 */) {   // QK2_0=64: d, qs [16] (18 bytes), 4 2-bit values per byte
+        const uint8_t* b = blocks + (v / 64) * 18;
+        const int i = (int) (v % 64);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t q = (b[2 + (i / 4)] >> ((i % 4) * 2)) & 0x03;
+        return d * (float) ((int) q - 1);
+    }
     if (type == kIQ4_NL) {   // d, qs [16]: value j < 16 the low nibble of byte j, value j + 16 its high one
         const uint8_t* b = blocks + (v / 32) * 18;
         const int i = (int) (v % 32), j = i % 16;
@@ -3238,7 +3252,7 @@ __device__ __forceinline__ float sum_f4x8(const float4 (&xv)[8]) {
 // the types whose 32-value sub-blocks the two helpers below read (an IQ4_NL block: one of them)
 __device__ __host__ __forceinline__ bool sub32_type(int type) {
     return type == kIQ2_XXS || type == kIQ2_XS || type == kIQ2_S || type == kIQ3_S || type == kIQ4_NL ||
-           type == kQ4_K || type == kIQ1_S || type == kIQ1_M;
+           type == 42 /* kQ2_0 */ || type == kQ4_K || type == kIQ1_S || type == kIQ1_M;
 }
 // IQ1_S / IQ1_M: 4 grid values (the nibbles g + 1 in the bytes of n, the delta d8 = +-1/8 added) against 4 inputs
 __device__ __forceinline__ float iq1_dot4(uint32_t n, float d8, float4 x) {
@@ -3350,6 +3364,20 @@ __device__ __forceinline__ float sub32_dot(int type, const uint8_t* w, int sb, c
         }
         return dl * a;
     }
+    if (type == 42 /* kQ2_0 */) {   // QK2_0=64: d, qs [16] (18 bytes), two 32-value halves
+        const uint8_t* b = w + (size_t) (sb >> 1) * 18;
+        const uint8_t* qs = b + 2 + (sb & 1) * 8;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        float a = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint8_t qb = qs[k];
+            const float4 xk = xv[k];
+            a += (float) ((int) (qb & 0x03) - 1) * xk.x + (float) ((int) ((qb >> 2) & 0x03) - 1) * xk.y +
+                 (float) ((int) ((qb >> 4) & 0x03) - 1) * xk.z + (float) ((int) ((qb >> 6) & 0x03) - 1) * xk.w;
+        }
+        return d * a;
+    }
     if (type == kIQ4_NL) {   // as IQ4_XS's sub-block, a block of its own
         const uint8_t* b = w + (size_t) sb * 18;
         const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
@@ -3444,6 +3472,18 @@ __device__ __forceinline__ void sub32_values(int type, const uint8_t* w, int sb,
                 y[8 * l + j] = dl * (float) ((g1 >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
                 y[8 * l + 4 + j] = dl * (float) ((g2 >> (8 * j)) & 0xFFu) * ((sg >> (4 + j)) & 1u ? -1.0f : 1.0f);
             }
+        }
+    } else if (type == 42 /* kQ2_0 */) {
+        const uint8_t* b = w + (size_t) (sb >> 1) * 18;
+        const uint8_t* qs = b + 2 + (sb & 1) * 8;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint8_t qb = qs[k];
+            y[4 * k + 0] = d * (float) ((int) (qb & 0x03) - 1);
+            y[4 * k + 1] = d * (float) ((int) ((qb >> 2) & 0x03) - 1);
+            y[4 * k + 2] = d * (float) ((int) ((qb >> 4) & 0x03) - 1);
+            y[4 * k + 3] = d * (float) ((int) ((qb >> 6) & 0x03) - 1);
         }
     } else if (type == kIQ4_NL) {
         const uint8_t* b = w + (size_t) sb * 18;
@@ -8297,7 +8337,7 @@ void argmax_gemv_i8(const int8_t* W, int ld, const float* xs, const float* base,
 }
 
 int block_values(int type) {
-    return type == kNVFP4 ? 64 : type == kQ8_0 || type == kIQ4_NL ? 32
+    return type == 30 ? 1 : type == kNVFP4 || type == 42 /* kQ2_0 */ ? 64 : type == kQ8_0 || type == kIQ4_NL ? 32
          : type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_XXS || type == kIQ2_XS ||
                   type == kIQ3_XXS || type == kIQ3_S || type == kIQ2_S || type == kIQ4_XS || type == kIQ1_S ||
                   type == kIQ1_M
@@ -8305,7 +8345,7 @@ int block_values(int type) {
              : 0;
 }
 size_t block_bytes(int type) {
-    return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kIQ4_NL ? 18 : type == kQ4_K ? 144
+    return type == 30 ? 2 : type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kIQ4_NL || type == 42 /* kQ2_0 */ ? 18 : type == kQ4_K ? 144
          : type == kQ5_K ? 176 : type == kQ6_K ? 210 : type == kIQ2_XXS ? 66 : type == kIQ2_XS ? 74
          : type == kIQ3_XXS ? 98 : type == kIQ3_S ? 110 : type == kIQ2_S ? 82 : type == kIQ4_XS ? 136
          : type == kIQ1_S ? 50 : type == kIQ1_M ? 56 : 0;
