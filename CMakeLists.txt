@@ -97,13 +97,17 @@ if(MAYA_ENABLE_METAL)   # (the CUDA / AMD options do not apply to this build)
 endif()
 
 if(MAYA_ENABLE_CUDA)
+  # The default has to be set BEFORE enable_language(CUDA): that call fills CMAKE_CUDA_ARCHITECTURES with nvcc's own
+  # default (sm_75 on CUDA 13) when it is unset, so a check after it never fires. A plain `cmake -S . -B build`
+  # then built for sm_75 without a word, and on an RTX 3090 (sm_86) that build loaded and answered short chats but
+  # gave wrong answers past a couple of thousand tokens of context.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  endif()
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
-  endif()
   # "native" builds for every GPU in the PC that CUDA_VISIBLE_DEVICES leaves visible - at configure time and again at
   # build time (nvcc -arch=native), so a display card beside the GPUs (a Quadro P400 or a GTX 1060 next to V100s, sm_61)
   # was compiled for too and could stop the build (#56). It becomes the list of those cards' own architectures here:
