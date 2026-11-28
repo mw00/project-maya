@@ -6590,6 +6590,13 @@ bool Glm5Model::fast_boundary(std::string& err) {
         auto& P = F->lp[(size_t) il];
         if (P.n == 0) continue;
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        // this layer's demotions still draining (only this step pushes to F->draining, each one for a spare): as
+        // many missing spares wait for them - their slots come free when (2) retires them.  Without this count a
+        // drain that had not landed by the next boundary (always so with fixed moves: n boundaries) let this step
+        // demote another resident for the same spare at every boundary until then - n demotions a refill, the VRAM
+        // pool bled residents faster than the refill (5c) brought them back (Maya-S24, 2 GB pool: 254 of 599 slots)
+        int spares_coming = 0;
+        for (const auto& d : F->draining) spares_coming += d.il == il;
         for (int j = 0; j < gf::kSpares; ++j) {
             if (P.spare[j] >= 0) continue;
             int s = -1;
@@ -6611,6 +6618,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
             if (glmfast::full_unified_pool(F->unified_memory, P.n, g.n_expert) ||
                 glmfast::complete_pool(P.n_main, g.n_expert, gf::kSpares))
                 break;
+            if (spares_coming > 0) {   // a demotion for a spare is already on its way
+                --spares_coming;
+                continue;
+            }
             // the least recently used resident of this layer goes (the engine's own rule now).  It is kept
             // MAYA_GLM_VRAM_EVICT=least (or 0): the least-used by the aged counts, recency breaking ties - route
             // traces replayed through these rules (Maya-M, 3090 + 3060 split): the aged counts keep experts that
