@@ -29,6 +29,7 @@
 #include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
 
 #include <atomic>
+#include <limits>
 #include <cublas_v2.h>
 #if defined(__linux__)
 #include <unistd.h>
@@ -397,6 +398,11 @@ struct Layer {
     float* pooled = nullptr;     // the indexer's pooled keys [max_ctx / kpool][ix_dim]
     float* ivg = nullptr;        // ... and each position's value | gate [ring][2 ix_dim]
     size_t bytes = 0;            // (the plan: its VRAM)
+    // HY4_KV_GROW (Impl::grow_set): the latent cache and the VRAM experts in one allocation, the cache first - its
+    // rows past the positions in use lend the room of grow_k more expert slots, just below `experts` (slots 0 ..
+    // grow_k - 1 of the layer's, the others numbered after them)
+    uint8_t* grow_buf = nullptr;
+    int grow_k = 0;
 };
 
 struct Gpu {
@@ -3596,9 +3602,17 @@ struct Model::Impl {
             std::sort(res.begin(), res.end());
             for (int s2 = 0; s2 < l.n_res; ++s2) l.slot_of[(size_t) res[(size_t) s2]] = s2;
             VPart vpool(l.mtp ? kVDrafter : kVPool);
-            if (!gp.alloc(l.experts, l.blob * (size_t) std::max(1, l.n_res), err) ||
-                !gp.alloc(l.slot_d, (size_t) g.n_expert, err))
+            if (grow_wanted() && N == 1 && !l.mtp && l.ix && !l.dense && l.n_res < g.n_expert) {
+                // (HY4_KV_GROW: the cache's rows and the experts in one allocation - caches() takes its first part)
+                const size_t kvb = (size_t) o.max_ctx * kv_rb();
+                if (!gp.alloc(l.grow_buf, kvb + l.blob * (size_t) std::max(1, l.n_res), err) ||
+                    !gp.alloc(l.slot_d, (size_t) g.n_expert, err))
+                    return false;
+                l.experts = l.grow_buf + kvb;
+            } else if (!gp.alloc(l.experts, l.blob * (size_t) std::max(1, l.n_res), err) ||
+                       !gp.alloc(l.slot_d, (size_t) g.n_expert, err)) {
                 return false;
+            }
             CK(cudaMemcpy(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice));
             const uint8_t *sg = pk.data(*tg), *su = pk.data(*tu), *sd = pk.data(*td);
             if (l.partial()) {   // (the CPU lane reads the others where they lie)
@@ -3695,7 +3709,8 @@ struct Model::Impl {
             }
         } else {
             l.ring = 0;
-            if (!gp.alloc(l.kv, (size_t) o.max_ctx * kv_rb() / 2, err) ||
+            if (l.grow_buf != nullptr) l.kv = (uint16_t*) l.grow_buf;   // (HY4_KV_GROW: load_layer's allocation)
+            if ((l.grow_buf == nullptr && !gp.alloc(l.kv, (size_t) o.max_ctx * kv_rb() / 2, err)) ||
                 !gp.alloc(l.pooled, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() / 4, err) ||
                 !gp.alloc(l.ivg, (size_t) ring * 2 * g.ix_dim * pool_b() / 4, err))
                 return false;
@@ -7037,6 +7052,107 @@ struct Model::Impl {
         for (int i = 0; i < T * g.n_used; ++i) ++c[shost().h_ids[i]];
     }
 
+    // HY4_KV_GROW (on unless HY4_KV_GROW=0; one GPU, the latent cache in VRAM - no KV streaming -, no GPU fetch): an
+    // indexed layer's latent cache is allocated for the whole context (--max-context), but a conversation uses its first
+    // `end` positions.  The rest lends its room to more of the layer's routed experts: the cache and the VRAM experts
+    // are one allocation, the cache first, and grow_k slots just below the experts' own live in the cache's tail - the
+    // experts' base moved down by grow_k blobs, the slots renumbered (the experts already in VRAM keep their bytes and
+    // addresses).  Between answers (idle) the room past end + kGrowRoom positions takes the layer's most routed experts
+    // of the CPU lane (HY4_HOT's scores); a window that would write a row inside the lent room first gives slots back
+    // (their experts to the CPU lane again - no copies, the slot tables only), so the cache holds every position as
+    // before.  The experts in VRAM change between answers only, as HY4_HOT's: an answer runs on one placement.
+    static constexpr int64_t kGrowRoom = 16384, kGrowStep = 8192;
+    int64_t grow_cap = std::numeric_limits<int64_t>::max();   // (positions every growing layer's cache holds: none lent yet)
+    int64_t grow_lent = 0, grow_back = 0, grow_moves = 0;
+    int grow_said = 0;
+    bool grow_wanted() const {
+        const char* e = std::getenv("HY4_KV_GROW");
+        return !(e && *e && std::atoi(e) == 0) && G.size() == 1 && tp <= 1 && kv_res() == 0 && !o.trial;
+    }
+    bool grow_any() const {
+        for (const Layer& l : L)
+            if (l.grow_buf != nullptr) return true;
+        return false;
+    }
+    // every growing layer's cache to hold `cap` positions at least (and no more than it must: the rest lent) - slots
+    // given back first where the cap rises, the most routed lane experts copied in where it falls
+    bool grow_set(int64_t cap, std::string& err) {
+        cap = std::min<int64_t>(std::max<int64_t>(cap, 0), o.max_ctx);
+        if (fx.mode != 0) return true;   // (the GPU fetch owns the slots)
+        const size_t kvb = (size_t) o.max_ctx * kv_rb();
+        int64_t held = o.max_ctx;
+        for (Layer& l : L) {
+            if (l.grow_buf == nullptr) continue;
+            Gpu& gp = G[(size_t) l.gpu];
+            const int want = cap >= o.max_ctx ? 0 : (int) std::min<size_t>((kvb - (size_t) cap * kv_rb()) / l.blob,
+                                                                          (size_t) (g.n_expert - (l.n_res - l.grow_k)));
+            if (want < l.grow_k) {   // (the lowest slots - the cache's next rows - back to the CPU lane)
+                const int d = l.grow_k - want;
+                for (int e = 0; e < g.n_expert; ++e) {
+                    int& sl = l.slot_of[(size_t) e];
+                    if (sl >= 0) sl = sl < d ? -1 : sl - d;
+                }
+                l.experts += (size_t) d * l.blob;
+                l.n_res -= d;
+                l.grow_k = want;
+                grow_back += d;
+                CK(cudaMemcpyAsync(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice, gp.s));
+            } else if (want > l.grow_k && h_stage != nullptr) {   // (the lane's most routed ones into new lowest slots)
+                const float* sc = hot.score.size() >= (size_t) (l.il + 1) * g.n_expert
+                                      ? hot.score.data() + (size_t) l.il * g.n_expert : nullptr;
+                std::vector<int> cand;
+                for (int e = 0; e < g.n_expert; ++e)
+                    if (l.slot_of[(size_t) e] < 0) cand.push_back(e);
+                if (sc) std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return sc[a] > sc[b]; });
+                const int a = std::min<int>(want - l.grow_k, (int) cand.size());
+                if (a <= 0) continue;
+                CK(cudaSetDevice(gp.dev));
+                uint8_t* base = l.experts - (size_t) a * l.blob;
+                for (int b0 = 0; b0 < a; b0 += kStage) {   // (the new slots' bytes first; the tables after)
+                    const int nb = std::min<int>(kStage, a - b0);
+                    auto gather = [&](int it) {
+                        const int i = it / 3, role = it % 3;
+                        const size_t e = (size_t) cand[(size_t) (b0 + i)];
+                        uint8_t* dst = h_stage + (size_t) i * stage_blob + l.tr[role];
+                        const uint8_t* src = role == 0 ? l.cex.G(e) : role == 1 ? l.cex.U(e) : l.cex.D(e);
+                        std::memcpy(dst, src, role == 2 ? l.cex.d_stride : l.cex.g_stride);
+                    };
+                    if (lane && nb >= 2) lane->parallel_for(nb * 3, gather);
+                    else
+                        for (int it = 0; it < nb * 3; ++it) gather(it);
+                    for (int i = 0; i < nb; ++i)
+                        CK(cudaMemcpyAsync(base + (size_t) (b0 + i) * l.blob, h_stage + (size_t) i * stage_blob,
+                                           l.tr[2] + l.cex.d_stride, cudaMemcpyHostToDevice, gp.s));
+                    CK(cudaStreamSynchronize(gp.s));   // (the staging blobs taken before they are reused)
+                }
+                for (int e = 0; e < g.n_expert; ++e) {
+                    int& sl = l.slot_of[(size_t) e];
+                    if (sl >= 0) sl += a;
+                }
+                for (int i = 0; i < a; ++i) l.slot_of[(size_t) cand[(size_t) i]] = i;
+                l.experts = base;
+                l.n_res += a;
+                l.grow_k += a;
+                grow_lent += a;
+                CK(cudaMemcpyAsync(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice, gp.s));
+            }
+            held = std::min<int64_t>(held, (int64_t) ((kvb - (size_t) l.grow_k * l.blob) / kv_rb()));
+        }
+        int lent = 0;
+        for (const Layer& l : L) lent += l.grow_k;
+        if (lent != grow_said)
+            std::fprintf(stderr, "maya-hy4: HY4_KV_GROW: %d more routed experts in VRAM, in the latent cache's room past "
+                         "%lld positions\n", lent, (long long) held);
+        grow_said = lent;
+        grow_cap = held;
+        ++grow_moves;
+        return true;
+    }
+    // a window writes rows p0 .. p1 - 1: the lent room given back first where they reach it
+    bool grow_fit(int64_t p1, std::string& err) {
+        if (p1 <= grow_cap) return true;
+        return grow_set(std::min<int64_t>(o.max_ctx, (p1 + kGrowStep - 1) / kGrowStep * kGrowStep + kGrowStep), err);
+    }
     // HY4_HOT (see Hot): its settings and the scores a start begins with - the file's, else the profile's counts
     // as 256 tokens of history, else none.  On unless HY4_HOT=0 (tensor parallel: HY4_HOT=1 only)
     void hot_init() {
@@ -8885,6 +9001,7 @@ struct Model::Impl {
     // (HY4_LOGIT_HASH: every window's logits rows hashed, bit by bit, as they come - printed with the reports at the
     //  end; two builds or settings that print the same hash made the same logits for every row)
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
+        if (grow_cap < o.max_ctx && !grow_fit(p0 + T, err)) return false;   // (HY4_KV_GROW: the rows not lent)
         if (!window_run(ids, T, p0, want, logits_out, err)) return false;
         if (logit_hash && want > 0 && logits_out != nullptr) {
             const size_t n = (size_t) want * g.n_vocab;
@@ -11236,6 +11353,9 @@ void Model::idle() {
     std::string err;
     if (m->hot.on && !m->hot.quiet && !m->hot_rebalance(m->hot.max_swaps, err))
         std::fprintf(stderr, "maya-hy4: HY4_HOT: %s\n", err.c_str());
+    // (HY4_KV_GROW: the cache's room past the conversation and kGrowRoom more positions lent to experts)
+    if (m->grow_any() && !m->grow_set(m->end + Impl::kGrowRoom, err))
+        std::fprintf(stderr, "maya-hy4: HY4_KV_GROW: %s\n", err.c_str());
 }
 
 int Model::vocab() const { return m->g.n_vocab; }
