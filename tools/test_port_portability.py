@@ -44,7 +44,8 @@ SRC_DIRS = ("src", "include", "tests")
 SRC_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh", ".inl", ".ipp"}
 
 # --- check 1 --------------------------------------------------------------------------------------------------------
-MSVC_SKIP_DIRS = ("include/maya/hip_compat/", "tests/hip/")   # the AMD build's only (ROCm clang compiles them)
+# the AMD build's only (ROCm clang compiles them; maya-ik2s, src/ik2s: AMD under Linux only, cmake/ik2s.cmake)
+MSVC_SKIP_DIRS = ("include/maya/hip_compat/", "tests/hip/", "src/ik2s/")
 MSVC_SKIP_FILES = {
     "tests/mm3_lane_test.cpp": "CMakeLists.txt builds it only if(NOT WIN32)",
 }

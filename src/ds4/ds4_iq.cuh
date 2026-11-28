@@ -30,7 +30,10 @@ constexpr int kQ8_0 = 8, kQ6_K = 14;
 ///   kActSwiglu  DeepSeek's clamped SwiGLU: g = min(g, limit), u = clamp(u, -limit, limit), silu(g) u (limit 0: none)
 ///   kActOai     MiniMax's swigluoai (gpt-oss's, llama.cpp's LLM_FFN_SWIGLU_OAI_MOE): the same clamps, then
 ///               g sigmoid(kOaiAlpha g) (u + 1)
-constexpr int kActSwiglu = 0, kActOai = 1;
+///   kActSitu    Inkling 2's SITU (llama.cpp's LLM_FFN_SITU): beta tanh(g / beta) sigmoid(g) * (lb > 0 ? lb tanh(u / lb)
+///               : u), beta = situ_beta, lb = situ_lb, no limit; gate and up of one type and beta > 0 (else false).
+///               Not MXFP4's light form nor maya-ds4's AMD prompt experts: a SITU set takes the tiles there.
+constexpr int kActSwiglu = 0, kActOai = 1, kActSitu = 2;
 constexpr float kOaiAlpha = 1.702f;
 
 /// Whether the routed experts' kernels take this ggml type.
@@ -68,11 +71,12 @@ struct Args {
     float* h = nullptr;      // [entries][n_ff]: the activation (act's)
     float* part = nullptr;   // [entries][n_embd]: each entry's down output
     int tg = 0, td = 0;      // gate / up's type, down's
-    int act = kActSwiglu;    // the activation (kActOai: MiniMax's)
+    int act = kActSwiglu;    // the activation (kActOai: MiniMax's, kActSitu: Inkling 2's)
     int tu = 0;              // the up's type when it is not the gate's (0: tg; any act): gate and up then in two passes,
                              // the gate's sums in h first - each value the same as one pass gives
     int pexp = 0;            // 1: the token kernels' SwiGLU takes exp_portable (ds4_par_exp.h, DS4_LANE_PARITY), the
                              // CPU lane's exp bit for bit, in place of CUDA's expf (its ex2.approx)
+    float situ_beta = 4.0f, situ_lb = 25.0f;   // (kActSitu) Inkling 2's (GGUF situ_beta / situ_linear_beta)
 };
 /// grid (n_ff / 8, groups): h of every entry (ne_max: a group's most entries).  false: a type not covered.
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
@@ -106,6 +110,7 @@ struct SetArgs {
     int act = kActSwiglu;      // the activation (Args::act)
     int tu = 0;                // the up's type when it is not the gate's (0: tg; any act) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
+    float situ_beta = 4.0f, situ_lb = 25.0f;   // (kActSitu) as Args::situ_beta / situ_lb
 };
 #if defined(MAYA_USE_HIP)
 // Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.

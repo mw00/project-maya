@@ -1,0 +1,104 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d25..566d25b6e 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -31,6 +31,7 @@ else()
+     add_subdirectory(simple-chat)
+     add_subdirectory(speculative)
+     add_subdirectory(speculative-simple)
++    add_subdirectory(inkling-dspark-eval)
+     add_subdirectory(gen-docs)
+     add_subdirectory(training)
+     add_subdirectory(diffusion)
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index c2ea18d3c..d3edf9cbc 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3830,6 +3830,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+                 return LLAMA_ROPE_TYPE_MROPE;
+             }
+             // DSV4 and ML4 DSpark drafters use normal RoPE; legacy DFlash backbones are NeoX
++            if (model->hparams.dspark_markov_rank > 0 && getenv("INK_DSPARK_ROPE_NORM")) { return LLAMA_ROPE_TYPE_NORM; } // MAYA-EVAL
+             return model->hparams.dsv4_hc_mult > 0 || model->hparams.n_lora_kv > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
+ 
+         case LLM_ARCH_SENSENOVA_U1:
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index df07f14cf..a261e5884 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -94,7 +94,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+             }
+         }
+         // The anchor row includes the anchor and the window before it.
+-        hparams.n_swa += 1;
++        hparams.n_swa += getenv("INK_DSPARK_SWA_PLUS") ? atoi(getenv("INK_DSPARK_SWA_PLUS")) : 1; // MAYA-EVAL
+         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+         hparams.rope_freq_base_train_swa = hparams.rope_freq_base_train;
+         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+@@ -138,7 +138,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+         if (hparams.dsv4_hc_single_pass) {
+             // DeepSeek-V4.1 DSpark: block queries see the main-KV ring plus the block via the mask row of the
+             // first query, so that row's SWA window must reach window_size positions before the anchor
+-            hparams.n_swa += 1;
++            hparams.n_swa += getenv("INK_DSPARK_SWA_PLUS") ? atoi(getenv("INK_DSPARK_SWA_PLUS")) : 1; // MAYA-EVAL
+         }
+         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+         hparams.set_swa_pattern(0);
+@@ -167,7 +167,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+         }
+ 
+         // same as DSV4.1 DSpark: block uses the window of the anchor
+-        hparams.n_swa += 1;
++        hparams.n_swa += getenv("INK_DSPARK_SWA_PLUS") ? atoi(getenv("INK_DSPARK_SWA_PLUS")) : 1; // MAYA-EVAL
+         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+         hparams.set_swa_pattern(0);
+         for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+@@ -2029,7 +2029,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
+         cur = ggml_concat(ctx0, cur, masks, 1);
+     }
+     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+-    attn->self_attn_mask_swa.block_uniform = true;
++    attn->self_attn_mask_swa.block_uniform = getenv("INK_DSPARK_ROWMASK") == nullptr; // MAYA-EVAL
+     for (int il = 0; il < n_layer; ++il) {
+         const auto & l = model.layers[il];
+         const int64_t hd = hparams.n_embd_head_k(il);
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 2c748ed97..11c80dc03 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -210,6 +210,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
+     auto * cur = build_norm(build_inp_embd(model.tok_embd), model.tok_norm, nullptr, LLM_NORM_RMS, -1);
+     std::vector<ggml_tensor *> blocks;
++    std::vector<ggml_tensor *> ink_mixed(n_layer, nullptr);
+     for (int il = 0; il < n_layer; ++il) {
+         const auto & l = model.layers[il];
+         const bool swa = hparams.is_swa(il);
+@@ -228,6 +229,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+             for (int j = 0; j < 3; ++j) {
+                 inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (swa ? 0 : j)*mixed->nb[1]));
+             }
++            ink_mixed[il] = inputs[0];
+         }
+         if (swa) {
+             inputs[0] = build_norm(inputs[0], l.attn_norm, nullptr, LLM_NORM_RMS, il);
+@@ -294,9 +296,19 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+         cur = ggml_add(ctx0, residual, cur);
+         cb(cur, "l_out", il);
+     }
++    ggml_tensor * ink_raw47 = cur; // MAYA-EVAL: tap variants in spare layer_inp slots
+     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
++    ggml_tensor * ink_mix48 = cur;
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+     res->t_layer_inp[n_layer] = cur;
++    if (getenv("INK_TAP_EXTRA")) {
++        res->t_layer_inp[0] = ink_raw47;                       // l_out-47, raw
++        res->t_layer_inp[1] = ggml_cont(ctx0, ink_mix48);      // the head's mix, before the norm
++        ggml_build_forward_expand(gf, res->t_layer_inp[1]);
++        for (int id = 5; id < n_layer; id += 6) {
++            if (ink_mixed[id]) res->t_layer_inp[id - 3] = ink_mixed[id];   // layer id's mixed Q input, before its norm
++        }
++    }
+     if (out_ids) {
+         cur = ggml_get_rows(ctx0, cur, out_ids);
+     }

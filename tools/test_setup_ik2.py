@@ -62,7 +62,8 @@ class Names(unittest.TestCase):
             self.assertEqual(Q.resolve(name), ("ik2", None), name)
         self.assertEqual(Q.resolve("Inkling-2-Mini-Maya-L"), ("ik2", Q.IK2_QUANT))
         self.assertEqual(Q.resolve("inkling-2-mini-ud-q4_k_xl"), ("ik2", Q.IK2_UNSLOTH))
-        self.assertIsNone(Q.resolve("inkling-2-small"))   # (Inkling-2-Small: by hand, no setup)
+        # (Inkling-2-Small: its own engine and setup, maya-ik2s on AMD - not maya-ik2's; tools/test_setup_ik2s.py)
+        self.assertEqual(Q.resolve("inkling-2-small"), ("ik2s", Q.IK2S_QUANT))
         self.assertEqual((maya.IK2, maya.IK2_SHOWN, maya.IK2_MODEL_NAME),
                          ("Inkling-2-Mini", "Inkling 2 Mini", "inkling-2-mini"))
         self.assertIn("ik2", maya.FAMILIES)

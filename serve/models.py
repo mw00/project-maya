@@ -18,6 +18,9 @@ A config's settings, as the page shows them (None: the engine's own default, or 
   Inkling-2-Mini (maya-ik2, it stops at a flag it does not know, only its own are written):
              kv ("fp8" | "f16": IK2_KV); one GPU, one answer at a time, text only, no drafting offered for now; whether
              a context keeps every expert in VRAM: tools/ik2_fit.py, the setup's
+  Inkling-2-Small (maya-ik2s, AMD; text only): DeepSeek's parallel, draft ("dspark" | "none": its DSpark drafter,
+             where its index is on this PC), reserve_mib, mmap, prefill_chunk, cpu_threads; kv ("q8" | "f16": the
+             global layers' cache, --kv) and dspark_cum (its counterpart of DeepSeek's dspark_conf)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -52,7 +55,10 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 # end yet)
 # (maya-hy4: Tencent's own Q4_K_M run end to end up to 256K; Maya's sizes up to 32K so far - the model is trained for 1M)
 # (maya-ik2: Inkling-2-Mini run to 262,144 by its contributor - every expert in VRAM with an FP8 cache)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "ik2": 262144, "ling": 262144}
+# (maya-ik2s: Inkling-2-Small run end to end at --max-context 524288 with a 307,710-token prompt - docs/INKLING2_AMD.md,
+#  "Long contexts"; 1M has not been run: on the PC it was measured on, its experts outside VRAM do not fit in RAM then)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "ik2": 262144, "ling": 262144,
+                  "ik2s": 524288}
 CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
@@ -98,6 +104,30 @@ LING_OFF = {"parallel": 1}
 LING_NOT_YET = {"parallel": "Answers at once: Ling-3.2-air answers one request at a time for now"}
 IK2_OFF: dict = {}
 IK2_NOT_YET: dict = {}   # (v1.1.74: --parallel, Answers at once, is in - the engine's resident path on one GPU)
+# Inkling-2-Small on maya-ik2s (AMD, docs/INKLING2_AMD.md): DeepSeek's settings, the cache's format and the drafts' floor
+IK2S_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "reserve_mib", "mmap", "prefill_chunk",
+             "cpu_threads", "kv", "dspark_cum")
+IK2S_CONTEXTS = DS4_CONTEXTS                        # (maya.py's IK2S_CONTEXTS: DeepSeek's, to its trained 1M)
+# its DSpark drafter (maya-ik2s --dspark-index): tools/ik2s/convert_dspark.py's Q8_0 index, in the folder the setup
+# downloads Thinking Machines' mtp.safetensors into, beside the model's GGUF folder
+IK2S_MTP_DIR = "Inkling-2-Small-MTP"
+IK2S_DSPARK = "maya-ik2s-dspark-q8_0"
+# its VRAM a context position, from its allocations (src/ik2s/ik2_hip_model.cu) - the setup's (maya.py's ik2s_kv_gb)
+# and the Models page's Context size line both count these:
+#   IK2S_KV_BYTES      all the GPUs together: the 8 global layers' K and V rows, 8 kv heads x 128 - F16, or (--kv q8)
+#                      int8 with an F32 scale a row; the 40 sliding-window layers' rings are 5,632 rows whatever the
+#                      context (the window 1,024 + --rewind 4,096 + a 512-token chunk);
+#   IK2S_ATTN_BYTES    each GPU: the decode step's attention scratch, n_head (48) x (head_dim + 2) floats a 16-key tile,
+#                      once it outgrows its floor;
+#   IK2S_DSPARK_KV_BYTES  the drafter's, on the last GPU while it drafts: its one global layer's K and V rows (F16) and
+#                      its attention's scores (F32 + F16 for 8 block rows x 48 heads)
+IK2S_KV_BYTES = {"q8": 8 * 2 * 8 * (128 + 4), "f16": 8 * 2 * 8 * 128 * 2}
+IK2S_ATTN_BYTES = 48 * (128 + 2) * 4 // 16
+IK2S_DSPARK_KV_BYTES = 2 * 8 * 128 * 2 + 8 * 48 * (4 + 2)
+# the drafter's VRAM on the last GPU at a context of 32,768, GB: measured (that GPU's free VRAM after the load with the
+# drafter and without it: its own 3,162.5 MiB, its BLAS, stream and kernels 151.5); the engine places its experts after
+# the drafter, so it needs no figure - the setup and the page say this one
+IK2S_DSPARK_GB = 3.47
 
 
 def ik2_draft_of(args: list) -> str:
@@ -151,7 +181,8 @@ def _float(v, default=None):
 
 
 def family(cfg: dict) -> str:
-    """"minimax", "deepseek", "qwen", "hy4" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
+    """"minimax", "deepseek", "qwen", "hy4", "ik2", "ik2s", "ling" or "glm" (maya_quants.family_of, as maya.py and the
+    server read it)."""
     return maya_quants.family_of(cfg)
 
 
@@ -229,10 +260,10 @@ def trained_context(model_dir) -> int | None:
 def trained_context_ds4(pack) -> int | None:
     """DeepSeek's, MiniMax's and Hy4-flash's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
     max_position_embeddings, from the model's config.json or a GGUF's context_length; hy4.txt's context_length;
-    V4.1-Flash, M3.1-Flash and Hy4-flash: 1,048,576, their native reach), the top of the dashboard's Context size.
-    None when the pack does not say."""
+    V4.1-Flash, M3.1-Flash and Hy4-flash: 1,048,576, their native reach; maya-ik2s's inkling2.txt context_length,
+    Inkling-2-Small's 1,048,576), the top of the dashboard's Context size.  None when the pack does not say."""
     for name, key in (("ds4.txt", "max_position_embeddings"), ("mm3.txt", "max_position_embeddings"),
-                      ("hy4.txt", "context_length")):
+                      ("hy4.txt", "context_length"), ("inkling2.txt", "context_length")):
         try:
             with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -379,6 +410,22 @@ def hy4_has_vision(cfg: dict) -> bool:
         return False
 
 
+def ik2s_drafter(cfg: dict) -> Path | None:
+    """maya-ik2s's DSpark drafter (an index with its dspark.txt): the one the config drafts with (--dspark-index), else
+    the one a setup converted beside the model - in its models folder (installer.models_dir), or where the setup's
+    layout puts it beside the pack (<models>/Inkling-2-Small-GGUF/<quant>/maya-ik2s).  None when it is not on this
+    PC."""
+    args = cfg.get("args") or []
+    found = [Path(p) for p in [flag(args, "--dspark-index")] if p]
+    models = (cfg.get("installer") or {}).get("models_dir")
+    if models:
+        found.append(Path(models) / IK2S_MTP_DIR / IK2S_DSPARK)
+    pack = flag(args, "--pack")
+    if pack and len(Path(pack).parents) > 3:
+        found.append(Path(pack).parents[2] / IK2S_MTP_DIR / IK2S_DSPARK)
+    return next((d for d in found if (d / "dspark.txt").is_file()), None)
+
+
 def mm3_pack_has(cfg: dict, key: str) -> bool:
     """MiniMax's pack indexes `key` (mm3.txt: "dspark.num_hidden_layers" its drafter, "vision.hidden_size" its vision
     tower - maya.py's checks)."""
@@ -467,6 +514,9 @@ def _choices(cfg: dict) -> dict:
     if family(cfg) == "ling":
         args = cfg.get("args") or []
         return {"draft": ["on", "none"], "images": bool(flag(args, "--mmproj")), "kv": ["f16", "q8"]}
+    if family(cfg) == "ik2s":                          # (Inkling-2-Small: text only; maya-ik2s drafts with DSpark)
+        return {"draft": ["dspark", "none"] if ik2s_drafter(cfg) is not None else ["none"], "images": False,
+                "text_only": True, "kv": list(IK2S_KV_BYTES)}
     if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off)
         # (drafting: auto - measured once on this PC; the drafter by hand where the setup downloaded it; none)
         ctx = int(flag(cfg.get("args") or [], "--max-context") or 0)
@@ -526,6 +576,19 @@ def settings_of(cfg: dict) -> dict:
         out.update(images=bool(flag(args, "--mmproj")) and flag(args, "--vision") != "off",
                    kv=kv_norm, draft=dr, parallel=1,
                    prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
+        return out
+    if family(cfg) == "ik2s":                          # (maya-ik2s's own defaults where the config names none)
+        # (it drafts unless --dspark off / none, as maya-ds4, from the index --dspark-index names - none named: none)
+        dspark, index = flag(args, "--dspark", "on"), flag(args, "--dspark-index")
+        out.update(images=False, draft="dspark" if dspark not in ("off", "none") and index and
+                   (Path(index) / "dspark.txt").is_file() else "none",
+                   reserve_mib=_int(flag(args, "--reserve-mib")), prefill_chunk=_int(flag(args, "--prefill-chunk")),
+                   cpu_threads=_int(flag(args, "--cpu-threads")), dspark_cum=_float(flag(args, "--dspark-cum")),
+                   kv=flag(args, "--kv", "f16"),        # (the engine's own: F16)
+                   mmap=flag(args, "--mmap-experts", "auto"),   # (DeepSeek's: auto, the engine's own)
+                   parallel=_int(flag(args, "--parallel"), 1))  # (DeepSeek's: n conversations at once)
+        if out["mmap"] not in ("auto", "on", "off"):
+            out["mmap"] = "auto"
         return out
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
         kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
@@ -634,7 +697,8 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS, "hy4": HY4_KEYS, "ik2": IK2_KEYS, "ling": LING_KEYS}.get(fam, GLM_KEYS)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS, "hy4": HY4_KEYS, "ik2": IK2_KEYS, "ling": LING_KEYS,
+             "ik2s": IK2S_KEYS}.get(fam, GLM_KEYS)
     known += ("ablate",)
     if fam == "hy4":
         not_yet = sorted(k for k in set(settings) & set(HY4_NOT_YET)
@@ -705,6 +769,8 @@ def apply(cfg: dict, settings: dict) -> dict:
         out.pop("env", None)
 
     reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam not in ("minimax", "hy4", "ik2") else None
+    if fam == "ik2s" and s.get("images"):
+        raise ValueError("Images: Inkling 2 Small on maya-ik2s reads text only for now")
     if fam == "qwen":
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"
@@ -816,6 +882,32 @@ def apply(cfg: dict, settings: dict) -> dict:
         args = set_flag(args, "--prefill-chunk", pc) if pc else args
         ct = _num(s, "cpu_threads", 1, 256, "CPU threads")
         args = set_flag(args, "--cpu-threads", ct) if ct else args
+    elif fam == "ik2s":
+        # (maya-ik2s: --max-context above, the GPUs, the env, its DSpark drafter - --dspark on or none with its index,
+        #  as DeepSeek's - the cache's format, and its DeepSeek settings as DeepSeek's are written; empty: the engine's
+        #  own)
+        if s.get("draft") not in can["draft"]:
+            raise ValueError("Drafting: no DSpark drafter for this model on this PC (the setup downloads and converts "
+                             "it)" if s.get("draft") == "dspark" else "Drafting: DSpark or none")
+        drafter = ik2s_drafter(cfg)
+        if drafter is not None:
+            args = set_flag(args, "--dspark", "on" if s["draft"] == "dspark" else "none")
+            args = set_flag(args, "--dspark-index", str(drafter))
+        if str(s.get("kv")) not in IK2S_KV_BYTES:
+            raise ValueError("KV cache: 8-bit (q8) or F16")
+        args = set_flag(args, "--kv", s["kv"]) if s["kv"] != "f16" or "--kv" in args else args
+        args = set_flag(args, "--reserve-mib", reserve) if reserve is not None else drop_flag(args, "--reserve-mib")
+        par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+        args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
+        if s.get("mmap") not in ("auto", "on", "off"):   # (DeepSeek's row: auto is the engine's own, not written)
+            raise ValueError("Experts VRAM does not hold: auto, on or off")
+        args = drop_flag(args, "--mmap-experts") if s["mmap"] == "auto" else set_flag(args, "--mmap-experts", s["mmap"])
+        for key, name, lo, hi, what in (("prefill_chunk", "--prefill-chunk", 16, 65536, "Prompt chunk"),
+                                        ("cpu_threads", "--cpu-threads", 1, 512, "CPU threads")):
+            v = _num(s, key, lo, hi, what)
+            args = set_flag(args, name, v) if v is not None else drop_flag(args, name)
+        cum = _dec(s, "dspark_cum", 0, 1, "Draft confidence")
+        args = set_flag(args, "--dspark-cum", f"{cum:g}") if cum is not None else drop_flag(args, "--dspark-cum")
     elif fam == "ik2":
         # (maya-ik2: --max-context above; one GPU or two - --gpus 2, the split; the cache's format, IK2_KV)
         if len(set(gpus)) not in (1, 2):
@@ -1073,7 +1165,7 @@ def describe(path: Path, running: str | None) -> dict:
         used = None
     cur = shown_settings(cfg)
     rng = context_range(trained_context_of(cfg), cur.get("context"),
-                        {"deepseek": "ds4", "minimax": "mm3", "ik2": "ik2", "ling": "ling",
+                        {"deepseek": "ds4", "minimax": "mm3", "ik2": "ik2", "ling": "ling", "ik2s": "ik2s",
                          "hy4": "hy4-q4" if hy4_plain(cfg) else "hy4"}.get(family(cfg), ""))
     hy4_fits = hy4_contexts(cfg) if family(cfg) == "hy4" else []
     ik2 = family(cfg) == "ik2"
@@ -1098,6 +1190,12 @@ def describe(path: Path, running: str | None) -> dict:
                                 for c, v in st.items() if v} or None)
         own.update(kv_small_from=min(small) if small else None,
                    context_more=bool(hy4_fits) and max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
+    if family(cfg) == "ik2s":
+        # (Inkling-2-Small on maya-ik2s: its VRAM a context position by the cache's format - all the GPUs' caches,
+        #  each GPU's attention scratch, the drafter's while it drafts - and the drafter's own VRAM, for the Context
+        #  size line and the Drafting hint)
+        own = {"ik2s_kv_bytes": IK2S_KV_BYTES, "kv_gpu_bytes": IK2S_ATTN_BYTES, "dspark_kv_bytes": IK2S_DSPARK_KV_BYTES,
+               "dspark_gb": IK2S_DSPARK_GB}
     if ik2:
         # (Inkling-2-Mini: whether each context keeps every expert in VRAM on its card, by the cache's format; the
         #  page says where the engine would run its slower path)
@@ -1142,7 +1240,8 @@ def describe(path: Path, running: str | None) -> dict:
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             # (Hy4-Flash: only the contexts that fit this config's cards - hy4_contexts; the slider ends at the largest)
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS,
-                         "hy4": hy4_fits, "ik2": IK2F.CONTEXTS, "ling": LING_CONTEXTS}.get(family(cfg), CONTEXTS),
+                         "hy4": hy4_fits, "ik2": IK2F.CONTEXTS, "ling": LING_CONTEXTS,
+                         "ik2s": IK2S_CONTEXTS}.get(family(cfg), CONTEXTS),
             # (the Engine settings' Context size slider: the same range as Settings > Model's for this model)
             "context_range": rng}
 
@@ -1789,7 +1888,7 @@ def pack_reads(pack: Path) -> list:
     the model's own shards, and
     what it takes from other folders: the Engram tables of a GGUF set beside it, the DSpark drafter, the vision tower."""
     model = None
-    for name in ("ds4.txt", "mm3.txt", "hy4.txt"):
+    for name in ("ds4.txt", "mm3.txt", "hy4.txt", "inkling2.txt"):   # (inkling2.txt: maya-ik2s's pack)
         try:
             with open(pack / name, encoding="utf-8", errors="replace") as f:
                 model = next((ln[len("model_dir "):].strip() for ln in f if ln.startswith("model_dir ")), None)
@@ -2058,7 +2157,8 @@ def delete(root: Path, path: Path, files: bool = False) -> dict:
 # its vision tower in another's).  Never a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
 # deletes one at a time.
 LEFTOVER_MIN = 10 ** 8
-PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "hy4.txt", "native_experts.txt", "index.txt")
+PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "hy4.txt", "inkling2.txt", "native_experts.txt",
+              "index.txt")
 
 
 def models_dirs(root: Path) -> list:

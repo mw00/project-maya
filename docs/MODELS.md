@@ -10,7 +10,7 @@ special about it. Back to the [README](../README.md).
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Hy4-Flash](#hy4-flash)
 - [Inkling-2-Mini](#inkling-2-mini)
-- [Inkling-2-Small (by hand, for now)](#inkling-2-small-by-hand-for-now)
+- [Inkling-2-Small](#inkling-2-small)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
 ## How the quants are named
@@ -330,18 +330,26 @@ inkling-2-mini-maya-l` switches it to Maya-L, `--model inkling-2-mini-ud-q4_k_xl
   ([docs/SETTINGS.md](SETTINGS.md#refusal-ablation-per-request-ablate)). Drafting stays exact with it on.
 - One request at a time for now.
 
-## Inkling-2-Small (by hand, for now)
+## Inkling-2-Small
 
 **[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)** (thinkingmachines; 594 B, ~17 B active,
-Apache 2.0) runs on its own engine, `maya-ik2` (#974), from unsloth's GGUFs as they are - not from the setup yet: a
-tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md](INKLING2.md) section 6).
+Apache 2.0), #974. Two engines run it, from unsloth's GGUFs as they are:
+
+- **On 2-4 AMD GPUs (Linux): `maya-ik2s`** ([INKLING2_AMD.md](INKLING2_AMD.md)), set up by `./maya.sh --setup
+  --backend hip --model inkling-2-small` or the Models page's list on an AMD install: unsloth's UD-Q2_K_XL with the
+  model's DSpark drafter (`tools/ik2s/download.json`, pinned by revision, size and sha256), the layers split across the
+  GPUs, the experts VRAM does not hold computed on the CPU from RAM; tool calls, thinking, several answers at once, up
+  to a 1M context; text only.
+- **On NVIDIA (CUDA, Linux): `maya-ik2`**, by hand for now - a tokenizer folder and a run config, then
+  `serve/server.py` ([INKLING2.md](INKLING2.md) section 6).
 
 | Files | Size | Runs on |
 | --- | --- | --- |
+| [unsloth's UD-Q2_K_XL](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) (IQ2_XS / IQ3_XXS experts) and the DSpark drafter (`mtp.safetensors`, 3.4 GB) | 205 GB + 3.4 GB; about 203 GB of VRAM and RAM together | `maya-ik2s`: 2-4 AMD GPUs, RDNA 3 / 4, Linux. Run on 4x Radeon AI PRO R9700 with 125 GB of RAM (`./maya.sh --bench`: see INKLING2_AMD.md) |
 | [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) (NVFP4 experts, layers 0-39) | 330 GiB; the experts ~323 GiB of pinned RAM | NVIDIA, Ampere on (CUDA), Linux; one or two GPUs. Run on H200 (35 tok/s) and RTX PRO 6000 (22; two: 42) |
 | unsloth's UD-Q3_K_XL (IQ3_XXS / IQ4_XS experts) | 266 GiB; ~260 GiB of pinned RAM | the same; H200: 44.6 tok/s |
 
-Text only, one request at a time. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
+Text only; on `maya-ik2`, one request at a time. Engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small) (`maya-ik2s`: [its own section](SETTINGS.md#inkling-2-small-on-amd-maya-ik2s)).
 
 ## Community quants of GLM-5.3-Flash
 

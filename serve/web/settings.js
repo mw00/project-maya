@@ -46,7 +46,8 @@ const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`se
 
 // the engines by their INFO engine_kind
 const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)",
-                 hy4: "Hy4-Flash (maya-hy4)", ik2: "Inkling 2 (maya-ik2)", ling: "Ling-3.2-air (maya-ling)"};
+                 hy4: "Hy4-Flash (maya-hy4)", ik2: "Inkling 2 (maya-ik2)", ling: "Ling-3.2-air (maya-ling)",
+                 ik2s: "Inkling 2 Small (maya-ik2s)"};
 // maya-ling's INFO spec=: what its start decided (the measurement where --drafting is auto)
 const LING_SPEC = {"mtp+lookup": "MTP and the prompt lookup: the model's draft block and text copied from the chat propose tokens, the full model checks them",
                    mtp: "MTP: the model's draft block proposes the next tokens, the full model checks them",

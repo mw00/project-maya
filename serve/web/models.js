@@ -375,6 +375,7 @@ function fieldsOf(m, d) {
   if (m.family === "hy4") return hy4Fields(m, d, s, ch, images, gpus);
   if (m.family === "ik2") return ik2Fields(m, d, ch);
   if (m.family === "ling") return lingFields(m, d, s, ch, gpus);
+  if (m.family === "ik2s") return ik2sFields(m, d, ch, gpus, reserve);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -597,6 +598,50 @@ function ik2Fields(m, d, ch) {
         hint="FP8, the default: half the bytes of F16 and the faster one deep in a long context. F16: twice the VRAM a token, a little closer to the model's own numbers.">
         <${Seg} label="KV cache" value=${d.kv} options=${[{id: "fp8", label: "FP8"}, {id: "f16", label: "F16"}]}
           onChange=${(v) => setDraft({kv: v})}/><//>`]},
+  ];
+}
+
+// Inkling-2-Small's (maya-ik2s, AMD; text only): DeepSeek's rows, its cache's format and its drafts' floor (--dspark-cum).
+// Its VRAM a context position (the server's IK2S_* figures): the global layers' caches across the GPUs by the format,
+// each GPU's attention scratch, and the drafter's while it drafts - a cache each with several answers at once
+function ik2sFields(m, d, ch, gpus, reserve) {
+  const dspark = m.choices.draft.includes("dspark"), per = Math.max(1, Number(d.parallel) || 1);
+  const kvb = ((m.ik2s_kv_bytes || {})[d.kv] || 32768) + Math.max(1, d.gpus.length) * (m.kv_gpu_bytes || 1560) +
+    (d.draft === "dspark" ? (m.dspark_kv_bytes || 6400) : 0);
+  return [
+    {label: "Model", rows: [
+      contextRow(m, d, ch, {vram: kvb * per}, ["kv", "parallel", "draft", "gpus"]),
+      html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint="Up to 8. Each extra conversation keeps its own context's caches in VRAM, which the experts give up; their tokens are decoded together."
+        warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
+      html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
+        hint=${dspark ? `The model's own DSpark drafter drafts a few tokens at a time for the model to check: the same answers, faster on prose and code. It takes about ${(m.dspark_gb || 3.47).toFixed(1)} GB of the last GPU's VRAM. The speed calibration picks the faster on this PC.`
+          : "No DSpark drafter for this model on this PC: the setup downloads and converts it."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>`,
+      html`<${Row} label="Images" flag="--vision" hint=${`${shownOf(m)} reads text only on this engine for now.`}/>`]},
+    {label: "GPUs and memory", rows: [gpus, reserve,
+      html`<${Row} label="KV cache" flag="--kv" changed=${ch("kv")}
+        hint=${`The 8 full-attention layers' cache. 8-bit, the setup's: ${fmt((m.ik2s_kv_bytes || {}).q8 || 16896)} bytes a token, more VRAM left to the experts and a faster decode deep in a chat, its answers within rounding of F16's. F16: ${fmt((m.ik2s_kv_bytes || {}).f16 || 32768)} bytes a token.`}>
+        <${Seg} label="KV cache" value=${d.kv} options=${[{id: "q8", label: "8-bit"}, {id: "f16", label: "F16"}]}
+          onChange=${(v) => setDraft({kv: v})}/><//>`,
+      html`<${Row} label="Experts VRAM does not hold" flag="--mmap-experts" changed=${ch("mmap")}
+        hint="Auto copies the most used into RAM for the CPU to compute, as many as fit, and reads the rest in place from the files.">
+        <${Seg} label="Experts VRAM does not hold" value=${d.mmap} options=${[{id: "auto", label: "Auto"}, {id: "on", label: "From the files"}, {id: "off", label: "In RAM"}]}
+          onChange=${(v) => setDraft({mmap: v})}/><//>`]},
+    {label: "Speed", rows: [
+      html`<${Row} label="Prompt chunk" flag="--prefill-chunk" changed=${ch("prefill_chunk")}
+        hint="The prompt tokens one pass reads at most. The setup's 2,048 reads long prompts faster (the first 4,096 positions in chunks of 512, so short prompts keep their speed); each GPU keeps about 1 GB more for it. Empty: the engine's 512."
+        warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="512" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
+      html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The threads that compute the experts VRAM does not hold. Empty: the engine picks."
+        warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`,
+      d.draft === "dspark" ? html`<${Row} label="Draft confidence" flag="--dspark-cum" changed=${ch("dspark_cum")}
+        hint="Drafts are offered while the drafter's running confidence in them stays at least this, from 0 to 1. Lower offers more. Empty: the engine's 0.5."
+        warn=${decimal(d.dspark_cum) && !(+d.dspark_cum > 1) ? null : "A number from 0 to 1, or empty."}>
+        <${Dec} label="Draft confidence" value=${d.dspark_cum} ph="0.5" on=${(v) => setDraft({dspark_cum: v})}/><//>` : null].filter(Boolean)},
   ];
 }
 
