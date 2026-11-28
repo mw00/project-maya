@@ -13,6 +13,7 @@
 //   x = hc_post(x, rms(that) w, post)
 // and logits = rms(hc_head(x)) w . Wout.
 #include "hy4_model.hpp"
+#include "hy4_tp_stage_slots.hpp"
 
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
@@ -1823,7 +1824,11 @@ struct Model::Impl {
     static constexpr int kPs = 96;       // (HY4_PSTREAM: experts a pass, at most - its second buffer's slots)
     char ps_route[160] = {0};           // (its INFO line about the route)
     bool ps_want = [] { const char* v = std::getenv("HY4_PSTREAM"); return v && std::atoi(v) != 0; }();   // (off; =1: on)
-    int stage_slots() const { return kStage + (ps_want ? kPs : 0); }
+    int tp_stage_cap() const {
+        static const int cap = hy4::parse_tp_stage_slots(std::getenv("HY4_TP_STAGE_SLOTS"), kStage);
+        return cap;
+    }
+    int stage_slots() const { return hy4::tp_stage_slots_for_group(G.size(), tp_stage_cap(), kStage, ps_want ? kPs : 0); }
     // tensor parallel with the CPU lane: a prompt chunk of this many rows or more has every member send its share of
     // the experts no member holds to its own GPU (kShareThreads copy a member's pass into its bounce); a shorter one
     // is member 0's alone, the CPU lane or its GPU as on the layer split
@@ -2838,7 +2843,7 @@ struct Model::Impl {
                 fixed += member_bytes(il, false);
                 if (il < g.n_dense_lead) continue;
                 one += (double) expert_bytes(il) * 1.02;
-                stage = std::max(stage, (double) expert_bytes(il) * kStage);
+                stage = std::max(stage, (double) expert_bytes(il) * tp_stage_cap());
                 tp_unsplit[(size_t) il] = 1;
             }
             std::vector<int> cap((size_t) N, 0);
@@ -4582,22 +4587,31 @@ struct Model::Impl {
                     !G[gi].alloc(G[gi].pmap, (size_t) g.n_expert, err))
                     return false;
                 // the GPU's PCIe as streaming sees it: the pinned bounce to the staging slots
-                CK(cudaMemcpy(G[gi].stage, sh[0].h_stage, blob * kStage, cudaMemcpyHostToDevice));
+                const size_t probe_slots = (size_t) (G.size() > 1 ? tp_stage_cap() : kStage);
+                CK(cudaMemcpy(G[gi].stage, sh[0].h_stage, blob * probe_slots, cudaMemcpyHostToDevice));
                 const double t0 = now_s();
                 for (int r = 0; r < 2; ++r)
-                    CK(cudaMemcpy(G[gi].stage, sh[0].h_stage, blob * kStage, cudaMemcpyHostToDevice));
-                G[gi].h2d_gbs = 2.0 * blob * kStage / 1e9 / std::max(1e-6, now_s() - t0);
+                    CK(cudaMemcpy(G[gi].stage, sh[0].h_stage, blob * probe_slots, cudaMemcpyHostToDevice));
+                G[gi].h2d_gbs = 2.0 * blob * probe_slots / 1e9 / std::max(1e-6, now_s() - t0);
             }
-            if (tp > 1)   // (each member streams its share of the experts no member holds: its own slots and buffers)
+            if (tp > 1) {   // (each member streams its share of the experts no member holds: its own slots and buffers)
+                const int sc = tp_stage_cap();
+                if (sc < kStage) {
+                    char sb[160];
+                    std::snprintf(sb, sizeof sb, "INFO HY4_TP_STAGE_SLOTS: %d slots/GPU (%.1f MiB/GPU)",
+                                  sc, (double) blob * sc / (1024.0 * 1024.0));
+                    info.push_back(sb);
+                }
                 for (int j = 0; j < tp; ++j) {
                     Gpu& gm = G[(size_t) mem[(size_t) j]];
                     CK(cudaSetDevice(gm.dev));
-                    if (!gm.stage && (!gm.alloc(gm.stage, blob * kStage, err) || !gm.alloc(gm.pmap, (size_t) g.n_expert, err)))
+                    if (!gm.stage && (!gm.alloc(gm.stage, blob * (size_t) sc, err) || !gm.alloc(gm.pmap, (size_t) g.n_expert, err)))
                         return false;
                     CK(cudaMallocHost(&gm.hs_ids, sizeof(int) * Tc * 16));
-                    CK(cudaMallocHost(&gm.hs_stage, blob * kStage));
+                    CK(cudaMallocHost(&gm.hs_stage, blob * (size_t) sc));
                     CK(cudaMallocHost(&gm.hs_pmap, sizeof(int) * g.n_expert));
                 }
+            }
             char buf[240];
             std::snprintf(buf, sizeof buf, "INFO CPU lane: %d of %d routed experts in VRAM (%.0f%%), the rest on %d CPU "
                           "threads from the model's file%s", n_res, n_all, 100.0 * n_res / std::max(1, n_all),
@@ -7404,20 +7418,21 @@ struct Model::Impl {
         std::vector<int> u;
         for (int e = 0; e < ne; ++e)
             if (used[(size_t) e]) u.push_back(e);
+        const int sc = G.size() > 1 ? tp_stage_cap() : kStage;
         if (l.tpm >= 0 && !u.empty()) {
             // (the slots still hold this layer's experts, the chunk's other half's: no copy where they cover this half's)
             const int m = l.tpm & 15;
             bool there = share && stg_il[m] == l.il;
             for (size_t i = 0; there && i < u.size(); ++i) there = pmap_h[u[i]] >= 0;
             if (there) return experts_sets(l, gp, T, err, gp.pmap, gp.stage, stg_np[m], true);
-            stg_il[m] = share && u.size() <= (size_t) kStage ? l.il : -1;
+            stg_il[m] = share && u.size() <= (size_t) sc ? l.il : -1;
             stg_np[m] = (int) u.size();
         }
         const CpuExperts& cx = l.cex;
         const size_t gb = cx.g_stride, db = cx.d_stride;
-        if (!share && stream_pipe() && u.size() > (size_t) kStage / 2) return streamed_pipe(l, gp, T, u, err);
-        for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) kStage) {
-            const int np = (int) std::min(u.size() - p0, (size_t) kStage);
+        if (!share && stream_pipe() && u.size() > (size_t) sc / 2) return streamed_pipe(l, gp, T, u, err);
+        for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) sc) {
+            const int np = (int) std::min(u.size() - p0, (size_t) sc);
             const double tc = now_s();
             auto copy = [&](int it) {
                 const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
@@ -7464,7 +7479,7 @@ struct Model::Impl {
         return on;
     }
     bool streamed_pipe(Layer& l, Gpu& gp, int T, const std::vector<int>& u, std::string& err) {
-        const int ne = g.n_expert, half = kStage / 2;
+        const int ne = g.n_expert, half = (G.size() > 1 ? tp_stage_cap() : kStage) / 2;
         cudaStream_t s = gp.s;
         StageHost& S = shost();   // (HY4_PP: the calling stage's host buffers)
         if (gp.cs == nullptr) {
