@@ -362,6 +362,12 @@ tokens parted after 17 of 48. With the CPU lane off, the decode does not depend 
 prompt read token by token (`MAYA_GLM_NO_PREFILL=1`, far slower prompts) both gave the same logits. So on a rig where
 the experts do not all fit in VRAM, answers with a drafter can differ from answers without one.
 
+## DeepSeek: CPU-lane jobs
+
+`MAYA_DS4_LANE_JOBS` (or `DS4_LANE_JOBS`) is off by default. Set it to a positive number to target that many jobs per
+CPU-lane thread on the IQ and mixed IQ/MXFP4 expert paths. Small calls then use fewer rows per job, down to 8 rows for
+IQ and 32 for MXFP4. With it unset or `0`, jobs retain the stock 64 rows. The parity path is unchanged.
+
 ## DeepSeek: an expert's bits wherever it sits
 
 DeepSeek's CPU lane does not give the bits the same expert gives in VRAM, so with any routed expert off VRAM a greedy
