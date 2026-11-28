@@ -234,6 +234,10 @@ struct Lines {
             cv.notify_all();
         }).detach();
     }
+    bool queued() {
+        std::lock_guard<std::mutex> lk(mu);
+        return !q.empty() || eof;
+    }
     bool next(std::string& l) {
         std::unique_lock<std::mutex> lk(mu);
         cv.wait(lk, [&] { return !q.empty() || eof; });
@@ -1751,7 +1755,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     // tokens), its last with a checkpoint before its last token and one after it: the next turn re-renders this one,
     // and shares its start up to one of them
     const auto prompt_piece = [&](Req& r, const std::string& tag, const std::function<bool()>& stop_now, Prompt& P,
-                                  size_t piece) -> bool {
+                                  size_t piece, bool idle) -> bool {
         const size_t total = r.ids.size();
         const size_t from = P.from;
         const double t0 = P.t0;
@@ -1773,6 +1777,13 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         m.set_progress(progress);
         // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
         static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
+        static const int resumed_batch_min = [] {
+            const char* value = ds4_env("DS4_RESUMED_BATCH_MIN");
+            if (value == nullptr) return 0;
+            char* end = nullptr;
+            const long min = std::strtol(value, &end, 10);
+            return end != value && *end == '\0' && min >= 2 && min <= 128 ? (int) min : 0;
+        }();
         m.set_cancel(stop_now);
         std::string err;
         bool ok = true, stopped = false;
@@ -1820,7 +1831,9 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                     ok = ok && m.feed(r.ids.data() + P.done + n - 1, 1, 1, err);
                 }
             } else {
-                ok = fin ? m.feed_mark(r.ids.data() + P.done, (int) n, 1, 1, err)
+                const bool resumed_batch = resumed_batch_min > 0 && !last_window && fin && idle && !in.queued() &&
+                    P.pics.empty() && P.from > 0 && P.done == P.from && n >= (size_t) resumed_batch_min && n <= 128;
+                ok = fin ? m.feed_mark(r.ids.data() + P.done, (int) n, 1, 1, err, resumed_batch)
                          : m.feed(r.ids.data() + P.done, (int) n, 0, err, (int) (upto - P.done - n));
                 if (ok) took = (size_t) m.fed();
             }
@@ -1910,7 +1923,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     };
     const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
                                Prompt& P) -> bool {
-        if (!prompt_begin(r, geni, tag, P) || !prompt_piece(r, tag, stop_now, P, r.ids.size())) return false;
+        if (!prompt_begin(r, geni, tag, P) || !prompt_piece(r, tag, stop_now, P, r.ids.size(), true)) return false;
         prompt_end(P);
         return true;
     };
@@ -2270,12 +2283,13 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         };
         // the next `piece` tokens of its prompt into its conversation (a STOP ends it here, its DONE written); `yield`:
         // the piece ends early at a chunk the model reaches once a line is waiting
-        const auto read_turn = [&](Act& a, size_t piece, bool yield) {
+        const auto read_turn = [&](Act& a, size_t piece, bool yield, bool idle) {
             bind(a.seq);
             const long long rid = a.r.rid;
             if (yield) m.set_yield([&] { return lines_posted.load(std::memory_order_acquire) != lines_taken; });
+            const bool quiet = idle && waiting.empty() && lines_posted.load(std::memory_order_acquire) == lines_taken;
             const bool read = prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P,
-                                           piece);
+                                           piece, quiet);
             m.set_yield(nullptr);
             if (!read) {
                 a.ended = a.done = true;
@@ -2348,7 +2362,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             const bool answering_now = std::any_of(acts.begin(), acts.end(),
                                                    [](const std::unique_ptr<Act>& x) { return !x->reading; });
             if ((!read_pieces && !answering_now) || !a->P.pics.empty()) {
-                read_turn(*a, r.ids.size(), false);
+                read_turn(*a, r.ids.size(), false, acts.empty());
                 if (a->ended) {
                     in.forget(rid);
                     end_if_broken();
@@ -2679,7 +2693,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             Act* a = read_line.front();
             read_line.pop_front();
             const bool alone = read_line.empty() && !answering;
-            if (!a->done) read_turn(*a, alone ? a->r.ids.size() : read_piece, alone);
+            if (!a->done) read_turn(*a, alone ? a->r.ids.size() : read_piece, alone, alone);
             if (a->reading && !a->done) {   // (arrival: the prompt in front keeps its turn, the later ones wait for it)
                 if (read_pieces) read_line.push_back(a);
                 else read_line.push_front(a);
@@ -2716,7 +2730,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         const auto reap = [&](bool answers) -> bool {
             for (auto& ap : acts)
                 if (!ap->done && in.stopped(ap->r.rid)) {
-                    if (ap->reading) read_turn(*ap, 0, false);
+                    if (ap->reading) read_turn(*ap, 0, false, false);
                     else if (answers) {
                         ap->finish = "cancel";
                         ap->done = true;
