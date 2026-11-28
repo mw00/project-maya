@@ -69,6 +69,12 @@ Nothing here is a fixed number for one machine: the setup reads the PC, and the 
   anything is downloaded; `--force-fit` goes on anyway.
 - **Several GPUs**: the layers are split across them, the cards ordered by the engine (a card driving a display
   last). Tensor parallel is not there yet.
+- **The RAM left to the system**: the engine leaves 8 GiB of the RAM free when it sizes its RAM tier; the layers
+  that do not fit are read from the SSD. One layer read from the SSD stops the engine from pinning the RAM tier,
+  which `--offload mix` and `gpu` need: on an RTX 3090 (250 W) with 60 GB of RAM, a 46 GB quant decoded 106 tok/s
+  with all of it in VRAM and RAM, and 70 tok/s with 0.3 GB of it on the SSD (the GPU found 92% of its experts,
+  then 69%). `MAYA_LING_RAM_HEADROOM_GB=<n>` in the config's `env` leaves n GiB instead, and lets the whole tier be
+  pinned: with 49.2 GB free at the start, `6` kept that quant off the SSD (106.3 tok/s), where 8 GiB would not have.
 - **Expert placement**: at its first start the engine measures how to split the experts between GPU, CPU and SSD on
   this PC and keeps the result in its calibration file, beside the model (`maya-ling/ling-calibration.txt`).
   `./maya.sh --calibrate` clears it, and the next start measures again.
