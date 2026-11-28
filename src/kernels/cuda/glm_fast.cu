@@ -59,6 +59,10 @@ __device__ __forceinline__ float __ldcg(const float* p) {
 #define GLMF_SM60 0
 #endif
 
+#if !defined(MAYA_USE_HIP)
+#include "glm_dsa_indexer.cuh"   // dsa_indexer below
+#endif
+
 namespace maya::kernels::glmf {
 namespace {
 
@@ -6718,6 +6722,71 @@ void dsa_select_rows(const DsaSelectRows& a, int n, int kpool, cudaStream_t s) {
     dsa_select_rows_kernel<<<n, 1024, 0, s>>>(a, kpool);
     launch_check("dsa_select_rows");
 }
+
+#if !defined(MAYA_USE_HIP)
+bool dsa_indexer(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
+                 int kpool, int top_pools, int n_sel, int pos, float* score, int* cells, cudaStream_t s) {
+    static const bool on = [] {
+        const char* e = std::getenv("MAYA_GLM_DSA_INDEXER");
+        if (e != nullptr && e[0] == '0' && e[1] == 0) return false;
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        if (major < 8) return false;
+        std::fprintf(stderr, "glm fast: DSA indexer in one call (MAYA_GLM_DSA_INDEXER)\n");
+        return true;
+    }();
+    if (!on || key_dim != dsa_idx::kKey || idx_heads != dsa_idx::kHeads) return false;
+    struct Slot {
+        int dev = -1;
+        cudaStream_t s = nullptr;
+        bool bad = false;
+        dsa_idx::Plan plan;
+    };
+    static Slot tab[16];
+    static std::atomic_flag lock = ATOMIC_FLAG_INIT;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    while (lock.test_and_set(std::memory_order_acquire)) {
+    }
+    Slot* x = nullptr;
+    for (Slot& t : tab)
+        if (t.dev == dev && t.s == s) { x = &t; break; }
+    if (x == nullptr)
+        for (Slot& t : tab)
+            if (t.dev < 0) {
+                x = &t;
+                x->dev = dev;
+                x->s = s;
+                break;
+            }
+    bool ok = x != nullptr && !x->bad;
+    if (ok && x->plan.max_pools < n_pools) {   // first use or a longer context: room for twice the pools, 262144 at least
+        if (x->plan.ctl != nullptr) {
+            cudaStreamSynchronize(s);
+            dsa_idx::release(x->plan);
+        }
+        ok = dsa_idx::init(x->plan, std::max(2 * n_pools, 262144)) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            dsa_idx::release(x->plan);
+            x->bad = true;
+        }
+    }
+    lock.clear(std::memory_order_release);
+    if (!ok) return false;
+    if (dsa_idx::indexer(x->plan, iq, pooled, iw, key_dim, idx_heads, n_pools, kpool, top_pools, n_sel, pos, score,
+                         cells, s) != cudaSuccess) {
+        cudaGetLastError();   // not sticky: dsa_score + dsa_select take this call
+        return false;
+    }
+    return true;
+}
+#else
+bool dsa_indexer(const float*, const float*, const float*, int, int, int, int, int, int, int, float*, int*, cudaStream_t) {
+    return false;
+}
+#endif
 
 void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s) {
     dsa_select_all_kernel<<<(n_sel + 255) / 256, 256, 0, s>>>(n_vis, kpool, n_sel, pos, cells);

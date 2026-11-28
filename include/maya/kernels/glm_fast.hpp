@@ -207,6 +207,11 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s);
+/// dsa_score + dsa_select for one decode token in one call (src/kernels/cuda/glm_dsa_indexer.cuh): the same cells in the
+/// same order; `score` may hold upper bounds instead of scores past 12,288 pools (~49K tokens). false: not taken (MAYA_GLM_DSA_INDEXER=0,
+/// before sm_80, HIP, another shape, no VRAM for its plan) - call the pair.
+bool dsa_indexer(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
+                 int kpool, int top_pools, int n_sel, int pos, float* score, int* cells, cudaStream_t s);
 /// dsa_score of up to kMaxMvNt rows of different sequences (the batched rows) in one launch: row r's query, pools,
 /// weights, scores and pool count as dsa_score's arguments - each row's scores dsa_score's
 struct DsaScoreRows {
