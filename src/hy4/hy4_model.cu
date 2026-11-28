@@ -7487,12 +7487,16 @@ struct Model::Impl {
             const int np = (int) std::min(u.size() - p0, (size_t) half);
             uint8_t* bounce = S.h_stage + (size_t) b * half * l.blob;
             const double tc = now_s();
-            lane->parallel_for(np * 3, [&](int it) {
-                const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
-                uint8_t* dst = bounce + (size_t) i * l.blob + l.tr[role];
-                const uint8_t* src = role == 0 ? cx.G((size_t) e) : role == 1 ? cx.U((size_t) e) : cx.D((size_t) e);
-                std::memcpy(dst, src, role == 2 ? db : gb);
-            });
+            {
+                std::unique_lock<std::mutex> lk(pp_lane_mu, std::defer_lock);
+                if (pp_live.load(std::memory_order_relaxed)) lk.lock();   // (HY4_PP: the two stages share the lane)
+                lane->parallel_for(np * 3, [&](int it) {
+                    const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
+                    uint8_t* dst = bounce + (size_t) i * l.blob + l.tr[role];
+                    const uint8_t* src = role == 0 ? cx.G((size_t) e) : role == 1 ? cx.U((size_t) e) : cx.D((size_t) e);
+                    std::memcpy(dst, src, role == 2 ? db : gb);
+                });
+            }
             sst().stream_ms += (now_s() - tc) * 1e3;
             CK(cudaStreamWaitEvent(gp.cs, gp.ev_used[b], 0));   // (its slots: the sets two passes back done)
             CK(cudaMemcpyAsync(gp.stage + (size_t) b * half * l.blob, bounce, (size_t) np * l.blob,
