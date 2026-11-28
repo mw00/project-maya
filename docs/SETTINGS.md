@@ -2168,6 +2168,35 @@ conversation was answering.
 | `MAYA_DS4_PREFIX_GB` | 2 | their RAM at most (a start bigger than this is not kept) |
 | `MAYA_DS4_PREFIX_MIN` | 1024 | the shortest start kept, in tokens |
 
+## DeepSeek: a stopped prompt read keeps what it read
+
+A client that gives up on a long read - an agent or a proxy with a timeout, Stop in the chat - and sends the same
+prompt again found the conversation back where the stopped read had begun, and read the whole prompt again (and again,
+when it gave up at the same point; GLM's engine had the same until `MAYA_GLM_KEEP_CANCELLED`, #573). A STOP now ends
+the read the way a waiting request's turn does (`Model::set_yield`): at a chunk every GPU reaches, the chunks read kept,
+the conversation part way through the prompt. The same prompt sent again - or a longer one that goes on from it -
+reads on from there, with one conversation and with `--parallel` alike (each conversation keeps its own).
+
+The part-way state is not the one a whole read leaves there: a long prompt's skip (`MAYA_DS4_PROMPT_SKIP`) runs layers
+20-39 only on the last ~2,700 rows of the stretch the read was planned to (the next restore point, or the prompt's end),
+so those layers have not seen the rows near the stop. A prompt goes on from it only when its read reaches that stretch's
+end (the restore points it asks for short of it are left out of that read): the rows those layers need are then all in
+it, and the state at the end is the one a whole read leaves, up to the last bits (the rows after the stop go in chunks
+of their own, and a kernel's choice goes by its row count). Any other prompt goes back to the latest whole state, as
+before. The part-way state is never a checkpoint, a restore point or a kept conversation (`MAYA_DS4_SLOT_KEEP`):
+another request that takes the conversation, or the engine's end, drops it. With pictures, the state holds the ones the
+read went into (their marks) and the read that goes on feeds the rest of a picture's span. A run that cannot end at a
+chunk (one that goes layer by layer) is cut short once the STOP has waited 2.5 times the run's pace, 20 s at least,
+and goes back to the latest whole state.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_KEEP_CANCELLED` | on (1) | `0`: a stopped read goes back to the state before the prompt and the next request reads the prompt again, as before |
+
+The engine's log says what a stopped read kept (`stopped while reading the prompt of N tokens, after T ms; the K tokens
+read are kept, part way: a request that reads on to token S at least goes on from token K`), and a prompt that read
+on from it pins the anchor at its end (`anchor at token ... (a prompt read on from a stopped read)`).
+
 ## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)
 
 A GGUF pack's tensor parallel width must divide the attention heads (64) and the output groups (8), so `--tp 3`
