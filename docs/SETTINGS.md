@@ -2361,7 +2361,7 @@ has its own kernel for its `_gfx12` WMMA, opt-in (`DS4_INDEX_TC_GFX12=1`; a 2 x 
 
 | Setting | Default | |
 | --- | --- | --- |
-| `DS4_INDEX_TC` | on for AMD `gfx11` (RDNA 3 / 3.5); off on NVIDIA and other AMD cards | `0`: the portable kernel on AMD too (the log says so). `1` on NVIDIA (compute capability 8.0+): the tensor cores' kernel (int8 MMAs) |
+| `DS4_INDEX_TC` | on for AMD `gfx11` (RDNA 3 / 3.5); off on NVIDIA and other AMD cards | `0`: the portable kernel on AMD too (the log says so). `1` on NVIDIA (compute capability 8.0+): the tensor cores' kernel (int8 MMAs); the first eligible indexer call logs the selected path, including a fallback on older cards |
 | `DS4_INDEX_TC_GFX12` | off | `1`: on RDNA 4 (`gfx12`) the indexer's scores on its WMMAs too (the last bits differ from the portable kernel, as on gfx11); `DS4_INDEX_TC=0` still turns every AMD card off |
 
 ## Qwen-3.8-Flash-Next (CYBER-FROST)

@@ -4245,6 +4245,9 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
                 cudaFuncSetAttribute(index_score_tc_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<5>());
                 cudaFuncSetAttribute(index_score_tc_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<6>());
                 capable.fetch_or(1ull << dev);
+                std::fprintf(stderr, "ds4: CUDA%d indexer scores on int8 tensor cores (DS4_INDEX_TC=1)\n", dev);
+            } else {
+                std::fprintf(stderr, "ds4: CUDA%d indexer scores on CUDA cores (DS4_INDEX_TC=1 needs compute capability 8.0+)\n", dev);
             }
 #else
             (void) major;
