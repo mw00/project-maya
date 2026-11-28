@@ -636,19 +636,28 @@ struct Glm5Model::FastState {
     // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
     // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
     // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).
+    // The tail's slot j sits at xbase + j * xstep: xstep = stride (a layer's tail in one run, the layers one after
+    // another) or, MAYA_GLM_POOL_FILL's interleaved tail, -row (row: one tail slot of every layer) - every layer's LAST
+    // tail slot in the region's first row, so a prompt that borrows only the region's first bytes takes the same few
+    // slots of every layer, the last ones, which a pool over n_expert slots keeps free (layout_tail)
     struct LayerPool {
         uint8_t* base = nullptr;
         uint8_t* xbase = nullptr;
         size_t stride = 0;
+        long long xstep = 0;   // (0: stride)
         int n = 0, n_main = 0;
+        long long step() const { return xstep != 0 ? xstep : (long long) stride; }
         uint8_t* slot_ptr(int s) const {
-            return s < n_main ? base + (size_t) s * stride : xbase + (size_t) (s - n_main) * stride;
+            return s < n_main ? base + (size_t) s * stride : xbase + (long long) (s - n_main) * step();
         }
         int slot_index(unsigned long long p) const {
-            const unsigned long long b0 = (unsigned long long) base, x0 = (unsigned long long) xbase;
+            const unsigned long long b0 = (unsigned long long) base;
             if (p >= b0 && p < b0 + (unsigned long long) n_main * stride) return (int) ((p - b0) / stride);
-            if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n - n_main) * stride)
-                return n_main + (int) ((p - x0) / stride);
+            if (xbase == nullptr) return -1;
+            for (int j = 0; j < n - n_main; ++j) {
+                const unsigned long long x = (unsigned long long) (xbase + (long long) j * step());
+                if (p >= x && p < x + stride) return n_main + j;
+            }
             return -1;
         }
         std::vector<int> key;        // slot -> expert, -1 none
@@ -658,6 +667,29 @@ struct Glm5Model::FastState {
         uint64_t evictions = 0;
     };
     std::vector<LayerPool> lp;   // indexed by absolute layer
+    bool tail_interleaved = false;   // MAYA_GLM_POOL_FILL: the tail laid out slot-major (layout_tail)
+    // every MoE layer's tail slots over the region x (k slots a layer, the same k for all): layer-major, or interleaved
+    void layout_tail(uint8_t* x, int l0, int lt) {
+        size_t row = 0;
+        int k = 0;
+        for (int il = l0; il < lt; ++il)
+            if (L[(size_t) il].moe) row += lp[(size_t) il].stride, k = lp[(size_t) il].n - lp[(size_t) il].n_main;
+        uint8_t* b = x;
+        size_t off = 0;
+        for (int il = l0; il < lt; ++il) {
+            if (!L[(size_t) il].moe) continue;
+            auto& P = lp[(size_t) il];
+            if (tail_interleaved && k > 0) {
+                P.xbase = x + (size_t) (k - 1) * row + off;
+                P.xstep = -(long long) row;
+                off += P.stride;
+            } else {
+                P.xbase = b;
+                P.xstep = 0;
+                b += (size_t) (P.n - P.n_main) * P.stride;
+            }
+        }
+    }
     std::vector<int> slot_of;    // il * n_expert + e -> slot in lp[il], -1 absent
     // the pool is COMPLETE (glmfast::complete_pool: every layer's main slots hold every expert and the spares; fast_setup
     // sized it so) ...

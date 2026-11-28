@@ -1872,13 +1872,7 @@ bool Glm5Model::vision_reclaim(std::string& err) {
         err = "the pool's tail is not free yet";
         return false;
     }
-    uint8_t* b = F->xpool;
-    for (int il = l0_; il < lt_; ++il) {
-        if (!F->L[(size_t) il].moe) continue;
-        auto& P = F->lp[(size_t) il];
-        P.xbase = b;
-        b += (size_t) (P.n - P.n_main) * P.stride;
-    }
+    F->layout_tail(F->xpool, l0_, lt_);
     if (pf_ != nullptr && !prefill_bind(F->xpool, F->xpool_bytes, err)) return false;
     {
         std::lock_guard<std::mutex> lk(F->mu);
