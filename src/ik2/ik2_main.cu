@@ -491,6 +491,39 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     const auto* t = S.info(n);
     if (!t) die("no tensor " + n);
     if (t->elements() != (uint64_t) N * Kd) die(n + ": " + std::to_string(t->elements()) + " values");
+    if ((int) t->type == 30) {  // GGML_TYPE_BF16 -> Q8_0 (32 values -> 34 bytes)
+        const uint16_t* bf = (const uint16_t*) S.data(n);
+        const size_t n_blocks = ((size_t) N * Kd) / 32;
+        std::vector<uint8_t> q8(n_blocks * 34);
+        for (size_t b = 0; b < n_blocks; ++b) {
+            float amax = 0.0f, v[32];
+            for (int j = 0; j < 32; ++j) {
+                uint32_t bits = (uint32_t) bf[b * 32 + j] << 16;
+                std::memcpy(&v[j], &bits, 4);
+                float av = std::fabs(v[j]);
+                if (av > amax) amax = av;
+            }
+            float d = amax / 127.0f;
+            float id = d ? 127.0f / amax : 0.0f;
+            uint16_t dh = 0;
+            __half h = __float2half_rn(d);
+            std::memcpy(&dh, &h, 2);
+            uint8_t* dst = &q8[b * 34];
+            dst[0] = (uint8_t) (dh & 0xFF);
+            dst[1] = (uint8_t) (dh >> 8);
+            for (int j = 0; j < 32; ++j) {
+                int q = (int) std::lround(v[j] * id);
+                dst[2 + j] = (uint8_t) (int8_t) (q < -127 ? -127 : q > 127 ? 127 : q);
+            }
+        }
+        Mat m;
+        m.type = 8 /* Q8_0 */, m.N = N, m.K = Kd;
+        const size_t nb = q8.size();
+        if (g_dense_q8 && upload_planar(m, {q8.data()}, {(size_t) N * Kd})) return m;
+        m.raw = dalloc<uint8_t>(nb);
+        CU(cudaMemcpy(m.raw, q8.data(), nb, cudaMemcpyHostToDevice));
+        return m;
+    }
     if (!k::block_values((int) t->type) || Kd % k::block_values((int) t->type))
         die(n + ": type " + t->type_name() + " not read here");
     Mat m;
@@ -595,12 +628,25 @@ Mat load_fused_f16(const Shards& S, const std::vector<MatPart>& parts, int Kd) {
             const auto* t = S.info(pt.name);
             if (!t) die("no tensor " + pt.name);
             if (t->elements() != (uint64_t) pt.N * Kd) die(pt.name + ": " + std::to_string(t->elements()) + " values");
-            if (!k::block_values((int) t->type) || Kd % k::block_values((int) t->type))
-                die(pt.name + ": type " + t->type_name() + " not read here");
-            const size_t nb = tensor_bytes(*t);
-            ensure_stage(nb);
-            CU(cudaMemcpy(g_stage, S.data(pt.name), nb, cudaMemcpyHostToDevice));
-            k::decode_f16((int) t->type, g_stage, (size_t) pt.N * Kd, m.f16 + (size_t) row * Kd, g_s);
+            if ((int) t->type == 30) {  // GGML_TYPE_BF16 -> F32 -> F16
+                const uint16_t* bf = (const uint16_t*) S.data(pt.name);
+                std::vector<float> f32((size_t) pt.N * Kd);
+                for (size_t i = 0; i < f32.size(); ++i) {
+                    uint32_t bits = (uint32_t) bf[i] << 16;
+                    std::memcpy(&f32[i], &bits, 4);
+                }
+                const size_t nb = f32.size() * 4;
+                ensure_stage(nb);
+                CU(cudaMemcpy(g_stage, f32.data(), nb, cudaMemcpyHostToDevice));
+                k::to_f16((const float*) g_stage, f32.size(), m.f16 + (size_t) row * Kd, g_s);
+            } else {
+                if (!k::block_values((int) t->type) || Kd % k::block_values((int) t->type))
+                    die(pt.name + ": type " + t->type_name() + " not read here");
+                const size_t nb = tensor_bytes(*t);
+                ensure_stage(nb);
+                CU(cudaMemcpy(g_stage, S.data(pt.name), nb, cudaMemcpyHostToDevice));
+                k::decode_f16((int) t->type, g_stage, (size_t) pt.N * Kd, m.f16 + (size_t) row * Kd, g_s);
+            }
         } else {
             const size_t nb = pt.f32.size() * 4;
             ensure_stage(nb);
@@ -621,6 +667,7 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
         const auto* t = S.info(pt.name);
         if (!t) die("no tensor " + pt.name);
         if (t->elements() != (uint64_t) pt.N * Kd) die(pt.name + ": " + std::to_string(t->elements()) + " values");
+        if ((int) t->type == 30) return false;  // BF16: fall back to load_fused_f16
         if (!k::block_values((int) t->type) || Kd % k::block_values((int) t->type))
             die(pt.name + ": type " + t->type_name() + " not read here");
         if (ty < 0) ty = (int) t->type;
