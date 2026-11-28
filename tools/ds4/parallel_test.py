@@ -19,6 +19,9 @@ Checks (greedy, spec=0 so a conversation's state ends exactly at its last printe
             the one it got alone, token for token (the check the GLM engine's docs give for --parallel)
   slots     `--parallel 2` with MAYA_DS4_SLOT_KEEP=1: A and B at once, then A's next turn - it reuses A's whole
             prefix from the lane (DONE's `reused`), so a conversation that stays in its lane is not read again
+  turns     the STAT line's totals by how many answers shared a turn (#1352), once the `together` run is over: its
+            rounds' tokens add up to the answers', its pieces' to the prompts' tokens read, and rounds of every lane
+            at once wrote some
   stop      two requests at once: STOP <rid> one of them; its DONE says `cancel` with fewer tokens, the other's
             answer is whole (a STOP is a request's own)
   reading   `--parallel 2`: a ~100K-token prompt and, a moment later, a small one: the small one's answer must make
@@ -302,6 +305,22 @@ def main() -> int:
                   matches(i, r["tokens"]))
             if not matches(i, r["tokens"]):
                 print("        " + diff(r["tokens"], ref[i]), flush=True)
+        # ---- turns (#1352): the STAT line's totals by how many answers shared a turn, as the engine went idle, add
+        #      up to what was written and read; with every lane answering, rounds of <lanes> answers were among them
+        end = time.monotonic() + 10
+        while " active=0" not in (eng.stat or "") and time.monotonic() < end:
+            time.sleep(0.05)
+        check("turns: the idle STAT came", " active=0" in (eng.stat or ""))
+        turns = {k: float(v) for k, _, v in (kv.partition("=") for kv in (eng.stat or "").split()[1:])
+                 if k.startswith(("dec_", "pp_"))}
+        wrote = sum(v for k, v in turns.items() if k.startswith("dec_tok_"))
+        read = sum(v for k, v in turns.items() if k.startswith("pp_tok_"))
+        want_read = sum(len(p) - (r["reused"] or 0) for p, r in zip(probes[:lanes], got))
+        check(f"turns: the idle STAT's rounds wrote {wrote:.0f} tokens, the answers {sum(r['generated'] for r in got)}",
+              bool(turns) and wrote == sum(r["generated"] for r in got))
+        check(f"turns: its pieces read {read:.0f} tokens, the prompts {want_read}", read == want_read)
+        check(f"turns: rounds of {lanes} answers wrote {turns.get(f'dec_tok_{lanes}', 0):.0f} tokens in "
+              f"{turns.get(f'dec_ms_{lanes}', 0):.0f} ms", turns.get(f"dec_tok_{lanes}", 0) > 0)
         # ---- stop: two at once, one stopped - the other's answer is whole
         rids = [eng.send(probes[0], 300, a.spec), eng.send(probes[1], 12, a.spec)]
         short = eng.stream(rids[1])

@@ -2190,6 +2190,29 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         double busy_t1 = 0;
         long long busy_n = 0, busy_io = -1;
         maya::ds4::Stats busy_s;
+        // the turns' totals since the start (#1352), by how many answers shared them: a round's tokens and time by
+        // the answers in it as it starts (dec_*_<n>), a piece of a prompt's tokens and time by the answers running
+        // beside it (pp_*_<n>, 0: no answer running).  On every STAT line; the idle one has every turn
+        std::vector<long long> dec_tok((size_t) nseq + 1, 0), pp_tok((size_t) nseq + 1, 0);
+        std::vector<double> dec_ms((size_t) nseq + 1, 0.0), pp_ms((size_t) nseq + 1, 0.0);
+        const auto answering_n = [&] {
+            return (size_t) std::count_if(acts.begin(), acts.end(),
+                                          [](const std::unique_ptr<Act>& x) { return !x->reading; });
+        };
+        const auto turns_text = [&] {
+            std::string out;
+            char b[96];
+            for (int n = 1; n <= nseq; ++n) {
+                std::snprintf(b, sizeof b, " dec_tok_%d=%lld dec_ms_%d=%.1f", n, dec_tok[(size_t) n], n,
+                              dec_ms[(size_t) n]);
+                out += b;
+            }
+            for (int n = 0; n < nseq; ++n) {
+                std::snprintf(b, sizeof b, " pp_tok_%d=%lld pp_ms_%d=%.1f", n, pp_tok[(size_t) n], n, pp_ms[(size_t) n]);
+                out += b;
+            }
+            return out;
+        };
         std::string err;
         std::fprintf(stderr, "maya ds4 serve: %d conversations at once (--parallel): GEN needs rid=<id>; STOP <rid>\n",
                      nseq);
@@ -2274,8 +2297,14 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             bind(a.seq);
             const long long rid = a.r.rid;
             if (yield) m.set_yield([&] { return lines_posted.load(std::memory_order_acquire) != lines_taken; });
+            const size_t beside = answering_n(), done0 = a.P.done;   // (#1352: the piece's tokens and time)
+            const double t0 = now_ms();
             const bool read = prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P,
                                            piece);
+            if (read) {   // (a piece a STOP or an error ended is left out: P.done has its whole last run, read or not)
+                pp_ms[beside] += now_ms() - t0;
+                pp_tok[beside] += (long long) (a.P.done - done0);
+            }
             m.set_yield(nullptr);
             if (!read) {
                 a.ended = a.done = true;
@@ -2442,7 +2471,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             }
             if (busy_n / 8 != n0 / 8) {   // the Monitor's line, every 8 tokens of all of them
                 std::string st = stat_text(busy_t1, busy_s, busy_io, busy_n, 0, 0);
-                st += " active=" + std::to_string(acts.size());
+                st += " active=" + std::to_string(acts.size()) + turns_text();
                 std::printf("%s\n", st.c_str());
             }
             std::fflush(stdout);
@@ -2702,9 +2731,14 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                     rounds = 0;
                     rounds_ms = 0;
                 } else if (answering) {
+                    const size_t n = answering_n();   // (#1352: the round's tokens and time, by the answers in it)
+                    const long long n0 = busy_n;
                     const double t = now_ms();
                     round_turn();
-                    rounds_ms += now_ms() - t;
+                    const double dt = now_ms() - t;
+                    rounds_ms += dt;
+                    dec_ms[n] += dt;
+                    dec_tok[n] += busy_n - n0;
                     ++rounds;
                 }
                 settle();
@@ -2745,6 +2779,12 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             if (!acts.empty()) {
                 queue_turn();
                 return;
+            }
+            if (busy_t1 > 0) {   // (idle again: the totals as they end, #1352 - the last STAT can be up to 7 tokens old)
+                std::printf("%s active=0%s\n", stat_text(busy_t1, busy_s, busy_io, busy_n, 0, 0).c_str(),
+                            turns_text().c_str());
+                std::fflush(stdout);
+                busy_t1 = 0;
             }
             if (quit) {
                 eng.stop();
