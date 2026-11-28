@@ -17,6 +17,7 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 - [DOCKER.md](DOCKER.md): a recipe to build a Docker image of Maya (there is no official image).
 - [AGENT_BENCH.md](AGENT_BENCH.md): `tools/agent_bench.py`, a benchmark that loads a running server like coding agents do.
 - [EXL3-HELPER.md](EXL3-HELPER.md): the experimental helper GPU that runs EXL3 experts the main GPUs miss.
+- [TWO-RIG-SPLIT.md](TWO-RIG-SPLIT.md): the experimental two-rig split - one GLM-5.3-Flash model on two machines over the network.
 
 ## Platforms and hardware
 
