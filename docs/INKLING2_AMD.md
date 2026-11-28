@@ -336,9 +336,8 @@ Reference checkout: `<llama.cpp>` (master b94959a64, Inkling 2 = PR #32217 + #32
 `situ_beta` (4.0) and `situ_lb` (25.0): `a = beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb)` (lb <= 0: up unchanged).
 Every gate_up form the engine uses on the GPU (token, window, the sets' light experts and tiles) takes it, as a fifth
 epilogue (EPI 4) beside MiniMax's; the existing activations' kernels are as they were, bit for bit. That is all maya-ik2s
-adds to `src/ds4`. Its own, in `src/ik2s`: the CPU lane's SITU (`ik2_hip_situ_cpu.hpp`: ds4's `iq_cpu_rows` for the
-gate and the up, then the SITU of them) and the drafter head's GEMV `mv_lds` (`ik2_hip_iq.cu`: ds4_iq.cu compiled as
-one translation unit with it, in ds4_iq.cu's place in this engine's build, so that it reuses ds4_iq's decoders).
+adds to `src/ds4`. The CPU lane's SITU is the engine's own (`src/ik2s/ik2_hip_situ_cpu.hpp`: ds4's `iq_cpu_rows`
+for the gate and the up, then the SITU of them).
 
 ## The reference (llama.cpp tensor dumps)
 

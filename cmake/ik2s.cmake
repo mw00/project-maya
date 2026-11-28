@@ -5,8 +5,7 @@
 # (src/ds4/ds4_iq, with Inkling 2's SITU activation) and maya-hy4's small kernels and lane threads, built as maya-hy4
 # builds them.  AMD under Linux only (MAYA_ENABLE_HIP); included from CMakeLists.txt inside its GPU block
 # (_maya_gpu_* in scope).
-# (src/ik2s/ik2_hip_iq.cu: src/ds4/ds4_iq.cu itself plus the engine's own GEMV on it, mv_lds - in its place)
-set(_ik2s_shared src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/ik2s/ik2_hip_iq.cu src/ds4/ds4_iq_cpu.cpp
+set(_ik2s_shared src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
                  src/ds4/ds4_gguf_cpu.cpp)
 add_executable(maya-ik2s src/ik2s/ik2_hip_main.cpp src/ik2s/ik2_hip_model.cu src/ik2s/ik2_hip_kernels.cu
                          src/ik2s/ik2_hip_lane.cpp src/ik2s/ik2_hip_dspark.cu ${_ik2s_shared})

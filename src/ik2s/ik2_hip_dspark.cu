@@ -8,7 +8,6 @@
 // step, and its 7 steps run on the device one after the other: the host reads the tokens once, at the end.
 #include "ik2_hip_dspark.hpp"
 
-#include "ik2_hip_iq.cuh"
 #include "ik2_hip_kernels.cuh"
 #include "ik2_hip_pack.hpp"
 #include "hy4_kernels.cuh"
@@ -993,11 +992,6 @@ struct Dspark::Impl {
     bool fuse = !(std::getenv("IK2_HIP_DSPARK_FUSE") && std::atoi(std::getenv("IK2_HIP_DSPARK_FUSE")) == 0);
     bool q8s = !(std::getenv("IK2_HIP_DSPARK_Q8S") && std::atoi(std::getenv("IK2_HIP_DSPARK_Q8S")) == 0);
     int q8s_rows = 0;   // rows a warp (1, 2, 4): IK2_HIP_DSPARK_Q8S_ROWS, else the fastest measured at the load
-    // IK2_HIP_DSPARK_HEAD_LDS (default 1; 0: iq::mv as before): the head's GEMV (the target's output matrix, up to 7
-    // draft rows) through mv_lds - its activation columns in LDS, the same bits - when the load's check finds the
-    // same bits and a faster time; the blocks a launch from the same check (IK2_HIP_DSPARK_HEAD_GRID to fix them)
-    bool head_lds_on = !(std::getenv("IK2_HIP_DSPARK_HEAD_LDS") && std::atoi(std::getenv("IK2_HIP_DSPARK_HEAD_LDS")) == 0);
-    int head_grid = 0, head_threads = 1024;
     // IK2_HIP_DSPARK_Q8S_LDS (default 1; 0: as before): the split GEMVs whose 8 columns fit in 64 KiB of LDS (q / k /
     // v, o, gate / up - not down) through q8s_mv_lds_kernel when the load's check finds the same bits and a better
     // time; q8s_lds_grid blocks of 1024 threads (0: off)
@@ -1340,80 +1334,6 @@ struct Dspark::Impl {
         (void) cudaEventDestroy(e0);
         (void) cudaEventDestroy(e1);
         std::fprintf(stderr, "%s -> %s\n", line, pick ? std::to_string(pick).c_str() : "global");
-        return true;
-    }
-    bool head_mv(const iq::MvJob& j, std::string& err) {
-        if (head_grid > 0 && mv_lds(j, head_grid, head_threads, s)) {
-            check("head mv_lds");
-            return true;
-        }
-        return mv({j}, err);
-    }
-    // the load's check of the head's GEMV: iq::mv against mv_lds at a few grids on the real matrix, 7 columns of
-    // made-up int8 rows; mv_lds is taken only with the same bits and a better time.  One line on stderr
-    bool head_check(std::string& err) {
-        if (!head_lds_on || B < 2) return true;
-        const int nc = B - 1;
-        std::vector<int8_t> hq((size_t) nc * E);
-        std::vector<float> hd((size_t) nc * E / 32);
-        uint32_t r = 12345u;
-        for (auto& v : hq) v = (int8_t) ((r = r * 1664525u + 1013904223u) >> 25) - 64;
-        for (auto& v : hd) v = 1e-3f * (float) (1 + ((r = r * 1664525u + 1013904223u) >> 28));
-        CK(cudaMemcpy(xq, hq.data(), hq.size(), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(xd, hd.data(), hd.size() * 4, cudaMemcpyHostToDevice));
-        const iq::MvJob j = job(out, xq, xd, nc, base, (size_t) Vp);
-        std::vector<float> ref((size_t) nc * Vp), got((size_t) nc * Vp);
-        cudaEvent_t e0, e1;
-        CK(cudaEventCreate(&e0));
-        CK(cudaEventCreate(&e1));
-        auto timed = [&](int grid, double& us) -> bool {
-            for (int rep = 0; rep < 2; ++rep) {   // (the first warms up)
-                CK(cudaEventRecord(e0, s));
-                for (int it = 0; it < 5; ++it)
-                    if (grid == 0 ? !mv({j}, err) : !mv_lds(j, grid, head_threads, s)) return false;
-                CK(cudaEventRecord(e1, s));
-                CK(cudaEventSynchronize(e1));
-                float ms = 0;
-                CK(cudaEventElapsedTime(&ms, e0, e1));
-                us = ms * 1e3 / 5;
-            }
-            return true;
-        };
-        double t_mv = 0;
-        if (!timed(0, t_mv)) return false;
-        CK(cudaMemcpy(ref.data(), base, ref.size() * 4, cudaMemcpyDeviceToHost));
-        char line[320];
-        int at = std::snprintf(line, sizeof line, "dspark: the head's GEMV (%d rows): mv %.0f us; mv_lds by blocks:", nc, t_mv);
-        const char* ev = std::getenv("IK2_HIP_DSPARK_HEAD_GRID");
-        int cus = 0;
-        (void) cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, dev);
-        std::vector<int> grids;
-        if (ev) grids.push_back(std::atoi(ev));
-        else for (int m : {1, 2, 4, 8}) grids.push_back(std::max(1, cus) * m);
-        double best = t_mv;
-        int pick = 0;
-        for (int g : grids) {
-            double us = 0;
-            if (!mv_lds(j, g, head_threads, s)) {
-                at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: refused", g);
-                (void) cudaGetLastError();
-                continue;
-            }
-            if (!timed(g, us)) return false;
-            CK(cudaMemcpy(got.data(), base, got.size() * 4, cudaMemcpyDeviceToHost));
-            size_t diff = 0;
-            for (int c = 0; c < nc; ++c)
-                diff += std::memcmp(ref.data() + (size_t) c * Vp, got.data() + (size_t) c * Vp, (size_t) Vu * 4) != 0;
-            at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: %.0f%s", g, us, diff ? " (bits differ)" : "");
-            if (!diff && us < best) {
-                best = us;
-                pick = g;
-            }
-        }
-        (void) cudaEventDestroy(e0);
-        (void) cudaEventDestroy(e1);
-        head_grid = pick;
-        std::fprintf(stderr, "%s -> %s\n", line, pick ? std::to_string(pick).c_str() : "mv");
         return true;
     }
     bool mv(std::initializer_list<iq::MvJob> jobs, std::string& err) {
@@ -1843,7 +1763,7 @@ struct Dspark::Impl {
                 std::fprintf(stderr, "%s -> %d\n", line, q8s_rows);
             }
         }
-        if (!q8s_lds_check(err) || !head_check(err)) return false;
+        if (!q8s_lds_check(err)) return false;
         st.vram_gb = (double) used / 1e9;
         st.load_s = (now_ms() - t0) / 1e3;
         if (o.verbose)
@@ -2036,10 +1956,10 @@ struct Dspark::Impl {
         if (o.profile) st.layers_ms = st.qkv_ms + st.attn_ms + st.o_ms + st.ffn_ms + st.norm_ms;
         // ---- the base logits of the draft rows (the target's output matrix, read once)
         if (fz8) {   // (the final norm's kernel made every row's int8 form: rows 1 .. max_n are the drafts')
-            if (!head_mv(job(out, xq + (size_t) E, xd + (size_t) E / 32, max_n, base, (size_t) Vp), err)) return false;
+            if (!mv({job(out, xq + (size_t) E, xd + (size_t) E / 32, max_n, base, (size_t) Vp)}, err)) return false;
         } else {
             hk::q8_rows(hN + (size_t) E, (size_t) E, max_n, E, xq, xd, s);
-            if (!head_mv(job(out, xq, xd, max_n, base, (size_t) Vp), err)) return false;
+            if (!mv({job(out, xq, xd, max_n, base, (size_t) Vp)}, err)) return false;
         }
         if (!phase(st.base_ms)) return false;
         // ---- the markov head, a step a draft: all on the device
