@@ -12,6 +12,7 @@ import string
 import sys
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 import urllib.error
@@ -987,6 +988,11 @@ class PrometheusMetrics(unittest.TestCase):
                     "draft_rounds": 12, "draft_ms": 123.5, "verify_ms": 456.75,
                     "eg_cache_rows": 10, "eg_cache_cap": 100, "eg_cache_row_bytes": 264,
                     "eg_lookup_rows": 20, "eg_lookup_hits": 15, "eg_lookup_reads": 5}
+        # the turns' totals as the engine's STAT line has them (#1352), read as the engine reads it
+        line = types.SimpleNamespace()
+        StrataEngine._parse_stat(line, "STAT tok_s=21.5 active=2 dec_tok_1=480 dec_ms_1=10000.0 dec_tok_2=700 "
+                                       "dec_ms_2=10000.0 pp_tok_0=9800 pp_ms_0=10000.0 pp_tok_1=0 pp_ms_1=0.0")
+        eng.stat.update({k: v for k, v in line.stat.items() if k.startswith(("dec_", "pp_"))})
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -1015,6 +1021,13 @@ class PrometheusMetrics(unittest.TestCase):
             for key in ("eg_cache_rows", "eg_cache_cap", "eg_cache_row_bytes"):
                 self.assertIn(f"# TYPE maya:engine_{key} gauge", text)
             self.assertIn("# TYPE llamacpp:prompt_tokens_total counter", text)
+            # the turns by how many answers shared them (#1352): one labelled series each, HELP and TYPE once
+            self.assertEqual((lines['maya:decode_tokens_total{answers="2"}'], lines['maya:decode_seconds_total{answers="2"}'],
+                              lines['maya:read_tokens_total{answers="0"}'], lines['maya:read_seconds_total{answers="1"}']),
+                             ("700.0", "10.0", "9800.0", "0.0"))
+            self.assertEqual(text.count("# TYPE maya:decode_tokens_total counter"), 1)
+            self.assertEqual(len([l for l in text.splitlines() if l.startswith("# TYPE ")]),
+                             len({l.split()[2] for l in text.splitlines() if l.startswith("# TYPE ")}))
             svc.api_key = "k1"
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 urllib.request.urlopen(base + "/metrics/prometheus", timeout=30)

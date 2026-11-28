@@ -4136,6 +4136,13 @@ class Service:
                  "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
                  "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
     PROM_STAT_COUNTERS = {"eg_lookup_rows", "eg_lookup_hits", "eg_lookup_reads"}
+    # the DeepSeek engine's turns by how many answers shared them (--parallel's STAT, #1352): a round's tokens and time
+    # by the answers in it, a prompt piece's by the answers beside it (0: read alone) - totals since the engine started
+    PROM_TURNS = {"dec_tok": ("maya:decode_tokens_total", "Tokens written in rounds of that many answers", 1),
+                  "dec_ms": ("maya:decode_seconds_total", "Time of the rounds of that many answers", 1000),
+                  "pp_tok": ("maya:read_tokens_total", "Prompt tokens read with that many answers beside", 1),
+                  "pp_ms": ("maya:read_seconds_total", "Time of the prompt pieces read with that many answers beside",
+                            1000)}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -4196,13 +4203,24 @@ class Service:
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
                  if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
+        turns = sorted((name, int(n), v) for k, v in stat.items() for name, _, n in [k.rpartition("_")]
+                       if name in self.PROM_TURNS and n.isdigit() and isinstance(v, (int, float)))
+        for name, n, v in turns:
+            metric, help_, unit = self.PROM_TURNS[name]
+            rows.append((f'{metric}{{answers="{n}"}}', "counter", help_, v / unit))
         for category, values in (("cache", self.responses.stats()), ("jobs", self.response_jobs.stats())):
             gauges = {"entries", "blocks", "bytes", "inflight_bytes", "peak_inflight_bytes", "max_entries",
                       "max_bytes", "ttl_s", "records", "running", "queued", "event_bytes", "readers"}
             rows += [(f"maya:responses_{category}_{key}", "gauge" if key in gauges else "counter",
                       f"Responses {category} {key}", value) for key, value in values.items()]
-        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
-                       for name, kind, help_, value in rows)
+        out, said = [], set()
+        for name, kind, help_, value in rows:   # (a labelled metric's HELP and TYPE once, before its first series)
+            base = name.split("{", 1)[0]
+            if base not in said:
+                said.add(base)
+                out.append(f"# HELP {base} {help_}\n# TYPE {base} {kind}\n")
+            out.append(f"{name} {value}\n")
+        return "".join(out)
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
