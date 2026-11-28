@@ -299,6 +299,9 @@ void mv_blocks_ref(int type, const uint8_t* W, int N, int K, const float* x, flo
 /// read from the memory once (a verify window's products over a matrix kept as blocks).
 void mv_blocks_rows(int type, const uint8_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
                     cudaStream_t s);
+/// The Q6_K window products' scratch (mv_blocks_rows' Q6_K branch), taken ahead of time: at load, before the experts
+/// fill the card and before a CUDA graph's capture - at the first window otherwise, where either can refuse it.
+void q6k_cols_reserve();
 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.
