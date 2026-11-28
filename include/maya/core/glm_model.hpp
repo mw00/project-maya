@@ -120,9 +120,10 @@ public:
                        const std::string& layer_split = "");
     bool load_pack_place(const std::string& pack_dir, int64_t max_ctx, std::string& err, const std::string& layer_split);
     /// The explicit split form behind load_pack_env: devs[i] runs layers [bounds[i-1], bounds[i]) (bounds holds
-    /// the first layer of each later part, devs.size() - 1 of them).
+    /// the first layer of each later part, devs.size() - 1 of them).  first/last: the layers the split covers (the
+    /// two-rig split's side: [first, last), last 0 = to the end; the whole model by default).
     bool load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
-                         const std::vector<int>& devs, std::string& err);
+                         const std::vector<int>& devs, std::string& err, int first = 0, int last = 0);
     static constexpr int kMaxParts = 16;
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; MAYA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).
@@ -292,6 +293,7 @@ public:
     /// closes the reasoning block this way inside the running decode - the speculative loop takes it as the truth
     /// for its position, like a rejected draft, so nothing is read again.
     void force_next(int32_t tok) { force_tok_ = tok; }
+    int32_t force_pending() const { return force_tok_; }   // (the two-rig split: the front's, sent to the back)
     /// The on-demand vision encoder (serve VLEND / VRECLAIM; MAYA_GLM_VISION_LEND_MB at load): the first GPU's
     /// lendable pool tail is emptied and freed so the encoder's process can use that VRAM, and allocated again
     /// once it has ended (false while the memory is still taken).  vision_lend_bytes(): 0 when unavailable.
@@ -810,6 +812,8 @@ public:
     bool spec_plain_turn();
     void spec_plain_end(int64_t produced);
     bool spec_plain_live_ = false;
+    bool decode_spec_link(maya::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                          int64_t& produced, std::string& err);   // the two-rig split's (glm_link.hpp)
     uint64_t spec_steps_ = 0, spec_hits_ = 0;              // speculative positions, accepted
     double spec_t_[4] = {0, 0, 0, 0};                      // MAYA_GLM_SPEC_PROF host phases of spec_head/tail
     int64_t spec_n_ = 0;
@@ -973,6 +977,36 @@ public:
     bool split_rows_ok() const;
     bool multi_issue_rows(const int* seqs, const int32_t* tokens, const maya::kernels::SamplerParams* sps, int n,
                           std::string& err);
+    /// THE TWO-RIG SPLIT (glm_link.hpp) with several conversations.  The front's multi_issue_rows queues each row's
+    /// residual (its last local part's pinned hop buffer and event) for the link instead of a head; its messages to
+    /// the back (link_send_pair: the scheduler's kSched / kAdmit / kVerd) queue behind those rows, so the back reads them in
+    /// the order both schedulers make their calls, while the front goes on.  link_pump sends what is ready, in order
+    /// (a row once its copy is done; `all`: waits for every row); multi_take polls for its token meanwhile.  The back
+    /// takes the rows from the link and sends each token as soon as it is picked (link_tok_pump, also while it waits
+    /// for the front's next message), in the order the rows came.
+    bool link_pump(bool all, std::string& err);
+    bool link_flush(std::string& err) { return link_pump(true, err); }
+    bool link_send_pair(uint32_t type, int64_t pos, int32_t val, int32_t n, std::string& err);
+    bool link_tok_pump(bool wait_head, std::string& err);
+    struct LinkOut {
+        uint32_t type;                                     // glmlink::kHop: sequence seq's row at pos; else a pair
+        int seq;
+        int64_t pos;
+        int32_t val, n;
+    };
+    std::vector<LinkOut> link_out_;                        // the front: what is not sent yet (oldest first)
+    std::vector<int> link_tok_q_;                          // the back: sequences whose token is not sent yet (oldest first)
+    std::vector<int32_t> link_tok_;                        // the back: each sequence's token once sent (-1: not yet, or it failed)
+    std::vector<int64_t> link_pos_;                        // a sequence's last issued row's position (its TOK's)
+    std::string link_tok_err_;                             // the back: why a token was not sent (link_tok_pump)
+    /// A link's session ends (a failure, a new link): nothing queued or remembered of it stays.
+    void link_reset() {
+        link_out_.clear();
+        link_tok_q_.clear();
+        link_tok_.assign(link_tok_.size(), -1);
+        link_pos_.assign(link_pos_.size(), -1);
+        link_tok_err_.clear();
+    }
     // ---- several conversations drafting with the NextN block at once (src/core/glm_mtp_rows.cu,
     // MAYA_GLM_MULTI_MTP=<drafts>, off by default).  A conversation's WINDOW - its last written token and its drafts
     // - goes through the split's batched rows as consecutive rows of one group; the last part's head picks every

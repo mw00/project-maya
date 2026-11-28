@@ -29,6 +29,7 @@
 //
 // The NextN cache's entry p pairs h_p with the token at p + 1 (the prompt path writes them so).
 #include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the block's cache rows through its mixer
+#include "maya/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 #include "maya/core/glm_model.hpp"
 #include "maya/kernels/glm_fast.hpp"
@@ -104,7 +105,7 @@ bool Glm5Model::mtp_decode_wanted(int dev, int n_parts, bool dsa) {
 #endif
 }
 
-bool Glm5Model::mtp_ready() const { return fast_ != nullptr && mtp_dec_ && mtp_il_ >= 0 && split_next_ == nullptr; }
+bool Glm5Model::mtp_ready() const { return fast_ != nullptr && mtp_dec_ && mtp_il_ >= 0 && split_next_ == nullptr && maya::core::glmlink::role() == maya::core::glmlink::kNone; }
 
 // ---------------------------------------------------------------- the draft head
 // A draft step ran the whole output head - 154880 x 4096 Q6_K, 0.52 GB, ~2.4 ms of the ~4 ms a step on the Radeon 8065S
