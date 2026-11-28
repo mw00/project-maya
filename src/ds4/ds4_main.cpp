@@ -27,6 +27,7 @@
 // (ds4_logprobs.hpp; INFO logprobs=20 says the engine has them).
 #include "ds4_evt.hpp"
 #include "ds4_logprobs.hpp"
+#include "ds4_keep_cancelled.hpp"
 #include "ds4_marks.hpp"
 #include "ds4_gguf.cuh"       // (--pack-info: the types the kernels take, asked of them)
 #include "ds4_iq.cuh"
@@ -841,6 +842,13 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     unsigned long long counter = 0;
     long long log_req = 0;   // (DS4_ROUND_LOG's tags)
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
+    // a prompt read a STOP ends keeps what it read (ds4_keep_cancelled.hpp; MAYA_DS4_KEEP_CANCELLED=0: the state goes
+    // back to where the read started, as before): the bound conversation's part-way state
+    static const bool keep_cancelled = [] {
+        const char* v = ds4_env("DS4_KEEP_CANCELLED");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    maya::ds4::PartWay partway;
     // a request that leaves a GPU's state unknown - a layer GPU's context took a fault inside a kernel (an illegal
     // address, ...), or the prompt path's room was not handed back (Model::broken): its last lines say so, END ahead of
     // its DONE (the server then takes this engine as ended, and the next request, even one already waiting, starts a
@@ -1115,6 +1123,11 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || m.ablating()) return;   // (an abliterated conversation is not kept: read again)
+        if (partway.at > 0 && (size_t) m.pos() == partway.at) {   // (a state a STOP left part way: only a read of
+            std::fprintf(stderr, "ds4 slots: a conversation part way through a prompt (%zu tokens) is not set aside%s\n",
+                         partway.at, why);                       //  its own prompt goes on from it)
+            return;
+        }
         const std::vector<int32_t>& t = m.tokens();
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
         std::vector<maya::ds4::PicMark> marks;   // (the state's pictures: what the slot keeps of them - no pixels,
@@ -1533,6 +1546,8 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         size_t next_pp = 0;      // (the next PP line's)
         bool continued = false;  // (the conversation goes on - its anchor stays)
         std::vector<Pic> pics;
+        bool resumed = false;   // it reads on from a state a STOP left part way (ds4_keep_cancelled.hpp) ...
+        size_t need = 0;        // ... whose read has to reach this token
         std::vector<maya::ds4::MarkAt> cuts;   // the restore points the read stops at (ds4_marks.hpp)
         size_t next_cut = 0;                     // (the next of them)
         // the tail point the read stops at (-1: none) and what the read spent before it and after it (TailCost)
@@ -1600,9 +1615,18 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
-        if (!state_is_prefix && n_state > 0 && c == n_state && n_state < r.ids.size()) {
+        // a state a STOP left part way through a prompt (MAYA_DS4_KEEP_CANCELLED): a prompt that continues it token for
+        // token reads on from it when its read reaches the stretch the stopped read was planned to; any other goes back
+        // to the latest whole state below (and never sets it aside: slot_put)
+        const bool at_partway = partway.at > 0 && partway.at == n_state;
+        P.resumed = false;
+        P.need = 0;
+        if (!state_is_prefix && n_state > 0 && c == n_state && n_state < r.ids.size() &&
+            (!at_partway || maya::ds4::part_way_resumes(partway, r.ids.size()))) {
             from = n_state;
             continued = true;
+            P.resumed = at_partway;
+            P.need = at_partway ? partway.need : 0;
         }
         else {
             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
@@ -1630,6 +1654,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 from = (size_t) m.pos();
             else m.reset();
         }
+        if (!P.resumed) partway = maya::ds4::PartWay{};   // (a whole state from here)
         if (abl_flip && from == 0 && m.pos() != 0) m.reset();
         m.set_ablate(abl);
         if (from == 0) held.clear();   // (a slot that came back set held itself: its pictures' marks, not only start
@@ -1691,13 +1716,14 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             m.set_images({});
             m.reset();
             held.clear();
+            partway = maya::ds4::PartWay{};
             return false;
         }
         // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
         // feeds, --parallel's between pieces) and goes back to the state before this prompt - kept here first, in
         // checkpoint 1, which the prompt's own end overwrites as before - so the next request still shares the
         // conversation up to it
-        if (from > 0 && from < r.ids.size()) m.checkpoint(1);
+        if (from > 0 && from < r.ids.size() && !P.resumed) m.checkpoint(1);   // (never at a part-way state)
         P.from = from;
         P.done = from;
         P.next_pp = from + 64;
@@ -1734,6 +1760,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             std::vector<std::pair<int64_t, int64_t>> spans;
             for (const Pic& q : pics) spans.push_back({q.start, (int64_t) q.len});
             cuts = maya::ds4::mark_plan(asked, r.shared, (int64_t) from, (int64_t) r.ids.size(), m.marks_cap(), 16, spans);
+            if (P.resumed) maya::ds4::part_way_cuts(cuts, partway);   // (none in [at, need): ds4_keep_cancelled.hpp)
             for (const maya::ds4::MarkAt& c : cuts)
                 if (c.pos == (int64_t) r.tail && c.pos > (int64_t) from) P.tail_at = c.pos;   // (the plan kept it there)
             static bool said = false;
@@ -1757,8 +1784,10 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         const double t0 = P.t0;
         const size_t start = P.done;
         int64_t beat_at = -1;   // (the run's progress at the last beat)
+        maya::ds4::RunPace pace;   // (the run's pace: how long a STOP waits for it to end at a chunk)
         // (a run of chunks: each one through every layer)
         const std::function<void(int64_t)> progress = [&](int64_t d) {
+            pace.see(d, now_ms());
             // (a beat only when it moved: the run calls this every 50 ms with what is done so far - a wedged chunk run
             //  repeats its last value for hours, #539, and must not look alive to the watchdog)
             if (d + (int64_t) P.done != beat_at) {
@@ -1773,7 +1802,19 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         m.set_progress(progress);
         // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
         static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
-        m.set_cancel(stop_now);
+        // a STOP keeps what was read (MAYA_DS4_KEEP_CANCELLED): the run ends at a chunk every device reaches - a yield,
+        // which the caller asks for on a STOP too (prompt_in, read_turn) - and the conversation stands at a token of the
+        // prompt.  A run that cannot end at a chunk (one that goes layer by layer) is cut short once the STOP has waited
+        // 2.5 times the run's pace, 20 s at least; the latest whole state before it stays then
+        double stop_seen = -1.0;
+        if (keep_cancelled)
+            m.set_cancel([&]() {
+                if (!stop_now()) return false;
+                const double now = now_ms();
+                if (stop_seen < 0) stop_seen = now;
+                return maya::ds4::stop_cuts_now(now - stop_seen, pace.ms(now));
+            });
+        else m.set_cancel(stop_now);
         std::string err;
         bool ok = true, stopped = false;
         while (ok && P.done < total) {
@@ -1861,17 +1902,51 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         }
         m.set_cancel(nullptr);
         m.set_progress(nullptr);
+        if (keep_cancelled) stopped = stopped || (ok && P.done < total && stop_now());   // (a STOP that ended a run)
         if (stopped || (!ok && m.cancelled())) {
             m.set_images({});
-            const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
-            if (!back) {
+            size_t kept = 0, back = 0;
+            if (keep_cancelled) {
+                // what was read stays: the state at P.done when the run ended at a chunk (or between two pieces) - part
+                // way, so only a read of the same stretch goes on from it - else the latest whole state at or before
+                // what was read (a restore point the read passed, the state before the prompt)
+                const size_t stretch = P.next_cut < P.cuts.size() ? (size_t) P.cuts[P.next_cut].pos : total;
+                if (ok && (size_t) m.pos() == P.done && P.done > from) kept = P.done;
+                else if (ok && P.resumed && P.done == from && (size_t) m.pos() == from) kept = from;   // (nothing more)
+                if (kept > 0) {
+                    held = maya::ds4::pics_at(held, P.pics, kept);
+                    if (m.restorable((int64_t) kept) == (int64_t) kept) partway = maya::ds4::PartWay{};   // (a point)
+                    else {
+                        partway.at = kept;
+                        partway.need = std::max(stretch, P.need);
+                    }
+                } else {
+                    partway = maya::ds4::PartWay{};
+                    const int64_t rp = m.restorable((int64_t) P.done);
+                    if (rp > 0 && m.restore(rp) && m.pos() == rp) {
+                        back = (size_t) rp;
+                        held = maya::ds4::pics_at(held, P.pics, back);
+                    }
+                }
+            } else if (from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from)
+                back = from;
+            if (kept == 0 && back == 0) {
                 m.reset();
                 held.clear();
             }
+            std::string what;
+            if (kept > from && partway.at == kept)
+                what = "; the " + std::to_string(kept - from) + " tokens read are kept, part way: a request that reads on "
+                       "to token " + std::to_string(partway.need) + " at least goes on from token " + std::to_string(kept);
+            else if (kept > from) what = "; the " + std::to_string(kept - from) + " tokens read are kept (a restore point)";
+            else if (kept > 0) what = "; the conversation stays part way at token " + std::to_string(kept);
+            else if (back > 0 && back == from) what = "; the conversation before it is kept";
+            else if (back > 0) what = "; back to token " + std::to_string(back);
             std::fprintf(stderr, "maya ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
-                         total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
+                         total, now_ms() - t0, what.c_str());
             end_note();
-            std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), total, now_ms() - t0, back ? from : (size_t) 0);
+            std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), total, now_ms() - t0,
+                        kept > 0 || back > 0 ? from : (size_t) 0);
             std::fflush(stdout);
             return false;
         }
@@ -1906,11 +1981,23 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             held = std::move(nh);
         }
         m.checkpoint(0);
-        if (!P.continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
+        partway = maya::ds4::PartWay{};   // (read to its end: a whole state)
+        // (a new run of prompts: where it may be rendered again from - and a prompt that read on from a STOP's part-way
+        //  state: the prompt that state was part of never reached its end)
+        if (!P.continued || P.resumed) {
+            m.pin();
+            if (P.resumed)
+                std::fprintf(stderr, "maya ds4 serve: anchor at token %lld (a prompt read on from a stopped read)\n",
+                             (long long) m.pos() - 1);
+        }
     };
     const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
                                Prompt& P) -> bool {
-        if (!prompt_begin(r, geni, tag, P) || !prompt_piece(r, tag, stop_now, P, r.ids.size())) return false;
+        if (!prompt_begin(r, geni, tag, P)) return false;
+        if (keep_cancelled) m.set_yield(stop_now);   // (a STOP ends the run at a chunk, keeping what was read)
+        const bool read = prompt_piece(r, tag, stop_now, P, r.ids.size());
+        m.set_yield(nullptr);
+        if (!read) return false;
         prompt_end(P);
         return true;
     };
@@ -2154,6 +2241,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         std::vector<long long> seq_rid((size_t) nseq, -1);   // the request in each conversation (-1: idle)
         std::vector<uint64_t> seq_used((size_t) nseq, 0);    // (the least recently used goes first)
         std::vector<std::vector<Pic>> held_of((size_t) nseq);   // the pictures each one holds (`held`: the bound one's)
+        std::vector<maya::ds4::PartWay> partway_of((size_t) nseq);   // each one's part-way state (`partway`)
         uint64_t use_clock = 0;
         std::vector<std::unique_ptr<Act>> acts;
         std::deque<std::string> waiting;   // GEN lines no conversation is free for yet
@@ -2197,9 +2285,11 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             const int b = m.seq_bound();
             if (s == b) return;
             held_of[(size_t) b] = std::move(held);
+            partway_of[(size_t) b] = partway;
             m.seq_bind(s);
             held = std::move(held_of[(size_t) s]);
             held_of[(size_t) s].clear();
+            partway = partway_of[(size_t) s];
         };
         const auto penalties = [&](const Req& r) {   // (and its logit_bias: the request's picks, set before each)
             m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
@@ -2273,7 +2363,12 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         const auto read_turn = [&](Act& a, size_t piece, bool yield) {
             bind(a.seq);
             const long long rid = a.r.rid;
-            if (yield) m.set_yield([&] { return lines_posted.load(std::memory_order_acquire) != lines_taken; });
+            // (MAYA_DS4_KEEP_CANCELLED: a STOP ends the run at a chunk too, keeping what was read)
+            if (yield || keep_cancelled)
+                m.set_yield([&] {
+                    return (keep_cancelled && in.stopped(rid)) ||
+                           (yield && lines_posted.load(std::memory_order_acquire) != lines_taken);
+                });
             const bool read = prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P,
                                            piece);
             m.set_yield(nullptr);
