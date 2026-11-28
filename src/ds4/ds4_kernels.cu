@@ -5174,14 +5174,20 @@ struct HostReducer::Impl {
     std::unique_ptr<Pool> pool;
     std::mutex mu;
     std::condition_variable cv;
-    std::deque<std::pair<unsigned, int>> q;
+    // (off4 / len4: the float4 range summed - the whole row unless a pair-halves reduce's half; plo: its first piece's
+    //  index among the flags; npieces over that range)
+    struct Job { unsigned seq; int n; int nmem; int npieces; int members[16]; int off4 = 0, len4 = -1, plo = 0;
+                 // (a pair-halves reduce's second half: its own members and range; nmem2 0: none) - both halves' pieces
+                 // summed in the order they come in, not half A whole before half B
+                 int nmem2 = 0, members2[16] = {}, off4b = 0, len4b = 0, plob = 0; };
+    std::deque<Job> q;
     bool quit = false;
     std::thread th;
     double t_wait = 0, t_sum = 0;   // (DS4_AR_HOST_STATS: printed at the end)
     long n_sums = 0;
     void loop() {
         for (;;) {
-            std::pair<unsigned, int> job;
+            Job job{};
             {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait(lk, [&] { return quit || !q.empty(); });
@@ -5189,19 +5195,72 @@ struct HostReducer::Impl {
                 job = q.front();
                 q.pop_front();
             }
-            const unsigned seq = job.first;
-            const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm, n4 = job.second / 4;
-            const int NP = ar_host_pieces(), P4 = (n4 + NP - 1) / NP, fs = a.slots * kArBlocks * 8;
+            const unsigned seq = job.seq;
+            const int slot = (int) (seq % (unsigned) a.slots), nm = job.nmem, n4 = job.n / 4;
+            const int o4 = job.off4, l4 = job.len4 >= 0 ? job.len4 : n4;
+            const int NP = job.npieces > 0 ? job.npieces : ar_host_pieces(), P4 = (l4 + NP - 1) / NP,
+                      fs = a.slots * kArBlocks * 8;
             const uint16_t* rp[16];
-            for (int m = 0; m < nm && m < 16; ++m) rp[m] = rows[(size_t) m] + (size_t) slot * max_n;
+            for (int t = 0; t < nm && t < 16; ++t) rp[t] = rows[(size_t) job.members[t]] + (size_t) slot * max_n;
             uint16_t* out = sums + (size_t) slot * max_n;
-            for (int p = 0; p < NP; ++p) {
-                const size_t h0 = (size_t) std::min(n4, p * P4) * 4, h1 = (size_t) std::min(n4, (p + 1) * P4) * 4;
+            if (job.nmem2 > 0) {   // (pair halves: every piece of both halves, each summed once all its members' are in)
+                const uint16_t* rp2[16];
+                for (int t = 0; t < job.nmem2 && t < 16; ++t) rp2[t] = rows[(size_t) job.members2[t]] + (size_t) slot * max_n;
+                struct Pc { int p; size_t h0, h1; const int* mem; int nm; const uint16_t* const* rp; bool done; };
+                std::vector<Pc> pcs;
+                const int P4b = (job.len4b + NP - 1) / NP;
+                for (int q = 0; q < NP; ++q) {
+                    pcs.push_back({job.plo + q, (size_t) (o4 + std::min(l4, q * P4)) * 4,
+                                   (size_t) (o4 + std::min(l4, (q + 1) * P4)) * 4, job.members, nm, rp, false});
+                    pcs.push_back({job.plob + q, (size_t) (job.off4b + std::min(job.len4b, q * P4b)) * 4,
+                                   (size_t) (job.off4b + std::min(job.len4b, (q + 1) * P4b)) * 4, job.members2,
+                                   job.nmem2, rp2, false});
+                }
+                const auto tw = std::chrono::steady_clock::now();
+                size_t left = pcs.size();
+                int spins = 0;
+                while (left > 0) {
+                    bool any = false;
+                    for (Pc& pc : pcs) {
+                        if (pc.done) continue;
+                        const unsigned* rf = a.bflags + ((size_t) slot * kArBlocks + pc.p) * 8;
+                        bool ready = true;
+                        for (int t = 0; t < pc.nm && ready; ++t)
+                            ready = (int) (*(volatile const unsigned*) (rf + (size_t) pc.mem[t] * fs) - seq) >= 0;
+                        if (!ready) continue;
+                        std::atomic_thread_fence(std::memory_order_acquire);
+                        const int T = pool->size();
+                        const size_t h0 = pc.h0, h1 = pc.h1;
+                        const uint16_t* const* prow = pc.rp;
+                        const int pnm = pc.nm;
+                        pool->run(T, [&](int t) {
+                            const size_t a0 = h0 + (h1 - h0) * (size_t) t / (size_t) T / 8 * 8,
+                                         a1 = t + 1 == T ? h1 : h0 + (h1 - h0) * (size_t) (t + 1) / (size_t) T / 8 * 8;
+                            if (a1 > a0) ar_host_sum(prow, pnm, out, a0, a1);
+                        });
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        *(volatile unsigned*) (a.bflags + (((size_t) a.nm * a.slots + slot) * kArBlocks + pc.p) * 8) = seq;
+                        pc.done = true;
+                        --left;
+                        ++n_sums;
+                        any = true;
+                    }
+                    if (!any) {
+                        if (++spins > 2000) std::this_thread::sleep_for(std::chrono::microseconds(20));
+                        else cpu_relax();
+                    } else spins = 0;
+                }
+                t_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+                continue;
+            }
+            for (int q = 0; q < NP; ++q) {
+                const int p = job.plo + q;
+                const size_t h0 = (size_t) (o4 + std::min(l4, q * P4)) * 4, h1 = (size_t) (o4 + std::min(l4, (q + 1) * P4)) * 4;
                 const unsigned* rf = a.bflags + ((size_t) slot * kArBlocks + p) * 8;
                 const auto tw = std::chrono::steady_clock::now();
-                for (int m = 0; m < nm; ++m) {   // (every member's piece out: its flag, after its copy)
+                for (int t = 0; t < nm; ++t) {   // (every member's piece out: its flag, after its copy)
                     int spins = 0;
-                    while ((int) (*(volatile const unsigned*) (rf + (size_t) m * fs) - seq) < 0) {
+                    while ((int) (*(volatile const unsigned*) (rf + (size_t) job.members[t] * fs) - seq) < 0) {
                         if (++spins > 2000) std::this_thread::sleep_for(std::chrono::microseconds(20));
                         else cpu_relax();
                     }
@@ -5216,7 +5275,8 @@ struct HostReducer::Impl {
                     if (a1 > a0) ar_host_sum(rp, nm, out, a0, a1);
                 });
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                *(volatile unsigned*) (a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8) = seq;
+                // (the group's member count for this offset: a job's nm is only its rows)
+                *(volatile unsigned*) (a.bflags + (((size_t) a.nm * a.slots + slot) * kArBlocks + p) * 8) = seq;
                 t_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
                 ++n_sums;
             }
@@ -5268,7 +5328,26 @@ HostReducer::~HostReducer() {
 void HostReducer::submit(unsigned seq, int n) {
     {
         std::lock_guard<std::mutex> lk(p_->mu);
-        p_->q.push_back({seq, n});
+        p_->q.push_back({seq, n, p_->a.nm, 0, {}});
+        for (int m = 0; m < p_->a.nm && m < 16; ++m) p_->q.back().members[m] = m;
+    }
+    p_->cv.notify_one();
+}
+void HostReducer::submit_halves(unsigned seq, int n, const int* ma, int na, int off4a, int len4a, int ploa,
+                                const int* mb, int nb, int off4b, int len4b, int plob, int npieces) {
+    {
+        std::lock_guard<std::mutex> lk(p_->mu);
+        HostReducer::Impl::Job j{seq, n, std::min(16, na), npieces, {}};
+        for (int t = 0; t < na && t < 16; ++t) j.members[t] = ma[t];
+        j.off4 = off4a;
+        j.len4 = len4a;
+        j.plo = ploa;
+        j.nmem2 = std::min(16, nb);
+        for (int t = 0; t < nb && t < 16; ++t) j.members2[t] = mb[t];
+        j.off4b = off4b;
+        j.len4b = len4b;
+        j.plob = plob;
+        p_->q.push_back(j);
     }
     p_->cv.notify_one();
 }
@@ -5346,6 +5425,87 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
         if (p1 > p0)
             pdl_launch(ar_from16_zc_kernel, std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s, (float4*) x, hsum, p1, p1, p1, p0);
     }
+}
+
+// A chunk's pair-halves all-reduce (DS4_AR_PAIR_HALF, a group of NVLink pairs - members 2k, 2k + 1): the pair
+// reduce-scatters on NVLink (each member sends its partial of the mate's half - F32 - and adds the mate's of its own,
+// own + mate), the even members' halves A and the odd members' halves B go to the host as FP16 (ar_to16) in pieces,
+// the host sums each half over its four rows in member order, each member reads its half's sum back and sends it to
+// its mate (F32, NVLink).  Every member's PCIe moves half a row each way, where the 8-way host reduce moves a whole
+// one.  scratch (this member's) and mate_scratch (its mate's, peer-mapped): 4n bytes each - [0, 2n) the half from
+// the mate (F32), [2n, 4n) the FP16 staging.  pf: the group's handshake flags [3][16] x 32 (ready, sent, final).
+// The caller's mi == 0 submits the two halves (HostReducer::submit_halves) before its copies
+// (allreduce_ph) the pair's NVLink transfers by the SMs: stores straight into the mate's memory (peer access on).  A
+// cudaMemcpyAsync between the two devices can hold the issuing thread until its stream gets to it, and the mate's
+// kernels spin on work that thread has not issued yet
+__global__ void ph_add_kernel(float* __restrict__ y, const float* __restrict__ x, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        y[i] += x[i];
+}
+static void add_f32(float* y, const float* x, size_t n, cudaStream_t s) {   // y[i] += x[i]
+    if (n == 0) return;
+    ph_add_kernel<<<(unsigned) std::min<size_t>(cdiv(n, kThreads), 4096), kThreads, 0, s>>>(y, x, n);
+}
+__global__ void ph_copy_kernel(float4* __restrict__ dst, const float4* __restrict__ src, size_t n4) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+static void ph_copy(float* dst, const float* src, size_t n4, cudaStream_t s) {
+    if (n4 == 0) return;
+    ph_copy_kernel<<<(unsigned) std::min<size_t>(cdiv(n4, kThreads), 160), kThreads, 0, s>>>((float4*) dst, (const float4*) src, n4);
+}
+void allreduce_ph(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
+                  void* mate_scratch, unsigned* pf, cudaStream_t s, const ArAux& aux, int h4in) {
+    // (h4in: the even members' share when it is not the middle - scratch's F32 part [0, 2n) and FP16 staging [2n, 4n)
+    //  may overlap for the larger share's mate partial in step 1, which step 2 consumes on this stream before staging)
+    const int slot = (int) (seq % (unsigned) a.slots), n4 = n / 4, NPh = ar_host_pieces();
+    const int h4 = h4in >= 0 && h4in <= n4 ? h4in : n4 / 2;
+    const int fs = a.slots * kArBlocks * 8, mate = mi ^ 1;
+    const bool even = (mi & 1) == 0;
+    const int o0 = even ? 0 : h4, o1 = even ? h4 : n4;       // this member's half (float4s)
+    const int t0 = even ? h4 : 0, t1 = even ? n4 : h4;       // the mate's
+    const int plo = even ? 0 : NPh, l4 = o1 - o0, P4 = (l4 + NPh - 1) / NPh;
+    float* rv = (float*) scratch;                            // the mate's partial of this half, then the mate's sum
+    float* rv_mate = (float*) mate_scratch;
+    uint2* st16 = (uint2*) ((char*) scratch + (size_t) n * 2);   // FP16 staging, indexed by float4
+    unsigned* f_ready = pf, *f_sent = pf + 16 * 32, *f_final = pf + 2 * 16 * 32;
+    // 1. the mate's half of this partial into the mate's scratch, once the mate is here (its scratch free)
+    set_flag(f_ready + (size_t) mi * 32, seq, s);
+    wait_flags(f_ready + (size_t) mate * 32, 1, 32, seq, s);
+    if (t1 > t0) ph_copy(rv_mate, x + (size_t) t0 * 4, (size_t) (t1 - t0), s);
+    set_flag(f_sent + (size_t) mi * 32, seq, s);
+    wait_flags(f_sent + (size_t) mate * 32, 1, 32, seq, s);
+    // 2. own + mate's on this half, its FP16 pieces out to the host
+    if (l4 > 0) {
+        add_f32(x + (size_t) o0 * 4, rv, (size_t) l4 * 4, s);
+        pdl_launch(ar_to16_kernel, std::max(1, std::min(1024, cdiv(l4, kThreads))), kThreads, 0, s,
+                   (const float4*) x + o0, l4, st16 + o0);
+    }
+    uint2* hrow = (uint2*) hr.row(mi, slot);
+    const uint2* hsum = (const uint2*) hr.sum(slot);
+    cudaEventRecord(aux.ev[0], s);
+    cudaStreamWaitEvent(aux.s2, aux.ev[0], 0);
+    for (int q = 0; q < NPh; ++q) {
+        const int p0 = o0 + std::min(l4, q * P4), p1 = o0 + std::min(l4, (q + 1) * P4);
+        if (p1 > p0) cudaMemcpyAsync(hrow + p0, st16 + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDefault, aux.s2);
+        pdl_launch(set_flag_kernel, 1, 1, 0, aux.s2, a.bflags + ((size_t) slot * kArBlocks + plo + q) * 8 + (size_t) mi * fs, seq);
+    }
+    // 3. the half's sums back, piece by piece
+    for (int q = 0; q < NPh; ++q) {
+        const int p0 = o0 + std::min(l4, q * P4), p1 = o0 + std::min(l4, (q + 1) * P4);
+        pdl_launch(wait_flags_kernel, 1, 32, 0, s, a.bflags + (((size_t) a.nm * a.slots + slot) * kArBlocks + plo + q) * 8, 1, 0, seq);
+        if (p1 > p0) {
+            cudaMemcpyAsync(st16 + p0, hsum + p0, (size_t) (p1 - p0) * 8, cudaMemcpyHostToDevice, s);
+            pdl_launch(ar_from16_kernel, std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s,
+                       (float4*) x + p0, (const uint2*) st16 + p0, p1 - p0, 0, 0);
+        }
+    }
+    // 4. this half's sum to the mate (its scratch's first part is free: it added from it before its pieces went out,
+    //    and these sums needed every member's pieces), the mate's into this member's other half
+    if (l4 > 0) ph_copy(rv_mate, x + (size_t) o0 * 4, (size_t) l4, s);
+    set_flag(f_final + (size_t) mi * 32, seq, s);
+    wait_flags(f_final + (size_t) mate * 32, 1, 32, seq, s);
+    if (t1 > t0) cudaMemcpyAsync(x + (size_t) t0 * 4, rv, (size_t) (t1 - t0) * 16, cudaMemcpyDeviceToDevice, s);
 }
 
 }  // namespace maya::ds4

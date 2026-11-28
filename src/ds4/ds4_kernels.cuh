@@ -586,6 +586,10 @@ public:
     ~HostReducer();
     bool ok() const;
     void submit(unsigned seq, int n);
+    /// Both halves of a pair-halves all-reduce as one job: each half's pieces (npieces each, flags ploa.. / plob..)
+    /// summed over its members as they come in, either half first
+    void submit_halves(unsigned seq, int n, const int* ma, int na, int off4a, int len4a, int ploa, const int* mb, int nb,
+                       int off4b, int len4b, int plob, int npieces);
     uint16_t* row(int m, int slot) const;   // member m's FP16 partials, slot `slot` (host-mapped)
     uint16_t* sum(int slot) const;
     HostReducer(const HostReducer&) = delete;
@@ -596,5 +600,13 @@ private:
 };
 void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
                     cudaStream_t s, const ArAux& aux);
+/// A chunk's pair-halves all-reduce (DS4_AR_PAIR_HALF; an even group of NVLink pairs, members 2k / 2k + 1): pair
+/// reduce-scatter on NVLink (F32), each half summed by the host over the even / odd members' FP16 pieces, the halves
+/// swapped back on NVLink - half a row each way on every member's PCIe link.  scratch / mate_scratch: 4n bytes each;
+/// pf: [3][16] x 32 host-mapped flags (zeroed).  h4: the even members' half in float4s, [0, h4) (-1: n / 8, the
+/// middle) - the odd members take [h4, n / 4); the host's sums are per element in member order, so any split gives
+/// the same bits
+void allreduce_ph(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
+                  void* mate_scratch, unsigned* pf, cudaStream_t s, const ArAux& aux, int h4 = -1);
 
 }  // namespace maya::ds4

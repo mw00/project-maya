@@ -1079,6 +1079,10 @@ struct Group {
     float* lg_stage = nullptr;
     unsigned *lg_flag = nullptr, *lg_ack = nullptr;
     std::shared_ptr<HostReducer> hred;   // a chunk's all-reduces summed on the host (5 members or more)
+    // (DS4_AR_PAIR_HALF) the pair-halves chunk all-reduce over hred: members 2k / 2k + 1 pairs with peer access on
+    // (NVLink), the handshake flags [3][16] x 32, host-mapped
+    unsigned* ph_flags = nullptr;
+    bool ph_on = false;
 };
 
 constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window plan covers
@@ -4536,7 +4540,11 @@ struct Model::Impl {
             // 5 members or more: a chunk's sums by the host (DS4_AR_HOST: the members from which, 0 off; threads
             // DS4_AR_HOST_THREADS, 32) - unless DS4_AR_DMA=0 (chunk_allreduce_on: the kernels' own sums then)
             const char* hm = std::getenv("DS4_AR_HOST");
-            const int host_from = hm != nullptr ? std::atoi(hm) : 5;
+            // DS4_AR_PAIR_HALF=1: an even group of four members or more takes the host's sums too - the pair-halves
+            // all-reduce below goes through them, and a group of four (two pairs) is where it pays most
+            const char* phe = ds4_env("DS4_AR_PAIR_HALF");
+            const bool ph_ask = phe != nullptr && std::atoi(phe) != 0 && G.arb.nm >= 4 && G.arb.nm % 2 == 0;
+            const int host_from = hm != nullptr ? std::atoi(hm) : ph_ask ? 4 : 5;
             const char* ad = std::getenv("DS4_AR_DMA");
             if (chunk > 0 && (ad == nullptr || std::atoi(ad) != 0) && host_from > 0 && G.arb.nm >= host_from &&
                 G.arb.nm <= 16) {
@@ -4545,6 +4553,35 @@ struct Model::Impl {
                 for (int m : G.mem) ids.push_back(devs[(size_t) m].id);
                 G.hred = std::make_shared<HostReducer>(G.arb, ids, G.arb.stride, ht != nullptr ? std::max(1, std::atoi(ht)) : 32);
                 if (!G.hred->ok()) G.hred.reset();   // (the sums by the copy engines then)
+            }
+            // DS4_AR_PAIR_HALF=1: an even group of pairs with peer access (NVLink) - members 2k, 2k + 1, the member
+            // order - reduce-scatters in its pairs between their VRAM first, so every member's PCIe moves half a row
+            // each way (allreduce_ph).  Its sums round to FP16 at another point than the host's whole-row reduce: the
+            // same values to FP16's rounding, not the same bits
+            if (G.hred != nullptr && ph_ask) {
+                bool ok = true;
+                for (int m = 0; m < G.arb.nm && ok; ++m) {
+                    const int me = devs[(size_t) G.mem[(size_t) m]].id, peer = devs[(size_t) G.mem[(size_t) (m ^ 1)]].id;
+                    int can = 0;
+                    ok = cudaSetDevice(me) == cudaSuccess && cudaDeviceCanAccessPeer(&can, me, peer) == cudaSuccess && can;
+                    if (ok) {
+                        const cudaError_t st = cudaDeviceEnablePeerAccess(peer, 0);
+                        ok = st == cudaSuccess || st == cudaErrorPeerAccessAlreadyEnabled;
+                        cudaGetLastError();
+                    }
+                }
+                void* v = nullptr;
+                if (ok && cudaHostAlloc(&v, 3 * 16 * 32 * sizeof(unsigned), cudaHostAllocPortable) == cudaSuccess) {
+                    std::memset(v, 0, 3 * 16 * 32 * sizeof(unsigned));
+                    G.ph_flags = (unsigned*) v;
+                    host_allocs.push_back(v);
+                    G.ph_on = true;
+                }
+                cudaGetLastError();
+                std::fprintf(stderr, "ds4: group of %d: %s (DS4_AR_PAIR_HALF)\n", G.arb.nm,
+                             G.ph_on ? "a chunk's all-reduce reduce-scatters in its pairs' VRAM first, half a row each "
+                                       "way on every member's PCIe"
+                                     : "the pair-halves all-reduce NOT enabled (no peer access between a pair)");
             }
             // the members' F32 rows and the sums the copy engines' sums go through: not with the host's, which has rows of
             // its own (FP16) - 1.3 GB of pinned RAM at 8 members and chunks of 4096, more at larger chunks
@@ -18549,6 +18586,19 @@ struct Model::Impl {
         }
 #endif
         HostReducer* hr = groups[(size_t) d.grp].hred.get();
+        if (dma && hr != nullptr && groups[(size_t) d.grp].ph_on && n > g.dim && n % 8 == 0) {   // (DS4_AR_PAIR_HALF)
+            Group& pg2 = groups[(size_t) d.grp];
+            const unsigned seq = ++c.arb_seq;
+            if (mi == 0) {   // (the lead submits both halves' sums before its members' pieces come)
+                const int n4 = n / 4, NPh = ar_host_pieces(), nmh = pg2.arb.nm / 2;
+                int ev[8], od[8];
+                for (int t = 0; t < nmh && t < 8; ++t) ev[t] = 2 * t, od[t] = 2 * t + 1;
+                hr->submit_halves(seq, n, ev, nmh, 0, n4 / 2, 0, od, nmh, n4 / 2, n4 - n4 / 2, NPh, NPh);
+            }
+            Chunk& cm = *chunks[(size_t) pg2.mem[(size_t) (mi ^ 1)]];
+            allreduce_ph(buf, n, ab, *hr, mi, seq, c.y, cm.y, pg2.ph_flags, s, aux);
+            return;
+        }
         if (dma && hr != nullptr) {   // (the lead submits the sum before its members' copies come)
             const unsigned seq = ++c.arb_seq;
             if (mi == 0) hr->submit(seq, n);
