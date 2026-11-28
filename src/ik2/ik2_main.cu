@@ -273,6 +273,16 @@ struct Layer {
 // A layer visit and its own state.  Without a loop a visit is a layer; a looped core's layer is visited once a pass,
 // each time with that visit's K / V cache and conv histories (the weights, and the experts in the cache, are the
 // layer's).  bind_visit() points the layer's state at a visit's before it runs.
+// The projections as the GGUF's blocks, for the resident and offload paths: fused into one matrix where their types
+// are one (try_load_fused_raw), else a matrix each - unsloth's UD-IQ3_XXS has attn_q in Q6_K, Q5_K or Q4_K beside Q8_0.
+static inline bool proj_blocks(const Layer& Ly) {
+    auto blocks = [](const Mat& m) { return m.raw || m.q8; };
+    return Ly.sliding ? blocks(Ly.wqkvrg) ||
+                            (blocks(Ly.wq) && blocks(Ly.wk) && blocks(Ly.wv) && blocks(Ly.wr) && blocks(Ly.wgate))
+                      : (blocks(Ly.wqrg) || (blocks(Ly.wq) && blocks(Ly.wr) && blocks(Ly.wgate))) && blocks(Ly.wk) &&
+                            blocks(Ly.wv);
+}
+
 struct Visit {
     int l = 0;        // the layer
     int pass = 0;     // the core's pass (0: its first, or a layer outside the core)
@@ -2674,6 +2684,8 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
 uint16_t* g_draft_head16 = nullptr;   // (the drafter's FP16 copy of a head kept as blocks other than Q8_0; else null)
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
+bool g_res_unfused = false; // IK2_RESIDENT_UNFUSED=1: the resident path where the projections are not fused, a matrix each
+bool g_no_fuse = false;     // IK2_FUSED=0: the projections a matrix each where they could be fused (the unfused launches' check)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
@@ -3171,7 +3183,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
             q_p = W.qkv, k_p = q_p + HD, v_p = k_p + KD, r_p = v_p + KD, gate_p = r_p + HR;
-            if (!sep) {
+            if (m.N == 0) {   // (not fused: a matrix each, the convs after their products)
+                mv1(Ly.wq, W.xq, q_p);
+                mv1c(Ly.wk, sep ? W.xk : W.xq, k_p, k::MvConv{0, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv});
+                mv1c(Ly.wv, sep ? W.xv : W.xq, v_p, k::MvConv{0, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
+                mv1(Ly.wr, W.xq, r_p);
+                mv1(Ly.wgate, W.xq, gate_p);
+            } else if (!sep) {
                 mv1c(m, W.xq, W.qkv, k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
                      k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
             } else if (m.q8) {   // (q, k and v each with its input: k's and v's rows take theirs, one launch)
@@ -3188,8 +3206,12 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             }
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
-            mv1(m, W.xq, W.qkv);
             q_p = W.qkv, r_p = q_p + HD, gate_p = r_p + HR;
+            if (m.N == 0) {   // (not fused: a matrix each)
+                mv1(Ly.wq, W.xq, q_p), mv1(Ly.wr, W.xq, r_p), mv1(Ly.wgate, W.xq, gate_p);
+            } else {
+                mv1(m, W.xq, W.qkv);
+            }
             k_p = W.kk, v_p = W.vv, kd_p = W.dyn, vd_p = W.dyn + (size_t) c.KV * 4;
             k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, W.xk, kd_p, g_s);
             k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, W.xv, vd_p, g_s);
@@ -4261,8 +4283,14 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         const bool ex = g_block_exact;
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
-            const int N = m.N;
-            if (ex && !sep) {
+            const int N = m.N, Nu = N > 0 ? N : 2 * HD + 2 * KD + HR;   // (not fused: the same rows, the sink's apart)
+            if (N == 0) {   // (not fused: a matrix each, its rows where the fused matrix's went)
+                exact_rows(Ly.wq, 0, HD, W.xq, C, T, W.qkv, Nu);
+                exact_rows(Ly.wk, 0, KD, sep ? W.xk : W.xq, C, T, W.qkv + HD, Nu);
+                exact_rows(Ly.wv, 0, KD, sep ? W.xv : W.xq, C, T, W.qkv + HD + KD, Nu);
+                exact_rows(Ly.wr, 0, HR, W.xq, C, T, W.qkv + HD + 2 * KD, Nu);
+                exact_rows(Ly.wgate, 0, HD, W.xq, C, T, W.qkv + HD + 2 * KD + HR, Nu);
+            } else if (ex && !sep) {
                 exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
             } else if (ex && m.q8 && k::mv_q8p_cols_alts(m.K, T, k::MvAlt{W.xk, HD, KD}, k::MvAlt{W.xv, HD + KD, KD})) {
                 // (q, k and v each with its input, as mv_q8p_conv's alternative inputs: one launch, not four)
@@ -4282,7 +4310,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                 tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N);
             }
             q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
-            q_ld = r_ld = gate_ld = N;
+            q_ld = r_ld = gate_ld = Nu;
             if (g_blk_fuse) {   // (k's and v's convs: one launch)
                 k::conv_block2(W.qkv + HD, Ly.h_k, Ly.sc_k, nullptr, W.kconv, Ly.rec_old[0], Ly.rec_x[0],
                                W.qkv + HD + KD, Ly.h_v, Ly.sc_v, nullptr, W.vconv, Ly.rec_old[1], Ly.rec_x[1], N, 0, 0, T,
@@ -4295,11 +4323,15 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             }
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
-            const int N = m.N;
-            if (ex) exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            const int N = m.N, Nu = N > 0 ? N : 2 * HD + HR;   // (not fused: the same rows, the sink's apart)
+            if (N == 0) {   // (not fused: a matrix each)
+                exact_rows(Ly.wq, 0, HD, W.xq, C, T, W.qkv, Nu);
+                exact_rows(Ly.wr, 0, HR, W.xq, C, T, W.qkv + HD, Nu);
+                exact_rows(Ly.wgate, 0, HD, W.xq, C, T, W.qkv + HD + HR, Nu);
+            } else if (ex) exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
             else tile_rows(m, 0, N, W.x16, T, W.qkv, N);
             q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + HR;
-            q_ld = r_ld = gate_ld = N;
+            q_ld = r_ld = gate_ld = Nu;
             const int DL = c.KV * 4;
             float *kd = W.dyn, *vd = W.dyn + (size_t) T * DL;
             k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, T, kd, DL, g_s);
@@ -4772,8 +4804,14 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
         int q_ld;
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
-            const int N = m.N;
-            if (!sep) {
+            const int N = m.N, Nu = N > 0 ? N : 2 * HD + 2 * KD + c.H * c.d_rel;   // (not fused: the same rows, the sink's apart)
+            if (N == 0) {   // (not fused: a matrix each)
+                exact_rows(Ly.wq, 0, HD, W.xq, C, T, W.qkv, Nu);
+                exact_rows(Ly.wk, 0, KD, sep ? W.xk : W.xq, C, T, W.qkv + HD, Nu);
+                exact_rows(Ly.wv, 0, KD, sep ? W.xv : W.xq, C, T, W.qkv + HD + KD, Nu);
+                exact_rows(Ly.wr, 0, c.H * c.d_rel, W.xq, C, T, W.qkv + HD + 2 * KD, Nu);
+                exact_rows(Ly.wgate, 0, HD, W.xq, C, T, W.qkv + HD + 2 * KD + c.H * c.d_rel, Nu);
+            } else if (!sep) {
                 exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
             } else {
                 exact_rows(m, 0, HD, W.xq, C, T, W.qkv, N);
@@ -4782,20 +4820,26 @@ void par_launches(Model& M, Work& W, int T, const int* sl, bool cand) {
                 exact_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.xq, C, T, W.qkv + HD + 2 * KD, N);
             }
             q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + (size_t) c.H * c.d_rel;
-            q_ld = N;
+            q_ld = Nu;
             for (int t = 0; t < T; ++t) {
                 const SlotVisit& S = g_slots[sl[t]][vis];
-                k::conv_block(W.qkv + (size_t) t * N + HD, N, S.h_k, Ly.sc_k, nullptr, 0, 0, 1, KD, nullptr, 0,
+                k::conv_block(W.qkv + (size_t) t * Nu + HD, Nu, S.h_k, Ly.sc_k, nullptr, 0, 0, 1, KD, nullptr, 0,
                               W.kconv + (size_t) t * KD, KD, nullptr, nullptr, g_s);
-                k::conv_block(W.qkv + (size_t) t * N + HD + KD, N, S.h_v, Ly.sc_v, nullptr, 0, 0, 1, KD, nullptr, 0,
+                k::conv_block(W.qkv + (size_t) t * Nu + HD + KD, Nu, S.h_v, Ly.sc_v, nullptr, 0, 0, 1, KD, nullptr, 0,
                               W.vconv + (size_t) t * KD, KD, nullptr, nullptr, g_s);
             }
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
-            const int N = m.N;
-            exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            const int N = m.N, Nu = N > 0 ? N : 2 * HD + c.H * c.d_rel;   // (not fused: the same rows, the sink's apart)
+            if (N == 0) {   // (not fused: a matrix each)
+                exact_rows(Ly.wq, 0, HD, W.xq, C, T, W.qkv, Nu);
+                exact_rows(Ly.wr, 0, c.H * c.d_rel, W.xq, C, T, W.qkv + HD, Nu);
+                exact_rows(Ly.wgate, 0, HD, W.xq, C, T, W.qkv + HD + c.H * c.d_rel, Nu);
+            } else {
+                exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            }
             q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + (size_t) c.H * c.d_rel;
-            q_ld = N;
+            q_ld = Nu;
             const int DL = c.KV * 4;
             float *kd = W.dyn, *vd = W.dyn + (size_t) T * DL;
             k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, T, kd, DL, g_s);
@@ -6894,6 +6938,8 @@ int main(int argc, char** argv) {
     if (!k::attn_flash_available()) g_flash = false;   // (AMD: the fused prompt attention where its kernel is built)
 #endif
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
+    g_res_unfused = getenv("IK2_RESIDENT_UNFUSED") && std::atoi(getenv("IK2_RESIDENT_UNFUSED"));
+    g_no_fuse = getenv("IK2_FUSED") && !std::atoi(getenv("IK2_FUSED"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {
         const int v = std::atoi(getenv("IK2_GROUP"));
@@ -7412,6 +7458,7 @@ int main(int argc, char** argv) {
         }
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && off_set != 1 && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        if (g_fast_want) k::q6k_cols_reserve();   // (a window's Q6_K products take a scratch of their own: before the card fills)
         g_off_want = (off_set == 1 || (off_set != 0 && !fits)) && !getenv("IK2_DENSE");
 #ifdef MAYA_USE_HIP   // (an AMD APU: the RAM is its memory, nothing to gain - the cache path where they do not fit)
         if (g_apu && off_set != 1) g_off_want = false;
@@ -7626,7 +7673,7 @@ int main(int argc, char** argv) {
                 qkv_parts.push_back({"", c.H, std::move(sink_v)});
                 Ly.wqkvrg = load_fused_f16(S, qkv_parts, (int) C);
             } else {
-                if (!try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg)) {
+                if (g_no_fuse || !try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C);
                     Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C);
@@ -7651,7 +7698,7 @@ int main(int argc, char** argv) {
                 Ly.wv_dyn = load_fused_f16(S, {{b + "attn_v.weight", (int) KD, {}}, {"", c.KV * 4, std::move(vd_v)}},
                                            (int) C);
             } else {
-                if (!try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg)) {
+                if (g_no_fuse || !try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wr = load_mat(S, nm(b, "attn_r.weight"), c.H * c.d_rel, (int) C);
                     Ly.wgate = load_mat(S, b + "attn_gate.weight", (int) HD, (int) C);
@@ -8691,7 +8738,9 @@ int main(int argc, char** argv) {
         auto blocks = [](const Mat& m) { return m.raw || m.q8; };
         bool raw = blocks(M.out_w);
         for (const auto& Ly : M.L)
-            raw = raw && blocks(Ly.wo) && (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv)));
+            raw = raw && blocks(Ly.wo) &&
+                  (g_res_unfused ? proj_blocks(Ly)
+                                 : (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv))));
         if (!raw) die("the offload path: a dense matrix is not kept as blocks");
         for (int l = 0; l < c.n_layer; ++l) {
             Layer& Ly = M.L[l];
@@ -8785,7 +8834,9 @@ int main(int argc, char** argv) {
         bool all = !EC.pools.empty(), raw = blocks(M.out_w);
         for (const auto& P : EC.pools) all = all && P.n_active >= P.n_layers * c.E;
         for (const auto& Ly : M.L)
-            raw = raw && blocks(Ly.wo) && (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv)));
+            raw = raw && blocks(Ly.wo) &&
+                  (g_res_unfused ? proj_blocks(Ly)
+                                 : (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv))));
         if (all && raw) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;

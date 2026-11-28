@@ -247,7 +247,12 @@ its embedding and three `attn_q` in Q4_K: read since the IQ2 / IQ3_S / IQ4_NL / 
 (their 32-value sub-blocks against the inputs, as IQ3_XXS's and IQ4_XS's). On an RTX 5080 (16 GB, Windows, FP8 cache,
 32,768 context) every expert stays in VRAM (9.6 GiB) and a token goes at 63 tok/s: its dense weights are of mixed
 types, so the fused projections are not kept as blocks and the token takes the cache path (the resident one stays
-off, #1173). Its head in Q5_K gives the drafter's fold no rows to read, so `--drafting auto` leaves the drafter out
+off, #1173). `IK2_RESIDENT_UNFUSED=1` takes the resident path there all the same: each projection its own matrix of
+blocks, a launch each where the fused matrix had one. On that card the same file then goes at 120 tok/s (59 on the
+cache path; 58 against 43 on an RTX 4060 Ti), 164 with DSpark (`--drafting on`) at a 16K context (47). Its answers are the cache
+path's where no two tokens are nearly tied: the same top-1 on 504 of 511 forced tokens and 397 of 399 on a prose
+prompt, the other nine within 0.04 of a tie; against the float64 reference both paths agree with it on 21 of 22 positions (the one miss a tie of
+0.012, both paths'). Its head in Q5_K gives the drafter's fold no rows to read, so `--drafting auto` leaves the drafter out
 with a NOTE and keeps the prompt lookup.
 Against llama.cpp (b12590 with the Inkling 2 PRs) the reference agrees on 47 of 47 top-1 tokens, KL 2.5e-3; the
 engine against the reference on 45-46 of 47, KL 6e-3..7e-3 - near ties of the router, as section 6.1 found; with

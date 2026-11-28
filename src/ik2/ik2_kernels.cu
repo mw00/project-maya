@@ -8639,6 +8639,7 @@ static float* q6k_cols_scratch() {
     }
     return buf[dev] + (size_t) (turn[dev]++ & 15u) * one;
 }
+void q6k_cols_reserve() { (void) q6k_cols_scratch(); }
 // IK2_Q6_COLS=0: Q6_K through the row dots (mv_blocks_kernel / mv_blocks_rows_kernel)
 static bool q6k_cols_fits(int type, int K, const float* x, int T) {
     static const bool q6 = !(getenv("IK2_Q6_COLS") && !atoi(getenv("IK2_Q6_COLS")));
