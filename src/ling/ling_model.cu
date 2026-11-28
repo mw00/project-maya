@@ -2131,8 +2131,10 @@ void Model::mla_decode(Gpu& gp, Layer& l, int il, bool seam, bool add_to_x) {
 
     if (!k::mla_dec_wmma(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, o_.ctx,
                          gp.d_step + 2, 1, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s)) {
+        // (any_device: maya-ling has no other decode attention on AMD, so it takes mla_dec on every arch it fits -
+        // RX 7000 / 9000 as well as gfx1151, mla_dec's own default on HIP)
         if (!glmd::mla_dec(gp.q_abs, gp.qm, c.qk_head, c.qk_nope, l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, gp.d_iota, o_.ctx,
-                           gp.d_step + 2, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s))
+                           gp.d_step + 2, H, KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo, s, true))
             throw std::runtime_error("mla: mla_dec refused shape");
     }
 
@@ -4118,7 +4120,8 @@ void Model::mla_decode_win(Gpu& gp, Layer& l, int il, int W, bool add_to_x) {
         for (int t = 0; t < W; ++t)
             if (!glmd::mla_dec(gp.q_abs + (size_t) t * H * KL, gp.qm + (size_t) t * H * c.qk_head, c.qk_head, c.qk_nope,
                                l.lat, o_.kv_q8 ? 1 : 0, l.k_pe, gp.d_iota, o_.ctx, gp.d_step + k::kStepWinCounts + t, H,
-                               KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo + (size_t) t * H * KL, s))
+                               KL, R, 1.0f / sqrtf((float) c.qk_head), gp.mla_part, gp.ctxo + (size_t) t * H * KL, s,
+                               true))
                 throw std::runtime_error("mla_win: mla_dec refused shape");
 #else
         throw std::runtime_error("mla_win: mla_dec_wmma failed");
