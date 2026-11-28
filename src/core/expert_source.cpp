@@ -1193,7 +1193,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 
 // ================================ THE RESIDENT ARENA (R2.1) ================================
 
-// Plan v0.3 P6: the arena from the model's shard 1.  Each layer's gate, up and down tensors hold the 512 experts
+// Plan v0.3 P6: the arena from the model's GGUF shards. Each layer's gate, up and down tensors hold the experts
 // one after another; they are read in chunks and each expert's slice lands at its place in the blob
 // [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const maya::kernels::cpu::ExpertLayout& lay,
@@ -1203,12 +1203,12 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const maya::k
     const auto t0 = std::chrono::steady_clock::now();
     std::atomic<int64_t> next{0};
     std::atomic<bool> bad{false};
-    // a layer's experts may sit in another shard of the model (native_experts.txt v3): a name beside `gguf`
+    // v3 names one shard per layer; v4 names a shard for each of gate, up and down.
     const size_t cut = gguf.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf.substr(0, cut + 1);
-    auto file_of = [&](int64_t l) -> std::string {
-        if (lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()) return gguf;
-        return dir + lay.gguf_file[(size_t) l];
+    auto file_of = [&](int64_t l, int r) -> std::string {
+        if (lay.gguf_file.empty() || lay.gguf_file[(size_t) (3 * l + r)].empty()) return gguf;
+        return dir + lay.gguf_file[(size_t) (3 * l + r)];
     };
     auto worker = [&]() {
         std::ifstream f;
@@ -1217,19 +1217,19 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const maya::k
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
-            const std::string name = file_of(l);
-            if (name != open_name) {
-                f.close();
-                f.clear();
-                f.open(name, std::ios::binary);
-                if (!f) { bad = true; return; }
-                open_name = name;
-            }
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};   // (gate and up differ on a mixed layer)
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
+                const std::string name = file_of(l, r);
+                if (name != open_name) {
+                    f.close();
+                    f.clear();
+                    f.open(name, std::ios::binary);
+                    if (!f) { bad = true; return; }
+                    open_name = name;
+                }
                 const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
                 const uint64_t total = per[r] * (uint64_t) lay.n_expert;
                 const uint64_t chunk = per[r] * 16;           // 16 experts per read
@@ -1616,78 +1616,77 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
     if (per_layer < 1) { err = "GgufExpertSource: the dispatch width is empty"; return false; }
     const size_t cut = shard1.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : shard1.substr(0, cut + 1);
-    map_of_.assign((size_t) n_layers, -1);
+    map_of_.assign((size_t) (3 * n_layers), -1);
     for (int64_t l = 0; l < n_layers; ++l) {
-        const std::string path = lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()
-                                     ? shard1 : dir + lay.gguf_file[(size_t) l];
-        int at = -1;
-        for (size_t i = 0; i < maps_.size(); ++i) if (maps_[i].path == path) at = (int) i;
-        if (at < 0) {
-            Map m;
-            m.path = path;
-#if defined(_WIN32)
-            const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-            std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
-            if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
-            // no FILE_FLAG_RANDOM_ACCESS: retention is the whole game (see FileExpertSource::open)
-            HANDLE f = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                   FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (f == INVALID_HANDLE_VALUE) { err = "GgufExpertSource: cannot open " + path; close(); return false; }
-            LARGE_INTEGER sz{};
-            HANDLE h = GetFileSizeEx(f, &sz) ? CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
-            void* view = h ? MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0) : nullptr;
-            if (view == nullptr) {
-                if (h) CloseHandle(h);
-                CloseHandle(f);
-                err = "GgufExpertSource: cannot map " + path;
-                close();
-                return false;
-            }
-            m.file = f;
-            m.mapping = h;
-            m.base = (const uint8_t*) view;
-            m.bytes = (uint64_t) sz.QuadPart;
-#else
-            const int fd = ::open(path.c_str(), O_RDONLY);
-            struct stat st{};
-            if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0) {
-                if (fd >= 0) ::close(fd);
-                err = "GgufExpertSource: cannot open " + path;
-                close();
-                return false;
-            }
-            void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-            if (view == MAP_FAILED) { ::close(fd); err = "GgufExpertSource: cannot map " + path; close(); return false; }
-            m.fd = fd;
-            m.base = (const uint8_t*) view;
-            m.bytes = (uint64_t) st.st_size;
-#if defined(__linux__) && defined(O_DIRECT)
-            // the misses are read unbuffered, a slice per read, many at once: through the mapping a miss is a run of
-            // 4 KB page faults and the file cache (small beside a model this size) churns the RAM the experts need.
-            // MAYA_EXPERT_DIRECT=0 turns it off; a file system that refuses O_DIRECT keeps the mapping.
-            const char* dv = std::getenv("MAYA_EXPERT_DIRECT");
-            if (dv == nullptr || std::atoi(dv) != 0) {
-                const int dfd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-                void* probe = nullptr;
-                if (dfd >= 0 && posix_memalign(&probe, 4096, 4096) == 0) {
-                    if (::pread(dfd, probe, 4096, 0) == 4096) m.dfd = dfd;
-                    else ::close(dfd);
-                    std::free(probe);
-                } else if (dfd >= 0) {
-                    ::close(dfd);
-                }
-            }
-#endif
-#endif
-            maps_.push_back(m);
-            at = (int) maps_.size() - 1;
-        }
-        map_of_[(size_t) l] = at;
-        // every slice of this layer inside its file: refused at open rather than faulting at token 4000
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t blob = lay.bytes[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};   // (gate and up differ on a mixed layer)
+        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
         for (int r = 0; r < 3; ++r) {
+            const std::string path = lay.gguf_file.empty() || lay.gguf_file[(size_t) (3 * l + r)].empty()
+                                         ? shard1 : dir + lay.gguf_file[(size_t) (3 * l + r)];
+            int at = -1;
+            for (size_t i = 0; i < maps_.size(); ++i) if (maps_[i].path == path) at = (int) i;
+            if (at < 0) {
+                Map m;
+                m.path = path;
+#if defined(_WIN32)
+                const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+                std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
+                if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
+                // no FILE_FLAG_RANDOM_ACCESS: retention is the whole game (see FileExpertSource::open)
+                HANDLE f = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (f == INVALID_HANDLE_VALUE) { err = "GgufExpertSource: cannot open " + path; close(); return false; }
+                LARGE_INTEGER sz{};
+                HANDLE h = GetFileSizeEx(f, &sz) ? CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+                void* view = h ? MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0) : nullptr;
+                if (view == nullptr) {
+                    if (h) CloseHandle(h);
+                    CloseHandle(f);
+                    err = "GgufExpertSource: cannot map " + path;
+                    close();
+                    return false;
+                }
+                m.file = f;
+                m.mapping = h;
+                m.base = (const uint8_t*) view;
+                m.bytes = (uint64_t) sz.QuadPart;
+#else
+                const int fd = ::open(path.c_str(), O_RDONLY);
+                struct stat st{};
+                if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0) {
+                    if (fd >= 0) ::close(fd);
+                    err = "GgufExpertSource: cannot open " + path;
+                    close();
+                    return false;
+                }
+                void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+                if (view == MAP_FAILED) { ::close(fd); err = "GgufExpertSource: cannot map " + path; close(); return false; }
+                m.fd = fd;
+                m.base = (const uint8_t*) view;
+                m.bytes = (uint64_t) st.st_size;
+#if defined(__linux__) && defined(O_DIRECT)
+                // the misses are read unbuffered, a slice per read, many at once: through the mapping a miss is a run of
+                // 4 KB page faults and the file cache (small beside a model this size) churns the RAM the experts need.
+                // MAYA_EXPERT_DIRECT=0 turns it off; a file system that refuses O_DIRECT keeps the mapping.
+                const char* dv = std::getenv("MAYA_EXPERT_DIRECT");
+                if (dv == nullptr || std::atoi(dv) != 0) {
+                    const int dfd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+                    void* probe = nullptr;
+                    if (dfd >= 0 && posix_memalign(&probe, 4096, 4096) == 0) {
+                        if (::pread(dfd, probe, 4096, 0) == 4096) m.dfd = dfd;
+                        else ::close(dfd);
+                        std::free(probe);
+                    } else if (dfd >= 0) {
+                        ::close(dfd);
+                    }
+                }
+#endif
+#endif
+                maps_.push_back(m);
+                at = (int) maps_.size() - 1;
+            }
+            map_of_[(size_t) (3 * l + r)] = at;
             const uint64_t off = lay.gguf_off[(size_t) (3 * l + r)], need = per[r] * (uint64_t) n_expert;
             if (off == 0 || per[r] == 0 || off > maps_[(size_t) at].bytes || need > maps_[(size_t) at].bytes - off) {
                 err = "GgufExpertSource: layer " + std::to_string(l) + "'s experts lie outside " + path +
@@ -1774,8 +1773,8 @@ void GgufExpertSource::parts(int64_t layer, int64_t expert, const uint8_t* src[3
     bytes[0] = fm.up_off;
     bytes[1] = fm.down_off - fm.up_off;   // (the up rows: not the gate's size on a mixed layer)
     bytes[2] = blob - fm.down_off;
-    const Map& m = maps_[(size_t) map_of_[(size_t) layer]];
     for (int r = 0; r < 3; ++r) {
+        const Map& m = maps_[(size_t) map_of_[(size_t) (3 * layer + r)]];
         file_off[r] = lay.gguf_off[(size_t) (3 * layer + r)] + (uint64_t) expert * bytes[r];
         src[r] = m.base + file_off[r];
     }
@@ -1793,7 +1792,7 @@ void GgufExpertSource::assemble(int64_t layer, int64_t expert, uint8_t* dst) con
 
 bool GgufExpertSource::read_part_direct(int64_t layer, int64_t expert, int part, uint8_t* dst) const {
 #if defined(__linux__)
-    const Map& m = maps_[(size_t) map_of_[(size_t) layer]];
+    const Map& m = maps_[(size_t) map_of_[(size_t) (3 * layer + part)]];
     if (m.dfd < 0) return false;
     const uint8_t* src[3];
     uint64_t bytes[3], off[3];
@@ -1945,8 +1944,10 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
                     const uint8_t* src[3];
                     uint64_t bytes[3], off[3];
                     parts(l, e, src, bytes, off);
-                    const int fd = maps_[(size_t) map_of_[(size_t) l]].fd;
-                    for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+                    for (int r = 0; r < 3; ++r) {
+                        const int fd = maps_[(size_t) map_of_[(size_t) (3 * l + r)]].fd;
+                        (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+                    }
 #endif
                 }
             }
@@ -1962,8 +1963,10 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
         const uint8_t* src[3];
         uint64_t bytes[3], off[3];
         parts(l, e, src, bytes, off);
-        const int fd = maps_[(size_t) map_of_[(size_t) l]].fd;
-        for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+        for (int r = 0; r < 3; ++r) {
+            const int fd = maps_[(size_t) map_of_[(size_t) (3 * l + r)]].fd;
+            (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+        }
     }
 #else
     (void) drop;
@@ -2074,8 +2077,10 @@ void GgufExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
         }
 #elif defined(POSIX_FADV_WILLNEED)
         if (!direct_) {   // (unbuffered reads fill their own ring slots: nothing to read ahead into the page cache)
-            const int fd = maps_[(size_t) map_of_[(size_t) layer]].fd;
-            for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_WILLNEED);
+            for (int r = 0; r < 3; ++r) {
+                const int fd = maps_[(size_t) map_of_[(size_t) (3 * layer + r)]].fd;
+                (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_WILLNEED);
+            }
         }
 #else
         (void) src; (void) bytes; (void) off;

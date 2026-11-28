@@ -7,6 +7,7 @@
 #include "ggml.h"
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -182,6 +183,56 @@ void test_native_variable_layout() {
     require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
     source.close();
 }
+
+void test_native_role_shards() {
+    using namespace maya::core;
+    using namespace maya::kernels::cpu;
+    constexpr int64_t experts = 2;
+    TempDirectory dir;
+
+    NativeFmt fmt;
+    std::string err;
+    require(native_fmt(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, H, FF, fmt, err),
+            "could not create the split-shard test format: " + err);
+    const uint64_t per[3] = {fmt.up_off, fmt.down_off - fmt.up_off, fmt.bytes - fmt.down_off};
+    const uint64_t offsets[3] = {11, 13, 17};
+    const char* names[3] = {"gate.gguf", "up.gguf", "down.gguf"};
+    for (int r = 0; r < 3; ++r) {
+        std::vector<uint8_t> bytes(offsets[r] + per[r] * experts);
+        for (int64_t e = 0; e < experts; ++e) {
+            std::fill(bytes.begin() + offsets[r] + e * per[r], bytes.begin() + offsets[r] + (e + 1) * per[r],
+                      (uint8_t) (0x10 * (r + 1) + e));
+        }
+        std::ofstream out(dir.path / names[r], std::ios::binary | std::ios::trunc);
+        require((bool) out, "could not create a synthetic role shard");
+        out.write((const char*) bytes.data(), (std::streamsize) bytes.size());
+        require((bool) out, "could not write a synthetic role shard");
+    }
+    {
+        std::ofstream metadata(dir.path / "native_experts.txt");
+        metadata << "0 " << GGML_TYPE_IQ4_NL << ' ' << GGML_TYPE_IQ4_NL << " 0 " << fmt.bytes << ' '
+                 << offsets[0] << ' ' << offsets[1] << ' ' << offsets[2] << ' '
+                 << names[0] << ' ' << names[1] << ' ' << names[2] << '\n';
+        require((bool) metadata, "could not write split-shard metadata");
+    }
+    require(expert_layout_load(dir.path.string(), 1, experts, err), "could not load split-shard metadata: " + err);
+    require(expert_layout().gguf_file.size() == 3 && expert_layout().gguf_file[1] == names[1] &&
+                expert_layout().gguf_file[2] == names[2], "role-specific shard names were not retained");
+
+    GgufExpertSource source;
+    require(source.open((dir.path / names[0]).string(), 1, experts, 2, err),
+            "could not map split-shard experts: " + err);
+    std::vector<uint8_t> blob(fmt.bytes);
+    for (int64_t e = 0; e < experts; ++e) {
+        require(source.copy_blob(0, e, blob.data()), "could not assemble a split-shard expert");
+        const uint64_t at[3] = {0, fmt.up_off, fmt.down_off};
+        for (int r = 0; r < 3; ++r)
+            for (uint64_t i = 0; i < per[r]; ++i)
+                require(blob[at[r] + i] == (uint8_t) (0x10 * (r + 1) + e),
+                        "an expert role came from the wrong shard or offset");
+    }
+    source.close();
+}
 #endif
 
 void test_complement_plan() {
@@ -316,6 +367,7 @@ int main() {
         test_begin_layer_prefetch();
 #if defined(MAYA_NATIVE_EXPERTS)
         test_native_variable_layout();
+        test_native_role_shards();
 #endif
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
