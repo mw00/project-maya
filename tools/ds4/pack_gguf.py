@@ -13,8 +13,9 @@ writes <model>/maya-ds4/ in pack.py's format, so the engine reads both:
   engram.bin    the Engram hash tables, from the GGUF's metadata (pack.py's layout; no tokenizers package needed)
   tokenizer/    the server's tokenizer from the GGUF's vocabulary and merges (pre "deepseek3"), and its chat template
 
-A GGUF has no DSpark drafter: drafter_pack.py makes it from DeepSeek's checkpoint into ../dspark/, and the pack takes it
-from there when it is present.  Nor a vision tower: vision_pack.py makes it from DeepSeek's checkpoint into ../vision/
+A model GGUF has no DSpark drafter: drafter_pack.py makes it from DeepSeek's checkpoint into ../dspark/, or
+drafter_from_gguf.py references an existing separate DSpark GGUF there without copying its weight file. The pack takes
+either when it is present. Nor a vision tower: vision_pack.py makes it from DeepSeek's checkpoint into ../vision/
 (--vision: another folder), and the pack takes it and its geometry (vision.<key>, image_token_id) from there when it is
 present; without it the engine reads text only.
 
@@ -25,6 +26,7 @@ v1.1.17 put it) when it is whole.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -109,6 +111,27 @@ class Gguf:
                 return list(struct.unpack("<%d%s" % (n, fmt[at]), self.f.read(n * n_b)))
             return [self._val(at) for _ in range(n)]
         raise SystemExit("%s: metadata type %d" % (self.path, t))
+
+
+def verify_existing_gguf(source: pathlib.Path, info: dict) -> None:
+    """Check an existing-GGUF drafter's recorded size and header, never its weight payload."""
+    if info.get("format") != "existing-gguf-byte-ranges":
+        return  # drafter_pack.py's ordinary .bin format has no GGUF header.
+    size, digest = info.get("source_size"), info.get("source_header_sha256")
+    if type(size) is not int or size <= 0 or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SystemExit(f"{source}: missing or invalid recorded GGUF source size/header hash; regenerate the drafter manifest")
+    try:
+        if source.stat().st_size != size:
+            raise SystemExit(f"{source}: GGUF source size changed; regenerate the drafter manifest")
+        header_bytes = Gguf(source).data_start
+        if header_bytes > size:
+            raise SystemExit(f"{source}: GGUF header extends beyond the file")
+        with source.open("rb") as handle:
+            actual = hashlib.sha256(handle.read(header_bytes)).hexdigest()
+    except (OSError, ValueError, struct.error) as exc:
+        raise SystemExit(f"{source}: cannot verify the GGUF source header: {exc}") from exc
+    if actual != digest:
+        raise SystemExit(f"{source}: GGUF source header hash changed; regenerate the drafter manifest")
 
 
 # GGUF name (blk.N. stripped) -> the checkpoint's name under layers.N. (pack.py / the engine)
@@ -426,7 +449,8 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
     ap.add_argument("--out", help="default: <model>/maya-ds4")
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
-    ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--drafter", help="the DSpark drafter's .json (from drafter_pack.py or drafter_from_gguf.py; "
+                                  "default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
@@ -572,6 +596,7 @@ def main() -> int:
     geo = geometry(kv, vocab)
     dinfo = json.loads(drafter.read_text()) if drafter_in else {}
     if drafter_in:   # (its geometry: the GGUF's, else filled in - a drafter without it never drafts: left out, said so)
+        verify_existing_gguf(drafter.with_suffix(".bin"), dinfo)
         fill, src = dspark_fill(geo, dinfo, vocab)
         if fill is None:
             print("WARNING: the DSpark drafter %s is left out of the pack: the GGUF has no %s for it (and this is not "
@@ -584,7 +609,13 @@ def main() -> int:
             print("DSpark geometry not in the GGUF, taken from %s: %s" %
                   (src, ", ".join("%s %s" % (k, fill[k]) for k in DSPARK_KEYS if k in fill)))
     if drafter_in:
-        files.append(rel(drafter.with_suffix(".bin")))
+        try:
+            drafter_file = rel(drafter.with_suffix(".bin"))
+        except ValueError as exc:  # Windows: another drive
+            raise SystemExit(f"{drafter}: the drafter must be on the model's drive") from exc
+        if any(char.isspace() for char in drafter_file):
+            raise SystemExit(f"{drafter}: the drafter path relative to the model cannot contain whitespace")
+        files.append(drafter_file)
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
         for name, dt, off, nb, shape in dinfo["tensors"]:
             if name.endswith(".attn.wo_a.weight"):   # (one entry a group, as the trunk's)
