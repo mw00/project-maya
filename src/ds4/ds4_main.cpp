@@ -1333,6 +1333,13 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         return true;
     };
+    // true when the state the bound conversation holds is one of the kept shared starts (no conversation of anyone's)
+    const auto state_is_a_prefix = [&]() {
+        const auto& st = m.tokens();
+        for (const Prefix& p : prefixes)
+            if (p.tokens.size() == st.size() && std::equal(p.tokens.begin(), p.tokens.end(), st.begin())) return true;
+        return false;
+    };
     if (slot_max > 0) {
         slot_dir = std::getenv("MAYA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("MAYA_DS4_SLOT_DIR"))
                                                       : std::filesystem::path(pack) / "slots";
@@ -1591,12 +1598,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         // takes it back, and a read that a STOP ends before it wrote a token leaves it there whole.  A prompt that
         // begins with it would then "continue" the start, while the conversation it does continue sits in a slot (just
         // set aside, in RAM) and is never taken back: the whole prompt reads again (a 190K-token conversation: ~73 s)
-        bool state_is_prefix = false;
-        for (const Prefix& p : prefixes) {
-            if (p.tokens.size() != n_state) continue;
-            state_is_prefix = std::equal(p.tokens.begin(), p.tokens.end(), st.begin());
-            if (state_is_prefix) break;
-        }
+        const bool state_is_prefix = state_is_a_prefix();
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
@@ -2116,7 +2118,10 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     // line a request causes carries it after its keyword (T <rid> <id>, PP <rid> ..., DONE <rid> ..., ERR <rid> ...);
     // STOP <rid> ends that request, a bare STOP every one.  Each request runs in one of the n conversations the model
     // holds (Model::seq_bind): the idle one whose state its prompt reuses the most, else an empty one, else the least
-    // recently used (whose conversation is set aside first with MAYA_DS4_SLOT_KEEP, as one conversation's is).  The
+    // recently used (whose conversation is set aside first with MAYA_DS4_SLOT_KEEP, as one conversation's is).  A
+    // prompt that continues a busy conversation's state - an agent's background compaction behind the chat whose
+    // answer is still writing - is copied into the idle conversation it takes and reads on from the copy
+    // (MAYA_DS4_SLOT_COPY, 1).  The
     // prompts being read take turns, a piece each (a chunk per pipeline stage: the split's stages all busy), and every
     // running request writes a token between two pieces - so a long prompt no longer holds every answer, and a short
     // question no longer waits for a long prompt read before it: a prompt whole in one piece goes ahead of the longer
@@ -2182,6 +2187,17 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                                                        : (size_t) m.feed_unit();
         const int read_rounds = env_count("MAYA_DS4_READ_ROUNDS", kReadRounds);
         const double read_share = std::min(env_count("MAYA_DS4_READ_SHARE", 0), kReadShareMax) / 100.0;
+        // MAYA_DS4_SLOT_COPY (1): a prompt that continues a conversation that is busy answering is not sent to an idle
+        // one to be read whole - the busy state is copied into the conversation it is assigned to (through host RAM,
+        // as a slot is) and the prompt reads on from it.  MAYA_DS4_SLOT_COPY_MIN (1024): the shortest state copied;
+        // the copy costs the state's bytes twice over and saves the tokens between its match and the idle ones', so
+        // it goes only when it covers at least twice what they cover on their own.
+        const auto env_on = [&](const char* name, bool dflt) {
+            const char* v = read_env(name);
+            return v == nullptr ? dflt : std::atoi(v) != 0;
+        };
+        const bool slot_copy = env_on("MAYA_DS4_SLOT_COPY", true);
+        const int64_t copy_min = env_count("MAYA_DS4_SLOT_COPY_MIN", 1024);
         // the reader's lines posted and taken: one waiting, a prompt read alone yields to it
         std::atomic<long long> lines_posted{0};
         long long lines_taken = 0;
@@ -2332,6 +2348,71 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             if (best < 0) {   // (the server gives each conversation one request: a request over that waits)
                 waiting.push_front(ln);
                 return;
+            }
+            // A prompt that continues a conversation that is busy answering - an agent's background compaction or
+            // title behind the chat whose answer is still writing, the next turn of a conversation whose side
+            // request runs - cannot wait for that conversation: the server gives each one request, but two
+            // renderings of one history are two conversations here.  It would take an idle conversation and read the
+            // whole session again.  When the busy conversation covers at least twice what the idle ones cover, its
+            // state is copied into the idle conversation picked above and the prompt reads on from the copy - whole,
+            // or from the latest checkpoint the prompt agrees with, as a kept conversation is taken back.  Text
+            // prompts only: a state's pictures are checked against the prompt's, which are not read yet here, and a
+            // state that holds pictures is not copied; nor with ablation loaded, whose projection a copied state
+            // carries being another thing to check.
+            if (slot_copy && !geni && !m.ablate_loaded()) {
+                int src = -1;
+                int64_t src_u = 0, src_len = 0;
+                for (int s = 0; s < nseq; ++s) {
+                    if (seq_rid[(size_t) s] < 0) continue;   // (the idle ones were judged above)
+                    bind(s);
+                    const auto& st = m.tokens();
+                    if (st.empty() || m.ablating() || !held.empty()) continue;
+                    // The answer can advance past the submitted prompt while it is queued (including a lookup
+                    // window). A longer source can still supply a matching checkpoint; restore the copy below.
+                    size_t c = 0;
+                    while (c < st.size() && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+                    int64_t u = 0;
+                    if (c == st.size() && c < r.ids.size()) u = (int64_t) c;   // (the whole state continued)
+                    else if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
+                    if (u < copy_min || u <= 2 * best_u) continue;
+                    if (u > src_u) src_u = u, src = s, src_len = (int64_t) st.size();
+                }
+                if (src >= 0) {
+                    const auto tc0 = std::chrono::steady_clock::now();
+                    bind(src);
+                    std::vector<uint8_t> buf;
+                    std::string e;
+                    bool copied = m.slot_save(buf, e) != 0;   // (the busy conversation keeps its own state: the save
+                                                             //  only reads it; its next token clears the flag it sets)
+                    bind(best);
+                    if (copied) {
+                        if (!state_is_a_prefix()) slot_put("");   // (the conversation the copy lands on goes to a
+                                                                  //  slot first, as one a prompt leaves would)
+                        std::vector<strata::ds4::PicMark> marks;
+                        if (!m.slot_load(buf.data(), buf.size(), src_len, e, &marks) || !marks.empty())
+                            copied = false;   // (a load that stopped midway left a reset conversation)
+                        else if (src_u < src_len && !(m.restore(src_u) && (size_t) m.pos() == (size_t) src_u)) {
+                            m.reset();   // (as when a kept conversation cannot be taken back at its point)
+                            copied = false;
+                        }
+                        if (copied) held.clear();   // (the copy holds no pictures: judged above)
+                    }
+                    if (!copied)
+                        std::fprintf(stderr, "ds4: copying conversation %d's state failed (%s) - reading its prompt again\n",
+                                     src, e.c_str());
+                    else {
+                        char msg[256];
+                        const std::string part = src_u < src_len
+                            ? " at token " + std::to_string(src_u) + " of " + std::to_string(src_len) : "";
+                        std::snprintf(msg, sizeof msg,
+                                      "copied conversation %d's state%s into conversation %d (%s in RAM in %.1f s); "
+                                      "%zu new tokens to read",
+                                      src, part.c_str(), best, gb(buf.size()).c_str(),
+                                      std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count(),
+                                      r.ids.size() - (size_t) src_u);
+                        note(msg);
+                    }
+                }
             }
             bind(best);
             seq_used[(size_t) best] = ++use_clock;
