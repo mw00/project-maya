@@ -353,6 +353,61 @@ void ref_expert(const Experts& E, int e, const float* x, double lim, std::vector
     for (int d = 0; d < E.D; ++d) y[d] = mx_dot(emat(E, e, 2), E.F, d, hr.data());
 }
 
+// Independent E4M3 reference using the ordered positive codes and ties-to-even.
+float bf16_from_bits(uint16_t bits) {
+    const uint32_t raw = uint32_t(bits) << 16;
+    float value;
+    std::memcpy(&value, &raw, sizeof(value));
+    return value;
+}
+
+float bf16_reference(float value) {
+    if (value == 0.0f) return value;
+    const float step = std::ldexp(1.0f, std::ilogb(value) - 7);
+    return std::nearbyint(value / step) * step;
+}
+
+std::vector<float> fp8_round(const float* input, int k, bool e8m0, bool bf16 = false,
+                             uint8_t* codes = nullptr) {
+    static const auto values = [] {
+        std::vector<float> v(127);
+        for (int i = 0; i < 127; ++i) {
+            const int exponent = i >> 3, fraction = i & 7;
+            v[i] = exponent == 0 ? std::ldexp((float) fraction, -9)
+                                 : std::ldexp(1.0f + fraction / 8.0f, exponent - 7);
+        }
+        return v;
+    }();
+    std::vector<float> output(k);
+    for (int i = 0; i < k; i += 32) {
+        float x[32], peak = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            x[j] = bf16 ? bf16_reference(input[i + j]) : __half2float(__float2half_rn(input[i + j]));
+            peak = std::max(peak, std::abs(x[j]));
+        }
+        if (peak == 0.0f) continue;
+        float scale = peak * (1.0f / 448.0f), inverse = 448.0f / peak;
+        if (e8m0) {
+            const float scaled = std::max(peak, 1e-4f) * (1.0f / 448.0f);
+            int exponent = 0;
+            const float fraction = std::frexp(scaled, &exponent);
+            scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+            inverse = 1.0f / scale;
+        }
+        for (int j = 0; j < 32; ++j) {
+            const float y = std::abs(x[j]) * inverse;
+            int hi = std::min(126, (int) (std::lower_bound(values.begin(), values.end(), y) - values.begin()));
+            if (hi > 0) {
+                const float left = y - values[hi - 1], right = values[hi] - y;
+                if (left < right || (left == right && (hi & 1))) --hi;
+            }
+            output[i + j] = std::copysign(values[hi] * scale, x[j]);
+            if (codes != nullptr) codes[i + j] = uint8_t(hi | (std::signbit(x[j]) ? 128 : 0));
+        }
+    }
+    return output;
+}
+
 void test_experts(int D, int F, cudaStream_t s) {
     const int n_exp = 12, k = 6, T = 5;
     const float lim = 10.0f;
@@ -472,6 +527,26 @@ void test_experts(int D, int F, cudaStream_t s) {
 
     // the prompt path's set: rows sorted by expert (bounds), each row a token index (row_idx) - experts of a few rows (the
     // light kernels), then of more (the tiles)
+    const char* no_light = std::getenv("MAYA_DS4_NO_LIGHT");
+    // The production light eligibility uses iq::block_values, whose current
+    // MXFP4 entry requires a 256-value multiple even though the tiles use 32.
+    const int light_block = maya::ds4::gguf::iq::block_values(gg::kTypeMXFP4);
+    const bool light_enabled = (no_light == nullptr || no_light[0] != '1') &&
+                               D % light_block == 0 && F % light_block == 0;
+    bool fp8 = false, bf16 = false;
+#if defined(MAYA_USE_HIP)
+    const char* use_fp8 = std::getenv("MAYA_DS4_MXFP4_WMMA_FP8");
+    const char* no_tc = std::getenv("MAYA_DS4_NO_TC");
+    bf16 = use_fp8 == nullptr || std::strcmp(use_fp8, "2") == 0;
+    if ((bf16 || (use_fp8 != nullptr && std::strcmp(use_fp8, "1") == 0)) && (!no_tc || no_tc[0] != '1')) {
+        int device = 0;
+        cudaDeviceProp prop{};
+        CU(cudaGetDevice(&device));
+        CU(cudaGetDeviceProperties(&prop, device));
+        fp8 = std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
+              std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0;
+    }
+#endif
     for (int R : {100, 200, 400}) {
         std::vector<int> owner(R), idx(R);
         for (int r = 0; r < R; ++r) owner[r] = (int) (rng() % n_exp);
@@ -486,6 +561,12 @@ void test_experts(int D, int F, cudaStream_t s) {
         const int NT = 40;
         std::vector<float> xs((size_t) NT * D);
         for (auto& v : xs) v = frand();
+        std::fill_n(xs.data(), 32, 0.0f);
+        if (D >= 128) {
+            std::fill_n(xs.data() + 32, 32, std::ldexp(1.0f, -15));
+            std::fill_n(xs.data() + 64, 32, 0.875f);
+            std::fill_n(xs.data() + 96, 32, 0.8759765625f);
+        }
         for (int r = 0; r < R; ++r) idx[r] = (int) (rng() % NT);
         float* dxs = dev(xs);
         int *dbd = dev(bounds), *didx = dev(idx);
@@ -522,28 +603,86 @@ void test_experts(int D, int F, cudaStream_t s) {
             if (!same) ++g_fail;
             cudaFree(dx16), cudaFree(dh2);
         }
+        if (!light_enabled) {
+            auto digest = [](const auto& values) {
+                uint64_t hash = 14695981039346656037ull;
+                const auto* bytes = reinterpret_cast<const unsigned char*>(values.data());
+                for (size_t i = 0; i < values.size() * sizeof(values[0]); ++i)
+                    hash = (hash ^ bytes[i]) * 1099511628211ull;
+                return (unsigned long long) hash;
+            };
+            std::printf("WMMA_DIGEST rows=%d h=%016llx down=%016llx\n", R, digest(h16), digest(y));
+        }
         std::vector<float> hgot((size_t) R * F);
         std::vector<double> hwant((size_t) R * F), ywant((size_t) R * D);
         // (an expert of at most 16 rows takes the light kernels: its inputs rounded to int8 per 32, as the token path's)
         int n_light = 0;
-        for (int e = 0; e < n_exp; ++e) n_light += bounds[e + 1] - bounds[e] <= 16 ? bounds[e + 1] - bounds[e] : 0;
+        size_t changed_input = 0, total_input = 0, changed_hidden = 0, total_hidden = 0;
+        uint64_t light_digest = 14695981039346656037ull;
+        double bf16_error2 = 0, bf16_reference2 = 0;
+        for (int e = 0; e < n_exp; ++e) n_light += light_enabled && bounds[e + 1] - bounds[e] <= 16 ? bounds[e + 1] - bounds[e] : 0;
         for (int r = 0; r < R; ++r) {
-            const bool light = bounds[owner[r] + 1] - bounds[owner[r]] <= 16;
-            const std::vector<float> xq = light ? q8_round(xs.data() + (size_t) idx[r] * D, D) : std::vector<float>();
-            const float* xr = light ? xq.data() : xs.data() + (size_t) idx[r] * D;
-            std::vector<float> hr(F);
+            const bool light = light_enabled && bounds[owner[r] + 1] - bounds[owner[r]] <= 16;
+            const float* x = xs.data() + (size_t) idx[r] * D;
+            const std::vector<float> xq = light ? q8_round(x, D) : fp8 ? fp8_round(x, D, bf16, bf16) : std::vector<float>();
+            const float* xr = xq.empty() ? x : xq.data();
+            std::vector<float> hr(F), hidden_reference(F);
+            if (fp8 && bf16 && !light) {
+                std::vector<uint8_t> before(D), after(D);
+                fp8_round(x, D, true, false, before.data());
+                fp8_round(x, D, true, true, after.data());
+                for (int i = 0; i < D; ++i) changed_input += before[i] != after[i];
+                total_input += D;
+            }
             for (int f = 0; f < F; ++f) {
                 hwant[(size_t) r * F + f] =
                     swiglu(mx_dot(emat(E, owner[r], 0), D, f, xr), mx_dot(emat(E, owner[r], 1), D, f, xr), lim);
-                hgot[(size_t) r * F + f] = __half2float(*(const __half*) &h16[(size_t) r * F + f]);
+                hidden_reference[f] = float(hwant[(size_t) r * F + f]);
+                hgot[(size_t) r * F + f] = fp8 && bf16 && !light ? bf16_from_bits(h16[(size_t) r * F + f])
+                    : __half2float(*(const __half*) &h16[(size_t) r * F + f]);
                 hr[f] = hgot[(size_t) r * F + f];   // the down from the F16 h the kernel kept
             }
-            if (light) hr = q8_round(hr.data(), F);
+            if (light) {
+                for (int f = 0; f < F; ++f)
+                    light_digest = (light_digest ^ h16[(size_t) r * F + f]) * 1099511628211ull;
+                for (int f = 0; f < D; ++f) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &y[(size_t) r * D + f], sizeof(bits));
+                    light_digest = (light_digest ^ bits) * 1099511628211ull;
+                }
+                hr = q8_round(hr.data(), F);
+            } else if (fp8 && bf16) {
+                const auto input_bf16 = fp8_round(x, D, true, true);
+                for (int f = 0; f < F; f += 32) {
+                    const float reference = bf16_reference(float(swiglu(
+                        mx_dot(emat(E, owner[r], 0), D, f, input_bf16.data()),
+                        mx_dot(emat(E, owner[r], 1), D, f, input_bf16.data()), lim)));
+                    const double error = double(hr[f]) - reference;
+                    bf16_error2 += error * error;
+                    bf16_reference2 += double(reference) * reference;
+                }
+                hr = fp8_round(hr.data(), F, true, true);
+            } else if (fp8) hr = fp8_round(hr.data(), F, false);
+            if (fp8 && bf16 && !light) {
+                std::vector<uint8_t> before(F), after(F);
+                fp8_round(hidden_reference.data(), F, true, false, before.data());
+                fp8_round(hidden_reference.data(), F, true, true, after.data());
+                for (int i = 0; i < F; ++i) changed_hidden += before[i] != after[i];
+                total_hidden += F;
+            }
             for (int d = 0; d < D; ++d) ywant[(size_t) r * D + d] = mx_dot(emat(E, owner[r], 2), F, d, hr.data());
         }
+        if (fp8 && bf16 && bf16_reference2 > 0)
+            std::printf("Relative gate/up RMS against BF16-boundary reference, %d rows: %.7g\n",
+                        R, std::sqrt(bf16_error2 / bf16_reference2));
+        if (n_light)
+            std::printf("LIGHT_DIGEST rows=%d light=%d bits=%016llx\n", R, n_light, (unsigned long long)light_digest);
+        if (fp8 && bf16)
+            std::printf("BF16 FP8 code changes: gate/up %zu/%zu, SwiGLU %zu/%zu\n",
+                        changed_input, total_input, changed_hidden, total_hidden);
         char sw[64];
-        std::snprintf(sw, sizeof(sw), "set gate/up (F16 h), %d rows, %d light", R, n_light);
-        expect(sw, hgot.data(), hwant.data(), hwant.size(), 2e-3);
+        std::snprintf(sw, sizeof(sw), "set gate/up (%s h), %d rows, %d light", fp8 && bf16 ? "BF16" : "F16", R, n_light);
+        expect(sw, hgot.data(), hwant.data(), hwant.size(), fp8 && bf16 ? 4e-3 : 2e-3);
         std::snprintf(sw, sizeof(sw), "set down, %d rows, %d light", R, n_light);
         expect(sw, y.data(), ywant.data(), ywant.size(), n_light > 0 ? 1e-4 : 5e-5);
         cudaFree(dxs), cudaFree(dbd), cudaFree(didx), cudaFree(dh16), cudaFree(dy);
@@ -1922,6 +2061,47 @@ void bench_cpu(int nth) {
 }
 
 // the decode kernels' speed: GB/s of weights read (a token's dense GEMVs and its experts)
+void bench_mx_prompt(cudaStream_t s, int F, int R) {
+    const int D = 5120, NE = 32;
+    Experts S = make_experts(D, F, NE);
+    std::vector<int> bounds(NE + 1), idx(NE * R);
+    for (int e = 0; e <= NE; ++e) bounds[e] = e * R;
+    for (int i = 0; i < NE * R; ++i) idx[i] = i;
+    int *db = dev(bounds), *di = dev(idx);
+    float* xs = dev(std::vector<float>((size_t) NE * R * D, 0.01f));
+    uint16_t* h16 = dev(std::vector<uint16_t>((size_t) NE * R * F));
+    float* y = dev(std::vector<float>((size_t) NE * R * D));
+    x3::SetArgs sa;
+    sa.wbase = S.dev;
+    sa.stride = S.blob;
+    sa.lay = S.lay;
+    sa.n_exp = NE;
+    sa.bounds = db;
+    sa.max_rows = R;
+    sa.n_embd = D;
+    sa.n_ff = F;
+    sa.limit = 10.0f;
+    const double flops = 2.0 * NE * R * 3.0 * D * F;
+    cudaEvent_t a0, a1;
+    cudaEventCreate(&a0);
+    cudaEventCreate(&a1);
+    gg::set_gate_up(sa, xs, D, di, h16, F, s);
+    gg::set_down(sa, h16, F, y, D, s);
+    cudaEventRecord(a0, s);
+    for (int i = 0; i < 5; ++i) {
+        gg::set_gate_up(sa, xs, D, di, h16, F, s);
+        gg::set_down(sa, h16, F, y, D, s);
+    }
+    cudaEventRecord(a1, s);
+    CU(cudaEventSynchronize(a1));
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a0, a1);
+    std::printf("MXFP4 prompt 32 experts x %d rows %8.3f ms  %6.1f TFLOP/s\n", R, ms / 5,
+                flops / (ms / 5 * 1e-3) / 1e12);
+    cudaFree(S.dev), cudaFree(db), cudaFree(di), cudaFree(xs), cudaFree(h16), cudaFree(y);
+    cudaEventDestroy(a0), cudaEventDestroy(a1);
+}
+
 void bench(cudaStream_t s) {
     cudaEvent_t a, b;
     cudaEventCreate(&a);
@@ -1988,45 +2168,7 @@ void bench(cudaStream_t s) {
             gg::moe_down(ma, dh, nullptr, dout, s);
         });
         cudaFree(E.dev);
-        {   // the prompt path: 32 experts x 128 rows each (an 8K chunk's share of 384 experts)
-            const int NE = 32, R = 128;
-            Experts S = make_experts(D, F, NE);
-            std::vector<int> bounds(NE + 1), idx(NE * R);
-            for (int e = 0; e <= NE; ++e) bounds[e] = e * R;
-            for (int i = 0; i < NE * R; ++i) idx[i] = i;
-            int *db = dev(bounds), *di = dev(idx);
-            float* xs = dev(std::vector<float>((size_t) NE * R * D, 0.01f));
-            uint16_t* h16 = dev(std::vector<uint16_t>((size_t) NE * R * F));
-            float* y = dev(std::vector<float>((size_t) NE * R * D));
-            x3::SetArgs sa;
-            sa.wbase = S.dev;
-            sa.stride = S.blob;
-            sa.lay = S.lay;
-            sa.n_exp = NE;
-            sa.bounds = db;
-            sa.max_rows = R;
-            sa.n_embd = D;
-            sa.n_ff = F;
-            sa.limit = 10.0f;
-            const double flops = 2.0 * NE * R * 3.0 * D * F;
-            cudaEvent_t a0, a1;
-            cudaEventCreate(&a0);
-            cudaEventCreate(&a1);
-            gg::set_gate_up(sa, xs, D, di, h16, F, s);
-            gg::set_down(sa, h16, F, y, D, s);
-            cudaEventRecord(a0, s);
-            for (int i = 0; i < 5; ++i) {
-                gg::set_gate_up(sa, xs, D, di, h16, F, s);
-                gg::set_down(sa, h16, F, y, D, s);
-            }
-            cudaEventRecord(a1, s);
-            CU(cudaEventSynchronize(a1));
-            float ms = 0;
-            cudaEventElapsedTime(&ms, a0, a1);
-            std::printf("bench %-40s %8.1f ms  %6.1f TFLOP/s\n", "prompt set: 32 experts x 128 rows", ms / 5,
-                        flops / (ms / 5 * 1e-3) / 1e12);
-            cudaFree(S.dev), cudaFree(db), cudaFree(di), cudaFree(xs), cudaFree(h16), cudaFree(y);
-        }
+        bench_mx_prompt(s, F, 128);
         E.dev = nullptr;
         E = make_experts(D, F, 6);
         for (int i = 0; i < 6; ++i) pp[i] = (unsigned long long) (E.dev + (size_t) i * E.blob);
@@ -3512,6 +3654,18 @@ int main(int argc, char** argv) {
             return same ? 0 : 1;
         }
         return check_rows(t, w, k, n, argc >= 8 ? argv[7] : "real rows", s) ? 0 : 1;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--mx-prompt") == 0) {
+        test_experts(5120, argc >= 3 ? std::atoi(argv[2]) : 1152, s);
+        if (gg::launch_errors() != 0) ++g_fail;
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 3 && std::strcmp(argv[1], "--bench-mx-prompt") == 0) {
+        const int rows = std::atoi(argv[2]);
+        if (rows < 17 || rows > 256) return 2;
+        bench_mx_prompt(s, 1152, rows);
+        return gg::launch_errors() == 0 ? 0 : 1;
     }
     if (argc >= 2 && std::strcmp(argv[1], "--bench") == 0) {
         bench(s);
