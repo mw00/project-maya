@@ -646,7 +646,7 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_ablate.cu
-    src/core/glm_tp.cu)
+    src/core/glm_tp.cu src/core/glm_link.cpp)
   target_include_directories(maya_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(maya_engine PUBLIC maya_core maya_kernels maya_kernels_cpu ${_maya_gpu_runtime_target})
   if(WIN32 AND MAYA_ENABLE_CUDA)

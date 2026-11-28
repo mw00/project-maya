@@ -120,9 +120,10 @@ public:
                        const std::string& layer_split = "");
     bool load_pack_place(const std::string& pack_dir, int64_t max_ctx, std::string& err, const std::string& layer_split);
     /// The explicit split form behind load_pack_env: devs[i] runs layers [bounds[i-1], bounds[i]) (bounds holds
-    /// the first layer of each later part, devs.size() - 1 of them).
+    /// the first layer of each later part, devs.size() - 1 of them).  first/last: the layers the split covers (the
+    /// two-rig split's side: [first, last), last 0 = to the end; the whole model by default).
     bool load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
-                         const std::vector<int>& devs, std::string& err);
+                         const std::vector<int>& devs, std::string& err, int first = 0, int last = 0);
     static constexpr int kMaxParts = 16;
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; MAYA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).
@@ -292,6 +293,7 @@ public:
     /// closes the reasoning block this way inside the running decode - the speculative loop takes it as the truth
     /// for its position, like a rejected draft, so nothing is read again.
     void force_next(int32_t tok) { force_tok_ = tok; }
+    int32_t force_pending() const { return force_tok_; }   // (the two-rig split: the front's, sent to the back)
     /// The on-demand vision encoder (serve VLEND / VRECLAIM; MAYA_GLM_VISION_LEND_MB at load): the first GPU's
     /// lendable pool tail is emptied and freed so the encoder's process can use that VRAM, and allocated again
     /// once it has ended (false while the memory is still taken).  vision_lend_bytes(): 0 when unavailable.
@@ -810,6 +812,8 @@ public:
     bool spec_plain_turn();
     void spec_plain_end(int64_t produced);
     bool spec_plain_live_ = false;
+    bool decode_spec_link(maya::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                          int64_t& produced, std::string& err);   // the two-rig split's (glm_link.hpp)
     uint64_t spec_steps_ = 0, spec_hits_ = 0;              // speculative positions, accepted
     double spec_t_[4] = {0, 0, 0, 0};                      // MAYA_GLM_SPEC_PROF host phases of spec_head/tail
     int64_t spec_n_ = 0;

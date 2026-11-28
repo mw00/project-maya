@@ -16,6 +16,7 @@
 // rounding (FP16 activations instead of q8_1), as between llama.cpp's batched and one-token paths.  The prompt's
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  MAYA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
+#include "maya/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 #include "glm_tier_numa.hpp"   // glm-dsa B8.4
 #include "glm_prefill_dsa.hpp"   // glm-dsa B9: the glm-dsa prompt layer
@@ -4896,7 +4897,7 @@ int Glm5Model::prefill_chunk_for(int64_t nn) const {   // (prefill's own choice 
         if (m->pf_ == nullptr) return 0;
         Tmax = std::min(Tmax, m->pf_->T);
     }
-    return maya::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr, prefill_floor(nn, 1));
+    return maya::core::prefill_chunk_len(nn, Tmax, (split_next_ != nullptr || maya::core::glmlink::role() != maya::core::glmlink::kNone), prefill_floor(nn, 1));
 }
 
 // The fewest chunks a split cuts a call of nn tokens into: the call's own floor (prefill_min_chunks, none under 256
@@ -4910,7 +4911,7 @@ int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
                                  "%d tokens (MAYA_GLM_PREFILL_MIN_CHUNKS), so the parts pipeline it\n", s.n, s.min_tokens);
         return s;
     }();
-    if (split_next_ == nullptr) return 1;
+    if (split_next_ == nullptr && maya::core::glmlink::role() == maya::core::glmlink::kNone) return 1;
     return std::max(maya::core::prefill_floor_chunks(nn, call_min, 256),
                     maya::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
 }
@@ -4921,8 +4922,14 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     if (prefill_tokens_dsa(tokens, next_token, err) || !err.empty()) return err.empty();   // glm-dsa B11.1: glm-dsa + NextN off the batched path (glm_dsa_mixer.cu)
     prefill_next_ = next_token;
     if (fast_ == nullptr || tokens.empty()) return false;
+    // THE TWO-RIG SPLIT: both sides must read this call the same way - through the prompt path in the same chunks, or
+    // token by token.  What this side can do is not the other's business to guess (a local part without its prompt
+    // state, a chunk that had to be halved here), so the two say it to each other below (glmlink::chunk_exchange)
+    const bool linked = maya::core::glmlink::role() != maya::core::glmlink::kNone;
+    bool can = true;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a tail lent to the vision encoder: the
-        if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) return false;   // token path, until it is back)
+        if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) can = false;   // token path, until it is back)
+    if (!can && !linked) return false;
     // a handful of tokens costs less through the token path (the batched path streams every expert they touch).  One
     // GPU: from 8 tokens - an agent session's later turns (13.5K of history + a short user turn, Maya-S24 on a V100,
     // two cooled rounds of three turns): prompt 1,041 / 648 / 521 ms at 32 -> 488 / 405 / 577 at 8 (4: 508 / 397 /
@@ -4930,6 +4937,12 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = split_next_ == nullptr && n_parts_ <= 1 ? 8 : 32;
     if (const char* mn = getenv("MAYA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if ((int64_t) tokens.size() < min_n) return false;
+    if (!can) {   // (linked: this side has no prompt path for the call - 0 says so, and both go token by token)
+        int32_t peer = 0;
+        if (!maya::core::glmlink::chunk_exchange(pos_, (int32_t) tokens.size(), 0, peer, err)) return false;
+        err.clear();
+        return false;
+    }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
@@ -4940,7 +4953,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, MAYA_GLM_PREFILL_MIN_CHUNKS)
     const int Trun_max = prefill_force_chunk > 0
                           ? std::min(Tmax, prefill_force_chunk)
-                          : maya::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                          : maya::core::prefill_chunk_len(nn, Tmax, (split_next_ != nullptr || maya::core::glmlink::role() != maya::core::glmlink::kNone),
                                                             prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
@@ -4963,6 +4976,39 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         }
         Trun = std::max(kMinPrefillChunk, Trun / 2);
         std::fprintf(stderr, "glm prefill: CUDA%d the chunk is %d tokens now (its layout did not fit)\n", dev_, Trun);
+    }
+    // THE TWO-RIG SPLIT: each side has just laid its chunk out on its own (the loop above halves one that does not
+    // fit this side's lendable region).  Both say what they came to and take the smaller; 0 is a side without a
+    // prompt path for this call (both read it token by token: `token_path`, the caller's fallback as for a short
+    // prompt), -1 a layout that does not fit at all (the request fails on both, unless the other side said 0)
+    bool token_path = false;
+    if (linked) {
+        int32_t peer = 0;
+        std::string le;
+        if (!maya::core::glmlink::chunk_exchange(pos_, (int32_t) nn, ok ? Trun : -1, peer, le)) {
+            if (ok) err = le;
+            ok = false;
+        } else if (peer == 0) {
+            // (0 is over everything: the token path needs no layout, so it stands even when this side's did not
+            // fit - the other side, which sent the 0, goes token by token whatever it reads from here)
+            token_path = true;
+            ok = false;
+            err.clear();
+        } else if (ok && peer < 0) {
+            err = "glm prefill: the other side of the two-rig split has no room for this prompt's chunk";
+            ok = false;
+        } else if (ok && peer < Trun) {
+            Trun = peer;
+            std::fprintf(stderr, "glm prefill: the chunk is %d tokens (the other side's)\n", Trun);
+            for (Glm5Model* m = this; ok && m != nullptr; m = m->split_next_.get()) {
+                cudaSetDevice(m->dev_);
+                if (!m->prefill_carve(Trun, pos_ + nn)) {
+                    err = "glm prefill: the layout of the other side's chunk of " + std::to_string(Trun) +
+                          " tokens does not fit the lendable region";
+                    ok = false;
+                }
+            }
+        }
     }
     if (ok) {
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -4994,6 +5040,9 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             ok = false;
         }
     }
+    // the two-rig split's back: a failed prompt ends the link (the front is still sending its rows)
+    if (!ok && !token_path && maya::core::glmlink::role() == maya::core::glmlink::kBack && err != "cancelled")
+        maya::core::glmlink::abort_link(err);
     progress_at("the prompt: returning the expert pool's tail");
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->cap_floor_ = 0;
@@ -5004,6 +5053,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         }
     }
     cudaSetDevice(dev_);
+    if (token_path && err.empty()) return false;   // (nothing was read: the caller goes token by token, as the other side)
     return ok;
 }
 
@@ -5175,14 +5225,17 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
               std::to_string(max_ctx_) + ")";
         return false;
     }
+    namespace gl = maya::core::glmlink;
+    const gl::Role lrole = gl::role();
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-    if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
+    if (lrole != gl::kBack && (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr)) {
         err = "glm prefill: no embedding dequantizer";
         return false;
     }
     const auto t0 = std::chrono::steady_clock::now();
     const int E = g.n_embd;
-    const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
+    // (the two-rig back's first part has no embedding - and, with several local parts, no token_embd type at all)
+    const size_t row_b = lrole == gl::kBack ? 0 : ggml_row_size((ggml_type) pack_emb_type_, E);
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
     const int64_t pos_start = pos_;
@@ -5216,6 +5269,129 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
         if (g_.mhc()) gb::embed_rows(S->x, S->R, T, E, fast_->cs); else cudaMemcpyAsync(S->R, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);   // glm-dsa B9.1: plain residual
+        return true;
+    };
+    // THE TWO-RIG SPLIT (glm_link.hpp): a thread moves the chunks over the link while this one computes - the front's
+    // through two slots of its pinned hop buffer (chunk c's rows go out while it reads chunk c + 1), the back's into two
+    // pinned landing slots (chunk c + 1 arrives while it reads chunk c)
+    struct LinkPipe {
+        std::mutex mu;
+        std::condition_variable cv;
+        int posted = 0;   // front: chunks in their slots, to send
+        int done = 0;     // front: chunks sent; back: chunks received
+        int freed = 0;    // back: chunks copied to the device (their slots free again)
+        bool bad = false, stop = false;
+        std::string err;
+        std::thread th;
+    } lp;
+    const size_t lslot = (size_t) Tc * 4 * E;   // floats
+    Glm5Model* ltail = this;   // the front's last local part: its rows cross the link (its hop slots are free)
+    while (ltail->split_next_) ltail = ltail->split_next_.get();
+    static float* rx = nullptr;                 // the back's landing slots (one model per process with a role)
+    static size_t rx_cap = 0;
+    const auto lchunk_b = [&](int c) { return (size_t) chunk_len(c) * 4 * E * sizeof(float); };
+    const auto lp0 = [&](int c) { return pos_start + (int64_t) c * Tc; };
+    const auto lfail = [&](const std::string& e) {
+        std::lock_guard<std::mutex> lk(lp.mu);
+        if (!lp.bad) lp.err = e;
+        lp.bad = true;
+        lp.cv.notify_all();
+    };
+    if (lrole == gl::kBack && nc > 0) {
+        if (rx_cap < 2 * lslot * sizeof(float)) {
+            if (rx != nullptr) cudaFreeHost(rx);
+            rx = nullptr;
+            rx_cap = 0;
+            if (cudaHostAlloc((void**) &rx, 2 * lslot * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                cudaGetLastError();
+                err = "glm link: the prompt's pinned landing slots did not allocate";
+                return false;
+            }
+            rx_cap = 2 * lslot * sizeof(float);
+        }
+        lp.th = std::thread([&] {
+            for (int c = 0; c < nc; ++c) {
+                {
+                    std::unique_lock<std::mutex> lk(lp.mu);
+                    lp.cv.wait(lk, [&] { return lp.freed >= c - 1 || lp.stop; });
+                    if (lp.stop) return;
+                }
+                std::string e;
+                if (!gl::recv_hop(lp0(c), chunk_len(c), rx + (size_t) (c & 1) * lslot, lchunk_b(c), e)) {
+                    lfail(e);
+                    return;
+                }
+                std::lock_guard<std::mutex> lk(lp.mu);
+                lp.done = c + 1;
+                lp.cv.notify_all();
+            }
+        });
+    } else if (lrole == gl::kFront && nc > 0) {
+        lp.th = std::thread([&] {
+            for (int c = 0; c < nc; ++c) {
+                {
+                    std::unique_lock<std::mutex> lk(lp.mu);
+                    lp.cv.wait(lk, [&] { return lp.posted > c || lp.stop; });
+                    if (lp.posted <= c) return;
+                }
+                std::string e;
+                if (!gl::send_hop(lp0(c), chunk_len(c), ltail->pf_->hop_h + (size_t) (c & 1) * lslot, lchunk_b(c), e)) {
+                    lfail(e);
+                    return;
+                }
+                std::lock_guard<std::mutex> lk(lp.mu);
+                lp.done = c + 1;
+                lp.cv.notify_all();
+            }
+        });
+    }
+    // every way out: the thread ends (the back's, if still waiting on the link, ends with the link: the request failed)
+    const std::shared_ptr<void> link_join(nullptr, [&](void*) {
+        if (!lp.th.joinable()) return;
+        bool finished;
+        {
+            std::lock_guard<std::mutex> lk(lp.mu);
+            lp.stop = true;
+            finished = lp.bad || lp.done >= nc;
+            lp.cv.notify_all();
+        }
+        if (!finished && lrole == gl::kBack) gl::abort_link(err.empty() ? "the prompt stopped" : err);
+        lp.th.join();
+    });
+    // the back: chunk c's rows from its landing slot into R (once the device is done with the slot's earlier chunk)
+    const auto link_in = [&](int c) -> bool {
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt link in", err)) return false;
+        {
+            std::unique_lock<std::mutex> lk(lp.mu);
+            lp.freed = c;
+            lp.cv.notify_all();
+            lp.cv.wait(lk, [&] { return lp.done > c || lp.bad; });
+            if (lp.done <= c) {
+                err = lp.err;
+                return false;
+            }
+        }
+        cudaMemcpyAsync(pf_->R, rx + (size_t) (c & 1) * lslot, lchunk_b(c), cudaMemcpyHostToDevice, fast_->cs);
+        return true;
+    };
+    // the front: chunk c's rows (the last local part's) into its slot (once chunk c - 2 has gone out of it), for the
+    // thread to send.  e: the error (the pipeline calls it from the last part's thread)
+    const auto link_out = [&](int c, std::string& e) -> bool {
+        {
+            std::unique_lock<std::mutex> lk(lp.mu);
+            lp.cv.wait(lk, [&] { return lp.done >= c - 1 || lp.bad; });
+            if (lp.bad) {
+                e = lp.err;
+                return false;
+            }
+        }
+        cudaSetDevice(ltail->dev_);
+        cudaMemcpyAsync(ltail->pf_->hop_h + (size_t) (c & 1) * lslot, ltail->pf_->R, lchunk_b(c), cudaMemcpyDeviceToHost,
+                        ltail->fast_->cs);
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(ltail->fast_->cs), "glm prompt link out", e)) return false;
+        std::lock_guard<std::mutex> lk(lp.mu);
+        lp.posted = c + 1;
+        lp.cv.notify_all();
         return true;
     };
     std::vector<Glm5Model*> parts;
@@ -5301,7 +5477,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + (int64_t) c * Tc;
             cudaSetDevice(dev_);
-            if (!embed(c)) return false;
+            if (lrole == gl::kBack ? !link_in(c) : !embed(c)) return false;
             if (!prefill_stream_early(p0, T, c, false, err)) return false;   // glm-dsa B9.9: the later parts pre-stage now
             std::vector<int32_t> nx0;
             std::vector<const float*> im0;
@@ -5349,12 +5525,22 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 prev = m;
             }
             if (cancelled) break;
+            if (lrole == gl::kFront && !link_out(c, err)) return false;   // the two-rig split: over the link
+            cudaSetDevice(dev_);
             pos_ = p0 + T;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
             ++pf_->chunks;
             if (prefill_progress && c + 1 < nc && !prefill_progress(pos_ - pos_start, n)) {
                 cancelled = true;
                 break;
+            }
+        }
+        if (lrole == gl::kFront && !cancelled) {   // the two-rig split: the last chunks out before the decode
+            std::unique_lock<std::mutex> lk(lp.mu);
+            lp.cv.wait(lk, [&] { return lp.done >= nc || lp.bad; });
+            if (lp.done < nc) {
+                err = lp.err;
+                return false;
             }
         }
     } else {
@@ -5452,6 +5638,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         read_done();
                         continue;
                     }
+                    if (lrole == gl::kFront && !link_out(c, e2)) {   // the two-rig split: the front's last part
+                        fail(e2.empty() ? "glm link: the prompt's rows did not go out" : e2);
+                        return;
+                    }
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt pipeline", e2)) {
                         fail(e2);
                         return;
@@ -5472,7 +5662,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             }
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + (int64_t) c * Tc;
-            if (!embed(c)) { fail(err); break; }
+            if (lrole == gl::kBack ? !link_in(c) : !embed(c)) { fail(err); break; }
             std::string e1;
             pf_->chunk_i = c + 1;
             pf_->chunk_n = nc;
@@ -5505,6 +5695,14 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             }
         }
         for (auto& t : later) t.join();
+        if (lrole == gl::kFront && !stop) {   // the two-rig split: the last chunks out before the decode
+            std::unique_lock<std::mutex> lk(lp.mu);
+            lp.cv.wait(lk, [&] { return lp.done >= nc || lp.bad; });
+            if (lp.done < nc) {
+                stop = true;
+                stage_err = lp.err.empty() ? "glm link: the prompt's rows did not go out" : lp.err;
+            }
+        }
         if (stop) {
             if (stage_err == "cancelled") {
                 cancelled = true;
