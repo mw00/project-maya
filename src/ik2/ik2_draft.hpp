@@ -76,5 +76,7 @@ size_t bytes(const Drafter* d);
 /// cache).  Synchronous.
 void save_context(const Drafter* d, int pos, std::vector<uint8_t>& out);
 void load_context(Drafter* d, int pos, const std::vector<uint8_t>& in);
+int mask_token_id(const Drafter* d);
+void set_mask(Drafter* d, const float* mask_h);
 
 }  // namespace ik2::draft

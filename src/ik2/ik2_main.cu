@@ -8393,6 +8393,12 @@ int main(int argc, char** argv) {
             g_taps = nullptr;
         }
         if (drafter) {
+            if (ik2::draft::mask_token_id(drafter) >= 0) {
+                float* raw = dalloc<float>(c.C), *mh = dalloc<float>(c.C);
+                embed_row(M, ik2::draft::mask_token_id(drafter), raw, mh);
+                ik2::draft::set_mask(drafter, mh);
+                CU(cudaFree(raw)); CU(cudaFree(mh));
+            }
             std::printf("drafter: %s, %s matrices, its context rows %s%s, %.2f GiB of VRAM, %.1f s\n",
                         draft_path.c_str(), ik2::draft::matrices_q8(drafter) ? "Q8_0" : "BF16",
                         ik2::draft::context_fp8(drafter) ? "FP8" : "FP16",
