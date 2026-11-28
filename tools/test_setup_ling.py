@@ -577,6 +577,14 @@ class Steps(unittest.TestCase):
         p, c = self.write(args(backend="hip"), pc=card)
         self.assertEqual(c["args"][c["args"].index("--reserve-gb") + 1], "3.0")
         p.unlink()
+        # three AMD cards: the layers split over all three, each keeping the same room free
+        three = {"backend": "hip", "gpus": [{"index": i, "name": "Radeon RX 7900 XTX", "arch": "gfx1100",
+                                             "vram_gb": 24.0, "vendor": "amd"} for i in range(3)]}
+        p, c = self.write(args(backend="hip"), pc=three)
+        self.assertEqual(c["gpu"], [0, 1, 2])
+        self.assertEqual(c["args"][c["args"].index("--gpus") + 1], "0,1,2")
+        self.assertEqual(c["args"][c["args"].index("--reserve-gb") + 1], "3.0")
+        p.unlink()
         _, c = self.write(args())                       # (NVIDIA: as before, the engine's own default)
         self.assertNotIn("--reserve-gb", c["args"])
 
@@ -590,6 +598,13 @@ class Steps(unittest.TestCase):
         v, ram = maya.ling_memory(card, 64.0)
         self.assertAlmostEqual(v[0], 20.0 - maya.hip_reserve_mib(card["gpus"]) / 1024.0)
         self.assertEqual(ram, 64.0)
+        # several AMD cards: each one's VRAM less the same room
+        three = {"backend": "hip", "gpus": [dict(card["gpus"][0], index=i, vram_gb=24.0) for i in range(3)]}
+        v, ram = maya.ling_memory(three, 187.0)
+        self.assertEqual(len(v), 3)
+        for x in v:
+            self.assertAlmostEqual(x, 24.0 - maya.hip_reserve_mib(three["gpus"]) / 1024.0)
+        self.assertEqual(ram, 187.0)
         # an APU (Gorgon Halo): the GPU's share of the one memory, and only the rest of the RAM beside it
         apu = {"backend": "hip", "gpus": [{"index": 0, "name": "AMD Radeon 8065S", "arch": "gfx1151", "vram_gb": 0.5,
                                            "vendor": "amd"}]}

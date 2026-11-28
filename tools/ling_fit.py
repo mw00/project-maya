@@ -60,7 +60,8 @@ RAM_SPARE_GIB = 8.0
 MIN_VRAM_GIB = 7.5   # 8 GB class card minimum (zero-expert VRAM pool works)
 MIN_CC = 70          # Volta / Turing+ (sm_70+)
 # AMD (HIP, Linux): wave32 RDNA 3 / 3.5 / 4 (gfx11 / gfx12), the HIP build's own family - run on a Gorgon Halo's
-# Radeon 8065S (gfx1151); one GPU for now (the layer split across AMD cards is not run yet)
+# Radeon 8065S (gfx1151), and with the layers split over three Radeon RX 7900 XTX (gfx1100); several cards are
+# discrete ones (an APU, whose memory is the RAM, runs alone)
 AMD_ARCHS = ("gfx11", "gfx12")
 
 # Neutral fallback sizing when no local GGUF file size is supplied (maintainers add official quants in download.json).
@@ -296,16 +297,19 @@ def unsupported(backend: str, win: bool, gpus: list[dict], ram_gb: float = 0.0, 
     if backend == "hip":
         if win:
             return ("Ling-3.2-air on AMD runs on Linux only for now; on Windows maya-ling runs on NVIDIA GPUs only")
-        if len(gpus) > 1:
-            return "Ling-3.2-air on AMD runs on one GPU for now: pick one (--gpu N)"
-        if gpus and not str(gpus[0].get("arch") or "").startswith(AMD_ARCHS):
-            return ("Ling-3.2-air on AMD needs a Radeon RX 7000 / 9000, a Radeon PRO W7000 / AI PRO R9700 or a Ryzen "
-                    "AI Max (Strix / Gorgon Halo) GPU - RDNA 3, 3.5 or 4 (gfx11 / gfx12); other AMD GPUs are not "
-                    "supported by its engine yet")
-        v = float(gpus[0].get("vram_gb") or 0) if gpus else 0.0
-        if gpus and not gpus[0].get("unified_memory") and 0 < v < MIN_VRAM_GIB:
-            return (f"GPU {gpus[0].get('name', '?')} has {v:.1f} GB VRAM (minimum {MIN_VRAM_GIB:.1f} GB for "
-                    "Ling-3.2-air trunk + KV)")
+        if len(gpus) > 1 and any(g.get("unified_memory") for g in gpus):
+            return ("Ling-3.2-air on several AMD GPUs runs on discrete cards; a Ryzen AI Max APU runs it alone: pick "
+                    "one GPU (--gpu N)")
+        for g in gpus:                                 # (every card the layers are split over)
+            if not str(g.get("arch") or "").startswith(AMD_ARCHS):
+                return ("Ling-3.2-air on AMD needs a Radeon RX 7000 / 9000, a Radeon PRO W7000 / AI PRO R9700 or a "
+                        "Ryzen AI Max (Strix / Gorgon Halo) GPU - RDNA 3, 3.5 or 4 (gfx11 / gfx12); other AMD GPUs "
+                        "are not supported by its engine yet" +
+                        (f" ({g.get('name', '?')} is {g.get('arch') or 'unknown'})" if len(gpus) > 1 else ""))
+            v = float(g.get("vram_gb") or 0)
+            if not g.get("unified_memory") and 0 < v < MIN_VRAM_GIB:
+                return (f"GPU {g.get('name', '?')} has {v:.1f} GB VRAM (minimum {MIN_VRAM_GIB:.1f} GB for "
+                        "Ling-3.2-air trunk + KV)")
         if not avx2:
             return "This CPU lacks AVX2; maya-ling's CPU expert lane requires AVX2"
         return None

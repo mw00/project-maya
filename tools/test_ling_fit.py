@@ -80,14 +80,18 @@ class TestLingFit(unittest.TestCase):
         self.assertIsNone(LINGF.unsupported("cuda", False, [{"vram_gb": 24, "cc": 86}], 128, True))
 
     def test_amd_linux(self):
-        # AMD (HIP) on Linux: one RDNA 3 / 3.5 / 4 GPU - a card of 8 GB or more, or an APU whose memory is the RAM
+        # AMD (HIP) on Linux: RDNA 3 / 3.5 / 4 GPUs - cards of 8 GB or more (one or several), or an APU whose memory
+        # is the RAM (alone)
         apu = {"name": "AMD Radeon 8065S", "arch": "gfx1151", "vram_gb": 0.5, "unified_memory": True}
         card = {"name": "Radeon RX 7900 XT", "arch": "gfx1100", "vram_gb": 20.0}
-        for gpus in ([apu], [card], [dict(card, arch="gfx1201")], []):
+        for gpus in ([apu], [card], [dict(card, arch="gfx1201")], [], [card, card], [card, card, card],
+                     [card, dict(card, arch="gfx1201")]):
             self.assertIsNone(LINGF.unsupported("hip", False, gpus, 187, True), gpus)
         for gpus in ([dict(card, arch="gfx1030")], [dict(card, arch="gfx942")], [dict(card, vram_gb=6.0)],
-                     [card, card]):
+                     [card, dict(card, arch="gfx1030")], [card, dict(card, vram_gb=6.0)], [apu, card], [card, apu]):
             self.assertIsNotNone(LINGF.unsupported("hip", False, gpus, 187, True), gpus)
+        self.assertIn("gfx1030", LINGF.unsupported("hip", False, [card, dict(card, arch="gfx1030")], 187, True))
+        self.assertIn("APU", LINGF.unsupported("hip", False, [apu, card], 187, True))
         self.assertIn("Linux only", LINGF.unsupported("hip", True, [card], 64, True))
         self.assertIn("AVX2", LINGF.unsupported("hip", False, [apu], 187, False))
         # (no NVIDIA rule reaches an AMD card: it has no compute capability)

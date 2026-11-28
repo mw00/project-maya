@@ -242,12 +242,13 @@ under Windows are refused by the setup in one line. docs/INKLING2.md has the eng
 
 ### Ling-3.2-air
 
-`./maya.sh --setup --backend hip --model ling-3.2-air-maya-s` (Linux). Its engine (`maya-ling`) runs on one RDNA 3 /
-3.5 / 4 GPU (gfx11 / gfx12) of 8 GB or more - the experts the card does not hold are computed from RAM, as on NVIDIA -
-or a Strix Halo / Gorgon Halo, whose memory is the RAM (the setup counts what the system leaves, less max(8 GB, 10%),
-and the engine keeps that much free beside its expert pool). Run by Maya's team on a Radeon 8065S (Gorgon Halo,
-Ubuntu, ROCm 7.14); Radeon RX 7000 / 9000 cards build the same engine but have not been run here yet. Several AMD GPUs,
-older AMD GPUs and AMD under Windows are refused by the setup in one line. docs/LING.md has the rest.
+`./maya.sh --setup --backend hip --model ling-3.2-air-maya-s` (Linux). Its engine (`maya-ling`) runs on RDNA 3 / 3.5 / 4
+GPUs (gfx11 / gfx12) of 8 GB or more, one or several - the experts the card does not hold are computed from RAM, as on
+NVIDIA - or a Strix Halo / Gorgon Halo, whose memory is the RAM (the setup counts what the system leaves, less max(8 GB,
+10%), and the engine keeps that much free beside its expert pool). Several cards (`--gpus 0,1,2`) split the layers
+between them, as on NVIDIA. Run by Maya's team on a Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.14), and by a contributor
+on three Radeon RX 7900 XTX (gfx1100, ROCm 7.2.1). An APU together with other GPUs, older AMD GPUs and AMD under Windows
+are refused by the setup in one line. docs/LING.md has the rest.
 
 ## Instinct MI300X / MI325X
 
