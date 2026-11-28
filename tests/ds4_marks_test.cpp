@@ -168,6 +168,20 @@ int main() {
         assert(v.size() == 2 && v[0].pos == 100 && v[1].pos == 200);
     }
 
+
+    // A bounded piece may batch past the tail point and keep its original endpoint.
+    using maya::ds4::batch_tail_in_piece;
+    assert(batch_tail_in_piece(15882, 16384, 16394, 262144, 8192));
+    assert(batch_tail_in_piece(8192, 8194, 9000, 8194, 8192));
+    assert(batch_tail_in_piece(8192, 8704, 9000, 9000, 8192));
+    assert(!batch_tail_in_piece(8192, 8705, 9000, 9000, 8192));
+    assert(!batch_tail_in_piece(8192, 8193, 9000, 9000, 8192));
+    assert(!batch_tail_in_piece(8192, 8192, 9000, 9000, 8192));
+    assert(!batch_tail_in_piece(8192, 8194, 8194, 9000, 8192));
+    assert(!batch_tail_in_piece(8192, 8194, 9000, 8193, 8192));
+    assert(!batch_tail_in_piece(8191, 8194, 9000, 9000, 8192));
+    assert(!batch_tail_in_piece(8192, 8194, 9000, 9000, 0));
+
     // mark_victim: the least recently used that is not a shared start, else the least recently used
     assert(mark_victim({}) == -1);
     assert(mark_victim({{10, false, 5}, {20, false, 3}, {30, false, 9}}) == 1);

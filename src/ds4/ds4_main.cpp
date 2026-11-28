@@ -1538,6 +1538,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         // the tail point the read stops at (-1: none) and what the read spent before it and after it (TailCost)
         int64_t tail_at = -1;
         double ms_main = 0.0, ms_tail = 0.0;
+        bool tail_batched = false;
     };
     // MAYA_DS4_RESTORE_TAIL_AUTO (1): the tail point is left out where its cost is measured higher than reading its
     // tokens again; 0: kept on every read that reaches it, as before
@@ -1713,6 +1714,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         cuts.clear();
         P.tail_at = -1;
         P.ms_main = P.ms_tail = 0.0;
+        P.tail_batched = false;
         // the tail point (tail=): only where the read reaches it, and - once two reads measured it - where its run
         // costs no more than reading its tokens again (TailCost: most experts outside VRAM make it a whole pass)
         std::vector<int64_t> asked = r.marks;
@@ -1773,6 +1775,10 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         m.set_progress(progress);
         // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
         static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
+        static const bool batch_marked_tail = [] {
+            const char* v = ds4_env("DS4_BATCH_MARKED_TAIL");
+            return v != nullptr && std::strcmp(v, "1") == 0;
+        }();
         m.set_cancel(stop_now);
         std::string err;
         bool ok = true, stopped = false;
@@ -1802,14 +1808,30 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 if (m.marks_inside((int) rest, rel))
                     for (size_t j = P.next_cut; j < P.cuts.size(); ++j) inner.push_back({P.cuts[j].pos, P.cuts[j].shared});
             }
-            if (!inner.empty()) n = rest;
+            if (!inner.empty()) {
+                n = rest;
+            } else if (batch_marked_tail && !last_window && P.from == 0 && P.pics.empty() &&
+                       P.tail_at > (int64_t) P.done && P.next_cut + 1 == P.cuts.size() &&
+                       P.cuts[P.next_cut].pos == P.tail_at && !P.cuts[P.next_cut].shared) {
+                const size_t piece_rows = piece - (P.done - start);
+                const size_t before_mark = upto - P.done;
+                if (maya::ds4::batch_tail_in_piece(before_mark, piece_rows, rest, (size_t) m.feed_unit(),
+                                                    (size_t) m.prompt_chunk()) &&
+                    m.marks_inside((int) piece_rows, {(int64_t) before_mark})) {
+                    inner.emplace_back(P.tail_at, false);
+                    n = piece_rows;
+                }
+            }
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = P.done + n == total;
             size_t took = n;   // (fewer: a yield - the model ended the run early, the rest a later piece's)
             const double f0 = P.tail_at >= 0 ? now_ms() : 0.0;   // (TailCost: the run's wall time)
             if (!inner.empty()) {
-                ok = m.feed_marks(r.ids.data() + P.done, (int) n, 1, 1, inner, err);
-                if (ok) took = (size_t) m.fed();
+                ok = m.feed_marks(r.ids.data() + P.done, (int) n, fin ? 1 : 0, fin ? 1 : -1, inner, err);
+                if (ok) {
+                    took = (size_t) m.fed();
+                    if (!fin && inner.front().first < (int64_t) (P.done + took)) P.tail_batched = true;
+                }
                 // (the points the read went past: kept by it)
                 while (ok && P.next_cut < P.cuts.size() && (size_t) P.cuts[P.next_cut].pos < P.done + took) ++P.next_cut;
             } else if (fin && last_window) {
@@ -1824,7 +1846,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                          : m.feed(r.ids.data() + P.done, (int) n, 0, err, (int) (upto - P.done - n));
                 if (ok) took = (size_t) m.fed();
             }
-            if (ok && P.tail_at >= 0) {
+            if (ok && P.tail_at >= 0 && !P.tail_batched) {
                 const bool after = P.done >= (size_t) P.tail_at;
                 (after ? P.ms_tail : P.ms_main) += now_ms() - f0;
                 if (after && P.done + took == total && tail_auto) {   // (the read's end: its cost measured)
