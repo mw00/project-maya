@@ -22885,7 +22885,8 @@ struct Model::Impl {
             // (DS4_RHELPER_LATE: a single token's layer the helper answers goes the window's way too - its combine
             //  waits for the helper's sums after this GPU's own experts, not before them; the same sums, WinArgs'
             //  contract)
-            const bool rh_late_tok = rh_lead && lead && rh_late_on() && rh_direct_on(l);
+            const bool rhd = rh_lead && lead && rh_direct_on(l);
+            const bool rh_late_tok = rhd && rh_late_on();
             if (T == 1 && moe_token_path && !rh_late_tok) {
                 const int lc = lead && nm == 1 && lay.fmt == gg::kFmtMXFP4 ? lane_class(l.il) : -1;
                 const bool zc_nowait = lc >= 0 && ln_zc_nowait && zc_layer_full(l);
@@ -22923,7 +22924,6 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
-                const bool rhd = rh_lead && lead && rh_direct_on(l);
                 if ((lead || lane_m) && !zc_nowait && !rhd) wait_seq(&resps[slot].seq, sq, s);
                 if (rh_lead && lead) {   // (MAYA_MIXED_HELPER's lead: the answer in by DMA, read from this GPU)
                     if (!(rhd ? rh_help_in(slot, sq, T, s, err) : rh_resp_in(slot, T, s, err))) return false;
@@ -22969,7 +22969,6 @@ struct Model::Impl {
                 wa.wait_ptr = lead || lane_m ? &resps[slot].seq : nullptr;
                 wa.wait_val = sq;
                 if (rh_lead && lead) {   // (MAYA_MIXED_HELPER's lead: the answer waited for, in by DMA, read here)
-                    const bool rhd = rh_direct_on(l);
                     if (rhd && rh_late_on()) {   // (DS4_RHELPER_LATE: its sums read in place, waited for after this GPU's own)
                         wa.wait_ptr = helper_flags + kRing + slot;
                         wa.wait_val = sq;
@@ -23003,6 +23002,11 @@ struct Model::Impl {
                     return false;
                 }
             }
+            // The service thread also reads the shared request and helper result.
+            // A direct GPU answer does not retire that reader: let it finish before
+            // subsequent layers can wrap the ring. resp.seq can be self-answered by
+            // the router, so use the service thread's own acknowledgement.
+            if (rhd) wait_seq(lane_done, sq, s);
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);

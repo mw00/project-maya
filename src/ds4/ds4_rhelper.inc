@@ -206,7 +206,11 @@
     bool rh_direct = true;
     int* rh_ones = nullptr;   // (device: kWin ones - every token's part counted; a token with no helper pick has 0s)
     bool rh_direct_on(const Layer& l) const {
-        return rh_direct && l.helper_tab != nullptr && !helper_dead.load(std::memory_order_relaxed);
+        // A hot helper only takes experts already resident on the lead. If the lead
+        // spills other experts to RAM/SSD, its CPU/streaming lane's sums must also
+        // be read from the combined service-thread response.
+        return rh_direct && l.helper_tab != nullptr && (!rh_hot || l.n_vram >= l.n_exp) &&
+               !helper_dead.load(std::memory_order_relaxed);
     }
     // DS4_RHELPER_LATE=1 (a hot helper's lead, verify windows): the helper's sums read in place by the experts' combine,
     // which waits for its flag on this GPU after this GPU's own experts (not before them) - the same sums, in the
