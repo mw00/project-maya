@@ -4,7 +4,8 @@
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
-// activations).  (b) and (c) each differ from (a) by their activation rounding only (a few 1e-3 relative).
+// activations).  (b) and (c) each differ from (a) by their activation rounding only.  The Q4_K/Q5_1 check also uses
+// the GPU's actual Q8_1 activations: layer 23's float-reference difference is 3.95e-2, while its stages agree to 2e-7.
 #include "maya/artifact/gguf_reader.hpp"
 #include "maya/kernels/cpu/native_expert.hpp"
 #include "maya/kernels/cpu/expert.hpp"
@@ -15,6 +16,8 @@
 #include "maya/kernels/iq_kernels.hpp"
 
 #include "ggml.h"
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
 
 #include <cuda_runtime.h>
 
@@ -238,6 +241,7 @@ int main(int argc, char** argv) {
             }
         }
         // (c) the GPU: one group holding the NT entries
+        double gpu_q8_rel = NAN;
         {
             const auto L = maya::kernels::native_expert_layout(f.gu_type, f.u_type, f.d_type, H, FF);
             void *dblob, *dx, *dxq, *dscr;
@@ -270,6 +274,53 @@ int main(int argc, char** argv) {
             cudaStreamSynchronize(s);
             if (ran) cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
             else got_g.assign(got_g.size(), NAN);
+            if (ran && f.gu_type == 12 && f.d_type == 7) {
+                const size_t fa = ((size_t) NT * FF * sizeof(float) + 255) & ~(size_t) 255;
+                std::vector<block_q8_1> xq((size_t) NT * H / 32), hq((size_t) NT * FF / 32);
+                std::vector<float> hg((size_t) NT * FF), gu_ref((size_t) NT * FF), down_ref((size_t) NT * H);
+                cudaMemcpy(xq.data(), dxq, xq.size() * sizeof(block_q8_1), cudaMemcpyDeviceToHost);
+                cudaMemcpy(hg.data(), (const uint8_t*) dscr + 2 * fa, hg.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(hq.data(), (const uint8_t*) dscr + 3 * fa, hq.size() * sizeof(block_q8_1),
+                           cudaMemcpyDeviceToHost);
+                for (int k = 0; k < NT; ++k) {
+                    for (int64_t r = 0; r < FF; ++r) {
+                        double g = 0, u = 0;
+                        for (int64_t b = 0; b < H / 32; ++b) {
+                            const auto& a = xq[(size_t) k * (H / 32) + (size_t) b];
+                            const float ad = ggml_fp16_to_fp32(a.data.data.d);
+                            for (int i = 0; i < 32; ++i) {
+                                const float av = ad * a.qs[i];
+                                const int64_t c = 32 * b + i;
+                                g += (double) G[(size_t) r * H + c] * av;
+                                u += (double) U[(size_t) r * H + c] * av;
+                            }
+                        }
+                        gu_ref[(size_t) k * FF + (size_t) r] = (float) (g / (1.0 + std::exp(-g)) * u);
+                    }
+                    for (int64_t r = 0; r < H; ++r) {
+                        double o = 0;
+                        for (int64_t b = 0; b < FF / 32; ++b) {
+                            const auto& w = ((const block_q5_1*) (blob.data() + f.down_off + (size_t) r * f.d_row))[b];
+                            const auto& a = hq[(size_t) k * (FF / 32) + (size_t) b];
+                            const float ad = ggml_fp16_to_fp32(a.data.data.d), as = ggml_fp16_to_fp32(a.data.data.s);
+                            const float m = ggml_fp16_to_fp32(w.data.data.m);
+                            double part = 0;
+                            int sumq = 0;
+                            for (int i = 0; i < 32; ++i) {
+                                part += (double) D[(size_t) r * FF + 32 * b + i] * ad * a.qs[i];
+                                sumq += a.qs[i];
+                            }
+                            o += part + (double) m * (as - ad * sumq);
+                        }
+                        down_ref[(size_t) k * H + (size_t) r] = (float) o;
+                    }
+                }
+                gpu_q8_rel = rel(got_g, down_ref);
+                std::printf("          q4_K/q5_1 stages on Q8_1 activations: gate/up rel %.3e, down rel %.3e, "
+                            "quant vs float %.3e\n", rel(hg, gu_ref), gpu_q8_rel, rel(down_ref, ref));
+                if (!(gpu_q8_rel < 1e-5))
+                    std::printf("          q4_K/q5_1 GPU vs Q8_1 reference MISMATCH (rel %.3e > 1e-5)\n", gpu_q8_rel);
+            }
             if (f.mixed() && f.n_embd % 256 == 0) {
                 // (c2) the prompt path's FP16 dequant of a mixed layer (rows interleaved gate, up, gate, ...)
                 // against ggml's to_float of each type
@@ -296,7 +347,8 @@ int main(int argc, char** argv) {
             cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
         }
         const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-        const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+        const bool gpu_ok = std::isfinite(gpu_q8_rel) ? gpu_q8_rel < 1e-5 : eg < 3e-2 && std::isfinite(eg);
+        const bool ok = ec < 3e-2 && gpu_ok && std::isfinite(ec);
         const std::string gu_name = f.mixed() ? std::string(ggml_type_name((ggml_type) f.gu_type)) + ":" +
                                                     ggml_type_name((ggml_type) f.u_type)
                                               : std::string(ggml_type_name((ggml_type) f.gu_type));
