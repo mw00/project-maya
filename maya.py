@@ -4751,6 +4751,20 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     return {"exe": str(VEXE), "mmproj": str(files["mmproj"]), "model": str(files["vocab"]), "gpu": True}
 
 
+VISION_KEEP = ("gpu", "threads", "max_tokens", "no_flash_attn", "resident")
+
+
+def vision_keep(old: dict | None, new: dict) -> dict:
+    """The config's fresh "vision" entry with the encoder's settings from the config before: a card it is pinned
+    to ("gpu": <n>, serve/server.py), its image-token cap, threads, precision and the resident switch are settings
+    the user chose, not files the setup owns - they survive a setup again like the kept engine args do."""
+    out = dict(new)
+    for k in VISION_KEEP:
+        if old and k in old:
+            out[k] = old[k]
+    return out
+
+
 # ------------------------------------------------------------------------------------------------ 8. config + start
 def parse_env(items) -> dict:
     env = {}
@@ -5004,7 +5018,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if a.api_key:
         cfg["api_key"] = a.api_key
     if vision:
-        cfg["vision"] = vision
+        cfg["vision"] = vision_keep(old_cfg.get("vision") or old_cfg.get("vision_off"), vision)
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
     if dsa:                                            # GLM-5.3: the pack's own profile, else its shipped one, if it fits
@@ -11508,7 +11522,7 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
-           **({"vision": vision} if vision else {})}
+           **({"vision": vision_keep(old.get("vision") or old.get("vision_off"), vision)} if vision else {})}
     kept += keep_server_settings(cfg, old, a, ("layer_split",))
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
@@ -12022,7 +12036,7 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
            **({"backend": "hip"} if pc.get("backend") == "hip" else {}),
            "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
-           **({"vision": vision} if vision else {})}
+           **({"vision": vision_keep(old.get("vision") or old.get("vision_off"), vision)} if vision else {})}
     kept += keep_server_settings(cfg, old, a)
     # (its cache in FP8 - half the bytes, the faster one deep in a context; the user's own variables kept)
     env = dict(old.get("env") or {})
