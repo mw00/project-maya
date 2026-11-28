@@ -3016,6 +3016,25 @@ inconclusive because the controls drifted. These are limited model measurements,
 a general speed guarantee. Full-vocabulary diagnostic dumps matched across settings and repeats on the tested
 states; other GPU architectures and broader workloads remain unvalidated.
 
+## The MLA decode attention on the matrix cores (AMD RDNA 3, experimental)
+
+Opt-in. On RDNA 3 / 3.5 (`gfx11`: RX 7000, Radeon 780M, Strix / Gorgon Halo) the decode attention of `glmd::mla_dec`
+(maya-ling's on AMD, and GLM-5.3's where it takes that kernel: gfx1151, or `MAYA_GLMD_MLA_DEC=1`) can run on the WMMAs:
+a block for 16 heads instead of 8, the scores and the weighted sum from FP16 products with F32 sums (the arithmetic of
+the CUDA build's tensor-core decode) in place of the portable kernel's F32 FMAs. The logits differ from the portable
+kernel's by rounding, so a long greedy answer can part from it after a while. Measured with Ling-3.2-air Maya-L on three
+Radeon RX 7900 XTX (gfx1100), 32K context: a decode step 16.08 -> 12.88 ms, the context's cost 0.152 -> 0.047 ms per 1K
+cells, decode with drafting 73.1 -> 91.5 tok/s at 32K and 88.6 -> 107.8 at 16K, about the same at 2K (8.16 against 8.04
+ms a token); all 12 questions about 16K- and 32K-token prompts answered right, as with the portable kernel, and drafts
+accepted on a real 32K summary 76-80% of the time (72.7% with it; on a prompt of random tokens fewer were accepted). Not
+measured on other gfx11 GPUs or with GLM-5.3; NVIDIA and other AMD cards keep the portable kernel.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_GLMD_MLA_DEC_RDNA` | unset (off) | `1`: the decode attention on the matrix cores on `gfx1100` / `gfx1101` / `gfx1102` / `gfx1150` / `gfx1151` (the log says so per GPU, or that it was ignored on another arch) |
+| `MAYA_GLMD_MLA_DEC_RDNA_SPLITS` | `64` | with the above, the most splits of the context a block of heads takes (1-64) |
+| `MAYA_GLMD_MLA_DEC_RDNA_MIN_TILES` | `2` | with the above, the fewest 32-cell tiles a split takes (1-64): fewer, larger splits at short contexts |
+
 ## AMD: setting up with a ROCm older than 7
 
 The HIP setup takes ROCm 7 or newer. A distribution's own ROCm 6.x packages (Debian's 6.4 under `/usr`, hipBLAS 2.x) are
