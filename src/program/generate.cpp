@@ -5558,6 +5558,12 @@ int main(int argc, char** argv) {
                                  "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
             return 1;
         }
+        if (wc->kind != maya::core::WeightKind::F16InF32 ||
+            wc->bytes != (uint64_t) maya::kernels::PLE_CONV_KERNEL * maya::kernels::NG_HC_DIM * sizeof(uint16_t)) {
+            std::fprintf(stderr, "maya generate: blk.1.ple_conv1d.weight must be F16 in the pack; rebuild it with "
+                                 "tools/iq_pack.py instead of reading another float format as F16\n");
+            return 1;
+        }
         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
         // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
         if (!wk->quantized()) {
