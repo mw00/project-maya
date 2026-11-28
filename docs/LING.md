@@ -21,20 +21,22 @@ alesha-pro contributed (PR #1224).
 | --- | --- |
 | NVIDIA, Linux | V100 / RTX 20 and newer (compute capability 7.0 on), one GPU or several |
 | NVIDIA, Windows | the same cards (`START-MAYA.bat --setup --model ling-3.2-air-maya-s`); the experts read from the SSD go through Windows' file cache (no unbuffered reads there) |
-| AMD, Linux | one RDNA 3 / 3.5 / 4 GPU (gfx11 / gfx12): a Radeon RX 7000 / 9000 or PRO card of 8 GB or more, or a Ryzen AI Max APU (Strix / Gorgon Halo), whose memory is the RAM |
+| AMD, Linux | RDNA 3 / 3.5 / 4 GPUs (gfx11 / gfx12): Radeon RX 7000 / 9000 or PRO cards of 8 GB or more, one or several, or a Ryzen AI Max APU (Strix / Gorgon Halo), whose memory is the RAM (on its own) |
 | CPU | AVX2 (the experts that are not in VRAM are computed on the CPU) |
-| AMD on Windows, Mac; several AMD GPUs; older AMD GPUs | not yet: the setup says so in one line and stops |
+| AMD on Windows, Mac; an APU with other GPUs; older AMD GPUs | not yet: the setup says so in one line and stops |
 
 On AMD the engine is the same program built with ROCm (HIP), as the other models' AMD engines are. Run by Maya's
-team on a Gorgon Halo (Radeon 8065S, gfx1151, Ubuntu, ROCm 7.14); Radeon RX 7000 / 9000 cards build the same engine
-but have not been run here yet. On an APU the GPU's share is the PC's memory less max(8 GB, 10%) for the system
-(and no more than Linux lets the GPU take: `ttm.pages_limit`, see [AMD_MAYA.md](AMD_MAYA.md)).
+team on a Gorgon Halo (Radeon 8065S, gfx1151, Ubuntu, ROCm 7.14), and by a contributor on three Radeon RX 7900 XTX
+(gfx1100, Unraid, ROCm 7.2.1), the layers split over the three as on NVIDIA. On an APU the GPU's share is the PC's
+memory less max(8 GB, 10%) for the system (and no more than Linux lets the GPU take: `ttm.pages_limit`, see
+[AMD_MAYA.md](AMD_MAYA.md)); on cards each keeps 3 GB free for the desktop (`--reserve-gb`).
 
 ## 3. Setting it up
 
 ```
 ./maya.sh --setup --model ling-3.2-air-maya-s
 ./maya.sh --setup --backend hip --model ling-3.2-air-maya-s     # an AMD GPU
+./maya.sh --setup --backend hip --gpus 0,1,2 --model ling-3.2-air-maya-l     # three AMD cards
 ```
 
 | Size | Setup id | File |
@@ -108,7 +110,7 @@ Off by default. `--restore-dir <folder>` in the config's arguments turns them on
 
 - One answer at a time: no `--parallel`.
 - No tensor parallel.
-- AMD on Windows, Mac, and several AMD GPUs at once.
+- AMD on Windows and Mac; an AMD APU together with other GPUs.
 - Windows: one node's CPU pinning only (a PC with several NUMA nodes runs as one); `--image` on the engine's own
   command line takes PPM files only (the server's pictures are not affected).
 - The same answer on one GPU and on several holds with `--repeatable` only; a normal run can differ in the last
