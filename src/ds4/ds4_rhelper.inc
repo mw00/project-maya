@@ -18,6 +18,47 @@
     static constexpr unsigned kRhMagic = 0x4d524831u;   // "MRH1"
     static constexpr size_t kRhJobs = 4096;
     bool rh_lead = false, rh_serve = false;
+    // DS4_RHELPER_COLD=1 (the lead, with a helper that lists its VRAM experts - DS4_RHELPER_HOT=1 there): a lead whose
+    // VRAM does not hold every expert leaves the helper the experts of the helper's VRAM that are NOT in its own - picks
+    // its CPU lane would compute.  The lead runs as alone (its requests in the block, its GPU waits for the service
+    // thread's answer), the service thread sends the helper's picks out and adds its sums to the CPU lane's part.
+    bool rh_cold = std::getenv("DS4_RHELPER_COLD") != nullptr && std::atoi(std::getenv("DS4_RHELPER_COLD")) != 0;
+    bool rh_mir() const { return rh_lead && !rh_cold; }   // (the request's mirror and the answers by DMA: not a cold lead's)
+    // (DS4_RHELPER_SKIP_FILE, the helper engine: "layer count" lines, written by the lead of the same start -
+    //  DS4_RHELPER_SKIP_OUT - and closed by its "-1 0" line; the helper waits for that line, the lead writes it before
+    //  it waits for the helper's list)
+    int rh_skip(int il) const {
+        static const std::vector<int> sk = [] {
+            std::vector<int> v;
+            const char* f = std::getenv("DS4_RHELPER_SKIP_FILE");
+            if (f == nullptr || !*f || std::getenv("DS4_RHELPER_SERVE") == nullptr) return v;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (bool end = false; !end;) {
+                v.clear();
+                if (std::FILE* in = std::fopen(f, "r")) {
+                    int a = 0, b = 0;
+                    while (std::fscanf(in, "%d %d", &a, &b) == 2) {
+                        if (a < 0) { end = true; break; }
+                        if (a < 4096) {
+                            if ((int) v.size() <= a) v.resize((size_t) a + 1, 0);
+                            v[(size_t) a] = b;
+                        }
+                    }
+                    std::fclose(in);
+                }
+                if (end) break;
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(600)) {
+                    std::fprintf(stderr, "ds4: helper engine: %s has no end line after 600 s - the lead's first experts are "
+                                         "not skipped\n", f);
+                    v.clear();
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return v;
+        }();
+        return il >= 0 && il < (int) sk.size() ? sk[(size_t) il] : 0;
+    }
     // DS4_RHELPER_HOT=1 (both engines): the helper's own VRAM experts are its share (the lead keeps every expert and
     // leaves those to it in decode) - a lead that holds the whole model, a helper with the fastest memory
     bool rh_hot = std::getenv("DS4_RHELPER_HOT") != nullptr && std::atoi(std::getenv("DS4_RHELPER_HOT")) != 0;
@@ -150,11 +191,58 @@
 
     // (the lead, in place of helper_select) the helper takes every expert of a trunk layer this GPU's VRAM leaves over
     bool rh_lead_select(std::string& err) {
+        // (a cold lead: this GPU's experts are placed, so the list of its first ones is whole - its end line, which
+        //  the helper waits for before it places its own and makes the block this engine maps next)
+        if (rh_cold)
+            if (const char* f = std::getenv("DS4_RHELPER_SKIP_OUT"); f != nullptr && *f)
+                if (std::FILE* out = std::fopen(f, "a")) std::fprintf(out, "-1 0\n"), std::fclose(out);
         if (!rh_map(false, err)) return false;
         helper_flags = (unsigned*) (rh_base + rh_off_flags);
         helper_res = (float*) (rh_base + rh_off_res);
         unsigned long long left = 0;
         if (rh_hot) return rh_lead_hot(err);
+        if (rh_cold) {
+            const double t0 = now_ms();
+            while (rh_hdr->bits_ready == 0) {
+                if (rh_hdr->dead != 0 || now_ms() - t0 > 600000.0) {
+                    err = "a helper in another engine: no list of its experts";
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(20000));
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            unsigned long long both = 0;
+            for (Layer& l : L) {
+                uint8_t* bits = rh_bits + (size_t) l.il * (size_t) g.n_exp;
+                for (int e = 0; e < l.n_exp; ++e) {
+                    if (!bits[e]) continue;
+                    if (l.mtp || l.nm != 1 || l.slot[(size_t) e] >= 0) {   // (this GPU's own: struck from the helper's list)
+                        bits[e] = 0;
+                        ++both;
+                        continue;
+                    }
+                    if (l.helper.empty()) l.helper.assign((size_t) l.n_exp, nullptr);
+                    l.helper[(size_t) e] = (uint8_t*) rh_base;
+                    ++helper_n;
+                    ++left;
+                }
+                if (!l.helper.empty()) l.helper_tab = (unsigned long long*) rh_base;
+            }
+            st.helper_held = helper_n;
+            std::atomic_thread_fence(std::memory_order_release);
+            rh_hdr->lead_ready = 1;
+            while (rh_hdr->helper_ready == 0) {
+                if (rh_hdr->dead != 0 || now_ms() - t0 > 600000.0) {
+                    err = "a helper in another engine: it did not get ready";
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(20000));
+            }
+            std::fprintf(stderr, "ds4: helper engine %s: it computes %llu experts this GPU's VRAM leaves over (its own "
+                                 "VRAM's; %llu more of its are this GPU's too, kept here; DS4_RHELPER_COLD)\n",
+                         rh_name.c_str(), left, both);
+            return true;
+        }
         for (Layer& l : L) {
             if (l.mtp || l.nm != 1) continue;
             uint8_t* bits = rh_bits + (size_t) l.il * (size_t) g.n_exp;
@@ -206,12 +294,23 @@
     bool rh_direct = true;
     int* rh_ones = nullptr;   // (device: kWin ones - every token's part counted; a token with no helper pick has 0s)
     bool rh_direct_on(const Layer& l) const {
-        return rh_direct && l.helper_tab != nullptr && !helper_dead.load(std::memory_order_relaxed);
+        // A hot helper only takes experts already resident on the lead. If the lead
+        // spills other experts to RAM/SSD, its CPU/streaming lane's sums must also
+        // be read from the combined service-thread response.
+        return rh_direct && l.helper_tab != nullptr && (!rh_hot || l.n_vram >= l.n_exp) &&
+               !helper_dead.load(std::memory_order_relaxed);
     }
     // DS4_RHELPER_LATE=1 (a hot helper's lead, verify windows): the helper's sums read in place by the experts' combine,
     // which waits for its flag on this GPU after this GPU's own experts (not before them) - the same sums, in the
     // same order; the lead's memory must reach the block at full speed (an integrated GPU's host memory)
     // (decode's routing) the helper's experts left out of this GPU's table while it answers; gone: the whole table again
+    // rh_tab is this GPU's VRAM table as it was at the start with the helper's experts struck out; this GPU's experts
+    // move afterwards (swaps, landings in recent slots, a prompt's borrowed room given back), so every change of
+    // vram_tab[e] is made in rh_tab[e] too - but for an expert the helper computes, which stays 0 there.  (Left as the
+    // start's copy, decode routed to slots that held other experts by then, or to freed memory.)
+    bool rh_follows(const Layer& x, int e) const {
+        return x.rh_tab != nullptr && !(e < (int) x.helper.size() && x.helper[(size_t) e] != nullptr);
+    }
     unsigned long long* rh_vtab(const Layer& l) const {
         return l.rh_tab != nullptr && !helper_dead.load(std::memory_order_relaxed) ? l.rh_tab : l.vram_tab;
     }
@@ -249,9 +348,19 @@
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         long long took = 0;
+        long long left = 0;
         for (Layer& l : L) {
-            if (l.mtp || l.nm != 1 || l.vram_tab == nullptr) continue;
-            const uint8_t* bits = rh_bits + (size_t) l.il * (size_t) g.n_exp;
+            // (an expert of the helper's this GPU does not take from it - not in this GPU's VRAM, so its own lane computes
+            //  it, or a layer it leaves alone - is struck from the list the helper reads back after lead_ready: left on
+            //  it, both engines computed that pick and its output was added twice)
+            uint8_t* const wbits = rh_bits + (size_t) l.il * (size_t) g.n_exp;
+            if (l.mtp || l.nm != 1 || l.vram_tab == nullptr) {
+                for (int e = 0; e < l.n_exp; ++e) left += wbits[e] != 0, wbits[e] = 0;
+                continue;
+            }
+            for (int e = 0; e < l.n_exp; ++e)
+                if (wbits[e] && l.slot[(size_t) e] < 0) wbits[e] = 0, ++left;
+            const uint8_t* bits = wbits;
             std::vector<unsigned long long> tb((size_t) l.n_exp, 0ull);
             if (cudaMemcpy(tb.data(), l.vram_tab, tb.size() * 8, cudaMemcpyDeviceToHost) != cudaSuccess) {
                 err = "a helper in another engine: layer " + std::to_string(l.il) + "'s VRAM table";
@@ -279,6 +388,9 @@
             took += n;
         }
         st.helper_held = helper_n;
+        if (left > 0)
+            std::fprintf(stderr, "ds4: helper engine: %lld of its experts are not in this GPU's VRAM - left to this GPU's own "
+                                 "lane, not to the helper\n", left);
         std::atomic_thread_fence(std::memory_order_release);
         rh_hdr->lead_ready = 1;
         while (rh_hdr->helper_ready == 0) {
@@ -315,6 +427,7 @@
         }
         if (const char* v = std::getenv("DS4_RHELPER_DIRECT")) rh_direct = std::atoi(v) != 0;
         if (rh_cmp != 0) rh_direct = false;   // (DS4_RHELPER_CMP: the service thread reads every answer)
+        if (rh_cold) rh_direct = false;       // (a cold lead's GPU waits for the service thread, as alone)
         if (rh_hot && !rh_p_alloc(err)) return false;
         devs[0].allocs.push_back(rh_dreq);
         devs[0].allocs.push_back(rh_dresp);

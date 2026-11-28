@@ -61,6 +61,14 @@ class TestMixedGpus(unittest.TestCase):
         self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_mode="helper"))["mode"], "helper")
         self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_mode="split"))["mode"], "split")
         self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_mode="x"))["mode"], MG.MODE)
+        # the helper's experts (hot: the most-routed; cold: the ones the AMD GPU's VRAM does not hold) and its CPUs
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True))["experts"], "hot")
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_helper_experts="cold"))["experts"], "cold")
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_helper_experts="x"))["experts"], "hot")
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True))["cpus"], [])
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_helper_cpus="14,15,30-31"))["cpus"], [14, 15, 30, 31])
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_helper_cpus=[3, 2]))["cpus"], [2, 3])
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_helper_cpus="a"))["cpus"], [])
 
     def test_only_hip_deepseek(self):
         self.assertIsNone(MG.config_of(dict(CFG, mixed_gpus=True, backend="cuda")))

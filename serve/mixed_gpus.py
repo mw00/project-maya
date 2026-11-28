@@ -21,6 +21,7 @@ import os
 import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -126,7 +127,33 @@ def config_of(cfg: dict) -> dict | None:
     if mode not in ("helper", "split"):
         print(f"[maya] two GPUs: mixed_mode {mode!r} is not \"helper\" or \"split\" - {MODE}", flush=True)
         mode = MODE
-    return {"layers": layers, "exe": cuda_exe(cfg), "gpu": int(cfg.get("mixed_gpu", 0)), "mode": mode}
+    # "mixed_helper_experts" (helper mode): "hot" - the card computes the most-routed experts, which the AMD GPU holds
+    # too (an AMD GPU whose memory holds every expert); "cold" - the card holds the experts that come AFTER the AMD
+    # GPU's own in the same order and computes the picks the AMD GPU's VRAM does not hold, which its CPU lane would
+    # compute (a discrete AMD card with less VRAM than the model: R9700 32 GB + RTX 3090 Ti, decode +8 %).
+    # "mixed_helper_cpus": the CPUs the card's engine runs on ("14,15,30,31"; Linux) - its threads spin, and on the
+    # AMD engine's cores they halved its decode on a 16-core CPU (19-24 against 37-39 tokens a second).
+    experts = str(cfg.get("mixed_helper_experts", "hot")).lower()
+    if experts not in ("hot", "cold"):
+        print(f"[maya] two GPUs: mixed_helper_experts {experts!r} is not \"hot\" or \"cold\" - hot", flush=True)
+        experts = "hot"
+    return {"layers": layers, "exe": cuda_exe(cfg), "gpu": int(cfg.get("mixed_gpu", 0)), "mode": mode,
+            "experts": experts, "cpus": cpu_list(cfg.get("mixed_helper_cpus"))}
+
+
+def cpu_list(v) -> list[int]:
+    """ "14,15,30-31" or [14, 15, 30, 31] -> the CPU numbers ([]: not set, or not readable - said)."""
+    if v is None or v == "" or v is False:
+        return []
+    try:
+        out: list[int] = []
+        for part in (v if isinstance(v, (list, tuple)) else str(v).split(",")):
+            a, _, b = str(part).strip().partition("-")
+            out.extend(range(int(a), int(b or a) + 1))
+        return sorted(set(out))
+    except ValueError:
+        print(f"[maya] two GPUs: mixed_helper_cpus {v!r} is not a list of CPU numbers - not set", flush=True)
+        return []
 
 
 def strip_flags(args: list[str], flags: dict[str, int]) -> list[str]:
@@ -296,17 +323,40 @@ def engine_class(base, wait_gpu_release):
             henv = dict(fenv)
             henv.update(HELPER_ENV)
             henv["DS4_RHELPER_SERVE"] = name
+            lead_env = dict(LEAD_ENV)
+            if m.get("experts") == "cold":
+                # the AMD GPU's engine writes how many experts of each layer are its own, the card's engine waits for
+                # that list and takes the ones after them
+                skip = str(Path(tempfile.gettempdir()) / (name + ".skip"))
+                try:
+                    os.unlink(skip)
+                except OSError:
+                    pass
+                henv["DS4_RHELPER_SKIP_FILE"] = skip
+                lead_env = {"DS4_RHELPER_HOT": "0", "DS4_RHELPER_COLD": "1", "DS4_RHELPER_PROMPT": "0",
+                            "DS4_RHELPER_LATE": "0", "DS4_RHELPER_SKIP_OUT": skip}
+            cpus = [c for c in m.get("cpus") or [] if hasattr(os, "sched_setaffinity")]
+
+            def helper_pre():
+                end_with_parent()
+                if cpus:
+                    try:
+                        os.sched_setaffinity(0, cpus)
+                    except OSError:
+                        pass   # (a CPU that is not there: the engine runs on all, as without the setting)
             part_log = (str(Path(log).with_suffix("")) + ".helper.log") if log else os.devnull
             self.part_log = part_log
             with open(part_log, "a", encoding="utf-8") as plog:
                 self.part = subprocess.Popen([m["exe"], "--pack", pack, "--serve", *HELPER_ARGS], cwd=cwd,
                                              stdin=subprocess.DEVNULL, stdout=plog, stderr=subprocess.STDOUT, env=henv,
-                                             preexec_fn=end_with_parent)
+                                             preexec_fn=helper_pre)
             lenv = dict(env or os.environ)
-            lenv.update(LEAD_ENV)
+            for k_, v_ in lead_env.items():
+                lenv.setdefault(k_, v_)   # (the config's env wins: a switch can be turned off for a test)
             lenv["DS4_RHELPER"] = name
-            print(f"[maya] two GPUs: the model on the AMD GPU, the NVIDIA card computes its most-routed experts for it "
-                  f"(its log: {part_log})", flush=True)
+            what = "the experts its VRAM does not hold" if m.get("experts") == "cold" else "its most-routed experts"
+            print(f"[maya] two GPUs: the model on the AMD GPU, the NVIDIA card computes {what} for it"
+                  f"{' on CPUs ' + ','.join(map(str, cpus)) if cpus else ''} (its log: {part_log})", flush=True)
             ready = threading.Event()
             threading.Thread(target=self._watch_load, args=(ready,), daemon=True).start()
             try:
