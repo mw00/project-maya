@@ -2363,6 +2363,7 @@ has its own kernel for its `_gfx12` WMMA, opt-in (`DS4_INDEX_TC_GFX12=1`; a 2 x 
 | --- | --- | --- |
 | `DS4_INDEX_TC` | on for AMD `gfx11` (RDNA 3 / 3.5); off on NVIDIA and other AMD cards | `0`: the portable kernel on AMD too (the log says so). `1` on NVIDIA (compute capability 8.0+): the tensor cores' kernel (int8 MMAs) |
 | `DS4_INDEX_TC_GFX12` | off | `1`: on RDNA 4 (`gfx12`) the indexer's scores on its WMMAs too (the last bits differ from the portable kernel, as on gfx11); `DS4_INDEX_TC=0` still turns every AMD card off |
+| `DS4_ROUTER_ROWS` | `1` | the router's gate GEMV for more than one token. `1`: the rows kernel for every T > 1; `2`: a decode window's rows (up to 16 tokens) take the one-token kernel, a row of blocks a token, and a prompt chunk keeps the rows kernel - faster verify rounds on RTX 3090s; `0`: the one-token kernel for every T. The same bits in every case |
 
 ## Qwen-3.8-Flash-Next (CYBER-FROST)
 
