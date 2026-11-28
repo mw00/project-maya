@@ -13,6 +13,7 @@
 //   x = hc_post(x, rms(that) w, post)
 // and logits = rms(hc_head(x)) w . Wout.
 #include "hy4_model.hpp"
+#include "hy4_stage_reuse.hpp"
 
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
@@ -785,6 +786,7 @@ struct Model::Impl {
     // (a member's staging slots as its last pass left them: the layer whose experts they hold and how many, -1 where
     //  the layer took several passes; a chunk's second half finds the first half's experts there)
     int stg_il[16], stg_np[16];
+    bool stage_reuse_reported = false;   // (member 0 only)
     int tp_own_most() const { return (g.n_expert + U - 1) / U; }   // (the experts a unit holds at most)
     bool unsplit_experts(int il) const { return (size_t) il < tp_unsplit.size() && tp_unsplit[(size_t) il] != 0; }
     // the blocks a unit's slice of layer il's experts holds, and the blocks an expert is (0: not a routed layer)
@@ -7404,14 +7406,26 @@ struct Model::Impl {
         std::vector<int> u;
         for (int e = 0; e < ne; ++e)
             if (used[(size_t) e]) u.push_back(e);
+        int stage_base = 0, cache_member = -1;
+        const size_t requested = u.size();
         if (l.tpm >= 0 && !u.empty()) {
-            // (the slots still hold this layer's experts, the chunk's other half's: no copy where they cover this half's)
+            // Only this rank's immediately reusable copy of this layer may be extended.
             const int m = l.tpm & 15;
-            bool there = share && stg_il[m] == l.il;
+            const bool same_layer = share && stg_il[m] == l.il;
+            bool there = same_layer;
             for (size_t i = 0; there && i < u.size(); ++i) there = pmap_h[u[i]] >= 0;
             if (there) return experts_sets(l, gp, T, err, gp.pmap, gp.stage, stg_np[m], true);
-            stg_il[m] = share && u.size() <= (size_t) kStage ? l.il : -1;
-            stg_np[m] = (int) u.size();
+            static const bool reuse = [] {
+                const char* value = std::getenv("HY4_TP_STAGE_REUSE");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            if (reuse && same_layer && fat_rows() == 0) {
+                stage_base = stage_tail(u, pmap_h, stg_np[m], kStage);
+            }
+            const size_t total = u.size() + (size_t) stage_base;
+            if (share && total <= (size_t) kStage) cache_member = m;
+            stg_il[m] = -1;
+            stg_np[m] = 0;
         }
         const CpuExperts& cx = l.cex;
         const size_t gb = cx.g_stride, db = cx.d_stride;
@@ -7442,13 +7456,22 @@ struct Model::Impl {
                 lane->parallel_for(np * 3, copy);
             }
             if (!own_ids) sst().stream_ms += (now_s() - tc) * 1e3;
-            CK(cudaMemcpyAsync(gp.stage, bounce, (size_t) np * l.blob, cudaMemcpyHostToDevice, s));
-            for (int e = 0; e < ne; ++e) pmap_h[e] = -1;
-            for (int i = 0; i < np; ++i) pmap_h[u[p0 + (size_t) i]] = i;
+            CK(cudaMemcpyAsync(gp.stage + (size_t) stage_base * l.blob, bounce,
+                               (size_t) np * l.blob, cudaMemcpyHostToDevice, s));
+            stage_slots_for_copy(pmap_h, ne, u.data() + p0, np, stage_base);
             CK(cudaMemcpyAsync(gp.pmap, pmap_h, sizeof(int) * ne, cudaMemcpyHostToDevice, s));
-            if (!experts_sets(l, gp, T, err, gp.pmap, gp.stage, np, true)) return false;
+            if (!experts_sets(l, gp, T, err, gp.pmap, gp.stage, stage_base + np, true)) return false;
             CK(cudaStreamSynchronize(s));   // (the bounce and the map are the next pass's)
             if (!own_ids) sst().streamed += np;
+        }
+        if (cache_member >= 0) {
+            stg_il[cache_member] = l.il;
+            stg_np[cache_member] = stage_base + (int) u.size();
+            if (stage_base != 0 && cache_member == 0 && !stage_reuse_reported) {
+                std::fprintf(stderr, "HY4_TP_STAGE_REUSE: appended %zu misses of %zu routed experts at layer %d\n",
+                             u.size(), requested, l.il);
+                stage_reuse_reported = true;
+            }
         }
         return true;
     }
