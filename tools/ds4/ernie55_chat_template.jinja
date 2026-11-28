@@ -1,0 +1,50 @@
+{#- ERNIE-5.5-Flash's chat format (baidu/ERNIE-5.5-Flash-Preview's encoding_ernie.py, Apache-2.0), for clients that read
+    the template.  Maya's server renders an ERNIE pack's prompts with that renderer itself (serve/ernie55_encoding.py);
+    this is its plain-text reading of the same rules: the system block (its settings, the global settings - the
+    reasoning effort, parallel tool calls -, the tools), the turns, an assistant turn's thinking and tool calls, the
+    tool results, the generation prompt (<ernie:think> opened, or closed with thinking off). -#}
+{%- set thinking_off = enable_thinking is defined and (enable_thinking == false or enable_thinking == 'false') -%}
+{%- set effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'medium', 'high'] else 'high' -%}
+<|ERNIE_MASK|><|ernie:im_start|>system
+{%- if messages and messages[0].role == 'system' %}<ernie:system_setting>
+{{ messages[0].content if messages[0].content is string else '' }}
+</ernie:system_setting>
+{% endif -%}
+<ernie:global_setting>
+{%- if not thinking_off %}
+reasoning_effort={{ effort }}
+{%- endif %}
+{%- if tools %}
+parallel_tool_calls=True
+{%- endif %}
+</ernie:global_setting>
+{%- if tools %}
+<ernie:tool_list>
+[{% for t in tools %}{{ ', ' if not loop.first }}{{ t | tojson }}{% endfor %}]
+</ernie:tool_list>
+{%- endif -%}
+<|ernie:im_end|>
+{% for m in messages -%}
+{%- if m.role == 'user' or (m.role == 'system' and not loop.first) -%}
+<|ernie:im_start|>{{ m.role }}
+{{ m.content if m.content is string else '' }}<|ernie:im_end|>
+{% elif m.role == 'assistant' -%}
+<|ernie:im_start|>assistant
+<ernie:think>{{ m.reasoning_content if m.reasoning_content is defined and m.reasoning_content and not thinking_off else '' }}</ernie:think>{{ m.content if m.content is string else '' }}
+{%- if m.tool_calls %}<ernie:tool_call>
+{% for c in m.tool_calls %}{% set f = c.function if c.function is defined else c %}<invoke name="{{ f.name }}">
+{%- set args = f.arguments if f.arguments is mapping else (f.arguments | fromjson if f.arguments is string else {}) -%}
+{%- for k, v in args | dictsort %}<parameter name="{{ k }}">{{ v if v is string else v | tojson }}</parameter>{% endfor %}</invoke>
+{% endfor %}</ernie:tool_call>
+{%- endif %}<|ernie:im_end|>
+{% elif m.role == 'tool' -%}
+{%- if loop.first or loop.previtem.role != 'tool' %}<|ernie:im_start|>tool{% endif %}
+<ernie:tool_output>{{ m.content if m.content is string else '' }}</ernie:tool_output>
+{%- if loop.last or loop.nextitem.role != 'tool' %}<|ernie:im_end|>
+{% endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt %}
+<|ernie:im_start|>assistant
+<ernie:think>{{ '</ernie:think>' if thinking_off }}
+{%- endif -%}

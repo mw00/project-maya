@@ -11,6 +11,7 @@ special about it. Back to the [README](../README.md).
 - [Hy4-Flash](#hy4-flash)
 - [Inkling-2-Mini](#inkling-2-mini)
 - [Inkling-2-Small (by hand, for now)](#inkling-2-small-by-hand-for-now)
+- [ERNIE-5.5-Flash (by hand, for now)](#ernie-55-flash-by-hand-for-now)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
 ## How the quants are named
@@ -342,6 +343,19 @@ tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md]
 | unsloth's UD-Q3_K_XL (IQ3_XXS / IQ4_XS experts) | 266 GiB; ~260 GiB of pinned RAM | the same; H200: 44.6 tok/s |
 
 Text only, one request at a time. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
+
+## ERNIE-5.5-Flash (by hand, for now)
+
+**[ERNIE-5.5-Flash-Preview](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview)** (Baidu; ~300 B parameters, 512
+experts a layer, Apache 2.0) runs on the DeepSeek engine, `maya-ds4` (#1232), from peasantsmith's GGUF as it is - not
+from the setup yet: a pack (`tools/ds4/pack_ernie55.py`) and a run config by hand, then `serve/server.py`
+([ERNIE55.md](ERNIE55.md)).
+
+| Files | Size | Runs on |
+| --- | --- | --- |
+| [ERNIE-5.5-Flash-Preview · Maya-S](https://huggingface.co/peasantsmith/ERNIE-5.5-Flash-Preview-Maya-GGUF) (IQ1_M / IQ2_XXS experts, FP8 dense) | 76 GB | NVIDIA (CUDA), Linux; one GPU (an AMD card beside it can take the most-routed experts), the experts that do not fit on the CPU. Run on an RTX 5070 12 GB + 128 GB RAM at 128K: decode ~18-20 tok/s (~21 with an RX 6700 beside it), prompts ~280-350 tok/s |
+
+Text only, one request at a time; thinking on and off, tool calls, conversations kept.
 
 ## Community quants of GLM-5.3-Flash
 

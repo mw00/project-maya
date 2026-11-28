@@ -806,15 +806,20 @@ __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
 // 2 then 3: a layer whose gate and up are of different types (Args::tu) - each value the one pass's
 template <int EPI>
 constexpr bool kBoth = EPI < 2;   // (gate and up in this pass)
+// ERNIE-5.5's SiTU-GLU (kActSitu: limit is its beta)
+__device__ __forceinline__ float situ(float gv, float uv, float beta, float lin) {
+    return beta * tanhf(gv / beta) * (1.0f / (1.0f + expf(-gv))) * (lin * tanhf(uv / lin));
+}
 template <int EPI>
-__device__ __forceinline__ float act_out(float gv, float uv, float limit, int pexp = 0) {
+__device__ __forceinline__ float act_out(float gv, float uv, float limit, int pexp = 0, int act = kActOai, float lin = 0.0f) {
     if constexpr (EPI == 0) return pexp ? maya::ds4::par::swiglu_portable(gv, uv, limit) : swiglu(gv, uv, limit);
-    else return swigluoai(gv, uv, limit);
+    else return act == kActSitu ? situ(gv, uv, limit, lin) : swigluoai(gv, uv, limit);
 }
 // EPI 3's h: the gate's sums (EPI 2's) with the up's, the one pass's epilogue for the layer's activation (act: Args /
 // SetArgs::act) - kActOai: swigluoai (EPI 1's); kActSwiglu: EPI 0's, maya-ling's post-SiLU clamp included
-__device__ __forceinline__ float act_split(float gv, float uv, float limit, int act, int pexp = 0) {
-    return act == kActOai ? swigluoai(gv, uv, limit) : act_out<0>(gv, uv, limit, pexp);
+__device__ __forceinline__ float act_split(float gv, float uv, float limit, int act, int pexp = 0, float lin = 0.0f) {
+    return act == kActOai ? swigluoai(gv, uv, limit) : act == kActSitu ? situ(gv, uv, limit, lin)
+                                                                        : act_out<0>(gv, uv, limit, pexp);
 }
 template <int EPI>
 constexpr int kRole0 = EPI == 3 ? 1 : 0;   // the matrix the pass reads first (3: the up)
@@ -1027,10 +1032,10 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                         float* hp = &a.h[(size_t) es[i] * a.n_ff + row];
                         if constexpr (TWO) {
                             const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
-                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp);
+                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp, a.act, a.lin);
                         } else {
                             const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
-                            if (lane == 0) *hp = EPI == 2 ? v : act_split(*hp, v, a.limit, a.act, a.pexp);
+                            if (lane == 0) *hp = EPI == 2 ? v : act_split(*hp, v, a.limit, a.act, a.pexp, a.lin);
                         }
                     }
             }
@@ -1196,9 +1201,9 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
             const int c = c0 + tx * TN + j;
             if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ag[i][j];
             else if constexpr (TWO)
-                a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_out<EPI>(ag[i][j], au[i][j], a.limit)));
+                a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_out<EPI>(ag[i][j], au[i][j], a.limit, 0, a.act, a.lin)));
             else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = ag[i][j];
-            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + c], ag[i][j], a.limit, a.act)));
+            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + c], ag[i][j], a.limit, a.act, 0, a.lin)));
         }
     }
 }
@@ -1353,7 +1358,7 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
         if (q >= nrm) break;   // (uniform)
         if (TWO)
             for (int i = 0; i < (int) fg[q][j].num_elements; ++i)
-                fg[q][j].x[i] = act_out<EPI>(fg[q][j].x[i], fu[q][j].x[i], a.limit);
+                fg[q][j].x[i] = act_out<EPI>(fg[q][j].x[i], fu[q][j].x[i], a.limit, 0, a.act, a.lin);
         wm::store_matrix_sync(ow, fg[q][j], 16, wm::mem_row_major);
         __syncthreads();   // (uniform: every warp stores, then reads its own tile)
         for (int i = lane; i < 16 * 16; i += 32) {
@@ -1363,7 +1368,7 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
             if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ow[i];
             else if constexpr (TWO) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(ow[i]));
             else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = ow[i];
-            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + c], ow[i], a.limit, a.act)));
+            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + c], ow[i], a.limit, a.act, 0, a.lin)));
         }
         __syncthreads();
     }
@@ -1855,9 +1860,9 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
                 if (lane == 0) {
                     const size_t lr = (size_t) (lo + i);
                     if constexpr (!GATE_UP) a.y[lr * a.ldo + row] = v0;
-                    else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit)));
+                    else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit, 0, a.act, a.lin)));
                     else if constexpr (EPI == 2) a.graw[lr * a.n_ff + row] = v0;
-                    else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + row], v0, a.limit, a.act)));
+                    else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_split(a.graw[lr * a.n_ff + row], v0, a.limit, a.act, 0, a.lin)));
                 }
             }
     }

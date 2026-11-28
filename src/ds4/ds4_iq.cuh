@@ -31,6 +31,8 @@ constexpr int kQ8_0 = 8, kQ6_K = 14;
 ///   kActOai     MiniMax's swigluoai (gpt-oss's, llama.cpp's LLM_FFN_SWIGLU_OAI_MOE): the same clamps, then
 ///               g sigmoid(kOaiAlpha g) (u + 1)
 constexpr int kActSwiglu = 0, kActOai = 1;
+///   kActSitu    ERNIE-5.5's SiTU-GLU: limit tanh(g / limit) sigmoid(g) . lin tanh(u / lin) (limit: beta, lin: linear beta)
+constexpr int kActSitu = 2;
 constexpr float kOaiAlpha = 1.702f;
 
 /// Whether the routed experts' kernels take this ggml type.
@@ -69,6 +71,7 @@ struct Args {
     float* part = nullptr;   // [entries][n_embd]: each entry's down output
     int tg = 0, td = 0;      // gate / up's type, down's
     int act = kActSwiglu;    // the activation (kActOai: MiniMax's)
+    float lin = 0.0f;        // (kActSitu) its linear beta
     int tu = 0;              // the up's type when it is not the gate's (0: tg; any act): gate and up then in two passes,
                              // the gate's sums in h first - each value the same as one pass gives
     int pexp = 0;            // 1: the token kernels' SwiGLU takes exp_portable (ds4_par_exp.h, DS4_LANE_PARITY), the
@@ -104,6 +107,7 @@ struct SetArgs {
     int xh_vec = 0;    // (launch_set's: xh 16-byte aligned rows - the tensor-core tiles load 8 values at once)
     int skip_ge = 0;   // (the tiles) > 0: the experts of at least this many rows are left out - the caller's GEMMs
     int act = kActSwiglu;      // the activation (Args::act)
+    float lin = 0.0f;          // (kActSitu) its linear beta
     int tu = 0;                // the up's type when it is not the gate's (0: tg; any act) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
 };

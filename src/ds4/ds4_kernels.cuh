@@ -179,7 +179,7 @@ bool copy_regions(const CopyRegions& r, cudaStream_t s);
 /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
 /// row of latent.
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, cudaStream_t s);
+                  int d, const float* w, float eps, float* latent, cudaStream_t s, const float* ape = nullptr);
 
 /// Per-query sizes, by value - or (gen > 0, a chunk of any length) made on the device from the query's position: query
 /// t at position p0 + t has nn = (p0 + t + 1) / R compressed positions and cb = min(ccap, ceil(nn / blk)) candidate
@@ -596,5 +596,75 @@ private:
 };
 void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
                     cudaStream_t s, const ArAux& aux);
+
+
+// ---------------------------------------------------------------- ERNIE-5.5-Flash (Geo::ernie)
+/// a token's routed experts at most on ERNIE's own paths (its 10; the V4.1 paths keep kPicks)
+constexpr int kErniePicks = 16;
+/// the split-feature router: scores = sigmoid(l0) + sigmoid(l1) (rows ld apart), the k best of scores + bias, their scores
+/// renormalised (renorm) times scale[expert] -> idx / w [T][stride]
+void ernie_route(const float* l0, const float* l1, int ld, const float* bias, const float* scale, int n, int k, bool renorm,
+                 int T, int* idx, float* w, int stride, cudaStream_t s);
+/// h = beta tanh(g / beta) sigmoid(g) . lin tanh(u / lin) (SiTU-GLU), n values
+void situ_mul(const float* g, const float* u, size_t n, float beta, float lin, float* h, cudaStream_t s);
+/// VHA in place: token t's head h (o + t ld_t + h ld_h, D values) <- sum_g m[h][g] head g; m [H][H], H <= 64
+void vha_mix(float* o, const float* m, int T, int H, int D, size_t ld_t, size_t ld_h, cudaStream_t s);
+/// x *= sigmoid(gate), n values
+void sigmoid_mul(float* x, const float* gate, size_t n, cudaStream_t s);
+/// the logits' multimax in place (ranges, ts: 4 each)
+void multimax(float* z, size_t n, const float* ranges, const float* ts, cudaStream_t s);
+/// the head's stream mix: pre[t][h] = sigmoid(mix[t][h] scale[0] + base[h]) + eps (mix rows 32 apart, pre 8)
+void hc_head_pre(const float* mix, const float* scale, const float* base, int hc, float eps, int T, float* pre,
+                 cudaStream_t s);
+/// an MLA layer: kva [T][kvl + rope] -> the cache's rows pos0 .. pos0 + T - 1 (BF16: rms(latent) w, then k_pe rotated)
+void mla_kv_store(const float* kva, int T, int kvl, int rope, const float* w, float eps, int pos0, const float* freqs,
+                  uint16_t* cache, cudaStream_t s);
+/// q [T][H][nope + rope] (q_pe rotated) -> qa [T][H][kvl + rope]: q_nope through W_uk ([H][nope][kvl] BF16), then q_pe
+void mla_absorb(const float* q, const uint16_t* wuk, int T, int H, int nope, int rope, int kvl, float* qa, cudaStream_t s);
+/// the latent attention: query t (position pos0 + t) over the keys sel[t][0 .. nsel[t]) (sel null: positions
+/// 0 .. pos0 + t), the sink in the denominator -> out [T][H][kvl]; false (nothing launched): more keys than it takes
+bool mla_attn(const float* qa, const uint16_t* cache, int T, int H, int kvl, int rope, int pos0, const int* sel,
+              int sel_stride, const int* nsel, int max_keys, const float* sink, float scale, float* out, cudaStream_t s);
+int mla_max_keys();
+/// o [T][H][kvl] -> y [T][H][v] through W_uv ([H][v][kvl] BF16)
+void mla_vup(const float* o, const uint16_t* wuv, int T, int H, int kvl, int v, float* y, cudaStream_t s);
+/// the routed sum of a window's latent MoE: out[t] = sum_j w[t][j] ed[row[t][j]] (+ cpu[t]), rows E apart
+struct ErnieCombine {
+    int n[kWin] = {};
+    int row[kWin][kErniePicks] = {};
+    float w[kWin][kErniePicks] = {};
+};
+void ernie_combine(const float* ed, const ErnieCombine& c, const float* cpu, int T, int E, float* out, cudaStream_t s);
+/// x *= a, n values
+void scale_rows(float* x, size_t n, float a, cudaStream_t s);
+/// y += x, n values
+void add_rows(float* y, const float* x, size_t n, cudaStream_t s);
+/// the DSA indexer (an MLA layer's): a key - LayerNorm (w, b) of k [T][128], NeoX rotation of its first `rope` values,
+/// the orthonormal Hadamard transform - into keys[pos0 + t]; the queries q [T][H][128] rotated and transformed in place;
+/// the scores out[t][s] = sum_h relu(q[t][h] . keys[s]) w[t][h] for s < n[t] (n on the device, nmax its largest)
+void ix_key(const float* k, const float* w, const float* b, int T, int rope, int pos0, const float* freqs, uint16_t* keys,
+            cudaStream_t s);
+void ix_query(float* q, int T, int H, int rope, int pos0, const float* freqs, cudaStream_t s);
+void ix_score(const float* q, const float* w, int T, int H, const uint16_t* keys, const int* n, int nmax, float* out,
+              long long out_stride, cudaStream_t s);
+/// row t of sel: its k[t] picks, then the window's positions up to pos[t]; nsel[t] = their count
+struct ErnieSel {
+    int pos[kWin] = {};
+    int k[kWin] = {};
+};
+void sel_window(int* sel, int stride, const ErnieSel& c, int T, int win, int* nsel, cudaStream_t s);
+/// (the chunked prompt path) a chunk's MLA rows' keys: row t's indexer picks, then its window (sel_window's for rows of
+/// consecutive positions from p0); a token's k picks as two rows of k / 2 (k even, the V4.1 paths' kPicks a row); rows
+/// doubled (out[2 t + r] = x[t]) and paired back (out[t] = x[2 t] + x[2 t + 1])
+void sel_window_range(int* sel, int stride, int p0, int T, int win, int topk, int* nsel, cudaStream_t s);
+void ernie_split_picks(const int* idx, const float* w, int in_stride, int k, int T, int* oidx, float* ow, int out_stride,
+                       cudaStream_t s);
+void ernie_dup_rows(const float* x, int n, int T, float* out, cudaStream_t s);
+void ernie_pair_sum(const float* x, int n, int T, float* out, cudaStream_t s);
+/// out[r] = x[src[r]] for r < n (rows of cols values)
+struct ErnieGather {
+    int src[kWin * kErniePicks] = {};
+};
+void ernie_gather(const float* x, const ErnieGather& g, int n, int cols, float* out, cudaStream_t s);
 
 }  // namespace maya::ds4

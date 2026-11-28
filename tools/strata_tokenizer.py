@@ -109,7 +109,20 @@ DEEPSEEK3_PATTERNS = (
 )
 # `hy_v4` (Hy4-flash's tokenizer) splits with these same three stages, word for word (the HUNYUAN_DENSE expressions,
 # which are DEEPSEEK3_LLM's), merges by rank
-PRE_ISOLATED = {"deepseek3": DEEPSEEK3_PATTERNS, "hy_v4": DEEPSEEK3_PATTERNS}
+# `ernie5` (ERNIE-5.5's tokenizer.json, baidu/ERNIE-5.5-Flash-Preview, Apache-2.0): its Sequence of pre-tokenizers -
+# Digits (individual_digits false: each run of numeric characters a piece), then four "Isolated" splits of the digit
+# runs into thousands groups from the right (a run longer than 510 in 510s first; then the leading 1 or 2 digits a run
+# whose rest is whole groups of 3 starts with; then the groups of 3), then DeepSeek-V3's CJK and word stages - before
+# the byte-level map; merges by rank (no ignore_merges)
+ERNIE5_PATTERNS = (
+    r"\p{N}+",
+    r"\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}",
+    # (tokenizer.json's `\p{Nd}{3}+\z` in Oniguruma's reading: one or more groups of 3 - `regex` would take `{3}+` for a
+    #  possessive quantifier - up to the end of the string, `regex`'s \Z)
+    r"\A\p{Nd}{1,2}(?=(?:\p{Nd}{3})+\Z)",
+    r"\A\p{Nd}{3}|\G\p{Nd}{3}",
+) + DEEPSEEK3_PATTERNS[1:]
+PRE_ISOLATED = {"deepseek3": DEEPSEEK3_PATTERNS, "hy_v4": DEEPSEEK3_PATTERNS, "ernie5": ERNIE5_PATTERNS}
 
 
 # The `minimax` pre-tokenizer: MiniMax-M3.1's tokenizer.json verbatim - an NFC normalizer, then one Split (invert,
@@ -175,9 +188,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4", "bailingmoe2") + O200K:
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4", "bailingmoe2", "ernie5") + O200K:
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
-                             "hy_v4, gpt-4o, inkling, inkling2" % pre)
+                             "hy_v4, ernie5, gpt-4o, inkling, inkling2" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece.  `gpt-4o` (Inkling 2's: its
         # tokenizer.json's one Split with GPT-4o's o200k regex - MINIMAX_PATTERN - and no normalizer, its BPE with
         # ignore_merges; also named "inkling": O200K) the same
