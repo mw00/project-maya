@@ -77,6 +77,13 @@ defaults have nothing to gain (their gain is deep in a context: a pass at 200K 5
 the two are within the runs' spread. 8K prompts read 7% faster. With upstream's AMD reserve of 3072 MiB instead of
 600 the same config read 2K / 8K prompts at 793 / 1,290 tok/s (8,519 experts in VRAM at its load).
 
+On main as of v1.1.84 (2026-11-28; the same PC, config and profile snapshot, each binary swapped into the build and
+alternated with the one above): the setup's config decodes at 75.4 / 75.3 tok/s and reads 2K / 8K prompts at 833 /
+831 and 1,282 / 1,280 tok/s, against 74.3 / 74.4, 863 / 864 and 1,356 / 1,352 for the build above. Main's ds4_iq
+GEMVs (`mv_rows_kernel`, #1292 / #1308) take the drafter's head GEMV from 1,555 to 1,314 us; its `set_tc_kernel`
+rewrite (#1296: the k loop as stage / mma lambdas; on AMD still one tile) costs the prompts' expert tiles 3.6% / 5.4%
+here - the same build with that commit reversed reads 864 / 1,357 tok/s.
+
 Overall against the engine as #1108 left it (15c731a4, frozen profile): long prompts up to ~2.1x faster (38.9K-token
 prompt 1,042 -> 2,218 tok/s), a decode pass 5% shorter and a draft round 8.5 -> 6.3 ms (decode tok/s up on each of
 seven prompts, geomean +9%: 13K 40.4 -> ~47, copying 95 -> 112, GSM8K 79.5 -> 85), answers at fixed placement (`--no-expert-cache`) the same bits on the default settings of then.
