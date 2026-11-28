@@ -365,6 +365,7 @@ inline bool dual() { return g_ep || g_tp; }
 // they are picked, so the two GPUs' shares come out as asked; without it by a hash of the expert.
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
+bool g_flash_tu = false;   // (the fused prompt attention on Turing: FP16 KV only)
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
 int g_n_sm = 0;
 bool g_pa70 = false;   // Volta: a prompt chunk's attention on a full layer on mma.m8n8k4 (IK2_PA70=0: cuBLAS)
@@ -375,7 +376,12 @@ bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, 
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
 struct Prof {
-    double attn = 0, route = 0, upload = 0, experts = 0, rest = 0;
+    double attn = 0, route = 0, upload = 0, experts = 0, rest = 0, attn_swa = 0;
+    double p0[3] = {};    // a layer's norm+residual pieces on a looped visit: attn_res, loop gates, the three norms (full layers)
+    double p0s[4] = {};   // the same on sliding layers; [3]: a plain visit's fused attn_res_rms
+    double p1w = 0;   // GPU 0 waiting for GPU 1's experts after its own are done (IK2_PF_GPU1)
+    double ex[6] = {};   // the prompt's experts: gather, decode gate/up, gemm gate/up, swiglu+decode down, gemm down, scatter
+    double ph[2][5] = {};   // attention layer's phases [sliding]: norm/residual, projections+convs, prep_qkv, core, gate+o-proj
     double t = 0;
     void start() {
         if (g_prof) cudaStreamSynchronize(g_s), t = now();
@@ -1311,6 +1317,116 @@ extern "C" void on_usr1(int) { g_cancel = 1; }
 float* g_taps = nullptr;
 int g_taps_ld = 0, g_final_tap = 7;   // (the final normed hidden: tap 7, a looped model's 3)
 bool g_rec = false;
+
+// The drafter on another GPU (IK2_DRAFT_GPU=N, the two-GPU split): the drafter's 1.45 GiB (weights, context rows) then
+// do not come out of GPU 0's expert tier, and its prompt work (a projection of every prompt position's taps into its
+// context caches) runs on the idle GPU while GPU 0 reads the next chunk.  Its own stream and cuBLAS handle; the taps
+// of the committed positions, the anchor's hidden and the target's Q8 output head are copied over (the runtime's
+// peer copies: direct over NVLink, else staged through the host).  The wrappers below are the drafter's whole
+// interface for the callers: with no remote drafter they are the plain calls.
+struct DraftRemote {
+    int dev = -1;                      // the drafter's GPU (-1: the current GPU, as before)
+    int C = 0;                         // the target's width
+    int ntap = 8;                      // the taps the target keeps: g_final_tap + 1 (4 for the looped model)
+    cudaStream_t s = nullptr;
+    cublasHandle_t blas = nullptr;
+    cudaEvent_t ev_src = nullptr;      // on GPU 0: the taps / the anchor are ready (recorded on g_s)
+    cudaEvent_t ev_cp = nullptr;       // on dev: the copies have read GPU 0's taps (GPU 0's stream waits for it)
+    float* taps = nullptr;             // [ntap][ld][C] F32, the committed rows
+    int ld = 0;
+    float* anchor = nullptr;           // [C] F32
+    int8_t* q8 = nullptr;              // the target's output head, planar Q8_0 (propose reads it)
+    uint16_t* q8d = nullptr;
+    float* host = nullptr;             // pinned: the taps on their way (GPU 0 to host to dev)
+    float* host_anchor = nullptr;      // pinned: the anchor's hidden on its way
+    bool cp_valid = false;             // ev_cp has been recorded (a wait on one that has not is left out)
+};
+DraftRemote g_drem;
+bool pf1_peer();   // (defined with the prompt experts on GPU 1: the first call decides, once the two-GPU split is up)
+// (makes `d` the runtime's current device, and puts the one it replaced back - the raw runtime calls leave use_dev()'s
+//  g_cur alone, so the device that was current is the one to return to)
+struct DevScope {
+    int prev = -1;
+    bool sw = false;
+    explicit DevScope(int d) {
+        CU(cudaGetDevice(&prev));
+        if (prev != d) {
+            CU(cudaSetDevice(d));
+            sw = true;
+        }
+    }
+    ~DevScope() {
+        if (sw) cudaSetDevice(prev);
+    }
+};
+// (the target's taps, rows r0 .. r0 + m - 1 of every tap, to the drafter's GPU: through pinned host memory - GPU 0's stream
+//  copies them down behind the forward that wrote them, the drafter's stream waits for that and copies them up.  The
+//  runtime's peer copy is not used: between two GPUs without peer access it faults in the driver, and the engine's own
+//  hand-offs in this mode bounce through the host as well.  Before the copy down, g_s waits for the drafter to have read
+//  the rows of the call before - the pinned and the remote buffers are then free)
+void drafter_copy_taps(const float* taps, int ld, int r0, int m) {
+    DraftRemote& R = g_drem;
+    if (R.ld < ld) die("the remote drafter's tap buffer is smaller than the target's");
+    const size_t bytes = (size_t) m * R.C * sizeof(float);
+    if (R.cp_valid) CU(cudaStreamWaitEvent(g_s, R.ev_cp, 0));
+    if (pf1_peer()) {   // (NVLink: the copies driven by GPU 0's stream - the source's: see pf1_run; the drafter's stream then waits for them)
+        for (int t = 0; t < R.ntap; ++t) {
+            const size_t off = ((size_t) t * ld + r0) * R.C;
+            CU(cudaMemcpyPeerAsync(R.taps + off, R.dev, taps + off, 0, bytes, g_s));
+        }
+        CU(cudaEventRecord(R.ev_src, g_s));
+        DevScope on(R.dev);
+        CU(cudaStreamWaitEvent(R.s, R.ev_src, 0));
+        return;
+    }
+    for (int t = 0; t < R.ntap; ++t) {
+        const size_t off = ((size_t) t * ld + r0) * R.C;
+        CU(cudaMemcpyAsync(R.host + off, taps + off, bytes, cudaMemcpyDeviceToHost, g_s));
+    }
+    CU(cudaEventRecord(R.ev_src, g_s));
+    DevScope on(R.dev);
+    CU(cudaStreamWaitEvent(R.s, R.ev_src, 0));
+    for (int t = 0; t < R.ntap; ++t) {
+        const size_t off = ((size_t) t * ld + r0) * R.C;
+        CU(cudaMemcpyAsync(R.taps + off, R.host + off, bytes, cudaMemcpyHostToDevice, R.s));
+    }
+}
+void drafter_write_context(ik2::draft::Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
+    if (g_drem.dev < 0) return ik2::draft::write_context(d, taps, ld, r0, m, pos0);
+    drafter_copy_taps(taps, ld, r0, m);
+    DevScope on(g_drem.dev);
+    ik2::draft::write_context(d, g_drem.taps, ld, r0, m, pos0);
+    CU(cudaEventRecord(g_drem.ev_cp, g_drem.s));
+    g_drem.cp_valid = true;   // (the rows are read: the next copy may overwrite them)
+}
+void drafter_set_f_rnn(ik2::draft::Drafter* d, const float* taps, int ld, int row) {
+    if (g_drem.dev < 0) return ik2::draft::set_f_rnn(d, taps, ld, row);
+    DevScope on(g_drem.dev);   // (the row is among the ones the paired write_context copied: the remote copy is read)
+    ik2::draft::set_f_rnn(d, g_drem.taps, ld, row);
+    CU(cudaEventRecord(g_drem.ev_cp, g_drem.s));
+    g_drem.cp_valid = true;
+}
+void drafter_propose(ik2::draft::Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows,
+                     int n_vocab, int* out, int proposals = ik2::draft::kBlock - 1, const ik2::draft::Noise* noise = nullptr) {
+    if (g_drem.dev < 0) return ik2::draft::propose(d, anchor, anchor_h, P, lm_f16, n_rows, n_vocab, out, proposals, noise);
+    if (pf1_peer()) {
+        if (g_drem.cp_valid) CU(cudaStreamWaitEvent(g_s, g_drem.ev_cp, 0));   // (the drafter has finished with the anchor before)
+        CU(cudaMemcpyPeerAsync(g_drem.anchor, g_drem.dev, anchor_h, 0, (size_t) g_drem.C * sizeof(float), g_s));
+        CU(cudaEventRecord(g_drem.ev_src, g_s));
+        DevScope on(g_drem.dev);
+        CU(cudaStreamWaitEvent(g_drem.s, g_drem.ev_src, 0));
+        ik2::draft::propose(d, anchor, g_drem.anchor, P, nullptr, n_rows, n_vocab, out, proposals, noise);
+        CU(cudaEventRecord(g_drem.ev_cp, g_drem.s));
+        g_drem.cp_valid = true;
+        return;
+    }
+    CU(cudaMemcpyAsync(g_drem.host_anchor, anchor_h, (size_t) g_drem.C * sizeof(float), cudaMemcpyDeviceToHost, g_s));
+    CU(cudaEventRecord(g_drem.ev_src, g_s));
+    DevScope on(g_drem.dev);
+    CU(cudaStreamWaitEvent(g_drem.s, g_drem.ev_src, 0));
+    CU(cudaMemcpyAsync(g_drem.anchor, g_drem.host_anchor, (size_t) g_drem.C * sizeof(float), cudaMemcpyHostToDevice, g_drem.s));
+    ik2::draft::propose(d, anchor, g_drem.anchor, P, nullptr, n_rows, n_vocab, out, proposals, noise);
+}
 // the drafter's tap a visit's stream (at its start) is, or -1
 inline int draft_tap(const Config& c, int l, int vis) {
     if (c.n_pass == 1) return (l % 6 == 5 && l < c.n_layer - 1) ? l / 6 : -1;
@@ -1570,7 +1686,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         k::ResStates st{};
         for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
         st.st[nb] = h_in;
+        g_pf.lap(g_pf.ph[Ly.sliding][0]);
         k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, T, C, 1e-6f, W.lp_in, g_s);
+        g_pf.lap(Ly.sliding ? g_pf.p0s[0] : g_pf.p0[0]);
         const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
                               Ly.sliding ? Ly.attn_norm : Ly.v_in_norm};
         uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
@@ -1580,8 +1698,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
                      Ly.lp_forget[j], Ly.lp_gain[j], y32[j]};
         loop_gates_chunk(W, gt, 3, T, C, c.rank, 1e-6f);
+        g_pf.lap(Ly.sliding ? g_pf.p0s[1] : g_pf.p0[1]);
         for (int j = 0; j < 3; ++j)
             k::rms_f16(y32[j], nw[j], T, C, c.eps, y16[j], need_x32 ? y32[j] : nullptr, g_s);
+        g_pf.lap(Ly.sliding ? g_pf.p0s[2] : g_pf.p0[2]);
         in_q = W.xq, in_k = W.xk, in_v = W.xv;
         xk16 = W.xk16, xv16 = W.xv16;
     } else if (l > 0) {
@@ -1593,7 +1713,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             outs.w[0] = Ly.attn_norm;
             outs.y16[0] = W.x16;
             outs.y32[0] = need_x32 ? W.xq : nullptr;
+            g_pf.lap(g_pf.ph[Ly.sliding][0]);
             k::attn_res_rms_f16(st, nb + 1, Ly.res_score, Ly.n_res_q, T, C, 1e-6f, c.eps, outs, g_s);
+            g_pf.lap(g_pf.p0s[3]);
             in_q = in_k = in_v = W.xq;
         } else {
             outs.w[0] = Ly.q_in_norm, outs.w[1] = Ly.k_in_norm, outs.w[2] = Ly.v_in_norm;
@@ -1613,6 +1735,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         in_q = W.xq, in_k = W.xk, in_v = W.xv;
         xk16 = W.xk16, xv16 = W.xv16;
     }
+    g_pf.lap(g_pf.ph[Ly.sliding][0]);
     const int HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     float *q_p = W.q, *k_p = W.kk, *v_p = W.vv, *r_p = W.rr, *gate_p = W.gate, *sink_p = W.sink;
     float *kd_p = W.dyn, *vd_p = W.dyn;
@@ -1711,6 +1834,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             k::conv4(v_p, Ly.h_v, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv, g_s);
         }
     }
+    g_pf.lap(g_pf.ph[Ly.sliding][1]);
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
     const float v_scale = 32.0f;
     const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
@@ -1724,6 +1848,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                           Ly.kv_cap, g_s);
     }
 
+    g_pf.lap(g_pf.ph[Ly.sliding][2]);
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
     const int window = Ly.sliding ? c.window : (1 << 30);
     const int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
@@ -1799,7 +1924,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         }
         if (pa70) {
         } else
-        if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
+        if (g_flash && !(g_flash_tu && g_kv_fp8) && c.D == 128 && W.relb && extent <= W.relb_ext) {
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
                 const int Tq = std::min(Work::kRelbRows, T - ts);
@@ -1899,8 +2024,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         }
     }
     if (staged) Ly.kc = kc_h, Ly.vc = vc_h, Ly.kc8 = kc8_h, Ly.vc8 = vc8_h;
+    g_pf.lap(g_pf.ph[Ly.sliding][3]);
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
+    g_pf.lap(g_pf.ph[Ly.sliding][4]);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
@@ -2046,6 +2173,13 @@ RdnaMoe& rdna_moe(int S, int E, int C, int F) {
 }
 #endif
 
+// (two GPUs, IK2_PF_GPU1=1: a prompt's experts that GPU 0 lacks run on GPU 1 from its VRAM instead of streaming through
+//  host memory - defined with the two-GPU code below)
+bool pf1_pick(int l, const Config& c, const std::vector<int>& cnt, const ExpertCache& EC, int T, std::vector<char>& skip);
+void pf1_run(const Model& M, int l, int T, const uint16_t* xq16, const Work& W, const std::vector<char>& skip, const int* gidx,
+             const float* sg, const float* su, const float* wtr);
+void pf1_add(Work& W, int T, int C);
+
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
     const Config& c = M.c;
@@ -2090,6 +2224,10 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         wtr[row] = wt[i];
     }
 
+    std::vector<char> p1skip;
+    const bool p1 = g_off && !g_ep && !g_tp && pf1_pick(l, c, W.cnt, EC, T, p1skip);
+    if (p1) pf1_run(M, l, T, xq16, W, p1skip, gidx, sg, su, wtr);
+
     // the experts on a GPU: d -1 all of them (one GPU), else the ones it owns (IK2_EP), into X.tmp
     auto exec = [&](int d, Work& X, ExpertCache& XC, const uint16_t* xin) {
         const uint64_t tick = g_off ? XC.tick : ++XC.tick;   // (the offload path: the tier is not touched)
@@ -2103,6 +2241,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                 X.slot_ptrs[e] = nullptr;
                 if (!W.cnt[e]) continue;
                 const int s = XC.loc[(size_t) l * c.E + e];
+                if (p1 && p1skip[e]) continue;   // (GPU 1's)
                 if (s >= 0) X.slot_ptrs[e] = P.data + (size_t) s * P.slot_bytes, X.hit_exps.push_back(e);
                 else X.miss_exps.push_back(e);
             }
@@ -2194,11 +2333,16 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         // depend on the cache. Only [T][C] of scratch: no [T * K][C] copies of the inputs or the outputs.
         auto run_exp = [&](int e) {
             const int cnt_e = W.cnt[e], st_e = W.start[e];
+            if (g_prof) g_pf.lap(g_pf.experts);   // (the wait for the copy before it)
             gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
+            g_pf.lap(g_pf.ex[0]);
             gate_up(e, X.ex16, cnt_e, X.gu32);
+            g_pf.lap(g_pf.ex[2]);
             k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
             down(e, X.h16, cnt_e, X.y32);
+            g_pf.lap(g_pf.ex[4]);
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
+            g_pf.lap(g_pf.ex[5]);
         };
         if (g_off) {
             // The offload path: the misses copied into the staging ring of their slot size (the decode's staging
@@ -2284,7 +2428,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             while (issued < std::min(n_miss, st.n)) issue();
             XC.t_up += now() - tu;
             for (int e = 0; e < c.E; ++e) {
-                if (!W.cnt[e]) continue;
+                if (!W.cnt[e] || (p1 && p1skip[e])) continue;
                 const int r = X.miss_pos[e];
                 if (r >= 0 && cst != g_s) CU(cudaStreamWaitEvent(g_s, rc[r], 0));
                 run_exp(e);
@@ -2454,6 +2598,11 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                              cudaMemcpyDefault, g_s));
     } else {
         exec(-1, W, EC, xq16);
+        if (p1) {
+            if (g_prof) g_pf.lap(g_pf.experts);
+            pf1_add(W, T, C);
+            g_pf.lap(g_pf.p1w);
+        }
     }
     g_pf.lap(g_pf.experts);
     t_exp += now() - te0;
@@ -2717,6 +2866,188 @@ void two_mail_check() {
             " waited more than " + std::to_string(k::kMailWaitNs / 1000000) + " ms for the other GPU - its work stopped or"
             " failed; the answers would not be its rows");
 #endif
+}
+// ---- IK2_PF_GPU1=1 (two GPUs): the experts a prompt chunk needs that GPU 0's tier lacks run on GPU 1, which holds
+// them: the chunk's input over (through pinned host memory - no peer access between these cards), each expert's tokens
+// gathered, run with the same kernels as GPU 0's prompt path, summed into one [T][C] buffer, which comes back and is
+// added to GPU 0's.  GPU 0 meanwhile runs the experts of its tier.  (The sums' order differs from the one GPU's:
+// the rows of the experts are added in two parts.)
+struct Pf1 {
+    int cap = 0, C = 0, F = 0, K = 0;
+    cudaStream_t s = nullptr;
+    cublasHandle_t blas = nullptr;
+    cudaEvent_t ev_in = nullptr, ev_done = nullptr;
+    uint16_t *x16 = nullptr, *ex16 = nullptr, *w16 = nullptr, *h16 = nullptr;
+    float *gu32 = nullptr, *y32 = nullptr, *tmp = nullptr, *sg = nullptr, *su = nullptr, *wtr = nullptr;
+    int* gidx = nullptr;
+    uint16_t* hx = nullptr;   // pinned
+    float* hy = nullptr;      // pinned
+    float* y0 = nullptr;      // GPU 0's: GPU 1's sums on their way back (peer copies, g_two.link.all_peer)
+    std::vector<std::vector<const uint8_t*>> tab;   // per layer: GPU 1's blocks (host copy)
+    uint64_t n_run = 0, n_exps = 0;
+} g_pf1;
+
+// (GPU 0 <-> GPU 1 directly when the engine's link test passed peer copies between them (NVLink); IK2_PF_HOST=1: through the host)
+bool pf1_peer() {
+    static const bool on = [] {
+        std::string why;
+        bool v = false;
+        const bool host = getenv("IK2_PF_HOST") && std::atoi(getenv("IK2_PF_HOST"));
+        if (!g_two.on || host) why = host ? "IK2_PF_HOST=1" : "no two-GPU split";
+        else if (g_two.link.all_peer) v = true, why = "the engine's link test passed";
+        else if (getenv("IK2_PF_PEER") && std::atoi(getenv("IK2_PF_PEER"))) {
+            // (the engine's own test drives its copies from the destination's stream, which is the one direction NVLink gets wrong on
+            //  RTX 2080 Ti pairs: here access is enabled and copies driven by the SOURCE's stream are checked both ways, sizes
+            //  from 64 KB to 6 MB, before anything relies on them)
+            const int d1 = g_two.dev;
+            int ab = 0, ba = 0;
+            cudaDeviceCanAccessPeer(&ab, 0, d1), cudaDeviceCanAccessPeer(&ba, d1, 0);
+            if (!ab || !ba) why = "no peer access between the GPUs";
+            else {
+                DevScope g0(0);
+                cudaDeviceEnablePeerAccess(d1, 0), (void) cudaGetLastError();
+                { DevScope g1(d1); cudaDeviceEnablePeerAccess(0, 0), (void) cudaGetLastError(); }
+                size_t wrong = 0;
+                const size_t sizes[] = {65536, 262144, 589824, 2097152, 6291456};
+                for (int dir = 0; dir < 2 && why.empty(); ++dir) {
+                    const int src = dir ? d1 : 0, dst = dir ? 0 : d1;
+                    for (size_t nb : sizes) {
+                        std::vector<uint32_t> pat(nb / 4), back(nb / 4);
+                        for (size_t k = 0; k < pat.size(); ++k) pat[k] = (uint32_t) (k * 2654435761u) ^ (uint32_t) (dir + 1);
+                        void *bs = nullptr, *bd = nullptr;
+                        cudaStream_t st = nullptr;
+                        { DevScope a(src); cudaMalloc(&bs, nb); cudaStreamCreate(&st); cudaMemcpy(bs, pat.data(), nb, cudaMemcpyHostToDevice); }
+                        { DevScope a(dst); cudaMalloc(&bd, nb); cudaMemset(bd, 0, nb); cudaDeviceSynchronize(); }
+                        { DevScope a(src); cudaMemcpyPeerAsync(bd, dst, bs, src, nb, st); cudaStreamSynchronize(st); }
+                        { DevScope a(dst); cudaMemcpy(back.data(), bd, nb, cudaMemcpyDeviceToHost); }
+                        for (size_t k = 0; k < pat.size(); ++k) wrong += back[k] != pat[k];
+                        { DevScope a(src); cudaFree(bs); cudaStreamDestroy(st); }
+                        { DevScope a(dst); cudaFree(bd); }
+                    }
+                }
+                (void) cudaGetLastError();
+                if (wrong) why = std::to_string(wrong) + " words wrong in the source-driven check copies";
+                else v = true, why = "IK2_PF_PEER=1: source-driven peer copies checked both ways";
+            }
+        } else why = "the engine's link test: " + g_two.link.say + " (IK2_PF_PEER=1 tries source-driven copies)";
+        std::fprintf(stderr, "NOTE GPU 1 prompt experts / remote drafter: hand-offs %s - %s\n", v ? "PEER (direct, NVLink)" : "through host memory",
+                     why.c_str());
+        return v;
+    }();
+    return on;
+}
+
+bool pf1_pick(int l, const Config& c, const std::vector<int>& cnt, const ExpertCache& EC, int T, std::vector<char>& skip) {
+    static const bool en = getenv("IK2_PF_GPU1") && std::atoi(getenv("IK2_PF_GPU1"));
+    if (!en || !g_two.on || T < 32) return false;
+    skip.assign(c.E, 0);
+    int n = 0;
+    for (int e = 0; e < c.E; ++e)
+        if (cnt[e] && EC.loc[(size_t) l * c.E + e] < 0 && g_two.own[(size_t) l * c.E + e]) skip[e] = 1, ++n;
+    return n > 0;
+}
+
+void pf1_run(const Model& M, int l, int T, const uint16_t* xq16, const Work& W, const std::vector<char>& skip, const int* gidx,
+             const float* sg, const float* su, const float* wtr) {
+    const Config& c = M.c;
+    const Layer& Ly = M.L[l];
+    Pf1& P = g_pf1;
+    const int C = c.C, F = c.F, S = T * c.K;
+    if (T > P.cap) {   // (grow: nothing of the old buffers is in flight - the chunks before it are done)
+        if (P.s) CU(cudaStreamSynchronize(P.s));
+        DevScope on(g_two.dev);
+        for (void* q : {(void*) P.x16, (void*) P.ex16, (void*) P.w16, (void*) P.h16, (void*) P.gu32, (void*) P.y32,
+                        (void*) P.tmp, (void*) P.sg, (void*) P.su, (void*) P.wtr, (void*) P.gidx})
+            if (q) CU(cudaFree(q));
+        if (P.y0) {
+            DevScope g0(0);
+            CU(cudaFree(P.y0));
+            P.y0 = nullptr;
+        }
+        if (!P.s) {
+            CU(cudaStreamCreate(&P.s));
+            CB(cublasCreate(&P.blas));
+            CB(cublasSetStream(P.blas, P.s));
+            CB(cublasSetMathMode(P.blas, CUBLAS_DEFAULT_MATH));
+            CU(cudaEventCreateWithFlags(&P.ev_done, cudaEventDisableTiming));
+            P.tab.assign(c.n_layer, {});
+        }
+        P.cap = std::max(T, 2048), P.C = C, P.F = F, P.K = c.K;
+        const size_t rows = (size_t) P.cap * c.K;
+        P.x16 = dalloc<uint16_t>((size_t) P.cap * C), P.ex16 = dalloc<uint16_t>((size_t) P.cap * C);
+        P.w16 = dalloc<uint16_t>((size_t) 2 * F * C), P.h16 = dalloc<uint16_t>((size_t) P.cap * F);
+        P.gu32 = dalloc<float>((size_t) P.cap * 2 * F), P.y32 = dalloc<float>((size_t) P.cap * C);
+        P.tmp = dalloc<float>((size_t) P.cap * C);
+        if (pf1_peer()) {
+            DevScope g0(0);
+            P.y0 = dalloc<float>((size_t) P.cap * C);
+        }
+        P.sg = dalloc<float>(rows), P.su = dalloc<float>(rows), P.wtr = dalloc<float>(rows), P.gidx = dalloc<int>(rows);
+        if (P.hx) {
+            CU(cudaFreeHost(P.hx));
+            CU(cudaFreeHost(P.hy));
+        }
+        CU(cudaHostAlloc((void**) &P.hx, (size_t) P.cap * C * 2, cudaHostAllocPortable));
+        CU(cudaHostAlloc((void**) &P.hy, (size_t) P.cap * C * 4, cudaHostAllocPortable));
+    }
+    if (!P.ev_in) CU(cudaEventCreateWithFlags(&P.ev_in, cudaEventDisableTiming));   // (GPU 0's)
+    if (P.tab[l].empty()) {
+        P.tab[l].assign(c.E, nullptr);
+        CU(cudaMemcpy(P.tab[l].data(), g_two.tab[l], (size_t) c.E * sizeof(void*), cudaMemcpyDeviceToHost));
+    }
+    // (peer copies are driven by the SOURCE GPU's stream: on 2x RTX 2080 Ti with NVLink a peer copy on the destination's stream
+    //  arrives partly wrong between ~256 KB and ~3 MB - measured, tools in the session notes; g_s is GPU 0's, and GPU 1's stream
+    //  has finished with P.x16 for the layer before: pf1_add made g_s wait for its event)
+    const bool peer = pf1_peer();
+    if (peer) CU(cudaMemcpyPeerAsync(P.x16, g_two.dev, xq16, 0, (size_t) T * C * 2, g_s));
+    else CU(cudaMemcpyAsync(P.hx, xq16, (size_t) T * C * 2, cudaMemcpyDeviceToHost, g_s));
+    CU(cudaEventRecord(P.ev_in, g_s));
+    DevScope on(g_two.dev);
+    CU(cudaStreamWaitEvent(P.s, P.ev_in, 0));
+    if (!peer) CU(cudaMemcpyAsync(P.x16, P.hx, (size_t) T * C * 2, cudaMemcpyHostToDevice, P.s));
+    CU(cudaMemcpyAsync(P.gidx, gidx, (size_t) S * 4, cudaMemcpyHostToDevice, P.s));
+    CU(cudaMemcpyAsync(P.sg, sg, (size_t) S * 4, cudaMemcpyHostToDevice, P.s));
+    CU(cudaMemcpyAsync(P.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, P.s));
+    CU(cudaMemcpyAsync(P.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, P.s));
+    CU(cudaMemsetAsync(P.tmp, 0, (size_t) T * C * 4, P.s));
+    const float one = 1.0f, zero = 0.0f;
+    auto gemm = [&](const uint16_t* Wt, int N, int Kd, const uint16_t* X, int rows, float* Y) {
+        CB(cublasGemmEx(P.blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, Kd, &one, Wt, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &zero, Y,
+                        CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    };
+    for (int e = 0; e < c.E; ++e) {
+        if (!skip[e]) continue;
+        const int cnt_e = W.cnt[e], st_e = W.start[e];
+        const uint8_t* sl = P.tab[l][e];
+        gather_f16_16_kernel<<<cnt_e, 256, 0, P.s>>>(P.x16, P.gidx + st_e, cnt_e, C, P.ex16);
+        if (Ly.ty[0] == Ly.ty[1]) {
+            k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, P.w16, P.s);
+        } else {
+            k::decode_f16(Ly.ty[0], sl, (size_t) F * C, P.w16, P.s);
+            k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, P.w16 + (size_t) F * C, P.s);
+        }
+        gemm(P.w16, 2 * F, C, P.ex16, cnt_e, P.gu32);
+        k::swiglu_cap_f32(P.gu32, cnt_e, F, P.sg + st_e, P.su + st_e, c.gate_cap, c.up_cap, P.h16, P.s);
+        k::decode_f16(Ly.ty[2], sl + Ly.eb[0] + Ly.eb[1], (size_t) C * F, P.w16, P.s);
+        gemm(P.w16, C, F, P.h16, cnt_e, P.y32);
+        scatter_add_rows_kernel<<<cnt_e, 256, 0, P.s>>>(P.y32, P.gidx + st_e, P.wtr + st_e, C, P.tmp, C);
+        ++P.n_exps;
+    }
+    ++P.n_run;
+    if (peer) CU(cudaMemcpyPeerAsync(P.y0, 0, P.tmp, g_two.dev, (size_t) T * C * 4, P.s));
+    else CU(cudaMemcpyAsync(P.hy, P.tmp, (size_t) T * C * 4, cudaMemcpyDeviceToHost, P.s));
+    CU(cudaEventRecord(P.ev_done, P.s));
+}
+// (on GPU 0's stream, after its own experts: GPU 1's sums in, added)
+void pf1_add(Work& W, int T, int C) {
+    Pf1& P = g_pf1;
+    CU(cudaStreamWaitEvent(g_s, P.ev_done, 0));
+    if (pf1_peer()) {
+        k::add(W.tmp, P.y0, (size_t) T * C, W.tmp, g_s);   // (GPU 1's sums already on GPU 0)
+        return;
+    }
+    CU(cudaMemcpyAsync(W.y32, P.hy, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
+    k::add(W.tmp, W.y32, (size_t) T * C, W.tmp, g_s);
 }
 
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
@@ -5091,7 +5422,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         //  IK2_DRAFT_COUPLE_T, so that its draws stay on the model's token there - any draft leaves the model's draw exact)
         static const double couple_t = getenv("IK2_DRAFT_COUPLE_T") ? std::atof(getenv("IK2_DRAFT_COUPLE_T")) : 1.0;
         nz.salt = sc.salt, nz.inv_temp = sc.temp > 0 ? (float) (1.0 / (sc.temp * couple_t)) : 0.0f, nz.cap = c.logit_cap;
-        ik2::draft::propose(drafter, anchor, anchor_h, P, g_draft_head16, c.n_rows, c.n_vocab, dr, B - 1,
+        drafter_propose(drafter, anchor, anchor_h, P, g_draft_head16, c.n_rows, c.n_vocab, dr, B - 1,
                             sc.temp > 0 && g_draft_couple ? &nz : nullptr);
         if (t_draft) *t_draft += now() - t0;
         g_sp_draft += now() - t0;
@@ -5166,8 +5497,8 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
     if (m < B) block_rollback(m);
     if (drafter) {   // (its context for the kept positions, whichever drafted)
-        ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
-        ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
+        drafter_write_context(drafter, g_taps, g_taps_ld, 0, m, P);
+        drafter_set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
     }
     static const bool sp_prof = getenv("IK2_SPEC_PROF") && std::atoi(getenv("IK2_SPEC_PROF"));
     if (sp_prof) {   // (the tail waited for: the rollback and the drafter's context)
@@ -5298,7 +5629,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
             }
         }
-        g_pf.lap(g_pf.attn);
+        g_pf.lap(Ly.sliding ? g_pf.attn_swa : g_pf.attn);
         gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
         const int S = T * c.K;
         int* rtop = W.route_d;
@@ -6095,8 +6426,8 @@ void decode_greedy(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, in
             std::vector<int> ag;
             forward(M, &anchor, 1, P, false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
             if (drafter) {
-                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
-                ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                drafter_write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
+                drafter_set_f_rnn(drafter, g_taps, g_taps_ld, 0);
             }
             CU(cudaStreamSynchronize(g_s));
             ctl.took_plain(now() - ts);
@@ -6393,9 +6724,6 @@ void check_hardware(int n_gpu, bool serve) {
     };
     const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
     const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
-#if defined(_WIN32) && defined(MAYA_USE_HIP)
-    if (!force) refuse("Inkling 2 on AMD is supported on Linux only, not on Windows" + run_anyway);
-#endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
 #ifdef MAYA_USE_HIP
@@ -6912,8 +7240,11 @@ int main(int argc, char** argv) {
         int cls = 80;
         for (int d = 0; d < n_gpu; ++d) use_dev(d), cls = std::min(cls, k::arch_class());
         use_dev(0);
-        if (cls < 80) g_flash = false;
-        g_pa70 = cls == 70 && !(getenv("IK2_PA70") && !std::atoi(getenv("IK2_PA70")));
+        if (cls < 80) g_flash = cls == 75 && getenv("IK2_FLASH_TURING") && std::atoi(getenv("IK2_FLASH_TURING"));   // (Turing: its own layout, FP16 KV)
+        g_flash_tu = cls < 80;
+        g_pa70 = (cls == 70 || (cls == 75 && getenv("IK2_PA70_TURING") && std::atoi(getenv("IK2_PA70_TURING")))) &&
+                 !(getenv("IK2_PA70") && !std::atoi(getenv("IK2_PA70")));
+        if (cls == 75) g_pa70_min = 16384;   // (Turing, IK2_PA70_TURING=1: even with the cuBLAS path at ~16K, ahead above)
         if (getenv("IK2_PA70_MIN")) g_pa70_min = std::max(0, std::atoi(getenv("IK2_PA70_MIN")));
         if (cls < 80 && !g_block_exact && (!draft_path.empty() || g_lookup)) {   // (the tiles' window: Ampere's)
             std::printf("NOTE maya-ik2: drafting off - IK2_BLOCK_EXACT=0's verify window is Ampere's (this GPU: sm_%d "
@@ -7995,16 +8326,55 @@ int main(int argc, char** argv) {
         // (the offload path: the plan's rows; it keeps the tier half a GiB beside the 1 GiB left free there)
         const bool off_dr = g_off_want && !g_fast_want;
         const size_t off_keep = (size_t) 3 << 29;
+        // (IK2_DRAFT_GPU=N: the drafter on GPU N, in the two-GPU split with the target's head as planar Q8 - the
+        //  drafter's VRAM is then N's, the expert tier of GPU 0 keeps it; see DraftRemote)
+        const char* dg_env = getenv("IK2_DRAFT_GPU");
+        const int dg = dg_env && *dg_env ? std::atoi(dg_env) : -1;
+        if (dg > 0 && g_drem.dev < 0) {
+            if (!g_two.want || dg != g_two.dev || draft_head || !M.out_w.q8 || dual())
+                std::printf("NOTE maya-ik2: IK2_DRAFT_GPU=%d is for the two-GPU split with the head as Q8: the drafter stays on GPU 0 "
+                            "(gpus %d, split %d on GPU %d, head f16 %d, head q8 %d, ep/tp %d)\n", dg, n_gpu, (int) g_two.want, g_two.dev,
+                            draft_head != nullptr, M.out_w.q8 != nullptr, (int) dual());
+            else {
+                DraftRemote& R = g_drem;
+                R.dev = dg, R.C = c.C, R.ld = g_taps_ld, R.ntap = g_final_tap + 1;
+                CU(cudaEventCreateWithFlags(&R.ev_src, cudaEventDisableTiming));
+                // (pinned with GPU 0 current: its stream does the copy down, the drafter's the copy up)
+                CU(cudaHostAlloc((void**) &R.host, (size_t) R.ntap * R.ld * R.C * sizeof(float), cudaHostAllocPortable));
+                CU(cudaHostAlloc((void**) &R.host_anchor, (size_t) R.C * sizeof(float), cudaHostAllocPortable));
+                DevScope on(dg);
+                CU(cudaStreamCreate(&R.s));
+                CB(cublasCreate(&R.blas));
+                CB(cublasSetStream(R.blas, R.s));
+                CB(cublasSetMathMode(R.blas, CUBLAS_DEFAULT_MATH));
+                CU(cudaEventCreateWithFlags(&R.ev_cp, cudaEventDisableTiming));
+                R.taps = dalloc<float>((size_t) R.ntap * R.ld * R.C);
+                R.anchor = dalloc<float>((size_t) R.C);
+                const size_t qb = (size_t) c.n_rows * c.C, db = (size_t) c.n_rows * (c.C / 32) * sizeof(uint16_t);
+                R.q8 = dalloc<int8_t>(qb);
+                R.q8d = dalloc<uint16_t>(db / sizeof(uint16_t));
+                CU(cudaMemcpyPeer(R.q8, dg, M.out_w.q8, 0, qb));
+                CU(cudaMemcpyPeer(R.q8d, dg, M.out_w.q8d, 0, db));
+            }
+        }
         for (int kv8 = kv_want == "fp8" || (off_dr && g_draft_kv8 == 1) ? 1 : 0;
              kv8 <= (kv_want == "f16" || (off_dr && g_draft_kv8 == 0) ? 0 : 1) && !drafter; ++kv8) {
             ik2::draft::Drafter* dr = nullptr;
             try {
+                if (g_drem.dev >= 0) {
+                    DevScope on(g_drem.dev);
+                    dr = ik2::draft::load(draft_path, c.C, ctx, g_drem.blas, g_drem.s, kv8 != 0);
+                    ik2::draft::fold_q8(dr, g_drem.q8, g_drem.q8d, c.n_rows);
+                    ik2::draft::set_head_q8(dr, g_drem.q8, g_drem.q8d);
+                    CU(cudaStreamSynchronize(g_drem.s));
+                } else {
                 dr = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, kv8 != 0);
                 if (draft_head) {
                     ik2::draft::fold(dr, draft_head, c.n_rows);
                 } else {
                     ik2::draft::fold_q8(dr, M.out_w.q8, M.out_w.q8d, c.n_rows);
                     ik2::draft::set_head_q8(dr, M.out_w.q8, M.out_w.q8d);
+                }
                 }
             } catch (const std::exception& e) {
                 die(e.what());
@@ -8029,6 +8399,8 @@ int main(int argc, char** argv) {
                         ik2::draft::context_fp8(drafter) && kv_want == "auto" ? (off_dr ? " (the plan's)" : " (FP16's do not fit beside every expert)")
                                                                                : "",
                         ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
+            if (g_drem.dev >= 0)
+                std::printf("drafter: on GPU %d (IK2_DRAFT_GPU): its VRAM is that GPU's, GPU 0's expert tier keeps the room\n", g_drem.dev);
         } else {
             if (off_dr)
                 std::printf("NOTE maya-ik2: the drafter left out: beside it the experts' tier would have no room (%.2f "
@@ -8809,8 +9181,8 @@ int main(int argc, char** argv) {
                             forward(M, ids.data() + p0, n, (int) p0, false, last_c ? OutMode::kArgmax : OutMode::kNone,
                                     std::string(), lo, &ag, t_exp);
                             if (drafter) {
-                                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
-                                if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                                drafter_write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
+                                if (last_c) drafter_set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                             }
                             if (last_c) first = ag[0];
                         }
@@ -9613,8 +9985,8 @@ int main(int argc, char** argv) {
                                 std::string(), lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
                         if (drafter) {   // (the drafter's context for these positions, from their taps)
-                            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
-                            if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                            drafter_write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
+                            if (last_c) drafter_set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                         }
                         if (serve_maya) {   // (read, total, ms, tok/s, reused: the page's live bar and prompt speed;
                                             //  the layer-major path above and --parallel print theirs, this path none)
@@ -9808,8 +10180,8 @@ int main(int argc, char** argv) {
                     last = std::move(lo);
                 }
                 if (drafter && spec_on) {   // (the drafter's context for the token: its taps, row 0)
-                    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, (int) hist.size());
-                    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                    drafter_write_context(drafter, g_taps, g_taps_ld, 0, 1, (int) hist.size());
+                    drafter_set_f_rnn(drafter, g_taps, g_taps_ld, 0);
                 }
                 if (req_spec) {
                     CU(cudaStreamSynchronize(g_s));
@@ -9826,6 +10198,20 @@ int main(int argc, char** argv) {
             if (serve_maya) stat_line(n_out, now());
             unsigned long long ph1 = 0, pn1 = 0;
             pick_counts(n_out, ph1, pn1);
+            if (g_prof && serve_maya) {   // (IK2_PROF=1: where this request's time went - prompt and decode together)
+                std::fprintf(stderr, "NOTE profile attention (full layers) %.2f s, (sliding) %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n", g_pf.attn, g_pf.attn_swa,
+                            g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
+                for (int sl = 1; sl >= 0; --sl)
+                    std::fprintf(stderr, "NOTE profile %s layers: norm+residual %.2f s, projections+convs %.2f s, prep_qkv %.2f s, attention core %.2f s, gate+o-proj %.2f s\n", sl ? "sliding" : "full", g_pf.ph[sl][0], g_pf.ph[sl][1], g_pf.ph[sl][2], g_pf.ph[sl][3], g_pf.ph[sl][4]);
+                std::fprintf(stderr, "NOTE profile experts: gather %.2f s, decode gate/up %.2f s, gemm gate/up %.2f s, swiglu+decode down %.2f s, gemm down %.2f s, scatter %.2f s\n", g_pf.ex[0], g_pf.ex[1], g_pf.ex[2], g_pf.ex[3], g_pf.ex[4], g_pf.ex[5]);
+                std::fprintf(stderr, "NOTE profile GPU 0 waited for GPU 1's experts %.2f s\n", g_pf.p1w);
+                g_pf.p1w = 0;
+                std::fprintf(stderr, "NOTE profile phase0 (norm+residual) pieces: looped visits full/sliding: attn_res %.2f/%.2f s, loop gates %.2f/%.2f s, 3x rms %.2f/%.2f s; plain sliding attn_res_rms %.2f s\n", g_pf.p0[0], g_pf.p0s[0], g_pf.p0[1], g_pf.p0s[1], g_pf.p0[2], g_pf.p0s[2], g_pf.p0s[3]);
+                std::memset(g_pf.p0, 0, sizeof g_pf.p0), std::memset(g_pf.p0s, 0, sizeof g_pf.p0s);
+                std::memset(g_pf.ex, 0, sizeof g_pf.ex);
+                std::memset(g_pf.ph, 0, sizeof g_pf.ph);
+                g_pf.attn_swa = g_pf.attn = g_pf.route = g_pf.upload = g_pf.experts = g_pf.rest = 0;
+            }
             if (serve_maya)   // (DONE's 6th and 7th fields: this answer's drafts kept and offered; 9th, 10th its picks
                               //  found in VRAM and all its picks)
                 std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %d %llu %llu\n", n_out, ids.size(), (t1 - t0) * 1e3,
@@ -9879,8 +10265,8 @@ int main(int argc, char** argv) {
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
-                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, g_depth + p0);
-                if (last) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                drafter_write_context(drafter, g_taps, g_taps_ld, 0, n, g_depth + p0);
+                if (last) drafter_set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
             }
         }
     }
@@ -10013,8 +10399,8 @@ int main(int argc, char** argv) {
                 std::vector<int> ag;
                 forward(M, &anchor, 1, P, false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
                 if (drafter) {
-                    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
-                    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                    drafter_write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
+                    drafter_set_f_rnn(drafter, g_taps, g_taps_ld, 0);
                 }
                 CU(cudaStreamSynchronize(g_s));
                 ctl.took_plain(now() - ts);
@@ -10049,7 +10435,7 @@ int main(int argc, char** argv) {
             const double t0 = now();
             embed_row(M, anchor, raw, anchor_h);
             int dr[ik2::draft::kBlock - 1];
-            if (B > 1) ik2::draft::propose(drafter, anchor, anchor_h, P, draft_head, c.n_rows, c.n_vocab, dr, B - 1);
+            if (B > 1) drafter_propose(drafter, anchor, anchor_h, P, draft_head, c.n_rows, c.n_vocab, dr, B - 1);
             const double t1 = now();
             int tk[ik2::draft::kBlock];
             tk[0] = anchor;
@@ -10143,8 +10529,8 @@ int main(int argc, char** argv) {
                 if (use_block && n_steps >= block_check) block_rollback(n + 1);
                 else rollback(M, n + 1);
             }
-            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n + 1, P);
-            ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n);
+            drafter_write_context(drafter, g_taps, g_taps_ld, 0, n + 1, P);
+            drafter_set_f_rnn(drafter, g_taps, g_taps_ld, n);
             for (int j = 0; j < n && (int) out.size() < gen; ++j) out.push_back(dr[j]);
             if ((int) out.size() < gen) out.push_back(g[n]);
             anchor = g[n];

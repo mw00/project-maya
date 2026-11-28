@@ -535,7 +535,7 @@ def _choices(cfg: dict) -> dict:
         # GLM-5.3 (744B): text only (no vision tower), its NextN block drafts (DFlash2's drafter is GLM-5.3-Flash's),
         # and what its engine serves today - KV streaming, answers at once decoded together (glm_dsa_product)
         return {"draft": ["mtp"], "images": False, "text_only": True, "dflash2": False,
-                "kv_streaming": G53.KV_STREAMING, "batched": G53.BATCHED_ROWS}
+                "kv_streaming": G53.kv_streaming_taken(), "batched": G53.BATCHED_ROWS}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
             "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -624,7 +624,7 @@ def settings_of(cfg: dict) -> dict:
                parallel=_int(flag(args, "--parallel"), 1), draft="dflash2" if flag(args, "--dflash") else "mtp",
                expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
                kv_streaming=glm_streams(cfg), kv_resident=_int(flag(args, "--kv-resident")))
-    if not G53.KV_STREAMING and G53.config_is_glm_dsa(cfg):   # (GLM-5.3: its whole cache in VRAM - apply() writes it)
+    if not G53.kv_streaming_taken() and G53.config_is_glm_dsa(cfg):   # (the gate closed: apply() writes it off)
         out.update(kv_streaming=False, kv_resident=None)
     return out
 
@@ -640,6 +640,16 @@ def glm53_kv_bytes(cfg: dict) -> int | None:
     int8 = int8.strip() != "0" if int8 is not None else flag(cfg.get("args") or [], "--kv") in (None, "int8")
     return G53.kv_bytes_per_token(G53.config_pack(cfg), int8,
                                   str(maya_names.lookup(env, "MAYA_GLM_IDX_FP16", "")).strip() == "1")
+
+
+def glm53_kv_index_bytes(cfg: dict) -> int | None:
+    """The part of glm53_kv_bytes that KV streaming leaves in VRAM: the indexer's keys a context token
+    (glm_dsa_product.kv_index_bytes_of; FP32 unless MAYA_GLM_IDX_FP16=1).  None for any other config."""
+    g = G53.geometry(G53.config_pack(cfg)) if G53.config_is_glm_dsa(cfg) else None
+    if g is None:
+        return None
+    env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
+    return G53.kv_index_bytes_of(g, str(maya_names.lookup(env, "MAYA_GLM_IDX_FP16", "")).strip() == "1")
 
 
 def glm_streams(cfg: dict) -> bool:
@@ -1040,10 +1050,9 @@ def apply(cfg: dict, settings: dict) -> dict:
         pf = _num(s, "prefill", 64, 65536, "Prompt chunk")
         if pf is not None or "--prefill" in args:
             args = set_flag(args, "--prefill", "auto" if pf is None else pf)
-        if dsa and not G53.KV_STREAMING:
-            # GLM-5.3: the engine keeps its whole cache in VRAM for now (a window below the context does not start) -
-            # asked for, a clear no; a config with it (an older setup's "on", a window) gets it off, so every context
-            # starts
+        if dsa and not G53.kv_streaming_taken():
+            # GLM-5.3 with KV streaming not taken at all (glm_dsa_product: neither the default nor by hand) - asked
+            # for, a clear no; a config with it (an older setup's "on", a window) gets it off
             if settings.get("kv_streaming") or (_int(settings.get("kv_resident"), 0) or 0) > 0:
                 raise ValueError("KV streaming: not served on GLM-5.3 yet - its whole attention cache stays in VRAM")
             if "--kv-streaming" in args or glm_streams(cfg):
@@ -1165,8 +1174,10 @@ def describe(path: Path, running: str | None) -> dict:
     setup = dict(inst.get("as_set_up") or cur)
     setup["env"] = shown_env(setup.get("env"))
     # GLM-5.3 (744B): its name on screen beside the quant, and its cache's bytes a context token for the Context size's
-    # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's) - keys only its configs have
-    own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg)} if G53.config_is_glm_dsa(cfg) else {}
+    # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's), with the part of it KV streaming leaves in VRAM (the
+    # indexer's keys) - keys only its configs have
+    own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg), "kv_index_bytes": glm53_kv_index_bytes(cfg)} \
+        if G53.config_is_glm_dsa(cfg) else {}
     if family(cfg) == "hy4":
         # (never said on the page: from which context the engine keeps its cache in the smaller rows - the Context
         #  size's GB figure counts them; and whether a context above the largest offered needs more VRAM - one line)

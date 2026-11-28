@@ -9,6 +9,7 @@
 //   8. Full-precision (F32 / F16 / BF16) dense matrices -> Q8_0 at load (ling_dense.hpp)
 #include "ling_dense.hpp"
 #include "ling_drafting.hpp"
+#include "ling_kv_reuse.hpp"
 #include "ling_moe_plan.hpp"
 #include "ling_restore.hpp"
 #include "ling_sys.hpp"
@@ -785,6 +786,30 @@ static void test_moe_tiles_bound_rows() {
 }
 
 // --drafting: auto measures at the first start; on (the setup writes mtp) drafts without measuring; off does not draft
+static void test_kv_reuse_plan() {
+    namespace K = ling::kv_reuse;
+    const size_t GiB = 1ull << 30, tb = K::tile_bytes(32, 128, 128);
+    EXPECT(tb == 16ull << 20, "tile bytes %zu", tb);
+    // one chunk: nothing is read twice
+    EXPECT(K::plan(4, 32, 128, 128, 0, 2048, 2048, 20 * GiB, 0, 32 * GiB).tiles_per_layer == 0, "one chunk kept tiles");
+    // 64K prompt from 0 in 2048 chunks: the last chunk starts at 63488 -> 62 tiles are read again; plenty of room
+    K::Plan p = K::plan(4, 32, 128, 128, 0, 65536, 2048, 20 * GiB, 1 * GiB, 32 * GiB);
+    EXPECT(p.tiles_per_layer == 62 && p.bytes == 62 * tb * 4, "64K plan %d", p.tiles_per_layer);
+    // a follow-up prompt that starts deep in the context: its earlier positions' tiles count too
+    p = K::plan(4, 32, 128, 128, 100000, 4096, 2048, 20 * GiB, 0, 32 * GiB);
+    EXPECT(p.tiles_per_layer == 99, "follow-up plan %d", p.tiles_per_layer);   // (100000 + 2048) / 1024
+    // room for part: free less reserve less 1/32 of the card, split over the layers
+    p = K::plan(4, 32, 128, 128, 0, 200000, 2048, 3 * GiB, 1 * GiB, 32 * GiB);
+    EXPECT(p.tiles_per_layer == (int) ((2 * GiB - GiB) / 4 / tb) && p.bytes <= 3 * GiB - 2 * GiB, "partial plan %d",
+           p.tiles_per_layer);
+    // too little free VRAM (or none beyond the reserve): nothing kept, today's path
+    EXPECT(K::plan(4, 32, 128, 128, 0, 200000, 2048, 2 * GiB, 1 * GiB, 32 * GiB).tiles_per_layer == 0, "no room");
+    EXPECT(K::plan(4, 32, 128, 128, 0, 200000, 2048, (2 * GiB) + 4 * tb - 1, 1 * GiB, 32 * GiB).tiles_per_layer == 0,
+           "less than a tile a layer");
+    EXPECT(K::plan(0, 32, 128, 128, 0, 200000, 2048, 20 * GiB, 0, 32 * GiB).tiles_per_layer == 0, "no MLA layer");
+    std::printf("PASS test_kv_reuse_plan\n");
+}
+
 static void test_drafting_values() {
     namespace D = ling::drafting;
     for (const char* v : {"on", "mtp", "1"}) {
@@ -810,6 +835,7 @@ int main() {
     test_dense_to_q8_0();
     test_moe_tiles_bound_rows();
     test_drafting_values();
+    test_kv_reuse_plan();
     test_numa_helpers();
     test_direct_reader();
     test_os_layer();

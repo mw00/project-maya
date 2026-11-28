@@ -7,10 +7,63 @@
 // call instead (two parts: 2 chunks 67%, 3 75%, 4 80%), against a fixed cost a chunk (every layer's routes synced to
 // the host for its plan, the expert weights read once a chunk) and fewer rows a GEMM.  The chunk length changes the
 // prompt's arithmetic, as --prefill N does.
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 
 namespace maya::core {
+
+// The largest chunk on Auto's 256-token grid whose buffers fit. The test must be monotonic on [first, last].
+template <class Fits>
+inline int64_t prefill_grid_chunk(int64_t first, int64_t last, Fits fits) {
+    int64_t lo = (first + 255) / 256, hi = last / 256, best = 0;
+    while (lo <= hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if (fits(mid * 256)) {
+            best = mid * 256;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
+inline constexpr int kPreMinT = 1024, kPreMinSlots = 16;   // the smallest chunk and ring used for prestaging
+
+struct PrefillPoolFit {
+    int chunk = 0, prestage = 0;
+    size_t bytes = 0, loan = 0;
+};
+
+// MAYA_GLM_PREFILL_MB takes precedence over the percentage. Both still leave the pool its slot floor.
+inline size_t prefill_pool_loan(int64_t per, int64_t keep, size_t row, int64_t pct, size_t fixed_bytes) {
+    const int64_t rows = std::max<int64_t>(0, per - keep);
+    if (fixed_bytes != SIZE_MAX) return std::min((size_t) rows * row, fixed_bytes);
+    const int64_t share = std::max<int64_t>(0, pct * per / 100);
+    return (size_t) std::min(rows, share) * row;
+}
+
+// Reconcile a prepared chunk with the measured pool loan. Trim its prestage ring first; only Auto may take a
+// smaller chunk. Never grow the ring beyond the events allocated for it. nonring measures the complete aligned
+// layout (including the whole KV staging area) without that ring.
+template <class Nonring>
+inline PrefillPoolFit prefill_pool_fit(int chunk, int prestage, size_t stride, size_t loan, bool automatic,
+                                      Nonring nonring) {
+    size_t base = nonring(chunk);
+    if (base > loan) {
+        if (!automatic) return {0, 0, base, loan};
+        chunk = (int) prefill_grid_chunk(256, chunk - 1, [&](int64_t t) { return nonring(t) <= loan; });
+        if (chunk == 0) return {0, 0, nonring(256), loan};
+        base = nonring(chunk);
+    }
+    // The ring is carved in whole 256-byte blocks; an expert stride need only be 16-byte aligned.
+    const size_t room = (loan - base) & ~size_t{255};
+    const int slots = chunk >= kPreMinT && stride > 0 ? (int) std::min((size_t) prestage, room / stride) : 0;
+    const int np = slots >= kPreMinSlots ? slots : 0;
+    return {chunk, np, base + (((size_t) np * stride + 255) & ~size_t{255}), loan};
+}
 
 struct PrefillMinChunks {
     int n = 1;              // 1: off (as many chunks as the largest chunk needs)

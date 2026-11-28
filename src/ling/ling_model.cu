@@ -4,6 +4,7 @@
 
 #include "ling_dense.hpp"
 #include "ling_kernels.cuh"
+#include "ling_kv_reuse.hpp"
 #include "ling_moe_plan.hpp"
 #include "ling_parity.hpp"
 #include "ling_sys.hpp"
@@ -2733,25 +2734,42 @@ void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io, const i
     const float one = 1.0f, zero = 0.0f;
     const float scale = 1.0f / sqrtf((float) c.qk_head);
 
+    // Kept tiles (ling_kv_reuse.hpp): a full tile expanded once in this prompt is read from the store by the later
+    // chunks; it is written by the same GEMM as the scratch tile, so the same bits
+    const bool kvr = l.kvr_slot >= 0 && gp.kvr_buf != nullptr && BK_tile == kv_reuse::kTile;
+    const size_t kvr_tb = kv_reuse::tile_bytes(H, QN, VH);
     for (int k0 = 0; k0 < S_total; k0 += BK_tile) {
         const int BK = std::min(BK_tile, S_total - k0);
-        const uint16_t* lat16_cur = nullptr;
-        if (o_.kv_q8) {
-            k::lat_q8_to_f16(l.lat, k0, BK, KL, lat16_buf, s);
-            lat16_cur = lat16_buf;
-        } else {
-            lat16_cur = (const uint16_t*) l.lat + (size_t) k0 * KL;
+        const int tile = k0 / BK_tile;
+        const bool kept = kvr && BK == kv_reuse::kTile && tile < gp.kvr_tiles && tile <= l.kvr_filled;
+        uint16_t* K_nope_cur = K_nope16;
+        uint16_t* V_cur = V16;
+        if (kept) {
+            uint8_t* base = gp.kvr_buf + ((size_t) l.kvr_slot * (size_t) gp.kvr_tiles + (size_t) tile) * kvr_tb;
+            K_nope_cur = (uint16_t*) base;
+            V_cur = (uint16_t*) (base + (size_t) H * kv_reuse::kTile * QN * 2);
         }
+        if (!kept || tile == l.kvr_filled) {
+            const uint16_t* lat16_cur = nullptr;
+            if (o_.kv_q8) {
+                k::lat_q8_to_f16(l.lat, k0, BK, KL, lat16_buf, s);
+                lat16_cur = lat16_buf;
+            } else {
+                lat16_cur = (const uint16_t*) l.lat + (size_t) k0 * KL;
+            }
 
-        // Expand K_nope[H, BK, QN] = wkb[H, KL, QN]^T_col * lat[BK, KL]
-        CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, QN, BK, KL, &one, wkb16, CUDA_R_16F, QN,
-                                          (long long) KL * QN, lat16_cur, CUDA_R_16F, KL, 0LL, &zero, K_nope16,
-                                          CUDA_R_16F, QN, (long long) BK * QN, H, CUBLAS_COMPUTE_32F,
-                                          CUBLAS_GEMM_DEFAULT));
-        // Expand V[H, BK, VH] = wvb[H, VH, KL] * lat[BK, KL]
-        CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, VH, BK, KL, &one, wvb16, CUDA_R_16F, KL,
-                                          (long long) VH * KL, lat16_cur, CUDA_R_16F, KL, 0LL, &zero, V16, CUDA_R_16F,
-                                          VH, (long long) BK * VH, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            // Expand K_nope[H, BK, QN] = wkb[H, KL, QN]^T_col * lat[BK, KL]
+            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, QN, BK, KL, &one, wkb16, CUDA_R_16F,
+                                              QN, (long long) KL * QN, lat16_cur, CUDA_R_16F, KL, 0LL, &zero,
+                                              K_nope_cur, CUDA_R_16F, QN, (long long) BK * QN, H, CUBLAS_COMPUTE_32F,
+                                              CUBLAS_GEMM_DEFAULT));
+            // Expand V[H, BK, VH] = wvb[H, VH, KL] * lat[BK, KL]
+            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, VH, BK, KL, &one, wvb16, CUDA_R_16F,
+                                              KL, (long long) VH * KL, lat16_cur, CUDA_R_16F, KL, 0LL, &zero, V_cur,
+                                              CUDA_R_16F, VH, (long long) BK * VH, H, CUBLAS_COMPUTE_32F,
+                                              CUBLAS_GEMM_DEFAULT));
+            if (kept) l.kvr_filled = tile + 1;
+        }
 
         const uint16_t* kpe_cur = l.k_pe + (size_t) k0 * R;
 
@@ -2760,7 +2778,7 @@ void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io, const i
             if (pos0 + q0 + BQ - 1 < k0) continue;   // strictly upper-triangular causal skip
 
             // S[H, BQ, BK] = scale * (K_nope @ Q_nope^T + K_pe @ Q_pe^T)
-            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, BK, BQ, QN, &scale, K_nope16,
+            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, BK, BQ, QN, &scale, K_nope_cur,
                                               CUDA_R_16F, QN, (long long) BK * QN, q_nope16 + (size_t) q0 * QN,
                                               CUDA_R_16F, QN, (long long) T * QN, &zero, S_buf, CUDA_R_32F, BK,
                                               (long long) BQ * BK, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -2772,7 +2790,7 @@ void Model::mla_prefill(Gpu& gp, Layer& l, int T, int pos0, float* x_io, const i
             k::mla_online_softmax(S_buf, H, T, q0, BQ, k0, BK, pos0, m_buf, l_buf, O_acc, VH, P16_buf, s);
 
             // O_acc[H, q0..q0+BQ, VH] += V[H, BK, VH] * P16[H, BQ, BK]
-            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, VH, BQ, BK, &one, V16, CUDA_R_16F, VH,
+            CKBLAS(cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, VH, BQ, BK, &one, V_cur, CUDA_R_16F, VH,
                                               (long long) BK * VH, P16_buf, CUDA_R_16F, BK, (long long) BQ * BK, &one,
                                               O_acc + (size_t) q0 * VH, CUDA_R_32F, VH, (long long) T * VH, H,
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -3377,6 +3395,73 @@ void Model::warm_vram_cache() {
     last_warm_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+void Model::kv_reuse_release() {
+    for (auto& l : layers_) {
+        l.kvr_slot = -1;
+        l.kvr_filled = 0;
+    }
+    for (auto& gp : gpus_) {
+        if (gp.kvr_buf == nullptr) continue;
+        set_dev(gp.dev);
+        if (cudaFree(gp.kvr_buf) != cudaSuccess) cudaGetLastError();
+        gp.kvr_buf = nullptr;
+        gp.kvr_bytes = 0;
+        gp.kvr_tiles = 0;
+    }
+}
+
+void Model::kv_reuse_begin(int pos0, int n) {
+    kv_reuse_release();
+    static const bool off = [] {
+        const char* e = std::getenv("LING_KV_REUSE");
+        return e != nullptr && e[0] == '0';
+    }();
+    if (off) return;
+    const Config& c = c_;
+    const int E = c.n_embd;
+    const size_t reserve_b = o_.reserve_gb > 0.0 ? (size_t) (o_.reserve_gb * (double) (1ULL << 30)) : 0u;
+    for (int gi = 0; gi < (int) gpus_.size(); ++gi) {
+        Gpu& gp = gpus_[(size_t) gi];
+        int n_mla = 0;
+        for (int il = gp.l0; il < gp.l1; ++il)
+            if (!layers_[(size_t) il].kda) ++n_mla;
+        if (n_mla == 0) continue;
+        set_dev(gp.dev);
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, gp.dev) != cudaSuccess) {
+            cudaGetLastError();
+            continue;
+        }
+        if (prop.integrated) continue;   // an APU's "VRAM" is the RAM the experts and the page cache use
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) {
+            cudaGetLastError();
+            continue;
+        }
+        // What this prompt still allocates itself: the M-RoPE table, and the drafter's prompt buffers on the last GPU
+        size_t keep = reserve_b + (size_t) 3 * (size_t) n * sizeof(int);
+        if (mtp_loaded_ && gi == (int) gpus_.size() - 1)
+            keep += (size_t) gp.pf_cap * (size_t) E * (2 * 4 + 2 * 2 + 4 + 4);
+        const kv_reuse::Plan pl = kv_reuse::plan(n_mla, c.n_head, c.qk_nope, c.v_head, pos0, n, gp.pf_cap, fb, keep, tb);
+        if (pl.tiles_per_layer <= 0) continue;
+        void* buf = nullptr;
+        if (cudaMalloc(&buf, pl.bytes) != cudaSuccess) {
+            cudaGetLastError();
+            continue;
+        }
+        gp.kvr_buf = (uint8_t*) buf;
+        gp.kvr_bytes = pl.bytes;
+        gp.kvr_tiles = pl.tiles_per_layer;
+        std::fprintf(stderr, "ling prompt: GPU%d keeps %d expanded K/V tiles a layer for %d MLA layers (%.2f GiB)\n",
+                     gp.dev, pl.tiles_per_layer, n_mla, (double) pl.bytes / (double) (1ULL << 30));
+        int slot = 0;
+        for (int il = gp.l0; il < gp.l1; ++il) {
+            Layer& l = layers_[(size_t) il];
+            if (!l.kda) l.kvr_slot = slot++;
+        }
+    }
+}
+
 const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<float>* all_logits_host,
                             const std::function<bool(int, int)>& on_progress,
                             const std::atomic<bool>* stop_flag) {
@@ -3431,6 +3516,13 @@ const float* Model::prefill(const int* tokens, int n, int pos0, std::vector<floa
         size_t fb = 0, tb = 0;
         if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) free_before_gib[(size_t) gi] = (double) fb / (double) (1ULL << 30);
     }
+    // Expanded K/V tiles of earlier chunks kept for the later ones, in VRAM the plan left free; freed when the prompt
+    // ends (every return and exception), so decode and the expert pool never see it
+    kv_reuse_begin(pos0, n);
+    struct KvReuseEnd {
+        Model* m;
+        ~KvReuseEnd() { m->kv_reuse_release(); }
+    } kv_reuse_end{this};
     if (mtp_loaded_) {
         mtp_pf_h_host_.assign((size_t) n * (size_t) E, 0.0f);
         mtp_pf_pos0_ = pos0;

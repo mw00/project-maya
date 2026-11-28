@@ -330,7 +330,7 @@ attn_flash_rdna_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __
     // so that the transposed V goes in as words, a half-warp a row's 16 words.
     using Raw = typename std::conditional<F8, uint2, uint4>::type;
     Raw zr;
-    std::memset(&zr, 0, sizeof zr);
+    __builtin_memset(&zr, 0, sizeof zr);   // (std::memset is a host function with MSVC's headers)
     const int vp = tid & 15, vg = tid >> 4;
     auto h8 = [&](const Raw& r) -> uint4 {
         if constexpr (F8) return e4m3x8_h8(r);

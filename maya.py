@@ -3035,6 +3035,10 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None, what="t
     --full-build-output: every line on the screen as it comes, no log."""
     full = S.full_build_output()
     bat = None
+    feats = S.win_simd_features() if WIN and not S.ARM else []
+    if feats and "-S" in conf and not any(str(c).startswith("-DMAYA_WIN_CPU_FEATURES=") for c in conf):
+        # ggml-cpu's AVX2/FMA/AVX-512 from the CPU itself, not from test programs Smart App Control can block
+        conf = list(conf) + ["-DMAYA_WIN_CPU_FEATURES=" + ",".join(feats)]
     if WIN:
         vcvars = vcvars or S.find_vcvars(nvcc=nvcc)
         if vcvars is None:
@@ -3078,7 +3082,31 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None, what="t
                 stopped = None
     finally:
         steps.close(stopped)
+    if feats:
+        try:
+            bdir = Path(conf[conf.index("-B") + 1]) if "-B" in conf else BUILD
+            note = cpu_guard_note(steps.path.read_text(encoding="utf-8", errors="replace"), feats, bdir)
+        except OSError:
+            note = None
+        if note:
+            warn(note)
     return stopped
+
+
+def cpu_guard_note(text: str, feats, build_dir: Path) -> str | None:
+    """One line when a Windows configure's log shows ggml-cpu built below what this CPU has - Smart App Control can
+    block CMake's check programs, and a blocked check reads as "the CPU lacks it" (no error, slower CPU experts) -
+    or shows that cmake/win_cpu_guard.cmake corrected such a result from an earlier configure.  None otherwise."""
+    variants = re.findall(r"Adding CPU backend variant ggml-cpu:\s*(.*)", text)
+    want = "GGML_AVX512" if "avx512" in feats else "GGML_AVX2" if {"avx2", "fma"} <= set(feats) else None
+    if variants and want and want not in variants[-1]:
+        return (f"ggml-cpu was built without {want[5:]} although this CPU has it (Windows Smart App Control may have "
+                f"blocked a build check): the CPU experts run slower - delete {build_dir / 'CMakeCache.txt'} and start "
+                "Maya again")
+    if "Maya CPU guard: corrected" in text:
+        return ("Windows Smart App Control had blocked a build check before; ggml-cpu is now built with " +
+                (want[5:] if want else "the CPU's own instructions"))
+    return None
 
 
 PROBE_CU ="""#include <cmath>
@@ -5042,9 +5070,9 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
         old = old_cfg.get("args") or []
-        # (GLM-5.3 without KV streaming: an older config's --kv-streaming on / --kv-resident is not kept - with them a
-        #  context above the window does not start)
-        kv_kept = () if dsa and not G53.KV_STREAMING else ("--kv-streaming", "--kv-resident")
+        # (GLM-5.3: KV streaming is opt-in - a config that has --kv-streaming on / --kv-resident, set by hand or on the
+        #  Models page, keeps them (G53.kv_streaming_taken); with that gate closed they are not kept)
+        kv_kept = () if dsa and not G53.kv_streaming_taken() else ("--kv-streaming", "--kv-resident")
         kept = keep_args(old, cfg["args"],
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
                           "--parallel", "--expert-profile-save", "--expert-profile-save-every") + kv_kept)

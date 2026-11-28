@@ -44,10 +44,20 @@ Pascal cards are not supported for it. EXL3 quants of GLM-5.3 are not supported 
 ## Context and memory
 
 Its attention cache takes **64,352 bytes a token** (the latent cache in INT8, the default; 102,272 in FP16 with
-`MAYA_GLM_KV_INT8=0`): 8K tokens about 0.5 GB, 128K about 7.9 GB (GiB), for each answer written at once. The whole cache
-stays in VRAM (KV streaming is not served on GLM-5.3 yet), so on discrete GPUs the setup offers only the contexts that
-still leave a tenth of the VRAM to the experts - up to 128K on 32 GB cards; `--context` still sets any other. The
-Models page shows the cache's GPU memory beside the context size.
+`MAYA_GLM_KV_INT8=0`): 8K tokens about 0.5 GB, 128K about 7.9 GB (GiB), for each answer written at once. By default the
+whole cache stays in VRAM (the setup writes `--kv-streaming off`), so on discrete GPUs the setup offers only the
+contexts that still leave a tenth of the VRAM to the experts - up to 128K on 32 GB cards; `--context` still sets any
+other. The Models page shows the cache's GPU memory beside the context size.
+
+**KV streaming is opt-in on GLM-5.3.** Turn it on on the Models page and give it a window, or put
+`"--kv-streaming", "on", "--kv-resident", "20480"` into the config's `"args"`; a setup again keeps it. The latent and
+rope (k_pe) caches - 53,088 of the 64,352 bytes a token - then live in pinned RAM, with a window of N positions of
+each layer in VRAM (20,480 at least); the indexer's keys (11,264 bytes a token) stay in VRAM for the whole context,
+because the indexer scores every position. `--kv-streaming on` without a window streams only when the whole cache
+does not fit beside the expert pools. Measured on 4x Tesla V100S 32 GB with UD-IQ2_M, one conversation (#975): at a
+1M context a 20,480 window decodes 29.9 tokens/s against 27.1 with the whole cache in VRAM and reads a 26K-token
+prompt at 616 tokens/s against 535, for 4 GB more RAM; in a conversation 397K tokens deep, long answers came about
+5% faster. Not measured: AMD (HIP), Windows, several answers at once, the FP16 latent.
 
 ## Its defaults
 

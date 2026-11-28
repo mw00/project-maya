@@ -23,11 +23,17 @@ _HEADER = re.compile(r"#\s*glm-dsa:")   # the line tools/strata/glm_dsa_pack.py 
 _DSA = re.compile(r"#\s*glm-dsa:\s*trunk\s+(\d+),.*?\bmtp\s+(\w+),\s*indexer full\s+([\d,]*)")
 
 # What the engine serves on glm-dsa today, for the setup and the Models page (each True once the engine has it):
-# KV streaming (--kv-streaming on / --kv-resident N) - glm_state_carve refuses a resident window smaller than the
-# context on glm-dsa (HANDOFF "Remaining work" 3a), so a GLM-5.3 config keeps its whole cache in VRAM: the setup
-# writes --kv-streaming off (with on, every context above 32768 would not start) and the Models page neither shows nor
-# takes it
+# KV streaming (--kv-streaming on / --kv-resident N) as the setup's default - not yet: the setup writes
+# --kv-streaming off for a GLM-5.3 config, which keeps its whole cache in VRAM, and offers the contexts that fit there
 KV_STREAMING = False
+# KV streaming by hand (opt-in): the fast path takes a resident window on glm-dsa (L1-6: glm_state_carve refuses one
+# only on the SlowF32 reference path).  Measured on CUDA with 4x Tesla V100S 32 GB and UD-IQ2_M (#975): a 1M context
+# with a 20480 and a 65536 window, token follow at the no-streaming count, an 803K-token conversation.  Not measured:
+# HIP, Windows, --parallel above 1, the FP16 latent.  So the setup's default stays off (KV_STREAMING above), and a
+# config that asks for it - by hand or on the Models page - keeps it: the page shows and takes the switch and the
+# window, and a setup again does not take them out.  (--kv-streaming on without a window streams only when the whole
+# cache does not fit beside the expert pools - decision 36; the measured gain at 1M came with --kv-resident N.)
+KV_STREAMING_BY_HAND = True
 # --parallel's conversations decoded together (batched rows, 3b): on glm-dsa they take turns (the pipelined path)
 BATCHED_ROWS = False
 # Memory guidance (neutral, no speeds): from about this much VRAM + RAM together every expert of unsloth's UD-IQ2_M
@@ -48,6 +54,11 @@ RESERVE_MIB = 700
 # --calibrate (tools/calibrate_glm.py: one engine run, ~20 groups of three 128-token answers) on GLM-5.3: its load takes
 # a few minutes and its answers come slower than GLM-5.3-Flash's
 CALIBRATE_MINUTES = "30-60"
+
+
+def kv_streaming_taken() -> bool:
+    """A GLM-5.3 config may carry --kv-streaming on / --kv-resident N: the setup's default, or opt-in by hand."""
+    return KV_STREAMING or KV_STREAMING_BY_HAND
 
 
 def pack_is_glm_dsa(pack) -> bool:
@@ -121,8 +132,14 @@ def kv_bytes_per_token(pack, int8: bool = True, idx_fp16: bool = False) -> int |
 def kv_bytes_of(g: dict, int8: bool = True, idx_fp16: bool = False) -> int:
     """kv_bytes_per_token's count for a geometry() (GEOMETRY: GLM-5.3's own, before its pack is built)."""
     lat = g["kv_lora"] + g["kv_lora"] // 16 if int8 else 2 * g["kv_lora"]
-    layers, full = g["trunk"] + g["mtp"], g["full"] + g["mtp"]
-    return layers * (lat + 2 * (g["kv_row"] - g["kv_lora"])) + full * g["idx_key"] * (2 if idx_fp16 else 4)
+    layers = g["trunk"] + g["mtp"]
+    return layers * (lat + 2 * (g["kv_row"] - g["kv_lora"])) + kv_index_bytes_of(g, idx_fp16)
+
+
+def kv_index_bytes_of(g: dict, idx_fp16: bool = False) -> int:
+    """The part of kv_bytes_of that is the indexer's keys.  KV streaming leaves it in VRAM for the whole context (the
+    indexer scores every position): only the latent and k_pe go to pinned RAM.  GLM-5.3: 22 x 512 = 11,264 bytes."""
+    return (g["full"] + g["mtp"]) * g["idx_key"] * (2 if idx_fp16 else 4)
 
 
 def pack_headwise_q8(pack) -> bool | None:

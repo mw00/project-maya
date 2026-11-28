@@ -106,6 +106,11 @@ class CacheBytes(Base):
                                                env={"MAYA_GLM_KV_INT8": "1"})), 64352)   # (the environment wins)
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, env={"MAYA_GLM_IDX_FP16": "1"})), 79 * 672 + 22 * 256)
         self.assertIsNone(M.glm53_kv_bytes(M.read(self.flash)))
+        # the part KV streaming leaves in VRAM: the indexer's keys (22 x 128 x 4 bytes; FP16 keys half)
+        self.assertEqual(M.glm53_kv_index_bytes(cfg), 22 * 512)
+        self.assertEqual(M.glm53_kv_index_bytes(dict(cfg, env={"MAYA_GLM_IDX_FP16": "1"})), 22 * 256)
+        self.assertEqual(M.glm53_kv_index_bytes(dict(cfg, env={"MAYA_GLM_KV_INT8": "0"})), 22 * 512)
+        self.assertIsNone(M.glm53_kv_index_bytes(M.read(self.flash)))
 
 
 NO_ABLATE = {"available": False, "why": "no refusal direction file for this model (its repo ships none yet)"}
@@ -118,7 +123,9 @@ class Page(Base):
     def test_choices(self):
         self.assertEqual(M.choices(M.read(self.g53)),
                          {"draft": ["mtp"], "images": False, "text_only": True, "dflash2": False,
-                          "kv_streaming": False, "batched": False, "ablate": NO_ABLATE})
+                          "kv_streaming": True, "batched": False, "ablate": NO_ABLATE})   # (by hand: shown)
+        with mock.patch.object(M.G53, "KV_STREAMING_BY_HAND", False):                # (the gate closed: as before)
+            self.assertIs(M.choices(M.read(self.g53))["kv_streaming"], False)
         self.assertEqual(M.choices(M.read(self.flash)), {"draft": ["mtp"], "images": True,   # (as before)
                                                          "ablate": NO_ABLATE})
         drafter = self.d / "GLM-5.3-Flash-DFlash2" / "drafter.gguf"                         # (a Flash drafter here:
@@ -129,10 +136,16 @@ class Page(Base):
                                                          "ablate": NO_ABLATE})
 
     def test_settings(self):
-        older = M.read(g53_cfg(self.d, "maya-older.json", kv_streaming="on"))   # (a setup before this one: "on")
-        for cfg in (M.read(self.g53), older):
-            s = M.settings_of(cfg)
-            self.assertEqual((s["kv_streaming"], s["kv_resident"], s["images"], s["draft"]), (False, None, False, "mtp"))
+        older = M.read(g53_cfg(self.d, "maya-older.json", kv_streaming="on"))   # (set by hand, or an older setup's)
+        s = M.settings_of(M.read(self.g53))                                     # (the setup's: off)
+        self.assertEqual((s["kv_streaming"], s["kv_resident"], s["images"], s["draft"]), (False, None, False, "mtp"))
+        s = M.settings_of(dict(older, args=older["args"] + ["--kv-resident", "20480"]))   # (a window by hand: read)
+        self.assertEqual((s["kv_streaming"], s["kv_resident"]), (True, 20480))
+        with mock.patch.object(M.G53, "KV_STREAMING_BY_HAND", False):           # (the gate closed: as before)
+            for cfg in (M.read(self.g53), older):
+                s = M.settings_of(cfg)
+                self.assertEqual((s["kv_streaming"], s["kv_resident"], s["images"], s["draft"]),
+                                 (False, None, False, "mtp"))
         self.assertEqual(M.settings_of(M.read(self.flash)),
                          {"context": 131072, "gpus": [0, 1], "env": {"MAYA_GLM_RAM_HEADROOM_GB": "4"}, "images": True,
                           "reserve_mib": None, "parallel": 1, "draft": "mtp", "expert_cache": None, "prefill": None,
@@ -140,8 +153,8 @@ class Page(Base):
 
     def test_describe(self):
         g = M.describe(self.g53, None)
-        self.assertEqual((g["shown"], g["kv_bytes"], g["quant"], g["model"], g["family"], g["ok"]),
-                         ("GLM-5.3 (744B)", 64352, "UD-IQ2_M", "glm-5.3", "glm", True))
+        self.assertEqual((g["shown"], g["kv_bytes"], g["kv_index_bytes"], g["quant"], g["model"], g["family"], g["ok"]),
+                         ("GLM-5.3 (744B)", 64352, 11264, "UD-IQ2_M", "glm-5.3", "glm", True))
         f = M.describe(self.flash, None)
         self.assertEqual(list(f), ["file", "path", "model", "family", "quant", "backend", "written", "used", "running",
                                    "port", "script", "folder", "size", "ok", "missing", "settings", "setup", "choices",
@@ -169,26 +182,48 @@ class Page(Base):
 class Apply(Base):
     """a) b) Settings written back: GLM-5.3 refuses what its engine does not serve; GLM-5.3-Flash as before."""
 
-    def test_kv_streaming_refused_and_switched_off(self):
+    def test_kv_streaming_by_hand(self):
+        """KV streaming on GLM-5.3 is opt-in: the page takes the switch and a window and keeps them; the setup's
+        config (off) is written back unchanged; what the engine does not serve is still refused."""
         cfg = M.read(self.g53)
-        for bad, why in (({"kv_streaming": True}, "KV streaming"), ({"kv_resident": 49152}, "KV streaming"),
-                         ({"images": True}, "text only"), ({"draft": "dflash2"}, "MTP \\(NextN\\)")):
+        for bad, why in (({"images": True}, "text only"), ({"draft": "dflash2"}, "MTP \\(NextN\\)")):
             with self.assertRaisesRegex(ValueError, why, msg=bad):
                 M.apply(cfg, bad)
-        older = M.read(g53_cfg(self.d, "maya-older.json", kv_streaming="on"))
-        older["args"] += ["--kv-resident", "32768"]
-        new = M.apply(older, {"context": 131072})                    # (any save: off, so every context starts)
-        self.assertEqual(M.flag(new["args"], "--kv-streaming"), "off")
-        self.assertNotIn("--kv-resident", new["args"])
-        self.assertEqual(M.flag(new["args"], "--max-context"), "131072")
-        same = M.apply(cfg, M.settings_of(cfg))                      # (the page's draft sent back unchanged)
-        self.assertEqual(same, cfg)
+        self.assertEqual(M.apply(cfg, M.settings_of(cfg)), cfg)      # (the page's draft sent back unchanged: still off)
+        on = M.apply(cfg, {"kv_streaming": True, "kv_resident": 20480})
+        self.assertEqual((M.flag(on["args"], "--kv-streaming"), M.flag(on["args"], "--kv-resident")), ("on", "20480"))
+        self.assertEqual(M.apply(on, M.settings_of(on)), on)         # (a save of what the page shows keeps it)
+        more = M.apply(on, {"context": 131072})                      # (another setting saved: the window stays)
+        self.assertEqual((M.flag(more["args"], "--kv-streaming"), M.flag(more["args"], "--kv-resident"),
+                          M.flag(more["args"], "--max-context")), ("on", "20480", "131072"))
+        off = M.apply(on, {"kv_streaming": False})
+        self.assertEqual(M.flag(off["args"], "--kv-streaming"), "off")
+        self.assertNotIn("--kv-resident", off["args"])
         bare = M.read(g53_cfg(self.d, "maya-bare.json", kv_streaming=None))   # (no flag: not added)
         self.assertEqual(M.apply(bare, {"context": 32768})["args"],
                          [a if a != "65536" else "32768" for a in bare["args"]])
-        env = dict(bare, env={"MAYA_GLM_KV_RESIDENT": "32768"})      # (a window from the environment: off)
-        self.assertEqual(M.flag(M.apply(env, {})["args"], "--kv-streaming"), "off")
-        self.assertEqual(M.flag(M.apply(cfg, {"parallel": 2})["args"], "--parallel"), "2")
+
+    def test_kv_streaming_refused_and_switched_off_with_the_gate_closed(self):
+        with mock.patch.object(M.G53, "KV_STREAMING_BY_HAND", False):
+            cfg = M.read(self.g53)
+            for bad, why in (({"kv_streaming": True}, "KV streaming"), ({"kv_resident": 49152}, "KV streaming"),
+                             ({"images": True}, "text only"), ({"draft": "dflash2"}, "MTP \\(NextN\\)")):
+                with self.assertRaisesRegex(ValueError, why, msg=bad):
+                    M.apply(cfg, bad)
+            older = M.read(g53_cfg(self.d, "maya-older.json", kv_streaming="on"))
+            older["args"] += ["--kv-resident", "32768"]
+            new = M.apply(older, {"context": 131072})                    # (any save: off, so every context starts)
+            self.assertEqual(M.flag(new["args"], "--kv-streaming"), "off")
+            self.assertNotIn("--kv-resident", new["args"])
+            self.assertEqual(M.flag(new["args"], "--max-context"), "131072")
+            same = M.apply(cfg, M.settings_of(cfg))                      # (the page's draft sent back unchanged)
+            self.assertEqual(same, cfg)
+            bare = M.read(g53_cfg(self.d, "maya-bare.json", kv_streaming=None))   # (no flag: not added)
+            self.assertEqual(M.apply(bare, {"context": 32768})["args"],
+                             [a if a != "65536" else "32768" for a in bare["args"]])
+            env = dict(bare, env={"MAYA_GLM_KV_RESIDENT": "32768"})      # (a window from the environment: off)
+            self.assertEqual(M.flag(M.apply(env, {})["args"], "--kv-streaming"), "off")
+            self.assertEqual(M.flag(M.apply(cfg, {"parallel": 2})["args"], "--parallel"), "2")
 
     def test_flash_written_as_before(self):
         cfg = M.read(self.flash)
@@ -343,11 +378,14 @@ const glmS = {context: 131072, gpus: [0], env: {}, images: true, reserve_mib: nu
 const base = {file: "maya-x.json", running: false, backend: "cuda", family: "glm",
               context_range: {min: 4096, max: 1048576, tested: 262144}};
 const flash = {...base, model: "glm-5.3-flash", quant: "Maya-M", settings: glmS, choices: {draft: ["mtp"], images: false}};
-const g53 = {...base, model: "glm-5.3", quant: "UD-IQ2_M", shown: "GLM-5.3 (744B)", kv_bytes: 64352,
+const g53 = {...base, model: "glm-5.3", quant: "UD-IQ2_M", shown: "GLM-5.3 (744B)", kv_bytes: 64352, kv_index_bytes: 11264,
              settings: {...glmS, images: false, kv_streaming: false},
-             choices: {draft: ["mtp"], images: false, text_only: true, dflash2: false, kv_streaming: false, batched: false}};
+             choices: {draft: ["mtp"], images: false, text_only: true, dflash2: false, kv_streaming: true, batched: false}};
+const g53shut = {...g53, choices: {...g53.choices, kv_streaming: false}};
 M.MS.data = {gpus: [{index: 0, name: "GPU", vram_gb: 32}]};
-const out = {flash: ser(M.fieldsOf(flash, {...flash.settings})), g53: ser(M.fieldsOf(g53, {...g53.settings}))};
+const out = {flash: ser(M.fieldsOf(flash, {...flash.settings})), g53: ser(M.fieldsOf(g53, {...g53.settings})),
+             g53shut: ser(M.fieldsOf(g53shut, {...g53shut.settings})),
+             g53on: ser(M.fieldsOf(g53, {...g53.settings, context: 1048576, kv_streaming: true, kv_resident: 20480}))};
 for (const [k, t] of Object.entries({off: {on: false}, hidden: {on: false, hidden: true}})) {
   st.S.turbo = t;
   out["turbo_" + k] = ser(T.TurboButton());
@@ -381,7 +419,13 @@ class PageJs(unittest.TestCase):
 
     def test_glm53_fields(self):
         g = rows_of(self.got["g53"])
-        self.assertNotIn("KV streaming", g)                                       # (not served on glm-dsa yet)
+        self.assertIn("KV streaming", g)                                          # (opt-in: the switch is shown, off)
+        self.assertNotIn("KV streaming", rows_of(self.got["g53shut"]))            # (the gate closed: no row)
+        self.assertIn("52 KB a token", g["KV streaming"]["hint"])                 # (53,088 bytes: latent + k_pe)
+        self.assertIn("the indexer's keys stay in VRAM", g["KV streaming"]["hint"])
+        on = json.dumps(rows_of(self.got["g53on"])["Context size"])               # (streamed at 1M, a 20480 window)
+        self.assertIn("51.8 GB of RAM for the context", on)                       # (1,048,576 x 53,088 bytes)
+        self.assertIn("11.0 GB of index keys stay in VRAM", on)                   # (1,048,576 x 11,264 bytes)
         self.assertEqual(g["Images"]["hint"], "GLM-5.3 (744B) reads text only: the model has no vision tower.")
         self.assertTrue(g["Answers at once"]["hint"].endswith("On GLM-5.3 (744B) they are answered one after another "
                                                               "for now."))

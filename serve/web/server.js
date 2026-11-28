@@ -173,7 +173,7 @@ export function ctxEstimate(n) {
 // `live`: the running engine's own measurement scaled (ctxEstimate); else from the cache's bytes per token - `ram`: a
 // streamed cache, every position in pinned RAM and `win` of them in VRAM (`whole`: a context up to `win` is not streamed,
 // GLM's), `vram`: a cache wholly in VRAM.  `now`: the size it has now (the change in GB is shown against it).
-export function ctxHint(n, {live = false, now = null, win = 0, whole = false, ram = 0, vram = 0} = {}) {
+export function ctxHint(n, {live = false, now = null, win = 0, whole = false, ram = 0, vram = 0, keys = 0} = {}) {
   const e = live ? ctxEstimate(n) : null, same = now == null || n === now;
   const more = (d) => (same || !d ? "." : ` · ${fmt(Math.abs(d), 1)} GB ${d > 0 ? "more" : "less"} than now.`);
   const W = ctxfmt(win || (S.ctxInfo && S.ctxInfo.kv_resident) || 0);
@@ -183,7 +183,9 @@ export function ctxHint(n, {live = false, now = null, win = 0, whole = false, ra
   const gb = (bytes, k) => (bytes * k) / 2 ** 30;
   if (ram && win) {
     if (whole && n <= win) return `Up to ${W} the whole cache stays in VRAM.`;
+    // (keys: bytes a token that stay in VRAM under streaming - GLM-5.3 (744B)'s index keys)
     return `≈ ${fmt(gb(ram, n), 1)} GB of RAM for the context (kept pinned; ${W} positions of it also in VRAM)` +
+      (keys ? ` · ≈ ${fmt(gb(keys, n), 1)} GB of index keys stay in VRAM` : "") +
       (now != null && whole && now <= win ? "." : more(gb(ram, n - (now || 0))));
   }
   if (vram) return `≈ ${fmt(gb(vram, n), 1)} GB of GPU memory for the context, taken from the experts` + more(gb(vram, n - (now || 0)));

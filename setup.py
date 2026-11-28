@@ -518,6 +518,43 @@ def _cpuid_avx2() -> bool:
         return False
 
 
+def win_simd_features() -> list:
+    """What ggml-cpu's Windows build checks (FindSIMD.cmake: AVX, AVX2 + FMA, AVX-512 F/CD/BW/DQ/VL), asked from the
+    CPU itself (CPUID + XGETBV through the stubs above) instead of by running freshly built test programs, which
+    Windows Smart App Control can block - a blocked check reads as "the CPU lacks it" and ggml-cpu is silently built
+    for AVX only.  ['avx', 'avx2', 'fma', 'f16c', 'avx512'] or a part of it; [] when the CPU cannot be asked."""
+    try:
+        def cpuid(leaf):
+            regs = (ctypes.c_uint32 * 4)()
+            _run_stub(bytes([0x53, 0x49, 0x89, 0xC8, 0x89, 0xD0, 0x31, 0xC9, 0x0F, 0xA2,
+                             0x41, 0x89, 0x00, 0x41, 0x89, 0x58, 0x04, 0x41, 0x89, 0x48, 0x08,
+                             0x41, 0x89, 0x50, 0x0C, 0x5B, 0xC3]), ctypes.addressof(regs), leaf)
+            return list(regs)
+        top = cpuid(0)[0]
+        ecx1 = cpuid(1)[2]
+        if not (ecx1 >> 27) & 1 or not (ecx1 >> 28) & 1:             # OSXSAVE, AVX
+            return []
+        xcr0 = (ctypes.c_uint32 * 2)()
+        _run_stub(bytes([0x49, 0x89, 0xC8, 0x31, 0xC9, 0x0F, 0x01, 0xD0,
+                         0x41, 0x89, 0x00, 0x41, 0x89, 0x50, 0x04, 0xC3]), ctypes.addressof(xcr0))
+        if xcr0[0] & 6 != 6:                                           # the OS saves XMM and YMM
+            return []
+        found = ["avx"]
+        ebx7 = cpuid(7)[1] if top >= 7 else 0
+        if (ebx7 >> 5) & 1:
+            found.append("avx2")
+        if (ecx1 >> 12) & 1:
+            found.append("fma")
+        if (ecx1 >> 29) & 1:
+            found.append("f16c")
+        need = (1 << 16) | (1 << 17) | (1 << 28) | (1 << 30) | (1 << 31)  # AVX-512 F, DQ, CD, BW, VL (/arch:AVX512)
+        if ebx7 & need == need and xcr0[0] & 0xE0 == 0xE0:             # and the OS saves the ZMM / mask state
+            found.append("avx512")
+        return found
+    except Exception:
+        return []
+
+
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
     s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version,pci.bus_id",

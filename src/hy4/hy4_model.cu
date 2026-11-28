@@ -46,6 +46,7 @@
 #include <ctime>
 #include <array>
 #include <fstream>
+#include <filesystem>
 #include <map>
 #include <numeric>
 #include <mutex>
@@ -1821,7 +1822,7 @@ struct Model::Impl {
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
     static constexpr int kPs = 96;       // (HY4_PSTREAM: experts a pass, at most - its second buffer's slots)
     char ps_route[160] = {0};           // (its INFO line about the route)
-    bool ps_want = [] { const char* v = std::getenv("HY4_PSTREAM"); return v && std::atoi(v) != 0; }();
+    bool ps_want = [] { const char* v = std::getenv("HY4_PSTREAM"); return v && std::atoi(v) != 0; }();   // (off; =1: on)
     int stage_slots() const { return kStage + (ps_want ? kPs : 0); }
     // tensor parallel with the CPU lane: a prompt chunk of this many rows or more has every member send its share of
     // the experts no member holds to its own GPU (kShareThreads copy a member's pass into its bounce); a shorter one
@@ -6386,7 +6387,7 @@ struct Model::Impl {
     }
     static const char* fetch_name(int mode) { return mode == 1 ? "gpu" : mode == 2 ? "mix" : "lane"; }
     // auto with copies and no verdict: Model::load measures after the warm-up
-    // HY4_PSTREAM (off by default): a prompt chunk's experts outside VRAM streamed from pinned RAM copies in
+    // HY4_PSTREAM (off by default, =1: on): a prompt chunk's experts outside VRAM streamed from pinned RAM copies in
     // passes, two staging buffers: a pass is copied (a stream of its own) while the pass before it runs, and the next
     // layer's first pass while this layer's last one and its attention do
     struct PStream {
@@ -7452,14 +7453,14 @@ struct Model::Impl {
         return true;
     }
 
-    // experts_streamed in two halves of kStage / 2 slots, in flight together (HY4_STREAM_PIPE=0: one pass at a time,
+    // experts_streamed in two halves of kStage / 2 slots, in flight together (HY4_STREAM_PIPE=1; off by default: one pass at a time,
     // as before): the lane's threads copy pass i + 1 from the model's file into its half of the pinned bounce while
     // pass i crosses the bus on the copies' own stream, and its sets run on the layer's stream while pass i + 1
     // crosses.  A half's bounce is filled again once its copy is done (ev_in), its staging slots once its sets are
     // (ev_used).  The same passes' sets, the same sums (each expert's rows in one pass either way: its slot is all
     // that differs).  One pass at a time a V100 streamed at ~4 GB/s, the copies, the bus and the sets one after another.
     bool stream_pipe() const {
-        static const bool on = std::getenv("HY4_STREAM_PIPE") && std::atoi(std::getenv("HY4_STREAM_PIPE")) != 0;
+        static const bool on = [] { const char* v = std::getenv("HY4_STREAM_PIPE"); return v && std::atoi(v) != 0; }();
         return on;
     }
     bool streamed_pipe(Layer& l, Gpu& gp, int T, const std::vector<int>& u, std::string& err) {
@@ -10802,6 +10803,359 @@ bool Model::resumable(int64_t pos) const {
 }
 int64_t Model::end() const { return m->end; }
 int64_t Model::restore(const int* ids, int64_t upto, std::string& err) { return m->snap_restore(ids, upto, err); }
+
+// ---- conversations kept aside (hy4_main.cpp's MAYA_HY4_SLOT_*; DeepSeek's slot_save / slot_load, #356).  A slot, by
+// position (u64 little endian but the tokens, int32): "HY4SLOT1", the identity's length and bytes, n, keep, the MTP
+// cache's valid rows, the n tokens; then each layer of the trunk in order and the MTP block, a block each - its byte
+// count, then (an indexed layer) its latent rows of positions [0, n), its pooled keys of the n / kpool complete groups,
+// its value | gate rows of positions [n - keep, n), or (a sliding-window layer) its latent rows of [n - keep, n); the
+// final-state ring's rows of [n - keep, n) (a block too); "HY4SLOT1" again.  Under tensor parallel member 0's copy is
+// saved (the members' are the same: the same sums feed every one) and a load writes every member's.
+namespace {
+constexpr uint64_t kHy4SlotMagic = 0x31544f4c53345948ull;   // "HY4SLOT1"
+}
+
+int64_t Model::ring_rows() const { return m->ring; }
+
+std::string Model::slot_identity() const {
+    const Impl& I = *m;
+    std::string id = std::string("maya-hy4-session-1 engine=") + MAYA_VERSION + " layers=" + std::to_string(I.g.n_layer) +
+                     " embd=" + std::to_string(I.g.n_embd) + " kv=" + std::to_string(I.g.kv_row()) +
+                     (I.kv_q8 ? "q8" : "f16") + " swa=" + std::to_string(I.g.n_swa) + " ix=" +
+                     std::to_string(I.g.ix_dim) + "/" + std::to_string(I.g.ix_kpool) + " mtp=" + (I.M.mtp ? "1" : "0");
+    std::vector<std::pair<std::string, uintmax_t>> files;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(I.pk.dir, ec))
+        if (e.is_regular_file(ec)) files.emplace_back(e.path().filename().string(), e.file_size(ec));
+    std::sort(files.begin(), files.end());
+    for (const auto& [name, size] : files)
+        if (name.find("expert-hot") == std::string::npos && name.find("vram-late") == std::string::npos &&
+            name.rfind("slot", 0) != 0)   // (the files a start writes itself are not the model)
+            id += " " + name + ":" + std::to_string(size);
+    return id;
+}
+
+uint64_t Model::slot_bytes(int64_t n, int64_t keep) const {
+    const Impl& I = *m;
+    const uint64_t kvb = I.kv_rb(), pb = I.pool_b(), D = (uint64_t) I.g.ix_dim, kp = (uint64_t) I.g.ix_kpool;
+    uint64_t b = 8 * 6 + slot_identity().size() + 4 * (uint64_t) n;   // (the two magics, four sizes; the tokens)
+    auto layer = [&](const Layer& l) {
+        b += 8;
+        if (l.swa) b += (uint64_t) keep * kvb;
+        else b += (uint64_t) n * kvb + (uint64_t) n / kp * D * pb + (uint64_t) keep * 2 * D * pb;
+    };
+    for (int il = 0; il < I.g.n_layer; ++il) layer(I.tp > 1 ? I.TL[0][(size_t) il] : I.L[(size_t) il]);
+    if (I.M.mtp) layer(I.M);
+    if (I.hring) b += 8 + (uint64_t) keep * (uint64_t) I.g.n_embd * 4;
+    return b;
+}
+
+uint64_t Model::slot_save(const std::vector<int>& toks, int64_t keep, std::vector<uint8_t>& out, std::string& err) {
+    Impl& I = *m;
+    const int64_t n = (int64_t) toks.size(), R = I.ring;
+    if (n <= 0 || n > I.end) {
+        err = n <= 0 ? "no conversation" : "the tokens go past the caches";
+        return 0;
+    }
+    if ((int64_t) I.tokens.size() < n || !std::equal(toks.begin(), toks.end(), I.tokens.begin())) {
+        err = "the tokens are not the caches' own";
+        return 0;
+    }
+    // the ring rows kept: at most what the ring still holds of [n - keep, n), and at least the window a forward at n reads
+    const int64_t lo = std::max(I.ring_lo, I.end - R), back = std::max(I.g.n_swa, I.g.ix_kpool) - 1;
+    keep = std::min({std::max<int64_t>(keep, 0), n, R, n - std::max<int64_t>(lo, 0)});
+    if (keep < std::min(n, back + 1)) {
+        err = "the rings no longer hold the window before the conversation's end";
+        return 0;
+    }
+    I.mtp_settle();
+    for (Gpu& gp : I.G) {
+        cudaSetDevice(gp.dev);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            err = std::string("a GPU: ") + cudaGetErrorString(cudaGetLastError());
+            return 0;
+        }
+    }
+    const std::string id = slot_identity();
+    out.assign(slot_bytes(n, keep), 0);
+    size_t off = 0;
+    auto put = [&](uint64_t v) {
+        std::memcpy(out.data() + off, &v, 8);
+        off += 8;
+    };
+    put(kHy4SlotMagic);
+    put(id.size());
+    std::memcpy(out.data() + off, id.data(), id.size());
+    off += id.size();
+    put((uint64_t) n);
+    put((uint64_t) keep);
+    put((uint64_t) std::min(I.mtp_done, n));
+    std::memcpy(out.data() + off, toks.data(), 4 * (size_t) n);
+    off += 4 * (size_t) n;
+    bool ok = true;
+    auto get_rows = [&](const void* dev, size_t rb, int64_t p0, int64_t cnt, int64_t ring) {   // (positions -> out)
+        const uint8_t* d = static_cast<const uint8_t*>(dev);
+        if (!ring) {
+            ok = ok && cudaMemcpy(out.data() + off, d + (size_t) p0 * rb, (size_t) cnt * rb, cudaMemcpyDeviceToHost) == cudaSuccess;
+        } else if (cnt > 0) {
+            const int64_t s = p0 % ring, a = std::min(cnt, ring - s);
+            ok = ok && cudaMemcpy(out.data() + off, d + (size_t) s * rb, (size_t) a * rb, cudaMemcpyDeviceToHost) == cudaSuccess;
+            if (cnt > a)
+                ok = ok && cudaMemcpy(out.data() + off + (size_t) a * rb, d, (size_t) (cnt - a) * rb,
+                                      cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        off += (size_t) cnt * rb;
+    };
+    const size_t kvb = I.kv_rb(), pb = I.pool_b(), D = (size_t) I.g.ix_dim, kp = (size_t) I.g.ix_kpool;
+    // (KV streaming: an indexed layer's rows of every position in pinned memory - the VRAM ring holds copies of the
+    //  newest; KV spill: the newest tier's there, in slot p % hres where htag says so, the older ones on the drive)
+    bool spill_short = false;
+    auto host_rows = [&](const Layer& l) {
+        uint8_t* dst = out.data() + off;
+        const uint8_t* base = (const uint8_t*) l.hrows;
+        off += (size_t) n * kvb;
+        if (!l.hidx) {
+            std::memcpy(dst, base, (size_t) n * kvb);
+            return;
+        }
+        // (the MTP block's rows trail the trunk's: past mtp_done none is stored yet - those go as zeros, as unread as
+        //  without spill)
+        const int64_t H = l.hres, done = I.sp_done[(size_t) l.region], valid = l.mtp ? std::min(I.mtp_done, n) : n;
+        std::vector<int> ht((size_t) H);
+        if (cudaMemcpy(ht.data(), l.htag, sizeof(int) * (size_t) H, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            ok = false;
+            return;
+        }
+        std::lock_guard<std::mutex> lk(I.sp_mu);
+        if (valid < n) std::memset(dst + (size_t) valid * kvb, 0, (size_t) (n - valid) * kvb);
+        for (int64_t p = 0; p < valid && ok;) {   // (runs within a block of 64: hres is a multiple of 64, no run wraps)
+            const bool here = ht[(size_t) (p % H)] == (int) p;
+            int64_t k = 1;
+            while (p + k < valid && (p + k) % 64 != 0 && (ht[(size_t) ((p + k) % H)] == (int) (p + k)) == here) ++k;
+            if (here) std::memcpy(dst + (size_t) p * kvb, base + (size_t) (p % H) * kvb, (size_t) k * kvb);
+            else if (p + k <= done) ok = I.sp_file.read(dst + (size_t) p * kvb, (size_t) k * kvb, I.sp_off(l.region, p));
+            else ok = false, spill_short = true;
+            p += k;
+        }
+    };
+    auto layer = [&](const Layer& l) {
+        cudaSetDevice(I.G[(size_t) l.gpu].dev);
+        const size_t at = off;
+        off += 8;
+        if (l.swa) {
+            get_rows(l.kv, kvb, n - keep, keep, l.ring);
+        } else {
+            if (l.res > 0) host_rows(l);
+            else get_rows(l.kv, kvb, 0, n, 0);
+            get_rows(l.pooled, D * pb, 0, n / (int64_t) kp, 0);
+            get_rows(l.ivg, 2 * D * pb, n - keep, keep, R);
+        }
+        const uint64_t b = off - at - 8;
+        std::memcpy(out.data() + at, &b, 8);
+    };
+    for (int il = 0; il < I.g.n_layer && ok; ++il) layer(I.tp > 1 ? I.TL[0][(size_t) il] : I.L[(size_t) il]);
+    if (I.M.mtp && ok) layer(I.M);
+    if (I.hring && ok) {
+        cudaSetDevice(I.G[(size_t) I.head_gpu].dev);
+        const size_t at = off;
+        off += 8;
+        get_rows(I.hring, (size_t) I.g.n_embd * 4, n - keep, keep, R);
+        const uint64_t b = off - at - 8;
+        std::memcpy(out.data() + at, &b, 8);
+    }
+    if (!ok) {
+        err = spill_short ? "KV spill: a row neither in RAM nor on the drive (a bug)"
+                          : std::string("a copy from a GPU or the drive: ") + cudaGetErrorString(cudaGetLastError());
+        out.clear();
+        return 0;
+    }
+    put(kHy4SlotMagic);
+    if (off != out.size()) {
+        err = "the slot's size is not its plan's (a bug)";
+        out.clear();
+        return 0;
+    }
+    return out.size();
+}
+
+bool Model::slot_load(const uint8_t* data, size_t bytes, std::vector<int>& toks, int64_t& keep, std::string& err) {
+    Impl& I = *m;
+    size_t off = 0;
+    auto get = [&](uint64_t& v) {
+        if (off + 8 > bytes) return false;
+        std::memcpy(&v, data + off, 8);
+        off += 8;
+        return true;
+    };
+    uint64_t magic = 0, idn = 0, n = 0, kp_ = 0, md = 0;
+    if (!get(magic) || magic != kHy4SlotMagic || !get(idn) || idn == 0 || idn > (1u << 20) || off + idn > bytes) {
+        err = "not a maya-hy4 slot";
+        return false;
+    }
+    const std::string id(reinterpret_cast<const char*>(data + off), (size_t) idn), mine = slot_identity();
+    off += (size_t) idn;
+    if (id != mine) {
+        err = "a slot of another engine or model";
+        return false;
+    }
+    if (!get(n) || !get(kp_) || !get(md)) {
+        err = "a slot cut short";
+        return false;
+    }
+    const int64_t R = I.ring, back = std::max(I.g.n_swa, I.g.ix_kpool) - 1;
+    if (n == 0 || (int64_t) n > I.o.max_ctx || (int64_t) kp_ > (int64_t) n || (int64_t) kp_ > R ||
+        (int64_t) kp_ < std::min<int64_t>((int64_t) n, back + 1) || md > n) {
+        err = "a slot this start's context or rings do not take";
+        return false;
+    }
+    keep = (int64_t) kp_;
+    if (bytes != slot_bytes((int64_t) n, keep)) {
+        err = "a slot of the wrong size";
+        return false;
+    }
+    toks.assign((size_t) n, 0);
+    std::memcpy(toks.data(), data + off, 4 * (size_t) n);
+    off += 4 * (size_t) n;
+    I.mtp_settle();
+    for (Gpu& gp : I.G) {
+        cudaSetDevice(gp.dev);
+        cudaDeviceSynchronize();
+    }
+    // (from the first row written on, a failure leaves the model empty: never two conversations' rows mixed)
+    bool ok = true, wrote = false;
+    auto put_rows = [&](void* dev, size_t rb, int64_t p0, int64_t cnt, int64_t ring, size_t src) {
+        uint8_t* d = static_cast<uint8_t*>(dev);
+        wrote = true;
+        if (!ring) {
+            ok = ok && cudaMemcpy(d + (size_t) p0 * rb, data + src, (size_t) cnt * rb, cudaMemcpyHostToDevice) == cudaSuccess;
+        } else if (cnt > 0) {
+            const int64_t s = p0 % ring, a = std::min(cnt, ring - s);
+            ok = ok && cudaMemcpy(d + (size_t) s * rb, data + src, (size_t) a * rb, cudaMemcpyHostToDevice) == cudaSuccess;
+            if (cnt > a)
+                ok = ok && cudaMemcpy(d, data + src + (size_t) a * rb, (size_t) (cnt - a) * rb,
+                                      cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+    };
+    const int64_t N = (int64_t) n;
+    const size_t kvb = I.kv_rb(), pb = I.pool_b(), D = (size_t) I.g.ix_dim, kp = (size_t) I.g.ix_kpool;
+    // KV streaming: an indexed layer's rows of every position into pinned memory (once: its tensor-parallel members
+    // share them), the newest res into the VRAM ring with their tags (every other slot's tag -1: read from the host).
+    // KV spill: the newest tier's rows (hres) in their slots, htag and hidx naming them, the older ones onto the drive
+    // (the region's mark there: sp_done), each copy's slots for a read from the drive empty
+    std::vector<const void*> hosts_done;
+    auto stream_rows = [&](Layer* l, size_t src) {
+        const int64_t res = l->res, v0 = std::max<int64_t>(0, N - res);
+        wrote = true;
+        std::vector<int> tg((size_t) res, -1);
+        for (int64_t p = v0; p < N; ++p) tg[(size_t) (p % res)] = (int) p;
+        put_rows(l->kv, kvb, v0, N - v0, res, src + (size_t) v0 * kvb);
+        ok = ok && cudaMemcpy(l->tag, tg.data(), sizeof(int) * (size_t) res, cudaMemcpyHostToDevice) == cudaSuccess;
+        l->hi = N;
+        const bool first = std::find(hosts_done.begin(), hosts_done.end(), (const void*) l->hrows) == hosts_done.end();
+        if (first) hosts_done.push_back(l->hrows);
+        uint8_t* base = (uint8_t*) l->hrows;
+        if (!l->hidx) {
+            if (first) std::memcpy(base, data + src, (size_t) N * kvb);
+            return;
+        }
+        const int64_t H = l->hres, t0 = std::max<int64_t>(0, N - H);
+        if (first) {
+            for (int64_t p = t0; p < N;) {
+                const int64_t s = p % H, k = std::min(N - p, H - s);
+                std::memcpy(base + (size_t) s * kvb, data + src + (size_t) p * kvb, (size_t) k * kvb);
+                p += k;
+            }
+            std::lock_guard<std::mutex> lk(I.sp_mu);
+            I.sp_done[(size_t) l->region] = 0;   // (nothing of the region's file trusted while it is written)
+            for (int64_t p = 0; p < t0 && ok;) {
+                const int64_t k = std::min(t0 - p, 64 - p % 64);
+                ok = I.sp_file.write(data + src + (size_t) p * kvb, (size_t) k * kvb, I.sp_off(l->region, p));
+                p += k;
+            }
+            if (ok) I.sp_done[(size_t) l->region] = t0;
+        }
+        std::vector<int> ht((size_t) H, -1), hx((size_t) I.o.max_ctx, -1);
+        for (int64_t p = t0; p < N; ++p) {
+            ht[(size_t) (p % H)] = (int) p;
+            hx[(size_t) p] = (int) (p % H);
+        }
+        ok = ok && cudaMemcpy(l->htag, ht.data(), sizeof(int) * ht.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMemcpy(l->hidx, hx.data(), sizeof(int) * hx.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+        std::fill(l->fpos.begin(), l->fpos.end(), -1);
+        l->fcur = 0;
+    };
+    // a block into every copy of the layer (tensor parallel: each member's)
+    auto layer = [&](std::vector<Layer*> copies) {
+        uint64_t b = 0;
+        if (!get(b) || off + b > bytes) {
+            ok = false;
+            return;
+        }
+        for (Layer* l : copies) {
+            cudaSetDevice(I.G[(size_t) l->gpu].dev);
+            size_t src = off;
+            if (l->swa) {
+                put_rows(l->kv, kvb, N - keep, keep, l->ring, src);
+            } else {
+                if (l->res > 0) stream_rows(l, src);
+                else put_rows(l->kv, kvb, 0, N, 0, src);
+                src += (size_t) N * kvb;
+                put_rows(l->pooled, D * pb, 0, N / (int64_t) kp, 0, src);
+                src += (size_t) (N / (int64_t) kp) * D * pb;
+                put_rows(l->ivg, 2 * D * pb, N - keep, keep, R, src);
+            }
+        }
+        off += (size_t) b;
+    };
+    for (int il = 0; il < I.g.n_layer && ok; ++il) {
+        std::vector<Layer*> copies;
+        if (I.tp > 1)
+            for (auto& tl : I.TL) copies.push_back(&tl[(size_t) il]);
+        else
+            copies.push_back(&I.L[(size_t) il]);
+        layer(copies);
+    }
+    if (I.M.mtp && ok) layer({&I.M});
+    if (I.hring && ok) {
+        uint64_t b = 0;
+        if (!get(b) || off + b > bytes) ok = false;
+        else {
+            cudaSetDevice(I.G[(size_t) I.head_gpu].dev);
+            put_rows(I.hring, (size_t) I.g.n_embd * 4, N - keep, keep, R, off);
+            off += (size_t) b;
+        }
+    }
+    uint64_t tail = 0;
+    if (ok && (!get(tail) || tail != kHy4SlotMagic || off != bytes)) ok = false;
+    if (ok)
+        for (Gpu& gp : I.G) {
+            cudaSetDevice(gp.dev);
+            ok = ok && cudaDeviceSynchronize() == cudaSuccess;
+        }
+    if (!ok) {
+        err = "a slot that did not load whole";
+        if (wrote) {   // (the caches hold part of it: nothing of either conversation is trusted)
+            I.end = 0;
+            I.tokens.clear();
+            I.ring_lo = 0;
+            I.mtp_done = 0;
+            I.mtp_apos = -1;
+            std::fill(I.sp_done.begin(), I.sp_done.end(), 0);   // (KV spill: the drive's rows are not this one's)
+        }
+        return false;
+    }
+    // the caches now hold the slot's conversation: as after a rewind to its end (a forward from n, or back to any
+    // position whose window is kept, continues it)
+    I.tokens = toks;
+    I.end = N;
+    I.ring_lo = N - keep;
+    I.mtp_done = (int64_t) md;
+    I.mtp_apos = -1;
+    I.mtp_atok = -1;
+    I.df.snap_p0 = -1;
+    I.df.snap_T = 0;
+    return true;
+}
 
 bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err) {
     if (n <= 0) {

@@ -156,6 +156,24 @@ public:
     /// (Options::snap_every) The latest restore point at or before upto whose sequence is ids' start, put back
     /// in the rings and the sequence cut there: its position (a forward may start there); 0: none (err: a CUDA error)
     int64_t restore(const int* ids, int64_t upto, std::string& err);
+    /// Conversations kept aside (hy4_main.cpp's MAYA_HY4_SLOT_*: DeepSeek's #356, ported).  slot_save: the state of the
+    /// first toks.size() positions (toks: the caller's tokens in the caches, checked against the model's) - every
+    /// indexed layer's and the MTP block's rows of each position (latent row, pooled indexer keys), the rows of the
+    /// last `keep` positions of every ring (the sliding-window layers' latent rows, the indexer's value | gate, the
+    /// trunk's final states the MTP block reads), and the tokens - into `out`, by position (a start with another ring
+    /// size loads it).  slot_load puts it back in place of the caches' conversation: a forward from any position the
+    /// slot holds a window for (the last one, or back to n - keep + 512) then gives what it would have without the
+    /// switch.  A load that fails after writing any row leaves the model empty (end 0).  0 / false: err says why.
+    /// (KV streaming and KV spill: the rows by position as well - from pinned memory and the drive, back into both)
+    uint64_t slot_save(const std::vector<int>& toks, int64_t keep, std::vector<uint8_t>& out, std::string& err);
+    bool slot_load(const uint8_t* data, size_t bytes, std::vector<int>& toks, int64_t& keep, std::string& err);
+    /// The engine and the model a slot is for: the version, the geometry, the rows' format, the MTP block, the pack's
+    /// files and sizes (a slot of another is refused)
+    std::string slot_identity() const;
+    /// A slot's bytes for n positions keeping `keep` ring rows
+    uint64_t slot_bytes(int64_t n, int64_t keep) const;
+    /// The ring's rows (a slot keeps at most this many)
+    int64_t ring_rows() const;
     /// The positions processed so far (the next forward's pos0 when continuing)
     int64_t end() const;
 

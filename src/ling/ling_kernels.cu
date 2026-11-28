@@ -7,6 +7,7 @@
 #endif
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -883,7 +884,7 @@ __global__ void __launch_bounds__(256)
 __global__ void __launch_bounds__(256)
     mla_online_softmax_kernel(const float* __restrict__ S, int H, int T, int q0, int BQ, int k0, int BK, int pos0,
                               float* __restrict__ m, float* __restrict__ l, float* __restrict__ o_acc, int v_head,
-                              uint16_t* __restrict__ P16) {
+                              uint16_t* __restrict__ P16, int allow_regs) {
     __shared__ float smax[8];
     __shared__ float ssum[8];
     const int q = blockIdx.x;
@@ -901,8 +902,22 @@ __global__ void __launch_bounds__(256)
         return;
     }
 
+    // A row of up to 4 x 256 scores is read from memory once (kept in registers for the exp pass); the arithmetic and
+    // each thread's order are those of a second read
+    constexpr int kRegCols = 4;
+    const bool in_regs = allow_regs != 0 && BK <= kRegCols * 256 && blockDim.x == 256;
+    float sv[kRegCols];
     float rmax = -INFINITY;
-    for (int j = tid; j < valid_k; j += blockDim.x) rmax = fmaxf(rmax, srow[j]);
+    if (in_regs) {
+#pragma unroll
+        for (int u = 0; u < kRegCols; ++u) {
+            const int j = tid + u * 256;
+            sv[u] = j < valid_k ? srow[j] : -INFINITY;
+            rmax = fmaxf(rmax, sv[u]);
+        }
+    } else {
+        for (int j = tid; j < valid_k; j += blockDim.x) rmax = fmaxf(rmax, srow[j]);
+    }
     rmax = warp_max_f(rmax);
     if ((tid & 31) == 0) smax[tid >> 5] = rmax;
     __syncthreads();
@@ -919,13 +934,28 @@ __global__ void __launch_bounds__(256)
     const float m_new = fmaxf(m_old, m_tile);
 
     float rsum = 0.0f;
-    for (int j = tid; j < BK; j += blockDim.x) {
-        if (j < valid_k) {
-            const float p = expf(srow[j] - m_new);
-            prow[j] = __float2half_rn(p);
-            rsum += p;
-        } else {
-            prow[j] = __float2half_rn(0.0f);
+    if (in_regs) {
+#pragma unroll
+        for (int u = 0; u < kRegCols; ++u) {
+            const int j = tid + u * 256;
+            if (j >= BK) break;
+            if (j < valid_k) {
+                const float p = expf(sv[u] - m_new);
+                prow[j] = __float2half_rn(p);
+                rsum += p;
+            } else {
+                prow[j] = __float2half_rn(0.0f);
+            }
+        }
+    } else {
+        for (int j = tid; j < BK; j += blockDim.x) {
+            if (j < valid_k) {
+                const float p = expf(srow[j] - m_new);
+                prow[j] = __float2half_rn(p);
+                rsum += p;
+            } else {
+                prow[j] = __float2half_rn(0.0f);
+            }
         }
     }
     rsum = warp_sum_f(rsum);
@@ -1569,6 +1599,298 @@ __global__ void __launch_bounds__(256, 1)
 #endif
 }
 
+// ---- Head-group MLA decode: the kernel above, one block per 16 heads ----
+// Every head is computed exactly as in mla_dec_wmma_kernel: the same splits and tiles, the same k ranges per warp,
+// the same order of the partial sums and the same online softmax, so the partials (and the context) are the same
+// bits. What changes is only where the work runs: a block takes one group of 16 heads (blockIdx.z) with the 4 warps
+// that group had, so a long cache is read by twice as many blocks; and the shared rows are padded to 584 halves, so
+// the WMMA fragment loads (row stride 1152 B, a multiple of 128 B) no longer all hit the same banks.
+constexpr int kMlaKs = kMlaK + 8;
+
+template <int TILE>
+constexpr size_t mla_hg_smem_bytes() {
+    return (size_t) 16 * kMlaKs * 2 + (size_t) TILE * kMlaKs * 2 + (size_t) 4 * 256 * 4 + (size_t) 16 * TILE * 2 + 256;
+}
+
+template <int LQ8, int TILE, int NCH>
+__global__ void __launch_bounds__(128)
+    mla_dec_wmma_hg_kernel(const float* __restrict__ q_abs, const float* __restrict__ q, int q_stride, int q_pe_off,
+                           const void* __restrict__ lat, const uint16_t* __restrict__ k_pe, int n_sel_cap,
+                           const int* __restrict__ n_sel_dev, int T, float scale, int s_max, float* __restrict__ part) {
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* sQ = (__half*) smem;                                                   // [16][584]
+    __half* sL = sQ + 16 * kMlaKs;                                                 // [TILE][584]
+    float* sTmp = (float*) (sL + TILE * kMlaKs);                                   // [4][256]
+    __half* sP = (__half*) (sTmp + 4 * 256);                                       // [16][TILE]
+    float* sM = (float*) (sP + 16 * TILE);                                         // [16]
+    float* sSum = sM + 16;                                                         // [16]
+    float* sAlpha = sSum + 16;                                                     // [16]
+
+    const int b = blockIdx.x;
+    const int tok = blockIdx.y;
+    const int hg = (int) blockIdx.z & 1;    // heads hg*16 .. hg*16+15
+    const int ch = (int) blockIdx.z >> 1;   // NCH = 2: this block's half of the 512 context columns
+    constexpr int NJ = 8 / NCH;
+    const int tid = threadIdx.x;
+    const int w = tid >> 5;      // the warp's place in its head group: (cg, kh) for TILE 32, ks for TILE 16
+    const int lane = tid & 31;
+    const int ks = w;
+
+    const int n_base = n_sel_dev != nullptr ? min(n_sel_cap, *n_sel_dev) : n_sel_cap;
+    const int n = n_base - (T - 1 - tok);
+    if (n <= 0) return;
+    const int S = mla_num_splits(n, TILE, s_max);
+    if (b >= S) return;
+
+    const int n_tiles = (n + TILE - 1) / TILE;
+    const int t0 = (int) (((int64_t) b * n_tiles) / S);
+    const int t1 = (int) (((int64_t) (b + 1) * n_tiles) / S);
+
+    const float* qa_tok = q_abs + (size_t) tok * 32 * kMlaLora;
+    const float* qp_tok = q + (size_t) tok * 32 * q_stride + q_pe_off;
+    for (int hl = w; hl < 16; hl += 4) {
+        const int h = hg * 16 + hl;
+        __half* dst = sQ + (size_t) hl * kMlaKs;
+        const float* qa_h = qa_tok + (size_t) h * kMlaLora;
+        const float* qp_h = qp_tok + (size_t) h * q_stride;
+        for (int d = lane * 2; d < kMlaLora; d += 64) {
+            *((__half2*) (dst + d)) = __floats2half2_rn(qa_h[d], qa_h[d + 1]);
+        }
+        *((__half2*) (dst + kMlaLora + lane * 2)) = __floats2half2_rn(qp_h[lane * 2], qp_h[lane * 2 + 1]);
+    }
+    sTmp[tid] = (float) (tid >> 4);
+    sTmp[tid + 128] = (float) ((tid + 128) >> 4);
+    if (tid < 16) {
+        sM[tid] = -INFINITY;
+        sSum[tid] = 0.0f;
+        sAlpha[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> rfrag;
+    wmma::load_matrix_sync(rfrag, sTmp, 16, wmma::mem_row_major);
+    int my_row[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) my_row[e] = (int) (rfrag.x[e] + 0.5f);
+    __syncthreads();
+
+    // Column block cb (16 wide) of O: the 8-warp kernel's warp ks holds cb = ks * 8 + j; with NCH = 2 a block holds
+    // half the blocks and its warp w the 4 of cb = ch * 16 + w * 4 + j (each block is computed the same way)
+    auto col_block = [&](int j) { return NCH == 1 ? ks * 8 + j : ch * 16 + w * 4 + j; };
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_acc[NJ];
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) wmma::fill_fragment(o_acc[j], 0.0f);
+
+    const size_t rec_bytes = (size_t) kMlaLora + (size_t) (kMlaLora / 32) * 2;
+
+    // The next tile's rows are read into registers while this tile is computed (rows c = w, w + 4, ...: the same
+    // values reach shared memory as in a direct copy, INT8 records unpacked the same way)
+    constexpr int RPW = TILE / 4;
+    uint4 r_lat[RPW][2];
+    uint4 r_pe[RPW];
+    float r_sc[RPW];
+    auto fetch = [&](int k_base) {
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            const int pos = k_base + w + 4 * i;
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            r_lat[i][0] = z;
+            r_lat[i][1] = z;
+            r_pe[i] = z;
+            r_sc[i] = 0.0f;
+            if (pos < n) {
+                if constexpr (LQ8 == 0) {
+                    const uint4* src_lat = (const uint4*) ((const __half*) lat + (size_t) pos * kMlaLora);
+                    r_lat[i][0] = src_lat[lane];
+                    r_lat[i][1] = src_lat[lane + 32];
+                } else {
+                    const uint8_t* rec = (const uint8_t*) lat + (size_t) pos * rec_bytes;
+                    r_lat[i][0] = ((const uint4*) rec)[lane];
+                    r_sc[i] = __half2float(((const __half*) (rec + kMlaLora))[lane >> 1]);
+                }
+                if (lane < 8) r_pe[i] = ((const uint4*) (k_pe + (size_t) pos * 64))[lane];
+            }
+        }
+    };
+    auto stash = [&](int k_base) {
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            const int c = w + 4 * i;
+            __half* dst = sL + (size_t) c * kMlaKs;
+            uint4* dst_lat = (uint4*) dst;
+            if (LQ8 == 0 || k_base + c >= n) {
+                dst_lat[lane] = r_lat[i][0];
+                dst_lat[lane + 32] = r_lat[i][1];
+            } else {
+                const uint4 qv = r_lat[i][0];
+                const float sc = r_sc[i];
+                uint4 out0, out1;
+                __half2* p0 = (__half2*) &out0;
+                __half2* p1 = (__half2*) &out1;
+                auto up = [&](uint32_t wd, __half2& h01, __half2& h23) {
+                    h01 = __floats2half2_rn((float) (int8_t) (wd & 0xffu) * sc,
+                                            (float) (int8_t) ((wd >> 8) & 0xffu) * sc);
+                    h23 = __floats2half2_rn((float) (int8_t) ((wd >> 16) & 0xffu) * sc,
+                                            (float) (int8_t) ((wd >> 24) & 0xffu) * sc);
+                };
+                up(qv.x, p0[0], p0[1]);
+                up(qv.y, p0[2], p0[3]);
+                up(qv.z, p1[0], p1[1]);
+                up(qv.w, p1[2], p1[3]);
+                dst_lat[lane * 2] = out0;
+                dst_lat[lane * 2 + 1] = out1;
+            }
+            if (lane < 8) ((uint4*) (dst + kMlaLora))[lane] = r_pe[i];
+        }
+    };
+    if (t0 < t1) fetch(t0 * TILE);
+
+    for (int tile = t0; tile < t1; ++tile) {
+        const int k_base = tile * TILE;
+        stash(k_base);
+        __syncthreads();
+        if (tile + 1 < t1) fetch(k_base + TILE);
+
+        // Phase A: S[16, TILE] = sQ[16, 576] @ sL[TILE, 576]^T, split over k as in the 8-warp kernel
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_acc;
+        wmma::fill_fragment(s_acc, 0.0f);
+        if constexpr (TILE == 32) {
+            const int cg = (w >> 1) & 1;
+            const int kh = w & 1;
+            const int k_start = kh * 18;
+            const __half* sL_row = sL + (size_t) (cg * 16) * kMlaKs;
+#pragma unroll
+            for (int ki = 0; ki < 18; ++ki) {
+                const int k_off = (k_start + ki) * 16;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+                wmma::load_matrix_sync(qa, sQ + k_off, kMlaKs);
+                wmma::load_matrix_sync(kb, sL_row + k_off, kMlaKs);
+                wmma::mma_sync(s_acc, qa, kb, s_acc);
+            }
+        } else {
+            const int k_start = ks * 9;
+#pragma unroll
+            for (int ki = 0; ki < 9; ++ki) {
+                const int k_off = (k_start + ki) * 16;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+                wmma::load_matrix_sync(qa, sQ + k_off, kMlaKs);
+                wmma::load_matrix_sync(kb, sL + k_off, kMlaKs);
+                wmma::mma_sync(s_acc, qa, kb, s_acc);
+            }
+        }
+        wmma::store_matrix_sync(sTmp + w * 256, s_acc, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        // Phase B: online softmax, 8 lanes a head (the same lanes and order as the 8-warp kernel's heads)
+        {
+            const int h_l = tid >> 3;
+            const int lh = tid & 7;
+            constexpr int C_PER = TILE / 8;
+            float sc_loc[C_PER];
+            float m_loc = -INFINITY;
+#pragma unroll
+            for (int u = 0; u < C_PER; ++u) {
+                const int c = lh * C_PER + u;
+                if (k_base + c < n) {
+                    float sum_v;
+                    if constexpr (TILE == 32) {
+                        const int cg = c >> 4;
+                        const int idx = h_l * 16 + (c & 15);
+                        sum_v = sTmp[(cg * 2 + 0) * 256 + idx] + sTmp[(cg * 2 + 1) * 256 + idx];
+                    } else {
+                        const int idx = h_l * 16 + c;
+                        sum_v = sTmp[0 * 256 + idx] + sTmp[1 * 256 + idx] + sTmp[2 * 256 + idx] +
+                                sTmp[3 * 256 + idx];
+                    }
+                    const float sv = sum_v * scale;
+                    sc_loc[u] = sv;
+                    m_loc = fmaxf(m_loc, sv);
+                } else {
+                    sc_loc[u] = -INFINITY;
+                }
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) m_loc = fmaxf(m_loc, __shfl_xor_sync(0xffffffffu, m_loc, o));
+            const float m_old = sM[h_l];
+            const float m_new = fmaxf(m_old, m_loc);
+            const float al = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+            float l_loc = 0.0f;
+#pragma unroll
+            for (int u = 0; u < C_PER; ++u) {
+                const int c = lh * C_PER + u;
+                const float p = (k_base + c < n) ? expf(sc_loc[u] - m_new) : 0.0f;
+                sP[h_l * TILE + c] = __float2half_rn(p);
+                l_loc += p;
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) l_loc += __shfl_xor_sync(0xffffffffu, l_loc, o);
+            if (lh == 0) {
+                sM[h_l] = m_new;
+                sSum[h_l] = sSum[h_l] * al + l_loc;
+                sAlpha[h_l] = al;
+            }
+        }
+        __syncthreads();
+
+        // Phase C: O[16, 512] = alpha * O + sP[16, TILE] @ sL[TILE, 512]
+        float al_e[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) al_e[e] = sAlpha[my_row[e]];
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o_acc[j].x[e] *= al_e[e];
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa0;
+        wmma::load_matrix_sync(pa0, sP, TILE);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa1;
+        if constexpr (TILE == 32) {
+            wmma::load_matrix_sync(pa1, sP + 16, TILE);
+        }
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            const int col_base = col_block(j) * 16;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb0;
+            wmma::load_matrix_sync(vb0, sL + col_base, kMlaKs);
+            wmma::mma_sync(o_acc[j], pa0, vb0, o_acc[j]);
+            if constexpr (TILE == 32) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb1;
+                wmma::load_matrix_sync(vb1, sL + 16 * kMlaKs + col_base, kMlaKs);
+                wmma::mma_sync(o_acc[j], pa1, vb1, o_acc[j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    float* p_tok = part + (size_t) tok * (size_t) s_max * 32 * kMlaPart;
+    const int o_row = lane >> 1;
+    const int o_col = (lane & 1) << 3;
+    const int h_out = hg * 16 + o_row;
+    float* dst_row = p_tok + ((size_t) b * 32 + h_out) * kMlaPart;
+    float* wt = sTmp + w * 256;
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        wmma::store_matrix_sync(wt, o_acc[j], 16, wmma::mem_row_major);
+        __syncwarp();
+        const float4* src4 = (const float4*) (wt + o_row * 16 + o_col);
+        float4* dst4 = (float4*) (dst_row + col_block(j) * 16 + o_col);
+        dst4[0] = src4[0];
+        dst4[1] = src4[1];
+    }
+    if (ks == 0 && ch == 0 && (lane & 1) == 0) {
+        dst_row[kMlaLora] = sM[o_row];
+        dst_row[kMlaLora + 1] = sSum[o_row];
+    }
+#else
+    (void) q_abs; (void) q; (void) q_stride; (void) q_pe_off; (void) lat; (void) k_pe;
+    (void) n_sel_cap; (void) n_sel_dev; (void) T; (void) scale; (void) s_max; (void) part;
+#endif
+}
+
 __global__ void __launch_bounds__(256)
     mla_dec_wmma_combine_kernel(const float* __restrict__ part, int n_sel_cap, const int* __restrict__ n_sel_dev, int T,
                                 int n_head, int tile_sz, int s_max, float* __restrict__ ctx) {
@@ -1661,6 +1983,45 @@ static int mla_dec_wmma_tile_ok() {
     }
     st = -1;
     return 0;
+}
+
+// The head-group kernel for the tile the 8-warp kernel would use (the tile sets the arithmetic, so it never changes
+// here); false where its shared memory cannot be had, and the 8-warp kernel runs.  LING_MLA_DEC_ONE_BLOCK=1 runs the
+// 8-warp kernel everywhere (an A/B switch: the context is the same either way).
+static bool g_mla_dec_one_block = [] {
+    const char* e = std::getenv("LING_MLA_DEC_ONE_BLOCK");
+    return e != nullptr && e[0] == '1';
+}();
+
+template <int LQ8>
+static bool mla_dec_hg_ok(int tile) {
+#if defined(MAYA_USE_HIP)
+    (void) tile;
+    return false;
+#else
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static int checked[64][2] = {};
+    int& st = checked[dev & 63][tile == 32 ? 1 : 0];
+    if (st != 0) return st > 0;
+    const size_t need = tile == 32 ? mla_hg_smem_bytes<32>() : mla_hg_smem_bytes<16>();
+    int optin = 0;
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cudaError_t e = (size_t) optin >= need ? cudaSuccess : cudaErrorInvalidValue;
+    if (e == cudaSuccess)
+        e = tile == 32 ? cudaFuncSetAttribute(mla_dec_wmma_hg_kernel<LQ8, 32, 1>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int) need)
+                       : cudaFuncSetAttribute(mla_dec_wmma_hg_kernel<LQ8, 16, 1>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int) need);
+    if (e == cudaSuccess)
+        e = tile == 32 ? cudaFuncSetAttribute(mla_dec_wmma_hg_kernel<LQ8, 32, 2>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int) need)
+                       : cudaFuncSetAttribute(mla_dec_wmma_hg_kernel<LQ8, 16, 2>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int) need);
+    if (e != cudaSuccess) cudaGetLastError();
+    st = e == cudaSuccess ? 1 : -1;
+    return st > 0;
+#endif
 }
 
 // ---- Windowed KDA prep + rollback + register-resident recurrence + exact commit (W <= 4) ----
@@ -2144,6 +2505,8 @@ void lat_q8_to_f16(const void* lat, int k0, int BK, int kv_lora, uint16_t* out16
     lat_q8_to_f16_kernel<<<(unsigned) BK, 256, 0, s>>>((const uint8_t*) lat, k0, kv_lora, out16);
 }
 
+static bool g_softmax_two_reads = false;   // tests: the row read twice, as before (the same bits)
+
 void mla_init_state(float* m, float* l, float* o_acc, int H, int T, int v_head, cudaStream_t s) {
     const int64_t HT = (int64_t) H * T;
     if (HT <= 0) return;
@@ -2155,8 +2518,10 @@ void mla_online_softmax(const float* S, int H, int T, int q0, int BQ, int k0, in
                         float* o_acc, int v_head, uint16_t* P16, cudaStream_t s) {
     if (BQ <= 0 || BK <= 0) return;
     mla_online_softmax_kernel<<<dim3((unsigned) BQ, (unsigned) H), 256, 0, s>>>(
-        S, H, T, q0, BQ, k0, BK, pos0, m, l, o_acc, v_head, P16);
+        S, H, T, q0, BQ, k0, BK, pos0, m, l, o_acc, v_head, P16, g_softmax_two_reads ? 0 : 1);
 }
+
+void mla_online_softmax_two_reads(bool on) { g_softmax_two_reads = on; }
 
 void mla_o_finalize_gate(const float* o_acc, const float* l, const float* gate, int T, int H, int v_head,
                          uint16_t* out16, cudaStream_t s) {
@@ -2202,9 +2567,13 @@ size_t mla_dec_wmma_part_bytes(int n_head, int max_T) {
 
 void mla_dec_wmma_init() {
     (void) mla_dec_dev_sms();
-    (void) mla_dec_wmma_tile_ok<0>();
-    (void) mla_dec_wmma_tile_ok<1>();
+    const int t0 = mla_dec_wmma_tile_ok<0>();
+    const int t1 = mla_dec_wmma_tile_ok<1>();
+    if (t0 != 0) (void) mla_dec_hg_ok<0>(t0);
+    if (t1 != 0) (void) mla_dec_hg_ok<1>(t1);
 }
+
+void mla_dec_wmma_one_block(bool on) { g_mla_dec_one_block = on; }
 
 bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off, const void* lat, int lat_q8,
                   const uint16_t* k_pe, int n_sel_cap, const int* n_sel_dev, int T, int n_head, int kv_lora,
@@ -2215,7 +2584,21 @@ bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off
     const int sms = mla_dec_dev_sms();
     const int s_max = std::min(kMlaMaxSplitsM, std::max(1, sms / 4));
     const dim3 grid((unsigned) s_max, (unsigned) T);
-    if (tile == 32) {
+    if (!g_mla_dec_one_block && (lat_q8 != 0 ? mla_dec_hg_ok<1>(tile) : mla_dec_hg_ok<0>(tile))) {
+        // Halves of the context columns as blocks of their own where the head groups alone leave SMs idle (a single
+        // row, or a short window, on a large GPU): the same bits, more of the GPU reading the cache
+        const bool halves = s_max * T * 2 < sms;
+        const dim3 grid_hg((unsigned) s_max, (unsigned) T, halves ? 4u : 2u);
+#define LING_HG(LQ, TL, NC)     mla_dec_wmma_hg_kernel<LQ, TL, NC><<<grid_hg, 128, mla_hg_smem_bytes<TL>(), s>>>(         q_abs, q, q_stride, q_pe_off, lat, k_pe, n_sel_cap, n_sel_dev, T, scale, s_max, part)
+        if (tile == 32) {
+            if (lat_q8 != 0) { if (halves) LING_HG(1, 32, 2); else LING_HG(1, 32, 1); }
+            else { if (halves) LING_HG(0, 32, 2); else LING_HG(0, 32, 1); }
+        } else {
+            if (lat_q8 != 0) { if (halves) LING_HG(1, 16, 2); else LING_HG(1, 16, 1); }
+            else { if (halves) LING_HG(0, 16, 2); else LING_HG(0, 16, 1); }
+        }
+#undef LING_HG
+    } else if (tile == 32) {
         if (lat_q8 != 0)
             mla_dec_wmma_kernel<1, 32><<<grid, 256, mla_wmma_smem_bytes<32>(), s>>>(
                 q_abs, q, q_stride, q_pe_off, lat, k_pe, n_sel_cap, n_sel_dev, T, scale, s_max, part);

@@ -485,7 +485,7 @@ class ThinkingBudget(_Glm53Api):
 # GLM-5.3-Flash's engine prints (src/program/generate.cpp: the glm-fast serve start, its decode loop's STAT every 8
 # tokens, the 10-field DONE)
 REAL_INFO = ("context kv kv_resident expert_slots expert_cache_mib engine_kind experts vram_slots vram_gb ram_slots "
-             "ram_gb mtp dflash vision_lend cpu_threads cpu_threads_max pcie_share logit_bias").split()
+             "ram_gb mtp dflash vision_lend cpu_threads cpu_threads_max pcie_share logit_bias prefill_batched").split()
 REAL_STAT = ("tok_s ms_tok vram_hit ram_fetch disk promo vram_used vram_slots ram_used ram_slots ram_gb vram_gb disk_gb "
              "draft_acc draft_off").split()
 REAL_VRAM = "dev pci total free weights kv kv_ram act drafter window pool tail borrow vision slots ctx layers".split()
@@ -561,6 +561,7 @@ class MonitorFigures(_Glm53Api):
                   "kv_ctx", "kv_gb", "max_context"):
             self.assertIsNotNone(eng.get(k), k)
         self.assertEqual(eng["speculation"], ["MTP"])                   # (INFO mtp=1: the drafting it runs)
+        self.assertEqual(eng["prefill_batched"], 0)
         now = m["tiers"]["now"]
         for k in REAL_STAT:
             self.assertIsInstance(now.get(k), float, k)

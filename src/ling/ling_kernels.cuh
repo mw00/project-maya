@@ -85,6 +85,8 @@ void mla_init_state(float* m, float* l, float* o_acc, int H, int T, int v_head, 
 /// Online causal softmax over pre-scaled scores S [H][BQ][BK] -> P16 [H][BQ][BK], rescaling o_acc [H][T][v_head].
 void mla_online_softmax(const float* S, int H, int T, int q0, int BQ, int k0, int BK, int pos0, float* m, float* l,
                         float* o_acc, int v_head, uint16_t* P16, cudaStream_t s);
+/// Tests: true reads each score row twice (the previous kernel; the same bits as the default one read).
+void mla_online_softmax_two_reads(bool on);
 
 /// Finalize tiled MLA output: out16 [T][H][v_head] = FP16((o_acc[h][t][d] / l[h][t]) * sigmoid(gate[t][h])).
 void mla_o_finalize_gate(const float* o_acc, const float* l, const float* gate, int T, int H, int v_head,
@@ -121,6 +123,8 @@ void pack_route_cpu(const int* ids, const float* w, const int* who, int n_used, 
 /// Vectorized coalesced KV loads + register-accumulated WMMA (TILE=32 on sm_80+, TILE=16 on sm_70/75).
 size_t mla_dec_wmma_part_bytes(int n_head, int max_T = 1);
 void mla_dec_wmma_init();
+/// Tests / A-B: true runs the one-block-for-all-heads kernel (the same context bits as the default head-group one).
+void mla_dec_wmma_one_block(bool on);
 bool mla_dec_wmma(const float* q_abs, const float* q, int q_stride, int q_pe_off, const void* lat, int lat_q8,
                   const uint16_t* k_pe, int n_sel_cap, const int* n_sel_dev, int T, int n_head, int kv_lora,
                   int qk_rope, float scale, float* part, float* ctx, cudaStream_t s);
