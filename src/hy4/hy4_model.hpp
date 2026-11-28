@@ -28,6 +28,9 @@ struct Options {
                                   // without starting over)
     double reserve_gb = 0.75;     // VRAM each GPU keeps free beyond the plan
     bool reserve_given = false;   // (--reserve-gb given: #1026 keeps what the run allocates after the plan beside it)
+    bool pin_experts = false;     // --pin-experts: the routed experts' mapped pages locked in RAM (the CPU lane's
+                                  // reads then never fault the page out to the disk; RAM held for the run)
+    bool pin_engram = false;      // --pin-engram: the Engram table's mapped pages locked in RAM (same trade)
     int prefill_chunk = 0;        // a prompt's tokens a forward takes at once (more than k::kMaxWin: the GEMMs); 0: auto -
                                   // 4096, 2048 or 1024, the largest the VRAM holds beside the model and the pictures
     double vram_experts = 1.0;    // the share of each layer's routed experts kept in VRAM at most (the plan takes less
