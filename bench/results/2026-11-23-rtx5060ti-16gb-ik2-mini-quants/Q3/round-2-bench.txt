@@ -1,0 +1,11 @@
+Project Maya v1.1.74 benchmark, 2026-11-23 09:43
+GPUs: NVIDIA GeForce RTX 5060 Ti 16 GB; RAM 128 GB; CPU 12th Gen Intel(R) Core(TM) i7-12700
+setup: config.json, context 32768, GPUs [0]
+decode (writing the answer): mean 34.2 tokens/s over 3 answers of up to 256 tokens (greedy, thinking off)
+    34.1 tokens/s  Write a Python function that parses a CSV file into a list of dictionaries, with type hints and a docstring.
+    34.4 tokens/s  Explain how photosynthesis works, step by step, for a high-school student.
+    34.3 tokens/s  Write a complete HTML page with a canvas that draws a bouncing ball animation in JavaScript.
+prefill (reading the prompt): 964 tokens/s, 2048 tokens
+prefill (reading the prompt): 979 tokens/s, 8192 tokens
+
+engine lines:
