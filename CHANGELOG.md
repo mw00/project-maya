@@ -4,6 +4,24 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.84 - 2026-11-28
+
+Hy4-Flash decodes about 9% faster and Ling-3.2-air keeps its decode speed deep into long contexts, both with the same answers; and 15 community changes for Hy4-Flash, Inkling 2 Mini, GLM-5.3 and DeepSeek.
+
+- **Faster matrix-vector kernels on NVIDIA, the same answers** (#1292, #1293, #1294, #1296, #1308, #1314, #1315), shared by Hy4-Flash, Ling-3.2-air and DeepSeek's GGUF quants: Hy4-Flash decodes about 9% faster on a V100.
+- **Ling-3.2-air: decode holds its speed deep into a long context** on NVIDIA, and long prompts read a little faster, with the same answers. With the bench's short prompts on two V100s: decode about 2% and 8K prompts about 4% faster.
+- **Hy4-Flash: conversations kept, opt-in (#1274).** Off by default; with `MAYA_HY4_SLOT_KEEP=1` a conversation is set aside when another one takes the model and comes back without reading its prompt again, also after a restart - for an agent's parent and its workers on one model. A conversation taken back gives the same answers as one continued in place. Settings in docs/SETTINGS.md.
+- **Inkling 2 Mini on RTX 20: long prompts much faster, opt-in (#1233).** Off by default: `IK2_FLASH_TURING=1` on one card, `IK2_PF_GPU1=1` (and `IK2_PF_PEER=1` with NVLink) on two. The defaults and their answers are unchanged; with `IK2_FLASH_TURING` some answers can differ in their wording. The measured rows and `tools/ik2_check.py` are in docs/INKLING2.md.
+- **Inkling 2 Mini on AMD under Windows (#1135).** `maya-ik2` builds with AMD's ROCm SDK (`tools\hip\build_ik2_windows.bat`) and runs with a config of your own; the setup does not offer it there yet.
+- **GLM-5.3: KV streaming opt-in (#1023).** Off by default, as the setup writes it; turn it on on the Models page with a window, or with `"--kv-streaming", "on", "--kv-resident", "20480"` in the config's `"args"`. See docs/GLM53.md.
+- **Fix: GLM-5.3 `--prefill auto` could fall back to token by token at the start (#1254, #1184)** where a smaller chunk would fit. It now picks the largest chunk that fits the measured expert pool, and `GET /metrics` reports `engine.prefill_batched`.
+- **Fix: Hy4-Flash pictures on AMD GPUs without BF16 matrix math (#1153)**, gfx906 (such as the MI50) and gfx10: the picture encoder runs in FP16 there by itself (`HY4_VISION_FP16=0` keeps BF16).
+- **Fix: Windows: a build check blocked by Smart App Control no longer silently gives a slower CPU build.** The build asks the CPU itself which instructions it has, and the setup says so in one line when a blocked check had to be corrected or the CPU build still came out without AVX2.
+- **DeepSeek:** docs/SETTINGS.md says what the opt-in `DS4_FLOW_COPY_DMA=1` (off by default) does on one AMD GPU and when it is worth turning on (#910).
+- **Tools:** `tools/ik2/checkpoint_gguf.py` converts a checkpoint of the Inkling 2 family in its original format into a GGUF that `maya-ik2` reads (#1115).
+- **Docs:** docs/MEMORY.md has rows for Ling-3.2-air and Inkling 2 Mini, and docs/MODELS.md says where Hy4-Flash and Inkling 2 Mini run.
+- **Credits.** @merbanan (#1292, #1293, #1294, #1296, #1308, #1314, #1315), @mrsirg97-rgb (#1274), @coolio986 (#1233), @HermesVC (#1135), @BrandoB (#1023), @oscarlius (#1254), @nicholas631 (#1153), @linus-aegu (#910), @CDC6600 (#1115).
+
 ## v1.1.83 - 2026-11-27
 
 Ling-3.2-air now runs on Windows with NVIDIA cards and on AMD under Linux; Inkling 2 Mini decodes much faster on 8-16 GB cards; and 32 community changes for Hy4-Flash, Inkling 2 Mini, DeepSeek and the server.
