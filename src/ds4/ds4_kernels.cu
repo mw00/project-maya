@@ -2556,6 +2556,219 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_mma_kernel(const float* 
     (void) q, (void) win, (void) ckv, (void) sel, (void) sel_stride, (void) ar, (void) sink, (void) heads, (void) scale, (void) out;
 #endif
 }
+// ---------------------------------------------------------------- the same for a decode window (DS4_ATTN_WIN_SPLIT)
+// sparse_attn_mma_kernel gives a (16 heads, query) to one block that walks every tile of 16 rows in turn: ~640 rows =
+// 40 tiles, ~120 us on an RTX 3090 whatever the window's width, on 2 blocks a query (a prompt chunk has a thousand
+// queries to fill the card with; a verify window has six).  Here a query's rows are cut into gridDim.z runs of whole
+// tiles, a block a run - the tile loop is sparse_attn_mma_kernel's, value for value, within the run - and each block
+// leaves its heads' partial sums, running maximum and denominator; sparse_attn_merge_kernel rescales the runs to the
+// common maximum, adds the sink and divides.  The same products and tile sums as sparse_attn_mma_kernel; the runs
+// are joined in another order than one serial walk would, so the last bits differ from it (as it differs from the
+// FP32 kernels).
+constexpr int kAttnPart = 512 + 2;   // a head's partial: 512 sums, the run's maximum, its denominator
+__device__ __forceinline__ int attn_split_tpb(int total, int nb) {
+    const int tiles = (total + 15) / 16;
+    return max(1, (tiles + nb - 1) / nb);
+}
+__global__ void __launch_bounds__(kThreads) sparse_attn_mma_split_kernel(const float* __restrict__ q,
+                                                                         const uint16_t* __restrict__ win,
+                                                                         const uint8_t* __restrict__ ckv,
+                                                                         const int* __restrict__ sel, int sel_stride,
+                                                                         AttnRows ar, int heads, float scale,
+                                                                         float* __restrict__ parts) {
+    pdl_wait();
+    pdl_trigger();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int d = 512, R = 16, dp = d + 8;   // (the tile's row stride: 1040 bytes)
+    const int hb = blockIdx.x * R, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, d);
+    __shared__ __align__(16) uint16_t tile[R * dp];
+    __shared__ float sp[kThreads / 32][R * R];
+    __shared__ __align__(16) float pr[R * R];
+    __shared__ const uint8_t* rows[R];
+    __shared__ float m_run[R], den[R], tsc[R];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, c2 = (lane & 3) * 2;
+    uint32_t qa[4][4], qb[4][4];   // A of the dots, k-step kk: heads hb + g, + 8; dimensions wp * 64 + kk * 16 + c2 ..
+    {
+        const float* q0 = q + ((size_t) t * heads + hb + g) * d + wp * 64 + c2;
+        const float* q1 = q0 + (size_t) 8 * d;
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            split_bf16x2(*(const float2*) (q0 + kk * 16), qa[kk][0], qb[kk][0]);
+            split_bf16x2(*(const float2*) (q1 + kk * 16), qa[kk][1], qb[kk][1]);
+            split_bf16x2(*(const float2*) (q0 + kk * 16 + 8), qa[kk][2], qb[kk][2]);
+            split_bf16x2(*(const float2*) (q1 + kk * 16 + 8), qa[kk][3], qb[kk][3]);
+        }
+    }
+    if (threadIdx.x < R) {
+        m_run[threadIdx.x] = -1e30f;
+        den[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+    float acc[8][4];   // the weighted sums: n-tile nt = dimensions wp * 64 + nt * 8 + c2, + 1 of heads hb + g, + 8
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+    const int sr = threadIdx.x >> 4, part = threadIdx.x & 15;   // the staging: a thread's row and 32 values
+    // ldmatrix row addresses: the dots' K - matrices (rows 0-7, dims + 0), (rows 0-7, + 8), (rows 8-15, + 0),
+    // (rows 8-15, + 8) of a k-step; the sums' V (transposed) - (rows 0-7, dims + 0), (rows 8-15, + 0),
+    // (rows 0-7, + 8), (rows 8-15, + 8) of a pair of n-tiles
+    const uint16_t* kb = tile + ((lane & 7) + ((lane >> 4) << 3)) * dp + wp * 64 + ((lane >> 3) & 1) * 8;
+    const uint16_t* vb = tile + (lane & 15) * dp + wp * 64 + (lane >> 4) * 8;
+    const int total = n_win + n_sel;
+    const int tpb = attn_split_tpb(total, (int) gridDim.z);   // this block's run of tiles: [z * tpb, + tpb)
+    const int row_lo = (int) blockIdx.z * tpb * R, row_hi = min(total, row_lo + tpb * R);
+    if (row_lo >= total) return;   // (a run past the query's rows: the merge counts the runs the same way)
+    for (int t0 = row_lo; t0 < row_hi; t0 += R) {
+        const int n = min(R, row_hi - t0);
+        if (threadIdx.x < n) {
+            const int j = t0 + threadIdx.x;
+            rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
+        }
+        __syncthreads();
+        {
+            uint4* dst = (uint4*) (tile + sr * dp + part * 32);
+            if (sr >= n) {
+                dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0u, 0u, 0u, 0u);
+            } else if (t0 + sr < n_win) {
+                const uint4* src = (const uint4*) (rows[sr] + part * 64);
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = src[3];
+            } else {
+                unpack32(rows[sr], part, dst);
+            }
+        }
+        __syncthreads();
+        float s[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};   // n-tile (rows 0-7, 8-15)
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            uint32_t b0, b1, b2, b3;
+            mma_ldsm_x4(b0, b1, b2, b3, kb + kk * 16);
+            mma_bf16(s[0], qa[kk], b0, b1);
+            mma_bf16(s[0], qb[kk], b0, b1);
+            mma_bf16(s[1], qa[kk], b2, b3);
+            mma_bf16(s[1], qb[kk], b2, b3);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int r0 = nt * 8 + c2;
+            sp[wp][g * R + r0] = s[nt][0];
+            sp[wp][g * R + r0 + 1] = s[nt][1];
+            sp[wp][(g + 8) * R + r0] = s[nt][2];
+            sp[wp][(g + 8) * R + r0 + 1] = s[nt][3];
+        }
+        __syncthreads();
+        {   // thread (head e / 16, row e % 16): the tile's score, the head's running max and denominator
+            const int e = threadIdx.x, h = e >> 4, r = e & 15;
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kThreads / 32; ++w) v += sp[w][e];
+            v = r < n ? v * scale : -INFINITY;
+            float mx = v;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+            const float m_old = m_run[h], m_new = fmaxf(m_old, mx);
+            const float p = r < n ? expf(v - m_new) : 0.0f;
+            float sum = p;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+            pr[e] = p;
+            if (r == 0) {   // (the head's 16 lanes read m_run above, in this same instruction stream)
+                const float ts = expf(m_old - m_new);
+                tsc[h] = ts;
+                den[h] = den[h] * ts + sum;
+                m_run[h] = m_new;
+            }
+        }
+        __syncthreads();
+        uint32_t pa[4], pb[4];   // A of the weighted sums: heads g, g + 8's probabilities of rows c2, + 1, + 8, + 9
+        split_bf16x2(*(const float2*) (pr + g * R + c2), pa[0], pb[0]);
+        split_bf16x2(*(const float2*) (pr + (g + 8) * R + c2), pa[1], pb[1]);
+        split_bf16x2(*(const float2*) (pr + g * R + c2 + 8), pa[2], pb[2]);
+        split_bf16x2(*(const float2*) (pr + (g + 8) * R + c2 + 8), pa[3], pb[3]);
+        const float ts0 = tsc[g], ts1 = tsc[g + 8];
+#pragma unroll
+        for (int np = 0; np < 4; ++np) {   // n-tiles 2 np, 2 np + 1
+            uint32_t b0, b1, b2, b3;
+            mma_ldsm_x4_t(b0, b1, b2, b3, vb + np * 16);
+            float* a0 = acc[2 * np];
+            float* a1 = acc[2 * np + 1];
+            a0[0] *= ts0, a0[1] *= ts0, a0[2] *= ts1, a0[3] *= ts1;
+            a1[0] *= ts0, a1[1] *= ts0, a1[2] *= ts1, a1[3] *= ts1;
+            mma_bf16(a0, pa, b0, b1);
+            mma_bf16(a0, pb, b0, b1);
+            mma_bf16(a1, pa, b2, b3);
+            mma_bf16(a1, pb, b2, b3);
+        }
+        __syncthreads();
+    }
+    // the run's partial: each head's unnormalized sums (relative to the run's own maximum), that maximum and the run's
+    // denominator - sparse_attn_merge_kernel puts the runs together
+    float* pb0 = parts + ((((size_t) t * (heads / R) + blockIdx.x) * gridDim.z + blockIdx.z) * R) * kAttnPart;
+    float* o0 = pb0 + (size_t) g * kAttnPart + wp * 64 + c2;
+    float* o1 = o0 + (size_t) 8 * kAttnPart;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        *(float2*) (o0 + nt * 8) = make_float2(acc[nt][0], acc[nt][1]);
+        *(float2*) (o1 + nt * 8) = make_float2(acc[nt][2], acc[nt][3]);
+    }
+    if (threadIdx.x < R) {
+        pb0[(size_t) threadIdx.x * kAttnPart + d] = m_run[threadIdx.x];
+        pb0[(size_t) threadIdx.x * kAttnPart + d + 1] = den[threadIdx.x];
+    }
+#else
+    (void) q, (void) win, (void) ckv, (void) sel, (void) sel_stride, (void) ar, (void) heads, (void) scale, (void) parts;
+#endif
+}
+// block (head h, query t): the runs' partials into out - M the runs' common maximum, a run's weight exp(m - M)
+__global__ void __launch_bounds__(kThreads) sparse_attn_merge_kernel(const float* __restrict__ part, AttnRows ar,
+                                                                     const float* __restrict__ sink, int heads, int nb,
+                                                                     float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    constexpr int d = 512, R = 16;
+    const int h = blockIdx.x, t = blockIdx.y;
+    int n_win, n_sel;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t];
+    }
+    const int total = n_win + n_sel, tpb = attn_split_tpb(total, nb);
+    const int used = min(nb, ((total + 15) / 16 + tpb - 1) / tpb);   // the runs that hold rows
+    const float* pb = part + ((((size_t) t * (heads / R) + h / R) * nb) * R + h % R) * kAttnPart;   // run 0's
+    const size_t step = (size_t) R * kAttnPart;                                                     // a run on
+    float M = -1e30f;
+    for (int b = 0; b < used; ++b) M = fmaxf(M, pb[(size_t) b * step + d]);
+    float dn = expf(sink[h] - M);
+    float o0 = 0.0f, o1 = 0.0f;
+    const int c = threadIdx.x * 2;
+    for (int b = 0; b < used; ++b) {
+        const float* p = pb + (size_t) b * step;
+        const float w = expf(p[d] - M);
+        dn += w * p[d + 1];
+        const float2 v = *(const float2*) (p + c);
+        o0 += w * v.x;
+        o1 += w * v.y;
+    }
+    *(float2*) (out + ((size_t) t * heads + h) * d + c) = make_float2(o0 / dn, o1 / dn);
+}
 #endif   // !MAYA_USE_HIP
 
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
@@ -4709,6 +4922,46 @@ static bool attn_mma_now() {
 #endif
 }
 
+#if !defined(MAYA_USE_HIP)
+// (DS4_ATTN_WIN_SPLIT) the runs a query, and the device's buffer of partials (kAttnScratchT queries x heads x runs),
+// allocated at the first window; null where it is off or the card has no room (then sparse_attn_mma_kernel)
+static int attn_split_runs() {
+    static const int nb = [] {
+        const char* v = std::getenv("DS4_ATTN_WIN_SPLIT");
+        const int n = v != nullptr ? std::atoi(v) : 8;
+        return n < 2 ? 0 : std::min(16, n);
+    }();
+    return nb;
+}
+static float* attn_split_part(int heads) {
+    const int nb = attn_split_runs();
+    if (nb == 0) return nullptr;
+    static std::mutex mu;
+    static float* part[64] = {};
+    static int part_heads[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    if (part_heads[dev] < 0) return nullptr;
+    if (part_heads[dev] < heads) {
+        if (part[dev] != nullptr) return nullptr;   // (a second, wider layer: keep the first buffer, the old kernel there)
+        const size_t n = (size_t) kAttnScratchT * (size_t) heads * (size_t) nb * kAttnPart * sizeof(float);
+        if (cudaMalloc(&part[dev], n) != cudaSuccess) {
+            cudaGetLastError();
+            part[dev] = nullptr;
+            part_heads[dev] = -1;
+            std::fprintf(stderr, "ds4: CUDA%d has no %zu MB for the split window attention - the one-block kernel\n", dev,
+                         n >> 20);
+            return nullptr;
+        }
+        part_heads[dev] = heads;
+        std::fprintf(stderr, "ds4: CUDA%d decode windows' attention on the tensor cores, %d runs a query (DS4_ATTN_WIN_SPLIT)\n",
+                     dev, nb);
+    }
+    return part[dev];
+}
+#endif
+
 // the few-queries path's scratch takes T queries of sel_stride rows
 static bool attn_scr_fits(int T, int sel_stride, const AttnScratch* scr) {
     return scr != nullptr && scr->rows != nullptr && T <= scr->max_t && sel_stride <= scr->cap;
@@ -4749,6 +5002,15 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
             return;
         }
         if (attn_mma_now() && heads % 16 == 0) {
+            // DS4_ATTN_WIN_SPLIT=<runs> (2..16; 8 unless set, 0 / 1: off): a decode window's queries (T up to
+            // kAttnScratchT - only DS4_ATTN_WIN_MMA sends such here) on the split kernel and its merge
+            if (float* part = T <= kAttnScratchT ? attn_split_part(heads) : nullptr) {
+                const int nb = attn_split_runs();
+                pdl_launch(sparse_attn_mma_split_kernel, dim3(heads / 16, T, nb), kThreads, 0, s, q, win,
+                           (const uint8_t*) ckv, sel, sel_stride, a, heads, scale, part);
+                pdl_launch(sparse_attn_merge_kernel, dim3(heads, T), kThreads, 0, s, part, a, sink, heads, nb, out);
+                return;
+            }
             pdl_launch(sparse_attn_mma_kernel, dim3(heads / 16, T), kThreads, 0, s, q, win, (const uint8_t*) ckv, sel,
                        sel_stride, a, sink, heads, scale, out);
             return;

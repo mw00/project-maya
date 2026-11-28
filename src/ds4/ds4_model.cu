@@ -22441,8 +22441,18 @@ struct Model::Impl {
             iota_rows(topk_r, T, T, (int) topk_stride(), s);
         }
         if (NHL > 0) {
+            // DS4_ATTN_WIN_MMA=<T> (off unless set; Ampere and newer): a decode window of at least <T> rows takes
+            // the prompt path's tensor-core attention (sparse_attn_mma_kernel's arithmetic, straight from the packed
+            // rows; up to kAttnScratchT rows with each query's rows split over several blocks) instead of
+            // unpack_sel + the FP32 kernel - the attention a prompt chunk's rows already get, so NOT the FP32
+            // kernel's last bits
+            static const int win_mma = [] {
+                const char* v = std::getenv("DS4_ATTN_WIN_MMA");
+                return v != nullptr ? std::atoi(v) : 0;
+            }();
+            const int hpb = win_mma > 0 && T >= win_mma && ckv_fmt == kKvFp4 && NHL % 16 == 0 ? kAttnWmma : 0;
             sparse_attn(q, d.ext, ckv, topk_r, (int) topk_stride(), ar, l.sink, NHL, HD, T,
-                        1.0f / std::sqrt((float) HD), o_r, s, ckv_fmt, 0, &d.attn_scr);
+                        1.0f / std::sqrt((float) HD), o_r, s, ckv_fmt, hpb, &d.attn_scr);
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) p0;
