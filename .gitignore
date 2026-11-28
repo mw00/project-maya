@@ -27,6 +27,7 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp/
+/third_party/strata/
 /models/
 /packs/
 /mtp/

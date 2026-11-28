@@ -15,6 +15,7 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 - [SETTINGS.md](SETTINGS.md): the `MAYA_*` environment variables and config entries that tune the engine.
 - [RESPONSES.md](RESPONSES.md): the `/v1/responses` API, its options and limits.
 - [DOCKER.md](DOCKER.md): a recipe to build a Docker image of Maya (there is no official image).
+- [QWEN_STRATA_ENGINE.md](QWEN_STRATA_ENGINE.md): opt-in: Qwen3.8-Flash-Next on Strata's current engine (`tools/strata_qwen.py`), with Maya's Monitor figures.
 - [AGENT_BENCH.md](AGENT_BENCH.md): `tools/agent_bench.py`, a benchmark that loads a running server like coding agents do.
 - [EXL3-HELPER.md](EXL3-HELPER.md): the experimental helper GPU that runs EXL3 experts the main GPUs miss.
 

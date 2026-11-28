@@ -1,0 +1,141 @@
+From 388c34a8c7aac162812c63c6d763ceb3ce5026cc Mon Sep 17 00:00:00 2001
+From: Maya local <maya@localhost>
+Date: Fri, 27 Nov 2026 23:48:19 -0500
+Subject: [PATCH] Maya integration: VRAM map line, engine_kind=qwen tiers INFO
+ (mtp/dflash), live STAT lines every 8 tokens
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/src/program/generate.cpp | 77 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/engine/src/program/generate.cpp b/engine/src/program/generate.cpp
+index af2724f6..85c2acb7 100644
+--- a/engine/src/program/generate.cpp
++++ b/engine/src/program/generate.cpp
+@@ -2216,11 +2216,20 @@ static void uma_refuse_chunk_if_full(int64_t chunk, bool borrows, double cache_g
+ }
+ 
+ /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
++// Maya: every mark's free VRAM is kept until the serve start, which turns the steps into the VRAM line - what each
++// part of the model holds on the card, measured (the Monitor's "what fills the GPU")
++struct MayaMark { const char* where; size_t free_b; };
++std::vector<MayaMark>& maya_marks() { static std::vector<MayaMark> v; return v; }
++bool g_maya_marks_open = true;
++uint64_t g_maya_borrow_bytes = 0;   // the prompt path's loan of expert-cache slots (inside the pool)
++
+ void mem_mark(const char* where) {
+     static const char* const env = std::getenv("STRATA_TRACE");
+-    if (env == nullptr) return;
++    if (env == nullptr && !g_maya_marks_open) return;
+     size_t free_b = 0, total_b = 0;
+     cudaMemGetInfo(&free_b, &total_b);
++    if (g_maya_marks_open) maya_marks().push_back({where, free_b});
++    if (env == nullptr) return;
+     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
+     // STRATA_TRACE=2: also wait for the device here and name the first step after which it reports an error.  A
+     // "sticky" failure (#2013: unspecified launch failure surfacing in a later, unrelated call) is then pinned to
+@@ -6065,6 +6074,7 @@ int main(int argc, char** argv) {
+         }
+         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
+                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
++        mem_mark("the native projections");
+     }
+     // ---- THE LAYER SPLIT'S SPILL WALK, STEP 1: THE TRIM.  CUDA0 holds the whole dense set now; every later card is about to load a copy of it (3.5 GiB for IQ3_S), which on a
+     // card that is short (two 8 GB cards: 6 of 6 starts failed in 0.2.10) is what leaves its expert cache and its prompt path no room.  A card that cannot afford the copy
+@@ -12922,6 +12932,7 @@ int main(int argc, char** argv) {
+                                  "buffers: %s\n", (long long) o.prefill_chunk, room.c_str());
+         }
+         if (any_loan) {
++            g_maya_borrow_bytes = borrow_bytes;
+             if (borrow != nullptr)
+                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
+                              (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
+@@ -16225,6 +16236,46 @@ int main(int argc, char** argv) {
+                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                        " batch_groups=" + std::to_string(o.batch_groups) +
+                                        " slot_read=" + std::to_string(slot_read_cap ? 1 : 0)).c_str() : "");
++            {   // Maya: the expert tiers as Maya's Monitor names them, and the measured map of what fills the GPU
++                const int64_t all_experts = (int64_t) g.n_layers * g.n_expert;
++                const uint64_t ram_b = o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total;
++                std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f "
++                            "mtp=%d dflash=%d vision_lend=0\n", (long long) all_experts, (long long) slots_all,
++                            (double) mib_all / 1024.0, (long long) all_experts, (double) ram_b / 1073741824.0,
++                            !o.mtp.empty() && !use_df2 ? 1 : 0, use_df2 ? 1 : 0);
++                if (stages.empty()) {   // one GPU: the steps' VRAM, by what they loaded
++                    uint64_t weights = 0, kv = 0, drafter = 0, act = 0, window = 0;
++                    const auto& mk = maya_marks();
++                    for (size_t i = 1; i < mk.size(); ++i) {
++                        if (mk[i - 1].free_b <= mk[i].free_b) continue;
++                        const uint64_t d = (uint64_t) (mk[i - 1].free_b - mk[i].free_b);
++                        const std::string w = mk[i].where;
++                        if (w == "the pack weights" || w == "the native projections" || w == "the native head") weights += d;
++                        else if (w == "the session (KV, GDN state, PLE history)") kv += d;
++                        else if (w == "the weights, the session and the drafter") drafter += d;
++                        else if (w == "the verifier and the drafter's binding") window += d;
++                        else if (w == "opening the expert cache" || w == "the profile fill") {}   // the pool: its own figure
++                        else act += d;
++                    }
++                    if (!mk.empty() && mk.back().free_b > free_b) act += (uint64_t) (mk.back().free_b - free_b);
++                    char pci[32] = "-";
++                    int dev = 0;
++                    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetPCIBusId(pci, (int) sizeof pci, dev) != cudaSuccess) {
++                        cudaGetLastError();
++                        std::snprintf(pci, sizeof pci, "-");
++                    }
++                    std::printf("VRAM dev=0 pci=%s total=%llu free=%llu weights=%llu kv=%llu kv_ram=%llu act=%llu drafter=%llu "
++                                "window=%llu pool=%llu tail=0 borrow=%llu vision=0 slots=%lld ctx=%lld layers=0-%lld\n",
++                                pci, (unsigned long long) total_b, (unsigned long long) free_b, (unsigned long long) weights,
++                                (unsigned long long) kv, (unsigned long long) strata::core::qsa_kv_host_bytes(),
++                                (unsigned long long) act, (unsigned long long) drafter, (unsigned long long) window,
++                                (unsigned long long) xcache.bytes(), (unsigned long long) g_maya_borrow_bytes,
++                                (long long) xcache.slots(), (long long) o.max_context, (long long) g.n_layers);   // (layers=[first, end), as Maya's GLM engine writes it)
++                }
++                g_maya_marks_open = false;   // (the marks are the start's: none is kept past it)
++                maya_marks().clear();
++                maya_marks().shrink_to_fit();
++            }
+             if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: engine choice and budgets (a diagnostic; off by default)
+                 auto& M = strata::core::manifest::instance();
+                 M.engine("version", STRATA_VERSION);
+@@ -21797,6 +21848,10 @@ int main(int argc, char** argv) {
+             const uint64_t file_bytes0 = src.file_read_bytes();
+             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
+             const int64_t offload0 = drive.d.offload_entries;   // #588
++            // Maya: live expert-tier counters (STAT lines) every 8 tokens, from this request's decode start
++            const Clock::time_point maya_stat_t0 = Clock::now();
++            int64_t maya_stat_next = 8;
++            const int64_t maya_promo0 = ajob ? a_swapped : adapt_nswaps;
+             pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
+             if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
+             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
+@@ -23120,6 +23175,26 @@ int main(int argc, char** argv) {
+                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
+                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                 }
++                if (produced_n >= maya_stat_next) {   // Maya's Monitor: where the experts live, a token
++                    maya_stat_next = produced_n + 8;
++                    const double el = std::chrono::duration<double>(Clock::now() - maya_stat_t0).count();
++                    const double nt = (double) produced_n;
++                    const int64_t h = drive.d.cache_hits - decode_hits0;
++                    const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
++                    const int64_t files = src.file_reads() - files0;
++                    const int64_t promo = (ajob ? a_swapped : adapt_nswaps) - maya_promo0;
++                    const int64_t all_experts = (int64_t) g.n_layers * g.n_expert;
++                    const double vram_gb = (double) xcache.bytes() / 1073741824.0;
++                    const uint64_t ram_b = o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total;
++                    std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
++                                "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f disk_gb=0.0 "
++                                "draft_acc=%lld draft_off=%lld\n",
++                                nt / std::max(1e-9, el), 1000.0 * el / nt, (double) h / (double) std::max<int64_t>(1, look),
++                                (double) std::max<int64_t>(0, look - h - files) / nt, (double) files / nt,
++                                (double) std::max<int64_t>(0, promo) / nt, (long long) xcache.resident(),
++                                (long long) xcache.slots(), (long long) (all_experts - xcache.resident()),
++                                (double) ram_b / 1073741824.0, vram_gb, (long long) draft_accepted, (long long) draft_offered);
++                }
+                 std::fflush(stdout);
+                 ++rounds;
+                 if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
+-- 
+2.34.1
+
