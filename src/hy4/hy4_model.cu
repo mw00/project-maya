@@ -13,6 +13,7 @@
 //   x = hc_post(x, rms(that) w, post)
 // and logits = rms(hc_head(x)) w . Wout.
 #include "hy4_model.hpp"
+#include "hy4_tp_hot.hpp"
 
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
@@ -785,6 +786,7 @@ struct Model::Impl {
     // (a member's staging slots as its last pass left them: the layer whose experts they hold and how many, -1 where
     //  the layer took several passes; a chunk's second half finds the first half's experts there)
     int stg_il[16], stg_np[16];
+    bool tp_hot_on = [] { const char* v = std::getenv("HY4_TP_HOT"); return v && std::strcmp(v, "1") == 0; }();
     int tp_own_most() const { return (g.n_expert + U - 1) / U; }   // (the experts a unit holds at most)
     bool unsplit_experts(int il) const { return (size_t) il < tp_unsplit.size() && tp_unsplit[(size_t) il] != 0; }
     // the blocks a unit's slice of layer il's experts holds, and the blocks an expert is (0: not a routed layer)
@@ -4611,9 +4613,10 @@ struct Model::Impl {
                                                   : std::string();
             if (hot.on && tp > 1) {
                 std::snprintf(buf, sizeof buf, "INFO HY4_HOT: tensor parallel places the experts in VRAM at the start (by "
-                              "%s), no swaps between",
+                              "%s)%s",
                               hot.seeded ? "Maya's shipped scores" : hot.loaded ? hot.file.c_str() : !prof_in.empty() ?
-                              "the profile" : "their order, no scores yet");
+                              "the profile" : "their order, no scores yet",
+                              tp_hot_on ? ", swaps across TP ranks between requests (HY4_TP_HOT=1)" : ", no swaps between");
                 info.push_back(buf + kept);
             } else if (hot.on) {
                 std::snprintf(buf, sizeof buf, "INFO HY4_HOT: the experts in VRAM follow the answers' routing (placed by "
@@ -7156,6 +7159,83 @@ struct Model::Impl {
                 if (sc[cpu[i]] <= (float) hot.ratio * sc[res[i]] + (float) hot.margin) break;
                 plan.push_back({sc[cpu[i]] - sc[res[i]], l.il, res[i], cpu[i]});
             }
+        }
+        if (tp > 1 && tp_hot_on) {
+            std::vector<hy4::TpHotSwap> tplan;
+            for (int il = 0; il < g.n_layer; ++il) {
+                if ((size_t) il >= TL[0].size() || !TL[0][(size_t) il].partial()) continue;
+                const float* sc = hot.score.data() + (size_t) il * g.n_expert;
+                std::vector<std::vector<int>> sof((size_t) tp);
+                std::vector<std::vector<char>> se((size_t) tp);
+                for (int m = 0; m < tp; ++m) {
+                    sof[(size_t) m] = TL[(size_t) m][(size_t) il].slot_of;
+                    se[(size_t) m] = TL[(size_t) m][(size_t) il].stream_e;
+                }
+                auto lp = hy4::plan_tp_hot_layer(il, sc, g.n_expert, sof, TL[0][(size_t) il].lane_e, se, hot.ratio, hot.margin);
+                tplan.insert(tplan.end(), lp.begin(), lp.end());
+            }
+            wanted = tplan.size();
+            std::stable_sort(tplan.begin(), tplan.end(), [](const hy4::TpHotSwap& a, const hy4::TpHotSwap& b) { return a.gain > b.gain; });
+            if ((int) tplan.size() > max_swaps) tplan.resize((size_t) std::max(0, max_swaps));
+            if (!tplan.empty()) {
+                for (auto& gp : G) {
+                    CK(cudaSetDevice(gp.dev));
+                    if (gp.s) CK(cudaStreamSynchronize(gp.s));
+                }
+                std::fill(std::begin(stg_il), std::end(stg_il), -1);
+                std::fill(std::begin(stg_np), std::end(stg_np), 0);
+                std::vector<std::vector<char>> touched((size_t) tp, std::vector<char>((size_t) g.n_layer, 0));
+                for (const hy4::TpHotSwap& sw : tplan) {
+                    Layer& lm = TL[(size_t) sw.gpu_rank][(size_t) sw.il];
+                    Layer& lk = TL[(size_t) sw.cpu_rank][(size_t) sw.il];
+                    Layer& l0 = TL[0][(size_t) sw.il];
+                    const int slot = lm.slot_of[(size_t) sw.out_e];
+                    if (slot < 0) continue;
+                    const size_t e_in = (size_t) sw.in_e;
+                    const CpuExperts& cx = l0.cex;
+                    std::memcpy(sh[0].h_stage + l0.tr[0], cx.G(e_in), cx.g_stride);
+                    std::memcpy(sh[0].h_stage + l0.tr[1], cx.U(e_in), cx.g_stride);
+                    std::memcpy(sh[0].h_stage + l0.tr[2], cx.D(e_in), cx.d_stride);
+                    Gpu& gm_gpu = G[(size_t) mem[(size_t) sw.gpu_rank]];
+                    CK(cudaSetDevice(gm_gpu.dev));
+                    CK(cudaMemcpyAsync(lm.experts + (size_t) slot * lm.blob, sh[0].h_stage,
+                                       l0.tr[2] + cx.d_stride, cudaMemcpyHostToDevice, gm_gpu.s));
+                    CK(cudaStreamSynchronize(gm_gpu.s));
+                    hy4::apply_tp_hot_layer_swap(sw.out_e, sw.in_e, lm.slot_of, l0.lane_e, lk.stream_e);
+                    touched[(size_t) sw.gpu_rank][(size_t) sw.il] = 1;
+                }
+                for (int m = 0; m < tp; ++m) {
+                    Gpu& gm_gpu = G[(size_t) mem[(size_t) m]];
+                    CK(cudaSetDevice(gm_gpu.dev));
+                    for (int il = 0; il < g.n_layer; ++il) {
+                        if (!touched[(size_t) m][(size_t) il]) continue;
+                        Layer& lm = TL[(size_t) m][(size_t) il];
+                        CK(cudaMemcpyAsync(lm.slot_d, lm.slot_of.data(), sizeof(int) * g.n_expert,
+                                           cudaMemcpyHostToDevice, gm_gpu.s));
+                    }
+                    CK(cudaStreamSynchronize(gm_gpu.s));
+                }
+            }
+            const double dt = now_s() - t0;
+            hot.swaps += (int64_t) tplan.size();
+            hot.swap_s += dt;
+            ++hot.rounds;
+            if (hot.log) {
+                uint64_t hp = 1469598103934665603ull, hs = hp;
+                for (int m = 0; m < tp; ++m)
+                    for (const Layer& l : TL[(size_t) m])
+                        for (int v : l.slot_of) hp = (hp ^ (uint32_t) v) * 1099511628211ull;
+                for (float f : hot.score) {
+                    uint32_t u;
+                    std::memcpy(&u, &f, 4);
+                    hs = (hs ^ u) * 1099511628211ull;
+                }
+                std::fprintf(stderr, "maya-hy4: HY4_TP_HOT: kept tokens %lld, picks %lld, %.1f%% in VRAM; %zu swaps of %zu "
+                             "wanted, %.1f ms; placement %016llx scores %016llx\n", (long long) kt, (long long) wp,
+                             wp ? 100.0 * (double) wh / (double) wp : 0.0, tplan.size(), wanted, dt * 1e3,
+                             (unsigned long long) hp, (unsigned long long) hs);
+            }
+            return true;
         }
         if (ps.on && ps.st && !plan.empty()) CK(cudaStreamSynchronize(ps.st));   // (HY4_PSTREAM: no copy under way)
         wanted = plan.size();

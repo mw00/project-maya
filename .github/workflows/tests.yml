@@ -55,6 +55,10 @@ jobs:
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -pthread -Isrc/ling -Isrc/ds4 tests/ling_unit_test.cpp -o "$RUNNER_TEMP/ling_unit_test"
           "$RUNNER_TEMP/ling_unit_test"
+      - name: HY4 TP dynamic hot-swap planning and ownership invariants (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/hy4_tp_hot_test.cpp -o "$RUNNER_TEMP/hy4_tp_hot_test"
+          "$RUNNER_TEMP/hy4_tp_hot_test"
       - name: Server tests
         # a hang prints every thread's stack (faulthandler, after 10 minutes, repeated) and ends the
         # step at 14 minutes instead of the job's 20 with nothing to read
