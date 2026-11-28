@@ -13,16 +13,18 @@
 // Arithmetic f32 throughout (FP16 latents as staged by mla2, INT8 records decoded to FP16 the same way); the sums are
 // associated differently from mla2's (f32 rounding apart).  kv_lora 512, qk_rope 64, n_head % 16 == 0 (GLM-5.3);
 // other shapes keep mla2's kernels.  Where it runs (glmd_dec.cu, auto_device): every CUDA device it fits; on HIP only
-// the archs it was measured faster on (gfx1151) unless MAYA_GLMD_MLA_DEC=1; 8 heads a block where a block gets
-// 64 KB of shared memory (the AMD GPUs).
+// the archs it was measured faster on (gfx1151) unless MAYA_GLMD_MLA_DEC=1 - or the caller has no other kernel for
+// the shape and asks for any device (maya-ling's decode); 8 heads a block where a block gets 64 KB of shared memory
+// (the AMD GPUs).
 #pragma once
 
 #include <cstddef>
 
 namespace glmd {
 
-/// The shapes mla_dec serves, on a device that takes it (see above).
-bool mla_dec_ok(int n_head, int kv_lora, int qk_rope);
+/// The shapes mla_dec serves, on a device that takes it (see above).  any_device: on every device it fits, whatever
+/// the device's default - for a caller with no kernel of its own to fall back on (maya-ling; GLM-5.3 keeps mla2's).
+bool mla_dec_ok(int n_head, int kv_lora, int qk_rope, bool any_device = false);
 /// The splits mla_dec uses at most on the current device (2 blocks a multiprocessor over the head groups, <= 64).
 int mla_dec_splits(int n_head);
 /// The partials' bytes for n_head heads (part: S x n_head x (512 + 2) floats; mla2_work_bytes's part covers it).
@@ -30,8 +32,9 @@ size_t mla_dec_part_bytes(int n_head);
 /// ctx[h * 512 + c] = sum_s softmax_s(scale (q_abs[h] . lat[s] + q_pe[h] . k_pe[s])) lat[s][c] over the selected
 /// cells (cells[0 .. n), -1 = padding; n = min(n_sel, *n_sel_dev) when n_sel_dev is set).  q_pe[h] = q + h q_stride +
 /// q_pe_off.  part: scratch of mla_dec_part_bytes.  false (nothing launched) for a shape it does not serve.
+/// any_device: as mla_dec_ok's.
 bool mla_dec(const float* q_abs, const float* q, int q_stride, int q_pe_off, const void* lat, int lat_q8,
              const unsigned short* k_pe, const int* cells, int n_sel, const int* n_sel_dev, int n_head, int kv_lora,
-             int qk_rope, float scale, float* part, float* ctx, void* stream);
+             int qk_rope, float scale, float* part, float* ctx, void* stream, bool any_device = false);
 
 }  // namespace glmd

@@ -319,10 +319,11 @@ const DevCfg& dev_cfg() {
 
 }  // namespace
 
-bool mla_dec_ok(int n_head, int kv_lora, int qk_rope) {
+bool mla_dec_ok(int n_head, int kv_lora, int qk_rope, bool any_device) {
     if (kv_lora != kLora || qk_rope != kRope || n_head <= 0) return false;
     const DevCfg& c = dev_cfg();
-    return c.on && n_head % (kWarps * c.hpw) == 0;
+    // (any_device: where it fits - hpw > 0 - whatever auto_device and MAYA_GLMD_MLA_DEC say)
+    return (c.on || (any_device && c.hpw > 0)) && n_head % (kWarps * c.hpw) == 0;
 }
 
 int mla_dec_splits(int n_head) {
@@ -336,10 +337,10 @@ size_t mla_dec_part_bytes(int n_head) { return (size_t) kMaxSplits * n_head * kP
 
 bool mla_dec(const float* q_abs, const float* q, int q_stride, int q_pe_off, const void* lat, int lat_q8,
              const unsigned short* k_pe, const int* cells, int n_sel, const int* n_sel_dev, int n_head, int kv_lora,
-             int qk_rope, float scale, float* part, float* ctx, void* stream) {
-    if (!mla_dec_ok(n_head, kv_lora, qk_rope) || !q_abs || !q || !lat || !k_pe || !part || !ctx || n_sel < 0 ||
-        (n_sel > 0 && !cells) || q_stride % 4 || q_pe_off % 4 || ((uintptr_t) lat & 15u) || ((uintptr_t) k_pe & 15u) ||
-        ((uintptr_t) q_abs & 15u) || ((uintptr_t) q & 15u))
+             int qk_rope, float scale, float* part, float* ctx, void* stream, bool any_device) {
+    if (!mla_dec_ok(n_head, kv_lora, qk_rope, any_device) || !q_abs || !q || !lat || !k_pe || !part || !ctx ||
+        n_sel < 0 || (n_sel > 0 && !cells) || q_stride % 4 || q_pe_off % 4 || ((uintptr_t) lat & 15u) ||
+        ((uintptr_t) k_pe & 15u) || ((uintptr_t) q_abs & 15u) || ((uintptr_t) q & 15u))
         return false;
     cudaStream_t s = (cudaStream_t) stream;
     const DevCfg& c = dev_cfg();
