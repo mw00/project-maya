@@ -1,0 +1,163 @@
+{
+  "source_sha256": "d202e1b28b116b2b7c4da0830edf48fb4a74c9542859d7bc95b551fa7362c903",
+  "test_sha256": "b4c3ec77fe879704da3abac70f1d31f180db9e719bc82a9cfe35330477b35122",
+  "scope": "Extracted actual host slot logic; fake model serialization; no GPU/model",
+  "platform": "win32",
+  "compiler": "cl",
+  "passed": 17,
+  "failed": [],
+  "date": "2026-11-15",
+  "base_commit": "7e68a30f2f208056195352129188661fb6b94445",
+  "normalization": "Only local temporary paths are replaced; actual outputs/assertions/exit codes retained.",
+  "compile": {
+    "exit_code": 0,
+    "stdout": "fixture.cpp\n<temporary-fixture>\\fixture.cpp(77): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.\n<temporary-fixture>\\fixture.cpp(78): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.\n<temporary-fixture>\\fixture.cpp(87): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.\n<temporary-fixture>\\fixture.cpp(104): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.\n<temporary-fixture>\\fixture.cpp(181): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.\n",
+    "stderr": ""
+  },
+  "cases": [
+    {
+      "name": "lru",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\lru\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\lru\\slots; kept across runs\nglm slots: dropped a 1-token conversation, no longer in RAM or on disk\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "budget",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\budget\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\budget\\slots; kept across runs\nglm slots: conversation exceeds the disk budget - not written\nglm slots: conversation exceeds the disk budget - not written\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "zero-budget",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\zero-budget\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\zero-budget\\slots; kept across runs\nglm slots: conversation exceeds the disk budget - not written\nglm slots: conversation exceeds the disk budget - not written\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "ram-pressure",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\ram-pressure\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\ram-pressure\\slots; kept across runs\nglm slots: saved a 1-token conversation (0.00 GB in RAM in 0.0 s); 1 in RAM, 0 on disk\nglm slots: saved a 1-token conversation (0.00 GB in RAM in 0.0 s); 1 in RAM, 1 on disk\nglm slots: took back a 1-token conversation from disk (0.0 s); 1 new tokens to read\nglm slots: dropped a 1-token conversation, no longer in RAM or on disk\nglm slots: saved a 1-token conversation (0.00 GB in RAM in 0.0 s); 1 in RAM, 1 on disk\nglm slots: dropped a 1-token conversation, no longer in RAM or on disk\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "failed-put",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\failed-put\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\failed-put\\slots; kept across runs\nglm slots: conversation exceeds the disk budget - not written\nglm slots: conversation was not retained after spilling - it will be read again when it comes back\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "flush",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\flush\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\flush\\slots; kept across runs\nglm slots: took back a 2-token conversation from RAM (0.0 s); 1 new tokens to read\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "reindex",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\flush\\slots: 2 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\flush\\slots; kept across runs\nglm slots: dropped a 2-token conversation, no longer in RAM or on disk\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "mixed-flush",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\mixed-flush\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\mixed-flush\\slots; kept across runs\nglm slots: took back a 2-token conversation from disk (0.0 s); 1 new tokens to read\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "mixed-reindex",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\mixed-flush\\slots: 2 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\mixed-flush\\slots; kept across runs\nglm slots: dropped a 2-token conversation, no longer in RAM or on disk\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "cli",
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "glm slots: folder <temporary-fixture>\\cli\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\cli\\slots; kept across runs\nglm slots: saved a 2-token conversation on shutdown (0.00 GB in RAM in 0.0 s); 1 in RAM, 0 on disk\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "cli-reindex",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\cli\\slots: 1 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\cli\\slots; kept across runs\nglm slots: took back a 2-token conversation from disk (0.0 s); 1 new tokens to read\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "write-failure",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\write-failure\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\write-failure\\slots; kept across runs\nglm slots: writing <temporary-fixture>\\write-failure\\not-a-directory\\slot-1794720272889-1.bin.tmp failed\nglm slots: writing <temporary-fixture>\\write-failure\\not-a-directory\\slot-1794720272889-2.bin.tmp failed\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "miss",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\miss\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 0.00 GB max, disk 0.00 GB in <temporary-fixture>\\miss\\slots; kept across runs\nglm slots: miss: no candidate\nglm slots: miss: prompt is not longer than the saved token prefix\nglm slots: miss: prompt is not longer than the saved token prefix\nglm slots: miss: diverged at token 0\nglm slots: miss: diverged at token 1\nglm slots: miss: token prefix matches but images differ\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "off-disk",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: saved a 1-token conversation (0.00 GB in 0.0 s); 1 kept, 0.00 GB\nglm slots: saved a 1-token conversation (0.00 GB in 0.0 s); 2 kept, 0.00 GB\nglm slots: saved a 1-token conversation (0.00 GB in 0.0 s); 2 kept, 0.00 GB\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "off-ram",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: slots parked in RAM (0.00 GB max) - nothing is written to disk, the states die with the run\nglm slots: saved a 1-token conversation (0.00 GB in RAM in 0.0 s); 1 kept, 0.00 GB\nglm slots: saved a 1-token conversation (0.00 GB in RAM in 0.0 s); 2 kept, 0.00 GB\nglm slots: saved a 1-token conversation (0.00 GB in RAM in 0.0 s); 2 kept, 0.00 GB\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "off-unset",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: saved a 1-token conversation (0.00 GB in 0.0 s); 1 kept, 0.00 GB\nglm slots: saved a 1-token conversation (0.00 GB in 0.0 s); 2 kept, 0.00 GB\nglm slots: saved a 1-token conversation (0.00 GB in 0.0 s); 2 kept, 0.00 GB\n",
+      "assertion_error": "",
+      "passed": true
+    },
+    {
+      "name": "default-budgets",
+      "exit_code": 0,
+      "stdout": "PASS\n",
+      "stderr": "glm slots: folder <temporary-fixture>\\default-budgets\\slots: 0 conversation(s) kept from earlier runs (0.00 GB)\nglm slots: two-tier slots: RAM 8.59 GB max, disk 17.18 GB in <temporary-fixture>\\default-budgets\\slots; kept across runs\nglm slots: saved a 1-token conversation (0.00 GB in RAM in 0.0 s); 1 in RAM, 0 on disk\n",
+      "assertion_error": "",
+      "passed": true
+    }
+  ],
+  "full_translation_unit_compile": {
+    "scope": "MSVC host translation unit only; no CUDA compile/link/model",
+    "source_sha256": "d202e1b28b116b2b7c4da0830edf48fb4a74c9542859d7bc95b551fa7362c903",
+    "exit_code": 0,
+    "source_unchanged": true,
+    "compiler": "MSVC 14.50.35717; C++20; /c; CUDA 12.8 headers; no CUDA code generation or link",
+    "warnings": "Existing C4244 integer conversion diagnostics retained in original local log."
+  }
+}

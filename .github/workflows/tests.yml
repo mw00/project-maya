@@ -67,5 +67,7 @@ jobs:
           PYEOF
           "$RUNNER_TEMP/venv/bin/python" -X faulthandler "$RUNNER_TEMP/run_server_tests.py" 2>&1 | tee "$RUNNER_TEMP/server-tests.log" | grep -vE "^\[maya\]" | cut -c1-300
           exit "${PIPESTATUS[0]}"
+      - name: GLM conversation-slot policy (CPU only)
+        run: '"$RUNNER_TEMP/venv/bin/python" tools/test_glm_slot_spill.py --receipt "$RUNNER_TEMP/glm-slot-spill.json"'
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'

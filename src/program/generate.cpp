@@ -1393,6 +1393,8 @@ static int glm_pack_generate(const Options& o) {
         // never supersede it - it goes only as the least recently used (#179)
         bool prefix = false;
         uint64_t img = kNoImages;               // img_hash() of the pictures in `tokens`
+        // A RAM-to-disk move must not refresh the persisted age or recency of a conversation.
+        std::filesystem::file_time_type used_at = std::filesystem::file_time_type::clock::now();
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
@@ -1403,18 +1405,29 @@ static int glm_pack_generate(const Options& o) {
     if (slot_max > 0 && maya::core::glmpc::engine_on(model)) slot_max = 0;   // glm-dsa B14.14: the prompt cache replaces the slots
     const size_t slot_min = (size_t) std::max(1.0, env_num("MAYA_GLM_SLOT_MIN", 1024));
     const uint64_t slot_budget = (uint64_t) (env_num("MAYA_GLM_SLOT_GB", 16) * 1073741824.0);
+    // MAYA_GLM_SLOT_SPILL=1: hot states stay in RAM (MAYA_GLM_SLOT_RAM_GB, 8 when unset) and the least recently
+    // used is written to the folder instead of deleted. The folder keeps the existing MAYA_GLM_SLOT_GB cap.
+    // Those files are kept across runs, and RAM states are written out when the engine ends. Unset keeps the
+    // count cap, which deletes the least recently used. MAYA_GLM_SLOT_RAM_GB alone still parks every slot in RAM
+    // with no folder.
+    const bool slot_spill = getenv("MAYA_GLM_SLOT_SPILL") != nullptr && std::atoi(getenv("MAYA_GLM_SLOT_SPILL")) != 0;
     // slots in RAM: the conversation's state is parked in a host buffer instead of a file.  The cap moves to RAM too
     // (slot_cap below); the states die with the run, so SLOT_KEEP, SLOT_DAYS, SLOT_DIR and the 8 GB-free disk guard
     // are theirs no longer.  Nothing on the disk is touched: in RAM mode the slots folder is neither used nor wiped.
-    const bool slot_ram = env_num("MAYA_GLM_SLOT_RAM_GB", 0) > 0;
+    const bool slot_ram = !slot_spill && env_num("MAYA_GLM_SLOT_RAM_GB", 0) > 0;
     const uint64_t slot_cap =
         slot_ram ? (uint64_t) (env_num("MAYA_GLM_SLOT_RAM_GB", 16) * 1073741824.0) : slot_budget;
+    const uint64_t slot_ram_budget =
+        slot_spill ? (uint64_t) (env_num("MAYA_GLM_SLOT_RAM_GB", 8) * 1073741824.0) : 0;
+    const uint64_t slot_disk_budget = slot_budget;
     // MAYA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
     // and kept when they belong to this model), the conversation in the model is set aside when the engine ends
     // (QUIT or end of input), and a file not used for MAYA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
     // .meta beside it: this model's identity, the conversation's tokens and the slot's size; a slot whose .meta is
     // missing, foreign or does not match its file is deleted.  Both files are written under a temporary name first.
-    const bool slot_keep = getenv("MAYA_GLM_SLOT_KEEP") != nullptr && std::atoi(getenv("MAYA_GLM_SLOT_KEEP")) != 0;
+    // Spill keeps the folder too, so a restart of that mode does not empty it.
+    const bool slot_keep = slot_spill ||
+                           (getenv("MAYA_GLM_SLOT_KEEP") != nullptr && std::atoi(getenv("MAYA_GLM_SLOT_KEEP")) != 0);
     const double slot_days = env_num("MAYA_GLM_SLOT_DAYS", 7);
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
@@ -1535,6 +1548,7 @@ static int glm_pack_generate(const Options& o) {
             // .meta has no flag for it, its tokens tell (no user turn)
             slots.back().prefix = maya::core::is_system_prefix(slots.back().tokens, 154827);
             slots.back().img = fd.img;
+            slots.back().used_at = fd.t;
         }
         if (slot_keep) {
             std::ostringstream m;
@@ -1549,6 +1563,9 @@ static int glm_pack_generate(const Options& o) {
             slot_max = 0;
         }
     }
+    if (slot_max > 0 && slot_spill)
+        note("two-tier slots: RAM " + gb(slot_ram_budget) + " max, disk " + gb(slot_disk_budget) +
+             " in " + slot_dir.string() + "; kept across runs");
     const auto slot_drop = [&](size_t i) {
         if (slots[i].data)                       // a RAM slot: its buffer simply dies
             slots[i].data.reset();
@@ -1559,12 +1576,110 @@ static int glm_pack_generate(const Options& o) {
         }
         slots.erase(slots.begin() + (long) i);
     };
+    const auto slot_touch = [&](Slot& s) {
+        s.used = ++slot_clock;
+        s.used_at = fs::file_time_type::clock::now();
+        if (slot_keep && !s.data) {
+            std::error_code ec;
+            fs::last_write_time(meta_of(s.path), s.used_at, ec);
+        }
+    };
     const auto slot_lru = [&](size_t keep) {   // the least recently used slot other than `keep`
         size_t lru = SIZE_MAX;
         for (size_t i = 0; i < slots.size(); ++i)
             if (i != keep && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;
         return lru;
     };
+    const auto slot_disk_bytes = [&]() {
+        uint64_t total = 0;
+        for (const auto& s : slots)
+            if (!s.data) total += s.bytes;
+        return total;
+    };
+    // Moving a cold RAM slot to disk is not a use: it must remain eligible for eviction ahead of hotter files.
+    const auto slot_trim_disk = [&]() {
+        while (slot_disk_bytes() > slot_disk_budget) {
+            size_t lru = SIZE_MAX;
+            for (size_t i = 0; i < slots.size(); ++i)
+                if (!slots[i].data &&
+                    (lru == SIZE_MAX || slots[i].used < slots[lru].used))
+                    lru = i;
+            if (lru == SIZE_MAX) break;
+            const size_t ntok = slots[lru].tokens.size();
+            slot_drop(lru);
+            char m[160];
+            std::snprintf(m, sizeof m, "dropped a %zu-token conversation, no longer in RAM or on disk", ntok);
+            note(m);
+        }
+    };
+    // a RAM slot into the folder (its bytes, then its .meta). false: not written
+    const auto slot_write_file = [&](size_t i) -> bool {
+        if (i >= slots.size() || !slots[i].data) return false;
+        // Reject an oversized state before writing or evicting any other conversation, including a zero budget.
+        if (slots[i].bytes > slot_disk_budget) {
+            note("conversation exceeds the disk budget - not written");
+            return false;
+        }
+        std::error_code ec;
+        const auto space = std::filesystem::space(slot_dir, ec);
+        if (!ec && space.available < ((uint64_t) 8 << 30)) {
+            std::fprintf(stderr, "glm slots: under 8 GB free in %s - the conversation is not written\n",
+                         slot_dir.string().c_str());
+            return false;
+        }
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string path = (slot_dir / ("slot-" + std::to_string(stamp) + "-" + std::to_string(++slot_seq) +
+                                              ".bin")).string();
+        {
+            std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc);
+            f.write((const char*) slots[i].data->data(), (std::streamsize) slots[i].data->size());
+            f.flush();
+            if (!f) {
+                std::filesystem::remove(path + ".tmp", ec);
+                std::fprintf(stderr, "glm slots: writing %s.tmp failed\n", path.c_str());
+                return false;
+            }
+        }
+        fs::rename(path + ".tmp", path, ec);
+        const bool written = !ec && meta_write(meta_of(path), slots[i].tokens, slots[i].bytes, slots[i].img);
+        if (written) fs::last_write_time(meta_of(path), slots[i].used_at, ec);
+        if (!written || ec) {
+            std::filesystem::remove(path + ".tmp", ec);
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(meta_of(path), ec);
+            std::filesystem::remove(meta_of(path) + ".tmp", ec);
+            std::fprintf(stderr, "glm slots: writing %s failed\n", path.c_str());
+            return false;
+        }
+        slots[i].path = path;
+        slots[i].data.reset();
+        slot_trim_disk();
+        return true;   // handled, even if trimming evicted this slot; `i` may no longer be valid
+    };
+    const auto slot_flush_ram = [&]() {
+        for (;;) {
+            size_t i = SIZE_MAX;
+            for (size_t k = 0; k < slots.size(); ++k)
+                if (slots[k].data) { i = k; break; }
+            if (i == SIZE_MAX) break;
+            if (!slot_write_file(i)) slot_drop(i);
+        }
+    };
+    // This guard also runs on non-serve returns. All captured slot storage and file helpers outlive it.
+    struct SlotFlushOnExit {
+        bool enabled;
+        const decltype(slot_flush_ram)& flush;
+        ~SlotFlushOnExit() {
+            if (!enabled) return;
+            try {
+                flush();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "glm slots: flushing RAM on exit failed (%s)\n", e.what());
+            }
+        }
+    } slot_flush_on_exit{slot_spill, slot_flush_ram};
+    if (slot_spill) slot_trim_disk();
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
@@ -1576,6 +1691,48 @@ static int glm_pack_generate(const Options& o) {
                 slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
+        if (slot_spill) {   // hot copy in RAM; past the RAM budget the least recently used is written, not deleted
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string e;
+            auto buf = std::make_shared<std::vector<uint8_t>>();
+            buf->reserve(1 << 20);
+            const uint64_t bytes = model.slot_save(*buf, e);
+            if (bytes == 0) {
+                note("setting the conversation aside in RAM failed (" + (e.empty() ? std::string("it did not copy") : e) +
+                     ") - it is not parked and will be read from token 0 when it comes back");
+                return;
+            }
+            const uint64_t saved_at = ++slot_clock;
+            slots.push_back({snap_tokens, "", bytes, saved_at});
+            slots.back().data = buf;
+            slots.back().img = snap_img_hash;
+            for (;;) {
+                uint64_t ram_b = 0;
+                int ram_n = 0;
+                for (const auto& s : slots)
+                    if (s.data) { ram_b += s.bytes; ++ram_n; }
+                if (ram_n == 0 || ram_b <= slot_ram_budget) break;
+                size_t lru = SIZE_MAX;
+                for (size_t i = 0; i < slots.size(); ++i)
+                    if (slots[i].data && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;
+                if (lru == SIZE_MAX) break;
+                if (!slot_write_file(lru)) slot_drop(lru);
+            }
+            snap_in_slot = std::any_of(slots.begin(), slots.end(),
+                                       [&](const Slot& s) { return s.used == saved_at; });
+            if (!snap_in_slot) {
+                note("conversation was not retained after spilling - it will be read again when it comes back");
+                return;
+            }
+            int ram_n = 0, disk_n = 0;
+            for (const auto& s : slots) (s.data ? ram_n : disk_n) += 1;
+            char m[320];
+            std::snprintf(m, sizeof m, "saved a %zu-token conversation%s (%s in RAM in %.1f s); %d in RAM, %d on disk",
+                          snap_tokens.size(), why, gb(bytes).c_str(),
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), ram_n, disk_n);
+            note(m);
+            return;
+        }
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
         if (slot_ram) {   // the conversation is parked in a host buffer; nothing touches the disk
             const auto t0 = std::chrono::steady_clock::now();
@@ -1665,7 +1822,28 @@ static int glm_pack_generate(const Options& o) {
                 len = t.size();
             }
         }
-        if (best == SIZE_MAX) return 0;
+        if (best == SIZE_MAX) {
+            size_t diverge = 0;
+            bool length_mismatch = false, image_mismatch = false;
+            for (const auto& s : slots) {
+                const auto& t = s.tokens;
+                size_t c = 0;
+                const size_t lim = std::min(t.size(), prompt.size());
+                while (c < lim && t[c] == prompt[c]) ++c;
+                if (c < lim) diverge = std::max(diverge, c);
+                else if (t.size() >= prompt.size()) length_mismatch = true;
+                else if (img_hash(t.size()) != s.img) image_mismatch = true;
+            }
+            if (slots.empty()) note("miss: no candidate");
+            else if (image_mismatch) note("miss: token prefix matches but images differ");
+            else if (length_mismatch) note("miss: prompt is not longer than the saved token prefix");
+            else {
+                char m[96];
+                std::snprintf(m, sizeof m, "miss: diverged at token %zu", diverge);
+                note(m);
+            }
+            return 0;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         std::string e;
         const bool back = slots[best].data
@@ -1680,12 +1858,8 @@ static int glm_pack_generate(const Options& o) {
         snap_tokens = slots[best].tokens;
         snap_img_hash = slots[best].img;
         snap_in_slot = true;
-        slots[best].used = ++slot_clock;
+        slot_touch(slots[best]);
         slots[best].anchor = false;
-        if (slot_keep && !slots[best].data) {   // its age counts from its last use (a file slot's only)
-            std::error_code ec;
-            fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
-        }
         char m[160];
         std::snprintf(m, sizeof m, "took back a %zu-token conversation from %s (%.1f s); %zu new tokens to read", len,
                       slots[best].data ? "RAM" : "disk",
@@ -1793,7 +1967,8 @@ static int glm_pack_generate(const Options& o) {
         if (slot_max <= 0 || p < slot_min) return;
         for (auto& sl : slots)
             if (sl.prefix && sl.tokens.size() == p && std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin())) {
-                sl.used = ++slot_clock;
+                if (slot_spill) slot_touch(sl);
+                else sl.used = ++slot_clock;
                 return;
             }
         if (!model.snapshot_save()) return;
@@ -4210,6 +4385,7 @@ static int glm_pack_generate(const Options& o) {
             return 0;
         }
         const int rc = run_request(o.tokens, o.max_new, sp);
+        if (slot_spill && rc == 0) slot_put(" on shutdown");
         return rc;
     }
 
