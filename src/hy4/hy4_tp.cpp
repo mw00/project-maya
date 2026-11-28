@@ -1,5 +1,6 @@
 // src/hy4/hy4_tp.cpp - maya-hy4's tensor parallel: the host's threads (see hy4_tp.hpp).
 #include "hy4_tp.hpp"
+#include "hy4_tp_affinity.hpp"
 #include "hy4_lane.hpp"
 
 #include <algorithm>
@@ -443,13 +444,9 @@ std::vector<int> node_cpus(int node) {
     std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
     std::string s;
     if (!std::getline(f, s)) return v;
-    std::stringstream ss(s);
-    std::string part;
-    while (std::getline(ss, part, ',')) {
-        const size_t d = part.find('-');
-        const int a = std::atoi(part.c_str()), b = d == std::string::npos ? a : std::atoi(part.c_str() + d + 1);
-        for (int c = a; c <= b; ++c) v.push_back(c);
-    }
+    v = tp_affinity::parse_cpulist(s);
+    cpu_set_t allowed;
+    if (tp_affinity::inherited_affinity_mask(allowed)) v = tp_affinity::filter_cpus(v, true, allowed);
 #else
     (void) node;
 #endif
@@ -474,11 +471,11 @@ void unbind_memory() {
 void pin_to(const std::vector<int>& cpus) {
 #if defined(__linux__)
     if (cpus.empty()) return;
+    cpu_set_t allowed;
+    const bool has_mask = tp_affinity::inherited_affinity_mask(allowed);
     cpu_set_t set;
-    CPU_ZERO(&set);
-    for (int c : cpus)
-        if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
-    (void) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    if (tp_affinity::make_affinity_set(cpus, has_mask, allowed, set))
+        (void) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 #else
     (void) cpus;
 #endif
