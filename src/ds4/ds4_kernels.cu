@@ -4032,6 +4032,56 @@ void project_out(float* y, const float* r, float scale, int dim, int T, cudaStre
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     pdl_launch(hc_mix_scale_kernel, T, kThreads, 0, s, h, hcdim, n_mix, eps, mixes);
 }
+// (DS4_HC_MIX_ROWS) a chunk's hc_mix, a block kTok tokens: their rows of h read once for all kMix mixes and the mixes'
+// weights once for the kTok tokens, each token's sums and square sum in hc_mix_value's own order and reduction -
+// hc_mix_kernel's bits (the decode path's), without its kMix reads of a row or a weight read a token
+template <int kMix, int kTok>
+__global__ void __launch_bounds__(kThreads) hc_mix_rows_kernel(const float* __restrict__ h, const float* __restrict__ fn,
+                                                               int hcdim, float eps, float* __restrict__ mixes, int T) {
+    pdl_wait();
+    pdl_trigger();
+    const int t0 = blockIdx.x * kTok, nt = min(kTok, T - t0);
+    float acc[kTok][kMix], ss[kTok];
+#pragma unroll
+    for (int j = 0; j < kTok; ++j) {
+        ss[j] = 0.0f;
+#pragma unroll
+        for (int m = 0; m < kMix; ++m) acc[j][m] = 0.0f;
+    }
+    for (int k = threadIdx.x * 4; k < hcdim; k += kThreads * 4) {
+        float4 hv[kTok];
+#pragma unroll
+        for (int j = 0; j < kTok; ++j)
+            hv[j] = j < nt ? *(const float4*) (h + (size_t) (t0 + j) * hcdim + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int m = 0; m < kMix; ++m) {
+            const float4 wv = *(const float4*) (fn + (size_t) m * hcdim + k);
+#pragma unroll
+            for (int j = 0; j < kTok; ++j)
+                acc[j][m] += hv[j].x * wv.x + hv[j].y * wv.y + hv[j].z * wv.z + hv[j].w * wv.w;
+        }
+#pragma unroll
+        for (int j = 0; j < kTok; ++j) ss[j] += hv[j].x * hv[j].x + hv[j].y * hv[j].y + hv[j].z * hv[j].z + hv[j].w * hv[j].w;
+    }
+#pragma unroll
+    for (int j = 0; j < kTok; ++j) {
+        const float inv = rsqrtf(block_sum(ss[j]) / (float) hcdim + eps);
+#pragma unroll
+        for (int m = 0; m < kMix; ++m) {
+            const float v = block_sum(acc[j][m]);
+            if (threadIdx.x == 0 && j < nt) mixes[(size_t) (t0 + j) * 32 + m] = v * inv;
+        }
+    }
+}
+bool hc_mix_rows(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
+    if (n_mix != 24 || hcdim % 4 != 0) return false;   // (hc 4: (2 + 4) * 4 mixes)
+    if (T <= 0) return true;
+    // (tokens a block: blocks for every CU twice over first - 96 on an XTX - then fewer reads of the weights)
+    if (T <= 256) pdl_launch(hc_mix_rows_kernel<24, 1>, T, kThreads, 0, s, h, fn, hcdim, eps, mixes, T);
+    else if (T <= 768) pdl_launch(hc_mix_rows_kernel<24, 2>, (T + 1) / 2, kThreads, 0, s, h, fn, hcdim, eps, mixes, T);
+    else pdl_launch(hc_mix_rows_kernel<24, 4>, (T + 3) / 4, kThreads, 0, s, h, fn, hcdim, eps, mixes, T);
+    return true;
+}
 void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T) {
     hc_split_pre_norm_kernel<<<dim3(2, (unsigned) std::max(1, T)), 1024, 0, s>>>(a);
 }
