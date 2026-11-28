@@ -5,7 +5,8 @@
 # (src/ds4/ds4_iq, with Inkling 2's SITU activation) and maya-hy4's small kernels and lane threads, built as maya-hy4
 # builds them.  AMD under Linux only (MAYA_ENABLE_HIP); included from CMakeLists.txt inside its GPU block
 # (_maya_gpu_* in scope).
-set(_ik2s_shared src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+# (src/ik2s/ik2_hip_iq.cu: src/ds4/ds4_iq.cu itself plus the engine's own GEMV on it, mv_lds - in its place)
+set(_ik2s_shared src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/ik2s/ik2_hip_iq.cu src/ds4/ds4_iq_cpu.cpp
                  src/ds4/ds4_gguf_cpu.cpp)
 add_executable(maya-ik2s src/ik2s/ik2_hip_main.cpp src/ik2s/ik2_hip_model.cu src/ik2s/ik2_hip_kernels.cu
                          src/ik2s/ik2_hip_lane.cpp src/ik2s/ik2_hip_dspark.cu ${_ik2s_shared})
@@ -16,7 +17,7 @@ target_link_libraries(maya-ik2s PRIVATE maya_kernels_cpu maya_spec ${_maya_gpu_r
 # (ds4_iq.cu as maya-mm3 and maya-hy4 take it; without DS4_IQ_MIN_FORMS, which would change the K-quants' rounding)
 target_compile_definitions(maya-ik2s PRIVATE MAYA_DS4_IQ_ONLY IK2_HIP_IQ_SITU=1)
 if(MAYA_BUILD_TESTS)
-  # Inkling 2's expert activation (SITU: kActSitu in src/ds4/ds4_iq.cuh, IqCpu::act in src/ds4/ds4_gguf_cpu.hpp)
+  # Inkling 2's expert activation (SITU: kActSitu in src/ds4/ds4_iq.cuh; the CPU lane's in src/ik2s/ik2_hip_situ_cpu.hpp)
   # through the token, window and prompt forms (light experts and tiles) and the CPU lane at Inkling 2 Small's shapes
   # and types (ggml-quantized random experts) against a double-precision reference; each run a path the environment
   # picks: the defaults (on RDNA 3 / 4: the matrix-core tiles), the F32 tiles, no light experts, the matrix-core tiles

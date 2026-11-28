@@ -8,6 +8,7 @@
 // step, and its 7 steps run on the device one after the other: the host reads the tokens once, at the end.
 #include "ik2_hip_dspark.hpp"
 
+#include "ik2_hip_iq.cuh"
 #include "ik2_hip_kernels.cuh"
 #include "ik2_hip_pack.hpp"
 #include "hy4_kernels.cuh"
@@ -993,7 +994,7 @@ struct Dspark::Impl {
     bool q8s = !(std::getenv("IK2_HIP_DSPARK_Q8S") && std::atoi(std::getenv("IK2_HIP_DSPARK_Q8S")) == 0);
     int q8s_rows = 0;   // rows a warp (1, 2, 4): IK2_HIP_DSPARK_Q8S_ROWS, else the fastest measured at the load
     // IK2_HIP_DSPARK_HEAD_LDS (default 1; 0: iq::mv as before): the head's GEMV (the target's output matrix, up to 7
-    // draft rows) through iq::mv_lds - its activation columns in LDS, the same bits - when the load's check finds the
+    // draft rows) through mv_lds - its activation columns in LDS, the same bits - when the load's check finds the
     // same bits and a faster time; the blocks a launch from the same check (IK2_HIP_DSPARK_HEAD_GRID to fix them)
     bool head_lds_on = !(std::getenv("IK2_HIP_DSPARK_HEAD_LDS") && std::atoi(std::getenv("IK2_HIP_DSPARK_HEAD_LDS")) == 0);
     int head_grid = 0, head_threads = 1024;
@@ -1342,13 +1343,13 @@ struct Dspark::Impl {
         return true;
     }
     bool head_mv(const iq::MvJob& j, std::string& err) {
-        if (head_grid > 0 && iq::mv_lds(j, head_grid, head_threads, s)) {
+        if (head_grid > 0 && mv_lds(j, head_grid, head_threads, s)) {
             check("head mv_lds");
             return true;
         }
         return mv({j}, err);
     }
-    // the load's check of the head's GEMV: iq::mv against iq::mv_lds at a few grids on the real matrix, 7 columns of
+    // the load's check of the head's GEMV: iq::mv against mv_lds at a few grids on the real matrix, 7 columns of
     // made-up int8 rows; mv_lds is taken only with the same bits and a better time.  One line on stderr
     bool head_check(std::string& err) {
         if (!head_lds_on || B < 2) return true;
@@ -1369,7 +1370,7 @@ struct Dspark::Impl {
             for (int rep = 0; rep < 2; ++rep) {   // (the first warms up)
                 CK(cudaEventRecord(e0, s));
                 for (int it = 0; it < 5; ++it)
-                    if (grid == 0 ? !mv({j}, err) : !iq::mv_lds(j, grid, head_threads, s)) return false;
+                    if (grid == 0 ? !mv({j}, err) : !mv_lds(j, grid, head_threads, s)) return false;
                 CK(cudaEventRecord(e1, s));
                 CK(cudaEventSynchronize(e1));
                 float ms = 0;
@@ -1393,7 +1394,7 @@ struct Dspark::Impl {
         int pick = 0;
         for (int g : grids) {
             double us = 0;
-            if (!iq::mv_lds(j, g, head_threads, s)) {
+            if (!mv_lds(j, g, head_threads, s)) {
                 at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: refused", g);
                 (void) cudaGetLastError();
                 continue;

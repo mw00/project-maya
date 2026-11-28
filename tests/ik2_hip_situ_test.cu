@@ -7,13 +7,14 @@
 // experts, 8 picks a token (a skewed routing: some experts of many rows, some of few).  Each form maya-ik2s takes -
 // the token form (a plan: a decode step), the window form (grouped entries: a verify window, a few prompt rows), the
 // prompt form (the sets: the light experts of <= 16 rows and the GEMM tiles) for 1 / 8 / 16 / 64 rows (the sets also
-// 160) and the CPU lane (iq_cpu_gate_up / iq_cpu_down with IqCpu::act) - against a double-precision reference over
+// 160) and the CPU lane (src/ik2s/ik2_hip_situ_cpu.hpp's situ_gate_up, iq_cpu_down) - against a double-precision
+// reference over
 // ggml's dequantized weights:
 //   h    the activation itself against the same inputs the form rounds (int8 per 32 values on the token / window /
 //        light forms, the CPU lane's Q8_K) - only F32 sums apart: the epilogue's SITU checked to ~1e-6
 //   y    each token's routed output against the exact reference (unrounded inputs): the forms' own roundings
 // and the window form's entries bit for bit the token form's (as with SwiGLU), every form again with other parameters
-// (beta 2.5, lb 0: not the structs' defaults), iq::situ_f16 against the reference, and what the dispatch refuses.
+// (beta 2.5, lb 0: not the structs' defaults), and what the dispatch refuses.
 // The environment picks the paths a run takes: MAYA_DS4_NO_TC=1 the F32 tiles, MAYA_DS4_NO_LIGHT=1 no light experts,
 // DS4_IQ_TC_RM=4 the tensor-core tiles of 256 rows, DS4_IQ_OWN=0 the CPU lane's ggml rows (cmake/ik2_hip_kernels.cmake
 // runs each).
@@ -42,6 +43,7 @@
 #include "ggml.h"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
+#include "../src/ik2s/ik2_hip_situ_cpu.hpp"
 
 namespace iq = maya::ds4::gguf::iq;
 namespace gg = maya::ds4::gguf;
@@ -441,9 +443,10 @@ bool set_form(const Layer& L, const Act& c, const std::vector<float>& x, const R
 }
 
 // The CPU lane (the experts in host memory, as GGUF tensors: gate and up rows of one tensor): an expert's entries up to
-// 16 a call (iq_cpu_gate_up's nt), the rows in pieces (r0 > 0 too) - h [T kNU][F], y [T][E]
+// 16 a call (iq_cpu_gate_up's nt), the rows in pieces (r0 > 0 too) - h [T kNU][F], y [T][E]; situ: the engine's SITU
+// (situ_gate_up) in place of ds4's SwiGLU
 void cpu_form(const Layer& L, const gg::IqCpu& f, float limit, const std::vector<float>& x, const Route& rt, int T,
-              std::vector<float>& h, std::vector<float>& y) {
+              std::vector<float>& h, std::vector<float>& y, const Act* situ = nullptr) {
     const int E = L.E, F = L.F, n = T * kNU;
     std::map<int, std::vector<int>> by;
     for (int j = 0; j < n; ++j) by[rt.ids[(size_t) j]].push_back(j);
@@ -467,7 +470,11 @@ void cpu_form(const Layer& L, const gg::IqCpu& f, float limit, const std::vector
             fp[(size_t) k] = h.data() + (size_t) ents[(size_t) k] * F;
         }
         for (int r0 = 0; r0 < F; r0 += 576)
-            gg::iq_cpu_gate_up(f, b + L.tr[0], b + L.tr[1], ap.data(), nt, fp.data(), r0, std::min(F, r0 + 576), limit);
+            if (situ != nullptr)
+                ik2hip::situ_gate_up(f, situ->beta, situ->lb, b + L.tr[0], b + L.tr[1], ap.data(), nt, fp.data(), r0,
+                                     std::min(F, r0 + 576));
+            else
+                gg::iq_cpu_gate_up(f, b + L.tr[0], b + L.tr[1], ap.data(), nt, fp.data(), r0, std::min(F, r0 + 576), limit);
         for (int k = 0; k < nt; ++k) {
             gg::iq_cpu_quant(f.d_act, fp[(size_t) k], F, hbuf.data() + (size_t) k * f.h_bytes);
             hp[(size_t) k] = hbuf.data() + (size_t) k * f.h_bytes;
@@ -812,9 +819,6 @@ void situ_layer(int tg, int td, const char* label, cudaStream_t s, std::map<std:
     const bool cpu_ok = gg::iq_cpu_fmt(tg, td, E, F, f, err);
     if (!cpu_ok) std::printf("  CPU lane: not in this build (%s)\n", err.c_str());
     CHECK(cpu_ok);
-    f.act = gg::kIqActSitu;
-    f.situ_beta = kBeta;
-    f.situ_lb = kLb;
     const Ref R = reference(L, x, rt, T8, cpu_ok ? f.gu_act : -1);
     std::printf("  reference: |SITU - SwiGLU| / |SITU| of the entries' activations = %.3f (the test tells them apart)\n",
                 R.sw_dist);
@@ -903,7 +907,7 @@ void situ_layer(int tg, int td, const char* label, cudaStream_t s, std::map<std:
     if (cpu_ok)
         for (int T : {1, 8, 16, 64}) {
             std::vector<float> h, y;
-            cpu_form(L, f, 0.0f, x, rt, T, h, y);
+            cpu_form(L, f, 0.0f, x, rt, T, h, y, &a);
             Err eh;
             if (R.have_k)
                 for (int j = 0; j < T * kNU; ++j) {
@@ -951,10 +955,7 @@ void situ_layer(int tg, int td, const char* label, cudaStream_t s, std::map<std:
             }
         }
         if (cpu_ok && R.have_k) {
-            gg::IqCpu fb = f;
-            fb.situ_beta = b.beta;
-            fb.situ_lb = b.lb;
-            cpu_form(L, fb, 0.0f, x, rt, 8, h, y);
+            cpu_form(L, f, 0.0f, x, rt, 8, h, y, &b);
             for (int j = 0; j < 8 * kNU; ++j) {
                 href(R, L, 2, j / kNU, rt.ids[(size_t) j], hr.data(), b.beta, b.lb);
                 for (int r = 0; r < F; ++r) ec.add(h[(size_t) j * F + r], hr[(size_t) r]);
@@ -964,35 +965,6 @@ void situ_layer(int tg, int td, const char* label, cudaStream_t s, std::map<std:
                     b.lb, et.max(), ew.max(), el.max(), es.max(), ec.max());
         CHECK(et.max() < 1e-4 && ew.max() < 1e-4 && ec.max() < 1e-4);
         CHECK((!light || el.max() < 2e-3) && es.max() < 1e-2);
-    }
-}
-
-// iq::situ_f16 (the busy experts' path: the caller's F32 gate | up rows -> F16 h) against the double reference
-void situ_f16_case(cudaStream_t s) {
-    const int n = 37, ff = 2304, ld = 2 * ff + 64, ldh = ff + 32;
-    std::vector<float> gu((size_t) n * ld);
-    std::mt19937_64 rng(78);
-    std::normal_distribution<float> ng(0.0f, 6.0f), nu(0.0f, 30.0f);
-    for (int r = 0; r < n; ++r)
-        for (int c = 0; c < ld; ++c) gu[(size_t) r * ld + c] = c < ff ? ng(rng) : nu(rng);
-    DBuf<float> dgu(gu.size());
-    DBuf<uint16_t> dh((size_t) n * ldh);
-    dgu.put(gu.data());
-    // (the up through lb tanh(u / lb) at 25; as it is at lb 0 - then the values reach the hundreds: F16's step there)
-    for (const auto& [beta, lb] : {std::pair<float, float>{kBeta, kLb}, std::pair<float, float>{2.5f, 0.0f}}) {
-        iq::situ_f16(dgu.p, ld, n, ff, beta, lb, dh.p, ldh, s);
-        CU(cudaStreamSynchronize(s));
-        std::vector<uint16_t> h((size_t) n * ldh);
-        dh.get(h.data());
-        double worst = 0;
-        for (int r = 0; r < n; ++r)
-            for (int c = 0; c < ff; ++c) {
-                const double ref = situ_ref(gu[(size_t) r * ld + c], gu[(size_t) r * ld + ff + c], beta, lb);
-                worst = std::max(worst, std::fabs(h2f(h[(size_t) r * ldh + c]) - ref) / (std::fabs(ref) + 1e-3));
-            }
-        std::printf("situ_f16 (beta %.1f, lb %.0f): %d rows of %d: max |h - ref| / (|ref| + 1e-3) = %.2e (F16)\n", beta,
-                    lb, n, ff, worst);
-        CHECK(worst < 1e-3);
     }
 }
 
@@ -1050,7 +1022,6 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "usage: %s --dump|--check FILE (this build: the existing activations only)\n", argv[0]);
     return 2;
 #else
-    static_assert(gg::kIqActSwiglu == iq::kActSwiglu && gg::kIqActSitu == iq::kActSitu, "the CPU lane's activation ids");
     cudaStream_t s;
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     cudaDeviceProp prop{};
@@ -1067,7 +1038,6 @@ int main(int argc, char** argv) {
     std::map<std::string, Worst> worst;
     situ_layer(iq::kIQ2_XS, iq::kIQ3_XXS, "layers 0-39", s, worst);
     situ_layer(iq::kIQ3_XXS, iq::kIQ4_XS, "layers 40-47", s, worst);
-    situ_f16_case(s);
     situ_refusals(s);
     std::printf("worst (max |err| / max |ref|): ");
     for (const auto& [k, w] : worst) std::printf(" %s h %.2e y %.2e;", k.c_str(), w.h, w.y);

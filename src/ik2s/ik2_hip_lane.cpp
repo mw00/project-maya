@@ -1,5 +1,6 @@
 // src/ik2s/ik2_hip_lane.cpp - maya-ik2s's CPU lane (ik2_hip_lane.hpp)
 #include "ik2_hip_lane.hpp"
+#include "ik2_hip_situ_cpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -85,11 +86,6 @@ struct Scratch {
 
 bool CpuExperts::init(int tg, int td, int n_embd, int n_ff, std::string& err) {
     if (!iqc::iq_cpu_fmt(tg, td, n_embd, n_ff, f, err)) return false;
-#if defined(IK2_HIP_IQ_SITU)
-    f.act = iqc::kIqActSitu;   // (ds4_iq_cpu's own SITU epilogue over the fused rows)
-    f.situ_beta = beta;
-    f.situ_lb = lb;
-#endif
     iqc::iq_cpu_prepare_rows(tg);
     iqc::iq_cpu_prepare_rows(td);
     return true;
@@ -117,7 +113,7 @@ void cpu_experts(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuEnt
         const void* act = sc.act.data();
         float* o = sc.gu.data() + (size_t) i * 2 * F;
         const uint8_t* gate = ex.gu(entries[(size_t) i].slot);
-        iqc::iq_cpu_gate_up(f, gate, gate + (size_t) F * f.gu_row, &act, 1, &o, r0, r1, 0.0f);
+        situ_gate_up(f, ex.beta, ex.lb, gate, gate + (size_t) F * f.gu_row, &act, 1, &o, r0, r1);
     });
     lane.parallel_for(n, [&](int i) {
         iqc::iq_cpu_quant(f.d_act, sc.gu.data() + (size_t) i * 2 * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
@@ -259,7 +255,7 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
         const int u = it / h_chunks, r0 = (it % h_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
         const int q0 = sc.ustart[(size_t) u], nt = sc.ustart[(size_t) u + 1] - q0;
         const uint8_t* gate = ex.gu(sc.uslot[(size_t) u]);
-        iqc::iq_cpu_gate_up(f, gate, gate + (size_t) F * f.gu_row, sc.ap.data() + q0, nt, sc.gp.data() + q0, r0, r1, 0.0f);
+        situ_gate_up(f, ex.beta, ex.lb, gate, gate + (size_t) F * f.gu_row, sc.ap.data() + q0, nt, sc.gp.data() + q0, r0, r1);
     }, aff ? &sc.nof_gu : nullptr);
     lap(1);
     if (quant_splits(F, f.h_bytes) && n <= 256) {
