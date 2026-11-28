@@ -1860,6 +1860,28 @@ static void gu_rows_post_clamp(const kc::NativeFmt& f, const uint8_t* gate, cons
 
 void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
                     float* const* ff, int r0, int r1, float limit) {
+    if (f.act == kIqActSitu) {   // (SiTU: the gate's and the up's rows as iq_cpu_rows sums them, then its epilogue)
+        if (r1 <= r0) return;
+        const int nr = r1 - r0;
+        thread_local std::vector<float> sbuf;
+        thread_local std::vector<float*> sgo, suo;
+        sbuf.resize((size_t) 2 * nt * nr);
+        sgo.resize((size_t) nt);
+        suo.resize((size_t) nt);
+        for (int t = 0; t < nt; ++t) {   // (iq_cpu_rows writes out[t][r] for r in [r0, r1))
+            sgo[(size_t) t] = sbuf.data() + (size_t) t * nr - r0;
+            suo[(size_t) t] = sbuf.data() + (size_t) (nt + t) * nr - r0;
+        }
+        iq_cpu_rows(f.tg, gate, f.gu_row, f.n_embd, act, nt, sgo.data(), r0, r1);
+        iq_cpu_rows(f.tu > 0 ? f.tu : f.tg, up, f.tu > 0 ? f.up_row : f.gu_row, f.n_embd, act, nt, suo.data(), r0, r1);
+        const float a = f.act_a, b = f.act_b;
+        for (int t = 0; t < nt; ++t)
+            for (int r = r0; r < r1; ++r) {
+                const float g = sgo[(size_t) t][r], u = suo[(size_t) t][r];
+                ff[t][r] = a * std::tanh(g / a) / (1.f + std::exp(-g)) * (b * std::tanh(u / b));
+            }
+        return;
+    }
     if (r1 > r0 && own_nt(f.tg, nt)) {   // (native_gu_rows_split's epilogue, on the same values)
         const int nr = r1 - r0;
         thread_local std::vector<float> buf;

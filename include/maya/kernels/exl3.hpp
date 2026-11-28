@@ -45,6 +45,7 @@ struct Mat {
     int fmt = 0;
     const void* raw = nullptr;
     int gg_type = 0;   // fmt 4 (maya-ds4's kFmtGG): the ggml block type
+    const float* sc = nullptr;   // fmt 5 (maya-ds4's kFmtF8): the F32 scale of each 128 x 128 block, [n / 128][k / 128]
 };
 
 /// Trellis bytes of a k x n matrix at k2 / 2 bits: 16 k2 bytes a 16x16 tile.
@@ -194,6 +195,7 @@ struct SetArgs {
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
     int skip_ge = 0;    // (ds4's low-bit GGUF experts) > 0: experts of at least this many rows are the caller's (FP16 GEMMs)
+    float* graw = nullptr;   // (ds4's low-bit GGUF experts, gate and up of different types) [set rows][n_ff] F32 scratch
 };
 /// h[local row] = FP16 clamped swiglu of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).
 void set_gate_up(const SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, cudaStream_t s);

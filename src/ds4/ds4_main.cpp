@@ -3733,7 +3733,7 @@ int main(int argc, char** argv) {
     }
 #endif
     maya::ds4::Options o;
-    std::string ids_s, dump, eos = "1", ppl;
+    std::string ids_s, dump, eos, ppl;   // (eos: --eos, else the pack's eos_token_id)
     int n = 0, window = 16, suffix_draft = 3;
     bool spec = true;
     bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
@@ -4001,7 +4001,7 @@ int main(int argc, char** argv) {
     }
     if (serve_mode) {
         g_vram_gpus = o.gpus;
-        return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
+        return serve(m, eos.empty() ? m.eos() : eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
     }
     if (!prof_run.empty()) return profile_run(m, prof_run, o.profile_out);
     if (!spec_eval_path.empty()) return spec_eval(m, spec_eval_path, n > 0 ? n : 256, temp, cli_seed);

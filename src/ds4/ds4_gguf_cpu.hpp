@@ -25,7 +25,14 @@ struct IqCpu {
     int gu_act = 0, d_act = 0;                 // the activations' ggml types
     size_t gu_row = 0, d_row = 0;              // bytes a weight row
     size_t act_bytes = 0, h_bytes = 0;         // bytes of x (n_embd) and of h (n_ff) as those
+    // iq_cpu_gate_up's activation: kIqActSwiglu (the clamped SwiGLU, `limit`), or kIqActSitu (ERNIE-5.5's SiTU-GLU:
+    // act_a tanh(g / act_a) sigmoid(g) . act_b tanh(u / act_b) - beta and linear beta; `limit` unused)
+    int act = 0;
+    float act_a = 0.0f, act_b = 0.0f;
+    int tu = 0;            // (kIqActSitu) the up's type when it is not the gate's (0: tg), its rows' bytes
+    size_t up_row = 0;
 };
+constexpr int kIqActSwiglu = 0, kIqActSitu = 2;
 /// The layer's geometry; false (err) when this build or ggml-cpu cannot take it.
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
 /// x (k values) as the activation type `act` (f.gu_act / f.d_act) into dst.

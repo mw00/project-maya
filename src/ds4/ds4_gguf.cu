@@ -76,10 +76,76 @@ struct BfJob {
     int k, n, ncol;
     const int8_t* xq;   // (Q8_0: the activations rounded to int8, q8_quant's)
     const float* xd;
+    const float* sc;    // (FP8: the 128 x 128 blocks' scales, sk a row of blocks)
+    int sk;
 };
 struct BfJobs {
     BfJob j[x3::kMaxMvJobs];
 };
+
+// ---------------------------------------------------------------- FP8 (E4M3) matrices with 128 x 128 block scales
+// ERNIE-5.5's dense FP8 as Baidu publishes it: a weight is its E4M3 value (sign, 4 exponent bits of bias 7, 3 mantissa
+// bits; E4M3FN: no infinities, its NaN never in a checkpoint) times its block's F32 scale - exact in F32.
+__device__ __forceinline__ float e4m3_value(uint32_t b) {
+    const uint32_t e = (b >> 3) & 15u, m = b & 7u;
+    const float v = e != 0 ? __uint_as_float(((e + 120u) << 23) | (m << 20)) : (float) m * 0.001953125f;   // 2^-9 m
+    return (b & 0x80u) ? -v : v;
+}
+// grid (max rows / 8, jobs): a warp a row, each of its activations' dot in F32 - a lane 16 weights a step (16 bytes,
+// within one 128-wide block: its scale once for them)
+template <int NC>
+__global__ void __launch_bounds__(kThreads) f8_mv_kernel(const BfJobs J) {
+    pdl_wait();
+    pdl_trigger();
+    const BfJob& b = J.j[blockIdx.y];
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = (const uint8_t*) b.w + (size_t) row * b.ld;
+    const float* srow = b.sc + (size_t) (row >> 7) * b.sk;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int i = lane * 16; i < b.k; i += 512) {
+        const uint4 q = *(const uint4*) (w + i);
+        const uint32_t wq[4] = {q.x, q.y, q.z, q.w};
+        float wf[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) wf[j] = e4m3_value((wq[j >> 2] >> (8 * (j & 3))) & 0xffu);
+        const float sb = __ldg(srow + (i >> 7));
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const float4* xp = (const float4*) (b.x + c * b.xcs + i);
+                float a = 0.0f;
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    const float4 x4 = __ldg(xp + v);
+                    a = fmaf(wf[4 * v], x4.x, a);
+                    a = fmaf(wf[4 * v + 1], x4.y, a);
+                    a = fmaf(wf[4 * v + 2], x4.z, a);
+                    a = fmaf(wf[4 * v + 3], x4.w, a);
+                }
+                acc[c] = fmaf(a, sb, acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+__global__ void f8_rows_kernel(const uint8_t* __restrict__ w, size_t ld, const float* __restrict__ sc, int sk, int k,
+                               int n, uint16_t* __restrict__ dst, bool bf16) {
+    pdl_wait();
+    pdl_trigger();
+    const size_t total = (size_t) n * (size_t) k;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+        const size_t r = i / (size_t) k, c = i - r * (size_t) k;
+        const float v = e4m3_value(w[r * ld + c]) * sc[(r >> 7) * (size_t) sk + (c >> 7)];
+        dst[i] = bf16 ? maya::ds4::bf16_rn(v) : __half_as_ushort(__float2half_rn(v));
+    }
+}
 
 // grid (max rows / 8, jobs): a warp a row, each of its activations' dot in F32 - a lane 8 BF16 weights (16 bytes) and
 // 8 activations a step (VEC), or one of each (rows or activations not 16-byte aligned)
@@ -1654,8 +1720,17 @@ size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, 
 bool mx_role(const x3::ExpertLayout& lay, bool gu) { return expert_type(lay, gu ? 0 : 2) == kTypeMXFP4; }
 // a layer's low-bit gate / up (gu) or down as ds4_iq's arguments - the other role may be MXFP4, which takes these
 // kernels (false: the role's types not covered - printed)
-bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who, bool gu) {
+// the routed experts' activation for ds4_iq's kernels (set_expert_act: ERNIE-5.5's SiTU; the default the clamped SwiGLU)
+std::atomic<int> g_act{iq::kActSwiglu};
+float g_act_a = 0.0f, g_act_b = 0.0f;
+bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who, bool gu,
+             bool two_pass = false) {
     ia = iq::Args{};
+    if (g_act.load(std::memory_order_relaxed) == iq::kActSitu) {   // (set_expert_act)
+        ia.act = iq::kActSitu;
+        ia.lin = g_act_b;
+        limit = g_act_a;
+    }
     for (int r = 0; r < 3; ++r) ia.tr[r] = lay.trellis[r];
     ia.n_embd = n_embd;
     ia.n_ff = n_ff;
@@ -1664,7 +1739,10 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     ia.td = expert_type(lay, 2);
     ia.pexp = lane_parity_on() ? 1 : 0;
     // (a row of the role's inputs in whole blocks: 256 values, IQ4_NL's 32)
-    if (gu ? ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || n_embd % iq::block_values(ia.tg) != 0
+    // (gate and up of different types: the sets' two passes alone, two_pass - ERNIE-5.5's mixed layers)
+    const int tu = expert_type(lay, 1);
+    const bool mixed_ok = two_pass && iq::supported(tu) && n_embd % iq::block_values(tu) == 0;
+    if (gu ? (ia.tg != tu && !mixed_ok) || !iq::supported(ia.tg) || n_embd % iq::block_values(ia.tg) != 0
            : !iq::supported(ia.td) || n_ff % iq::block_values(ia.td) != 0) {
         std::fprintf(stderr, "ds4 gguf %s: expert types %s / %s / %s (n_embd %d, n_ff %d) not covered\n", who,
                      type_name(expert_type(lay, 0)), type_name(expert_type(lay, 1)), type_name(expert_type(lay, 2)),
@@ -1726,6 +1804,8 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
                            (size_t) q8_tc_smem<1, 2, 32>(), s, J);
         } else if (vec) pdl_launch(q8_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
         else pdl_launch(q8_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
+    } else if (f == 3) {
+        pdl_launch(f8_mv_kernel<NC>, grid, kThreads, 0, s, J);
     } else {
         if (vec) pdl_launch(bf16_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
         else pdl_launch(bf16_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
@@ -1747,6 +1827,7 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
     v.ld = (int) ld;
     v.raw = m.fmt != kFmtBF16 ? (const void*) ((const uint8_t*) m.raw + (size_t) c0 * ld)
                               : (const void*) ((const uint16_t*) m.raw + (size_t) c0 * ld);
+    if (m.fmt == kFmtF8) v.sc = m.sc + (size_t) (c0 / 128) * (size_t) ((m.k + 127) / 128);   // (c0 % 128 == 0)
     v.n = nc;
     return v;
 }
@@ -1755,9 +1836,9 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) { return mv(jobs, n, s, nu
 
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
-    BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
-    int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
-    bool vec[3] = {true, true, true};
+    BfJobs J[4] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones, the FP8 ones: a launch each
+    int nj[4] = {0, 0, 0, 0}, max_n[4] = {0, 0, 0, 0}, max_c[4] = {1, 1, 1, 1};
+    bool vec[4] = {true, true, true, true};
     iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
     Q8Round QR;   // (the jobs' int8 inputs: one launch before the GEMVs, an input read by several jobs rounded once)
@@ -1793,10 +1874,12 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
             b.alpha = q.alpha;
             continue;
         }
-        const int f = m.fmt == kFmtMXFP4 ? 1 : m.fmt == kFmtQ8_0 ? 2 : 0;
-        if ((m.fmt != kFmtBF16 && m.fmt != kFmtMXFP4 && m.fmt != kFmtQ8_0) || m.raw == nullptr || q.xf == nullptr ||
-            q.y == nullptr || q.ncol < 1 || q.ncol > x3::kMaxMvCols || m.k <= 0 || m.n <= 0 ||
-            (f != 0 && m.k % kMxBlock != 0)) {
+        const int f = m.fmt == kFmtMXFP4 ? 1 : m.fmt == kFmtQ8_0 ? 2 : m.fmt == kFmtF8 ? 3 : 0;
+        if ((m.fmt != kFmtBF16 && m.fmt != kFmtMXFP4 && m.fmt != kFmtQ8_0 && m.fmt != kFmtF8) || m.raw == nullptr ||
+            q.xf == nullptr || q.y == nullptr || q.ncol < 1 || q.ncol > x3::kMaxMvCols || m.k <= 0 || m.n <= 0 ||
+            (f != 0 && m.k % kMxBlock != 0) ||
+            (f == 3 && (m.sc == nullptr || m.k % 16 != 0 || row_stride(m) % 16 != 0 || ((uintptr_t) m.raw & 15u) ||
+                        ((uintptr_t) q.xf & 15u) || (q.ncol > 1 && q.xf_cs % 4 != 0)))) {
             std::fprintf(stderr, "ds4 gguf mv: job %d unsupported (fmt %d k %d n %d, %d activations)\n", i, m.fmt, m.k,
                          m.n, q.ncol);
             g_errors.fetch_add(1, std::memory_order_relaxed);
@@ -1814,6 +1897,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
         b.k = m.k;
         b.n = m.n;
         b.ncol = q.ncol;
+        b.sc = m.sc;
+        b.sk = (m.k + 127) / 128;
         max_n[f] = std::max(max_n[f], m.n);
         max_c[f] = std::max(max_c[f], q.ncol);
         const bool xa = ((uintptr_t) b.x & 15u) == 0 && (q.ncol == 1 || b.xcs % 4 == 0);
@@ -1837,7 +1922,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
         }
     }
     QR.flush(s);
-    for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
+    for (int f = 0; f < 4; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");
         return false;
@@ -1852,14 +1937,18 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
         check("rows");
         return;
     }
-    if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0) || m.raw == nullptr) {
-        fail("rows: not a BF16 or Q8_0 matrix");
+    if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0 && m.fmt != kFmtF8) || m.raw == nullptr ||
+        (m.fmt == kFmtF8 && m.sc == nullptr)) {
+        fail("rows: not a BF16, Q8_0 or FP8 matrix");
         return;
     }
     const size_t ld = row_stride(m);
     const size_t total = (size_t) m.n * (size_t) m.k;
     const unsigned blocks = (unsigned) std::min<size_t>((total + 255) / 256, 65535);
-    if (m.fmt == kFmtQ8_0) pdl_launch(q8_rows_kernel, blocks, 256, 0, s, (const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
+    if (m.fmt == kFmtF8)
+        pdl_launch(f8_rows_kernel, blocks, 256, 0, s, (const uint8_t*) m.raw, ld, m.sc, (m.k + 127) / 128, m.k, m.n, dst,
+                   bf16);
+    else if (m.fmt == kFmtQ8_0) pdl_launch(q8_rows_kernel, blocks, 256, 0, s, (const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
     else pdl_launch(bf16_rows_kernel, blocks, 256, 0, s, (const uint16_t*) m.raw, ld, m.k, m.n, dst, bf16);
     check("rows");
 }
@@ -2054,6 +2143,11 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
     q.n_ff = sa.n_ff;
     q.limit = sa.limit;
     q.skip_ge = sa.skip_ge;
+    if (g_act.load(std::memory_order_relaxed) == iq::kActSitu) {
+        q.act = iq::kActSitu;
+        q.limit = g_act_a;
+        q.lin = g_act_b;
+    }
     return q;
 }
 }  // namespace
@@ -2064,7 +2158,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_role(sa.lay, true)) {   // a low-bit gate / up: ds4_iq's sets
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up", true)) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up", true, true)) return;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
         q.xh = x16;   // (the tensor-core tiles' FP16 rows; the light kernels keep xf)
@@ -2074,6 +2168,10 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         q.ldo = ldh;
         q.tg = ia.tg;
         q.td = ia.td;
+        if (expert_type(sa.lay, 1) != expert_type(sa.lay, 0)) {   // (ERNIE-5.5's mixed gate / up: two passes)
+            q.tu = expert_type(sa.lay, 1);
+            q.graw = sa.graw;
+        }
         if (!iq::set_gate_up(q, s)) fail("set_gate_up: not covered");
         check("set_gate_up");
         return;
@@ -2179,6 +2277,12 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     else
         pdl_launch(mx_set_kernel<false>, grid, kThreads, 0, s, k);
     check("set_down");
+}
+
+void set_expert_act(int act, float a, float b) {
+    g_act_a = a;
+    g_act_b = b;
+    g_act.store(act, std::memory_order_relaxed);
 }
 
 }  // namespace maya::ds4::gguf

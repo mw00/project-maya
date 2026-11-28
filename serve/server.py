@@ -3147,7 +3147,10 @@ class Service:
                             # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
                             (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
                              _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
-                             if getattr(template, "hy4", False) else []))
+                             if getattr(template, "hy4", False) else []) +
+                            # ERNIE-5.5-Flash with <|ernie:im_end|> (and would start the next turn with <|ernie:im_start|>)
+                            (_special_ids("<|ernie:im_end|>") + _special_ids("<|ernie:im_start|>") + _special_ids("<|ERNIE_MASK|>")
+                             if getattr(template, "ernie", False) else []))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
@@ -3168,6 +3171,7 @@ class Service:
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         # (Hy4-flash with its suffixed </think:..>, which the pack's tokenizer names </think> in what the server reads)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
+            _special_ids("</ernie:think>") if getattr(template, "ernie", False) else \
             (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
             if getattr(template, "hy4", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
@@ -5124,6 +5128,7 @@ class Service:
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
                                 inkling=getattr(self.template, "inkling", False),
+                                ernie=getattr(self.template, "ernie", False),
                                 strict_tools=responses, single_tool=single_tool,
                                 unions=getattr(self.template, "glm_dsa", False))
         parser = new_parser()

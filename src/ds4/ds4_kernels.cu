@@ -370,7 +370,8 @@ __device__ __forceinline__ float hc_mix_value(const float* __restrict__ h, const
     }
     acc = block_sum(acc);
     ss = block_sum(ss);
-    return acc * rsqrtf(ss / (float) hcdim + eps);
+    // (eps < 0: ERNIE-5.5's mHC, 1 / (sqrt(mean) - eps) - the epsilon outside the square root)
+    return eps < 0.0f ? acc / (sqrtf(ss / (float) hcdim) - eps) : acc * rsqrtf(ss / (float) hcdim + eps);
 }
 __global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restrict__ h, const float* __restrict__ fn,
                                                           int hcdim, float eps, float* __restrict__ mixes) {
@@ -964,7 +965,7 @@ __global__ void copy_regions_kernel(const CopyRegions r) {
 __global__ void __launch_bounds__(512) compress_kernel(const float* __restrict__ kv, const float* __restrict__ score,
                                                        float* kv_state, float* score_state, int ratio, int p0, int T,
                                                        int d, const float* __restrict__ w, float eps,
-                                                       float* __restrict__ latent) {
+                                                       float* __restrict__ latent, const float* __restrict__ ape) {
     pdl_wait();
     pdl_trigger();
     int g = 0;
@@ -973,7 +974,9 @@ __global__ void __launch_bounds__(512) compress_kernel(const float* __restrict__
         const bool pool = (p0 + t + 1) % ratio == 0;
         for (int e = threadIdx.x; e < d; e += blockDim.x) {
             kv_state[(size_t) slot * d + e] = kv[(size_t) t * d + e];
-            score_state[(size_t) slot * d + e] = score[(size_t) t * d + e];
+            // (ape: DeepSeek-V4's and ERNIE-5.5's position-in-group bias of the scores; V4.1 has none)
+            score_state[(size_t) slot * d + e] =
+                score[(size_t) t * d + e] + (ape != nullptr ? ape[(size_t) slot * d + e] : 0.0f);
         }
         __syncthreads();
         if (!pool) continue;
@@ -3716,7 +3719,8 @@ __global__ void __launch_bounds__(kThreads) hc_mix_scale_kernel(const float* __r
         ss += hv.x * hv.x + hv.y * hv.y + hv.z * hv.z + hv.w * hv.w;
     }
     ss = block_sum(ss);
-    const float inv = rsqrtf(ss / (float) hcdim + eps);
+    // (eps < 0: ERNIE-5.5's 1 / (sqrt(mean) - eps), hc_mix_value's)
+    const float inv = eps < 0.0f ? 1.0f / (sqrtf(ss / (float) hcdim) - eps) : rsqrtf(ss / (float) hcdim + eps);
     if (threadIdx.x < n_mix) mixes[(size_t) t * 32 + threadIdx.x] *= inv;
 }
 
@@ -4196,8 +4200,8 @@ bool copy_regions(const CopyRegions& r, cudaStream_t s) {
 }
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, cudaStream_t s) {
-    pdl_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
+                  int d, const float* w, float eps, float* latent, cudaStream_t s, const float* ape) {
+    pdl_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, ape);
 }
 
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
@@ -5348,5 +5352,539 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
     }
 }
 
-}  // namespace maya::ds4
 
+// ---------------------------------------------------------------- ERNIE-5.5-Flash (Geo::ernie)
+namespace {
+
+constexpr int kErnieRouteThreads = 512;
+
+// the split-feature router: scores = sigmoid(l0) + sigmoid(l1), the k best of scores + bias, their scores renormalised
+// (renorm) and times each pick's learned factor (vLLM-ERNIE's ernie5_5_routing); a block a token
+__global__ void __launch_bounds__(kErnieRouteThreads) ernie_route_kernel(const float* __restrict__ l0,
+                                                                        const float* __restrict__ l1, int ld,
+                                                                        const float* __restrict__ bias,
+                                                                        const float* __restrict__ scale, int n, int k,
+                                                                        int renorm, int* __restrict__ idx,
+                                                                        float* __restrict__ w, int stride) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ float sc[1024], sel[1024];
+    __shared__ float wv[32];
+    __shared__ int wi[32];
+    __shared__ int pick[kErniePicks];
+    __shared__ float pw[kErniePicks];
+    const int t = blockIdx.x, lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int e = threadIdx.x; e < n; e += blockDim.x) {
+        const float a = l0[(size_t) t * ld + e], b = l1[(size_t) t * ld + e];
+        const float s = 1.0f / (1.0f + expf(-a)) + 1.0f / (1.0f + expf(-b));
+        sc[e] = s;
+        sel[e] = s + bias[e];
+    }
+    __syncthreads();
+    for (int j = 0; j < k; ++j) {
+        float bv = -FLT_MAX;
+        int bi = n;
+        for (int e = threadIdx.x; e < n; e += blockDim.x)
+            if (sel[e] > bv || (sel[e] == bv && e < bi)) bv = sel[e], bi = e;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+        }
+        if (lane == 0) wv[wp] = bv, wi[wp] = bi;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float v = wv[0];
+            int i = wi[0];
+            for (int q = 1; q < nw; ++q)
+                if (wv[q] > v || (wv[q] == v && wi[q] < i)) v = wv[q], i = wi[q];
+            pick[j] = i;
+            pw[j] = sc[i];
+            sel[i] = -FLT_MAX;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int j = 0; j < k; ++j) sum += pw[j];
+        const float inv = renorm ? 1.0f / fmaxf(sum, 1e-20f) : 1.0f;
+        for (int j = 0; j < k; ++j) {
+            idx[(size_t) t * stride + j] = pick[j];
+            w[(size_t) t * stride + j] = pw[j] * inv * scale[pick[j]];
+        }
+    }
+}
+
+// SiTU-GLU: beta tanh(g / beta) sigmoid(g) . lin tanh(u / lin)
+__device__ __forceinline__ float situ_value(float g, float u, float beta, float lin) {
+    return beta * tanhf(g / beta) * (1.0f / (1.0f + expf(-g))) * (lin * tanhf(u / lin));
+}
+__global__ void situ_mul_kernel(const float* __restrict__ g, const float* __restrict__ u, size_t n, float beta, float lin,
+                                float* __restrict__ h) {
+    pdl_wait();
+    pdl_trigger();
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        h[i] = situ_value(g[i], u[i], beta, lin);
+}
+
+// VHA: each head's output o[h] <- sum_g m[h][g] o[g] (m = I + V U^T), heads `ld_h` floats apart, tokens `ld_t` apart;
+// a block a token's 64 columns of every head (H <= 64)
+constexpr int kVhaCols = 64;
+__global__ void __launch_bounds__(256) vha_mix_kernel(float* __restrict__ o, const float* __restrict__ m, int H, int D,
+                                                      size_t ld_t, size_t ld_h) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ float tile[64][kVhaCols + 1];
+    __shared__ float mm[64][64 + 1];
+    const int t = blockIdx.y, c0 = blockIdx.x * kVhaCols;
+    float* ot = o + (size_t) t * ld_t;
+    for (int i = threadIdx.x; i < H * kVhaCols; i += blockDim.x) {
+        const int h = i / kVhaCols, c = i % kVhaCols;
+        tile[h][c] = c0 + c < D ? ot[(size_t) h * ld_h + c0 + c] : 0.0f;
+    }
+    for (int i = threadIdx.x; i < H * H; i += blockDim.x) mm[i / H][i % H] = m[i];
+    __syncthreads();
+    for (int i = threadIdx.x; i < H * kVhaCols; i += blockDim.x) {
+        const int h = i / kVhaCols, c = i % kVhaCols;
+        if (c0 + c >= D) continue;
+        float a = 0.0f;
+        for (int q = 0; q < H; ++q) a = fmaf(mm[h][q], tile[q][c], a);
+        ot[(size_t) h * ld_h + c0 + c] = a;
+    }
+}
+
+__global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restrict__ gate, size_t n) {
+    pdl_wait();
+    pdl_trigger();
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        x[i] *= 1.0f / (1.0f + expf(-gate[i]));
+}
+
+// the logits' multimax: z + t0 relu(r0 - z) + t1 relu(z - r1) + t2 relu(r2 - z)^2 + t3 relu(z - r3)^2
+__global__ void multimax_kernel(float* __restrict__ z, size_t n, const float* __restrict__ r, const float* __restrict__ tt) {
+    pdl_wait();
+    pdl_trigger();
+    const float r0 = r[0], r1 = r[1], r2 = r[2], r3 = r[3], t0 = tt[0], t1 = tt[1], t2 = tt[2], t3 = tt[3];
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const float x = z[i];
+        const float a = fmaxf(r0 - x, 0.0f), b = fmaxf(x - r1, 0.0f), c = fmaxf(r2 - x, 0.0f), d = fmaxf(x - r3, 0.0f);
+        float y = x + t0 * a;
+        y = y + t1 * b;
+        y = y + t2 * (c * c);
+        z[i] = y + t3 * (d * d);
+    }
+}
+
+// the head's stream mix (mhc_contract): pre[t][h] = sigmoid(mix[t][h] scale + base[h]) + eps (rows 8 apart)
+__global__ void hc_head_pre_kernel(const float* __restrict__ mix, const float* __restrict__ scale,
+                                   const float* __restrict__ base, int hc, float eps, int T, float* __restrict__ pre) {
+    pdl_wait();
+    pdl_trigger();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * hc) return;
+    const int t = i / hc, h = i % hc;
+    pre[(size_t) t * 8 + h] = 1.0f / (1.0f + expf(-(mix[(size_t) t * 32 + h] * scale[0] + base[h]))) + eps;
+}
+
+// an MLA layer's cache rows: kva [T][kvl + rope] -> cache[pos0 + t] = [rms(kva[:kvl]) w | rope(kva[kvl:], pos)] (BF16;
+// the rotation of adjacent pairs, finish's)
+__global__ void __launch_bounds__(256) mla_kv_store_kernel(const float* __restrict__ kva, int kvl, int rope,
+                                                          const float* __restrict__ w, float eps, int pos0,
+                                                          const float* __restrict__ freqs, uint16_t* __restrict__ cache) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = blockIdx.x, row = kvl + rope;
+    const float* x = kva + (size_t) t * row;
+    float ss = 0.0f;
+    for (int e = threadIdx.x; e < kvl; e += blockDim.x) ss += x[e] * x[e];
+    const float inv = rsqrtf(block_sum(ss) / (float) kvl + eps);
+    uint16_t* out = cache + (size_t) (pos0 + t) * row;
+    for (int e = threadIdx.x; e < kvl; e += blockDim.x) out[e] = f2bf16(x[e] * inv * w[e]);
+    const int pos = pos0 + t;
+    for (int i = threadIdx.x; i < rope / 2; i += blockDim.x) {
+        const float a = x[kvl + 2 * i], b = x[kvl + 2 * i + 1];
+        const float ang = (float) pos * freqs[i], c = cosf(ang), sn = sinf(ang);
+        out[kvl + 2 * i] = f2bf16(a * c - b * sn);
+        out[kvl + 2 * i + 1] = f2bf16(a * sn + b * c);
+    }
+}
+
+// q_nope into the latent space (W_uk: [H][nope][kvl] BF16) beside the rotated q_pe: q [T][H][nope + rope] ->
+// qa [T][H][kvl + rope]; a block a (head, token), a thread a latent dimension
+__global__ void mla_absorb_kernel(const float* __restrict__ q, const uint16_t* __restrict__ wuk, int H, int nope,
+                                  int rope, int kvl, float* __restrict__ qa) {
+    pdl_wait();
+    pdl_trigger();
+    const int h = blockIdx.x, t = blockIdx.y;
+    __shared__ float qs[512];
+    const float* qh = q + ((size_t) t * H + h) * (nope + rope);
+    for (int i = threadIdx.x; i < nope; i += blockDim.x) qs[i] = qh[i];
+    __syncthreads();
+    float* out = qa + ((size_t) t * H + h) * (kvl + rope);
+    const uint16_t* wh = wuk + (size_t) h * nope * kvl;
+    for (int d = threadIdx.x; d < kvl; d += blockDim.x) {
+        float a = 0.0f;
+        for (int i = 0; i < nope; ++i) a = fmaf(qs[i], bf16f(wh[(size_t) i * kvl + d]), a);
+        out[d] = a;
+    }
+    for (int j = threadIdx.x; j < rope; j += blockDim.x) out[kvl + j] = qh[nope + j];
+}
+
+// MLA attention over the cache: query (t, h) at position pos0 + t reads the keys sel[t][0 .. nsel[t]) (or, sel null,
+// every position 0 .. pos0 + t), scores (qa . row) scale, a sink in the softmax's denominator, out = sum p . row[:kvl];
+// a block a (head, token).  At most kMlaKeys keys a query.
+constexpr int kMlaKeys = 4096;
+__global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ qa, const uint16_t* __restrict__ cache,
+                                                       int H, int kvl, int rope, int pos0, const int* __restrict__ sel,
+                                                       int sel_stride, const int* __restrict__ nsel,
+                                                       const float* __restrict__ sink, float scale,
+                                                       float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    const int h = blockIdx.x, t = blockIdx.y, row = kvl + rope;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    __shared__ float qs[640];
+    __shared__ float sc[kMlaKeys];
+    __shared__ float red[32];
+    const float* qh = qa + ((size_t) t * H + h) * row;
+    for (int i = threadIdx.x; i < row; i += blockDim.x) qs[i] = qh[i];
+    __syncthreads();
+    const int n = sel != nullptr ? nsel[t] : pos0 + t + 1;
+    const int nk = min(n, kMlaKeys);
+    for (int j = wp; j < nk; j += nw) {
+        const int key = sel != nullptr ? sel[(size_t) t * sel_stride + j] : j;
+        const uint16_t* kr = cache + (size_t) key * row;
+        float a = 0.0f;
+        for (int d = lane; d < row; d += 32) a = fmaf(qs[d], bf16f(kr[d]), a);
+        a = warp_sum(a);
+        if (lane == 0) sc[j] = a * scale;
+    }
+    __syncthreads();
+    float m = sink[h];
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) m = fmaxf(m, sc[j]);
+    m = warp_max(m);
+    if (lane == 0) red[wp] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = red[0];
+        for (int q = 1; q < nw; ++q) v = fmaxf(v, red[q]);
+        red[0] = v;
+    }
+    __syncthreads();
+    m = red[0];
+    __syncthreads();
+    float s = 0.0f;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) {
+        const float p = expf(sc[j] - m);
+        sc[j] = p;
+        s += p;
+    }
+    const float den = block_sum(s) + expf(sink[h] - m);
+    const float inv = 1.0f / den;
+    float* oh = out + ((size_t) t * H + h) * kvl;
+    for (int d = threadIdx.x; d < kvl; d += blockDim.x) {
+        float a = 0.0f;
+        for (int j = 0; j < nk; ++j) {
+            const int key = sel != nullptr ? sel[(size_t) t * sel_stride + j] : j;
+            a = fmaf(sc[j], bf16f(cache[(size_t) key * row + d]), a);
+        }
+        oh[d] = a * inv;
+    }
+}
+
+// the latent attention's output back out (W_uv: [H][v][kvl] BF16): o [T][H][kvl] -> y [T][H][v]; a warp an output
+__global__ void __launch_bounds__(256) mla_vup_kernel(const float* __restrict__ o, const uint16_t* __restrict__ wuv, int H,
+                                                      int kvl, int v, float* __restrict__ y) {
+    pdl_wait();
+    pdl_trigger();
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    __shared__ float os[512];
+    const float* oh = o + ((size_t) t * H + h) * kvl;
+    for (int d = threadIdx.x; d < kvl; d += blockDim.x) os[d] = oh[d];
+    __syncthreads();
+    const uint16_t* wh = wuv + (size_t) h * v * kvl;
+    for (int e = wp; e < v; e += nw) {
+        float a = 0.0f;
+        for (int d = lane; d < kvl; d += 32) a = fmaf(bf16f(wh[(size_t) e * kvl + d]), os[d], a);
+        a = warp_sum(a);
+        if (lane == 0) y[((size_t) t * H + h) * v + e] = a;
+    }
+}
+
+// the latent MoE's routed sum: out[t] = sum_j w[t][j] ed[row[t][j]] (+ cpu[t]), rows E apart
+__global__ void ernie_combine_kernel(const float* __restrict__ ed, const ErnieCombine c, const float* __restrict__ cpu,
+                                     int E, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    float a = cpu != nullptr ? cpu[(size_t) t * E + e] : 0.0f;
+    for (int j = 0; j < c.n[t]; ++j) a = fmaf(c.w[t][j], ed[(size_t) c.row[t][j] * E + e], a);
+    out[(size_t) t * E + e] = a;
+}
+
+__global__ void add_rows_kernel(float* __restrict__ y, const float* __restrict__ x, size_t n) {
+    pdl_wait();
+    pdl_trigger();
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) y[i] += x[i];
+}
+
+__global__ void ernie_gather_kernel(const float* __restrict__ x, const ErnieGather g, int cols, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    const int r = blockIdx.y;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < cols; c += gridDim.x * blockDim.x)
+        out[(size_t) r * cols + c] = x[(size_t) g.src[r] * cols + c];
+}
+
+// the DSA indexer's rows (128 values, a block of 128 threads each): NeoX rotation of the first `rope` values at the
+// row's position (pairs i, i + rope / 2), then the orthonormal Hadamard transform (Sylvester's order)
+__device__ __forceinline__ void ix_rotate_hadamard(float* v, int rope, int pos, const float* freqs) {
+    const int i = threadIdx.x;
+    float r = v[i];
+    if (i < rope) {
+        const int h = rope / 2, j = i < h ? i : i - h;
+        const float ang = (float) pos * freqs[j], c = cosf(ang), sn = sinf(ang);
+        r = i < h ? v[i] * c - v[i + h] * sn : v[i] * c + v[i - h] * sn;
+    }
+    __syncthreads();
+    v[i] = r;
+    __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        const int blk = i / (2 * len), off = i % (2 * len);
+        float x = 0.0f;
+        if (off < len) x = v[blk * 2 * len + off] + v[blk * 2 * len + off + len];
+        else x = v[blk * 2 * len + off - len] - v[blk * 2 * len + off];
+        __syncthreads();
+        v[i] = x;
+        __syncthreads();
+    }
+    v[i] *= 0.08838834764831845f;   // 1 / sqrt(128)
+    __syncthreads();
+}
+// a key: LayerNorm (w, b; eps 1e-6) of k = wk x, rotated, Hadamard-rotated -> keys[pos0 + t] (FP16)
+__global__ void __launch_bounds__(128) ix_key_kernel(const float* __restrict__ k, const float* __restrict__ w,
+                                                     const float* __restrict__ b, int rope, int pos0,
+                                                     const float* __restrict__ freqs, __half* __restrict__ keys) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ float v[128];
+    const int t = blockIdx.x, i = threadIdx.x;
+    const float x = k[(size_t) t * 128 + i];
+    const float mean = block_sum(x) / 128.0f;
+    const float dv = x - mean;
+    const float var = block_sum(dv * dv) / 128.0f;
+    v[i] = dv * rsqrtf(var + 1e-6f) * w[i] + b[i];
+    __syncthreads();
+    ix_rotate_hadamard(v, rope, pos0 + t, freqs);
+    keys[(size_t) (pos0 + t) * 128 + i] = __float2half_rn(v[i]);
+}
+// the queries in place: q [T][H][128], each head rotated and Hadamard-rotated at its token's position
+__global__ void __launch_bounds__(128) ix_query_kernel(float* __restrict__ q, int H, int rope, int pos0,
+                                                       const float* __restrict__ freqs) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ float v[128];
+    const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
+    float* row = q + ((size_t) t * H + h) * 128;
+    v[i] = row[i];
+    __syncthreads();
+    ix_rotate_hadamard(v, rope, pos0 + t, freqs);
+    row[i] = v[i];
+}
+// scores[t][s] = sum_h relu(q[t][h] . keys[s]) w[t][h] for s < n[t]; a block 64 keys of one query (H <= 64)
+constexpr int kIxKeys = 64;
+__global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__ q, const float* __restrict__ w, int H,
+                                                       const __half* __restrict__ keys, const int* __restrict__ n,
+                                                       float* __restrict__ out, long long out_stride) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ float qT[128][65];
+    __shared__ float ks[8][128];
+    __shared__ float ws[64];
+    const int t = blockIdx.y, s0 = blockIdx.x * kIxKeys, lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const int nt = n[t];
+    if (s0 >= nt) return;
+    for (int i = threadIdx.x; i < H * 128; i += blockDim.x) qT[i % 128][i / 128] = q[(size_t) t * H * 128 + i];
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) ws[i] = i < H ? w[(size_t) t * 64 + i] : 0.0f;
+    __syncthreads();
+    for (int j = wp; j < kIxKeys; j += 8) {
+        const int sidx = s0 + j;
+        if (sidx >= nt) break;
+        for (int d = lane; d < 128; d += 32) ks[wp][d] = __half2float(keys[(size_t) sidx * 128 + d]);
+        __syncwarp();
+        float a0 = 0.0f, a1 = 0.0f;
+        const int h0 = lane, h1 = lane + 32;
+        for (int d = 0; d < 128; ++d) {
+            const float kv = ks[wp][d];
+            a0 = fmaf(qT[d][h0], kv, a0);
+            a1 = fmaf(qT[d][h1], kv, a1);
+        }
+        float v = (h0 < H ? fmaxf(a0, 0.0f) * ws[h0] : 0.0f) + (h1 < H ? fmaxf(a1, 0.0f) * ws[h1] : 0.0f);
+        v = warp_sum(v);
+        if (lane == 0) out[(size_t) t * out_stride + sidx] = v;
+        __syncwarp();
+    }
+}
+// a query's keys: its indexer picks (sel[t][0 .. k[t])), then the window's positions; nsel[t] their count
+__global__ void sel_window_kernel(int* __restrict__ sel, int stride, const ErnieSel c, int win, int* __restrict__ nsel) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = blockIdx.x;
+    const int p = c.pos[t], k = c.k[t], wn = min(p + 1, win);
+    for (int i = threadIdx.x; i < wn; i += blockDim.x) sel[(size_t) t * stride + k + i] = p - wn + 1 + i;
+    if (threadIdx.x == 0) nsel[t] = k + wn;
+}
+
+// a chunk's MLA queries: row t (position p0 + t) - its indexer picks k = min(topk, rows older than its window), then
+// the window's positions; nsel[t] their count
+__global__ void sel_window_range_kernel(int* __restrict__ sel, int stride, int p0, int win, int topk, int* __restrict__ nsel) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = blockIdx.x, p = p0 + t;
+    const int k = min(topk, max(0, p + 1 - win)), wn = min(p + 1, win);
+    for (int i = threadIdx.x; i < wn; i += blockDim.x) sel[(size_t) t * stride + k + i] = p - wn + 1 + i;
+    if (threadIdx.x == 0) nsel[t] = k + wn;
+}
+// a token's k picks (rows `in_stride` apart) as two rows of k / 2 each (rows `out_stride` apart): pick j of token t
+// to row 2 t + j / h, place j % h
+__global__ void ernie_split_picks_kernel(const int* __restrict__ idx, const float* __restrict__ w, int in_stride, int k,
+                                         int T, int* __restrict__ oidx, float* __restrict__ ow, int out_stride) {
+    pdl_wait();
+    pdl_trigger();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * k) return;
+    const int t = i / k, j = i % k, h = k / 2;
+    const size_t o = (size_t) (2 * t + j / h) * out_stride + j % h;
+    oidx[o] = idx[(size_t) t * in_stride + j];
+    ow[o] = w[(size_t) t * in_stride + j];
+}
+// rows doubled: out[2 t + r] = x[t] (r = 0, 1), rows of n values
+__global__ void ernie_dup_rows_kernel(const float* __restrict__ x, int n, int T, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    const size_t total = (size_t) T * n;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+        const size_t t = i / n, e = i % n;
+        const float v = x[i];
+        out[(2 * t) * n + e] = v;
+        out[(2 * t + 1) * n + e] = v;
+    }
+}
+// rows paired back: out[t] = x[2 t] + x[2 t + 1]
+__global__ void ernie_pair_sum_kernel(const float* __restrict__ x, int n, int T, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    const size_t total = (size_t) T * n;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+        const size_t t = i / n, e = i % n;
+        out[i] = x[(2 * t) * n + e] + x[(2 * t + 1) * n + e];
+    }
+}
+
+__global__ void scale_rows_kernel(float* __restrict__ x, size_t n, float a) {
+    pdl_wait();
+    pdl_trigger();
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) x[i] *= a;
+}
+unsigned ernie_blocks(size_t n) { return (unsigned) std::min<size_t>((n + 255) / 256, 65535); }
+
+}  // namespace
+void scale_rows(float* x, size_t n, float a, cudaStream_t s) {
+    if (n > 0) pdl_launch(scale_rows_kernel, ernie_blocks(n), 256, 0, s, x, n, a);
+}
+
+void sel_window_range(int* sel, int stride, int p0, int T, int win, int topk, int* nsel, cudaStream_t s) {
+    if (T > 0) pdl_launch(sel_window_range_kernel, T, 128, 0, s, sel, stride, p0, win, topk, nsel);
+}
+void ernie_split_picks(const int* idx, const float* w, int in_stride, int k, int T, int* oidx, float* ow, int out_stride,
+                       cudaStream_t s) {
+    if (T > 0) pdl_launch(ernie_split_picks_kernel, cdiv(T * k, 256), 256, 0, s, idx, w, in_stride, k, T, oidx, ow, out_stride);
+}
+void ernie_dup_rows(const float* x, int n, int T, float* out, cudaStream_t s) {
+    if (T > 0) pdl_launch(ernie_dup_rows_kernel, ernie_blocks((size_t) T * n), 256, 0, s, x, n, T, out);
+}
+void ernie_pair_sum(const float* x, int n, int T, float* out, cudaStream_t s) {
+    if (T > 0) pdl_launch(ernie_pair_sum_kernel, ernie_blocks((size_t) T * n), 256, 0, s, x, n, T, out);
+}
+
+void ix_key(const float* k, const float* w, const float* b, int T, int rope, int pos0, const float* freqs, uint16_t* keys,
+            cudaStream_t s) {
+    if (T > 0) pdl_launch(ix_key_kernel, T, 128, 0, s, k, w, b, rope, pos0, freqs, (__half*) keys);
+}
+void ix_query(float* q, int T, int H, int rope, int pos0, const float* freqs, cudaStream_t s) {
+    if (T > 0) pdl_launch(ix_query_kernel, dim3((unsigned) H, (unsigned) T), 128, 0, s, q, H, rope, pos0, freqs);
+}
+void ix_score(const float* q, const float* w, int T, int H, const uint16_t* keys, const int* n, int nmax, float* out,
+              long long out_stride, cudaStream_t s) {
+    if (T > 0 && nmax > 0 && H <= 64)
+        pdl_launch(ix_score_kernel, dim3((unsigned) cdiv(nmax, kIxKeys), (unsigned) T), 256, 0, s, q, w, H, (const __half*) keys, n, out,
+                   out_stride);
+}
+void sel_window(int* sel, int stride, const ErnieSel& c, int T, int win, int* nsel, cudaStream_t s) {
+    if (T > 0) pdl_launch(sel_window_kernel, T, 128, 0, s, sel, stride, c, win, nsel);
+}
+
+void ernie_gather(const float* x, const ErnieGather& g, int n, int cols, float* out, cudaStream_t s) {
+    if (n > 0) pdl_launch(ernie_gather_kernel, dim3((unsigned) cdiv(cols, 256), (unsigned) n), 256, 0, s, x, g, cols, out);
+}
+
+void ernie_route(const float* l0, const float* l1, int ld, const float* bias, const float* scale, int n, int k, bool renorm,
+                 int T, int* idx, float* w, int stride, cudaStream_t s) {
+    if (T <= 0 || n <= 0 || n > 1024 || k < 1 || k > kErniePicks || k > stride) {
+        std::fprintf(stderr, "ds4 ernie_route: %d experts, %d picks (stride %d) not covered\n", n, k, stride);
+        return;
+    }
+    pdl_launch(ernie_route_kernel, T, kErnieRouteThreads, 0, s, l0, l1, ld, bias, scale, n, k, renorm ? 1 : 0, idx, w,
+               stride);
+}
+void situ_mul(const float* g, const float* u, size_t n, float beta, float lin, float* h, cudaStream_t s) {
+    if (n > 0) pdl_launch(situ_mul_kernel, ernie_blocks(n), 256, 0, s, g, u, n, beta, lin, h);
+}
+void vha_mix(float* o, const float* m, int T, int H, int D, size_t ld_t, size_t ld_h, cudaStream_t s) {
+    if (T <= 0 || H > 64) {
+        if (H > 64) std::fprintf(stderr, "ds4 vha_mix: %d heads (64 at most)\n", H);
+        return;
+    }
+    pdl_launch(vha_mix_kernel, dim3((unsigned) cdiv(D, kVhaCols), (unsigned) T), 256, 0, s, o, m, H, D, ld_t, ld_h);
+}
+void sigmoid_mul(float* x, const float* gate, size_t n, cudaStream_t s) {
+    if (n > 0) pdl_launch(sigmoid_mul_kernel, ernie_blocks(n), 256, 0, s, x, gate, n);
+}
+void multimax(float* z, size_t n, const float* ranges, const float* ts, cudaStream_t s) {
+    if (n > 0) pdl_launch(multimax_kernel, ernie_blocks(n), 256, 0, s, z, n, ranges, ts);
+}
+void hc_head_pre(const float* mix, const float* scale, const float* base, int hc, float eps, int T, float* pre,
+                 cudaStream_t s) {
+    if (T > 0) pdl_launch(hc_head_pre_kernel, cdiv(T * hc, 128), 128, 0, s, mix, scale, base, hc, eps, T, pre);
+}
+void mla_kv_store(const float* kva, int T, int kvl, int rope, const float* w, float eps, int pos0, const float* freqs,
+                  uint16_t* cache, cudaStream_t s) {
+    if (T > 0) pdl_launch(mla_kv_store_kernel, T, 256, 0, s, kva, kvl, rope, w, eps, pos0, freqs, cache);
+}
+void mla_absorb(const float* q, const uint16_t* wuk, int T, int H, int nope, int rope, int kvl, float* qa, cudaStream_t s) {
+    if (T > 0 && nope <= 512) pdl_launch(mla_absorb_kernel, dim3((unsigned) H, (unsigned) T), 256, 0, s, q, wuk, H, nope, rope, kvl, qa);
+}
+bool mla_attn(const float* qa, const uint16_t* cache, int T, int H, int kvl, int rope, int pos0, const int* sel,
+              int sel_stride, const int* nsel, int max_keys, const float* sink, float scale, float* out, cudaStream_t s) {
+    if (T <= 0) return true;
+    if (max_keys > kMlaKeys || kvl + rope > 640 || kvl > 512) {
+        std::fprintf(stderr, "ds4 mla_attn: %d keys of %d + %d not covered\n", max_keys, kvl, rope);
+        return false;
+    }
+    pdl_launch(mla_attn_kernel, dim3((unsigned) H, (unsigned) T), 256, 0, s, qa, cache, H, kvl, rope, pos0, sel, sel_stride,
+               nsel, sink, scale, out);
+    return true;
+}
+int mla_max_keys() { return kMlaKeys; }
+void mla_vup(const float* o, const uint16_t* wuv, int T, int H, int kvl, int v, float* y, cudaStream_t s) {
+    if (T > 0 && kvl <= 512) pdl_launch(mla_vup_kernel, dim3((unsigned) H, (unsigned) T), 256, 0, s, o, wuv, H, kvl, v, y);
+}
+void ernie_combine(const float* ed, const ErnieCombine& c, const float* cpu, int T, int E, float* out, cudaStream_t s) {
+    if (T > 0) pdl_launch(ernie_combine_kernel, dim3((unsigned) cdiv(E, 256), (unsigned) T), 256, 0, s, ed, c, cpu, E, out);
+}
+void add_rows(float* y, const float* x, size_t n, cudaStream_t s) {
+    if (n > 0) pdl_launch(add_rows_kernel, ernie_blocks(n), 256, 0, s, y, x, n);
+}
+
+}  // namespace maya::ds4

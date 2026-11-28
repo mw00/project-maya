@@ -300,6 +300,9 @@ public:
     int64_t pos() const;
     int64_t max_context() const;
     int vocab() const;
+    // the serve loop's end tokens without --eos ("a,b"): ERNIE-5.5's eos_token_id (ds4.txt) and <|ERNIE_MASK|> (2: the
+    // next conversation's opening, its generation_config's eos_token_id [2, 8]), else 1 as before
+    std::string eos() const;
     int dim() const;
     const std::vector<int32_t>& tokens() const;   // what the state has consumed, in order
 

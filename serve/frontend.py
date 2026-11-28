@@ -98,6 +98,10 @@ class ChatTemplate:
         # (none .. max, its effort_map) or a number; tool call arguments must be objects
         self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
         self.ling = "<|role_end|>" in self.source and "detailed thinking on" in self.source
+        # ERNIE-5.5-Flash (tools/ds4/ernie55_chat_template.jinja): rendered by baidu's own renderer
+        # (serve/ernie55_encoding.py); <ernie:think> reasoning, tool calls in <ernie:tool_call> invoke blocks
+        # (OutputParser(ernie=True)); reasoning_effort low / medium / high, thinking off its closed think block
+        self.ernie = "<|ernie:im_start|>" in self.source and "<ernie:global_setting>" in self.source
         if self.ling:   # (Ling's sets enable_thinking = true only as its default when none is given: not CYBER-FROST's)
             self.forced_thinking = False
 
@@ -118,7 +122,8 @@ class ChatTemplate:
     def opens_thinking(self, prompt: str) -> bool:
         """Whether a rendered prompt ends in an open thinking block (Hy4-flash: its suffixed <think:..>)."""
         end = prompt.rstrip()
-        return end.endswith("<think>") or (self.hy4 and end.endswith("<think%s>" % self.hy4_tag))
+        return end.endswith("<think>") or (self.hy4 and end.endswith("<think%s>" % self.hy4_tag)) or \
+            (getattr(self, "ernie", False) and end.endswith(ERNIE_THINK))
 
     def hy4_call_open(self, name: str = "") -> str:
         """Hy4-flash: a tool call's opening as its template writes one (the wrapper, the call, the tool's name) - what
@@ -158,6 +163,18 @@ class ChatTemplate:
                 if opens_turn and last.get("task") is None and prompt.endswith(header):
                     prompt = prompt[:-len(header)]
             return prompt
+        if self.ernie:
+            from serve.ernie55_encoding import render_chat
+            off = kwargs.pop("enable_thinking", None) is False
+            level = name or kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking_mode", None)
+            if level in ("none", "no_think", "off", "minimal"):
+                off = True
+            effort = level if level in ("low", "medium", "high") else "high" if level else None
+            extra = {} if effort is None or off else {"reasoning_effort": effort}
+            schemas = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return render_chat(messages, schemas, add_generation_prompt=add_generation_prompt,
+                               enable_thinking=not off, **extra).text
         if self.minimax:
             # MiniMax's card: "set reasoning_effort in the chat template: low, medium, high, xhigh or max" - its
             # template has one thinking mode, adaptive (the model decides whether to think), and writes the effort
@@ -1641,13 +1658,100 @@ class InklingRewriter:
                 "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + val(v) + ARG_VAL_END for k, v in args.items()) + CALL_END)
 
 
+ERNIE_THINK, ERNIE_THINK_END = "<ernie:think>", "</ernie:think>"
+ERNIE_CALL, ERNIE_CALL_END = "<ernie:tool_call>", "</ernie:tool_call>"
+
+
+class ErnieRewriter:
+    """ERNIE-5.5-Flash's output (baidu's encoding_ernie / decoding_ernie protocol) rewritten, as it streams, into what
+    OutputParser reads (DeepSeek's path: GLM's tool-call form with JSON values).  `<ernie:think>` opens reasoning
+    (THINK_AGAIN, as MinimaxRewriter's), `</ernie:think>` is </think>.  A tool block - `<ernie:tool_call>` around
+    `<invoke name="N">` elements of `<parameter name="K">V</parameter>` - is held until it is whole, then each invoke
+    becomes `<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`: the protocol writes a string
+    parameter raw and any other value as JSON, so V is JSON-quoted where the tool's schema admits a string
+    (may_be_string), else taken as the JSON it spells (a number, a boolean, an object) or quoted when it is none.  A tag
+    split across deltas is held until it is whole."""
+
+    MARKS = (ERNIE_THINK, ERNIE_THINK_END, ERNIE_CALL)
+    INVOKE = re.compile(r'<invoke\s+name="([^"]+)">(.*?)</invoke>', re.S)
+    PARAM = re.compile(r'<parameter\s+name="([^"]+)">(.*?)</parameter>', re.S)
+
+    def __init__(self, tools: list[dict] | None = None):
+        self.types = {}
+        for t in tools or []:
+            f = t.get("function", t)
+            params = f.get("parameters") or {}
+            props = params.get("properties") or {}
+            defs = {**(params.get("definitions") or {}), **(params.get("$defs") or {})}
+            self.types[f.get("name")] = {k: may_be_string(v, defs) for k, v in props.items()}
+        self.buf = ""
+        self.block = None   # a tool block's text while it is not whole
+
+    def _value(self, name: str, key: str, raw: str) -> str:
+        if self.types.get(name, {}).get(key, name not in self.types):
+            return json.dumps(raw, ensure_ascii=False)
+        try:
+            return json.dumps(json.loads(raw), ensure_ascii=False)
+        except ValueError:
+            return json.dumps(raw, ensure_ascii=False)
+
+    def _calls(self, body: str) -> str:
+        out = []
+        for m in self.INVOKE.finditer(body):
+            name = m.group(1)
+            args = "".join("<arg_key>%s</arg_key><arg_value>%s</arg_value>" % (k, self._value(name, k, v))
+                           for k, v in self.PARAM.findall(m.group(2)))
+            out.append("<tool_call>%s%s</tool_call>" % (name, args))
+        return "".join(out)
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            if self.block is not None:   # inside a tool block: until its end
+                j = self.buf.find(ERNIE_CALL_END)
+                if j < 0:
+                    self.block += self.buf
+                    self.buf = ""
+                    break
+                self.block += self.buf[:j]
+                self.buf = self.buf[j + len(ERNIE_CALL_END):]
+                out.append(self._calls(self.block))
+                self.block = None
+                continue
+            hits = [(i, m) for m in self.MARKS for i in [self.buf.find(m)] if i >= 0]
+            if not hits:
+                keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                out.append(self.buf[:len(self.buf) - keep])
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i, m = min(hits)
+            out.append(self.buf[:i])
+            self.buf = self.buf[i + len(m):]
+            if m == ERNIE_THINK:
+                out.append(THINK_AGAIN)
+            elif m == ERNIE_THINK_END:
+                out.append(THINK_END)
+            else:
+                self.block = ""
+        return "".join(out)
+
+    def finish(self) -> str:
+        out = self.buf
+        self.buf = ""
+        if self.block is not None:   # (a block the answer cut short: its whole invokes)
+            out += self._calls(self.block)
+            self.block = None
+        return out
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False, unions: bool = False, inkling: bool = False):
+                 token_only_end: bool = False, unions: bool = False, inkling: bool = False, ernie: bool = False):
         self.state = "reasoning" if thinking else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
@@ -1659,11 +1763,12 @@ class OutputParser:
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else \
-            InklingRewriter(thinking) if inkling else None   # (Inkling 2: its typed segments, InklingRewriter)
+            InklingRewriter(thinking) if inkling else ErnieRewriter(tools) if ernie else None   # (Inkling 2: its typed
+        # segments, InklingRewriter; ERNIE-5.5: its think tags and invoke blocks, ErnieRewriter)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
-        self.schemas = {} if dsml or minimax or inkling else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax or inkling or ernie else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees

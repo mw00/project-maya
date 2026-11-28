@@ -28,6 +28,8 @@ constexpr int kFmtMXFP4 = 2;   // x3::ExpertLayout::fmt (and an expert's matrix 
 constexpr int kFmtQ8_0 = 3;    // x3::Mat::fmt: ggml's Q8_0, an FP16 scale and 32 int8 in 34 bytes (UD-Q4_K_XL's dense)
 constexpr int kFmtGG = 4;      // x3::Mat::fmt: ggml's low-bit block type m.gg_type (ds4_iq.cuh's: IQ2_XXS ..
                                // Q4_K), [n][k / 256]
+constexpr int kFmtF8 = 5;      // x3::Mat::fmt: E4M3 bytes [n][k] (ERNIE-5.5's dense FP8 as published), times the F32
+                               // scale of each 128 x 128 block (m.sc, [ceil(n / 128)][ceil(k / 128)]) - exactly
 constexpr int kMxBlock = 32, kMxBytes = 17, kQ8Bytes = 34;
 constexpr int kTypeMXFP4 = 39;   // ggml's type id
 
@@ -69,8 +71,9 @@ void q8_mode(int mode);
 bool q8_batch_check(int dev, std::string& err);
 
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
-/// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
-/// or kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)).
+/// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -,
+/// kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)) or kFmtF8 (raw = E4M3 [n][k], ld bytes
+/// a row; m->sc its blocks' scales).
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s);
 /// (DS4_HC_FUSE) an F32 input x of k values already rounded to int8 as mv rounds a Q8_0 job's (q [k], d [k / 32]: see
 /// hc_split_pre_norm): a kFmtQ8_0 job whose xf is x, its k this k and one activation reads them instead of rounding x
@@ -116,6 +119,9 @@ bool lane_parity();
 /// (tests) lane_parity from here on: 1 on, 0 off (-1: the environment's again).  The engine reads it once at load.
 void lane_parity_mode(int mode);
 
+/// The routed experts' activation in ds4_iq's kernels from here on: iq::kActSitu (ERNIE-5.5's SiTU-GLU, a its beta,
+/// b its linear beta), else the clamped SwiGLU (the default).  Set once at load.
+void set_expert_act(int act, float a, float b);
 /// Launch failures of these kernels since the process started (each is also printed).
 int launch_errors();
 
