@@ -1822,7 +1822,7 @@ struct Model::Impl {
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
     static constexpr int kPs = 96;       // (HY4_PSTREAM: experts a pass, at most - its second buffer's slots)
     char ps_route[160] = {0};           // (its INFO line about the route)
-    bool ps_want = [] { const char* v = std::getenv("HY4_PSTREAM"); return !v || !*v || std::atoi(v) != 0; }();   // (on; =0: off)
+    bool ps_want = [] { const char* v = std::getenv("HY4_PSTREAM"); return v && std::atoi(v) != 0; }();   // (off; =1: on)
     int stage_slots() const { return kStage + (ps_want ? kPs : 0); }
     // tensor parallel with the CPU lane: a prompt chunk of this many rows or more has every member send its share of
     // the experts no member holds to its own GPU (kShareThreads copy a member's pass into its bounce); a shorter one
@@ -6387,7 +6387,7 @@ struct Model::Impl {
     }
     static const char* fetch_name(int mode) { return mode == 1 ? "gpu" : mode == 2 ? "mix" : "lane"; }
     // auto with copies and no verdict: Model::load measures after the warm-up
-    // HY4_PSTREAM (on by default, =0: off): a prompt chunk's experts outside VRAM streamed from pinned RAM copies in
+    // HY4_PSTREAM (off by default, =1: on): a prompt chunk's experts outside VRAM streamed from pinned RAM copies in
     // passes, two staging buffers: a pass is copied (a stream of its own) while the pass before it runs, and the next
     // layer's first pass while this layer's last one and its attention do
     struct PStream {
@@ -7453,14 +7453,14 @@ struct Model::Impl {
         return true;
     }
 
-    // experts_streamed in two halves of kStage / 2 slots, in flight together (the default; HY4_STREAM_PIPE=0: one pass at a time,
+    // experts_streamed in two halves of kStage / 2 slots, in flight together (HY4_STREAM_PIPE=1; off by default: one pass at a time,
     // as before): the lane's threads copy pass i + 1 from the model's file into its half of the pinned bounce while
     // pass i crosses the bus on the copies' own stream, and its sets run on the layer's stream while pass i + 1
     // crosses.  A half's bounce is filled again once its copy is done (ev_in), its staging slots once its sets are
     // (ev_used).  The same passes' sets, the same sums (each expert's rows in one pass either way: its slot is all
     // that differs).  One pass at a time a V100 streamed at ~4 GB/s, the copies, the bus and the sets one after another.
     bool stream_pipe() const {
-        static const bool on = [] { const char* v = std::getenv("HY4_STREAM_PIPE"); return !v || !*v || std::atoi(v) != 0; }();
+        static const bool on = [] { const char* v = std::getenv("HY4_STREAM_PIPE"); return v && std::atoi(v) != 0; }();
         return on;
     }
     bool streamed_pipe(Layer& l, Gpu& gp, int T, const std::vector<int>& u, std::string& err) {
