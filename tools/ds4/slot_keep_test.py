@@ -414,7 +414,7 @@ def main() -> int:
         dir_cancel = os.path.join(tmp, "cancel")
         rc, notes_c, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_cancel, True,
                              [("A", lambda _: a2, {"keys": f"shared={len(s)}"}),
-                              ("B", lambda _: b2, {"keys": f"shared={len(s)}", "stop_after_pp": 1}),
+                              ("B", lambda _: b2, {"keys": f"shared={len(s)}", "stop_after_pp": 2}),   # (the first PP: the read's start)
                               ("A-turn", lambda ans: a2 + ans["A"]["tokens"] + turn)], max_new, settings=settings)
         ca, cb, ct = rc["A"], rc["B"], rc["A-turn"]
         print(f"        A {len(a2)} tok in {ca['s']:.0f} s; the stopped read {cb['len']} tok in {cb['s']:.1f} s "
